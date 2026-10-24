@@ -1,15 +1,15 @@
 roles:
   owner:
-    email: vipul@saeloun.com
+    email: owner@harborline.example.com
     password: password
   employee:
-    email: keshav@saeloun.com
+    email: elena@harborline.example.com
     password: password
   book_keeper:
-    email: accounts@saeloun.com
+    email: bookkeeper@harborline.example.com
     password: password
   client:
-    email: finance@example.com
+    email: finance@bluefin.example.com
     password: password
 
 groups:

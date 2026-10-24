@@ -65,12 +65,12 @@ def ensure_user!(company:, first_name:, last_name:, email:, roles:, current_work
   ensure_address!(
     user,
     address_type: "current",
-    address_line_1: "475 Clermont Ave",
+    address_line_1: "100 Example Way",
     address_line_2: "Suite #{100 + user.id.to_i}",
-    city: "Brooklyn",
-    state: "NY",
+    city: "Springfield",
+    state: "OR",
     country: "US",
-    pin: "11238"
+    pin: "97477"
   )
 
   if user.devices.blank?
@@ -143,20 +143,20 @@ def seeded_holidays_for(year)
   ]
 end
 
-company = Company.find_or_initialize_by(name: "Saeloun Inc")
+company = Company.find_or_initialize_by(name: "Harborline Consulting")
 company.update!(
-  address: "475 Clermont Ave, Brooklyn, NY 11238",
-  business_phone: phone("+1 9296207865"),
+  address: "100 Example Way, Springfield, OR 97477",
+  business_phone: phone("+1 4155550100"),
   base_currency: "USD",
   standard_price: 1250,
   fiscal_year_end: "Dec",
   date_format: "MM-DD-YYYY",
   country: "US",
   timezone: "(GMT-10:00) America/Adak",
-  bank_name: "Mercury",
-  bank_account_number: "1234567890",
-  bank_routing_number: "021000021",
-  bank_swift_code: "CHASUS33",
+  bank_name: "Example Bank",
+  bank_account_number: "0000000000",
+  bank_routing_number: "000000000",
+  bank_swift_code: "XXXXUS00",
   tax_id: "12-3456789",
   vat_number: "US-998877",
   gst_number: "GST-10001",
@@ -164,33 +164,30 @@ company.update!(
   billing_exempt: true
 )
 
-logo_path = Rails.root.join("app/assets/images/saeloun_logo.png")
-company.logo.attach(io: File.open(logo_path), filename: "saeloun_logo.png") if File.exist?(logo_path) && !company.logo.attached?
-
 ensure_address!(
   company,
   address_type: "permanent",
-  address_line_1: "475 Clermont Ave",
+  address_line_1: "100 Example Way",
   address_line_2: "Floor 3",
-  city: "Brooklyn",
-  state: "NY",
+  city: "Springfield",
+  state: "OR",
   country: "US",
-  pin: "11238"
+  pin: "97477"
 )
 
 puts "Company ready: #{company.name}"
 
-owner = ensure_user!(company:, first_name: "Vipul", last_name: "AM", email: "vipul@saeloun.com", roles: [:owner])
-super_admin = ensure_user!(company:, first_name: "Saeloun", last_name: "Admin", email: "hello@saeloun.com", roles: [:owner], super_admin: true)
-admin = ensure_user!(company:, first_name: "Supriya", last_name: "Agarwal", email: "supriya@saeloun.com", roles: [:admin])
-book_keeper = ensure_user!(company:, first_name: "Accounts", last_name: "Saeloun", email: "accounts@saeloun.com", roles: [:book_keeper])
-employee_1 = ensure_user!(company:, first_name: "Sonam", last_name: "Saeloun", email: "sonam@saeloun.com", roles: [:employee])
-employee_2 = ensure_user!(company:, first_name: "Keshav", last_name: "Saeloun", email: "keshav@saeloun.com", roles: [:employee])
-employee_3 = ensure_user!(company:, first_name: "Amit", last_name: "Saeloun", email: "amit@saeloun.com", roles: [:employee])
-client_user_1 = ensure_user!(company:, first_name: "Olivia", last_name: "Client", email: "oliver@example.com", roles: [:client])
-client_user_2 = ensure_user!(company:, first_name: "Maya", last_name: "Stakeholder", email: "maya.client@example.com", roles: [:client])
-client_user_3 = ensure_user!(company:, first_name: "Finance", last_name: "Microsoft", email: "finance.microsoft@example.com", roles: [:client])
-client_user_4 = ensure_user!(company:, first_name: "Accounts", last_name: "Acme", email: "accounts.acme@example.com", roles: [:client])
+owner = ensure_user!(company:, first_name: "Rowan", last_name: "Hale", email: "owner@harborline.example.com", roles: [:owner])
+super_admin = ensure_user!(company:, first_name: "Harborline", last_name: "Admin", email: "superadmin@harborline.example.com", roles: [:owner], super_admin: true)
+admin = ensure_user!(company:, first_name: "Priya", last_name: "Lindqvist", email: "admin@harborline.example.com", roles: [:admin])
+book_keeper = ensure_user!(company:, first_name: "Morgan", last_name: "Keats", email: "bookkeeper@harborline.example.com", roles: [:book_keeper])
+employee_1 = ensure_user!(company:, first_name: "Jun", last_name: "Okafor", email: "jun@harborline.example.com", roles: [:employee])
+employee_2 = ensure_user!(company:, first_name: "Elena", last_name: "Marsh", email: "elena@harborline.example.com", roles: [:employee])
+employee_3 = ensure_user!(company:, first_name: "Theo", last_name: "Brandt", email: "theo@harborline.example.com", roles: [:employee])
+client_user_1 = ensure_user!(company:, first_name: "Olivia", last_name: "Client", email: "olivia@bluefin.example.com", roles: [:client])
+client_user_2 = ensure_user!(company:, first_name: "Maya", last_name: "Stakeholder", email: "maya@northwind.example.com", roles: [:client])
+client_user_3 = ensure_user!(company:, first_name: "Finance", last_name: "Bluefin", email: "finance@bluefin.example.com", roles: [:client])
+client_user_4 = ensure_user!(company:, first_name: "Accounts", last_name: "Acme", email: "accounts@acme.example.com", roles: [:client])
 
 users = [super_admin, owner, admin, book_keeper, employee_1, employee_2, employee_3]
 employees = [owner, admin, book_keeper, employee_1, employee_2, employee_3]
@@ -199,10 +196,10 @@ client_users = [client_user_1, client_user_2, client_user_3, client_user_4]
 puts "Users ready: #{(users + client_users).map(&:email).join(', ')}"
 
 clients = [
-  ensure_client!(company:, name: "Microsoft", email: client_user_3.email, phone_number: "+1 4155550101", member: client_user_3),
+  ensure_client!(company:, name: "Bluefin Analytics", email: client_user_3.email, phone_number: "+1 4155550101", member: client_user_3),
   ensure_client!(company:, name: "Acme Labs", email: client_user_4.email, phone_number: "+1 4155550102", member: client_user_4),
   ensure_client!(company:, name: "Northwind Studio", email: client_user_2.email, phone_number: "+1 4155550103", member: client_user_2),
-  ensure_client!(company:, name: "Pinecone Health", email: "ops@pineconehealth.com", phone_number: "+1 4155550104")
+  ensure_client!(company:, name: "Cedar Ridge Clinics", email: "ops@cedarridge.example.com", phone_number: "+1 4155550104")
 ]
 
 ClientMember.find_or_create_by!(company:, client: clients[0], user: client_user_1)
@@ -213,12 +210,12 @@ ClientMember.find_or_create_by!(company:, client: clients[2], user: client_user_
 ClientMember.find_or_create_by!(company:, client: clients[3], user: client_user_2)
 
 projects = [
-  ensure_project!(client: clients[0], name: "Office.com", description: "Platform delivery and reporting"),
-  ensure_project!(client: clients[0], name: "Azure Growth", description: "Enterprise launch support"),
+  ensure_project!(client: clients[0], name: "Bluefin Insights", description: "Platform delivery and reporting"),
+  ensure_project!(client: clients[0], name: "Bluefin Expansion", description: "Enterprise launch support"),
   ensure_project!(client: clients[1], name: "Acme Revamp", description: "Website redesign and analytics"),
   ensure_project!(client: clients[1], name: "Acme Retainer", description: "Ongoing product support"),
   ensure_project!(client: clients[2], name: "Northwind Mobile", description: "Mobile app iteration"),
-  ensure_project!(client: clients[3], name: "Pinecone Operations", description: "Operations tooling and support")
+  ensure_project!(client: clients[3], name: "Cedar Ridge Operations", description: "Operations tooling and support")
 ]
 
 project_rates = {
@@ -419,14 +416,14 @@ end
 puts "Invoices and payments ready"
 
 expense_rows = [
-  { user: employee_1, category_name: "Travel", vendor_name: "Delta", description: "Flight for client workshop", amount: 825_00, date: Date.new(2025, 2, 10), expense_type: :business, status: :paid, paid_at: Date.new(2025, 2, 20) },
-  { user: employee_2, category_name: "Meals", vendor_name: "Sweetgreen", description: "Team lunch with client", amount: 124_50, date: Date.new(2025, 3, 12), expense_type: :business, status: :approved },
-  { user: employee_3, category_name: "Office", vendor_name: "Staples", description: "Desk accessories and cables", amount: 210_75, date: Date.new(2025, 4, 4), expense_type: :business, status: :submitted },
-  { user: book_keeper, category_name: "Software", vendor_name: "Figma", description: "Design tool renewal", amount: 540_00, date: Date.new(2025, 5, 1), expense_type: :business, status: :paid, paid_at: Date.new(2025, 5, 2) },
-  { user: owner, category_name: "Travel", vendor_name: "Uber", description: "Airport transfer", amount: 68_25, date: Date.new(2025, 6, 14), expense_type: :business, status: :rejected },
-  { user: employee_1, category_name: "Training", vendor_name: "RailsConf", description: "Conference ticket", amount: 699_00, date: Date.new(2025, 8, 8), expense_type: :business, status: :approved },
-  { user: employee_2, category_name: "Wellness", vendor_name: "Apollo Pharmacy", description: "Prescription reimbursement", amount: 93_10, date: Date.new(2025, 10, 18), expense_type: :personal, status: :paid, paid_at: Date.new(2025, 10, 22) },
-  { user: employee_3, category_name: "Travel", vendor_name: "Marriott", description: "Hotel stay for onsite", amount: 455_60, date: Date.new(2026, 1, 16), expense_type: :business, status: :submitted }
+  { user: employee_1, category_name: "Travel", vendor_name: "Skyline Air", description: "Flight for client workshop", amount: 825_00, date: Date.new(2025, 2, 10), expense_type: :business, status: :paid, paid_at: Date.new(2025, 2, 20) },
+  { user: employee_2, category_name: "Meals", vendor_name: "Greenleaf Kitchen", description: "Team lunch with client", amount: 124_50, date: Date.new(2025, 3, 12), expense_type: :business, status: :approved },
+  { user: employee_3, category_name: "Office", vendor_name: "Paperclip Supply", description: "Desk accessories and cables", amount: 210_75, date: Date.new(2025, 4, 4), expense_type: :business, status: :submitted },
+  { user: book_keeper, category_name: "Software", vendor_name: "Canvasly", description: "Design tool renewal", amount: 540_00, date: Date.new(2025, 5, 1), expense_type: :business, status: :paid, paid_at: Date.new(2025, 5, 2) },
+  { user: owner, category_name: "Travel", vendor_name: "Metro Rides", description: "Airport transfer", amount: 68_25, date: Date.new(2025, 6, 14), expense_type: :business, status: :rejected },
+  { user: employee_1, category_name: "Training", vendor_name: "DevSummit", description: "Conference ticket", amount: 699_00, date: Date.new(2025, 8, 8), expense_type: :business, status: :approved },
+  { user: employee_2, category_name: "Wellness", vendor_name: "Corner Pharmacy", description: "Prescription reimbursement", amount: 93_10, date: Date.new(2025, 10, 18), expense_type: :personal, status: :paid, paid_at: Date.new(2025, 10, 22) },
+  { user: employee_3, category_name: "Travel", vendor_name: "Harbor Inn", description: "Hotel stay for onsite", amount: 455_60, date: Date.new(2026, 1, 16), expense_type: :business, status: :submitted }
 ]
 
 expense_rows.each_with_index do |attrs, index|
@@ -488,15 +485,15 @@ pending_client_invitation.update!(
 
 puts "Invitations ready"
 puts "Seed complete"
-puts "Login credentials:"
-puts "- vipul@saeloun.com (owner)"
-puts "- hello@saeloun.com (super admin + owner)"
-puts "- supriya@saeloun.com (admin)"
-puts "- accounts@saeloun.com (book keeper)"
-puts "- sonam@saeloun.com (employee)"
-puts "- keshav@saeloun.com (employee)"
-puts "- amit@saeloun.com (employee)"
-puts "- oliver@example.com (client)"
-puts "- maya.client@example.com (client)"
-puts "- finance.microsoft@example.com (client)"
-puts "- accounts.acme@example.com (client)"
+puts "Login credentials (password: #{PASSWORD}):"
+puts "- owner@harborline.example.com (owner)"
+puts "- superadmin@harborline.example.com (super admin + owner)"
+puts "- admin@harborline.example.com (admin)"
+puts "- bookkeeper@harborline.example.com (book keeper)"
+puts "- jun@harborline.example.com (employee)"
+puts "- elena@harborline.example.com (employee)"
+puts "- theo@harborline.example.com (employee)"
+puts "- olivia@bluefin.example.com (client)"
+puts "- maya@northwind.example.com (client)"
+puts "- finance@bluefin.example.com (client)"
+puts "- accounts@acme.example.com (client)"
