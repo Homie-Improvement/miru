@@ -527,6 +527,83 @@ Invitation.find_or_initialize_by(company:, recipient_email: "planner@summitevent
 )
 
 puts "Invitations ready"
+# --- A second company, for company boundaries ------------------------------
+#
+# Copper Kettle Bakery, another fictional small business with its own staff,
+# client, project, entries and one sent invoice. Fork & Leaf's book keeper keeps
+# its books too, so one user belongs to both companies (her current workspace
+# stays Fork & Leaf) and a workspace switch can be shown.
+
+BAKERY_DOMAIN = "copperkettle.example"
+bakery = Company.find_or_initialize_by(name: "Copper Kettle Bakery")
+bakery.update!(
+  address: "48 Mill Lane, Springfield, OR 97477",
+  business_phone: phone("+1 4155550200"),
+  base_currency: "USD",
+  standard_price: 4000,
+  fiscal_year_end: "Dec",
+  date_format: "MM-DD-YYYY",
+  country: "US",
+  timezone: "(GMT-08:00) America/Los_Angeles",
+  bank_name: "Example Bank",
+  bank_account_number: "0000000000",
+  bank_routing_number: "000000000",
+  bank_swift_code: "XXXXUS00",
+  plan_tier: "paid",
+  billing_exempt: true
+)
+ensure_address!(bakery, address_type: "permanent", address_line_1: "48 Mill Lane", address_line_2: "Bakery", city: "Springfield", state: "OR", country: "US", pin: "97477")
+
+bakery_owner = ensure_user!(company: bakery, first_name: "Hugo", last_name: "Brandt", email: "hugo@#{BAKERY_DOMAIN}", roles: [:owner])
+baker = ensure_user!(company: bakery, first_name: "Lena", last_name: "Park", email: "lena@#{BAKERY_DOMAIN}", roles: [:employee])
+# The shared book keeper: a member of both companies, still working in Fork & Leaf.
+ensure_user!(company: bakery, first_name: "Grace", last_name: "Lin", email: book_keeper.email, roles: [:book_keeper], current_workspace: false)
+cafe_contact = ensure_user!(company: bakery, first_name: "Paulo", last_name: "Silva", email: "paulo@northcafe.example", roles: [:client])
+
+north_cafe = ensure_client!(company: bakery, name: "North Street Cafe", email: cafe_contact.email, phone_number: "+1 4155550201", member: cafe_contact)
+pastry_supply = ensure_project!(client: north_cafe, name: "Cafe Pastry Supply", description: "Daily pastry delivery, billed monthly")
+bakery_rates = { bakery_owner => 6000, baker => 3800 }
+bakery_rates.each { |user, rate| ensure_project_member!(project: pastry_supply, user:, hourly_rate: rate) }
+
+bakery_entries = (Date.new(2026, 9, 1)..Date.new(2026, 9, 30)).select { |day| day.tuesday? || day.thursday? }.flat_map do |day|
+  bakery_rates.keys.map do |user|
+    seed_entry!(user:, project: pastry_supply, work_date: day, duration: user == baker ? 240 : 60, note: user == baker ? "Early bake and delivery" : "Order planning")
+  end
+end
+
+bakery_lines = bakery_entries.map do |entry|
+  { name: "Cafe Pastry Supply: #{entry.user.full_name}", description: entry.note, date: entry.work_date, minutes: entry.duration.round, rate_cents: bakery_rates.fetch(entry.user), entry: }
+end
+bakery_subtotal = bakery_lines.sum { |line| ((line[:minutes] / 60.0) * line[:rate_cents]).round }
+bakery_tax = (bakery_subtotal * 0.0875).round
+bakery_invoice = Invoice.find_or_initialize_by(company: bakery, invoice_number: "CK-0001")
+bakery_invoice.update!(
+  client: north_cafe,
+  issue_date: Date.new(2026, 9, 30),
+  due_date: Date.new(2026, 10, 30),
+  reference: "202609-CK",
+  amount: money(bakery_subtotal + bakery_tax),
+  tax: money(bakery_tax),
+  discount: 0,
+  amount_paid: 0,
+  amount_due: money(bakery_subtotal + bakery_tax),
+  outstanding_amount: money(bakery_subtotal + bakery_tax),
+  status: :sent,
+  currency: bakery.base_currency,
+  base_currency_amount: money(bakery_subtotal + bakery_tax),
+  sent_at: Date.new(2026, 10, 1)
+)
+bakery_invoice.invoice_line_items.destroy_all
+bakery_lines.each do |line|
+  bakery_invoice.invoice_line_items.create!(
+    name: line[:name], description: line[:description], date: line[:date],
+    quantity: line[:minutes], rate: money(line[:rate_cents]), timesheet_entry_id: line[:entry].id
+  )
+  line[:entry].update!(bill_status: :billed)
+end
+
+puts "Second company ready: #{bakery.name} (#{bakery_entries.size} entries, invoice #{bakery_invoice.invoice_number})"
+
 puts "Seed complete (as of #{END_DATE})"
 puts "Logins (the seed password is not printed):"
 puts "- dana@#{STAFF_DOMAIN} (owner)"
@@ -534,3 +611,5 @@ puts "- luis@#{STAFF_DOMAIN} (admin)"
 puts "- grace@#{STAFF_DOMAIN} (book keeper)"
 puts "- mateo@, aisha@, sam@, keiko@#{STAFF_DOMAIN} (employees: prep, packing, delivery, catering setup)"
 puts "- nora@brightline.example, ap@brightline.example, owen@harborlegal.example, rina@summitevents.example (clients)"
+puts "- hugo@#{BAKERY_DOMAIN} (owner), lena@#{BAKERY_DOMAIN} (employee), paulo@northcafe.example (client): Copper Kettle Bakery"
+puts "- grace@#{STAFF_DOMAIN} is book keeper in both companies"
