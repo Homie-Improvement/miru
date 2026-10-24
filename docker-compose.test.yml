@@ -23,10 +23,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: test
+      target: development
       cache_from:
         - ghcr.io/saeloun/miru-web:base
         - ghcr.io/saeloun/miru-web:test-latest
+    working_dir: /app
     depends_on:
       postgres:
         condition: service_healthy
@@ -51,10 +52,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: test
+      target: development
       cache_from:
         - ghcr.io/saeloun/miru-web:base
         - ghcr.io/saeloun/miru-web:test-latest
+    working_dir: /app
     depends_on:
       postgres:
         condition: service_healthy

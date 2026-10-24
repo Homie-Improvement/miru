@@ -23,7 +23,7 @@ services:
   app:
     build:
       context: .
-      dockerfile: .devcontainer/Dockerfile
+      dockerfile: Dockerfile
       target: development
     command: bash -c "rm -f tmp/pids/server.pid && bundle install && bundle exec rails db:prepare && bundle exec falcon serve --bind http://0.0.0.0:3000"
     ports:
@@ -58,7 +58,7 @@ services:
   vite:
     build:
       context: .
-      dockerfile: .devcontainer/Dockerfile
+      dockerfile: Dockerfile
       target: development
     command: bash -c "pnpm install && pnpm vite dev --host 0.0.0.0 --port 3036"
     ports:
@@ -76,7 +76,7 @@ services:
   worker:
     build:
       context: .
-      dockerfile: .devcontainer/Dockerfile
+      dockerfile: Dockerfile
       target: development
     command: bundle exec rake solid_queue:start
     working_dir: /app
