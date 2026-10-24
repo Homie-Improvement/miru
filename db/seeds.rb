@@ -345,8 +345,12 @@ projects.group_by(&:client).each_with_index do |(client, client_projects), clien
       .where(project: client_projects, work_date: month_cursor..month_cursor.end_of_month)
       .order(:work_date)
 
-    if grouped_entries.exists?
-      subtotal_cents = grouped_entries.sum { |entry| ((entry.duration / 60.0) * project_rates.fetch(entry.user)).round }
+    # The invoice's figures come from the same entries that become its line
+    # items, so the stored totals match what the invoice recalculates.
+    invoice_entries = grouped_entries.limit(6).to_a
+
+    if invoice_entries.any?
+      subtotal_cents = invoice_entries.sum { |entry| ((entry.duration / 60.0) * project_rates.fetch(entry.user)).round }
       tax_cents = (subtotal_cents * 0.1).round
       discount_cents = ((client_index + month_cursor.month) % 4 == 0 ? 5000 : 0)
       total_cents = subtotal_cents + tax_cents - discount_cents
@@ -383,14 +387,14 @@ projects.group_by(&:client).each_with_index do |(client, client_projects), clien
       )
 
       invoice.invoice_line_items.destroy_all
-      grouped_entries.limit(6).each do |entry|
-        hours = (entry.duration / 60.0)
+      invoice_entries.each do |entry|
         rate = money(project_rates.fetch(entry.user))
         invoice.invoice_line_items.create!(
           name: "#{entry.project.name} work",
           description: entry.note,
           date: entry.work_date,
-          quantity: hours,
+          # Minutes, as the invoice editor records them (Invoice divides by 60).
+          quantity: entry.duration.round,
           rate:,
           timesheet_entry_id: entry.id
         )
