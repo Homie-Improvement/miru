@@ -313,7 +313,7 @@ The cost: entry writes depend on the monolith being up. Today they do too, becau
 ### 5.1 Common rules for every contract
 
 - Every request and every event carries `company_id`. Timekeeping checks it against the entry's stored `company_id` and against the caller's identity (section 6). A mismatch returns `404 not_found`, the same answer as for a missing id, so a caller cannot probe other tenants.
-- Every state-changing request carries an `Idempotency-Key` header. Timekeeping stores it in `idempotency_records`, keyed by `(company_id, actor_type, actor_id, operation, key)` and kept for at least 24 hours, which matches the MCP store (`app/mcp/idempotency_store.rb`). A retry with the same key and the same body returns the stored response. The same key with a different body returns `422 idempotency_key_reused`. A key from another company or actor never matches.
+- Every state-changing request carries an `Idempotency-Key` header. Timekeeping stores it in `idempotency_records`, keyed by `(company_id, actor_type, actor_id, operation, key)` and kept for at least 24 hours, which matches the MCP store (`app/mcp/idempotency_store.rb`). Only successful (2xx) responses are stored, as in the MCP store. A retry with the same key and the same body returns the stored success; a retry after an error, including a `409`, is evaluated again, so a conflict that has since cleared does not keep failing. The same key with a different body returns `422 idempotency_key_reused`. A key from another company or actor never matches.
 - Every API path is versioned in the URL (`/v1/…`). Every event carries `schema_version`. Additive changes (new optional fields) keep the version. Removing or retyping a field needs a new version, and both versions run in parallel until every consumer has moved.
 - Money travels as decimal strings, for example `"125.50"`, never as floats (section 8). Durations travel as decimal strings of minutes (section 8.3).
 - Write responses return the entry's `version` (a counter that rises on every change). Updates may send `If-Match: <version>`; a stale version returns `409 version_conflict`. Clients that do not send it keep today's last-write-wins behaviour.
@@ -444,8 +444,9 @@ unique (company_id, entry_id) where state = 'held'
   - No current hold: insert one with a fresh random `hold_token`.
   - Current hold with the same `invoice_id` **and** the same `association_id`: return the existing token. This is what lets every draft save (L1) re-send its claims without changing anything.
   - Current hold with the same `invoice_id` but a **different** `association_id`: the draft removed the entry and added it again. Replace the hold with a new token in the same statement. The old token stops matching.
+  - Current legacy hold (`invoice_id = null`, created by the backfill for L3 entries, section 10.3): replace it with a hold for the claiming invoice and a new token. Today an unbilled entry still locked after a non-draft discard can be put on a new invoice (section 1.5), so a legacy hold must not block a claim.
   - Current hold by another invoice: refuse with `409 held_by_other`.
-  - A retry with the same idempotency key returns the first answer.
+  - A retry with the same idempotency key returns the stored success. A refusal is not stored, so a retry is checked again (section 5.1).
 - **Release** names the `hold_token`. It clears the hold only when the token matches the current hold, in one statement (`UPDATE … WHERE entry_id = ? AND hold_token = ? AND state = 'held'`). If nothing matches, it returns `no_matching_hold` and changes nothing.
 
 Billing stores the returned `hold_token` on the line item (direct link) or the `invoice_line_item_time_entries` row (aggregate link).
@@ -482,10 +483,9 @@ Timekeeping owns `bill_status` and applies S1–S3 and A7. Allowed changes:
 ```text
 non_billable <-> unbilled          (user edit, project rules S1/S3)
 unbilled     ->  billed            (user edit A11, import L7, mark-billed L5)
-billed       ->  unbilled/non_billable  only for owner/admin (A7) or a background operation
 ```
 
-Billed entries cannot be edited or deleted by any role through the policy (A2), as today.
+No path moves an entry out of `billed`. The policy refuses updates and deletes of billed entries for every role (A2), and none of the named background operations (`holds.claim`, `holds.release`, `entries.mark_billed`, `entries.import`) changes a billed entry. Timekeeping still applies A7 as a second check, as the model does today.
 
 ### 7.4 Future work, not part of the migration
 
@@ -528,13 +528,17 @@ M2 is kept: line items copy `rate` and `quantity` at creation. An `Updated` even
 ```text
 1. In one monolith transaction: save invoice + associations, each association marked hold_state = 'pending',
    and write an outbox row "claim needed".
-2. A job sends holds/claim with idempotency key = hash(invoice_id, association_id, entry_id).
-3. On 200: store hold_token on each association, set hold_state = 'held'.
+2. Still inside the same request, right after the commit, the monolith sends one holds/claim for the whole
+   batch. Its idempotency key is the id of the "claim needed" outbox row, so it is unique to this save
+   and stays the same on every retry.
+3. On 200: store hold_token on each association, set hold_state = 'held', then answer the user.
    On 409: set hold_state = 'conflict'; the invoice shows the entries as not held, and the user is told.
+   On a timeout or 5xx: answer the user with the invoice saved and its holds pending; a job retries
+   the same claim, with the same key, until it gets 200 or 409.
 4. Removal: set association hold_state = 'releasing' with its token; a job sends holds/release.
 ```
 
-The synchronous web request may also call claim directly to answer the user at once, with the job as the retry path.
+The claim is synchronous, so in the normal case entries are held before the save returns, as with L1 today. The job is only the retry path. **Disclosed change from L1:** today the lock commits in the same database transaction as the invoice. In the target, there is a short window between the invoice commit and the claim. That window lasts the length of one HTTP call, and longer when Timekeeping cannot be reached. During it, an employee could still edit an entry that is already on the draft. The reconciler reports associations that stay `pending` longer than 10 minutes. No design without a shared transaction closes this window completely. Claiming before the commit would instead leave orphan holds when the commit fails (see the second row of 9.3).
 
 ### 9.3 Failure cases
 
@@ -556,7 +560,7 @@ Mark-billed on send is not in this table, because sending does not mark entries 
 ### 9.4 Concurrency on entries
 
 - Entry updates take a row lock in Timekeeping and bump `version`. Clients that send `If-Match` get conflict detection; others keep last-write-wins, as today.
-- A user edit and a claim on the same entry serialize on the entry row. A claim that commits first makes a later employee edit fail with the locked error (A6), as today.
+- A user edit and a claim on the same entry serialize on the entry row. A claim that commits first makes a later employee edit fail with the locked error (A6), as today. An edit made in the window between the invoice commit and the claim (section 9.2) succeeds. Today's single transaction prevents that edit, so this is the disclosed change named in 9.2.
 
 ## 10. Migration, backfill, reconciliation, phased cutover and rollback (proposed)
 
@@ -598,7 +602,7 @@ P4 can start as soon as P2 has a stable event stream, in parallel with P3 (secti
 - It copies every column as stored, including `bill_status`, `review_status` and `discarded_at`. **It never infers `billed` from invoice links.** Entries that are billed with no invoice (L7), locked but unbilled on sent invoices (L6), and locked with no kept invoice (L3) are copied exactly as they are.
 - Locks become holds:
   - Each `locked = true` entry with an association on a kept invoice becomes a `held` hold for that invoice and association, with a new token. The token is written back to the billing association in the same batch.
-  - A `locked = true` entry with no kept invoice (L3) becomes a **legacy hold**: `invoice_id = null`, `association_id = null`. It shows `locked: true` as today, and no billing release can match it. Only an approved operator command can clear it.
+  - A `locked = true` entry with no kept invoice (L3) becomes a **legacy hold**: `invoice_id = null`, `association_id = null`. It shows `locked: true` as today, and no billing release can match it. A claim by a new invoice takes it over (section 7.2), so these entries can still be invoiced again, as today. Otherwise only an approved operator command can clear it.
   - An entry on two kept invoices at once (possible today, section 1.5) gets a hold for the oldest invoice. The others are listed in the reconciliation report with `hold_state = 'conflict'`. The invoices and their money are not touched.
 - `duration` is copied to `numeric(12,4)`. Each value is checked to round-trip to the same float; the batch stops on the first mismatch (section 8.3).
 - `audits` rows for entries are copied with their original timestamps and authors.
