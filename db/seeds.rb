@@ -216,16 +216,16 @@ ClientMember.find_or_create_by!(company:, client: brightline, user: brightline_f
 ClientMember.find_or_create_by!(company:, client: riverside, user: summit_contact)
 
 office_lunch = [
-  ensure_project!(client: brightline, name: "Brightline Weekday Office Lunch", description: "Recurring weekday lunch contract, billed monthly"),
-  ensure_project!(client: harbor, name: "Harbor Legal Office Lunch Program", description: "Recurring office lunch contract, billed monthly")
+  ensure_project!(client: brightline, name: "Brightline Office Lunch", description: "Recurring weekday lunch contract, billed monthly"),
+  ensure_project!(client: harbor, name: "Harbor Legal Office Lunch", description: "Recurring office lunch contract, billed monthly")
 ]
 catering = [
-  ensure_project!(client: brightline, name: "Brightline Quarterly All-Hands Catering", description: "Catering for quarterly all-hands meetings"),
-  ensure_project!(client: summit, name: "Summit Fall Product Launch Catering", description: "Launch-day catering engagement"),
-  ensure_project!(client: summit, name: "Summit Conference Boxed Lunches", description: "Boxed lunches for a two-day conference"),
-  ensure_project!(client: riverside, name: "Riverside Gallery Gala Catering", description: "Evening gala catering engagement")
+  ensure_project!(client: brightline, name: "Brightline All-Hands Catering", description: "Catering for quarterly all-hands meetings"),
+  ensure_project!(client: summit, name: "Summit Launch Catering", description: "Launch-day catering engagement"),
+  ensure_project!(client: summit, name: "Summit Conference Lunches", description: "Boxed lunches for a two-day conference"),
+  ensure_project!(client: riverside, name: "Riverside Gala Catering", description: "Evening gala catering engagement")
 ]
-kitchen_training = ensure_project!(client: kitchen, name: "Kitchen Training and Food Safety", description: "Internal, not billed to any client", billable: false)
+kitchen_training = ensure_project!(client: kitchen, name: "Kitchen Training", description: "Internal, not billed to any client", billable: false)
 
 # Hourly rates in cents, by person: what a client is billed for an hour of their time.
 project_rates = {
@@ -313,10 +313,10 @@ end
 
 # Catering engagements happen on fixed event days.
 EVENT_DAYS = {
-  "Brightline Quarterly All-Hands Catering" => [Date.new(2025, 3, 20), Date.new(2025, 6, 19), Date.new(2025, 9, 18), Date.new(2025, 12, 11), Date.new(2026, 3, 19), Date.new(2026, 6, 18), Date.new(2026, 9, 17)],
-  "Summit Fall Product Launch Catering" => [Date.new(2025, 10, 7), Date.new(2025, 10, 8), Date.new(2026, 10, 6), Date.new(2026, 10, 7)],
-  "Summit Conference Boxed Lunches" => [Date.new(2026, 4, 14), Date.new(2026, 4, 15)],
-  "Riverside Gallery Gala Catering" => [Date.new(2025, 11, 15), Date.new(2026, 5, 9)]
+  "Brightline All-Hands Catering" => [Date.new(2025, 3, 20), Date.new(2025, 6, 19), Date.new(2025, 9, 18), Date.new(2025, 12, 11), Date.new(2026, 3, 19), Date.new(2026, 6, 18), Date.new(2026, 9, 17)],
+  "Summit Launch Catering" => [Date.new(2025, 10, 7), Date.new(2025, 10, 8), Date.new(2026, 10, 6), Date.new(2026, 10, 7)],
+  "Summit Conference Lunches" => [Date.new(2026, 4, 14), Date.new(2026, 4, 15)],
+  "Riverside Gala Catering" => [Date.new(2025, 11, 15), Date.new(2026, 5, 9)]
 }.freeze
 
 def seed_entry!(user:, project:, work_date:, duration:, note:, bill_status: :unbilled)
