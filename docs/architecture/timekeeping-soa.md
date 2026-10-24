@@ -557,3 +557,291 @@ Mark-billed on send is not in this table, because sending does not mark entries 
 
 - Entry updates take a row lock in Timekeeping and bump `version`. Clients that send `If-Match` get conflict detection; others keep last-write-wins, as today.
 - A user edit and a claim on the same entry serialize on the entry row. A claim that commits first makes a later employee edit fail with the locked error (A6), as today.
+
+## 10. Migration, backfill, reconciliation, phased cutover and rollback (proposed)
+
+### 10.1 The one rule: one writer per company at a time
+
+Write ownership moves **per company**, never per entry point. Today the web API, bulk actions, CLI, MCP, mobile, agent, invoice callbacks, the Harvest import and jobs all write the same rows (section 1.3). Suppose only the web path moved first: a web edit would land in Timekeeping while a CLI edit to the same entry landed in the monolith. The two stores would then disagree about the employee's time.
+
+So the monolith keeps one routing record per company:
+
+```text
+timekeeping_ownership(company_id primary key, owner: 'monolith' | 'moving' | 'timekeeping' | 'returning',
+                      epoch integer, changed_at, changed_by)
+```
+
+Every code path that writes an entry, a hold or `bill_status` reads this record first, through one shared function in the monolith (`TimekeepingRouting.owner_for(company)`):
+
+- `monolith`: write locally, as today.
+- `timekeeping`: forward to Timekeeping with the current `epoch`.
+- `moving` or `returning`: refuse with a retryable `503 ownership_moving`. The window should last seconds to minutes per company. Whether every client (web, mobile, CLI, MCP, timer) retries a `503` today was not checked; any that does not must get a retry before its company moves, and this is listed as an open question in section 15.
+
+Timekeeping stores the epoch it was handed ownership at and rejects writes that carry an older one (`409 stale_epoch`). That stops a request that was routed just before a flip from landing on the wrong side. No per-entry-point feature flags exist. The paths that must call the routing function are: `app/controllers/api/v1/timesheet_entry_controller.rb`, `app/controllers/api/v1/timesheet_entry/bulk_action_controller.rb`, `app/controllers/api/v1/cli/timesheet_entries_controller.rb` (and through it the MCP tools), `app/controllers/api/v1/agent/timesheet_entries_controller.rb`, the lock callbacks in `app/models/invoice.rb` and `app/models/invoice_line_item.rb`, `Invoice#update_timesheet_entry_status!`, and `app/services/imports/harvest_time_entries_importer.rb`. A guard test (section 12.2) fails if any other code writes `TimesheetEntry` for a company that is not owned by the monolith.
+
+### 10.2 Phases
+
+| Phase | What happens | Who writes entries | Exit check |
+|---|---|---|---|
+| P0. Prepare the monolith | Add `company_id` to `timesheet_entries`, backfilled from project → client → company and kept by a model callback. Add the monolith outbox, `TimekeepingRouting`, the ownership table (every company `monolith`), and the hold token columns on billing associations (empty). No behaviour change. | Monolith | Full existing suite green; `company_id` matches the derived company for 100% of rows |
+| P1. Stand up Timekeeping | Deploy the service and its database with no traffic. Build the entry API, hold commands, outbox and token check. | Monolith | Contract suite (section 12.3) green against a test instance |
+| P2. Backfill and shadow | Copy entries, audits and lock state to Timekeeping (10.3). Then stream monolith changes to it continuously, keyed by source id. Run shadow reads: for sampled requests, the monolith also asks Timekeeping and logs any difference. Claims run in shadow mode for the double-hold refusal (section 7.2). | Monolith | Reconciler (10.4) reports zero unexplained differences for 7 days |
+| P3. Cut over companies in waves | Move companies one at a time with the procedure in 10.5: first internal workspaces, then about 5% of companies, then 25%, then all. | Monolith for unmoved companies; Timekeeping for moved ones | Per-wave acceptance checks (section 13) pass; no rollback needed for 7 days |
+| P4. Reporting projection | Reports, analytics and metrics read from the projection fed by Timekeeping events instead of `timesheet_entries`. Each report switches behind a per-report read flag. The read flag only changes where a report reads; it never changes where anything is written. | Timekeeping | Report outputs match the old SQL for every moved company (12.4) |
+| P5. Retire | Stop the monolith → Timekeeping sync. Make `timesheet_entries` read-only, keep it for one full rollback window (proposed: 90 days), then archive it. Drop the billing foreign keys to it. | Timekeeping | All acceptance criteria in section 13 pass. Retiring the table needs an owner sign-off |
+
+P4 can start as soon as P2 has a stable event stream, in parallel with P3 (section 14).
+
+### 10.3 Backfill
+
+- It runs per company, in batches, and is safe to re-run. Each row is an upsert keyed on the monolith row id, which Timekeeping keeps as the entry id. Running it twice changes nothing.
+- It copies every column as stored, including `bill_status`, `review_status` and `discarded_at`. **It never infers `billed` from invoice links.** Entries that are billed with no invoice (L7), locked but unbilled on sent invoices (L6), and locked with no kept invoice (L3) are copied exactly as they are.
+- Locks become holds:
+  - Each `locked = true` entry with an association on a kept invoice becomes a `held` hold for that invoice and association, with a new token. The token is written back to the billing association in the same batch.
+  - A `locked = true` entry with no kept invoice (L3) becomes a **legacy hold**: `invoice_id = null`, `association_id = null`. It shows `locked: true` as today, and no billing release can match it. Only an approved operator command can clear it.
+  - An entry on two kept invoices at once (possible today, section 1.5) gets a hold for the oldest invoice. The others are listed in the reconciliation report with `hold_state = 'conflict'`. The invoices and their money are not touched.
+- `duration` is copied to `numeric(12,4)`. Each value is checked to round-trip to the same float; the batch stops on the first mismatch (section 8.3).
+- `audits` rows for entries are copied with their original timestamps and authors.
+- Money is never read or written by the backfill.
+
+### 10.4 Reconciliation
+
+A reconciler job runs per company: hourly during P2–P3, daily after. It compares the two sides and writes a report. It **never repairs to "intended" behaviour**. A difference is either explained by a known quirk or raised for an operator.
+
+| Check | Source of truth | Action on difference |
+|---|---|---|
+| Entry fields and `version` match (P2, and moved companies until P5) | Current owner from `timekeeping_ownership` | Re-copy from the owner, logged |
+| Count and sum of `duration` per company, per user, per month | Owner | Alert; never auto-fix money-related fields |
+| `locked` in the monolith equals "has held hold" in Timekeeping | Owner | Re-copy from the owner |
+| Each billing association with `hold_state = 'held'` has a matching hold token | Timekeeping | Alert; association goes to `conflict` |
+| Associations `pending` or `releasing` longer than 10 minutes | Monolith | Re-enqueue the claim or release job |
+| Holds whose invoice and association the monolith does not have | Monolith | Release, unless it is a legacy hold |
+| Invoice money columns unchanged since the last snapshot | Monolith snapshot taken at P0 | Page an operator; this must never happen |
+
+Every check is keyed by `company_id`. No report or result mixes companies.
+
+### 10.5 Moving one company, and moving it back
+
+```text
+cutover(company):
+  1. ownership := 'moving'                  -- new writes for this company get 503 ownership_moving
+  2. wait for in-flight monolith requests and jobs for this company to finish (timeout 60 s, else abort)
+  3. drain the sync stream for this company to the last id
+  4. reconcile the company; abort on any unexplained difference
+  5. Timekeeping: accept ownership at epoch + 1
+  6. ownership := 'timekeeping', epoch := epoch + 1
+
+rollback(company):
+  1. ownership := 'returning'               -- Timekeeping refuses writes for this company
+  2. drain the Timekeeping outbox for this company into the monolith tables (upsert by id and version)
+  3. reconcile; abort on any unexplained difference
+  4. ownership := 'monolith', epoch := epoch + 1
+```
+
+Abort at any step sets the ownership back to its previous value. No write is lost in either direction:
+
+- During `moving` and `returning`, nobody accepts writes.
+- After a move, every Timekeeping change goes to its outbox and keeps flowing to the monolith tables until P5. Rollback therefore replays changes, and no one has to reconstruct them.
+
+Billing holds follow the same rule. While a company is owned by the monolith, the existing `locked` callbacks run. After a move, billing calls the hold commands. The P0 token columns let both shapes exist side by side.
+
+## 11. Deployment, configuration and operational observability (proposed)
+
+### 11.1 Deployment
+
+- Timekeeping is its own application image with its own Kamal configuration, its own `web` role and its own job worker for the outbox relay. It has its own PostgreSQL database. It does not share the monolith's database user.
+- The monolith and Timekeeping deploy independently. The contract rules in section 5.1 (additive changes keep the version; breaking changes add a version) make this safe.
+- Database migrations on either side must be backward-compatible with the previous release of the other side.
+
+### 11.2 Configuration (key names only)
+
+| Key | Where | Purpose |
+|---|---|---|
+| `TIMEKEEPING_DATABASE_URL` | Timekeeping | Its own database |
+| `TIMEKEEPING_TOKEN_PUBLIC_KEY` | Timekeeping | Verifies user tokens minted by the monolith |
+| `TIMEKEEPING_TOKEN_PRIVATE_KEY` | Monolith | Signs user tokens |
+| `TIMEKEEPING_SERVICE_TOKEN` (or mutual TLS certificates) | Both | Background service identity |
+| `TIMEKEEPING_BASE_URL` | Monolith | Where to forward entry requests |
+| `MONOLITH_REFERENCE_URL` | Timekeeping | Reference-data read endpoint (section 3.4) |
+| `EVENT_BROKER_URL` | Both | Outbox relay target, once the broker is chosen |
+
+Secrets are supplied the same way as the existing `DATABASE_URL` and `REDIS_URL` keys in `config/deploy.yml`. This document names no values.
+
+### 11.3 Observability
+
+Every log line and metric carries `company_id`, `request_id` and the actor kind. The monolith passes `request_id` to Timekeeping in a header so that one request can be traced across both.
+
+| Signal | Alert when |
+|---|---|
+| Outbox lag (oldest unsent row age), per side | Over 5 minutes |
+| Associations in `pending` / `releasing` / `conflict` | Any older than 10 minutes, or any `conflict` |
+| `503 ownership_moving` rate per company | Lasts longer than 5 minutes for one company |
+| `409 stale_epoch` count | Any during steady state |
+| `503 reference_unavailable` rate | Over 1% of writes for 5 minutes |
+| Shadow-read differences (P2) | Any unexplained difference |
+| Shadow double-hold refusals (P2–P3) | Reported daily for the owner decision in section 15 |
+| Reconciler differences | Any unexplained difference; any money-snapshot difference pages at once |
+| Timekeeping p95 latency for entry writes | Over 300 ms (proposed; to tune against today's baseline) |
+
+The existing `Rails.event.notify` history stays as it is, as observability only.
+
+## 12. Regression, contract, integration and end-to-end verification (proposed)
+
+### 12.1 Regression: existing specs stay green
+
+These existing specs pin the observed behaviour in section 2. They run against the monolith for companies it owns and, through a test adapter, against Timekeeping for moved companies. Any spec change during the migration must be explained as a disclosed behaviour change.
+
+| Behaviour | Existing specs |
+|---|---|
+| Entry rules S1–S4, S7, A6, A7 | `spec/models/timesheet_entry_spec.rb` |
+| Policy A1–A4 | `spec/policies/timesheet_entry_policy_spec.rb` |
+| Bulk A9, A10 | `spec/requests/api/v1/timesheet_entries/bulk_actions/update_spec.rb`, `spec/requests/api/v1/timesheet_entries/bulk_actions/destroy_spec.rb` |
+| Web listing | `spec/requests/api/v1/timesheet_entry/index_spec.rb` |
+| CLI and MCP | `spec/requests/api/v1/cli/timesheet_entries/create_spec.rb`, `update_spec.rb`, `destroy_spec.rb`; `spec/mcp/tools/write_tools_spec.rb`; `spec/mcp/idempotency_store_spec.rb` |
+| Agent S4, S7 | `spec/requests/api/v1/agent/timesheet_entries/create_spec.rb` |
+| Locking L1, mark billed L5 | `spec/requests/api/v1/invoices/create_spec.rb`, `spec/models/invoice_spec.rb` |
+| Line-item company rule L8 | `spec/models/invoice_line_item_spec.rb` (a spec for L8 must be added first; none exists today) |
+| Send path L6 | `spec/requests/api/v1/invoices/send_invoice_spec.rb`, `spec/system/invoices/send_invoice_spec.rb` |
+| Import L7 | `spec/services/imports/harvest_time_entries_importer_spec.rb` |
+| Reports | `spec/services/reports/time_entries/`, `spec/services/analytics/team_productivity_analytics_spec.rb`, `spec/services/metrics/data_builder_spec.rb` |
+
+Before P0, add characterization specs for the quirks that have none today: L3 (non-draft discard leaves entries locked), L4 on a non-draft invoice, L6 (sent invoice leaves entries unbilled), and A9 (bulk move skips locked entries silently). These pin today's behaviour so that the migration cannot change it unnoticed.
+
+### 12.2 Guard tests
+
+- **Single writer guard.** A test that, for a company owned by Timekeeping, runs every writer listed in section 10.1 and fails if any row in the monolith `timesheet_entries` changes other than through the sync stream.
+- **Tenant guard.** For each Timekeeping endpoint and command: a request for company A carrying an entry id from company B returns `404`, and changes nothing.
+- **Money guard.** A test that runs backfill, reconciliation, rollback and event replay against a fixture set of invoices, and asserts every money column in section 1.6 is byte-for-byte unchanged.
+
+### 12.3 Contract tests
+
+Consumer-driven contracts between the monolith (consumer) and Timekeeping (provider), run in both repositories' CI on every change:
+
+- Entry API request and response shapes, including `held` → `locked` mapping and decimal strings.
+- Hold commands, including every row of the failure table in section 9.3 marked "Contract".
+- Event envelope and payloads for each event in section 5.4, at each live `schema_version`.
+- Idempotency: same key and body returns the same answer; same key, new body gives `422`; same key from another company or actor does not match.
+
+### 12.4 Integration tests
+
+- Each row of section 9.3 marked "Integration" or "Concurrency", against real databases for both sides and a real relay.
+- **Alternating writers across cutover and rollback.** For one entry in one company: a web edit, a CLI edit, then `cutover(company)` starts. A web edit and a CLI edit are sent during `moving` and must get `503`, and their retries succeed after the flip. More alternating web and CLI edits follow, then `rollback(company)`, then two more edits. The test asserts that the final `duration` and `note` are the last accepted values, and that both stores agree. It also asserts that the audit history lists every accepted edit exactly once.
+- Backfill re-run: run it twice on the same company; the row counts and checksums are equal.
+- Report parity: for a fixture company, each report in section 1.7 returns the same output from the projection as from the old SQL.
+
+### 12.5 End-to-end tests
+
+Run in a staging environment with both services, through the real clients:
+
+- Create, edit and delete an entry from the web app, the CLI and an MCP tool; check that the entry list and the time report show the change.
+- Create a draft invoice from entries, save it twice, remove one entry, re-add it, send the invoice; check that entries show `locked` exactly as today and stay `unbilled` (L6).
+- Discard a sent invoice; check that its entries stay locked (L3).
+- As an employee, try to edit a locked entry and an entry outside the edit window; check that both are refused as today.
+
+## 13. Acceptance criteria for the completed migration (proposed)
+
+The migration is complete only when every item below holds for every company, and each is shown by the named test or query.
+
+| # | Criterion | Shown by |
+|---|---|---|
+| AC1 | Every company has `owner = 'timekeeping'`, and the monolith `timesheet_entries` table receives no writes for 30 days. | Ownership table query; single writer guard; database write metrics |
+| AC2 | Every entry in Timekeeping equals its monolith row at the moment of cutover, field for field, except the declared `numeric` duration type. | Reconciler report with zero unexplained differences |
+| AC3 | Every observed behaviour in section 2.1–2.4 still holds. | Regression suite in 12.1, including the new characterization specs, green against Timekeeping |
+| AC4 | No invoice money column has changed for any invoice that existed before P0. | Money guard; reconciler money snapshot check |
+| AC5 | No entry is held by two kept invoices, other than the pre-existing cases listed in the P2 conflict report. | Query on `billing_holds`; conflict report |
+| AC6 | A request for one company can never read or change another company's entry, hold or idempotency record. | Tenant guard on every endpoint |
+| AC7 | Each failure case in section 9.3 ends in its stated surviving state and is repaired. | The test named in each row |
+| AC8 | Alternating web and CLI edits across a cutover and a rollback lose no accepted write and leave both stores equal. | Alternating writers integration test (12.4) |
+| AC9 | Every entry, hold and bill-status change has an audit row naming the company and the actor, including hold changes. | Audit query in Timekeeping; contract tests |
+| AC10 | Reports, analytics and metrics return the same output as before for each company. | Report parity tests (12.4) |
+| AC11 | Timekeeping can be deployed while the monolith is unchanged, and the reverse, with contract tests green. | Two independent production deploys in a row with no paired release |
+| AC12 | The quirks L3, L6, L7, A8 (named operations only) and A9 still behave as section 2 describes, unless an owner decision in section 15 changed them. | Characterization specs |
+
+## 14. Implementation sequence and parallel work (proposed)
+
+Each box is a unit of work that can be reviewed and merged on its own. Arrows show real dependencies, where one unit needs an interface or data another creates.
+
+```mermaid
+flowchart TD
+  C0[C0 Characterization specs for L3, L4, L6, A9, L8]
+  M1[M1 company_id on timesheet_entries + backfill]
+  M2[M2 Monolith outbox + relay]
+  M3[M3 Ownership table + TimekeepingRouting in every writer]
+  M4[M4 Hold token columns on billing associations]
+  T1[T1 Timekeeping skeleton: app, DB, deploy, token check]
+  T2[T2 Entry API + rules A1-A11, S1-S7]
+  T3[T3 Billing holds + mark-billed]
+  T4[T4 Timekeeping outbox + events]
+  R1[R1 Reference-data endpoint + token claims in monolith]
+  K1[K1 Contract test suite]
+  B1[B1 Backfill + shadow sync]
+  B2[B2 Reconciler]
+  B3[B3 Billing switches to hold commands for moved companies]
+  P1[P1 Reporting projection + per-report read flags]
+  X1[X1 Cutover and rollback procedure + alternating-writer test]
+  W[W Company waves]
+  Z[Z Retire monolith table]
+
+  C0 --> X1
+  M1 --> B1
+  T1 --> T2 --> T3
+  T1 --> T4
+  R1 --> T2
+  T2 --> K1
+  T3 --> K1
+  T4 --> P1
+  M2 --> P1
+  M4 --> B3
+  T3 --> B3
+  T2 --> B1
+  B1 --> B2
+  M3 --> X1
+  B2 --> X1
+  B3 --> X1
+  K1 --> X1
+  X1 --> W --> Z
+  P1 --> Z
+```
+
+Parallel tracks:
+
+- **Monolith track:** C0, M1, M2, M3, M4 have no dependency on each other or on Timekeeping. They can start at once, in parallel.
+- **Service track:** T1, then T2 and T4 in parallel, then T3. R1 runs beside T1 and joins at T2.
+- **Data track:** B1 and B2 start once M1 and T2 exist.
+- **Reporting track:** P1 needs only the event stream (T4, plus M2 for the monolith's events). It runs beside cutover work.
+- **Join points** (the integration risks): X1 needs routing, reconciliation, billing on holds and the contract suite all at once. Z needs both the waves and the projection. These two points are where schedule slips collect, and they need one owner each.
+
+Within the monolith, M3 touches every writer of entries (section 10.1). It should land as one change, so that no writer is left out of routing.
+
+## 15. Risks, unresolved questions and decisions that need review
+
+### 15.1 Decisions for owners
+
+| # | Decision | Options and cost | Recommendation |
+|---|---|---|---|
+| D1 | Enforce refusal of a claim on an entry another invoice holds (section 7.2) | Enforce: closes a double-billing path, but some invoice saves that work today will fail. Shadow only: no behaviour change, and double billing stays possible. | Enforce after P2 shadow data shows how often it fires |
+| D2 | Duration type | `numeric(12,4)` with round-trip check, or keep `float` | `numeric(12,4)` if the backfill check finds no mismatch |
+| D3 | Event broker | Solid Queue jobs as relay (no new infrastructure, Postgres-backed), or a dedicated broker (more throughput, new system to run) | Start with Solid Queue; revisit if outbox lag alerts |
+| D4 | Fix quirks L3, L6, A8, A9, `metrics/data_builder.rb` `:billable` filter | Each fix changes customer-visible state or output | Keep all as they are for the migration; decide each separately afterwards |
+| D5 | Clearing legacy holds (L3 entries) | Leave them, or release them by operator command | Leave them; report the count |
+| D6 | Rollback window length before P5 | Longer is safer, and costs more double-running | 90 days |
+
+### 15.2 Open questions
+
+- How does the desktop timer write entries (section 1.3)? It must go through routing in M3.
+- Does every client retry a `503` answer (section 10.1)? Any client that does not needs a retry before its company moves.
+- What does `bill_status: :billable` in `app/services/metrics/data_builder.rb` return today? The answer decides what report parity compares against.
+- How many entries are in each quirk state in production (section 2.6)? The answer sizes D1, D4 and D5.
+- Are there external readers of `rails_event_viewer_entries` (section 2.6)?
+
+### 15.3 Risks
+
+| Risk | Effect | Mitigation |
+|---|---|---|
+| A writer is missed in routing | Two stores diverge for a moved company | M3 as one change; single writer guard; reconciler |
+| Monolith outage blocks entry writes | Users cannot log time | Same as today (writes run in the monolith now); `503 reference_unavailable` is retryable; alert in 11.3 |
+| Hold protocol bugs | Entries stuck held, or double billed | Contract tests for every failure row; shadow mode; reconciler |
+| Float-to-numeric duration drift | Totals in reports shift | Round-trip check stops the backfill; D2 |
+| Report parity gaps | Customers see different numbers | Per-report read flags in P4; parity tests |
+| Longer request path (monolith → Timekeeping) | Higher latency | Latency alert; keep payloads small |
+| A project moves to another company in future | Entries carry the wrong `company_id` | Not possible through the current route; if added, it must re-stamp entries (section 6.1) |
