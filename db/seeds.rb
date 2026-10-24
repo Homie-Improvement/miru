@@ -8,7 +8,8 @@ Faker::Config.random = Random.new(2025)
 Faker::UniqueGenerator.clear
 
 START_DATE = Date.new(2025, 1, 1)
-END_DATE = Date.current
+# Fixed, so every seed produces the same entries, invoices and report totals.
+END_DATE = Date.parse(ENV.fetch("MIRU_SEED_AS_OF", "2026-10-23"))
 PASSWORD = ENV.fetch("MIRU_SEED_PASSWORD", "password")
 
 def phone(number)
@@ -65,12 +66,12 @@ def ensure_user!(company:, first_name:, last_name:, email:, roles:, current_work
   ensure_address!(
     user,
     address_type: "current",
-    address_line_1: "475 Clermont Ave",
+    address_line_1: "100 Example Way",
     address_line_2: "Suite #{100 + user.id.to_i}",
-    city: "Brooklyn",
-    state: "NY",
+    city: "Springfield",
+    state: "OR",
     country: "US",
-    pin: "11238"
+    pin: "97477"
   )
 
   if user.devices.blank?
@@ -143,102 +144,109 @@ def seeded_holidays_for(year)
   ]
 end
 
-company = Company.find_or_initialize_by(name: "Saeloun Inc")
+# --- Fork & Leaf Salads: a fictional salad shop and catering business --------
+#
+# Every person, client and vendor below is fictional, and every mailbox is on a
+# reserved .example domain (RFC 2606), so no mail can reach a person. The data
+# is fixed to AS_OF, so the same seed always produces the same entries,
+# invoices and report totals.
+
+company = Company.find_or_initialize_by(name: "Fork & Leaf Salads")
 company.update!(
-  address: "475 Clermont Ave, Brooklyn, NY 11238",
-  business_phone: phone("+1 9296207865"),
+  address: "212 Market Row, Springfield, OR 97477",
+  business_phone: phone("+1 4155550100"),
   base_currency: "USD",
-  standard_price: 1250,
+  standard_price: 4500,
   fiscal_year_end: "Dec",
   date_format: "MM-DD-YYYY",
   country: "US",
-  timezone: "(GMT-10:00) America/Adak",
-  bank_name: "Mercury",
-  bank_account_number: "1234567890",
-  bank_routing_number: "021000021",
-  bank_swift_code: "CHASUS33",
-  tax_id: "12-3456789",
-  vat_number: "US-998877",
-  gst_number: "GST-10001",
+  timezone: "(GMT-08:00) America/Los_Angeles",
+  bank_name: "Example Bank",
+  bank_account_number: "0000000000",
+  bank_routing_number: "000000000",
+  bank_swift_code: "XXXXUS00",
+  tax_id: "00-0000000",
+  vat_number: "US-000000",
+  gst_number: "GST-00000",
   plan_tier: "paid",
   billing_exempt: true
 )
 
-logo_path = Rails.root.join("app/assets/images/saeloun_logo.png")
-company.logo.attach(io: File.open(logo_path), filename: "saeloun_logo.png") if File.exist?(logo_path) && !company.logo.attached?
-
 ensure_address!(
   company,
   address_type: "permanent",
-  address_line_1: "475 Clermont Ave",
-  address_line_2: "Floor 3",
-  city: "Brooklyn",
-  state: "NY",
+  address_line_1: "212 Market Row",
+  address_line_2: "Kitchen and office",
+  city: "Springfield",
+  state: "OR",
   country: "US",
-  pin: "11238"
+  pin: "97477"
 )
 
 puts "Company ready: #{company.name}"
 
-owner = ensure_user!(company:, first_name: "Vipul", last_name: "AM", email: "vipul@saeloun.com", roles: [:owner])
-super_admin = ensure_user!(company:, first_name: "Saeloun", last_name: "Admin", email: "hello@saeloun.com", roles: [:owner], super_admin: true)
-admin = ensure_user!(company:, first_name: "Supriya", last_name: "Agarwal", email: "supriya@saeloun.com", roles: [:admin])
-book_keeper = ensure_user!(company:, first_name: "Accounts", last_name: "Saeloun", email: "accounts@saeloun.com", roles: [:book_keeper])
-employee_1 = ensure_user!(company:, first_name: "Sonam", last_name: "Saeloun", email: "sonam@saeloun.com", roles: [:employee])
-employee_2 = ensure_user!(company:, first_name: "Keshav", last_name: "Saeloun", email: "keshav@saeloun.com", roles: [:employee])
-employee_3 = ensure_user!(company:, first_name: "Amit", last_name: "Saeloun", email: "amit@saeloun.com", roles: [:employee])
-client_user_1 = ensure_user!(company:, first_name: "Olivia", last_name: "Client", email: "oliver@example.com", roles: [:client])
-client_user_2 = ensure_user!(company:, first_name: "Maya", last_name: "Stakeholder", email: "maya.client@example.com", roles: [:client])
-client_user_3 = ensure_user!(company:, first_name: "Finance", last_name: "Microsoft", email: "finance.microsoft@example.com", roles: [:client])
-client_user_4 = ensure_user!(company:, first_name: "Accounts", last_name: "Acme", email: "accounts.acme@example.com", roles: [:client])
+STAFF_DOMAIN = "forkandleaf.example"
 
-users = [super_admin, owner, admin, book_keeper, employee_1, employee_2, employee_3]
-employees = [owner, admin, book_keeper, employee_1, employee_2, employee_3]
-client_users = [client_user_1, client_user_2, client_user_3, client_user_4]
+owner = ensure_user!(company:, first_name: "Dana", last_name: "Whitfield", email: "dana@#{STAFF_DOMAIN}", roles: [:owner])
+admin = ensure_user!(company:, first_name: "Luis", last_name: "Ortega", email: "luis@#{STAFF_DOMAIN}", roles: [:admin])
+book_keeper = ensure_user!(company:, first_name: "Grace", last_name: "Lin", email: "grace@#{STAFF_DOMAIN}", roles: [:book_keeper])
+prep_lead = ensure_user!(company:, first_name: "Mateo", last_name: "Reyes", email: "mateo@#{STAFF_DOMAIN}", roles: [:employee])
+packer = ensure_user!(company:, first_name: "Aisha", last_name: "Bello", email: "aisha@#{STAFF_DOMAIN}", roles: [:employee])
+driver = ensure_user!(company:, first_name: "Sam", last_name: "Novak", email: "sam@#{STAFF_DOMAIN}", roles: [:employee])
+catering_lead = ensure_user!(company:, first_name: "Keiko", last_name: "Tanaka", email: "keiko@#{STAFF_DOMAIN}", roles: [:employee])
 
-puts "Users ready: #{(users + client_users).map(&:email).join(', ')}"
+brightline_contact = ensure_user!(company:, first_name: "Nora", last_name: "Patel", email: "nora@brightline.example", roles: [:client])
+brightline_finance = ensure_user!(company:, first_name: "Ian", last_name: "Mercer", email: "ap@brightline.example", roles: [:client])
+harbor_contact = ensure_user!(company:, first_name: "Owen", last_name: "Brooks", email: "owen@harborlegal.example", roles: [:client])
+summit_contact = ensure_user!(company:, first_name: "Rina", last_name: "Cho", email: "rina@summitevents.example", roles: [:client])
 
-clients = [
-  ensure_client!(company:, name: "Microsoft", email: client_user_3.email, phone_number: "+1 4155550101", member: client_user_3),
-  ensure_client!(company:, name: "Acme Labs", email: client_user_4.email, phone_number: "+1 4155550102", member: client_user_4),
-  ensure_client!(company:, name: "Northwind Studio", email: client_user_2.email, phone_number: "+1 4155550103", member: client_user_2),
-  ensure_client!(company:, name: "Pinecone Health", email: "ops@pineconehealth.com", phone_number: "+1 4155550104")
+staff = [owner, admin, prep_lead, packer, driver, catering_lead]
+client_users = [brightline_contact, brightline_finance, harbor_contact, summit_contact]
+
+puts "Users ready: #{([book_keeper] + staff + client_users).map(&:email).join(', ')}"
+
+# Office clients buy recurring lunch contracts; event organizers buy catering.
+brightline = ensure_client!(company:, name: "Brightline Software", email: brightline_finance.email, phone_number: "+1 4155550101", member: brightline_contact)
+harbor = ensure_client!(company:, name: "Harbor Legal Group", email: harbor_contact.email, phone_number: "+1 4155550102", member: harbor_contact)
+summit = ensure_client!(company:, name: "Summit Events Co.", email: summit_contact.email, phone_number: "+1 4155550103", member: summit_contact)
+riverside = ensure_client!(company:, name: "Riverside Arts Council", email: "events@riversidearts.example", phone_number: "+1 4155550104")
+kitchen = ensure_client!(company:, name: "Fork & Leaf (internal)", email: "kitchen@#{STAFF_DOMAIN}", phone_number: "+1 4155550105")
+
+ClientMember.find_or_create_by!(company:, client: brightline, user: brightline_finance)
+ClientMember.find_or_create_by!(company:, client: riverside, user: summit_contact)
+
+office_lunch = [
+  ensure_project!(client: brightline, name: "Brightline Office Lunch", description: "Recurring weekday lunch contract, billed monthly"),
+  ensure_project!(client: harbor, name: "Harbor Legal Office Lunch", description: "Recurring office lunch contract, billed monthly")
 ]
-
-ClientMember.find_or_create_by!(company:, client: clients[0], user: client_user_1)
-ClientMember.find_or_create_by!(company:, client: clients[0], user: client_user_3)
-ClientMember.find_or_create_by!(company:, client: clients[1], user: client_user_4)
-ClientMember.find_or_create_by!(company:, client: clients[2], user: client_user_2)
-ClientMember.find_or_create_by!(company:, client: clients[2], user: client_user_1)
-ClientMember.find_or_create_by!(company:, client: clients[3], user: client_user_2)
-
-projects = [
-  ensure_project!(client: clients[0], name: "Office.com", description: "Platform delivery and reporting"),
-  ensure_project!(client: clients[0], name: "Azure Growth", description: "Enterprise launch support"),
-  ensure_project!(client: clients[1], name: "Acme Revamp", description: "Website redesign and analytics"),
-  ensure_project!(client: clients[1], name: "Acme Retainer", description: "Ongoing product support"),
-  ensure_project!(client: clients[2], name: "Northwind Mobile", description: "Mobile app iteration"),
-  ensure_project!(client: clients[3], name: "Pinecone Operations", description: "Operations tooling and support")
+catering = [
+  ensure_project!(client: brightline, name: "Brightline All-Hands Catering", description: "Catering for quarterly all-hands meetings"),
+  ensure_project!(client: summit, name: "Summit Launch Catering", description: "Launch-day catering engagement"),
+  ensure_project!(client: summit, name: "Summit Conference Lunches", description: "Boxed lunches for a two-day conference"),
+  ensure_project!(client: riverside, name: "Riverside Gala Catering", description: "Evening gala catering engagement")
 ]
+kitchen_training = ensure_project!(client: kitchen, name: "Kitchen Training", description: "Internal, not billed to any client", billable: false)
 
+# Hourly rates in cents, by person: what a client is billed for an hour of their time.
 project_rates = {
-  owner => 16000,
-  admin => 14000,
-  book_keeper => 9000,
-  employee_1 => 11000,
-  employee_2 => 10500,
-  employee_3 => 9800
+  owner => 8500,
+  admin => 6500,
+  prep_lead => 4500,
+  packer => 4000,
+  driver => 4200,
+  catering_lead => 5000
 }
 
-projects.each_with_index do |project, index|
-  employees.each do |user|
-    next if user == book_keeper && index.odd?
-
-    ensure_project_member!(project:, user:, hourly_rate: project_rates.fetch(user))
-  end
+# Who works on what: the kitchen crew on every contract and engagement, the
+# managers on catering engagements only.
+crew = [prep_lead, packer, driver, catering_lead]
+(office_lunch + catering).each do |project|
+  members = catering.include?(project) ? crew + [owner, admin] : crew
+  members.each { |user| ensure_project_member!(project:, user:, hourly_rate: project_rates.fetch(user)) }
 end
+crew.each { |user| ensure_project_member!(project: kitchen_training, user:, hourly_rate: 0) }
 
-puts "Projects ready: #{projects.size}"
+puts "Projects ready: #{office_lunch.size + catering.size + 1}"
 
 [2025, 2026].each do |year|
   holiday = Holiday.find_or_initialize_by(company:, year:)
@@ -261,12 +269,10 @@ leave_2026 = Leave.find_or_initialize_by(company:, year: 2026)
 leave_2026.save!
 
 leave_types = [
-  { leave: leave_2025, name: "Vacation", icon: :vacation, color: :chart_blue, allocation_value: 18, allocation_period: :days, allocation_frequency: :per_year, carry_forward_days: 5 },
-  { leave: leave_2025, name: "Sick Leave", icon: :medicine, color: :chart_green, allocation_value: 10, allocation_period: :days, allocation_frequency: :per_year, carry_forward_days: 0 },
-  { leave: leave_2025, name: "Personal", icon: :user, color: :chart_purple, allocation_value: 6, allocation_period: :days, allocation_frequency: :per_year, carry_forward_days: 0 },
-  { leave: leave_2026, name: "Vacation", icon: :vacation, color: :chart_blue, allocation_value: 18, allocation_period: :days, allocation_frequency: :per_year, carry_forward_days: 5 },
-  { leave: leave_2026, name: "Sick Leave", icon: :medicine, color: :chart_green, allocation_value: 10, allocation_period: :days, allocation_frequency: :per_year, carry_forward_days: 0 },
-  { leave: leave_2026, name: "Personal", icon: :user, color: :chart_purple, allocation_value: 6, allocation_period: :days, allocation_frequency: :per_year, carry_forward_days: 0 }
+  { leave: leave_2025, name: "Vacation", icon: :vacation, color: :chart_blue, allocation_value: 15, allocation_period: :days, allocation_frequency: :per_year, carry_forward_days: 5 },
+  { leave: leave_2025, name: "Sick Leave", icon: :medicine, color: :chart_green, allocation_value: 8, allocation_period: :days, allocation_frequency: :per_year, carry_forward_days: 0 },
+  { leave: leave_2026, name: "Vacation", icon: :vacation, color: :chart_blue, allocation_value: 15, allocation_period: :days, allocation_frequency: :per_year, carry_forward_days: 5 },
+  { leave: leave_2026, name: "Sick Leave", icon: :medicine, color: :chart_green, allocation_value: 8, allocation_period: :days, allocation_frequency: :per_year, carry_forward_days: 0 }
 ]
 
 leave_type_records = leave_types.map do |attrs|
@@ -275,166 +281,222 @@ leave_type_records = leave_types.map do |attrs|
   leave_type
 end
 
-employees.each do |user|
-  Carryover.find_or_create_by!(
-    user:,
-    company:,
-    leave_type: leave_type_records.find { |record| record.leave == leave_2026 && record.name == "Vacation" },
-    from_year: 2025,
-    to_year: 2026,
-    total_leave_balance: 3,
-    duration: 2
-  )
-end
-
-timeoff_seed = [
-  [employee_1, Date.new(2025, 2, 14), "Vacation", 480],
-  [employee_1, Date.new(2025, 7, 18), "Vacation", 480],
-  [employee_2, Date.new(2025, 3, 7), "Sick Leave", 480],
-  [employee_2, Date.new(2025, 11, 3), "Personal", 240],
-  [employee_3, Date.new(2025, 8, 22), "Vacation", 480],
-  [owner, Date.new(2025, 12, 26), "Vacation", 480]
-]
-
-timeoff_seed.each do |user, leave_date, leave_name, duration|
+[
+  [prep_lead, Date.new(2025, 3, 14), "Vacation", 480],
+  [packer, Date.new(2025, 6, 9), "Sick Leave", 480],
+  [driver, Date.new(2025, 8, 22), "Vacation", 480],
+  [catering_lead, Date.new(2026, 2, 6), "Vacation", 480]
+].each do |user, leave_date, leave_name, duration|
   leave_record = leave_date.year == 2025 ? leave_2025 : leave_2026
   leave_type = leave_type_records.find { |record| record.leave == leave_record && record.name == leave_name }
-  TimeoffEntry.find_or_create_by!(user:, leave_type:, leave_date:) do |entry|
-    entry.duration = duration
-  end
-end
-
-optional_holiday = HolidayInfo.joins(:holiday).find_by(holidays: { company_id: company.id, year: 2025 }, name: "Presidents Day")
-TimeoffEntry.find_or_create_by!(user: employee_1, holiday_info: optional_holiday, leave_date: optional_holiday.date) do |entry|
-  entry.duration = 480
+  TimeoffEntry.find_or_create_by!(user:, leave_type:, leave_date:) { |entry| entry.duration = duration }
 end
 
 puts "Leave data ready"
 
-receipt_path = Rails.root.join("spec/fixtures/files/test-image.png")
+# --- Time entries ---------------------------------------------------------
+#
+# What each person does, written into the entry's note.
+DUTIES = {
+  prep_lead => ["Salad prep and portioning", "Dressing and grain batch prep"],
+  packer => ["Packing lunch orders", "Labeling and packing"],
+  driver => ["Office delivery run", "Delivery and drop-off"],
+  catering_lead => ["Catering setup", "Event service and breakdown"],
+  owner => ["Client walkthrough and event lead"],
+  admin => ["Event staffing and logistics"]
+}.freeze
 
-employees.each do |user|
-  projects_for_user = user.projects.kept.order(:id).limit(2)
-  next if projects_for_user.empty?
+def duty_note(duties, user, day)
+  list = duties.fetch(user)
+  list[day.yday % list.size]
+end
 
-  (START_DATE..END_DATE).each do |work_date|
-    next if work_date.saturday? || work_date.sunday?
-    next if work_date > END_DATE
-    next if work_date.month == 12 && work_date.day > 20
+# Catering engagements happen on fixed event days.
+EVENT_DAYS = {
+  "Brightline All-Hands Catering" => [Date.new(2025, 3, 20), Date.new(2025, 6, 19), Date.new(2025, 9, 18), Date.new(2025, 12, 11), Date.new(2026, 3, 19), Date.new(2026, 6, 18), Date.new(2026, 9, 17)],
+  "Summit Launch Catering" => [Date.new(2025, 10, 7), Date.new(2025, 10, 8), Date.new(2026, 10, 6), Date.new(2026, 10, 7)],
+  "Summit Conference Lunches" => [Date.new(2026, 4, 14), Date.new(2026, 4, 15)],
+  "Riverside Gala Catering" => [Date.new(2025, 11, 15), Date.new(2026, 5, 9)]
+}.freeze
 
-    projects_for_user.each_with_index do |project, index|
-      next if (work_date.yday + user.id + index) % 3 == 0
+def seed_entry!(user:, project:, work_date:, duration:, note:, bill_status: :unbilled)
+  entry = TimesheetEntry.find_or_initialize_by(user:, project:, work_date:)
+  entry.update!(duration:, note:, bill_status:, locked: false)
+  entry
+end
 
-      entry = TimesheetEntry.find_or_initialize_by(user:, project:, work_date:)
-      duration = 180 + (((work_date.yday + user.id + index) % 5) * 60)
-      entry.update!(
-        duration:,
-        note: ["Feature delivery", "Support and triage", "Planning", "Client sync", "QA and review"][(work_date.yday + index) % 5],
-        bill_status: :unbilled,
-        locked: false
-      )
+(START_DATE..END_DATE).each do |day|
+  next if day.saturday? || day.sunday?
+  next if day.month == 12 && day.day > 22
+
+  office_lunch.each_with_index do |project, index|
+    crew.each do |user|
+      next if (day.yday + user.id + index) % 4 == 0
+
+      # Whole hours: 2 to 4 on a lunch day.
+      duration = 120 + (((day.yday + user.id + index) % 3) * 60)
+      seed_entry!(user:, project:, work_date: day, duration:, note: duty_note(DUTIES, user, day))
+    end
+  end
+
+  # Kitchen training: every other Friday, not billable.
+  next unless day.friday? && day.cweek.even?
+
+  crew.each do |user|
+    seed_entry!(user:, project: kitchen_training, work_date: day, duration: 60, note: "Food safety and kitchen training", bill_status: :non_billable)
+  end
+end
+
+catering.each do |project|
+  EVENT_DAYS.fetch(project.name).select { |day| day <= END_DATE }.each do |day|
+    project.project_members.includes(:user).map(&:user).each do |user|
+      duration = [owner, admin].include?(user) ? 180 : 300
+      seed_entry!(user:, project:, work_date: day, duration:, note: duty_note(DUTIES, user, day))
     end
   end
 end
 
 puts "Timesheet entries ready"
 
-invoice_counter = 1
-projects.group_by(&:client).each_with_index do |(client, client_projects), client_index|
-  month_cursor = START_DATE.beginning_of_month
+# --- Invoices -------------------------------------------------------------
+#
+# Office-lunch contracts are billed monthly with GROUPED lines: one line per
+# person per month, linked to every entry it covers. Catering engagements are
+# billed per event month with INDIVIDUAL lines, one per entry. Each invoice's
+# stored figures come from its own lines, so they match what Miru recalculates.
+#
+# Status by month, relative to AS_OF: the current month is a draft (its entries
+# lock); the previous two months were sent, and are overdue once past due, as
+# the daily overdue job would mark them; the two before that were viewed and
+# half paid; older months are paid. Entries on a sent, viewed, overdue or paid
+# invoice are billed. Miru's own send action does not mark entries billed at
+# this commit (observed), so the seed records the historical billed state
+# directly.
 
-  while month_cursor <= END_DATE.beginning_of_month
-    grouped_entries = TimesheetEntry.kept
-      .where(project: client_projects, work_date: month_cursor..month_cursor.end_of_month)
-      .order(:work_date)
+def invoice_status_for(month, as_of, due_date)
+  return :draft if month >= as_of.beginning_of_month
+  return (due_date < as_of ? :overdue : :sent) if month > (as_of << 3).beginning_of_month
+  return :viewed if month > (as_of << 5).beginning_of_month
 
-    if grouped_entries.exists?
-      subtotal_cents = grouped_entries.sum { |entry| ((entry.duration / 60.0) * project_rates.fetch(entry.user)).round }
-      tax_cents = (subtotal_cents * 0.1).round
-      discount_cents = ((client_index + month_cursor.month) % 4 == 0 ? 5000 : 0)
-      total_cents = subtotal_cents + tax_cents - discount_cents
-
-      status = if month_cursor >= Date.current.beginning_of_month
-        :draft
-      elsif month_cursor > 2.months.ago.beginning_of_month
-        :sent
-      elsif month_cursor > 4.months.ago.beginning_of_month
-        :viewed
-      else
-        :paid
-      end
-
-      amount_paid_cents = status == :paid ? total_cents : (status == :viewed ? (total_cents * 0.5).round : 0)
-      amount_due_cents = total_cents - amount_paid_cents
-
-      invoice = Invoice.find_or_initialize_by(company:, invoice_number: "MIRU-#{invoice_counter.to_s.rjust(4, '0')}")
-      invoice.update!(
-        client:,
-        issue_date: month_cursor.end_of_month,
-        due_date: month_cursor.end_of_month + 15.days,
-        reference: "FY#{month_cursor.year}#{month_cursor.month.to_s.rjust(2, '0')}",
-        amount: money(subtotal_cents),
-        tax: money(tax_cents),
-        discount: money(discount_cents),
-        amount_paid: money(amount_paid_cents),
-        amount_due: money(amount_due_cents),
-        outstanding_amount: money(amount_due_cents),
-        status:,
-        currency: company.base_currency,
-        base_currency_amount: money(total_cents),
-        sent_at: status == :draft ? nil : month_cursor.end_of_month + 1.day
-      )
-
-      invoice.invoice_line_items.destroy_all
-      grouped_entries.limit(6).each do |entry|
-        hours = (entry.duration / 60.0)
-        rate = money(project_rates.fetch(entry.user))
-        invoice.invoice_line_items.create!(
-          name: "#{entry.project.name} work",
-          description: entry.note,
-          date: entry.work_date,
-          quantity: hours,
-          rate:,
-          timesheet_entry_id: entry.id
-        )
-      end
-
-      if invoice.amount_paid.positive?
-        payment = invoice.payments.find_or_initialize_by(name: "Seed payment #{invoice.invoice_number}")
-        payment.update!(
-          amount: invoice.amount_paid,
-          transaction_date: invoice.issue_date + 10.days,
-          transaction_type: :bank_transfer,
-          payment_currency: company.base_currency
-        )
-      end
-
-      invoice_counter += 1
-    end
-
-    month_cursor = month_cursor.next_month
-  end
+  :paid
 end
 
-puts "Invoices and payments ready"
+invoice_counter = 0
+next_invoice_number = lambda do
+  invoice_counter += 1
+  "FL-#{invoice_counter.to_s.rjust(4, '0')}"
+end
+
+seed_invoice = lambda do |client:, month:, lines:, discount_cents: 0|
+  subtotal_cents = lines.sum { |line| ((line[:quantity] / 60.0) * line[:rate_cents]).round }
+  tax_cents = (subtotal_cents * 0.0875).round
+  total_cents = subtotal_cents + tax_cents - discount_cents
+  issue_date = month.end_of_month
+  due_date = issue_date + 30.days
+  status = invoice_status_for(month, END_DATE, due_date)
+  paid_cents = { paid: total_cents, viewed: (total_cents * 0.5).round }.fetch(status, 0)
+
+  invoice = Invoice.find_or_initialize_by(company:, invoice_number: next_invoice_number.call)
+  invoice.update!(
+    client:,
+    issue_date:,
+    due_date:,
+    reference: "#{month.strftime('%Y%m')}-#{client.id}",
+    amount: money(total_cents),
+    tax: money(tax_cents),
+    discount: money(discount_cents),
+    amount_paid: money(paid_cents),
+    amount_due: money(total_cents - paid_cents),
+    outstanding_amount: money(total_cents - paid_cents),
+    status:,
+    currency: company.base_currency,
+    base_currency_amount: money(total_cents),
+    sent_at: status == :draft ? nil : issue_date + 1.day
+  )
+
+  invoice.invoice_line_items.destroy_all
+  lines.each do |line|
+    invoice.invoice_line_items.create!(
+      name: line[:name],
+      description: line[:description],
+      date: line[:date],
+      quantity: line[:quantity],
+      rate: money(line[:rate_cents]),
+      timesheet_entry_id: line[:timesheet_entry_id],
+      linked_timesheet_entry_ids: line.fetch(:linked_timesheet_entry_ids, [])
+    )
+  end
+
+  unless status == :draft
+    entry_ids = lines.flat_map { |line| [line[:timesheet_entry_id], *line.fetch(:linked_timesheet_entry_ids, [])] }.compact
+    TimesheetEntry.where(id: entry_ids).find_each { |entry| entry.update!(bill_status: :billed) }
+  end
+
+  if paid_cents.positive?
+    payment = invoice.payments.find_or_initialize_by(name: "Payment #{invoice.invoice_number}")
+    payment.update!(
+      amount: money(paid_cents),
+      transaction_date: issue_date + 10.days,
+      transaction_type: :bank_transfer,
+      payment_currency: company.base_currency
+    )
+  end
+  invoice
+end
+
+month = START_DATE.beginning_of_month
+while month <= END_DATE.beginning_of_month
+  office_lunch.each do |project|
+    entries = TimesheetEntry.kept.where(project:, work_date: month..month.end_of_month).order(:work_date).to_a
+    next if entries.empty?
+
+    lines = entries.group_by(&:user).map do |user, user_entries|
+      {
+        name: "#{project.name}: #{user.full_name}",
+        description: "#{month.strftime('%B %Y')} lunch service, #{user_entries.size} days",
+        date: month.end_of_month,
+        quantity: user_entries.sum(&:duration).round,
+        rate_cents: project_rates.fetch(user),
+        linked_timesheet_entry_ids: user_entries.map(&:id)
+      }
+    end
+    seed_invoice.call(client: project.client, month:, lines:, discount_cents: month.month == 12 ? 5000 : 0)
+  end
+
+  catering.group_by(&:client).each do |client, client_projects|
+    entries = TimesheetEntry.kept.where(project: client_projects, work_date: month..month.end_of_month).order(:work_date, :id).to_a
+    next if entries.empty?
+
+    lines = entries.map do |entry|
+      {
+        name: "#{entry.project.name}: #{entry.user.full_name}",
+        description: entry.note,
+        date: entry.work_date,
+        quantity: entry.duration.round,
+        rate_cents: project_rates.fetch(entry.user),
+        timesheet_entry_id: entry.id
+      }
+    end
+    seed_invoice.call(client:, month:, lines:)
+  end
+
+  month = month.next_month
+end
+
+puts "Invoices and payments ready: #{invoice_counter}"
+
+receipt_path = Rails.root.join("spec/fixtures/files/test-image.png")
 
 expense_rows = [
-  { user: employee_1, category_name: "Travel", vendor_name: "Delta", description: "Flight for client workshop", amount: 825_00, date: Date.new(2025, 2, 10), expense_type: :business, status: :paid, paid_at: Date.new(2025, 2, 20) },
-  { user: employee_2, category_name: "Meals", vendor_name: "Sweetgreen", description: "Team lunch with client", amount: 124_50, date: Date.new(2025, 3, 12), expense_type: :business, status: :approved },
-  { user: employee_3, category_name: "Office", vendor_name: "Staples", description: "Desk accessories and cables", amount: 210_75, date: Date.new(2025, 4, 4), expense_type: :business, status: :submitted },
-  { user: book_keeper, category_name: "Software", vendor_name: "Figma", description: "Design tool renewal", amount: 540_00, date: Date.new(2025, 5, 1), expense_type: :business, status: :paid, paid_at: Date.new(2025, 5, 2) },
-  { user: owner, category_name: "Travel", vendor_name: "Uber", description: "Airport transfer", amount: 68_25, date: Date.new(2025, 6, 14), expense_type: :business, status: :rejected },
-  { user: employee_1, category_name: "Training", vendor_name: "RailsConf", description: "Conference ticket", amount: 699_00, date: Date.new(2025, 8, 8), expense_type: :business, status: :approved },
-  { user: employee_2, category_name: "Wellness", vendor_name: "Apollo Pharmacy", description: "Prescription reimbursement", amount: 93_10, date: Date.new(2025, 10, 18), expense_type: :personal, status: :paid, paid_at: Date.new(2025, 10, 22) },
-  { user: employee_3, category_name: "Travel", vendor_name: "Marriott", description: "Hotel stay for onsite", amount: 455_60, date: Date.new(2026, 1, 16), expense_type: :business, status: :submitted }
+  { user: prep_lead, category_name: "Supplies", vendor_name: "Valley Greens Produce", description: "Produce for a catering event", amount: 412_80, date: Date.new(2025, 10, 6), expense_type: :business, status: :paid, paid_at: Date.new(2025, 10, 10) },
+  { user: packer, category_name: "Supplies", vendor_name: "Example Packaging Co.", description: "Compostable lunch boxes", amount: 268_40, date: Date.new(2026, 1, 12), expense_type: :business, status: :approved },
+  { user: driver, category_name: "Travel", vendor_name: "Metro Van Rentals", description: "Extra van for a conference delivery", amount: 189_00, date: Date.new(2026, 4, 14), expense_type: :business, status: :submitted },
+  { user: catering_lead, category_name: "Equipment", vendor_name: "Kitchen Supply Depot", description: "Chafing dishes for an evening gala", amount: 356_25, date: Date.new(2025, 11, 12), expense_type: :business, status: :paid, paid_at: Date.new(2025, 11, 20) },
+  { user: admin, category_name: "Training", vendor_name: "Example Food Safety Institute", description: "Food handler certification", amount: 145_00, date: Date.new(2026, 2, 3), expense_type: :business, status: :rejected }
 ]
 
 expense_rows.each_with_index do |attrs, index|
-  expense = company.expenses.find_or_initialize_by(
-    user: attrs[:user],
-    date: attrs[:date],
-    description: attrs[:description]
-  )
+  expense = company.expenses.find_or_initialize_by(user: attrs[:user], date: attrs[:date], description: attrs[:description])
   expense.update!(
     amount: money(attrs[:amount]),
     category_name: attrs[:category_name],
@@ -447,56 +509,107 @@ expense_rows.each_with_index do |attrs, index|
   next unless File.exist?(receipt_path)
   next if expense.receipts.attached?
 
-  expense.receipts.attach(
-    io: File.open(receipt_path),
-    filename: "receipt-#{index + 1}.png",
-    content_type: "image/png"
-  )
+  expense.receipts.attach(io: File.open(receipt_path), filename: "receipt-#{index + 1}.png", content_type: "image/png")
 end
 
 puts "Expenses ready"
 
-providers = [
-  { name: "stripe", connected: false, enabled: false, accepted_payment_methods: %w[card ach] }
-]
-
-providers.each do |attrs|
-  provider = company.payments_providers.find_or_initialize_by(name: attrs[:name])
-  provider.update!(attrs)
-end
-
-pending_employee_invitation = Invitation.find_or_initialize_by(company:, recipient_email: "new.employee@example.com")
-pending_employee_invitation.update!(
-  sender: admin,
-  first_name: "New",
-  last_name: "Employee",
-  role: :employee,
-  accepted_at: nil,
-  expired_at: 10.days.from_now
+# Stripe stays disconnected: the demo takes no payments.
+company.payments_providers.find_or_initialize_by(name: "stripe").update!(
+  name: "stripe", connected: false, enabled: false, accepted_payment_methods: %w[card ach]
 )
 
-pending_client_invitation = Invitation.find_or_initialize_by(company:, recipient_email: "new.client@example.com")
-pending_client_invitation.update!(
-  sender: admin,
-  client: clients.first,
-  first_name: "New",
-  last_name: "Client",
-  role: :client,
-  accepted_at: nil,
-  expired_at: 10.days.from_now
+Invitation.find_or_initialize_by(company:, recipient_email: "new.hire@#{STAFF_DOMAIN}").update!(
+  sender: admin, first_name: "New", last_name: "Hire", role: :employee, accepted_at: nil, expired_at: 10.days.from_now
+)
+Invitation.find_or_initialize_by(company:, recipient_email: "planner@summitevents.example").update!(
+  sender: admin, client: summit, first_name: "Event", last_name: "Planner", role: :client, accepted_at: nil, expired_at: 10.days.from_now
 )
 
 puts "Invitations ready"
-puts "Seed complete"
-puts "Login credentials:"
-puts "- vipul@saeloun.com (owner)"
-puts "- hello@saeloun.com (super admin + owner)"
-puts "- supriya@saeloun.com (admin)"
-puts "- accounts@saeloun.com (book keeper)"
-puts "- sonam@saeloun.com (employee)"
-puts "- keshav@saeloun.com (employee)"
-puts "- amit@saeloun.com (employee)"
-puts "- oliver@example.com (client)"
-puts "- maya.client@example.com (client)"
-puts "- finance.microsoft@example.com (client)"
-puts "- accounts.acme@example.com (client)"
+# --- A second company, for company boundaries ------------------------------
+#
+# Copper Kettle Bakery, another fictional small business with its own staff,
+# client, project, entries and one sent invoice. Fork & Leaf's book keeper keeps
+# its books too, so one user belongs to both companies (her current workspace
+# stays Fork & Leaf) and a workspace switch can be shown.
+
+BAKERY_DOMAIN = "copperkettle.example"
+bakery = Company.find_or_initialize_by(name: "Copper Kettle Bakery")
+bakery.update!(
+  address: "48 Mill Lane, Springfield, OR 97477",
+  business_phone: phone("+1 4155550200"),
+  base_currency: "USD",
+  standard_price: 4000,
+  fiscal_year_end: "Dec",
+  date_format: "MM-DD-YYYY",
+  country: "US",
+  timezone: "(GMT-08:00) America/Los_Angeles",
+  bank_name: "Example Bank",
+  bank_account_number: "0000000000",
+  bank_routing_number: "000000000",
+  bank_swift_code: "XXXXUS00",
+  plan_tier: "paid",
+  billing_exempt: true
+)
+ensure_address!(bakery, address_type: "permanent", address_line_1: "48 Mill Lane", address_line_2: "Bakery", city: "Springfield", state: "OR", country: "US", pin: "97477")
+
+bakery_owner = ensure_user!(company: bakery, first_name: "Hugo", last_name: "Brandt", email: "hugo@#{BAKERY_DOMAIN}", roles: [:owner])
+baker = ensure_user!(company: bakery, first_name: "Lena", last_name: "Park", email: "lena@#{BAKERY_DOMAIN}", roles: [:employee])
+# The shared book keeper: a member of both companies, still working in Fork & Leaf.
+ensure_user!(company: bakery, first_name: "Grace", last_name: "Lin", email: book_keeper.email, roles: [:book_keeper], current_workspace: false)
+cafe_contact = ensure_user!(company: bakery, first_name: "Paulo", last_name: "Silva", email: "paulo@northcafe.example", roles: [:client])
+
+north_cafe = ensure_client!(company: bakery, name: "North Street Cafe", email: cafe_contact.email, phone_number: "+1 4155550201", member: cafe_contact)
+pastry_supply = ensure_project!(client: north_cafe, name: "Cafe Pastry Supply", description: "Daily pastry delivery, billed monthly")
+bakery_rates = { bakery_owner => 6000, baker => 3800 }
+bakery_rates.each { |user, rate| ensure_project_member!(project: pastry_supply, user:, hourly_rate: rate) }
+
+bakery_entries = (Date.new(2026, 9, 1)..Date.new(2026, 9, 30)).select { |day| day.tuesday? || day.thursday? }.flat_map do |day|
+  bakery_rates.keys.map do |user|
+    seed_entry!(user:, project: pastry_supply, work_date: day, duration: user == baker ? 240 : 60, note: user == baker ? "Early bake and delivery" : "Order planning")
+  end
+end
+
+bakery_lines = bakery_entries.map do |entry|
+  { name: "Cafe Pastry Supply: #{entry.user.full_name}", description: entry.note, date: entry.work_date, minutes: entry.duration.round, rate_cents: bakery_rates.fetch(entry.user), entry: }
+end
+bakery_subtotal = bakery_lines.sum { |line| ((line[:minutes] / 60.0) * line[:rate_cents]).round }
+bakery_tax = (bakery_subtotal * 0.0875).round
+bakery_invoice = Invoice.find_or_initialize_by(company: bakery, invoice_number: "CK-0001")
+bakery_invoice.update!(
+  client: north_cafe,
+  issue_date: Date.new(2026, 9, 30),
+  due_date: Date.new(2026, 10, 30),
+  reference: "202609-CK",
+  amount: money(bakery_subtotal + bakery_tax),
+  tax: money(bakery_tax),
+  discount: 0,
+  amount_paid: 0,
+  amount_due: money(bakery_subtotal + bakery_tax),
+  outstanding_amount: money(bakery_subtotal + bakery_tax),
+  status: :sent,
+  currency: bakery.base_currency,
+  base_currency_amount: money(bakery_subtotal + bakery_tax),
+  sent_at: Date.new(2026, 10, 1)
+)
+bakery_invoice.invoice_line_items.destroy_all
+bakery_lines.each do |line|
+  bakery_invoice.invoice_line_items.create!(
+    name: line[:name], description: line[:description], date: line[:date],
+    quantity: line[:minutes], rate: money(line[:rate_cents]), timesheet_entry_id: line[:entry].id
+  )
+  line[:entry].update!(bill_status: :billed)
+end
+
+puts "Second company ready: #{bakery.name} (#{bakery_entries.size} entries, invoice #{bakery_invoice.invoice_number})"
+
+puts "Seed complete (as of #{END_DATE})"
+puts "Logins (the seed password is not printed):"
+puts "- dana@#{STAFF_DOMAIN} (owner)"
+puts "- luis@#{STAFF_DOMAIN} (admin)"
+puts "- grace@#{STAFF_DOMAIN} (book keeper)"
+puts "- mateo@, aisha@, sam@, keiko@#{STAFF_DOMAIN} (employees: prep, packing, delivery, catering setup)"
+puts "- nora@brightline.example, ap@brightline.example, owen@harborlegal.example, rina@summitevents.example (clients)"
+puts "- hugo@#{BAKERY_DOMAIN} (owner), lena@#{BAKERY_DOMAIN} (employee), paulo@northcafe.example (client): Copper Kettle Bakery"
+puts "- grace@#{STAFF_DOMAIN} is book keeper in both companies"

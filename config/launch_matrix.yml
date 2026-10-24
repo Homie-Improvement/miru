@@ -1,15 +1,15 @@
 roles:
   owner:
-    email: vipul@saeloun.com
+    email: dana@forkandleaf.example
     password: password
   employee:
-    email: keshav@saeloun.com
+    email: aisha@forkandleaf.example
     password: password
   book_keeper:
-    email: accounts@saeloun.com
+    email: grace@forkandleaf.example
     password: password
   client:
-    email: finance@example.com
+    email: nora@brightline.example
     password: password
 
 groups:
