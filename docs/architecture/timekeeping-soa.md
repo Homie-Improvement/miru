@@ -342,7 +342,7 @@ Response:   { id, company_id, version, ...fields, held: true|false }
 
 ```text
 POST /v1/companies/{company_id}/holds/claim
-  { holder: { invoice_id, association_id }, entry_ids: [...], seq, idempotency_key }
+  { invoice_id, claims: [ { entry_id, association_id } ], seq, idempotency_key }
   -> 200 { holds: [ { entry_id, hold_token | null, outcome: "held" | "stale_claim" } ] }
   -> 409 { conflicts: [ { entry_id, reason: "held_by_other" | "not_billable_state" } ] }   (whole batch rejected)
 
@@ -355,7 +355,7 @@ POST /v1/companies/{company_id}/entries/mark-billed
   -> 200 { results: [ { entry_id, outcome: "billed" | "no_matching_hold" } ] }
 ```
 
-`association_id` identifies one link between an invoice and an entry: the line item id for a direct link, or the `invoice_line_item_time_entries` row id for an aggregate link. Section 7.2 defines how claim and release behave.
+`association_id` identifies one link between an invoice and an entry: the line item id for a direct link, or the `invoice_line_item_time_entries` row id for an aggregate link. Each entry in `claims` carries its own `association_id`, so one request covers a draft with many line items. The batch is all or nothing: a `409` on any entry rejects every claim in it. Section 7.2 defines how claim and release behave.
 
 `mark-billed` exists for parity with `Invoice#update_timesheet_entry_status!`, which today runs only from the uncalled mailer path (L5). Nothing in the migration starts calling it more often. Marking entries billed when an invoice is sent is listed under future work (section 7.4).
 
@@ -365,9 +365,11 @@ Timekeeping writes events to its outbox in the same transaction as the change. N
 
 | Event | Payload (besides the envelope) |
 |---|---|
-| `TimesheetEntries::Created`, `TimesheetEntries::Updated`, `TimesheetEntries::Discarded` | `entry_id`, `version`, `project_id`, `user_id`, `work_date`, `duration`, `bill_status`, `review_status`, `held`, `changed_fields` |
+| `TimesheetEntries::Created`, `TimesheetEntries::Updated`, `TimesheetEntries::Discarded` | the entry snapshot, plus `changed_fields` |
 | `TimesheetEntries::HoldClaimed`, `TimesheetEntries::HoldReleased` | the same entry snapshot as `Updated`, plus `holder.invoice_id`, `holder.association_id`, `hold_token` |
 | `TimesheetEntries::Billed` | the same entry snapshot as `Updated` |
+
+The **entry snapshot** is every column of the entry row: `entry_id`, `company_id`, `version`, `project_id`, `user_id`, `agent_id`, `work_date`, `duration`, `note`, `bill_status`, `review_status`, `source`, `source_metadata`, `external_run_id`, `external_session_id`, `proof_url`, `proof_metadata`, `discarded_at`, `created_at`, `updated_at` and `held`. These are the columns of `timesheet_entries` in `db/schema.rb`, with `held` in place of `locked` and the new `company_id` and `version`. The same snapshot is what the Timekeeping → monolith sync and rollback (section 10.5) write back, so every field can be restored. A column added later must be added to the snapshot in the same release.
 
 Every event that raises an entry's `version` carries the full entry snapshot. Without it, a consumer that keeps only the highest version would drop an older `Updated` that arrived after a newer `HoldClaimed`, and it would never learn the new `duration`.
 
@@ -454,12 +456,12 @@ hold_sequences(company_id, invoice_id, entry_id, last_seq)   -- kept after relea
   - Current hold by another invoice: depends on the holder mode below.
   - On success, `last_seq` becomes `seq`.
   - A retry with the same idempotency key returns the stored success. A refusal is not stored, so a retry is checked again (section 5.1).
-- **Release** names the `hold_token` and its own `seq`. It raises `last_seq` to `seq` whether or not a hold matches. It clears a hold only when the token matches that hold, in one statement (`UPDATE … WHERE entry_id = ? AND hold_token = ? AND state = 'held'`). If nothing matches, it returns `no_matching_hold` and changes nothing else. A release clears only the caller's own hold, never another invoice's.
+- **Release** names the `hold_token` and its own `seq`. It raises `last_seq` to `seq` whether or not a hold matches. It clears a hold only when the token matches that hold, in one statement (`UPDATE … WHERE entry_id = ? AND hold_token = ? AND state = 'held'`). If nothing matches, it returns `no_matching_hold` and changes nothing else. A stale or foreign token therefore never clears anything. What a matching release clears depends on the holder mode below.
 
 **Two holder modes.** The mode is a per-company setting, `refuse_double_holds`, and it defaults to off:
 
-- **Off (shadow).** A claim on an entry another invoice holds still succeeds and adds a second hold, exactly as today's `locked` flag allows. Timekeeping logs a `would_refuse_double_hold` metric with both invoice ids. Each invoice releases only its own hold, so the entry stays locked until every holder releases. This is the mode for every company until D1 is decided.
-- **On (enforced).** That claim is refused with `409 held_by_other`. The entry row lock makes two simultaneous claims serialize, so exactly one wins.
+- **Off (shadow).** This mode copies today's single `locked` flag. A claim on an entry another invoice holds still succeeds and adds a second hold. Timekeeping logs a `would_refuse_double_hold` metric with both invoice ids. A release whose token matches clears **every** hold on that entry, because today `Invoice#unlock_timesheet_entries` writes `locked: false` without checking other invoices. So when drafts A and B share an entry, discarding A unlocks it, as today. B's next draft save claims it again (L1 re-locks on every save), and B stores the new token. This is the mode for every company until D1 is decided.
+- **On (enforced).** That claim is refused with `409 held_by_other`. The entry row lock makes two simultaneous claims serialize, so exactly one wins. With only one hold per entry, a release clears that hold only.
 
 P3 waves can therefore run before D1 is decided, with no change in whether an invoice save succeeds.
 
@@ -536,47 +538,48 @@ M2 is kept: line items copy `rate` and `quantity` at creation. An `Updated` even
 ### 9.1 Transaction boundaries
 
 - Timekeeping: an entry change, its audit row, its idempotency record and its outbox row commit together in one transaction.
-- Monolith billing: an invoice or line-item change and its outbox row commit together. Calls to Timekeeping are not inside that transaction.
+- Monolith billing: an invoice or line-item change and its outbox row commit together. The one exception is the draft-save claim (9.2): it is sent while the save transaction is still open, so the save commits only after its entries are held. Release calls are made after commit.
 - Between them there is no shared transaction. Consistency comes from ordered steps, idempotent commands and a reconciler.
 
 ### 9.2 Ordering of a draft save
 
 ```text
-1. In one monolith transaction: save invoice + associations, each association marked hold_state = 'pending',
-   and write an outbox row "claim needed".
-2. Still inside the same request, right after the commit, the monolith sends one holds/claim for the whole
-   batch. Its idempotency key and its seq are both the id of the "claim needed" outbox row, so they are
-   unique to this save and stay the same on every retry.
-3. On 200: for each association still 'pending', store hold_token and set hold_state = 'held'; for one
-   that moved to 'releasing' meanwhile, store the token and leave it 'releasing' so step 4 releases it.
-   Then answer the user.
-   On 409: set hold_state = 'conflict'; the invoice shows the entries as not held, and the user is told.
-   On a timeout or 5xx: answer the user with the invoice saved and its holds pending; a job retries
-   the same claim, with the same key and seq, until it gets 200 or 409.
-   Before each retry the job re-reads the invoice and association. If the invoice is discarded or the
-   association is gone or 'releasing', it sends no claim; it hands the association to step 4 instead.
-4. Removal or draft discard: set each association to hold_state = 'releasing' (a 'pending' one too).
-   A job sends holds/release with the stored token and a new seq. An association that has no token
-   yet is released as soon as a late claim response supplies one (step 3). Its new seq also makes any
-   still-delayed claim for it stale (section 7.2).
+1. Open a monolith transaction. Save the invoice and its associations, and insert an outbox row
+   "claim needed". The row's id is assigned now, before commit; it is this save's seq and idempotency key.
+2. With the transaction still open, send one holds/claim listing every association of the draft
+   (section 5.3). Timeout: 5 seconds.
+3. Read the answer to this request only. No other request writes these association rows while this
+   transaction holds them:
+   - 200, every entry "held": store each hold_token, set hold_state = 'held', commit, answer the user.
+   - 200 with any entry "stale_claim": a newer save of the same draft already ran. Roll back and tell
+     the user the draft changed and must be reloaded. A stale claim creates no hold, so nothing is left.
+   - 409 (enforced mode only): roll back; the save fails with "entry is on another invoice".
+   - Timeout or 5xx: roll back; the save fails with a retryable error. Today this save would succeed,
+     so this is a disclosed availability change (section 15.3).
+4. If the commit itself fails after a 200, send holds/release for the returned tokens at once. If that
+   release is also lost, the reconciler releases holds whose association the monolith does not have.
+5. Removal or draft discard: in the same transaction as the change, set each affected association to
+   hold_state = 'releasing'. After commit, a job sends holds/release with the stored token and a new seq,
+   retrying until it gets an answer. The new seq makes any delayed claim for it stale (section 7.2).
 ```
 
-The claim is synchronous, so in the normal case entries are held before the save returns, as with L1 today. The job is only the retry path. **Disclosed change from L1:** today the lock commits in the same database transaction as the invoice. In the target, there is a short window between the invoice commit and the claim. That window lasts the length of one HTTP call, and longer when Timekeeping cannot be reached. During it, an employee could still edit an entry that is already on the draft. The reconciler reports associations that stay `pending` longer than 10 minutes. No design without a shared transaction closes this window completely. Claiming before the commit would instead leave orphan holds when the commit fails (see the second row of 9.3).
+Entries are held before the invoice save commits, as with L1 today, so no one can edit an entry that is on a saved draft. The cost is that the open transaction waits for one HTTP call, bounded by the timeout. While Timekeeping is down, draft saves fail instead of succeeding without a lock. On removal or discard, the entry stays locked until the release job runs, a short delay after commit. That only makes the lock last longer, never shorter, so no edit gets through that today's rules refuse.
 
 ### 9.3 Failure cases
 
 | Case | State that survives | How it is detected and repaired | Proving test |
 |---|---|---|---|
-| Invoice saved, claim call failed | Association `hold_state = 'pending'`; entry free | The job retries with the same idempotency key until it gets an answer; the reconciler lists associations pending longer than 10 minutes | Integration: Timekeeping returns 503 twice then 200; association ends `held`, one hold row exists |
-| Claim succeeded, invoice transaction rolled back | Hold exists with no association | Not possible in the ordering in 9.2, because claim runs after commit. If a synchronous claim is used before commit, the reconciler releases holds whose `invoice_id`/`association_id` the monolith does not have | Integration: force rollback after a synchronous claim; reconciler run releases the orphan hold |
+| Claim call fails or times out during a draft save | Invoice change rolled back; entries as before | The user retries the save. A claim that Timekeeping applied but whose answer was lost leaves a hold with no association, which the reconciler releases | Integration: Timekeeping returns 503; save fails, nothing committed; retry after recovery succeeds with one hold per entry |
+| Claim succeeded, invoice transaction rolled back or commit failed | Hold exists with no association | The save sends an immediate release; failing that, the reconciler releases holds whose `invoice_id`/`association_id` the monolith does not have | Integration: force a commit failure after a 200 claim; entry ends `locked: false` |
+| Two saves of one draft overlap; the older one's claim arrives second | Newer save's holds | The older claim gets `stale_claim`; that save rolls back and asks the user to reload. Its rows never store a token | Integration: run two saves with seq 5 and 7, claim 7 first; save 7 commits with held associations; save 5 rolls back |
 | Discard or line-item delete, release lost | Association `releasing`; hold still `held` | Job retries release with the stored token; reconciler lists `releasing` older than 10 minutes | Integration: drop the first release; retry releases; entry shows `locked: false` |
 | Stale release after the same draft re-adds the entry | New hold with token T2 | Late release carries T1, matches nothing, returns `no_matching_hold` | Contract: claim(A, assoc1) → T1; claim(A, assoc2) → T2; release(T1) → no change; entry still held |
 | Reordered release from another invoice | Hold of invoice B | Release from A carries A's token, which never matches B's hold | Contract: claim A → T1; release T1; claim B → T2; replay release T1 → no change |
 | Duplicate claim (retry, double click, re-save) | One hold | Same idempotency key returns the stored answer; same association returns the same token | Contract: send the same claim three times; one hold row, one token |
 | Two drafts claim one entry at once, `refuse_double_holds` on | One hold | Claims serialize on the entry row lock; the second sees the first hold and gets 409 | Concurrency: two parallel claims; exactly one 200 |
-| Two drafts claim one entry, `refuse_double_holds` off (shadow) | Two holds, entry locked | Second claim succeeds and logs `would_refuse_double_hold`; each invoice later releases only its own hold | Contract: claim A, claim B; release A → entry still locked; release B → entry free |
+| Two drafts claim one entry, `refuse_double_holds` off (shadow) | Two holds, entry locked | Second claim succeeds and logs `would_refuse_double_hold`; a matching release by either invoice clears both holds, as today's `locked: false` does | Contract: claim A, claim B; release A → entry free; B re-claims on its next save → entry held with a new token; release with B's old token → no change |
 | Claims for one invoice arrive in reverse order (delayed claim for a removed association) | Hold from the newer claim | The older claim's `seq` is not above `last_seq`; it returns `stale_claim` and changes nothing | Contract: claim(A, assoc2, seq 7) → T2; then claim(A, assoc1, seq 5) → stale_claim; release(T2, seq 8) → entry free; a further claim(seq 5) → still stale |
-| Draft discarded while its claim is pending | No hold | Discard sets associations to `releasing`; the retry job sees the discard and sends no claim; a claim already in flight is released when its token arrives. The reconciler also releases any hold whose invoice is discarded while still in `draft` status (L2), and leaves holds of invoices discarded after leaving draft (L3) | Integration: claim returns 503; discard the draft; let the job run; entry shows `locked: false` |
+| Draft discarded, release job lost | Associations `releasing`; holds still held | The job retries with the stored tokens. The reconciler also releases any hold whose invoice is discarded while still in `draft` status (L2), and leaves holds of invoices discarded after leaving draft (L3) | Integration: drop the release job; discard the draft; reconciler run; entry shows `locked: false` |
 | Hold event arrives before an older update | Projection has the new duration and the hold | Every version-raising event carries the full entry snapshot (section 5.4), so the highest version is complete | Contract: deliver HoldClaimed v3 (with duration 90) then Updated v2 (with duration 90); projection shows duration 90 and held |
 | Reference facts unavailable | No change | Write refused with `503 reference_unavailable`; client or job retries | Integration: monolith reference endpoint down; entry write refused; nothing written |
 | Outbox relay down | Rows stay unsent | Relay resumes from the last sent id; consumers dedupe | Integration: stop relay, make changes, restart; projection matches, no duplicates |
@@ -587,7 +590,7 @@ Mark-billed on send is not in this table, because sending does not mark entries 
 ### 9.4 Concurrency on entries
 
 - Entry updates take a row lock in Timekeeping and bump `version`. Clients that send `If-Match` get conflict detection; others keep last-write-wins, as today.
-- A user edit and a claim on the same entry serialize on the entry row. A claim that commits first makes a later employee edit fail with the locked error (A6), as today. An edit made in the window between the invoice commit and the claim (section 9.2) succeeds. Today's single transaction prevents that edit, so this is the disclosed change named in 9.2.
+- A user edit and a claim on the same entry serialize on the entry row. A claim that commits first makes a later employee edit fail with the locked error (A6), as today. Because the invoice save commits only after its claim succeeds (section 9.2), there is no moment when a saved draft's entries are editable.
 
 ## 10. Migration, backfill, reconciliation, phased cutover and rollback (proposed)
 
@@ -630,7 +633,7 @@ P4 can start as soon as P2 has a stable event stream, in parallel with P3 (secti
 - Locks become holds:
   - Each `locked = true` entry with an association on a kept invoice becomes a `held` hold for that invoice and association, with a new token. The token is written back to the billing association in the same batch.
   - A `locked = true` entry with no kept invoice (L3) becomes a **legacy hold**: `invoice_id = null`, `association_id = null`. It shows `locked: true` as today, and no billing release can match it. A claim by a new invoice takes it over (section 7.2), so these entries can still be invoiced again, as today. Otherwise only an approved operator command can clear it.
-  - An entry on two kept invoices at once (possible today, section 1.5) gets one hold for each of those invoices, each with its own token. This copies today's state as it is: the entry stays locked until every invoice has released it. The entry is listed in the reconciliation report. The invoices and their money are not touched.
+  - An entry on two kept invoices at once (possible today, section 1.5) gets one hold for each of those invoices, each with its own token. This copies today's state as it is: the entry is locked, and in shadow mode a release by either invoice unlocks it, as today. The entry is listed in the reconciliation report. The invoices and their money are not touched.
 - `duration` is copied to `numeric(12,4)`. Each value is checked to round-trip to the same float; the batch stops on the first mismatch (section 8.3).
 - `audits` rows for entries are copied with their original timestamps and authors.
 - Money is never read or written by the backfill.
@@ -645,9 +648,9 @@ A reconciler job runs per company: hourly during P2–P3, daily after. It compar
 | Count and sum of `duration` per company, per user, per month | Owner | Alert; never auto-fix money-related fields |
 | `locked` in the monolith equals "has held hold" in Timekeeping | Owner | Re-copy from the owner |
 | Each billing association with `hold_state = 'held'` has a matching hold token | Timekeeping | Alert; association goes to `conflict` |
-| Associations `pending` or `releasing` longer than 10 minutes | Monolith | Re-enqueue the claim or release job |
+| Associations `releasing` longer than 10 minutes | Monolith | Re-enqueue the release job |
 | Holds whose invoice and association the monolith does not have, or whose invoice was discarded while still a draft | Monolith | Release, unless it is a legacy hold. Holds of invoices discarded after leaving draft stay (L3) |
-| Invoice money columns unchanged since the last snapshot | Monolith snapshot taken at P0 | Page an operator; this must never happen |
+| No invoice money column was changed by a migration operation | Invoice audit history (`audited` on `Invoice`) | For each money-column change since P0, check the audit actor. Changes by users, payments and normal billing jobs are expected. A change with a migration actor (backfill, sync, cutover, rollback, reconciler, event replay), or with no actor, pages an operator; this must never happen |
 
 Every check is keyed by `company_id`. No report or result mixes companies.
 
@@ -657,24 +660,39 @@ Every check is keyed by `company_id`. No report or result mixes companies.
 cutover(company):
   1. ownership := 'moving'                  -- new writes for this company get 503 ownership_moving
   2. wait for in-flight monolith requests and jobs for this company to finish (timeout 60 s, else abort)
-  3. drain the sync stream for this company to the last id, then stop the monolith -> Timekeeping sync for it
-  3b. convert this company's locks to holds again (the lock rules in 10.3), and write each token back to
-      its billing association. This covers drafts that the old callbacks locked after the backfill.
+  3. drain the sync stream for this company to the last id
   4. reconcile the company; abort on any unexplained difference
-  5. Timekeeping: accept ownership at epoch + 1
-  6. ownership := 'timekeeping', epoch := epoch + 1
+  5. as the last step:
+       Timekeeping: convert this company's locks to holds again (the lock rules in 10.3) and accept
+       ownership at epoch + 1; then, in one monolith transaction, write each token back to its billing
+       association, stop the monolith -> Timekeeping sync for the company, and set
+       ownership := 'timekeeping', epoch := epoch + 1.
+     Re-running the conversion covers drafts that the old callbacks locked after the backfill.
+
+  Abort (any step before 5 commits): nothing outside the ownership record has changed, so set ownership
+  back to 'monolith'. If Timekeeping already created holds in step 5 but the monolith transaction failed,
+  Timekeeping drops ownership and those holds (they are not yet visible to anyone) before writes reopen.
 
 rollback(company):
-  1. ownership := 'returning'               -- Timekeeping refuses writes for this company
-  2. drain the Timekeeping outbox for this company into the monolith tables (upsert by id and version)
-  2b. clear the hold tokens and hold_state on this company's billing associations; `locked` now carries the state
-  3. reconcile; abort on any unexplained difference
-  4. ownership := 'monolith', epoch := epoch + 1, restart the monolith -> Timekeeping sync
+  1. ownership := 'returning'               -- the monolith stops sending this company's writes
+  2. Timekeeping sets its own copy of the company's ownership to 'returning'. Every Timekeeping write
+     transaction reads that row with a shared lock, and this change takes an exclusive lock, so it waits
+     for every write transaction already running and no write can commit after it (timeout 60 s, else abort).
+  3. drain the Timekeeping outbox for this company into the monolith tables (upsert by id and version).
+     The outbox is now final, because step 2 stopped new commits.
+  4. reconcile; abort on any unexplained difference
+  5. in one monolith transaction: clear the hold tokens and hold_state on this company's billing
+     associations (`locked` now carries the state), restart the monolith -> Timekeeping sync, and set
+     ownership := 'monolith', epoch := epoch + 1.
+
+  Abort (any step before 5 commits): no billing token has been cleared and no sync has changed, so
+  Timekeeping sets its own ownership back to 'timekeeping' and the monolith sets ownership back to
+  'timekeeping'. Writes reopen exactly as before the attempt.
 ```
 
-Abort at any step sets the ownership back to its previous value. No write is lost in either direction:
+Each procedure keeps every side effect that writes reopen depends on (tokens, sync direction, ownership) in its last step, which commits as a whole or not at all. An abort before that step therefore only has to reset the ownership record. No write is lost in either direction:
 
-- During `moving` and `returning`, nobody accepts writes.
+- During `moving` and `returning`, nobody accepts writes, and rollback waits for Timekeeping writes already running before it reads the final outbox position.
 - After a move, every Timekeeping change goes to its outbox and keeps flowing to the monolith tables until the rollback window ends in P5. Rollback therefore replays changes, and no one has to reconstruct them.
 
 Billing holds follow the same rule. While a company is owned by the monolith, the existing `locked` callbacks run. After a move, billing calls the hold commands. The P0 token columns let both shapes exist side by side.
@@ -708,13 +726,13 @@ Every log line and metric carries `company_id`, `request_id` and the actor kind.
 | Signal | Alert when |
 |---|---|
 | Outbox lag (oldest unsent row age), per side | Over 5 minutes |
-| Associations in `pending` / `releasing` / `conflict` | Any older than 10 minutes, or any `conflict` |
+| Associations in `releasing` / `conflict` | Any `releasing` older than 10 minutes, or any `conflict` |
 | `503 ownership_moving` rate per company | Lasts longer than 5 minutes for one company |
 | `409 stale_epoch` count | Any during steady state |
 | `503 reference_unavailable` rate | Over 1% of writes for 5 minutes |
 | Shadow-read differences (P2) | Any unexplained difference |
 | Shadow double-hold refusals (P2–P3) | Reported daily for the owner decision in section 15 |
-| Reconciler differences | Any unexplained difference; any money-snapshot difference pages at once |
+| Reconciler differences | Any unexplained difference; any invoice money change made by a migration actor pages at once |
 | Timekeeping p95 latency for entry writes | Over 300 ms (proposed; to tune against today's baseline) |
 
 The existing `Rails.event.notify` history stays as it is, as observability only.
@@ -760,6 +778,8 @@ Consumer-driven contracts between the monolith (consumer) and Timekeeping (provi
 
 - Each row of section 9.3 marked "Integration" or "Concurrency", against real databases for both sides and a real relay.
 - **Alternating writers across cutover and rollback.** For one entry in one company: a web edit, a CLI edit, then `cutover(company)` starts. A web edit and a CLI edit are sent during `moving` and must get `503`, and their retries succeed after the flip. More alternating web and CLI edits follow, then `rollback(company)`, then two more edits. The test asserts that the final `duration` and `note` are the last accepted values, and that both stores agree. It also asserts that the audit history lists every accepted edit exactly once.
+- **Aborted moves.** Abort `cutover(company)` at reconcile, and again with the monolith transaction in its step 5 forced to fail. Abort `rollback(company)` at reconcile. After each abort, the test asserts that ownership is back where it started, every billing hold token is still stored and still releases its hold, the sync direction is unchanged, and an edit afterwards succeeds.
+- **Rollback waits for running writes.** Start a Timekeeping entry update that pauses before commit, then start `rollback(company)`. The test asserts that step 2 waits until the update commits or aborts, and that the update's change is in the monolith table after rollback.
 - Backfill re-run: run it twice on the same company; the row counts and checksums are equal.
 - Report parity: for a fixture company, each report in section 1.7 returns the same output from the projection as from the old SQL.
 
@@ -782,7 +802,7 @@ The migration is complete only when every item below holds for every company, an
 | AC1 | Every company has `owner = 'timekeeping'`, and for 30 days the monolith `timesheet_entries` table receives no writes except from the Timekeeping → monolith sync. | Ownership table query; single writer guard; database write metrics |
 | AC2 | Every entry in Timekeeping equals its monolith row at the moment of cutover, field for field, except the declared `numeric` duration type. | Reconciler report with zero unexplained differences |
 | AC3 | Every observed behaviour in section 2.1–2.4 still holds. | Regression suite in 12.1, including the new characterization specs, green against Timekeeping |
-| AC4 | No invoice money column has changed for any invoice that existed before P0. | Money guard; reconciler money snapshot check |
+| AC4 | No migration operation (backfill, sync, cutover, rollback, reconciliation or event replay) has changed any invoice money column. Normal billing changes, such as payments and draft edits, continue as today. | Migration code runs under a database role with no column-level write grant on invoice and line-item money columns; reconciler audit-actor check (10.4) |
 | AC5 | No entry is held by two kept invoices, other than the pre-existing cases listed in the P2 conflict report. | Query on `billing_holds`; conflict report |
 | AC6 | A request for one company can never read or change another company's entry, hold or idempotency record. | Tenant guard on every endpoint |
 | AC7 | Each failure case in section 9.3 ends in its stated surviving state and is repaired. | The test named in each row |
@@ -875,6 +895,7 @@ Within the monolith, M3 touches every writer of entries (section 10.1). It shoul
 |---|---|---|
 | A writer is missed in routing | Two stores diverge for a moved company | M3 as one change; single writer guard; reconciler |
 | Monolith outage blocks entry writes | Users cannot log time | Same as today (writes run in the monolith now); `503 reference_unavailable` is retryable; alert in 11.3 |
+| Timekeeping outage blocks draft invoice saves | Draft saves fail with a retryable error while Timekeeping is down; today they succeed. This is a disclosed availability change, chosen so that a saved draft's entries are always locked | Timekeeping availability alert (11.3); 5-second claim timeout; the save can be retried unchanged |
 | Hold protocol bugs | Entries stuck held, or double billed | Contract tests for every failure row; shadow mode; reconciler |
 | Float-to-numeric duration drift | Totals in reports shift | Round-trip check stops the backfill; D2 |
 | Report parity gaps | Customers see different numbers | Per-report read flags in P4; parity tests |
