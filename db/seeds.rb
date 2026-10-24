@@ -528,7 +528,7 @@ Invitation.find_or_initialize_by(company:, recipient_email: "planner@summitevent
 
 puts "Invitations ready"
 puts "Seed complete (as of #{END_DATE})"
-puts "Logins (password: MIRU_SEED_PASSWORD):"
+puts "Logins (the seed password is not printed):"
 puts "- dana@#{STAFF_DOMAIN} (owner)"
 puts "- luis@#{STAFF_DOMAIN} (admin)"
 puts "- grace@#{STAFF_DOMAIN} (book keeper)"
