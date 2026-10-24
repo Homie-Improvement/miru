@@ -375,7 +375,7 @@ puts "Timesheet entries ready"
 
 def invoice_status_for(month, as_of, due_date)
   return :draft if month >= as_of.beginning_of_month
-  return(due_date < as_of ? :overdue : :sent) if month > (as_of << 3).beginning_of_month
+  return (due_date < as_of ? :overdue : :sent) if month > (as_of << 3).beginning_of_month
   return :viewed if month > (as_of << 5).beginning_of_month
 
   :paid
