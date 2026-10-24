@@ -346,6 +346,14 @@ POST /v1/companies/{company_id}/holds/claim
   -> 200 { holds: [ { entry_id, hold_token | null, outcome: "held" | "stale_claim" } ] }
   -> 409 { conflicts: [ { entry_id, reason: "held_by_other" | "not_billable_state" } ] }   (whole batch rejected)
 
+POST /v1/companies/{company_id}/holds/confirm      -- the save that sent claim seq committed
+  { invoice_id, seq, idempotency_key }
+  -> 200 { confirmed: <count> }
+
+POST /v1/companies/{company_id}/holds/abandon      -- the save that sent claim seq did not commit
+  { invoice_id, seq, idempotency_key }
+  -> 200 { abandoned: <count>, restored: <count> }
+
 POST /v1/companies/{company_id}/holds/release
   { releases: [ { entry_id, hold_token } ], invoice_id, seq, idempotency_key }
   -> 200 { results: [ { entry_id, outcome: "released" | "no_matching_hold" } ] }
@@ -439,24 +447,28 @@ A review workflow (approve or reject commands, and whether billing may claim `pe
 A hold is a row in Timekeeping:
 
 ```text
-billing_holds(company_id, entry_id, invoice_id, association_id, hold_token, state, created_at, released_at)
-unique (company_id, entry_id, invoice_id) where state = 'held'
+billing_holds(company_id, entry_id, invoice_id, association_id, hold_token, state, acquired_seq,
+              replaced_hold_id, created_at, released_at)
+  state: 'provisional' | 'held' | 'replaced' | 'released' | 'abandoned'
+unique (company_id, entry_id, invoice_id) where state in ('provisional', 'held')
 
 hold_sequences(company_id, invoice_id, entry_id, last_seq)   -- kept after release
 ```
 
-- An entry is "locked" exactly when it has at least one row in state `held`. The monolith shows that as `locked: true`. More than one invoice can hold an entry only while double holds are not refused (see "Two holder modes" below).
-- Every claim and every release carries `seq`, the id of the monolith outbox row that asked for it. Outbox ids only rise, so a later request from billing always has a larger `seq`. `hold_sequences` keeps the highest `seq` seen for each `(company_id, invoice_id, entry_id)`, and keeps it after the hold is released.
-- **Claim** takes the entry's row lock, then works in one transaction, keyed by the caller's idempotency key:
+- An entry is "locked" exactly when it has at least one row in state `provisional` or `held`. The monolith shows that as `locked: true`. A provisional hold therefore protects the entry from the moment it is claimed, before the invoice save commits. More than one invoice can hold an entry only while double holds are not refused (see "Two holder modes" below).
+- Every claim and every release carries `seq`. For a claim, `seq` is the id of the monolith's claim attempt row (section 9.2); for a release, it is the id of the outbox row that asked for it. Both come from one monolith sequence that only rises, so a later request from billing always has a larger `seq`. `hold_sequences` keeps the highest `seq` seen for each `(company_id, invoice_id, entry_id)`, and keeps it after the hold is released.
+- **Claim** takes the entry's row lock, then works in one transaction, keyed by the caller's idempotency key. Every hold it creates is `provisional`, with `acquired_seq = seq`:
   - `seq` not above `last_seq` for this invoice and entry: a stale claim. Return `stale_claim` and change nothing. This stops a delayed claim for an association that was later removed, or removed and added again, from replacing or recreating a hold.
-  - No current hold by this invoice: insert one with a fresh random `hold_token`.
-  - Current hold by this invoice with the same `association_id`: return the existing token. This is what lets every draft save (L1) re-send its claims without changing anything.
-  - Current hold by this invoice with a **different** `association_id`: the draft removed the entry and added it again. Replace the hold with a new token. The old token stops matching.
-  - Current legacy hold (`invoice_id = null`, created by the backfill for L3 entries, section 10.3): replace it with a hold for the claiming invoice and a new token. Today an unbilled entry still locked after a non-draft discard can be put on a new invoice (section 1.5), so a legacy hold must not block a claim.
+  - No current hold by this invoice: insert a provisional hold with a fresh random `hold_token`.
+  - Current hold by this invoice with the same `association_id`: return the existing token and change nothing. The hold is **reused**: it belongs to an earlier save, keeps its own `acquired_seq`, and nothing this attempt does later can remove it. This is what lets every draft save (L1) re-send its claims.
+  - Current hold by this invoice with a **different** `association_id`: the draft removed the entry and added it again. Mark the current hold `replaced`, and insert a provisional hold with a new token and `replaced_hold_id` pointing to it. The old token stops matching. Until the save commits, the old hold can still be restored.
+  - Current legacy hold (`invoice_id = null`, created by the backfill for L3 entries, section 10.3): mark it `replaced` and insert a provisional hold for the claiming invoice, as above. Today an unbilled entry still locked after a non-draft discard can be put on a new invoice (section 1.5), so a legacy hold must not block a claim.
   - Current hold by another invoice: depends on the holder mode below.
   - On success, `last_seq` becomes `seq`.
   - A retry with the same idempotency key returns the stored success. A refusal is not stored, so a retry is checked again (section 5.1).
-- **Release** names the `hold_token` and its own `seq`. It raises `last_seq` to `seq` whether or not a hold matches. It clears a hold only when the token matches that hold, in one statement (`UPDATE … WHERE entry_id = ? AND hold_token = ? AND state = 'held'`). If nothing matches, it returns `no_matching_hold` and changes nothing else. A stale or foreign token therefore never clears anything. What a matching release clears depends on the holder mode below.
+- **Release** names the `hold_token` and its own `seq`. It raises `last_seq` to `seq` whether or not a hold matches. It clears a hold only when the token matches that hold, in one statement (`UPDATE … WHERE entry_id = ? AND hold_token = ? AND state IN ('provisional', 'held')`). Billing only sends tokens stored on committed associations, so a matching provisional hold belongs to a save that has committed and whose confirm has not arrived yet. If nothing matches, it returns `no_matching_hold` and changes nothing else. A stale or foreign token therefore never clears anything. What a matching release clears depends on the holder mode below.
+- **Confirm** `(invoice_id, seq)` turns every `provisional` hold with `acquired_seq = seq` into `held`, and drops the restore link on the holds they replaced. After a confirm, abandon can no longer touch them.
+- **Abandon** `(invoice_id, seq)` undoes exactly what claim `seq` acquired, and nothing else. For each `provisional` hold with `acquired_seq = seq`, it marks that hold `abandoned`, and if the hold has a `replaced_hold_id`, it puts the replaced hold back to `held` with its original token. Reused holds were not acquired by `seq`, so they are untouched. In shadow mode, abandon removes only the attempt's own provisional hold; it never uses the release rule that clears every hold on the entry. Abandon after confirm, or a repeated abandon, changes nothing.
 
 **Two holder modes.** The mode is a per-company setting, `refuse_double_holds`, and it defaults to off:
 
@@ -470,9 +482,13 @@ Billing stores the returned `hold_token` on the line item (direct link) or the `
 ```mermaid
 stateDiagram-v2
   [*] --> Free
-  Free --> Held: claim (new token T1)
-  Held --> Held: claim, same invoice + same association (returns T1)
-  Held --> Held: claim, same invoice + new association (token T1 replaced by T2)
+  Free --> Provisional: claim (new token T1, acquired by seq S)
+  Provisional --> Held: confirm S (the save committed)
+  Provisional --> Free: abandon S (the save failed)
+  Provisional --> Free: release with current token (save committed, confirm not yet arrived)
+  Held --> Held: claim, same invoice + same association (returns T1, reused; abandon of the new seq leaves it)
+  Held --> Provisional: claim, same invoice + new association (T1 replaced by T2, acquired by seq S)
+  Provisional --> Held: abandon S of a replacement (T2 dropped, T1 restored)
   Held --> Free: release with current token
   Held --> Held: release with old token (no change)
   Held --> Held: claim by another invoice (refused when enforced; second hold added in shadow mode)
@@ -544,33 +560,55 @@ M2 is kept: line items copy `rate` and `quantity` at creation. An `Updated` even
 ### 9.2 Ordering of a draft save
 
 ```text
-1. Open a monolith transaction. Save the invoice and its associations, and insert an outbox row
-   "claim needed". The row's id is assigned now, before commit; it is this save's seq and idempotency key.
+0. In its own short transaction, which commits at once, insert a claim attempt row:
+     hold_claim_attempts(id, company_id, invoice_id, state: 'open' | 'committed' | 'failed', started_at)
+   Its id is this save's seq and idempotency key. This row is the durable record of whether the save
+   committed; nothing else decides it.
+1. Open the save transaction. Save the invoice and its associations.
 2. With the transaction still open, send one holds/claim listing every association of the draft
-   (section 5.3). Timeout: 5 seconds.
+   (section 5.3). Timeout: 5 seconds. Every hold the claim creates is provisional and already locks
+   its entry (section 7.2).
 3. Read the answer to this request only. No other request writes these association rows while this
    transaction holds them:
-   - 200, every entry "held": store each hold_token, set hold_state = 'held', commit, answer the user.
+   - 200, every entry "held": store each hold_token and set hold_state = 'held'. Then, still in the save
+     transaction, run UPDATE hold_claim_attempts SET state = 'committed' WHERE id = seq AND state = 'open'.
+     If it changes one row, also write an outbox row "claim committed" (seq), commit and answer the user.
+     If it changes no row, the attempt was already closed as failed (step 4); roll back.
    - 200 with any entry "stale_claim": a newer save of the same draft already ran. Roll back and tell
-     the user the draft changed and must be reloaded. A stale claim creates no hold, so nothing is left.
+     the user the draft changed and must be reloaded.
    - 409 (enforced mode only): roll back; the save fails with "entry is on another invoice".
    - Timeout or 5xx: roll back; the save fails with a retryable error. Today this save would succeed,
      so this is a disclosed availability change (section 15.3).
-4. If the commit itself fails after a 200, send holds/release for the returned tokens at once. If that
-   release is also lost, the reconciler releases holds whose association the monolith does not have.
-5. Removal or draft discard: in the same transaction as the change, set each affected association to
+4. Whenever the save transaction ends without committing (any rollback above, or a failed commit),
+   set the attempt to 'failed' (only WHERE state = 'open') and send holds/abandon (invoice_id, seq), retried by a job until answered.
+   Abandon removes only what this attempt acquired and restores any hold it replaced (section 7.2), so a
+   reused hold of the already-saved draft keeps protecting its entry. This works even when the claim
+   answer was lost, because abandon is keyed by seq, not by tokens.
+   If the process dies before this step, the attempt stays 'open'. The reconciler closes it: once the
+   attempt is older than the save transaction's time limit (proposed: 60 seconds), it runs
+   UPDATE hold_claim_attempts SET state = 'failed' WHERE id = seq AND state = 'open'. That update and the
+   save's own 'committed' update take the same row lock, so exactly one wins: either the save committed
+   and the reconciler changes nothing, or the reconciler wins and the save can no longer commit. Only
+   after its update wins does the reconciler send holds/abandon.
+5. After a commit, the relay delivers "claim committed" as holds/confirm (invoice_id, seq), which makes
+   the provisional holds permanent. Until it arrives they already lock their entries, and release works.
+6. Removal or draft discard: in the same transaction as the change, set each affected association to
    hold_state = 'releasing'. After commit, a job sends holds/release with the stored token and a new seq,
    retrying until it gets an answer. The new seq makes any delayed claim for it stale (section 7.2).
 ```
 
-Entries are held before the invoice save commits, as with L1 today, so no one can edit an entry that is on a saved draft. The cost is that the open transaction waits for one HTTP call, bounded by the timeout. While Timekeeping is down, draft saves fail instead of succeeding without a lock. On removal or discard, the entry stays locked until the release job runs, a short delay after commit. That only makes the lock last longer, never shorter, so no edit gets through that today's rules refuse.
+Entries are held before the invoice save commits, as with L1 today, so no one can edit an entry that is on a saved draft. A failed save undoes only its own provisional holds, and only after the attempt row says, durably, that the save can no longer commit. So neither a failed update nor a cleanup run can unlock an entry of a draft that is saved, or about to be. The cost is that the open transaction waits for one HTTP call, bounded by the timeout. While Timekeeping is down, draft saves fail instead of succeeding without a lock. On removal or discard, the entry stays locked until the release job runs, a short delay after commit. That only makes the lock last longer, never shorter, so no edit gets through that today's rules refuse.
 
 ### 9.3 Failure cases
 
 | Case | State that survives | How it is detected and repaired | Proving test |
 |---|---|---|---|
-| Claim call fails or times out during a draft save | Invoice change rolled back; entries as before | The user retries the save. A claim that Timekeeping applied but whose answer was lost leaves a hold with no association, which the reconciler releases | Integration: Timekeeping returns 503; save fails, nothing committed; retry after recovery succeeds with one hold per entry |
-| Claim succeeded, invoice transaction rolled back or commit failed | Hold exists with no association | The save sends an immediate release; failing that, the reconciler releases holds whose `invoice_id`/`association_id` the monolith does not have | Integration: force a commit failure after a 200 claim; entry ends `locked: false` |
+| Claim call fails or times out during a draft save, answer lost | Invoice change rolled back; attempt `failed`; entries as before the save | Abandon by `seq` removes whatever the lost claim acquired and restores what it replaced. The user retries the save | Integration, in both holder modes: Timekeeping applies the claim but the answer is dropped; save fails; after abandon each entry's lock state equals its state before the save |
+| New invoice: claim succeeded, commit failed | Attempt `failed`; provisional holds abandoned; entries unlocked as before | Abandon by `seq` | Integration: force a commit failure after a 200 claim on a new draft; entry ends `locked: false` |
+| Saved draft re-saved unchanged: claim reuses T1, commit fails | Hold T1 still held; entry still locked | Abandon touches only holds with `acquired_seq` = this seq; T1 was acquired by an earlier save | Integration, in both holder modes: draft A holds T1; re-save fails at commit; entry still locked and T1 still releases it; in shadow mode another invoice's hold on the entry is also untouched |
+| Saved draft re-adds an entry under a new association: claim replaces T1 with T2, commit fails | T1 restored to held; T2 abandoned | Abandon follows `replaced_hold_id` back to T1 | Integration, in both holder modes: re-add then fail commit; entry still locked; release with T1 frees it; release with T2 does nothing |
+| Save paused after its claim while the reconciler runs | Provisional holds kept; attempt `open` | The reconciler leaves attempts younger than the time limit alone. An older one is closed by the conditional update, which the save's own update cannot also win | Integration: claim on a new draft, pause the save, run the reconciler, resume; the save commits and its entries stay locked. Then repeat with the pause past the time limit: the reconciler wins, the save rolls back, the holds are abandoned |
+| Process dies after the claim, before commit or abandon | Attempt `open` | Reconciler closes it as `failed` after the time limit and sends abandon | Integration: kill the worker after the claim; reconciler run; entry back to its state before the save |
 | Two saves of one draft overlap; the older one's claim arrives second | Newer save's holds | The older claim gets `stale_claim`; that save rolls back and asks the user to reload. Its rows never store a token | Integration: run two saves with seq 5 and 7, claim 7 first; save 7 commits with held associations; save 5 rolls back |
 | Discard or line-item delete, release lost | Association `releasing`; hold still `held` | Job retries release with the stored token; reconciler lists `releasing` older than 10 minutes | Integration: drop the first release; retry releases; entry shows `locked: false` |
 | Stale release after the same draft re-adds the entry | New hold with token T2 | Late release carries T1, matches nothing, returns `no_matching_hold` | Contract: claim(A, assoc1) → T1; claim(A, assoc2) → T2; release(T1) → no change; entry still held |
@@ -646,10 +684,12 @@ A reconciler job runs per company: hourly during P2–P3, daily after. It compar
 |---|---|---|
 | Entry fields and `version` match (P2, and moved companies until P5) | Current owner from `timekeeping_ownership` | Re-copy from the owner, logged |
 | Count and sum of `duration` per company, per user, per month | Owner | Alert; never auto-fix money-related fields |
-| `locked` in the monolith equals "has held hold" in Timekeeping | Owner | Re-copy from the owner |
+| `locked` in the monolith equals "has a provisional or held hold" in Timekeeping | Owner | Re-copy from the owner |
 | Each billing association with `hold_state = 'held'` has a matching hold token | Timekeeping | Alert; association goes to `conflict` |
 | Associations `releasing` longer than 10 minutes | Monolith | Re-enqueue the release job |
-| Holds whose invoice and association the monolith does not have, or whose invoice was discarded while still a draft | Monolith | Release, unless it is a legacy hold. Holds of invoices discarded after leaving draft stay (L3) |
+| Claim attempts still `open` after the save time limit (proposed: 60 seconds) | Monolith `hold_claim_attempts` | Close with `UPDATE … SET state = 'failed' WHERE id = ? AND state = 'open'`; only if that update wins, send `holds/abandon`. Younger open attempts are left alone, because their save can still commit |
+| Attempts `committed` whose holds are still `provisional`, or `failed` ones whose holds are not yet abandoned | Monolith `hold_claim_attempts` | Re-send confirm or abandon |
+| Confirmed (`held`) holds whose invoice and association the monolith does not have, or whose invoice was discarded while still a draft | Monolith | Release, unless it is a legacy hold. Holds of invoices discarded after leaving draft stay (L3). Provisional holds are never released by this check; only their attempt's outcome decides them |
 | No invoice money column was changed by a migration operation | Invoice audit history (`audited` on `Invoice`) | For each money-column change since P0, check the audit actor. Changes by users, payments and normal billing jobs are expected. A change with a migration actor (backfill, sync, cutover, rollback, reconciler, event replay), or with no actor, pages an operator; this must never happen |
 
 Every check is keyed by `company_id`. No report or result mixes companies.
