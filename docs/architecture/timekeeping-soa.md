@@ -344,7 +344,7 @@ Response:   { id, company_id, version, ...fields, held: true|false }
 POST /v1/companies/{company_id}/holds/claim
   { invoice_id, claims: [ { entry_id, association_id } ], seq, idempotency_key,
     prior_outcomes: [ { seq, outcome: "committed" | "failed" } ] }   -- earlier attempts of this invoice not yet acknowledged
-  -> 200 { holds: [ { entry_id, hold_token | null, outcome: "held" | "stale_claim" } ] }
+  -> 200 { holds: [ { entry_id, hold_token | null, outcome: "held" | "stale_claim" | "attempt_closed" } ] }
   -> 409 { conflicts: [ { entry_id, reason: "held_by_other" | "not_billable_state" } ] }   (whole batch rejected)
 
 POST /v1/companies/{company_id}/holds/confirm      -- the save that sent claim seq committed
@@ -454,11 +454,13 @@ billing_holds(company_id, entry_id, invoice_id, association_id, hold_token, stat
 unique (company_id, entry_id, invoice_id) where state in ('provisional', 'held')
 
 hold_sequences(company_id, invoice_id, entry_id, last_seq)   -- kept after release
+invoice_claim_floors(company_id, invoice_id, closed_seq)      -- highest claim attempt with a known outcome; kept for good
 ```
 
 - An entry is "locked" exactly when it has at least one row in state `provisional` or `held`. The monolith shows that as `locked: true`. A provisional hold therefore protects the entry from the moment it is claimed, before the invoice save commits. More than one invoice can hold an entry only while double holds are not refused (see "Two holder modes" below).
 - Every claim and every release carries `seq`. For a claim, `seq` is the id of the monolith's claim attempt row (section 9.2); for a release, it is the id of the outbox row that asked for it. Both come from one monolith sequence that only rises, so a later request from billing always has a larger `seq`. `hold_sequences` keeps the highest `seq` seen for each `(company_id, invoice_id, entry_id)`, and keeps it after the hold is released.
 - **Claim** takes the entry's row lock, then works in one transaction, keyed by the caller's idempotency key. Every hold it creates is `provisional`, with `acquired_seq = seq`. Before it looks at any hold, it applies `prior_outcomes`: a confirm for each committed earlier attempt and an abandon for each failed one (the rules below). So a claim never reuses or replaces a provisional hold whose creator's outcome is still unknown to Timekeeping, and a delayed confirm or abandon for those earlier attempts arrives later as a no-op.
+  - Closed attempts acquire nothing. Every confirm, every abandon, and every outcome in `prior_outcomes` raises `invoice_claim_floors.closed_seq` for the invoice to at least that `seq`, even when no hold matched. A claim first takes that floor row's lock. If its `seq` is not above `closed_seq`, its attempt has already ended, so it returns `attempt_closed` for every entry and changes nothing. This covers a claim delivered for the first time after its own abandon, including for entries that the retry left out, and a delayed claim from any earlier attempt of the invoice. Because saves of one invoice run one after the other (section 9.2) and seq only rises, every attempt at or below the floor is finished. The floor row lock makes a claim and an abandon of the same seq serialize: whichever runs second sees the other's result.
   - Backstop: a provisional hold of this invoice whose `acquired_seq` is neither `seq` nor in `prior_outcomes` means an earlier save's outcome was not passed on. The claim is refused with `409 claim_in_progress`, and the save fails with a retryable error. The monolith's invoice row lock (section 9.2) is meant to make this impossible.
   - `seq` not above `last_seq` for this invoice and entry: a stale claim. Return `stale_claim` and change nothing. This stops a delayed claim for an association that was later removed, or removed and added again, from replacing or recreating a hold.
   - No current hold by this invoice: insert a provisional hold with a fresh random `hold_token`.
@@ -583,8 +585,9 @@ M2 is kept: line items copy `rate` and `quantity` at creation. An `Updated` even
      transaction, run UPDATE hold_claim_attempts SET state = 'committed' WHERE id = seq AND state = 'open'.
      If it changes one row, also write an outbox row "claim committed" (seq), commit and answer the user.
      If it changes no row, the attempt was already closed as failed (step 4); roll back.
-   - 200 with any entry "stale_claim": a newer request for this invoice already reached Timekeeping,
-     which the invoice row lock makes rare. Roll back and tell the user the draft changed and must be
+   - 200 with any entry "stale_claim" or "attempt_closed": a newer request for this invoice already
+     reached Timekeeping, or the reconciler already closed this attempt; the invoice row lock and the
+     time limit make both rare. Roll back and tell the user the draft changed and must be
      reloaded.
    - 409 claim_in_progress: roll back; the save fails with a retryable error (section 7.2 backstop).
    - 409 (enforced mode only): roll back; the save fails with "entry is on another invoice".
@@ -624,6 +627,8 @@ Entries are held before the invoice save commits, as with L1 today, so no one ca
 | Failed save, then retry with the same association, abandon of the failed save delayed | Retry's hold, `held` | The retry passes `failed` for the earlier seq, so Timekeeping abandons the earlier provisional hold first, then creates a fresh provisional hold for the retry. The late abandon is a no-op | Integration, in both holder modes: discard draft B so A's hold clears (shadow mode); re-save A (S1) and fail its commit; hold back abandon S1; retry (S2) commits; deliver abandon S1; entry still locked and S2's token releases it |
 | Failed save, then retry that replaces an association, abandon delayed | Retry's new hold; the committed hold it replaced can be restored if the retry fails | Prior outcome applied first restores the committed hold, which the retry then replaces | Integration, in both holder modes: S1 replaces T1 with T2 and fails; S2 re-adds again and commits with T3; late abandon S1 does nothing; release T3 frees the entry; T1 and T2 do nothing |
 | Earlier save committed, its confirm delayed, then the next save reuses its hold | Hold `held` | The next save passes `committed` for the earlier seq, so Timekeeping confirms first and the reused hold is no longer provisional. A failure of the next save cannot remove it | Integration, in both holder modes: S1 commits, hold back confirm S1; S2 reuses the hold and fails; entry still locked; late confirm S1 is a no-op |
+| Claim delivered for the first time after its attempt was abandoned, for an entry the retry left out | No hold on that entry | The abandon (or the retry's `prior_outcomes`) raised the invoice's claim floor; the late claim's seq is not above it, so it returns `attempt_closed` and creates nothing | Integration, in both holder modes, for a saved invoice with no time-linked lines: S1 adds entry X, its claim is held back past the timeout, S1 rolls back and abandon S1 is acknowledged; retry S2 adds entry Y and commits; deliver claim S1; X stays editable and has no hold, Y is held. Repeat with abandon S1 also held back, so only S2's `prior_outcomes` closes S1 |
+| Claim and abandon of one seq race | Either no hold, or a hold that the abandon removes | Both take the invoice's floor row lock; a claim after the abandon sees the floor, an abandon after the claim finds and removes its provisional holds | Concurrency: send claim S1 and abandon S1 in parallel many times; afterwards no hold with `acquired_seq` = S1 is provisional or held |
 | Earlier outcome not passed on (bug) | No change | Claim refused with `409 claim_in_progress`; save fails with a retryable error | Contract: claim seq 9 for an invoice with a provisional hold from seq 8 and no `prior_outcomes`; 409; hold unchanged |
 | Discard or line-item delete, release lost | Association `releasing`; hold still `held` | Job retries release with the stored token; reconciler lists `releasing` older than 10 minutes | Integration: drop the first release; retry releases; entry shows `locked: false` |
 | Stale release after the same draft re-adds the entry | New hold with token T2 | Late release carries T1, matches nothing, returns `no_matching_hold` | Contract: claim(A, assoc1) → T1; claim(A, assoc2) → T2; release(T1) → no change; entry still held |
@@ -704,6 +709,7 @@ A reconciler job runs per company: hourly during P2–P3, daily after. It compar
 | Associations `releasing` longer than 10 minutes | Monolith | Re-enqueue the release job |
 | Claim attempts still `open` after the save time limit (proposed: 60 seconds) | Monolith `hold_claim_attempts` | Close with `UPDATE … SET state = 'failed' WHERE id = ? AND state = 'open'`; only if that update wins, send `holds/abandon`. Younger open attempts are left alone, because their save can still commit |
 | Attempts `committed` or `failed` with `acknowledged_at` still empty | Monolith `hold_claim_attempts` | Re-send confirm or abandon. Both are idempotent, so a copy that arrives after a later claim already applied the outcome changes nothing |
+| Any `provisional` hold older than the save time limit, whatever the attempt's `acknowledged_at` | Monolith `hold_claim_attempts`, looked up by the hold's `acquired_seq` | `committed`: confirm. `failed`: abandon. `open`: close it first, as in the row above. This backstop finds a provisional hold even if it appeared after its attempt was acknowledged, so an acknowledgement never hides one from recovery |
 | Confirmed (`held`) holds whose invoice and association the monolith does not have, or whose invoice was discarded while still a draft | Monolith | Release, unless it is a legacy hold. Holds of invoices discarded after leaving draft stay (L3). Provisional holds are never released by this check; only their attempt's outcome decides them |
 | No invoice money column was changed by a migration operation | Invoice audit history (`audited` on `Invoice`) | For each money-column change since P0, check the audit actor. Changes by users, payments and normal billing jobs are expected. A change with a migration actor (backfill, sync, cutover, rollback, reconciler, event replay), or with no actor, pages an operator; this must never happen |
 
