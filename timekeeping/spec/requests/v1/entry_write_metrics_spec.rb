@@ -85,6 +85,18 @@ RSpec.describe "Entry write routes: write metrics" do
     expect(row.latency_ms_buckets.values.sum).to eq(3)
   end
 
+  it "stores each request's measured latency in whole ms, on both sides of the 300 ms edge" do
+    # Start and end readings of the monotonic clock, in ms, for two requests:
+    # one that takes exactly 300 ms and one that takes 300.4 ms.
+    readings = [1000.0, 1300.0, 2000.0, 2300.4]
+    allow_any_instance_of(Timekeeping::V1::EntriesController).to receive(:monotonic_ms) { readings.shift }
+
+    2.times { expect(send_metric_write(:post, entries_path, owner_token, metric_entry_body).status).to eq(201) }
+
+    row = WriteMetricWindow.find_by!(company_id: company)
+    expect([row.latency_ms_sum, row.latency_ms_buckets]).to eq([601, { "300" => 1, "500" => 1 }])
+  end
+
   it "counts a write to another company's path under the token's company" do
     send_metric_write(:post, other_entries_path, owner_token, metric_entry_body)
 
