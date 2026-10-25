@@ -5,6 +5,8 @@ RSpec.configure do |config|
     DatabaseCleaner.allow_remote_database_url = true
     DatabaseCleaner.url_allowlist = [ENV["DATABASE_URL"]]
     DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
+    # Truncation empties the ownership table; restore its one row.
+    TimekeepingOwnership.ensure_initial!
   end
 
   config.before do
@@ -21,6 +23,7 @@ RSpec.configure do |config|
 
   config.before(:each, type: :system) do
     DatabaseCleaner.clean_with :deletion, except: %w(ar_internal_metadata schema_migrations), pre_count: true, reset_ids: false
+    TimekeepingOwnership.ensure_initial!
   end
 
   config.append_after(:each, type: :system) do

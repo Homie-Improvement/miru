@@ -1,6 +1,13 @@
 # frozen_string_literal: true
 
 namespace :timekeeping do
+  desc "Set timesheet_entries.company_id from project -> client -> company where it is missing or wrong"
+  task backfill_entry_company_ids: :environment do
+    fixed = Timekeeping::EntryCompanyBackfill.call(ActiveRecord::Base.connection)
+
+    puts "fixed company_id on #{fixed} timesheet entries"
+  end
+
   desc "Load the demo seed into an empty database and record its seed disposition (MIRU_SEED_AS_OF required, OUTPUT optional)"
   task record_seed_disposition: :environment do
     abort "Refusing to record the seed disposition in production." if Rails.env.production?

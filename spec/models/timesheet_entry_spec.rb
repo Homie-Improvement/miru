@@ -62,6 +62,38 @@ RSpec.describe TimesheetEntry, type: :model do
         .is_greater_than_or_equal_to(0.0)
     end
 
+    it "is invalid when agent_id names no agent" do
+      entry = build(:timesheet_entry, project:)
+      entry.agent_id = Agent.maximum(:id).to_i + 1_000
+
+      expect(entry).not_to be_valid
+      expect(entry.errors[:agent]).to include("must exist")
+    end
+
+    it "is valid with no agent" do
+      entry = build(:timesheet_entry, project:, agent_id: nil)
+
+      expect(entry).to be_valid
+    end
+
+    it "is invalid when agent_id is 0, which names no agent" do
+      entry = build(:timesheet_entry, project:)
+      entry.agent_id = 0
+
+      expect(entry).not_to be_valid
+      expect(entry.errors[:agent]).to include("must exist")
+    end
+
+    it "refuses to save with an agent object whose row was deleted after it was loaded" do
+      cached_agent = create(:agent)
+      agent_project = create(:project, client: create(:client, company: cached_agent.company))
+      entry = build(:timesheet_entry, project: agent_project, user: cached_agent.user, agent: cached_agent)
+      Agent.find(cached_agent.id).destroy!
+
+      expect(entry.save).to be(false)
+      expect(entry.errors[:agent]).to include("must exist")
+    end
+
     it "validates an invalid bill status" do
       timesheet_entry = build(:timesheet_entry)
 
@@ -75,6 +107,49 @@ RSpec.describe TimesheetEntry, type: :model do
     it { is_expected.to callback(:ensure_bill_status_is_set).before(:validation) }
     it { is_expected.to callback(:ensure_bill_status_is_not_billed).before(:validation) }
     it { is_expected.to callback(:ensure_billed_status_should_not_be_changed).before(:validation) }
+  end
+
+  describe "stored company_id" do
+    def stored_company_id(entry)
+      ActiveRecord::Base.connection.select_value("SELECT company_id FROM timesheet_entries WHERE id = #{entry.id}")
+    end
+
+    it "is the project's client's company on create" do
+      expect(stored_company_id(timesheet_entry)).to eq(company.id)
+    end
+
+    it "follows a project move made through the association" do
+      timesheet_entry.project = project2
+      timesheet_entry.save!
+
+      expect(stored_company_id(timesheet_entry)).to eq(company2.id)
+    end
+
+    it "follows a project move made with update(project_id:), as the bulk move does" do
+      TimesheetEntry.where(id: timesheet_entry.id).each { |entry| entry.update(project_id: project2.id) }
+
+      expect(stored_company_id(timesheet_entry)).to eq(company2.id)
+    end
+
+    it "is filled on the next save when it is missing" do
+      timesheet_entry.update_columns(company_id: nil)
+
+      timesheet_entry.reload.update!(note: "edited")
+
+      expect(stored_company_id(timesheet_entry)).to eq(company.id)
+    end
+
+    it "keeps the entry's company resolved through its client" do
+      timesheet_entry.update_columns(company_id: company2.id)
+
+      expect(timesheet_entry.reload.company).to eq(company)
+    end
+
+    it "is not recorded in the audit log" do
+      timesheet_entry.update!(project: project2)
+
+      expect(timesheet_entry.audits.map { |audit| audit.audited_changes.keys }.flatten).not_to include("company_id")
+    end
   end
 
   describe "Scopes" do

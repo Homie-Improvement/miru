@@ -32,6 +32,19 @@ RSpec.describe Agent, type: :model do
     end
   end
 
+  describe "destroy" do
+    it "keeps the agent's timesheet entries and clears their agent_id" do
+      agent = create(:agent)
+      client = create(:client, company: agent.company)
+      project = create(:project, client:)
+      entry = create(:timesheet_entry, project:, user: agent.user, agent:)
+
+      agent.destroy!
+
+      expect(entry.reload.agent_id).to be_nil
+    end
+  end
+
   describe "#backing_user_active_for_company?" do
     it "rejects a user whose employment was discarded" do
       company = create(:company)

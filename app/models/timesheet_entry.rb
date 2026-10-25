@@ -50,12 +50,14 @@ class TimesheetEntry < ApplicationRecord
   before_validation :ensure_billed_status_should_not_be_changed, on: :update
   before_validation :normalize_source_fields
   before_validation :normalize_proof_metadata
+  before_save :assign_company_from_project, if: -> { company_id.nil? || will_save_change_to_project_id? }
   after_create { Rails.event.notify(TimesheetEntries::Created.new(self)) }
 
   validates :duration, :work_date, :bill_status, :review_status, presence: true
   validates :duration, numericality: { less_than_or_equal_to: 6000000, greater_than_or_equal_to: 0.0 }
   validates :source, inclusion: { in: SOURCES }
   validates :proof_url, length: { maximum: 2000 }, allow_blank: true
+  validate :validate_agent_exists, if: -> { !agent_id.nil? && will_save_change_to_agent_id? }
   validate :validate_billable_project
   validate :validate_agent_belongs_to_workspace
   validate :prevent_edit_if_locked, on: :update
@@ -128,6 +130,23 @@ class TimesheetEntry < ApplicationRecord
   end
 
   private
+
+    # Keeps the stored company_id equal to project -> client -> company, the
+    # tenant the Timekeeping handoff copies entries under. Reads of the entry's
+    # company still go through the has_one :company association.
+    # No database key checks agent_id, so a supplied id must name an agent row
+    # that still exists; a cached agent object is not enough. The shared lock
+    # holds that row until this save commits, so Agent#destroy, which locks it
+    # first, cannot delete it in between.
+    def validate_agent_exists
+      return if Agent.where(id: agent_id).lock("FOR SHARE").exists?
+
+      errors.add(:agent, :required)
+    end
+
+    def assign_company_from_project
+      self.company_id = project.client.company_id
+    end
 
     def ensure_bill_status_is_set
       return if bill_status.present? || project.nil?
