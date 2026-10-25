@@ -62,6 +62,7 @@ response:
     - proof_url
     - proof_metadata
     - locked
+  index_fields: [entries]
   bulk_fields: [results]
   bulk_result_fields: [entry_id, result]
   bulk_results: [moved, deleted, not_found]
@@ -79,6 +80,9 @@ rules:
   destroy: DELETE discards the entry and returns it; a later GET answers not_found.
 
 errors:
+  unauthorized:
+    status: 401
+    body: { reason: unauthorized }
   not_found:
     status: 404
     body: { reason: not_found }

@@ -9,4 +9,16 @@ These files are the single written form of the three Timekeeping contracts that 
 
 The files are data. `TimekeepingContract.load(name)` in `spec/support/timekeeping/contract.rb` reads one and returns it frozen. The RSpec shared examples in `spec/contracts/timekeeping/` and the fakes in `spec/support/timekeeping/` take field lists, reasons and rules from the loader, so a change here reaches every implementation that runs the examples.
 
+## Running the examples against an implementation
+
+The shared groups are `"timekeeping entry API contract"`, `"timekeeping reservations contract"`, `"timekeeping idempotency contract"`, `"timekeeping entry snapshot shape"`, `"timekeeping entry snapshot endpoint"` and `"timekeeping prepare reconciliation"`. Each runs on its own, so a provider can include only the groups for the routes it already serves. Require the group file from `spec/contracts/timekeeping/` and define:
+
+- `timekeeping_client`: responds to `call(method, path, headers: {}, body: nil)` and returns a `TimekeepingContract::Response` with the status and the JSON body parsed into string-keyed Hashes.
+- `timekeeping_arrange`: seeds companies, users, tokens, service identities, projects, entries and reserved entries, sets the ownership generation, and reads what the examples cannot reach through a route. `TimekeepingContract::FakeArrange` lists every method.
+- `reconciler`, for the reconciliation group only: responds to `call(remote_state:, intent_state:)`.
+
+`spec/contracts/timekeeping/fake_timekeeping_spec.rb` and `fake_relay_spec.rb` run the groups against the in-memory fakes through the `"timekeeping contract fakes"` shared context. `mutation_spec.rb` breaks one rule of a fake at a time and checks that the matching group fails.
+
+## Exact keys
+
 The key lists in `entry_snapshots.yml` are exact. The entry fields are the columns of `timesheet_entries` in `db/schema.rb` plus `company_id` and `version`. A snapshot with any other key, such as a user name, an email or a token, breaks the contract. When a column is added to `timesheet_entries`, add it to `entry_fields` in the same change.

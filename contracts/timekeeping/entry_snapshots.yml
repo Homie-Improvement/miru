@@ -58,6 +58,9 @@ errors:
   stale_generation:
     status: 409
     body: { reason: stale_generation }
+  not_found:
+    status: 404
+    body: { reason: not_found }
   unauthorized:
     status: 401
     body: { reason: unauthorized }
