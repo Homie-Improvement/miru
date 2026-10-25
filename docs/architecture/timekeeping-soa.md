@@ -14,6 +14,26 @@ Each statement in this document falls into one of three kinds, and every section
 
 "Monolith" means the single Rails application in this repository. "Tenant", "company" and "workspace" all mean the `Company` record that owns a customer's data.
 
+### Goals, in order
+
+1. **Depth over breadth.** One real, complete extraction, proven end to end, including rollback and re-cutover. Not a broad rewrite left half done.
+2. **Boundaries that reduce complexity.** The entry and invoice callbacks that lock time today become three components a reader can understand on their own: a write gateway (section 3.1), one reservation rule (section 7.2), and one read model (section 3.3).
+3. **Real parallel work.** Implementation lanes that are independent because their contracts are fixed (section 14).
+
+### Decided scope
+
+The repository owner reviewed and decided these against the code at `main`. They are inputs to this design, not options.
+
+- **One new service.** One independently deployable Timekeeping application with its own database, in this repository. Identity, catalogue, billing and reporting stay in the monolith.
+- **One cutover for the whole dataset.** Both seeded businesses move together, in one bounded write pause, under one global ownership generation (section 10). Tenant isolation is proven by tests on both tenants.
+- **Durations and money keep their current types and values** (section 8.1).
+- **`timesheet_entries` is the one read model,** a read-only projection written only by the projection consumer (section 3.3).
+- **One event stream, one consumer, no broker** (section 5.4).
+- **Every entry writer keeps its route and goes through one gateway** (sections 3.1 and 10.1).
+- **Characterization first:** today's real behaviour is pinned by specs before any change (section 12.1).
+- **The gateway and the invoice reservation boundary are inside the scope.**
+- **Two deliberate behaviour fixes,** kept through rollback (section 2.3).
+
 ## 1. Existing architecture and its important dependencies
 
 ### 1.1 Runtime shape (observed)
@@ -1066,90 +1086,97 @@ The implementation is accepted in the demo environment only when every item belo
 
 ## 14. Implementation sequence and parallel work (proposed)
 
-Each box is a unit of work that can be reviewed and merged on its own. Arrows show real dependencies, where one unit needs an interface or data another creates.
+The work is cut into lanes by capability. A lane is independent because the contract it builds against is fixed first, with a fake on the consumer's side, not because the work was split into pieces of equal size. How each lane is broken into issues is the implementer's judgement.
 
 ```mermaid
 flowchart TD
-  C0[C0 Characterization specs for L3, L4, L6, A9, L8]
-  M1[M1 company_id on timesheet_entries + backfill]
-  M2[M2 Monolith outbox + relay]
-  M3[M3 Ownership table + TimekeepingRouting in every writer]
-  M4[M4 Hold token columns on billing associations]
-  T1[T1 Timekeeping skeleton: app, DB, deploy, token check]
-  T2[T2 Entry API + rules A1-A11, S1-S7]
-  T3[T3 Billing holds + mark-billed]
-  T4[T4 Timekeeping outbox + events]
-  R1[R1 Reference-data endpoint + token claims in monolith]
-  K1[K1 Contract test suite]
-  B1[B1 Backfill + shadow sync]
-  B2[B2 Reconciler]
-  B3[B3 Billing switches to hold commands for moved companies]
-  P1[P1 Reporting projection + per-report read flags]
-  X1[X1 Cutover and rollback procedure + alternating-writer test]
-  W[W Company waves]
-  Z[Z Retire monolith table]
+  F[Foundation: characterization specs, two-tenant seed fixtures, three contracts with fakes]
+  L1[Timekeeping core]
+  L2[Timekeeping outbox]
+  L3[Gateway]
+  L4[Invoice boundary]
+  L5[Projection consumer]
+  L6[Cutover and rollback tooling]
+  L7[Deployment and runtime]
+  J[Join: end-to-end journey and independent deployment proof]
 
-  C0 --> X1
-  M1 --> B1
-  T1 --> T2 --> T3
-  T1 --> T4
-  R1 --> T2
-  T2 --> K1
-  T3 --> K1
-  T4 --> P1
-  M2 --> P1
-  M4 --> B3
-  T3 --> B3
-  T2 --> B1
-  B1 --> B2
-  M3 --> X1
-  B2 --> X1
-  B3 --> X1
-  K1 --> X1
-  X1 --> W --> Z
-  P1 --> Z
+  F --> L1
+  F --> L2
+  F --> L3
+  F --> L4
+  F --> L5
+  F --> L6
+  L1 --> J
+  L2 --> J
+  L3 --> J
+  L4 --> J
+  L5 --> J
+  L6 --> J
+  L7 --> J
 ```
 
-Parallel tracks:
+**Foundation, first.** Three pieces of work come before any lane:
 
-- **Monolith track:** C0, M1, M2, M3, M4 have no dependency on each other or on Timekeeping. They can start at once, in parallel.
-- **Service track:** T1, then T2 and T4 in parallel, then T3. R1 runs beside T1 and joins at T2.
-- **Data track:** B1 and B2 start once M1 and T2 exist.
-- **Reporting track:** P1 needs only the event stream (T4, plus M2 for the monolith's events). It runs beside cutover work.
-- **Join points** (the integration risks): X1 needs routing, reconciliation, billing on holds and the contract suite all at once. Z needs both the waves and the projection. These two points are where schedule slips collect, and they need one owner each.
+- characterization specs that pin today's real behaviour: the true draft-discard re-lock, L3, L4, L6 and A9, and the PDF totals (section 12.1, step S0 in section 10.2);
+- the two-tenant seed fixtures, which also assert that the pre-flight's orphan and conflict lists are empty (section 10.4);
+- three contracts, each with a fake on its consumer's side: the entry API (section 5.2), prepare, commit and abort (section 5.3), and the entry snapshot event (section 5.4). Section 12.3 tests them.
 
-Within the monolith, M3 touches every writer of entries (section 10.1). It should land as one change, so that no writer is left out of routing.
+**Then, each lane on its own contract and tests:**
+
+| Lane | What it builds | Builds against |
+|---|---|---|
+| Timekeeping core | The service shell, the entry API and its rules, idempotency, and the shared reservation decision table (section 7.2) | Entry API and reservation contracts |
+| Timekeeping outbox | The relay, on its dedicated queue and worker (section 11.1) | Snapshot event contract; a fake projection endpoint |
+| Gateway | Forwarding in every writer of section 10.1, agent destroy and the seed and demo writers included; the user token and its reference claims (section 3.4); the generation fence | Entry API contract; a fake Timekeeping |
+| Invoice boundary | The reservation module that replaces the lock callbacks; the foreign-key migration (step S1); candidate selection and validation through Timekeeping; the prepared monolith's local reservation table | Reservation contract; a fake Timekeeping |
+| Projection consumer | The version upsert into `timesheet_entries`, tombstones, the generation rule, and the split between the two read rules (section 3.3) | Snapshot event contract; a fake relay |
+| Cutover and rollback tooling | The fence, the pre-flight, the sequence and version handoff, the drain, the checkpoint, the reconcile, and the financial snapshot diff (section 10) | The ownership record and the checkpoint shape (sections 10.1 and 10.3) |
+| Deployment and runtime | The second Kamal configuration, the image and its CI job (section 11.1). Start early: it depends on nothing and every proof in section 13 needs it | Nothing |
+
+**Join, last.** The end-to-end journey of AC1 and the independent deployment proof of AC4 (section 13). This is the one point where every lane meets, and it needs one owner.
+
+**Runtime.** Start only the dedicated relay worker. The `default` worker would run the integration jobs already queued in the demo data (section 11.1).
 
 ## 15. Risks, unresolved questions and decisions that need review
 
-### 15.1 Decisions for owners
+### 15.1 Decisions
 
-| # | Decision | Options and cost | Recommendation |
-|---|---|---|---|
-| D1 | Enforce refusal of a claim on an entry another invoice holds (section 7.2) | Enforce: closes a double-billing path, but some invoice saves that work today will fail. Shadow only (the `refuse_double_holds` default): no behaviour change, and double billing stays possible. | Enforce after P2 shadow data shows how often it fires |
-| D2 | Duration type | `numeric(12,4)` with round-trip check, or keep `float` | `numeric(12,4)` if the backfill check finds no mismatch |
-| D3 | Event broker | Solid Queue jobs as relay (no new infrastructure, Postgres-backed), or a dedicated broker (more throughput, new system to run) | Start with Solid Queue; revisit if outbox lag alerts |
-| D4 | Fix quirks L3, L6, A8, A9, `metrics/data_builder.rb` `:billable` filter | Each fix changes customer-visible state or output | Keep all as they are for the migration; decide each separately afterwards |
-| D5 | Clearing legacy holds (L3 entries) | Leave them, or release them by operator command | Leave them; report the count |
-| D6 | Rollback window after the last company moves, before P5 retires the monolith table | Longer is safer, and costs more double-running | 90 days |
+The repository owner has decided D1 to D4. They are recorded here so a reader can see what was open in the first version of this design and how it was closed. D5 is kept as the design's own choice. D6, the rollback window, is removed: rollback has no end date, because `timesheet_entries` is never retired (section 10.2).
+
+| # | Decision | Decided |
+|---|---|---|
+| D1 | Refuse a reservation on an entry another kept invoice already holds (section 7.2) | **Decided: exclusive.** Prepare refuses the entry from the first cutover. There is no shadow mode (deliberate fix, section 2.3). |
+| D2 | Duration type | **Decided: keep `float`.** No conversion and no round-trip check (section 8.3). |
+| D3 | How snapshots are delivered | **Decided: a dedicated queue and worker** for the relay, on Solid Queue. There is no broker (section 11.1). |
+| D4 | Legacy quirks | **Decided:** the draft-discard re-lock (L2) and double allocation are fixed (section 2.3). L3, L6, A8, A9 and the `:billable` filter in `app/services/metrics/data_builder.rb` are kept as they are. |
+| D5 | Entries kept locked by a discarded or destroyed non-draft (L3) | Kept as known owners with disposition `retained`, and released only when a successor invoice commits for them (section 7.2). The pre-flight lists them (section 10.4). |
 
 ### 15.2 Open questions
 
-- How does the desktop timer write entries (section 1.3)? It must go through routing in M3.
-- Does every client retry a `503` answer (section 10.1)? Any client that does not needs a retry before its company moves.
+- How does the desktop timer write entries (section 1.3)? Whichever API it calls, that controller is a gateway writer (section 10.1).
+- Does every client (web, mobile, CLI, MCP, timer) retry a `503 ownership_moving` answer (section 10.1)? Any client that does not loses the edits it sends during the write pause, so it needs a retry before the first cutover.
 - What does `bill_status: :billable` in `app/services/metrics/data_builder.rb` return today? The answer decides what report parity compares against.
-- How many entries are in each quirk state in production (section 2.6)? The answer sizes D1, D4 and D5.
 - Are there external readers of `rails_event_viewer_entries` (section 2.6)?
 
 ### 15.3 Risks
 
 | Risk | Effect | Mitigation |
 |---|---|---|
-| A writer is missed in routing | Two stores diverge for a moved company | M3 as one change; single writer guard; reconciler |
+| A writer is missed by the gateway | It writes the projection directly, and Timekeeping never sees the change | The writer list in section 10.1; the single-writer guard (section 12.2); reconciliation (section 10.4) |
 | Monolith outage blocks entry writes | Users cannot log time | Same as today (writes run in the monolith now); `503 reference_unavailable` is retryable; alert in 11.3 |
-| Timekeeping outage blocks draft invoice saves | Draft saves fail with a retryable error while Timekeeping is down; today they succeed. This is a disclosed availability change, chosen so that a saved draft's entries are always locked | Timekeeping availability alert (11.3); 5-second claim timeout; the save can be retried unchanged |
-| Hold protocol bugs | Entries stuck held, or double billed | Contract tests for every failure row; shadow mode; reconciler |
-| Float-to-numeric duration drift | Totals in reports shift | Round-trip check stops the backfill; D2 |
-| Report parity gaps | Customers see different numbers | Per-report read flags in P4; parity tests |
+| Timekeeping outage blocks draft invoice saves | Saves that change an invoice's entry set fail with a retryable error while Timekeeping is down; today they succeed. This is a disclosed availability change, chosen so that a saved draft's entries are always reserved | Timekeeping availability alert (11.3); the bounded prepare timeout (section 9.2); the save can be retried unchanged |
+| Reservation protocol bugs | Entries stuck reserved, or a save that fails without a clear reason | Contract and integration tests for every row of section 9.3; recovery from the durable intent (section 9.2); reconciliation (section 10.4) |
+| Report parity gaps | Customers see different numbers | The projection keeps today's table and columns; report parity test (section 12.4) |
+| Relay lag | Aggregates show stale totals for a while | Money and read-after-write reads go to Timekeeping (section 3.3); outbox lag alert (section 11.3) |
 | Longer request path (monolith → Timekeeping) | Higher latency | Latency alert; keep payloads small |
 | A project moves to another company in future | Entries carry the wrong `company_id` | Not possible through the current route; if added, it must re-stamp entries (section 6.1) |
+
+### 15.4 Deferred: future rollout notes
+
+These are outside this design's scope. They are kept here so that a later production move can pick them up with their reasons.
+
+- **Per-company waves, shadow reads, 7-day gates, 30-day observation, 90-day retirement.** A production rollout needs them. Two seeded businesses moved in one pause do not, and they bring mixed ownership and its ID and sync machinery.
+- **Retiring `timesheet_entries`, and a second reporting model.** The table as a projection keeps every aggregate reader working with no rewrite.
+- **Changing `duration` to a decimal.** It adds a conversion and a round-trip check and changes no result.
+- **More services, a broker, or a general event platform.** One consumer does not need them.
+- **Payroll, scheduling, or new features.** Out of scope.
