@@ -119,7 +119,7 @@ This coupling is the main reason timekeeping cannot be deployed on its own today
 - `app/models/invoice.rb:63` runs `after_discard :unlock_timesheet_entries, if: :draft?`. It unlocks only when the invoice is still a draft. **A discarded invoice that has left draft leaves its entries locked.**
 - **Discarding a draft also leaves its entries locked.** The unlock at line 63 runs first. Then `after_discard :update_invoice_number` (line 64) calls `self.update(invoice_number: "ARC-...")` (`app/models/invoice.rb:323-325`). That save fires `after_save :lock_timesheet_entries, if: :draft?` (line 62) again, because the invoice is still a draft, and the entries end the discard locked.
 - Single invoice delete is a soft `invoice.discard!` (`app/controllers/api/v1/invoices_controller.rb:59-62`). Bulk delete is a hard destroy: `current_company.invoices.where(id: params[:invoices_ids])`, with no `.kept` filter, then `destroy` on each (`app/controllers/api/v1/invoices/bulk_deletion_controller.rb:7-8`). An invoice with payments fails to destroy (`has_many :payments, dependent: :restrict_with_error`, `app/models/invoice.rb:42`) and is reported back with a 422. Otherwise `has_many :invoice_line_items, dependent: :destroy` (line 40) runs each line item's `before_destroy :unlock_timesheet_entries`, which unlocks only when the invoice is a draft. **So a hard-destroyed non-draft invoice leaves its entries locked with no invoice, kept or discarded, that references them.**
-- `app/models/invoice_line_item.rb:10` runs `before_destroy :unlock_timesheet_entries`. It unlocks only when the parent invoice is a draft. It uses `TimesheetEntry.where(id: associated_timesheet_entry_ids)` with **no workspace filter**. It reaches only the direct `timesheet_entry_id`: `dependent: :destroy` on `invoice_line_item_time_entries` (line 6) runs first, so `linked_timesheet_entry_ids` is empty by then, and **a project aggregate line's linked entries stay locked with no invoice referencing them**, even on a draft.
+- `app/models/invoice_line_item.rb:10` runs `before_destroy :unlock_timesheet_entries`. It unlocks only when the parent invoice is a draft. It uses `TimesheetEntry.where(id: associated_timesheet_entry_ids)` with **no workspace filter**. `dependent: :destroy` on `invoice_line_item_time_entries` (line 6) runs first, so unless `linked_timesheet_entries` was already loaded on that instance, `linked_timesheet_entry_ids` is empty by then and the unlock reaches only the direct `timesheet_entry_id`. In that case, which includes the bulk delete's freshly loaded line items, **a project aggregate line's linked entries stay locked with no invoice referencing them**, even on a draft (L4).
 - `Invoice#update_timesheet_entry_status!` (`app/models/invoice.rb:126-128`) sets `bill_status: :billed` on the invoice's kept entries, through `TimesheetEntry.kept.where(id:)` with no workspace filter.
 - An entry is referenced by an invoice in one of two ways:
   - Directly, through `invoice_line_items.timesheet_entry_id`.
@@ -217,7 +217,7 @@ Each row below is current behaviour, cited to its source. The target design must
 | L1 | Every save of a draft invoice locks every entry it references, scoped to the invoice's company. | `app/models/invoice.rb:62`, `lock_timesheet_entries` |
 | L2 **(quirk)** | Discarding a draft invoice leaves its entries **locked**. `after_discard :unlock_timesheet_entries` unlocks them, then `after_discard :update_invoice_number` calls `update`, which fires `after_save :lock_timesheet_entries` again while the invoice is still a draft. Fixed by the target design (deliberate fixes, below). | `app/models/invoice.rb:62-64`, `:323-325` |
 | L3 **(quirk)** | Discarding an invoice that has left draft does **not** unlock its entries; they stay locked with no kept invoice holding them. | Same callback, `if: :draft?` |
-| L4 **(quirk)** | Destroying a line item on a draft invoice unlocks its **direct** entry (`timesheet_entry_id`); on a non-draft invoice it unlocks nothing. The unlock uses `TimesheetEntry.where(id:)` with no workspace filter. A project aggregate line's linked entries stay locked even on a draft: `has_many :invoice_line_item_time_entries, dependent: :destroy` (line 6) is declared before `before_destroy :unlock_timesheet_entries` (line 10), so the join rows are already gone when the unlock reads `linked_timesheet_entry_ids`. This covers a line item removed from a draft and every line item of a draft destroyed by the bulk invoice delete; the line items of a hard-destroyed non-draft leave all their entries locked (section 1.4). | `app/models/invoice_line_item.rb:6`, `:10`, `:72-80` |
+| L4 **(quirk)** | Destroying a line item on a draft invoice unlocks its **direct** entry (`timesheet_entry_id`); on a non-draft invoice it unlocks nothing. The unlock uses `TimesheetEntry.where(id:)` with no workspace filter. A project aggregate line's linked entries can stay locked even on a draft: `has_many :invoice_line_item_time_entries, dependent: :destroy` (line 6) is declared before `before_destroy :unlock_timesheet_entries` (line 10), so the join rows are already gone when the unlock reads `linked_timesheet_entry_ids`. That read finds nothing unless `linked_timesheet_entries` was already loaded on the same instance. A small ActiveRecord 8.1.3.1 model with the same callback order showed both cases: a freshly loaded line item, as the bulk delete destroys, left the linked entries locked; a preloaded one unlocked them. The S0 characterization specs pin the real paths (section 12.1). This covers a line item removed from a draft and every line item of a draft destroyed by the bulk invoice delete; the line items of a hard-destroyed non-draft leave all their entries locked (section 1.4). | `app/models/invoice_line_item.rb:6`, `:10`, `:72-80` |
 | L5 **(quirk)** | Among invoice flows, only `InvoiceMailer#invoice` marks entries `billed`, through `after_action :update_status` (`app/mailers/invoice_mailer.rb:4`, `:73`). That mailer is enqueued only by `Invoice#send_to_email` (`app/models/concerns/invoice_sendable.rb`). A repository search finds no production caller of `send_to_email`; only `spec/models/invoice_spec.rb:200-215` calls it. Outside invoices, `billed` is also set by the Harvest import (L7), by any user allowed to edit the entry (A11), and by the seed data (section 1.3). | Search for `send_to_email` and `bill_status: :billed` |
 | L6 **(quirk)** | The live send path, `send_invoice` in `app/controllers/api/v1/invoices_controller.rb`, uses `InvoiceMailer#send_invoice` and `record_send!`. These set the invoice to `sent` and emit `Invoices::Sent`, but never mark entries billed. **Entries on sent invoices therefore usually stay `locked` and `unbilled`.** | `app/controllers/api/v1/invoices_controller.rb:64`; `app/models/concerns/invoice_sendable.rb` |
 | L7 **(quirk)** | The Harvest import creates entries as `unbilled` and then calls `entry.update!(bill_status: :billed)` with no invoice. So `billed` is not always backed by an invoice link. | `app/services/imports/harvest_time_entries_importer.rb` (`create_entry`); `spec/services/imports/harvest_time_entries_importer_spec.rb` |
@@ -397,7 +397,7 @@ The cost: entry writes depend on the monolith being up. Today they do too, becau
 |---|---|---|
 | A. Move timekeeping code into modules or service classes inside the monolith | No independent deployment and no separate data ownership, which the goal rules out explicitly. Billing callbacks could still write entry rows. | Rejected. Useful only as a preparatory refactor before extraction. |
 | B. Separate deploy, shared database | Deploys split, but both apps write `timesheet_entries`, so nobody owns the data. Schema changes need lock-step deploys. | Rejected. It keeps the coupling in section 1.4 and adds deploy coordination. |
-| **C. One Timekeeping service with its own database (recommended)** | One new network boundary, one outbox, a reservation protocol, and a migration. | Chosen. It is the smallest change that gives timekeeping its own deploy and data, and it removes billing's direct writes. |
+| **C. One Timekeeping service with its own database (recommended)** | One new network boundary, two outboxes (Timekeeping's entry snapshots, and billing's delivery of commit and abort), a reservation protocol, and a migration. | Chosen. It is the smallest change that gives timekeeping its own deploy and data, and it removes billing's direct writes. |
 | D. Two services: Timekeeping and Billing | Billing would have to call back for users, clients, projects, payments and rates. Every invoice screen becomes a cross-service read. | Rejected as unnecessary distributed complexity. It may be revisited later on its own merits. |
 | E. Timekeeping plus a separate Reporting service | Another service and database for read-only data. Revenue reports would need billing data replicated too. | Rejected. The projection inside the monolith is enough. |
 | F. Event-fed copies of reference data inside Timekeeping (instead of section 3.4) | Fewer synchronous calls, but a role, edit-window or project change would apply only when its event arrives. That weakens authorization rules A1–A7 for a period. | Rejected, recorded for review. It could return only with an owner decision that accepts the delay. |
@@ -593,9 +593,12 @@ reservations(company_id, entry_id, invoice_id, state: 'provisional' | 'committed
   unique (company_id, entry_id) where state = 'provisional'
 
 invoice_operations(company_id, invoice_id, operation_id, state: 'prepared' | 'committed' | 'aborted',
+                   desired_entry_ids, disposition: 'active' | 'retained',
                    generation, created_at, finished_at)
   unique (company_id, invoice_id) where state = 'prepared'    -- at most one unresolved operation per invoice
 ```
+
+- Prepare writes the operation row, with the desired entry set and the disposition from its request, in the same transaction as its provisional reservations. Commit reads them from that row, not from the request, so any worker or a restarted service applies exactly the change prepare accepted, including removals of entries that are committed now but absent from the desired set.
 
 - `invoice_id` is the stable invoice identity. It has no foreign key, so a reservation of a hard-destroyed invoice keeps its owner: the tenant (`company_id`), the invoice identity and the disposition.
 - `disposition: 'retained'` marks a reservation held by a discarded or destroyed **non-draft** invoice. It is a known owner. It keeps the entry locked against edits, and it can pass to a successor invoice (below).
@@ -652,7 +655,7 @@ Mapping of today's callbacks:
 | L1 draft save locks entries | The invoice reservation boundary prepares and commits the draft's desired entry set when it changes (section 9.2) |
 | L2 draft discard leaves entries locked (re-lock) | Empty desired set; reservations released at commit. **Deliberate fix** (section 2.3) |
 | L3 non-draft discard keeps locks | Reservations kept with `disposition: 'retained'`. **Preserved quirk.** |
-| L4 line-item destroy on draft unlocks; on non-draft does not | On a draft, the entry leaves the desired set and is released at commit. On a non-draft, the boundary sends no removal, so the reservation stays. Preserved. One difference: a removed aggregate line's linked entries also leave the desired set and are released, where today they stay locked with no invoice referencing them. Keeping them reserved would need an owner that no line references, which the one rule does not have. This is an open question for the owner (section 15.2). |
+| L4 line-item destroy on draft unlocks; on non-draft does not | On a draft, the entry leaves the desired set and is released at commit. On a non-draft, the boundary sends no removal, so the reservation stays. Preserved. One difference: a removed aggregate line's linked entries also leave the desired set and are released, where today they can stay locked with no invoice referencing them (L4). Keeping them reserved would need an owner that no line references, which the one rule does not have. This is an open question for the owner (section 15.2). |
 | Bulk hard destroy of an invoice | Draft: released. Non-draft: `retained`, carrying its own owner. Failed destroy: operation aborted, prior state kept (section 1.4) |
 | Two kept invoices on one entry | Refused at prepare: `on_another_invoice`. **Deliberate fix** (section 2.3) |
 | L5 mark billed via uncalled mailer | `mark-billed` (section 5.3), called only from the same path |
@@ -738,7 +741,7 @@ Timekeeping keeps its own terminal record of the same operations (`invoice_opera
 **Recovery.** A crash after prepare always leaves a `pending` intent to recover from, because step 1 committed it before the remote call. Recovery picks up an intent that has stayed `pending` longer than the save's time limit (proposed: 60 seconds). Age only selects which intents recovery looks at; it never releases anything by itself. Recovery then works in this order:
 
 1. It takes the same advisory lock on (company_id, invoice_id). Holding the lock rules out a commit still in progress, because a save holds that lock from step 1 to step 4.
-2. It records a definitive failure: `UPDATE invoice_operation_intents SET state = 'failed' WHERE operation_id = ? AND state = 'pending'`. If the update changes no row, the save already committed, and recovery leaves it alone.
+2. It records a definitive failure: `UPDATE invoice_operation_intents SET state = 'failed' WHERE company_id = ? AND invoice_id = ? AND operation_id = ? AND state = 'pending'`, scoped to the same (company_id, invoice_id) whose lock it holds. If the update changes no row, the save already committed, and recovery leaves it alone.
 3. Only if its update won, it delivers abort.
 
 A missing response or elapsed time alone never releases a reservation. Only a commit that removes the entry, or an abort after the failure is recorded, releases it.
@@ -871,7 +874,7 @@ The checkpoint copies no money. The first cutover reads invoice links to derive 
 
 **Pre-flight (first cutover only).** Today's legacy states are listed, never normalized quietly. Inside the write fence, before any copy, the pre-flight lists:
 
-- **orphans:** entries locked with no invoice, kept or discarded, that references them. Today a bulk hard destroy of a non-draft invoice creates exactly these, because its line items unlock only on a draft (section 1.4). Removing a project aggregate line from a draft, or bulk-deleting a draft with one, creates them too, because the unlock never sees the aggregate's linked entries (L4). Any such action run before the first cutover makes this list non-empty.
+- **orphans:** entries locked with no invoice, kept or discarded, that references them. Today a bulk hard destroy of a non-draft invoice creates exactly these, because its line items unlock only on a draft (section 1.4). Removing a project aggregate line from a draft, or bulk-deleting a draft with one, can create them too, when the unlock does not see the aggregate's linked entries (L4). Any such action run before the first cutover makes this list non-empty.
 - **conflicts:** entries referenced by two or more kept invoices, or with more than one plausible historical owner.
 - entries held by a discarded non-draft invoice: kept, as `retained` reservations (10.3).
 - entries locked only by the old draft-discard re-lock (section 2.3): released at cutover as a listed correction, only when no other committed or pending owner exists;
@@ -918,9 +921,11 @@ handoff(outgoing, incoming):
      for each 'committed' intent and abort for each 'failed' one, and runs recovery (section 9.2) on
      each intent still 'pending'. User deletion intents are settled the same way (section 3.3).
      During this step only, the outgoing owner still applies a commit or
-     abort that carries the old generation, and only for an operation in its own invoice_operations.
-     The step ends when no intent is 'pending' and no operation is 'prepared': no pending billing
-     operation crosses the handoff.
+     abort that carries the old generation, and only for an operation it registered: one in its own
+     invoice_operations, or a user-retire operation whose `retiring` mark it holds (retire/commit or
+     retire/abort). It accepts no new prepare or retire.
+     The step ends when no intent is 'pending', no operation is 'prepared' and no user is 'retiring':
+     no pending billing operation or user deletion crosses the handoff.
   3. Freeze.
      The outgoing owner stops applying commit and abort, so nothing can change its data any more.
      Capture its final outbox position P. Drain the outbox into the projection through P. Until the
@@ -1028,7 +1033,7 @@ These existing specs cover the observed behaviour in section 2. They run against
 
 - L2 as it really is: a discarded draft's entries end up locked again;
 - L3: a discarded non-draft leaves its entries locked;
-- L4: a line-item destroy on a non-draft leaves its entries locked; removing a project aggregate line from a draft, and bulk-deleting a draft that has one, leave the aggregate's linked entries locked;
+- L4: a line-item destroy on a non-draft leaves its entries locked; removing a project aggregate line from a draft through the invoice update, and bulk-deleting a draft that has one, each with the aggregate's linked entries' `locked` state asserted afterwards;
 - L6: a sent invoice leaves its entries locked and `unbilled`;
 - A9: the bulk move ignores `locked`, and it skips a failing entry silently;
 - A10 and S7;
@@ -1170,7 +1175,7 @@ The repository owner has decided D1 to D4. They are recorded here so a reader ca
 - Does every client (web, mobile, CLI, MCP, timer) retry a `503 ownership_moving` answer (section 10.1)? Any client that does not loses the edits it sends during the write pause, so it needs a retry before the first cutover.
 - What does `bill_status: :billable` in `app/services/metrics/data_builder.rb` return today? The answer decides what report parity compares against.
 - Are there external readers of `rails_event_viewer_entries` (section 2.6)?
-- Should removing a project aggregate line from a draft release its linked entries (section 7.2), or should today's behaviour, which leaves them locked with no invoice referencing them (L4), be kept? It is not one of the two deliberate fixes.
+- Should removing a project aggregate line from a draft release its linked entries (section 7.2), or should today's behaviour, which can leave them locked with no invoice referencing them (L4), be kept? It is not one of the two deliberate fixes.
 
 ### 15.3 Risks
 
