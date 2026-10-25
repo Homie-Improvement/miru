@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_02_01_000000) do
+ActiveRecord::Schema[8.1].define(version: 2026_03_01_000000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -109,6 +109,16 @@ ActiveRecord::Schema[8.1].define(version: 2026_02_01_000000) do
     t.index ["company_id", "entry_id"], name: "index_reservations_one_provisional_per_entry", unique: true, where: "((state)::text = 'provisional'::text)"
     t.check_constraint "disposition::text = ANY (ARRAY['active'::character varying, 'retained'::character varying]::text[])", name: "reservations_disposition_check"
     t.check_constraint "state::text = ANY (ARRAY['provisional'::character varying, 'committed'::character varying]::text[])", name: "reservations_state_check"
+  end
+
+  create_table "write_metric_windows", force: :cascade do |t|
+    t.bigint "company_id", null: false
+    t.datetime "window_start", null: false
+    t.bigint "writes", default: 0, null: false
+    t.bigint "reference_unavailable", default: 0, null: false
+    t.bigint "latency_ms_sum", default: 0, null: false
+    t.jsonb "latency_ms_buckets", default: {}, null: false
+    t.index ["company_id", "window_start"], name: "index_write_metric_windows_on_company_id_and_window_start", unique: true
   end
 
   add_foreign_key "reservations", "entries", column: ["company_id", "entry_id"], primary_key: ["company_id", "id"]

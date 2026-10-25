@@ -22,6 +22,26 @@ RSpec.describe Timekeeping::Identity do
     expect(identity).to have_attributes(kind: :anonymous, status: :expired, company_id: nil)
   end
 
+  it "keeps an expired token's signed company apart from company_id, so logs still read it as unverified" do
+    identity = resolve("Bearer #{mint_token({ company_id: 9, exp: Time.now.to_i - 1 })}")
+
+    expect(identity).to have_attributes(status: :expired, company_id: nil, role: nil, signed_company_id: 9)
+    expect(Timekeeping::RequestIdentity.company_tag(identity)).to eq("unverified")
+  end
+
+  it "gives a verified user's company as the signed company" do
+    identity = resolve("Bearer #{mint_token({ company_id: 9 })}")
+
+    expect(identity.signed_company_id).to eq(9)
+  end
+
+  it "gives no signed company to a forged expired token or the service" do
+    forged = mint_token({ exp: Time.now.to_i - 1 }, key: OpenSSL::PKey::RSA.generate(2048))
+
+    expect(resolve("Bearer #{forged}").signed_company_id).to be_nil
+    expect(resolve("Bearer #{service_token}").signed_company_id).to be_nil
+  end
+
   it "reports a forged token as invalid and anonymous" do
     identity = resolve("Bearer #{mint_token({}, key: OpenSSL::PKey::RSA.generate(2048))}")
 
