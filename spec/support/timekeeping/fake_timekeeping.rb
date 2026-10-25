@@ -54,6 +54,9 @@ module TimekeepingContract
       # Whether a reservation route refused for its credential still runs its
       # command before answering the refusal: never.
       refused_command_writes: ->(route:) { false },
+      # Whether an accepted mark_billed or detach_entries stores the changes
+      # it counts: always.
+      service_command_writes: ->(route:) { true },
       replay_terminal_prepare: true,
       snapshot_entry: ->(entry, credentials:) { entry },
       # Whether an entry write carries a credential Timekeeping holds anywhere
@@ -512,7 +515,9 @@ module TimekeepingContract
           end
           entries = held.filter_map { |reservation| visible_entry(reservation[:entry_id], company_id) }
             .reject { |entry| entry["bill_status"] == "billed" }
-          entries.each { |entry| write_entry(entry.merge("bill_status" => "billed")) }
+          if @policies[:service_command_writes].call(route: "mark_billed")
+            entries.each { |entry| write_entry(entry.merge("bill_status" => "billed")) }
+          end
           respond(200, "billed" => entries.size)
         end
       end
@@ -524,7 +529,9 @@ module TimekeepingContract
           entries = @entries.values.select do |entry|
             entry["company_id"] == company_id && entry["agent_id"] == agent_id
           end
-          entries.each { |entry| write_entry(entry.merge("agent_id" => nil)) }
+          if @policies[:service_command_writes].call(route: "detach_entries")
+            entries.each { |entry| write_entry(entry.merge("agent_id" => nil)) }
+          end
           respond(200, "detached" => entries.size)
         end
       end
