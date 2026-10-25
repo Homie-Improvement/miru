@@ -797,7 +797,7 @@ timekeeping_ownership(generation bigint, owner: 'monolith' | 'timekeeping',
 
 - **The generation only rises.** It starts at 1 with the monolith as owner. Every handoff raises it by one: the first cutover to 2, a rollback to 3, a re-cutover to 4. An aborted handoff does not lower it.
 - **Each owner admits writes at one generation.** Timekeeping, and the prepared monolith's local path (below), each store the generation they admit writes at, or none while fenced. A write, prepare, commit, abort or command that carries any other generation returns `409 stale_generation` and changes nothing (section 5.1). This also refuses a command that was queued before a handoff and delivered after it.
-- **The gateway reads the record on every write.** When `handoff_step` is set, the gateway refuses entry writes, prepares and service commands with a retryable `503 ownership_moving`, so invoice saves that change an entry set and user hard deletes fail with a retryable error during the pause. Whether every client (web, mobile, CLI, MCP, timer) retries a `503` today was not checked; this is an open question in section 15.
+- **The gateway reads the record on every write.** When `handoff_step` is set, the gateway refuses entry writes, prepares and service commands with a retryable `503 ownership_moving`, so invoice saves that change an entry set and user hard deletes fail with a retryable error during the pause. The monolith also refuses every other invoice, line-item, invoice-tax and payment write with the same `503` while `handoff_step` is set, so the financial snapshot comparison (10.4) compares two states with no billing write between them. Whether every client (web, mobile, CLI, MCP, timer) retries a `503` today was not checked; this is an open question in section 15.
 
 **Every writer goes through the gateway.** The writers are those of section 3.1:
 
@@ -848,7 +848,7 @@ The checkpoint is read in one database snapshot of the frozen source and carries
 - An entry with `locked = true` that is referenced by exactly one kept invoice becomes a committed reservation by that invoice, `disposition: 'active'`.
 - An entry with `locked = true` that is held by a discarded non-draft invoice, and by no kept invoice, becomes a committed reservation by that invoice, `disposition: 'retained'` (L3).
 - An entry locked only by the old draft-discard re-lock (L2) is released, as a listed correction, only when no other committed or pending owner exists.
-- An entry that is referenced by a kept invoice but has `locked = false` gets no reservation. Copying never adds a lock that does not exist today. The pre-flight reports such entries for information.
+- An entry that is referenced by a kept invoice but has `locked = false` is never given a reservation silently: the pre-flight lists it as an **unlocked link** (10.4), and the disposition recorded for it decides whether it becomes a committed reservation by that invoice. Without a reservation, a second invoice could prepare it after cutover, which the double-allocation fix exists to refuse.
 - Orphans and conflicts are copied only with the disposition recorded for each (10.4).
 
 Later handoffs copy the reservation table as it is.
@@ -866,9 +866,12 @@ The checkpoint copies no money. The first cutover reads invoice links to derive 
 - **orphans:** entries locked with no invoice, kept or discarded, that references them. Today a bulk hard destroy of a non-draft invoice creates exactly these, because its line items unlock only on a draft (section 1.4). Any such destroy run before the first cutover makes this list non-empty.
 - **conflicts:** entries referenced by two or more kept invoices, or with more than one plausible historical owner.
 - entries held by a discarded non-draft invoice: kept, as `retained` reservations (10.3).
-- entries locked only by the old draft-discard re-lock (section 2.3): released at cutover as a listed correction, only when no other committed or pending owner exists.
+- entries locked only by the old draft-discard re-lock (section 2.3): released at cutover as a listed correction, only when no other committed or pending owner exists;
+- **unlocked links:** entries referenced by a kept invoice but with `locked = false`, for example on an invoice created directly as non-draft, which no draft save ever locked (10.3).
 
-Cutover proceeds only when the orphan and conflict lists are empty, or every item has a recorded disposition. The pre-flight is an assertion the cutover runs, not an assumption: for the two seeded businesses, the characterization fixtures assert that both lists are empty, and the cutover checks them again on the live data.
+Cutover proceeds only when the orphan, conflict and unlocked-link lists are empty, or every item has a recorded disposition. The pre-flight is an assertion the cutover runs, not an assumption: for the two seeded businesses, the characterization fixtures assert that the orphan and conflict lists are empty, and the cutover checks every list again on the live data.
+
+**Corrected entries reach the projection.** On the first cutover, an entry whose reservation state differs from its legacy `locked` value (a released draft-discard re-lock, or an orphan or unlocked link whose disposition changes it) is a listed correction. After loading the checkpoint, Timekeeping writes one snapshot per corrected entry to its outbox, at version 1 and the new generation. The relay delivers them after the flip, and the projection then shows the corrected `locked` value.
 
 **Reconciliation (every handoff, step 6).** It compares the loaded checkpoint against the frozen source and writes a report. It **never repairs to "intended" behaviour**. Any difference that the pre-flight did not list aborts the handoff.
 
@@ -877,13 +880,13 @@ Cutover proceeds only when the orphan and conflict lists are empty, or every ite
 | Entries | Every entry snapshot, field by field, with its `version` | Checkpoint equals source; `duration` compared as the stored float, bit for bit |
 | Totals | Count and sum of `duration` per company, per user, per month | Equal |
 | Reservations | Per entry: owner `invoice_id`, `state`, `disposition`, including destroyed-invoice owners | Equal; no `provisional` reservation remains; at most one committed reservation per entry. First cutover: equal to the pre-flight's classification (10.3) |
-| Projection | Every entry in the checkpoint against its `timesheet_entries` row, after the step 3 drain | Same fields and `version`; `locked` is true exactly when the entry has a reservation |
+| Projection | Every entry in the checkpoint against its `timesheet_entries` row, after the step 3 drain | Same fields and `version`; `locked` is true exactly when the entry has a reservation, except for the first cutover's listed corrections, whose snapshots are delivered after the flip |
 | Audit rows | Count and checksum per company | Equal |
 | Operation receipts | Every `invoice_operations` row, and every `invoice_operation_intents` row in the monolith | Equal; no operation `prepared` and no intent `pending`; each `committed` intent has a committed operation, and each `failed` intent has an aborted operation or none |
 | Idempotency receipts | Count and checksum per company, keyed by tenant | Equal |
 | Retired-user marks | Every mark | Equal |
 | Id sequence | The incoming owner's sequence against the highest checkpoint id | Sequence is higher |
-| Money | The financial snapshot: invoice `amount`, `tax`, `discount` and `outstanding_amount`, every line item's `rate` and `quantity`, every `invoice_taxes` row, and the rendered PDF totals, taken before step 1 and after step 6, with no user billing edit between the two | Identical (section 13). The audit log cannot prove this, because `audited` on `Invoice` omits `discount`, `tax` and `outstanding_amount`, and line items and taxes are not audited |
+| Money | The financial snapshot: invoice `amount`, `tax`, `discount` and `outstanding_amount`, every line item's `rate` and `quantity`, every `invoice_taxes` row, and the rendered PDF totals, taken at the end of step 2, once every billing operation admitted before step 1 has settled, and again after step 6. Billing writes are refused between the two (10.1) | Identical (section 13). The audit log cannot prove this, because `audited` on `Invoice` omits `discount`, `tax` and `outstanding_amount`, and line items and taxes are not audited |
 
 Every check is keyed by `company_id`. No report or result mixes companies.
 
