@@ -73,6 +73,19 @@ RSpec.describe Timekeeping::LogSafety do
     end
   end
 
+  describe "a credential configured in TIMEKEEPING_SERVICE_CREDENTIALS" do
+    it "is masked even when shaped like an id, while other ids stay clear" do
+      held_id = "9876543210987654321"
+
+      with_timekeeping_env(Timekeeping::Environment::SERVICE_CREDENTIALS => "other-secret,#{held_id}") do
+        expect(described_class.clear_param?("project_id", held_id)).to be(false)
+        expect(described_class.clear_param?("project_id", "5")).to be(true)
+        expect(described_class.loggable_path("/v1/companies/#{held_id}/entries/12"))
+          .to eq("/v1/companies/[FILTERED]/entries/12")
+      end
+    end
+  end
+
   describe ".loggable_method" do
     it "keeps a known HTTP method and masks any other text" do
       expect(described_class.loggable_method("GET")).to eq("GET")
@@ -114,6 +127,12 @@ RSpec.describe Timekeeping::LogSafety do
       expect(described_class.loggable_path("/v1/companies/#{hex_token}/entries/#{jwt}"))
         .to eq("/v1/companies/[FILTERED]/entries/[FILTERED]")
       expect(described_class.loggable_path("/v1/secret-word/")).to eq("/v1/[FILTERED]/")
+    end
+
+    it "keeps the bulk route words in clear" do
+      expect(described_class.loggable_path("/v1/companies/12/entries/bulk-move")).to eq("/v1/companies/12/entries/bulk-move")
+      expect(described_class.loggable_path("/v1/companies/12/entries/bulk-delete"))
+        .to eq("/v1/companies/12/entries/bulk-delete")
     end
   end
 

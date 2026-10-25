@@ -2,15 +2,15 @@
 
 require "cgi"
 require "digest"
-require_relative "environment"
+require_relative "config"
 require_relative "identity"
 
 module Timekeeping
   # Decides which request values may appear in a log line. A caller can send a
   # bearer token or the service token under any parameter name or as the
   # X-Request-Id header, so a value is shown in clear only when both its name
-  # and its shape say it cannot be a credential and it is not the configured
-  # service token.
+  # and its shape say it cannot be a credential and it is not a credential the
+  # service holds.
   module LogSafety
     MASK = "[FILTERED]"
 
@@ -23,7 +23,7 @@ module Timekeeping
 
     # The fixed words of the service's routes. Any other path segment is a
     # caller's value, such as a company or entry id, and could be a credential.
-    PATH_WORDS = %w[v1 companies entries].freeze
+    PATH_WORDS = %w[v1 companies entries bulk-move bulk-delete].freeze
 
     # The only parameters logged in clear, each with the one value shape it may
     # have. For entry_ids the shape applies to each element.
@@ -44,11 +44,12 @@ module Timekeeping
 
     module_function
 
-    # The configured service token can have any shape, an id, a date or a
-    # UUID included, so every value a shape rule would log in clear is first
-    # compared with it.
+    # A held credential (the service token or one in
+    # Timekeeping.config.service_credentials) can have any shape, an id, a date
+    # or a UUID included, so every value a shape rule would log in clear is
+    # first compared with each of them.
     def held_credential?(value)
-      Identity.service_token?(value.to_s, Environment.service_token)
+      Config.service_credentials.any? { |credential| Identity.service_token?(value.to_s, credential) }
     end
 
     def clear_param?(key, value)

@@ -36,7 +36,7 @@ module Timekeeping
     def self.resolve(authorization:, public_key:, service_token:)
       return anonymous(:missing) if authorization.to_s.strip.empty?
 
-      token = authorization.to_s[BEARER, 1]
+      token = bearer(authorization)
       return anonymous(:invalid) unless token
       return service if service_token?(token, service_token)
 
@@ -45,6 +45,12 @@ module Timekeeping
       anonymous(:expired)
     rescue TokenVerifier::InvalidToken
       anonymous(:invalid)
+    end
+
+    # The token of a "Bearer <token>" Authorization header, or nil. Entry
+    # writes also read it, to refuse a body that carries the caller's token.
+    def self.bearer(authorization)
+      authorization.to_s[BEARER, 1]
     end
 
     # Also used by Timekeeping::LogSafety, so a value equal to the service
