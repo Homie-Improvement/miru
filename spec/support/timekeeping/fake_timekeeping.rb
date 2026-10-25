@@ -53,6 +53,13 @@ module TimekeepingContract
       refused_prepare: ->(free_entry_ids:, conflicting_entry_ids:) { { reserve: [], release: [] } },
       replay_terminal_prepare: true,
       snapshot_entry: ->(entry, credentials:) { entry },
+      # Whether an entry write carries a credential Timekeeping holds anywhere
+      # in its body. Such a write is refused, so the snapshot it would publish
+      # can never carry the credential.
+      credential_in_body: lambda do |body:, credentials:|
+        serialized = JSON.generate(body)
+        credentials.any? { |credential| serialized.include?(credential) }
+      end,
       receipt_key: IdempotencyReceipts::SCOPED_RECEIPT_KEY,
       reject_reused_key: true
     }.freeze
@@ -135,7 +142,7 @@ module TimekeepingContract
 
     def add_reservation(entry_id:, invoice_id:, state:, disposition:)
       company_id = @entries.fetch(entry_id).fetch("company_id")
-      @reservations += [{ company_id:, entry_id:, invoice_id:, state:, disposition:, operation_id: "arranged-#{next_id}" }]
+      @reservations += [{ company_id:, entry_id:, invoice_id:, state:, disposition:, operation_key: "arranged-#{next_id}" }]
       refresh_locked([entry_id])
     end
 
@@ -193,6 +200,7 @@ module TimekeepingContract
         return Wire.error(@entry_contract, "not_found") unless acting.fetch("company_id") == company_id
         return entry_route(route, company_id, acting, params, headers, body) unless ENTRY_WRITE_ROUTES.include?(route)
         return Wire.error(@entry_contract, "stale_generation") unless generation_current?(headers["Ownership-Generation"])
+        return Wire.error(@entry_contract, "credential_in_body") if @policies[:credential_in_body].call(body:, credentials:)
 
         @receipts.answer(company_scope: company_id, actor: ["user", acting["id"]], operation: "#{route} #{params["entry_id"]}",
                          key: headers["Idempotency-Key"], body:) do
@@ -369,7 +377,10 @@ module TimekeepingContract
           other[:company_id] == company_id && other[:invoice_id] == body["invoice_id"] && other[:state] == "prepared"
         end
         if unresolved
-          return respond(409, "reason" => "unresolved_operation", "operation_id" => unresolved[:operation_id], "retryable" => true)
+          unresolved_error = @reservation_contract.dig("errors", "unresolved_operation")
+          return respond(unresolved_error.fetch("status"), "reason" => unresolved_error.fetch("reason"),
+                                                           "operation_id" => unresolved[:operation_id],
+                                                           "retryable" => unresolved_error.fetch("retryable"))
         end
 
         entry_ids = Array(body["entries"]).map { |id| integer(id) }
@@ -377,21 +388,26 @@ module TimekeepingContract
         conflicts = outcomes.select { |_entry_id, outcome| ReservationRules.refusal?(outcome) }
         free = outcomes.select { |_entry_id, outcome| outcome == :add_provisional }.keys
         operation_id = body["operation_id"]
+        # Reservations carry the operation's full identity, so another actor's
+        # operation with the same operation_id never commits or aborts them.
+        operation_key = @policies[:operation_key].call(company_id:, actor:, operation_id:)
 
         unless conflicts.empty?
           refused = @policies[:refused_prepare].call(free_entry_ids: free, conflicting_entry_ids: conflicts.keys)
-          reserve_provisionally(refused[:reserve], company_id, body, operation_id)
+          reserve_provisionally(refused[:reserve], company_id, body, operation_key)
           release(refused[:release])
-          return respond(409, "reason" => "conflict",
-                              "conflicts" => conflicts.map { |entry_id, reason| { "entry_id" => entry_id, "reason" => reason.to_s } })
+          conflict_error = @reservation_contract.dig("errors", "conflict")
+          return respond(conflict_error.fetch("status"),
+                         "reason" => conflict_error.fetch("reason"),
+                         "conflicts" => conflicts.map { |entry_id, reason| { "entry_id" => entry_id, "reason" => reason.to_s } })
         end
 
-        reserve_provisionally(free, company_id, body, operation_id)
+        reserve_provisionally(free, company_id, body, operation_key)
         stored = {
-          company_id:, operation_id:, invoice_id: body["invoice_id"], state: "prepared", request:,
+          key: operation_key, company_id:, operation_id:, invoice_id: body["invoice_id"], state: "prepared", request:,
           desired_entry_ids: entry_ids, disposition: body["disposition"]
         }
-        @operations[@policies[:operation_key].call(company_id:, actor:, operation_id:)] = stored
+        @operations[operation_key] = stored
         prepare_answer(stored)
       end
 
@@ -410,9 +426,9 @@ module TimekeepingContract
                      "entries" => operation[:desired_entry_ids].map { |id| { "entry_id" => id, "company_id" => operation[:company_id] } })
       end
 
-      def reserve_provisionally(entry_ids, company_id, body, operation_id)
+      def reserve_provisionally(entry_ids, company_id, body, operation_key)
         @reservations += entry_ids.map do |entry_id|
-          { company_id:, entry_id:, invoice_id: body["invoice_id"], state: "provisional", disposition: body["disposition"], operation_id: }
+          { company_id:, entry_id:, invoice_id: body["invoice_id"], state: "provisional", disposition: body["disposition"], operation_key: }
         end
         refresh_locked(entry_ids)
       end
@@ -470,8 +486,7 @@ module TimekeepingContract
 
       def own_provisional(operation)
         @reservations.select do |reservation|
-          reservation[:company_id] == operation[:company_id] && reservation[:operation_id] == operation[:operation_id] &&
-            reservation[:state] == "provisional"
+          reservation[:operation_key] == operation[:key] && reservation[:state] == "provisional"
         end
       end
 

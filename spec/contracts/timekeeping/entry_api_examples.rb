@@ -176,6 +176,34 @@ RSpec.shared_examples "timekeeping entry API contract" do
     end
   end
 
+  describe "credentials in an entry body" do
+    let(:credential_in_body) { timekeeping_contract_error(:entry_api, "credential_in_body") }
+
+    it "refuses a create that nests the caller's token or a service identity in metadata and creates nothing" do
+      service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: [])
+      bodies = [
+        entry_body(project:, source_metadata: { "session" => owner_token }),
+        entry_body(project:, proof_metadata: { "headers" => { "authorization" => "Bearer #{service}" } })
+      ]
+
+      bodies.each do |body|
+        response = create_entry(company, owner_token, body)
+
+        expect([response.status, response.body]).to eq([credential_in_body.fetch("status"), credential_in_body.fetch("body")])
+      end
+      expect(list_entries(company, owner_token).body.fetch("entries")).to be_empty
+    end
+
+    it "refuses an update that nests the caller's token in metadata and changes nothing" do
+      created = create_entry(company, owner_token, entry_body(project:)).body
+
+      response = write("PATCH", entry_path(:update, created.fetch("id")), owner_token, { "proof_metadata" => { "token" => owner_token } })
+
+      expect([response.status, response.body]).to eq([credential_in_body.fetch("status"), credential_in_body.fetch("body")])
+      expect(show_entry(company, owner_token, created.fetch("id")).body).to eq(created)
+    end
+  end
+
   describe "the company boundary" do
     it "answers GET, PATCH and DELETE of another company's entry exactly as a missing id" do
       before = show_entry(other_company, foreign_owner_token, foreign_entry).body

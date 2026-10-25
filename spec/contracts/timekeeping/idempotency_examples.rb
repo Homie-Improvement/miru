@@ -122,6 +122,24 @@ RSpec.shared_examples "timekeeping idempotency contract" do |contracts: [:entry_
         expect(other_actor.body.fetch("entries")).to eq([{ "entry_id" => y, "company_id" => company }])
       end
 
+      it "keeps another service's reservations when one service ends an operation with the same id" do
+        operation_id = new_key
+        second_service = timekeeping_arrange.service_identity(company:, name: "invoice-cleanup", operations:)
+        prepare_with(service, company, 501, [x], operation_id)
+        prepare_with(second_service, company, 502, [y], operation_id)
+
+        aborted = reservation_command(:abort, company, service, { "invoice_id" => 501, "operation_id" => operation_id })
+
+        expect(aborted.body).to eq("dropped" => 1)
+        expect(timekeeping_arrange.reservations_for(x)).to eq([])
+        expect(timekeeping_arrange.reservations_for(y)).to eq([{ "invoice_id" => 502, "state" => "provisional" }])
+
+        committed = reservation_command(:commit, company, second_service, { "invoice_id" => 502, "operation_id" => operation_id })
+
+        expect(committed.body).to eq("reserved" => 1, "released" => 0)
+        expect(timekeeping_arrange.reservations_for(y)).to eq([{ "invoice_id" => 502, "state" => "committed" }])
+      end
+
       it "does not match an operation id reused by another company" do
         operation_id = new_key
         prepare_with(service, company, 501, [x], operation_id)
@@ -181,6 +199,17 @@ RSpec.shared_examples "timekeeping idempotency contract" do |contracts: [:entry_
         other_company_answer = deliver_snapshots(relay_identity, [snapshot_item(entry_id: 80_002, company: other_company, version: 1)], key:)
 
         expect([other_company_answer.status, other_company_answer.body]).to eq([200, { "applied" => 1, "ignored" => 0 }])
+      end
+
+      it "evaluates a batch again after a 409 under the same key instead of replaying the refusal" do
+        key = new_key
+        timekeeping_arrange.set_generation(2)
+
+        refused = deliver_snapshots(relay_identity, [snapshot_item(entry_id: 80_001, company:, version: 1, generation: 1)], key:)
+        retried = deliver_snapshots(relay_identity, [snapshot_item(entry_id: 80_001, company:, version: 1, generation: 2)], key:)
+
+        expect(refused.status).to eq(timekeeping_contract_error(:entry_snapshots, "stale_generation").fetch("status"))
+        expect([retried.status, retried.body]).to eq([200, { "applied" => 1, "ignored" => 0 }])
       end
 
       it "counts an already stored version under a new key as ignored" do

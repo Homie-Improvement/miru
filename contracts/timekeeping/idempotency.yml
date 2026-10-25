@@ -2,7 +2,9 @@
 # (docs/architecture/timekeeping-soa.md section 5.1).
 # Same key and body returns the same answer; same key with a new body answers
 # idempotency_key_reused; a key or operation id from another company or actor
-# never matches.
+# never matches. One exception: a prepare replayed after its operation ended
+# returns the operation's terminal state, not the first prepared answer
+# (see key_sources.reservations).
 name: idempotency
 source: docs/architecture/timekeeping-soa.md section 5.1
 
@@ -19,6 +21,12 @@ key_sources:
   reservations:
     key: operation_id in the body
     company_scope: the path company_id
+    # Prepare answers from the stored operation record, not from a receipt.
+    # A replayed prepare returns the operation's current state, so after
+    # commit or abort it answers committed or aborted (reservations.yml
+    # rules.terminal_prepare). The record is kept with no 24-hour limit.
+    # Commit, abort, mark-billed and detach-entries use ordinary receipts.
+    prepare_answer: the stored operation record, with its current state
   entry_snapshots:
     key: Idempotency-Key header
     company_scope: the sorted set of company_id values in the batch's entries

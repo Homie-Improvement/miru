@@ -92,7 +92,9 @@ RSpec.describe "Timekeeping contract examples against fakes with one rule broken
        generation == current || (!handoff.nil? && generation == handoff[:previous_generation])
      end } }],
     ["reports success for a committed operation whose intent is pending", :reconciliation,
-     { reconciler: { outcome: ->(table, remote_state:, **) { remote_state == "committed" ? table.fetch("rows").first : table.fetch("fallback") } } }]
+     { reconciler: { outcome: ->(table, remote_state:, **) { remote_state == "committed" ? table.fetch("rows").first : table.fetch("fallback") } } }],
+    ["stores a 409 as a snapshot receipt", :snapshot_idempotency, { relay: { store_answer: ->(**) { true } } }],
+    ["accepts an entry body that carries a credential", :entry_api, { timekeeping: { credential_in_body: ->(**) { false } } }]
   ]
 
   it "passes every group with the unbroken fakes" do

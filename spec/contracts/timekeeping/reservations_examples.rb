@@ -13,6 +13,7 @@ RSpec.shared_examples "timekeeping reservations contract" do
   let(:company) { timekeeping_arrange.company }
   let(:other_company) { timekeeping_arrange.company }
   let(:service) { timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: reservation_operations) }
+  let(:conflict_error) { timekeeping_contract_error(:reservations, "conflict") }
   let(:invoice_a) { 501 }
   let(:invoice_b) { 502 }
   let(:user) { timekeeping_arrange.user(company:, role: "employee") }
@@ -60,7 +61,7 @@ RSpec.shared_examples "timekeeping reservations contract" do
       response = prepare(invoice_b, [y, x, z])
 
       expect(response.status).to eq(409)
-      expect(response.body).to eq("reason" => "conflict", "conflicts" => [{ "entry_id" => x, "reason" => "on_another_invoice" }])
+      expect(response.body).to eq("reason" => conflict_error.fetch("reason"), "conflicts" => [{ "entry_id" => x, "reason" => "on_another_invoice" }])
       expect(reservation_state(x, y, z)).to eq(before)
       expect(timekeeping_arrange.reservations_for(x)).to eq(held_by(invoice_a))
       expect(timekeeping_arrange.entry_locked(x)).to be(true)
@@ -77,9 +78,12 @@ RSpec.shared_examples "timekeeping reservations contract" do
       unresolved = prepare(invoice_a, [y])
 
       expect(elsewhere.status).to eq(409)
-      expect(elsewhere.body).to eq("reason" => "conflict", "conflicts" => [{ "entry_id" => x, "reason" => "provisional_elsewhere" }])
+      expect(elsewhere.body).to eq("reason" => conflict_error.fetch("reason"), "conflicts" => [{ "entry_id" => x, "reason" => "provisional_elsewhere" }])
       expect(unresolved.status).to eq(409)
-      expect(unresolved.body).to eq("reason" => "unresolved_operation", "operation_id" => first_operation, "retryable" => true)
+      unresolved_error = timekeeping_contract_error(:reservations, "unresolved_operation")
+      expect(unresolved.status).to eq(unresolved_error.fetch("status"))
+      expect(unresolved.body).to eq("reason" => unresolved_error.fetch("reason"), "operation_id" => first_operation,
+                                    "retryable" => unresolved_error.fetch("retryable"))
       expect(reservation_state(x, y)).to eq(before)
     end
 

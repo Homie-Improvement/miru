@@ -4,19 +4,21 @@ require "json"
 
 module TimekeepingContract
   # In-memory idempotency receipts (contracts/timekeeping/idempotency.yml).
-  # A receipt is stored only for a 2xx answer, so a retry after an error,
-  # a 409 included, is evaluated again.
+  # A receipt is stored only for an answer in the contract's stored_statuses
+  # class (2xx), so a retry after an error, a 409 included, is evaluated again.
   class IdempotencyReceipts
-    SUCCESS = (200..299)
-
     # Which request facts a receipt is keyed by. The contract scopes it by
     # company, actor, operation and key, so no other caller can match it.
     SCOPED_RECEIPT_KEY = ->(company_scope:, actor:, operation:, key:) { [company_scope, actor, operation, key] }
 
-    def initialize(receipt_key: SCOPED_RECEIPT_KEY, reject_reused_key: true)
+    # Whether an answer is stored: stored_statuses names a status class such as "2xx".
+    STORE_CONTRACT_STATUSES = ->(status:, stored_statuses:) { status.to_s.start_with?(stored_statuses.delete_suffix("xx")) }
+
+    def initialize(receipt_key: SCOPED_RECEIPT_KEY, reject_reused_key: true, store_answer: STORE_CONTRACT_STATUSES)
       @contract = TimekeepingContract.load(:idempotency)
       @receipt_key = receipt_key
       @reject_reused_key = reject_reused_key
+      @store_answer = store_answer
       @receipts = {}
     end
 
@@ -35,7 +37,9 @@ module TimekeepingContract
       end
 
       response = yield
-      @receipts[receipt_key] = { fingerprint:, response: } if SUCCESS.cover?(response.status)
+      if @store_answer.call(status: response.status, stored_statuses: @contract.fetch("stored_statuses"))
+        @receipts[receipt_key] = { fingerprint:, response: }
+      end
       response
     end
   end

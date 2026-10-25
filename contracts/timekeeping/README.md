@@ -19,6 +19,10 @@ The shared groups are `"timekeeping entry API contract"`, `"timekeeping reservat
 
 `spec/contracts/timekeeping/fake_timekeeping_spec.rb` and `fake_relay_spec.rb` run the groups against the in-memory fakes through the `"timekeeping contract fakes"` shared context. `mutation_spec.rb` breaks one rule of a fake at a time and checks that the matching group fails.
 
+## What these contracts do not cover
+
+The entry API contract covers the body's `user_id` (the target user), not which existing entries an employee may read or change. Whether an employee may see, edit or delete a colleague's entry in the same company (rows A1 and A4 of section 2.1, enforced in Timekeeping per section 6.3) is not checked here, and the fake Timekeeping lets any user of the company do it. A provider that passes these examples has not shown that rule. Its own specs must prove it.
+
 ## Exact keys
 
 The key lists in `entry_snapshots.yml` are exact. The entry fields are the columns of `timesheet_entries` in `db/schema.rb` plus `company_id` and `version`. A snapshot with any other key, such as a user name, an email or a token, breaks the contract. When a column is added to `timesheet_entries`, add it to `entry_fields` in the same change.

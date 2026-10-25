@@ -53,10 +53,12 @@ rules:
 errors:
   conflict:
     status: 409
+    reason: conflict
     body_fields: [reason, conflicts]
     conflict_fields: [entry_id, reason]
   unresolved_operation:
     status: 409
+    reason: unresolved_operation
     body_fields: [reason, operation_id, retryable]
     retryable: true
   stale_generation:

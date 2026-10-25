@@ -78,6 +78,10 @@ rules:
   company_mismatch: An entry or user of another company answers not_found, exactly as a missing id does.
   stale_generation: A stale Ownership-Generation answers stale_generation and changes nothing; on a bulk route it fails the whole request.
   destroy: DELETE discards the entry and returns it; a later GET answers not_found.
+  credential_in_body: >-
+    A write whose body holds, anywhere, a credential the provider issued or
+    holds (a user token or a service identity) answers credential_in_body and
+    changes nothing, so no snapshot can carry it.
 
 errors:
   unauthorized:
@@ -95,3 +99,6 @@ errors:
   version_conflict:
     status: 409
     body: { reason: version_conflict }
+  credential_in_body:
+    status: 422
+    body: { reason: credential_in_body }

@@ -27,7 +27,8 @@ module TimekeepingContract
       # A discard is kept as a row with discarded_at set, never deleted.
       delete_tombstones: false,
       receipt_key: IdempotencyReceipts::SCOPED_RECEIPT_KEY,
-      reject_reused_key: true
+      reject_reused_key: true,
+      store_answer: IdempotencyReceipts::STORE_CONTRACT_STATUSES
     }.freeze
 
     attr_reader :generation
@@ -37,7 +38,8 @@ module TimekeepingContract
       @policies = POLICIES.merge(policies)
       @contract = TimekeepingContract.load(:entry_snapshots)
       @router = Router.new(@contract.fetch("routes"))
-      @receipts = IdempotencyReceipts.new(receipt_key: @policies[:receipt_key], reject_reused_key: @policies[:reject_reused_key])
+      @receipts = IdempotencyReceipts.new(receipt_key: @policies[:receipt_key], reject_reused_key: @policies[:reject_reused_key],
+                                          store_answer: @policies[:store_answer])
       @generation = FakeTimekeeping::INITIAL_GENERATION
       @handoff = nil
       @projection = {}

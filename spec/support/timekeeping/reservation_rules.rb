@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "contract"
+
 module TimekeepingContract
   # The prepare decision table of docs/architecture/timekeeping-soa.md
   # section 7.2, as data. For each entry in an invoice's desired set, the
@@ -16,7 +18,7 @@ module TimekeepingContract
       [->(_entry) { true }, :add_provisional]
     ].freeze
 
-    REFUSALS = %i[not_found provisional_elsewhere on_another_invoice].freeze
+    REFUSALS = TimekeepingContract.load(:reservations).fetch("conflict_reasons").map(&:to_sym).freeze
 
     module_function
 
