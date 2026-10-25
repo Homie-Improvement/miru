@@ -1,0 +1,69 @@
+# The entry snapshot event (docs/architecture/timekeeping-soa.md section 5.4).
+# Payloads carry ids, never user names, emails or credentials, so every key
+# list here is exact: a key outside it breaks the contract.
+name: entry_snapshots
+source: docs/architecture/timekeeping-soa.md section 5.4
+schema_version: 1
+
+routes:
+  deliver:
+    method: POST
+    path: /internal/v1/timekeeping/entry-snapshots
+
+headers:
+  authorization: "Authorization: Bearer <Timekeeping service identity>"
+  idempotency_key: "Idempotency-Key: <uuid>"
+
+batch_fields: [schema_version, snapshots]
+item_fields: [generation, outbox_position, entry]
+entry_fields:
+  # The columns of timesheet_entries in db/schema.rb.
+  - id
+  - project_id
+  - user_id
+  - agent_id
+  - work_date
+  - duration
+  - note
+  - bill_status
+  - review_status
+  - locked
+  - source
+  - source_metadata
+  - external_run_id
+  - external_session_id
+  - proof_url
+  - proof_metadata
+  - discarded_at
+  - created_at
+  - updated_at
+  # Columns the projection gains.
+  - company_id
+  - version
+response_fields: [applied, ignored]
+
+rules:
+  version_upsert: The consumer upserts by entry id and applies a snapshot only when its version is higher than the stored row's; any other is counted ignored.
+  tombstone: A discard arrives with discarded_at set and is never a row delete, so a late older snapshot cannot bring the entry back.
+  generation: The consumer accepts the current owner's generation.
+  handoff_window: >-
+    Between closing admission and the ownership flip, the consumer also accepts
+    the previous generation, but only up to the final outbox_position captured
+    when that owner was frozen. The flip removes that permission.
+  stale_batch: A batch holding any refused snapshot answers stale_generation and applies nothing.
+  outbox_order: The relay delivers in outbox_position order and marks a row sent only after a 200.
+  credentials: No credential the producer holds appears anywhere in the batch.
+
+errors:
+  stale_generation:
+    status: 409
+    body: { reason: stale_generation }
+  not_found:
+    status: 404
+    body: { reason: not_found }
+  unauthorized:
+    status: 401
+    body: { reason: unauthorized }
+  forbidden:
+    status: 403
+    body: { reason: forbidden }

@@ -1,0 +1,531 @@
+# frozen_string_literal: true
+
+require "securerandom"
+
+require_relative "client"
+require_relative "contract"
+require_relative "idempotency_receipts"
+require_relative "reservation_rules"
+
+module TimekeepingContract
+  # An in-memory Timekeeping that answers the entry API and the reservation
+  # operations of contracts/timekeeping/, and writes one entry snapshot to its
+  # outbox for every change to an entry. Later lanes build against it.
+  #
+  # Every rule the contract examples check is a named policy passed in at
+  # construction, so spec/contracts/timekeeping/mutation_spec.rb can break one
+  # rule at a time and show the examples catch it. All state is per instance.
+  class FakeTimekeeping
+    INITIAL_GENERATION = 1
+    FIRST_ID = 1000
+    CLOCK_START = Time.utc(2026, 1, 1)
+
+    # Who the body's user_id names, in order: the first row that holds decides.
+    TARGET_USER_TABLE = [
+      [->(request) { request[:requested_id].nil? || request[:requested_id] == request[:acting]["id"] }, :acting],
+      [->(request) { !request[:privileged] }, :forbidden],
+      [->(request) { request[:requested]&.fetch("company_id") != request[:acting]["company_id"] }, :not_found],
+      [->(_request) { true }, :requested]
+    ].freeze
+
+    # Whether a credential may call a reservation route, in order.
+    SERVICE_ACCESS_TABLE = [
+      [->(access) { access[:kind].nil? }, :unauthorized],
+      [->(access) { access[:kind] == :user }, :forbidden],
+      [->(access) { !access[:service].fetch("operations").include?(access[:operation]) }, :forbidden],
+      [->(access) { access[:service].fetch("company_id") != access[:company_id] }, :not_found],
+      [->(_access) { true }, :ok]
+    ].freeze
+
+    def self.first_match(table, facts)
+      table.find { |condition, _result| condition.call(facts) }.last
+    end
+
+    POLICIES = {
+      generation_current: ->(sent:, current:) { sent == current },
+      entry_visible: ->(entry:, company_id:) { !entry.nil? && entry["discarded_at"].nil? && entry["company_id"] == company_id },
+      locked: ->(reserved:, was_locked:) { reserved },
+      duration: ->(stored) { stored },
+      target_user: ->(**request) { first_match(TARGET_USER_TABLE, request) },
+      service_access: ->(**access) { first_match(SERVICE_ACCESS_TABLE, access) },
+      operation_key: ->(company_id:, actor:, operation_id:) { [company_id, actor, operation_id] },
+      # Which entries a refused prepare still reserves or releases: none.
+      refused_prepare: ->(free_entry_ids:, conflicting_entry_ids:) { { reserve: [], release: [] } },
+      replay_terminal_prepare: true,
+      snapshot_entry: ->(entry, credentials:) { entry },
+      # Whether an entry write carries a credential Timekeeping holds anywhere
+      # in its body. Such a write is refused, so the snapshot it would publish
+      # can never carry the credential.
+      credential_in_body: lambda do |body:, credentials:|
+        serialized = JSON.generate(body)
+        credentials.any? { |credential| serialized.include?(credential) }
+      end,
+      receipt_key: IdempotencyReceipts::SCOPED_RECEIPT_KEY,
+      reject_reused_key: true
+    }.freeze
+
+    ENTRY_WRITE_ROUTES = %w[create update destroy bulk_move bulk_delete].freeze
+
+    attr_reader :generation, :outbox
+
+    def initialize(policies: POLICIES)
+      @policies = POLICIES.merge(policies)
+      @entry_contract = TimekeepingContract.load(:entry_api)
+      @reservation_contract = TimekeepingContract.load(:reservations)
+      @idempotency_contract = TimekeepingContract.load(:idempotency)
+      @snapshot_contract = TimekeepingContract.load(:entry_snapshots)
+      @entry_router = Router.new(@entry_contract.fetch("routes"))
+      @reservation_router = Router.new(@reservation_contract.fetch("routes"))
+      @receipts = IdempotencyReceipts.new(receipt_key: @policies[:receipt_key], reject_reused_key: @policies[:reject_reused_key])
+      @generation = INITIAL_GENERATION
+      @next_id = FIRST_ID
+      @ticks = 0
+      @users = {}
+      @tokens = {}
+      @services = {}
+      @projects = {}
+      @entries = {}
+      @reservations = []
+      @operations = {}
+      @outbox = []
+    end
+
+    def call(method, path, headers: {}, body: nil)
+      headers = headers.to_h
+      body = Wire.copy(body) || {}
+      if (match = @entry_router.match(method, path))
+        entry_request(*match, headers, body)
+      elsif (match = @reservation_router.match(method, path))
+        reservation_request(*match, headers, body)
+      else
+        Wire.error(@entry_contract, "not_found")
+      end
+    end
+
+    # Setup used by FakeArrange. Real providers seed through their own stores.
+
+    def add_company
+      next_id
+    end
+
+    def add_user(company_id:, role:)
+      next_id.tap { |id| @users[id] = { "id" => id, "company_id" => company_id, "role" => role } }
+    end
+
+    def issue_token(user_id)
+      "test-user-token-#{SecureRandom.hex(8)}".tap { |token| @tokens[token] = user_id }
+    end
+
+    def add_service(company_id:, name:, operations:)
+      "test-service-identity-#{SecureRandom.hex(8)}".tap do |credential|
+        @services[credential] = { "company_id" => company_id, "name" => name, "operations" => operations }
+      end
+    end
+
+    def service(credential)
+      @services[credential]
+    end
+
+    def user_token?(credential)
+      @tokens.key?(credential)
+    end
+
+    def add_project(company_id:)
+      next_id.tap { |id| @projects[id] = company_id }
+    end
+
+    def add_entry(company_id:, user_id:, project_id:, **attributes)
+      fields = { "work_date" => "2026-03-02", "duration" => 60.0 }
+        .merge(Wire.copy(attributes), "project_id" => project_id, "user_id" => user_id)
+      write_entry(new_entry(company_id, fields))
+    end
+
+    def add_reservation(entry_id:, invoice_id:, state:, disposition:)
+      company_id = @entries.fetch(entry_id).fetch("company_id")
+      @reservations += [{ company_id:, entry_id:, invoice_id:, state:, disposition:, operation_key: "arranged-#{next_id}" }]
+      refresh_locked([entry_id])
+    end
+
+    def generation=(generation)
+      @generation = Integer(generation)
+    end
+
+    def entry_locked?(entry_id)
+      @entries.fetch(entry_id).fetch("locked")
+    end
+
+    def reservations_for(entry_id)
+      @reservations.filter_map do |reservation|
+        { "invoice_id" => reservation[:invoice_id], "state" => reservation[:state] } if reservation[:entry_id] == entry_id
+      end
+    end
+
+    def credentials
+      @tokens.keys + @services.keys
+    end
+
+    private
+
+      def next_id
+        @next_id += 1
+      end
+
+      def now
+        (CLOCK_START + (@ticks += 1)).iso8601
+      end
+
+      def integer(value)
+        Integer(value, exception: false)
+      end
+
+      def respond(status, body)
+        Response.new(status:, body: Wire.copy(body))
+      end
+
+      def generation_current?(sent)
+        @policies[:generation_current].call(sent: integer(sent), current: @generation)
+      end
+
+      def visible_entry(id, company_id)
+        entry = @entries[integer(id)]
+        entry if @policies[:entry_visible].call(entry:, company_id:)
+      end
+
+      # Entry API
+
+      def entry_request(route, params, headers, body)
+        company_id = integer(params["company_id"])
+        acting = @users[@tokens[Wire.bearer(headers)]]
+        return Wire.error(@entry_contract, "unauthorized") unless acting
+        return Wire.error(@entry_contract, "not_found") unless acting.fetch("company_id") == company_id
+        return entry_route(route, company_id, acting, params, headers, body) unless ENTRY_WRITE_ROUTES.include?(route)
+        return Wire.error(@entry_contract, "stale_generation") unless generation_current?(headers["Ownership-Generation"])
+        return Wire.error(@entry_contract, "credential_in_body") if @policies[:credential_in_body].call(body:, credentials:)
+
+        @receipts.answer(company_scope: company_id, actor: ["user", acting["id"]], operation: "#{route} #{params["entry_id"]}",
+                         key: headers["Idempotency-Key"], body:) do
+          entry_route(route, company_id, acting, params, headers, body)
+        end
+      end
+
+      def entry_route(route, company_id, acting, params, headers, body)
+        case route
+        when "create" then create_entry(company_id, acting, body)
+        when "update" then update_entry(company_id, acting, params, headers, body)
+        when "destroy" then destroy_entry(company_id, params)
+        when "show" then show_entry(company_id, params)
+        when "index" then list_entries(company_id, params)
+        when "bulk_move" then bulk_change(company_id, body, "moved") { |entry| entry.merge("project_id" => body["project_id"]) }
+        when "bulk_delete" then bulk_change(company_id, body, "deleted") { |entry| entry.merge("discarded_at" => now) }
+        end
+      end
+
+      def create_entry(company_id, acting, body)
+        user_id, failure = target_user(acting, body)
+        return failure if failure
+        return Wire.error(@entry_contract, "not_found") unless @projects[integer(body["project_id"])] == company_id
+
+        entry = write_entry(new_entry(company_id, entry_fields(body).merge("user_id" => user_id)))
+        respond(201, present(entry))
+      end
+
+      def update_entry(company_id, acting, params, headers, body)
+        entry = visible_entry(params["entry_id"], company_id)
+        return Wire.error(@entry_contract, "not_found") unless entry
+
+        if_match = headers["If-Match"]
+        return Wire.error(@entry_contract, "version_conflict") if if_match && integer(if_match) != entry["version"]
+
+        changes = entry_fields(body)
+        if body.key?("user_id")
+          user_id, failure = target_user(acting, body)
+          return failure if failure
+
+          changes["user_id"] = user_id
+        end
+        if changes.key?("project_id") && @projects[integer(changes["project_id"])] != company_id
+          return Wire.error(@entry_contract, "not_found")
+        end
+
+        respond(200, present(write_entry(entry.merge(changes))))
+      end
+
+      def destroy_entry(company_id, params)
+        entry = visible_entry(params["entry_id"], company_id)
+        return Wire.error(@entry_contract, "not_found") unless entry
+
+        respond(200, present(write_entry(entry.merge("discarded_at" => now))))
+      end
+
+      def show_entry(company_id, params)
+        entry = visible_entry(params["entry_id"], company_id)
+        entry ? respond(200, present(entry)) : Wire.error(@entry_contract, "not_found")
+      end
+
+      def list_entries(company_id, params)
+        filters = params.slice("user_id", "project_id").reject { |_field, value| value.to_s.empty? }
+          .transform_values { |value| integer(value) }
+        entries = @entries.values.select do |entry|
+          @policies[:entry_visible].call(entry:, company_id:) &&
+            filters.all? { |field, value| entry[field] == value } &&
+            (params["from"].to_s.empty? || entry["work_date"] >= params["from"]) &&
+            (params["to"].to_s.empty? || entry["work_date"] <= params["to"])
+        end
+        respond(200, "entries" => entries.map { |entry| present(entry) })
+      end
+
+      def bulk_change(company_id, body, result)
+        if body.key?("project_id") && @projects[integer(body["project_id"])] != company_id
+          return Wire.error(@entry_contract, "not_found")
+        end
+
+        results = Array(body["entry_ids"]).map do |entry_id|
+          entry = visible_entry(entry_id, company_id)
+          write_entry(yield(entry)) if entry
+          { "entry_id" => entry_id, "result" => entry ? result : "not_found" }
+        end
+        respond(200, "results" => results)
+      end
+
+      # Returns [user id] or [nil, error response] for the body's user_id.
+      def target_user(acting, body)
+        requested_id = body["user_id"].nil? ? nil : integer(body["user_id"])
+        decision = @policies[:target_user].call(
+          acting:, requested_id:, requested: @users[requested_id],
+          privileged: @entry_contract.fetch("privileged_roles").include?(acting["role"])
+        )
+        case decision
+        when :acting then [acting["id"]]
+        when :requested then [requested_id]
+        else [nil, Wire.error(@entry_contract, decision.to_s)]
+        end
+      end
+
+      def entry_fields(body)
+        request = @entry_contract.fetch("request")
+        body.slice(*(request.fetch("entry_required_fields") + request.fetch("entry_optional_fields") - ["user_id"]))
+      end
+
+      def new_entry(company_id, fields)
+        time = now
+        defaults = @snapshot_contract.fetch("entry_fields").index_with(nil).merge(
+          "id" => next_id, "company_id" => company_id, "version" => 0, "note" => "", "bill_status" => "unbilled",
+          "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
+          "proof_metadata" => {}, "created_at" => time
+        )
+        defaults.merge(fields.slice(*defaults.keys))
+      end
+
+      # Stores a changed entry with a higher version and writes its snapshot to
+      # the outbox, as Timekeeping does in the same transaction as the change.
+      def write_entry(entry)
+        stored = entry.merge("version" => entry["version"] + 1, "updated_at" => now)
+        @entries[stored["id"]] = stored
+        snapshot = @policies[:snapshot_entry].call(snapshot_fields(stored), credentials:)
+        @outbox += [{ "generation" => @generation, "outbox_position" => @outbox.size + 1, "entry" => Wire.copy(snapshot) }]
+        stored
+      end
+
+      def snapshot_fields(entry)
+        entry.slice(*@snapshot_contract.fetch("entry_fields")).merge("duration" => @policies[:duration].call(entry["duration"]))
+      end
+
+      def present(entry)
+        entry.slice(*@entry_contract.dig("response", "entry_fields"))
+          .merge("duration" => @policies[:duration].call(entry["duration"]))
+      end
+
+      # Reservations and service commands
+
+      def reservation_request(route, params, headers, body)
+        company_id = integer(params["company_id"])
+        actor, failure = authorize_service(Wire.bearer(headers), company_id, route)
+        return failure if failure
+        return Wire.error(@reservation_contract, "stale_generation") unless generation_current?(body["generation"])
+
+        case route
+        when "prepare" then prepare(company_id, actor, body)
+        when "commit", "abort" then finish(route, company_id, actor, body)
+        when "mark_billed" then mark_billed(company_id, actor, params, body)
+        when "detach_entries" then detach_entries(company_id, actor, params, body)
+        end
+      end
+
+      # Returns [actor] or [nil, error response].
+      def authorize_service(credential, company_id, operation)
+        service = @services[credential]
+        kind = (:service if service) || (:user if user_token?(credential))
+        decision = @policies[:service_access].call(kind:, service:, company_id:, operation:)
+        return [nil, Wire.error(@reservation_contract, decision.to_s)] unless decision == :ok
+
+        [service ? ["service", service["name"]] : ["user", @tokens[credential]]]
+      end
+
+      def operation(company_id, actor, operation_id)
+        @operations[@policies[:operation_key].call(company_id:, actor:, operation_id:)]
+      end
+
+      def prepare(company_id, actor, body)
+        existing = operation(company_id, actor, body["operation_id"])
+        if existing
+          return Wire.error(@idempotency_contract, "key_reused") unless existing[:request] == body
+          return prepare_answer(existing) if existing[:state] == "prepared" || @policies[:replay_terminal_prepare]
+        end
+
+        unresolved = @operations.values.find do |other|
+          other[:company_id] == company_id && other[:invoice_id] == body["invoice_id"] && other[:state] == "prepared"
+        end
+        if unresolved
+          unresolved_error = @reservation_contract.dig("errors", "unresolved_operation")
+          return respond(unresolved_error.fetch("status"), "reason" => unresolved_error.fetch("reason"),
+                                                           "operation_id" => unresolved[:operation_id],
+                                                           "retryable" => unresolved_error.fetch("retryable"))
+        end
+
+        entry_ids = Array(body["entries"]).map { |id| integer(id) }
+        outcomes = entry_ids.index_with { |entry_id| prepare_outcome(entry_id, company_id, body["invoice_id"]) }
+        conflicts = outcomes.select { |_entry_id, outcome| ReservationRules.refusal?(outcome) }
+        free = outcomes.select { |_entry_id, outcome| outcome == :add_provisional }.keys
+        operation_id = body["operation_id"]
+        # Reservations carry the operation's full identity, so another actor's
+        # operation with the same operation_id never commits or aborts them.
+        operation_key = @policies[:operation_key].call(company_id:, actor:, operation_id:)
+
+        unless conflicts.empty?
+          refused = @policies[:refused_prepare].call(free_entry_ids: free, conflicting_entry_ids: conflicts.keys)
+          reserve_provisionally(refused[:reserve], company_id, body, operation_key)
+          release(refused[:release])
+          conflict_error = @reservation_contract.dig("errors", "conflict")
+          return respond(conflict_error.fetch("status"),
+                         "reason" => conflict_error.fetch("reason"),
+                         "conflicts" => conflicts.map { |entry_id, reason| { "entry_id" => entry_id, "reason" => reason.to_s } })
+        end
+
+        reserve_provisionally(free, company_id, body, operation_key)
+        stored = {
+          key: operation_key, company_id:, operation_id:, invoice_id: body["invoice_id"], state: "prepared", request: body,
+          desired_entry_ids: entry_ids, disposition: body["disposition"]
+        }
+        @operations[operation_key] = stored
+        prepare_answer(stored)
+      end
+
+      def prepare_outcome(entry_id, company_id, invoice_id)
+        current = @reservations.select { |reservation| reservation[:entry_id] == entry_id }
+        ReservationRules.prepare_outcome(
+          in_company: !visible_entry(entry_id, company_id).nil?,
+          committed: current.find { |reservation| reservation[:state] == "committed" },
+          provisional: current.find { |reservation| reservation[:state] == "provisional" },
+          invoice_id:
+        )
+      end
+
+      def prepare_answer(operation)
+        respond(200, "operation_id" => operation[:operation_id], "state" => operation[:state],
+                     "entries" => operation[:desired_entry_ids].map { |id| { "entry_id" => id, "company_id" => operation[:company_id] } })
+      end
+
+      def reserve_provisionally(entry_ids, company_id, body, operation_key)
+        @reservations += entry_ids.map do |entry_id|
+          { company_id:, entry_id:, invoice_id: body["invoice_id"], state: "provisional", disposition: body["disposition"], operation_key: }
+        end
+        refresh_locked(entry_ids)
+      end
+
+      def release(entry_ids)
+        @reservations = @reservations.reject { |reservation| entry_ids.include?(reservation[:entry_id]) }
+        refresh_locked(entry_ids)
+      end
+
+      # Commit and abort act only on what prepare stored. After the first of
+      # them, the operation is terminal and a later one changes nothing.
+      def finish(route, company_id, actor, body)
+        @receipts.answer(company_scope: company_id, actor:, operation: route, key: body["operation_id"], body:) do
+          stored = operation(company_id, actor, body["operation_id"])
+          next Wire.error(@reservation_contract, "not_found") unless stored && stored[:invoice_id] == body["invoice_id"]
+
+          route == "commit" ? commit(stored) : abort_operation(stored)
+        end
+      end
+
+      def commit(operation)
+        return respond(200, "reserved" => 0, "released" => 0) unless operation[:state] == "prepared"
+
+        mine = own_provisional(operation)
+        reserved_ids = mine.pluck(:entry_id)
+        held = @reservations.select do |reservation|
+          reservation[:company_id] == operation[:company_id] && reservation[:invoice_id] == operation[:invoice_id] &&
+            reservation[:state] == "committed"
+        end
+        released_ids = held.pluck(:entry_id) - operation[:desired_entry_ids]
+
+        @reservations = @reservations.reject do |reservation|
+          (reservation[:state] == "committed" && reserved_ids.include?(reservation[:entry_id])) ||
+            (held.include?(reservation) && released_ids.include?(reservation[:entry_id]))
+        end
+        @reservations = @reservations.map do |reservation|
+          next reservation unless mine.include?(reservation) || held.include?(reservation)
+
+          reservation.merge(state: "committed", disposition: operation[:disposition])
+        end
+        operation[:state] = "committed"
+        refresh_locked(reserved_ids + released_ids)
+        respond(200, "reserved" => reserved_ids.size, "released" => released_ids.size)
+      end
+
+      def abort_operation(operation)
+        return respond(200, "dropped" => 0) unless operation[:state] == "prepared"
+
+        mine = own_provisional(operation)
+        @reservations -= mine
+        operation[:state] = "aborted"
+        refresh_locked(mine.pluck(:entry_id))
+        respond(200, "dropped" => mine.size)
+      end
+
+      def own_provisional(operation)
+        @reservations.select do |reservation|
+          reservation[:operation_key] == operation[:key] && reservation[:state] == "provisional"
+        end
+      end
+
+      def mark_billed(company_id, actor, params, body)
+        invoice_id = integer(params["invoice_id"])
+        @receipts.answer(company_scope: company_id, actor:, operation: "mark_billed #{invoice_id}", key: body["operation_id"],
+                         body:) do
+          held = @reservations.select do |reservation|
+            reservation[:company_id] == company_id && reservation[:invoice_id] == invoice_id && reservation[:state] == "committed"
+          end
+          entries = held.filter_map { |reservation| visible_entry(reservation[:entry_id], company_id) }
+            .reject { |entry| entry["bill_status"] == "billed" }
+          entries.each { |entry| write_entry(entry.merge("bill_status" => "billed")) }
+          respond(200, "billed" => entries.size)
+        end
+      end
+
+      def detach_entries(company_id, actor, params, body)
+        agent_id = integer(params["agent_id"])
+        @receipts.answer(company_scope: company_id, actor:, operation: "detach_entries #{agent_id}", key: body["operation_id"],
+                         body:) do
+          entries = @entries.values.select do |entry|
+            entry["company_id"] == company_id && entry["agent_id"] == agent_id
+          end
+          entries.each { |entry| write_entry(entry.merge("agent_id" => nil)) }
+          respond(200, "detached" => entries.size)
+        end
+      end
+
+      # locked mirrors whether the entry has any reservation; a change to it is
+      # a change to the entry, so it raises the version and writes a snapshot.
+      def refresh_locked(entry_ids)
+        entry_ids.uniq.each do |entry_id|
+          entry = @entries[entry_id]
+          next unless entry
+
+          reserved = @reservations.any? { |reservation| reservation[:entry_id] == entry_id }
+          locked = @policies[:locked].call(reserved:, was_locked: entry["locked"])
+          write_entry(entry.merge("locked" => locked)) unless locked == entry["locked"]
+        end
+      end
+  end
+end
