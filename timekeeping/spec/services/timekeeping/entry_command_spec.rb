@@ -1,0 +1,87 @@
+# frozen_string_literal: true
+
+require "rails_helper"
+
+RSpec.describe Timekeeping::EntryCommand do
+  let(:facts) do
+    Timekeeping::ReferenceClient::Facts.new(
+      company_id: 3, edit_days: 30, users: [Timekeeping::ReferenceClient::User.new(id: 7, role: "owner")],
+      projects: [Timekeeping::ReferenceClient::Project.new(id: 11, company_id: 3, billable: true, member_user_ids: [])],
+      missing_project_ids: []
+    )
+  end
+  let(:reference_client) { instance_double(Timekeeping::ReferenceClient, fetch: facts) }
+  let(:identity) { Timekeeping::Identity.new(kind: :user, status: :verified, user_id: 7, company_id: 3, role: "owner") }
+
+  def build(route, body: {}, entry_id: nil, headers: { "Idempotency-Key" => "key-1", "Ownership-Generation" => "1" },
+            raw_body: JSON.generate(body))
+    described_class.build(route:, identity:, bearer: "caller-token", company_id: 3, entry_id:, headers:, raw_body:,
+                          reference_client:, today: Date.new(2026, 3, 3))
+  end
+
+  def create_body(**fields)
+    { "project_id" => 11, "work_date" => "2026-03-02", "duration" => 30.0 }.merge(fields.transform_keys(&:to_s))
+  end
+
+  it "builds a create with the receipt operation, the body fingerprint and the facts" do
+    command = build(:create, body: create_body)
+
+    expect(command).to have_attributes(operation: "create ", key: "key-1", actor_id: 7, role: "owner", project_id: 11,
+                                       fingerprint: Digest::SHA256.hexdigest(JSON.generate(create_body)), facts:)
+    expect(reference_client).to have_received(:fetch).with(company_id: 3, project_ids: [11])
+  end
+
+  it "names the path entry id in an update's operation and fetches no project it does not name" do
+    command = build(:update, entry_id: "42", body: { "note" => "x" })
+
+    expect([command.operation, command.entry_id]).to eq(["update 42", 42])
+    expect(reference_client).to have_received(:fetch).with(company_id: 3, project_ids: [])
+  end
+
+  it "counts the same fields in another key order as another body" do
+    first = build(:create, body: create_body)
+    reordered = build(:create, raw_body: JSON.generate(create_body.to_a.reverse.to_h))
+
+    expect(reordered.fingerprint).not_to eq(first.fingerprint)
+  end
+
+  it "refuses a missing or blank Idempotency-Key before reading the facts" do
+    [{}, { "Idempotency-Key" => " " }].each do |headers|
+      expect(build(:create, body: create_body, headers:)).to eq(Timekeeping::WriteOutcome.refusal(:idempotency_key_required))
+    end
+    expect(reference_client).not_to have_received(:fetch)
+  end
+
+  it "refuses the caller's bearer token in the body before reading the facts" do
+    outcome = build(:create, body: create_body(source_metadata: { "token" => "caller-token" }))
+
+    expect(outcome).to eq(Timekeeping::WriteOutcome.refusal(:credential_in_body))
+    expect(reference_client).not_to have_received(:fetch)
+  end
+
+  it "answers a project id that is not an id, or one the facts do not hold, as not_found" do
+    expect(build(:create, body: create_body(project_id: "11; DROP"))).to eq(Timekeeping::WriteOutcome.refusal(:not_found))
+
+    allow(reference_client).to receive(:fetch).and_return(facts.with(projects: [], missing_project_ids: [11]))
+    expect(build(:create, body: create_body)).to eq(Timekeeping::WriteOutcome.refusal(:not_found))
+  end
+
+  it "answers an entry id that is not an id as not_found" do
+    expect(build(:destroy, entry_id: "12abc")).to eq(Timekeeping::WriteOutcome.refusal(:not_found))
+  end
+
+  it "answers unreadable facts as reference_unavailable" do
+    allow(reference_client).to receive(:fetch).and_raise(Timekeeping::ReferenceClient::Unavailable)
+
+    expect(build(:create, body: create_body)).to eq(Timekeeping::WriteOutcome.refusal(:reference_unavailable))
+  end
+
+  it "refuses a body that is not a JSON object, or a field of the wrong shape, as a bad request" do
+    ["[1]", "{not json"].each do |raw_body|
+      expect { build(:create, raw_body:) }.to raise_error(ActionController::BadRequest)
+    end
+    expect { build(:create, body: create_body(work_date: "2026-02-30")) }.to raise_error(ActionController::BadRequest)
+    expect { build(:create, body: create_body.except("duration")) }.to raise_error(ActionController::BadRequest)
+    expect { build(:bulk_delete, body: { "entry_ids" => 5 }) }.to raise_error(ActionController::BadRequest)
+  end
+end
