@@ -110,16 +110,19 @@ module TimekeepingRules
 
     # A9: a bulk move or delete. Every entry is judged before any result is
     # returned, so one refused entry refuses the whole request wherever it
-    # sits in the list.
+    # sits in the list. Entries are judged before they are keyed by id, so an
+    # id listed twice cannot hide a refusal; it is skipped if either copy is.
     def bulk_decision(caller:, change:, role:, acting_user_id:, entries:, edit_days:, today:)
       check_caller!(caller)
       check_action!(change, BULK_ACTIONS)
-      refusals = entries.to_h do |entry|
+      refusals = entries.map do |entry|
         [entry[:id], refusing_rules(caller:, change:, role:, acting_user_id:, entry:, edit_days:, today:)]
       end
-      return :forbidden if refusals.values.any? { |rules| rules.intersect?(WHOLE_REQUEST_RULES) }
+      return :forbidden if refusals.any? { |_id, rules| rules.intersect?(WHOLE_REQUEST_RULES) }
 
-      refusals.transform_values { |rules| rules.empty? ? :apply : :skip }
+      refusals.each_with_object({}) do |(id, rules), outcomes|
+        outcomes[id] = rules.empty? && outcomes[id] != :skip ? :apply : :skip
+      end
     end
 
     def change_facts(caller:, change:, role:, acting_user_id:, entry:, edit_days:, today:)

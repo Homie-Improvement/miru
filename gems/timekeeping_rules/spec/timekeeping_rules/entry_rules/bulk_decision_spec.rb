@@ -56,6 +56,23 @@ RSpec.describe TimekeepingRules::EntryRules, ".bulk_decision" do
     expect(decide(entries: [locked], caller: "entries.import", role: nil, acting_user_id: nil)).to eq(10 => :apply)
   end
 
+  it "refuses the whole request when a refused copy of a repeated id comes first or last" do
+    {
+      billed: entry(id: 11, bill_status: "billed"),
+      stale: entry(id: 11, work_date: today - 8),
+      foreign: entry(id: 11, user_id: 2)
+    }.each_value do |refused|
+      expect(decide(entries: [refused, free])).to eq(:forbidden)
+      expect(decide(entries: [free, refused])).to eq(:forbidden)
+    end
+  end
+
+  it "skips a repeated id when either copy is locked, in both orders" do
+    locked_copy = entry(id: 11, locked: true)
+    expect(decide(entries: [locked_copy, free])).to eq(11 => :skip)
+    expect(decide(entries: [free, locked_copy])).to eq(11 => :skip)
+  end
+
   it "raises on an action bulk does not support" do
     expect { decide(entries: [free], action: :update) }.to raise_error(ArgumentError)
   end
