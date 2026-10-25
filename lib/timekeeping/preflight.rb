@@ -30,7 +30,7 @@ module Timekeeping
         },
         :relock_releases
       ]
-    ].freeze
+    ].map(&:freeze).freeze
 
     module_function
 

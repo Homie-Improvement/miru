@@ -122,4 +122,9 @@ RSpec.describe Timekeeping::Preflight do
 
     expect(result[:active]).to eq([1])
   end
+
+  it "freezes the classification table and each of its rows" do
+    expect(described_class::CLASSIFICATION_TABLE).to be_frozen
+    expect(described_class::CLASSIFICATION_TABLE).to all(be_frozen)
+  end
 end
