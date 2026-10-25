@@ -47,7 +47,7 @@ module TimekeepingRules
       [:a4, ->(facts) { facts[:user_delegated] }, ->(facts) { !facts[:privileged] && !facts[:own] }],
       [:a6, ->(facts) { facts[:user_delegated] && facts[:action] != :delete }, ->(facts) { facts[:employee] && facts[:locked] }],
       [:a7, ->(facts) { facts[:user_delegated] && facts[:action] == :update }, ->(facts) { facts[:employee] && facts[:leaves_billed] }]
-    ].freeze
+    ].map(&:freeze).freeze
 
     # A9: a bulk request containing an entry these rules refuse is refused
     # whole. An entry refused by any other rule (A6) is skipped on its own.
@@ -62,7 +62,7 @@ module TimekeepingRules
       [->(request) { !request[:privileged] }, :forbidden],
       [->(request) { !request[:company_user_ids].include?(request[:requested_user_id]) }, :not_found],
       [->(_request) { true }, :requested]
-    ].freeze
+    ].map(&:freeze).freeze
 
     module_function
 
