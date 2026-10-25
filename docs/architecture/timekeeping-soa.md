@@ -119,7 +119,7 @@ This coupling is the main reason timekeeping cannot be deployed on its own today
 - `app/models/invoice.rb:63` runs `after_discard :unlock_timesheet_entries, if: :draft?`. It unlocks only when the invoice is still a draft. **A discarded invoice that has left draft leaves its entries locked.**
 - **Discarding a draft also leaves its entries locked.** The unlock at line 63 runs first. Then `after_discard :update_invoice_number` (line 64) calls `self.update(invoice_number: "ARC-...")` (`app/models/invoice.rb:323-325`). That save fires `after_save :lock_timesheet_entries, if: :draft?` (line 62) again, because the invoice is still a draft, and the entries end the discard locked.
 - Single invoice delete is a soft `invoice.discard!` (`app/controllers/api/v1/invoices_controller.rb:59-62`). Bulk delete is a hard destroy: `current_company.invoices.where(id: params[:invoices_ids])`, with no `.kept` filter, then `destroy` on each (`app/controllers/api/v1/invoices/bulk_deletion_controller.rb:7-8`). An invoice with payments fails to destroy (`has_many :payments, dependent: :restrict_with_error`, `app/models/invoice.rb:42`) and is reported back with a 422. Otherwise `has_many :invoice_line_items, dependent: :destroy` (line 40) runs each line item's `before_destroy :unlock_timesheet_entries`, which unlocks only when the invoice is a draft. **So a hard-destroyed non-draft invoice leaves its entries locked with no invoice, kept or discarded, that references them.**
-- `app/models/invoice_line_item.rb:10` runs `before_destroy :unlock_timesheet_entries`. It unlocks only when the parent invoice is a draft. It uses `TimesheetEntry.where(id: associated_timesheet_entry_ids)` with **no workspace filter**.
+- `app/models/invoice_line_item.rb:10` runs `before_destroy :unlock_timesheet_entries`. It unlocks only when the parent invoice is a draft. It uses `TimesheetEntry.where(id: associated_timesheet_entry_ids)` with **no workspace filter**. It reaches only the direct `timesheet_entry_id`: `dependent: :destroy` on `invoice_line_item_time_entries` (line 6) runs first, so `linked_timesheet_entry_ids` is empty by then, and **a project aggregate line's linked entries stay locked with no invoice referencing them**, even on a draft.
 - `Invoice#update_timesheet_entry_status!` (`app/models/invoice.rb:126-128`) sets `bill_status: :billed` on the invoice's kept entries, through `TimesheetEntry.kept.where(id:)` with no workspace filter.
 - An entry is referenced by an invoice in one of two ways:
   - Directly, through `invoice_line_items.timesheet_entry_id`.
@@ -217,7 +217,7 @@ Each row below is current behaviour, cited to its source. The target design must
 | L1 | Every save of a draft invoice locks every entry it references, scoped to the invoice's company. | `app/models/invoice.rb:62`, `lock_timesheet_entries` |
 | L2 **(quirk)** | Discarding a draft invoice leaves its entries **locked**. `after_discard :unlock_timesheet_entries` unlocks them, then `after_discard :update_invoice_number` calls `update`, which fires `after_save :lock_timesheet_entries` again while the invoice is still a draft. Fixed by the target design (deliberate fixes, below). | `app/models/invoice.rb:62-64`, `:323-325` |
 | L3 **(quirk)** | Discarding an invoice that has left draft does **not** unlock its entries; they stay locked with no kept invoice holding them. | Same callback, `if: :draft?` |
-| L4 | Destroying a line item on a draft invoice unlocks its entries; on a non-draft invoice it does not. The unlock uses `TimesheetEntry.where(id:)` with no workspace filter. This covers a line item removed from a draft and every line item of a draft destroyed by the bulk invoice delete; the line items of a hard-destroyed non-draft leave their entries locked (section 1.4). | `app/models/invoice_line_item.rb:10`, `:72-76` |
+| L4 **(quirk)** | Destroying a line item on a draft invoice unlocks its **direct** entry (`timesheet_entry_id`); on a non-draft invoice it unlocks nothing. The unlock uses `TimesheetEntry.where(id:)` with no workspace filter. A project aggregate line's linked entries stay locked even on a draft: `has_many :invoice_line_item_time_entries, dependent: :destroy` (line 6) is declared before `before_destroy :unlock_timesheet_entries` (line 10), so the join rows are already gone when the unlock reads `linked_timesheet_entry_ids`. This covers a line item removed from a draft and every line item of a draft destroyed by the bulk invoice delete; the line items of a hard-destroyed non-draft leave all their entries locked (section 1.4). | `app/models/invoice_line_item.rb:6`, `:10`, `:72-80` |
 | L5 **(quirk)** | Among invoice flows, only `InvoiceMailer#invoice` marks entries `billed`, through `after_action :update_status` (`app/mailers/invoice_mailer.rb:4`, `:73`). That mailer is enqueued only by `Invoice#send_to_email` (`app/models/concerns/invoice_sendable.rb`). A repository search finds no production caller of `send_to_email`; only `spec/models/invoice_spec.rb:200-215` calls it. Outside invoices, `billed` is also set by the Harvest import (L7), by any user allowed to edit the entry (A11), and by the seed data (section 1.3). | Search for `send_to_email` and `bill_status: :billed` |
 | L6 **(quirk)** | The live send path, `send_invoice` in `app/controllers/api/v1/invoices_controller.rb`, uses `InvoiceMailer#send_invoice` and `record_send!`. These set the invoice to `sent` and emit `Invoices::Sent`, but never mark entries billed. **Entries on sent invoices therefore usually stay `locked` and `unbilled`.** | `app/controllers/api/v1/invoices_controller.rb:64`; `app/models/concerns/invoice_sendable.rb` |
 | L7 **(quirk)** | The Harvest import creates entries as `unbilled` and then calls `entry.update!(bill_status: :billed)` with no invoice. So `billed` is not always backed by an invoice link. | `app/services/imports/harvest_time_entries_importer.rb` (`create_entry`); `spec/services/imports/harvest_time_entries_importer_spec.rb` |
@@ -368,7 +368,7 @@ A single-writer guard test runs every flow above and fails if anything other tha
 
 The keys `timesheet_entries → projects` (`:1326`) and `timesheet_entries → users` (`:1327`) stay. Today the users key is the only check that stops a user with time entries from being hard-deleted (section 1.3). A projection key cannot keep that check alone, because an entry Timekeeping accepted may not have reached the projection yet. So the check moves to the owner of the entries:
 
-- **User-retire check.** Before a user hard delete, the gateway sends the user-retire command (section 5.3). In one Timekeeping transaction, the command refuses if any entry references the user, and otherwise marks the user retired. After that, Timekeeping refuses new entries for a retired user, so a create cannot race the check. The monolith destroys the user row only after the command succeeds. While the prepared monolith owns the data (section 10), the same check runs against its own entry table.
+- **User-retire check.** Before a user hard delete, the gateway sends the user-retire command (section 5.3). In one Timekeeping transaction, the command refuses if any entry references the user, and otherwise marks the user `retiring`. After that, Timekeeping refuses new entries for that user, so a create cannot race the check. The monolith destroys the user row only after the command succeeds. The destroy can still fail for another reason, for example the `expenses → users` foreign key (`db/schema.rb:1273`), so the mark follows the delete's outcome with the save-order pattern of section 9.2. Under an advisory lock on the user id, the monolith first writes a pending deletion intent outside the delete transaction, then sends retire. The `destroy!` transaction records the intent `committed`, and the monolith then delivers `retire/commit`, which makes the mark `retired` for good. If the destroy fails, the monolith records the intent `failed` first, then delivers `retire/abort`, which clears the mark so the user can log time again. Recovery picks up a pending intent under the same lock: if the user row is gone, it records `committed` and delivers commit; if the row still exists, it records `failed` and delivers abort. While the prepared monolith owns the data (section 10), the same check runs against its own entry table.
 - The same rule applies to a project hard delete. No code in `app/` destroys a project, so the rule has no caller today.
 - Agent destroys that run through `User` (`app/models/user.rb:39`) happen only after the user check has passed.
 
@@ -478,13 +478,21 @@ POST /v1/companies/{company_id}/agents/{agent_id}/detach-entries
 
 POST /v1/users/{user_id}/retire
   { operation_id, generation }
-  -> 200 { retired: true }
+  -> 200 { retiring: true }
   -> 409 { reason: "user_has_entries" }
+
+POST /v1/users/{user_id}/retire/commit
+  { operation_id, generation }
+  -> 200 { retired: true }
+
+POST /v1/users/{user_id}/retire/abort
+  { operation_id, generation }
+  -> 200 { retiring: false }
 ```
 
 - **mark-billed** replaces `Invoice#update_timesheet_entry_status!`. It sets `bill_status: billed` on the kept entries that the invoice holds by committed reservation. Today that method runs only from the uncalled mailer path (L5), and the migration does not call it more often.
 - **detach-entries** is agent destroy. It nulls `agent_id` on that company's entries for the agent and writes an audit row for each entry.
-- **retire** is the user-retire check of section 3.3. It is the one command not scoped to a company, because one user can hold entries in several companies. Its answer is only yes or no, and it returns no entry data.
+- **retire** is the user-retire check of section 3.3. It is the one command not scoped to a company, because one user can hold entries in several companies. Its answer is only yes or no, and it returns no entry data. `retire/commit` and `retire/abort` settle it from the monolith's deletion intent, idempotent by the same `operation_id`, as commit and abort settle a reservation operation. A handoff's settle step (section 10.5) resolves pending deletion intents too, so only `retired` marks travel in the checkpoint.
 
 ### 5.4 The entry snapshot stream
 
@@ -644,7 +652,7 @@ Mapping of today's callbacks:
 | L1 draft save locks entries | The invoice reservation boundary prepares and commits the draft's desired entry set when it changes (section 9.2) |
 | L2 draft discard leaves entries locked (re-lock) | Empty desired set; reservations released at commit. **Deliberate fix** (section 2.3) |
 | L3 non-draft discard keeps locks | Reservations kept with `disposition: 'retained'`. **Preserved quirk.** |
-| L4 line-item destroy on draft unlocks; on non-draft does not | On a draft, the entry leaves the desired set and is released at commit. On a non-draft, the boundary sends no removal, so the reservation stays. Preserved. |
+| L4 line-item destroy on draft unlocks; on non-draft does not | On a draft, the entry leaves the desired set and is released at commit. On a non-draft, the boundary sends no removal, so the reservation stays. Preserved. One difference: a removed aggregate line's linked entries also leave the desired set and are released, where today they stay locked with no invoice referencing them. Keeping them reserved would need an owner that no line references, which the one rule does not have. This is an open question for the owner (section 15.2). |
 | Bulk hard destroy of an invoice | Draft: released. Non-draft: `retained`, carrying its own owner. Failed destroy: operation aborted, prior state kept (section 1.4) |
 | Two kept invoices on one entry | Refused at prepare: `on_another_invoice`. **Deliberate fix** (section 2.3) |
 | L5 mark billed via uncalled mailer | `mark-billed` (section 5.3), called only from the same path |
@@ -863,7 +871,7 @@ The checkpoint copies no money. The first cutover reads invoice links to derive 
 
 **Pre-flight (first cutover only).** Today's legacy states are listed, never normalized quietly. Inside the write fence, before any copy, the pre-flight lists:
 
-- **orphans:** entries locked with no invoice, kept or discarded, that references them. Today a bulk hard destroy of a non-draft invoice creates exactly these, because its line items unlock only on a draft (section 1.4). Any such destroy run before the first cutover makes this list non-empty.
+- **orphans:** entries locked with no invoice, kept or discarded, that references them. Today a bulk hard destroy of a non-draft invoice creates exactly these, because its line items unlock only on a draft (section 1.4). Removing a project aggregate line from a draft, or bulk-deleting a draft with one, creates them too, because the unlock never sees the aggregate's linked entries (L4). Any such action run before the first cutover makes this list non-empty.
 - **conflicts:** entries referenced by two or more kept invoices, or with more than one plausible historical owner.
 - entries held by a discarded non-draft invoice: kept, as `retained` reservations (10.3).
 - entries locked only by the old draft-discard re-lock (section 2.3): released at cutover as a listed correction, only when no other committed or pending owner exists;
@@ -908,7 +916,8 @@ handoff(outgoing, incoming):
   2. Settle.
      Resolve every registered invoice operation from its durable outcome. The monolith delivers commit
      for each 'committed' intent and abort for each 'failed' one, and runs recovery (section 9.2) on
-     each intent still 'pending'. During this step only, the outgoing owner still applies a commit or
+     each intent still 'pending'. User deletion intents are settled the same way (section 3.3).
+     During this step only, the outgoing owner still applies a commit or
      abort that carries the old generation, and only for an operation in its own invoice_operations.
      The step ends when no intent is 'pending' and no operation is 'prepared': no pending billing
      operation crosses the handoff.
@@ -937,7 +946,7 @@ handoff(outgoing, incoming):
 
 **Resumable.** `handoff_step` records the last step that completed. After an interruption, the operator re-runs the handoff, and it resumes from the step that failed. Every step is safe to repeat: settle re-delivers idempotent operations, the drain stops at the same position P, the checkpoint load replaces the incoming owner's tables in one transaction, the sequence only advances, and reconciliation only reads.
 
-**Abort.** Before the flip, an operator may abort instead of resuming. The outgoing owner then admits writes again at the raised generation, and `handoff_step` returns to null. Nothing has changed outside the ownership record and the incoming owner's tables, which nothing reads until a flip, and which the next handoff's load replaces. The generation stays raised, so a command queued before the attempt is still refused.
+**Abort.** Before the flip, an operator may abort instead of resuming. Abort first completes steps 2 and 3 if they have not completed, so every operation is settled and the outgoing owner's outbox is drained through P while the projection still accepts its previous-generation snapshots. If those steps cannot complete (for example, the projection endpoint is down), the handoff stays fenced and resumable, and abort waits. Only then does the outgoing owner admit writes again at the raised generation, and `handoff_step` returns to null. Snapshots it writes from then on carry the raised generation, so the projection accepts them. Nothing has changed outside the ownership record and the incoming owner's tables, which nothing reads until a flip, and which the next handoff's load replaces. The generation stays raised, so a command queued before the attempt is still refused.
 
 **Why no write is lost.**
 
@@ -1019,7 +1028,7 @@ These existing specs cover the observed behaviour in section 2. They run against
 
 - L2 as it really is: a discarded draft's entries end up locked again;
 - L3: a discarded non-draft leaves its entries locked;
-- L4: a line-item destroy on a non-draft leaves its entries locked;
+- L4: a line-item destroy on a non-draft leaves its entries locked; removing a project aggregate line from a draft, and bulk-deleting a draft that has one, leave the aggregate's linked entries locked;
 - L6: a sent invoice leaves its entries locked and `unbilled`;
 - A9: the bulk move ignores `locked`, and it skips a failing entry silently;
 - A10 and S7;
@@ -1056,8 +1065,9 @@ Three contracts are fixed first, each with a fake on its consumer's side, so eac
   - the queued snapshots up to that position reach the projection;
   - the handoff completes from the step that failed;
   - after the flip, a previous-generation snapshot redelivered by the relay is refused with `409 stale_generation` and leaves the row unchanged.
-  It repeats the run with an abort instead of a resume, and asserts that the outgoing owner admits writes again at the raised generation.
+  It repeats the run with an abort instead of a resume, once after step 3 and once before it with snapshots still unsent. Each time it asserts that every unsent previous-generation snapshot reaches the projection before the outgoing owner admits writes again at the raised generation, and that its later snapshots reach the projection too.
 - **User delete with the relay paused.** Pause the relay. Create a user's first entry, then try to hard-delete that user as a super admin. The user-retire check refuses, and the user row stays, although the projection holds no row for the user yet. A second run starts an entry create and the delete at the same time: either the create wins and the delete is refused, or the retire wins and the create is refused. Never both. Resume the relay: the entry reaches the projection with no foreign-key error.
+- **Failed user delete clears the retire mark.** Take a user with an expense and no time entries. Hard-delete them as a super admin: retire succeeds, then `destroy!` fails on the `expenses → users` foreign key. The test asserts that the intent is `failed`, that `retire/abort` clears the mark, and that the user can create an entry afterwards. A second run kills the worker between retire and `destroy!`, runs recovery, and asserts the same outcome.
 - **Rollback waits for running writes.** Start a Timekeeping entry update that pauses before commit, then start a rollback. Step 1 waits until the update commits or aborts, and the update's change is in the checkpoint.
 - **Checkpoint load re-run.** Load the same checkpoint twice; the row counts and checksums are equal.
 - **Report parity.** On both seeded tenants, each reader in section 1.7 returns the same output from the projection after cutover as from `timesheet_entries` before it.
@@ -1160,6 +1170,7 @@ The repository owner has decided D1 to D4. They are recorded here so a reader ca
 - Does every client (web, mobile, CLI, MCP, timer) retry a `503 ownership_moving` answer (section 10.1)? Any client that does not loses the edits it sends during the write pause, so it needs a retry before the first cutover.
 - What does `bill_status: :billable` in `app/services/metrics/data_builder.rb` return today? The answer decides what report parity compares against.
 - Are there external readers of `rails_event_viewer_entries` (section 2.6)?
+- Should removing a project aggregate line from a draft release its linked entries (section 7.2), or should today's behaviour, which leaves them locked with no invoice referencing them (L4), be kept? It is not one of the two deliberate fixes.
 
 ### 15.3 Risks
 
@@ -1168,6 +1179,7 @@ The repository owner has decided D1 to D4. They are recorded here so a reader ca
 | A writer is missed by the gateway | It writes the projection directly, and Timekeeping never sees the change | The writer list in section 10.1; the single-writer guard (section 12.2); reconciliation (section 10.4) |
 | Monolith outage blocks entry writes | Users cannot log time | Same as today (writes run in the monolith now); `503 reference_unavailable` is retryable; alert in 11.3 |
 | Timekeeping outage blocks draft invoice saves | Saves that change an invoice's entry set fail with a retryable error while Timekeeping is down; today they succeed. This is a disclosed availability change, chosen so that a saved draft's entries are always reserved | Timekeeping availability alert (11.3); the bounded prepare timeout (section 9.2); the save can be retried unchanged |
+| Billing writes pause during a handoff | Every invoice, line-item, invoice-tax and payment write, including mobile-collection payments, gets a retryable `503 ownership_moving` for the length of the write pause. This is a disclosed availability change, chosen so the financial snapshot comparison (section 10.4) compares two states with no billing write between them | Keep the pause short; the `503 ownership_moving` alert (11.3); clients retry |
 | Reservation protocol bugs | Entries stuck reserved, or a save that fails without a clear reason | Contract and integration tests for every row of section 9.3; recovery from the durable intent (section 9.2); reconciliation (section 10.4) |
 | Report parity gaps | Customers see different numbers | The projection keeps today's table and columns; report parity test (section 12.4) |
 | Relay lag | Aggregates show stale totals for a while | Money and read-after-write reads go to Timekeeping (section 3.3); outbox lag alert (section 11.3) |
