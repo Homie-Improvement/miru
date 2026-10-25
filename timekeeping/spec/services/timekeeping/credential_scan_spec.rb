@@ -128,6 +128,26 @@ RSpec.describe Timekeeping::CredentialScan do
     end
   end
 
+  describe "a signed user token with a header the monolith does not mint" do
+    def sign_raw_header(header_json)
+      encode = ->(value) { Base64.urlsafe_encode64(value, padding: false) }
+      signed = "#{encode.call(header_json)}.#{encode.call(JSON.generate(valid_token_claims(sub: 9)))}"
+      "#{signed}.#{encode.call(rsa_key_pair.sign(OpenSSL::Digest.new("SHA256"), signed))}"
+    end
+
+    it "finds it with a header longer than 512 characters, with text glued to both ends" do
+      long_header = mint_token({ sub: 9 }, headers: { "kid" => "x" * 600 })
+
+      expect(long_header.split(".").first.length).to be > 512
+      expect(found?({ "proof_metadata" => { "token" => "ab#{long_header}/tail" } })).to be(true)
+    end
+
+    it "finds it with whitespace in the header JSON" do
+      expect(found?({ "note" => sign_raw_header('{ "alg":"RS256" }') })).to be(true)
+      expect(found?({ "note" => sign_raw_header(%({\n  "alg": "RS256"\n})) })).to be(true)
+    end
+  end
+
   it "finds a user token behind a long run of eyJ glued to its header" do
     other = mint_token({ sub: 9 })
 

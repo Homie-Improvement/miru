@@ -9,28 +9,24 @@ module Timekeeping
   # Pure: the caller's bearer token, the held credentials and the public key
   # are arguments, and nothing is read from ENV.
   module CredentialScan
-    # A run of base64 segments joined by dots. TokenVerifier accepts only three
-    # base64url segments, its header starting with HEADER_START and at most
-    # MAX_HEADER_LENGTH long, so this search covers every token it accepts.
-    # Standard base64 characters and padding are also taken, because anyone
-    # holding an issued token can respell its signature that way without the
-    # signing key, and the spelling turns back into the live token.
+    # A run of base64 segments joined by dots, in base64url or standard base64,
+    # padded or not: a JWT verifier decodes a signature in any of them.
     DOTTED_SEGMENTS = %r{[A-Za-z0-9_+/=-]+(?:\.[A-Za-z0-9_+/=-]+)+}
-    JWT_HEADER_START = TokenVerifier::HEADER_START
-    JWT_SEGMENT_COUNT = TokenVerifier::SEGMENT_COUNT
-    MAX_HEADER_LENGTH = TokenVerifier::MAX_HEADER_LENGTH
+    # A user token is a header, a payload and then its signature.
+    SEGMENTS_BEFORE_SIGNATURE = 2
+    SIGNATURE_DIGEST = "SHA256"
 
     module_function
 
     # True when the body holds, anywhere, the bearer token, a held credential,
-    # or a string whose signature verifies as a user token. A token that fails
-    # only on exp still counts: its signature verifies, so it was issued.
+    # or a user token signed with the given key.
     def found?(parsed_body, bearer:, held:, public_key:)
       texts = [JSON.generate(parsed_body), *decoded_strings(parsed_body)]
       literals = [bearer, *held].map(&:to_s).reject(&:empty?)
       return true if texts.any? { |text| literals.any? { |literal| text.include?(literal) } }
 
-      user_token_in?(texts, public_key)
+      rsa = rsa_key(public_key)
+      rsa.present? && texts.any? { |text| signed_token_in?(text, rsa) }
     end
 
     # Every hash key and string value, at any depth. JSON.generate escapes a
@@ -44,59 +40,35 @@ module Timekeeping
       end
     end
 
-    # Candidates are made and checked one at a time, so a body built to yield
-    # many of them never holds them all in memory, and the search stops at the
-    # first one that verifies.
-    def user_token_in?(texts, public_key)
-      rsa = rsa_key(public_key)
-      return false unless rsa
-
-      signature_length = signature_length(rsa)
-      texts.lazy.flat_map { |text| token_candidates(text, signature_length) }
-        .uniq.any? { |candidate| verifies?(candidate, rsa) }
-    end
-
-    # A token can sit inside a longer string with other base64url text glued
-    # to either end ("x" + token + "y"), so each dotted run is cut into every
-    # window of three segments. The header is tried from each "eyJ" near the
-    # end of its segment. The signature is read back to base64url without
-    # padding, then cut to the length an RS256 signature with this key has,
-    # so neither a respelling nor text appended after the token can hide it.
-    # The header and payload are signed as written, so they are left as they
-    # are: any other spelling of them no longer verifies.
-    def token_candidates(text, signature_length)
-      text.scan(DOTTED_SEGMENTS).lazy.flat_map do |run|
-        run.split(".").each_cons(JWT_SEGMENT_COUNT).lazy.flat_map do |head, payload, tail|
-          signature = tail.tr("+/", "-_").delete("=")
-          next [] if signature.length < signature_length
-
-          signature = signature[0, signature_length]
-          header_starts(head).lazy.map { |start| [head[start..], payload, signature].join(".") }
-        end
+    # A token is found by its signature alone: any dotted segment that follows
+    # two others and opens with a valid RS256 signature made by the key. Only
+    # the key's holder can make one, and the monolith signs nothing but user
+    # tokens with it, so the token is found whatever its header or payload say,
+    # however long they are and whatever text is glued around them, and an
+    # expired token counts too. Each segment costs one RSA public-key
+    # operation, so the work grows with the body's length, not its square.
+    def signed_token_in?(text, rsa)
+      text.scan(DOTTED_SEGMENTS).any? do |run|
+        run.split(".").drop(SEGMENTS_BEFORE_SIGNATURE).any? { |segment| key_signature?(segment, rsa) }
       end
     end
 
-    # Only the last MAX_HEADER_LENGTH characters of a segment can hold the
-    # start of a token's header, because the header ends where the segment
-    # does. Searching the whole segment would make a long run of "eyJ" cost
-    # the square of its length.
-    def header_starts(segment)
-      starts = []
-      index = segment.index(JWT_HEADER_START, [segment.length - MAX_HEADER_LENGTH, 0].max)
-      while index
-        starts << index
-        index = segment.index(JWT_HEADER_START, index + 1)
-      end
-      starts
-    end
+    # The segment is cut to the length a signature with this key has, so text
+    # appended after the token cannot hide it, and read in either base64
+    # alphabet with or without padding, as a verifier would read it.
+    def key_signature?(segment, rsa)
+      length = encoded_signature_length(rsa)
+      encoded = segment.tr("-_", "+/").delete("=")
+      return false if encoded.length < length
 
-    def verifies?(candidate, rsa)
-      TokenVerifier.verify(candidate, public_key: rsa)
-      true
-    rescue TokenVerifier::ExpiredToken
-      true
-    rescue TokenVerifier::InvalidToken
+      signature = pad(encoded[0, length]).unpack1("m")
+      signature.bytesize == rsa.n.num_bytes && rsa.verify_recover(SIGNATURE_DIGEST, signature).present?
+    rescue OpenSSL::PKey::PKeyError
       false
+    end
+
+    def pad(encoded)
+      encoded + ("=" * (-encoded.length % 4))
     end
 
     # With no readable key nothing verifies, as in Identity.resolve.
@@ -106,13 +78,13 @@ module Timekeeping
       nil
     end
 
-    # The unpadded base64url length of an RS256 signature: the modulus size in
+    # The unpadded base64 length of an RS256 signature: the modulus size in
     # bytes.
-    def signature_length(rsa)
+    def encoded_signature_length(rsa)
       (rsa.n.num_bytes * 4 / 3.0).ceil
     end
 
-    private_class_method :decoded_strings, :user_token_in?, :token_candidates, :header_starts, :verifies?,
-      :rsa_key, :signature_length
+    private_class_method :decoded_strings, :signed_token_in?, :key_signature?, :pad, :rsa_key,
+      :encoded_signature_length
   end
 end

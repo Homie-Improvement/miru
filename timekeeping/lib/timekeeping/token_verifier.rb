@@ -17,16 +17,6 @@ module Timekeeping
     # instead of failing later as a server error.
     CLAIM_TYPES = { "sub" => Integer, "company_id" => Integer, "role" => String }.freeze
 
-    # The only form a token may take: three unpadded base64url segments, the
-    # first a compact JSON header ('{"' encodes to eyJ) of bounded length, as
-    # the monolith mints them. Timekeeping::CredentialScan finds every string
-    # of this form inside a write body, so a token this verifier would accept
-    # can never pass that scan in another spelling.
-    SEGMENT = /\A[A-Za-z0-9_-]+\z/
-    SEGMENT_COUNT = 3
-    HEADER_START = "eyJ"
-    MAX_HEADER_LENGTH = 512
-
     class InvalidToken < StandardError; end
 
     # Raised only after the signature verified, so a forged token is never
@@ -39,8 +29,6 @@ module Timekeeping
     # x5u header. The jwt gem checks the signature before exp, so a forged
     # token that has also expired raises InvalidToken.
     def verify(token, public_key:)
-      raise InvalidToken, "invalid Timekeeping user token" unless compact?(token.to_s)
-
       payload, _header = JWT.decode(
         token.to_s,
         rsa_public_key(public_key),
@@ -70,13 +58,6 @@ module Timekeeping
       CLAIM_TYPES.all? { |claim, type| payload[claim].is_a?(type) }
     end
 
-    def compact?(token)
-      segments = token.split(".", -1)
-      header = segments.first.to_s
-      segments.length == SEGMENT_COUNT && segments.all?(SEGMENT) &&
-        header.start_with?(HEADER_START) && header.length <= MAX_HEADER_LENGTH
-    end
-
-    private_class_method :rsa_public_key, :typed_claims?, :compact?
+    private_class_method :rsa_public_key, :typed_claims?
   end
 end
