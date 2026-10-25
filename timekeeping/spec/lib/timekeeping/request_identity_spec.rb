@@ -50,6 +50,15 @@ RSpec.describe Timekeeping::RequestIdentity do
     expect(tags_for(seen_env)).to include("company_id=unverified", "actor=anonymous")
   end
 
+  it "tags a verified service caller as having no company, not as unverified" do
+    service_token = SecureRandom.hex(32)
+    with_timekeeping_env(Timekeeping::Environment::SERVICE_TOKEN => service_token) do
+      get_with("Bearer #{service_token}")
+    end
+
+    expect(tags_for(seen_env)).to include("company_id=none", "actor=service")
+  end
+
   it "runs before the request logger so its start and end lines carry the tags" do
     stack = Rails.application.middleware.map(&:klass)
 

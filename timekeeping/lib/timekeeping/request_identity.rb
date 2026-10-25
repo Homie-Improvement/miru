@@ -8,14 +8,23 @@ module Timekeeping
   class RequestIdentity
     ENV_KEY = "timekeeping.identity"
     UNVERIFIED_COMPANY = "unverified"
+    # A verified caller that acts for no company, such as the service identity.
+    NO_COMPANY = "none"
 
     def self.from(env)
       env.fetch(ENV_KEY) { Identity.anonymous(:missing) }
     end
 
+    def self.company_tag(identity)
+      return identity.company_id.to_s if identity.company_id
+      return NO_COMPANY if identity.status == :verified
+
+      UNVERIFIED_COMPANY
+    end
+
     # Rails.application.config.log_tags: each proc receives the request.
     LOG_TAGS = [
-      ->(request) { "company_id=#{from(request.env).company_id || UNVERIFIED_COMPANY}" },
+      ->(request) { "company_id=#{company_tag(from(request.env))}" },
       ->(request) { "request_id=#{LogSafety.request_id_tag(request.request_id)}" },
       ->(request) { "actor=#{from(request.env).kind}" }
     ].freeze
