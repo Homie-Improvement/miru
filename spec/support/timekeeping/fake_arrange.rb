@@ -64,7 +64,10 @@ module TimekeepingContract
     end
 
     delegate :flip_ownership, :projected_entry, to: :@relay
-    delegate :reservations_for, to: :@timekeeping
+    # stored_entry returns the entry's stored fields as a string-keyed Hash.
+    # The reservations group reads them here because a provider may run it
+    # without the entry API.
+    delegate :reservations_for, :stored_entry, to: :@timekeeping
 
     def published_snapshots
       @relay.next_batch

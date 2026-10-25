@@ -268,8 +268,21 @@ RSpec.shared_examples "timekeeping reservations contract" do
       end
     end
 
+    def entry_fields(*entry_ids)
+      entry_ids.index_with { |entry_id| timekeeping_arrange.stored_entry(entry_id).slice("bill_status", "agent_id") }
+    end
+
     it "refuses a missing credential, a user token, a service without the operation and another company's service" do
+      # Entries mark_billed and detach_entries would change, so a provider
+      # that writes before refusing has something to change.
+      billable = timekeeping_arrange.reserved_entry(company:, invoice_id: invoice_a, state: "committed")
+      agent_entry = timekeeping_arrange.entry(company:, user:, project:, agent_id: 77)
       before = reservation_state(x)
+      fields_before = entry_fields(billable, agent_entry)
+      expect(fields_before).to eq(
+        billable => { "bill_status" => "unbilled", "agent_id" => nil },
+        agent_entry => { "bill_status" => "unbilled", "agent_id" => 77 }
+      )
       expected = {
         nil => timekeeping_contract_error(:reservations, "unauthorized"),
         user_token => timekeeping_contract_error(:reservations, "forbidden"),
@@ -282,6 +295,7 @@ RSpec.shared_examples "timekeeping reservations contract" do
           response = command(route, credential)
 
           expect([route, response.status, response.body]).to eq([route, error.fetch("status"), error.fetch("body")])
+          expect([route, entry_fields(billable, agent_entry)]).to eq([route, fields_before])
         end
       end
       expect(reservation_state(x)).to eq(before)

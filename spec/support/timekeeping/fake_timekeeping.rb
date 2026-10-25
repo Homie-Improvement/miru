@@ -154,6 +154,10 @@ module TimekeepingContract
       @entries.fetch(entry_id).fetch("locked")
     end
 
+    def stored_entry(entry_id)
+      Wire.copy(@entries.fetch(entry_id))
+    end
+
     def reservations_for(entry_id)
       @reservations.filter_map do |reservation|
         { "invoice_id" => reservation[:invoice_id], "state" => reservation[:state] } if reservation[:entry_id] == entry_id
