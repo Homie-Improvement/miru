@@ -6,9 +6,52 @@ module TimekeepingRules
   # symbol (or the acting user's id) and reads no clock, database or Rails
   # state, so the monolith and the Timekeeping service decide alike.
   module EntryRules
+    # Raised for any caller: value outside USER_DELEGATED and
+    # BACKGROUND_OPERATIONS, so a missing or misspelled caller can never be
+    # read as a background caller and skip A6 and A7.
+    class UnknownCaller < ArgumentError; end
+
     # Matches privileged_roles in contracts/timekeeping/entry_api.yml. Every
     # other role, an unknown one included, is non-privileged.
     PRIVILEGED_ROLES = %w[owner admin].freeze
+
+    # A6 and A7 bind only this role, as the model's validations do today.
+    EMPLOYEE_ROLE = "employee"
+    BILLED = "billed"
+
+    USER_DELEGATED = :user_delegated
+    # The named background operations of section 6.2, spelled as there.
+    BACKGROUND_OPERATIONS = %w[
+      reservations.prepare
+      reservations.commit
+      reservations.abort
+      invoices.mark_billed
+      entries.import
+      agents.detach_entries
+    ].freeze
+
+    CHANGE_ACTIONS = %i[update delete].freeze
+    BULK_ACTIONS = %i[move delete].freeze
+    ACTIONS = (CHANGE_ACTIONS | BULK_ACTIONS).freeze
+
+    # Refusal rules as [rule id, binds, refuses]. A rule refuses a change when
+    # both conditions hold for the change's facts. A2 binds every caller, so a
+    # billed entry is never changed or deleted. A3, A4, A6 and A7 rest on the
+    # user's role and id, so they bind user-delegated callers only; that is
+    # the A8 skip, granted to named background operations. A10 is A6 not
+    # binding deletes. A11 is the absence of any rule guarding a change to
+    # billed.
+    CHANGE_RULES = [
+      [:a2, ->(_facts) { true }, ->(facts) { facts[:billed] }],
+      [:a3, ->(facts) { facts[:user_delegated] }, ->(facts) { !facts[:privileged] && facts[:stale] }],
+      [:a4, ->(facts) { facts[:user_delegated] }, ->(facts) { !facts[:privileged] && !facts[:own] }],
+      [:a6, ->(facts) { facts[:user_delegated] && facts[:action] != :delete }, ->(facts) { facts[:employee] && facts[:locked] }],
+      [:a7, ->(facts) { facts[:user_delegated] && facts[:action] == :update }, ->(facts) { facts[:employee] && facts[:leaves_billed] }]
+    ].freeze
+
+    # A9: a bulk request containing an entry these rules refuse is refused
+    # whole. An entry refused by any other rule (A6) is skipped on its own.
+    WHOLE_REQUEST_RULES = %i[a2 a3 a4].freeze
 
     # A5: whom a create request's user_id names, in order. The first row whose
     # condition holds decides, the same order as TARGET_USER_TABLE in
@@ -45,6 +88,80 @@ module TimekeepingRules
 
       acting_user_id
     end
+
+    # The ids of every rule in CHANGE_RULES that refuses this change of one
+    # entry, in table order. change: is { action: :update | :delete | :move,
+    # bill_status: new status or nil }; entry: is { id:, user_id:, work_date:,
+    # bill_status:, locked: }.
+    def refusing_rules(caller:, change:, role:, acting_user_id:, entry:, edit_days:, today:)
+      check_caller!(caller)
+      check_action!(change, ACTIONS)
+      facts = change_facts(caller:, change:, role:, acting_user_id:, entry:, edit_days:, today:)
+      CHANGE_RULES.filter_map { |rule_id, binds, refuses| rule_id if binds.call(facts) && refuses.call(facts) }
+    end
+
+    # A2 to A4, A6, A7, A10, A11 for an update or delete of one entry.
+    def change_decision(caller:, change:, role:, acting_user_id:, entry:, edit_days:, today:)
+      check_caller!(caller)
+      check_action!(change, CHANGE_ACTIONS)
+      refusals = refusing_rules(caller:, change:, role:, acting_user_id:, entry:, edit_days:, today:)
+      refusals.empty? ? :ok : :forbidden
+    end
+
+    # A9: a bulk move or delete. Every entry is judged before any result is
+    # returned, so one refused entry refuses the whole request wherever it
+    # sits in the list.
+    def bulk_decision(caller:, change:, role:, acting_user_id:, entries:, edit_days:, today:)
+      check_caller!(caller)
+      check_action!(change, BULK_ACTIONS)
+      refusals = entries.to_h do |entry|
+        [entry[:id], refusing_rules(caller:, change:, role:, acting_user_id:, entry:, edit_days:, today:)]
+      end
+      return :forbidden if refusals.values.any? { |rules| rules.intersect?(WHOLE_REQUEST_RULES) }
+
+      refusals.transform_values { |rules| rules.empty? ? :apply : :skip }
+    end
+
+    def change_facts(caller:, change:, role:, acting_user_id:, entry:, edit_days:, today:)
+      user_delegated = caller == USER_DELEGATED
+      # A background caller carries no role, so its role is never read.
+      privileged = user_delegated && privileged?(role)
+      new_bill_status = change[:bill_status]
+      {
+        action: change[:action],
+        user_delegated:,
+        privileged:,
+        employee: user_delegated && role == EMPLOYEE_ROLE,
+        own: entry[:user_id] == acting_user_id,
+        billed: entry[:bill_status] == BILLED,
+        locked: entry[:locked] == true,
+        leaves_billed: entry[:bill_status] == BILLED && !new_bill_status.nil? && new_bill_status != BILLED,
+        stale: stale?(entry[:work_date], edit_days:, today:)
+      }
+    end
+    private_class_method :change_facts
+
+    # A3: older than the window by a strict less-than, as the policy's
+    # stale check does, so the boundary day can still be changed. An entry
+    # without a work date is never stale.
+    def stale?(work_date, edit_days:, today:)
+      !work_date.nil? && work_date < today - edit_days
+    end
+    private_class_method :stale?
+
+    def check_caller!(caller)
+      return if caller == USER_DELEGATED || BACKGROUND_OPERATIONS.include?(caller)
+
+      raise UnknownCaller, "unknown caller #{caller.inspect}"
+    end
+    private_class_method :check_caller!
+
+    def check_action!(change, allowed)
+      return if allowed.include?(change[:action])
+
+      raise ArgumentError, "change action must be one of #{allowed.inspect}, got #{change[:action].inspect}"
+    end
+    private_class_method :check_action!
 
     def privileged?(role)
       # A Symbol such as :owner would otherwise fall silently to non-privileged.
