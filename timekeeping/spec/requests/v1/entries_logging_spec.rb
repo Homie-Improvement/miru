@@ -92,6 +92,36 @@ RSpec.describe "Timekeeping entry reads: request logging" do
     expect(log).not_to include(planted_jwt.split(".").first)
   end
 
+  it "never logs a token sent as a parameter name, at the top level or under an allowed name" do
+    log = capture_entry_logs do
+      get "/v1/companies/#{company_a}/entries?#{service_token}=value&project_id[#{service_token}]=5",
+        headers: { "Authorization" => "Bearer #{token}" }
+    end
+
+    expect(log).to include("Started GET", "Parameters:")
+    expect(log).not_to include(service_token)
+  end
+
+  it "never logs a token sent as the HTTP method" do
+    log = capture_entry_logs do
+      process(service_token.to_sym, "/v1/companies/#{company_a}/entries", headers: { "Authorization" => "Bearer #{token}" })
+    end
+
+    expect(log).to include(%(Started [FILTERED] "/v1/companies/#{company_a}/entries"))
+    expect(log.downcase).not_to include(service_token)
+  end
+
+  it "digests a UUID request id that equals a UUID service token" do
+    uuid_service_token = SecureRandom.uuid
+
+    log = with_timekeeping_env(Timekeeping::Environment::SERVICE_TOKEN => uuid_service_token) do
+      capture_entry_logs { get_entries(request_id: uuid_service_token) }
+    end
+
+    expect(log).to include("Started GET", "request_id=sha256:")
+    expect(log).not_to include(uuid_service_token)
+  end
+
   it "logs an allowed id and a UUID request id in clear, and masks other values" do
     request_id = SecureRandom.uuid
 

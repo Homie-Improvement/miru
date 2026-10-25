@@ -289,9 +289,8 @@ jobs:
           bundler: latest
           working-directory: timekeeping
 
-      # bin/rails is called through ruby because the file is not executable.
       - name: Prepare database
-        run: bundle exec ruby bin/rails db:prepare
+        run: bundle exec rails db:prepare
 
       - name: Run service specs
         run: bundle exec rspec

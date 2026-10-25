@@ -25,10 +25,10 @@ RSpec.describe "Timekeeping entry reads" do
     )
   end
 
-  def reserve_entry(entry, state)
+  def reserve_entry(entry, state, disposition: "active")
     Reservation.create!(
       company_id: entry.company_id, entry_id: entry.id, invoice_id: 1, state:,
-      disposition: "active", operation_id: SecureRandom.uuid
+      disposition:, operation_id: SecureRandom.uuid
     )
   end
 
@@ -72,6 +72,14 @@ RSpec.describe "Timekeeping entry reads" do
       expect(list_ids(owner_token, from: "2026-01-06", to: "2026-01-06")).to eq([own_entries.last.id])
     end
 
+    it "leaves out entries after the to date" do
+      later_entry = create_reads_spec_entry(work_date: Date.new(2026, 1, 7))
+
+      expect(list_ids(owner_token, to: "2026-01-06")).to match_array(own_entries.map(&:id) + [colleague_entry.id])
+      expect(list_ids(owner_token, from: "2026-01-06", to: "2026-01-06")).not_to include(later_entry.id)
+      expect(list_ids(owner_token, from: "2026-01-05", to: "2026-01-07")).to include(later_entry.id)
+    end
+
     it "returns nothing for a filter of the wrong shape rather than ignoring it" do
       expect(list_ids(owner_token, user_id: "7abc")).to eq([])
       expect(list_ids(owner_token, from: "2026-02-30")).to eq([])
@@ -104,18 +112,24 @@ RSpec.describe "Timekeeping entry reads" do
     let!(:unreserved) { create_reads_spec_entry(locked: true) }
     let!(:provisional) { create_reads_spec_entry(locked: false).tap { |entry| reserve_entry(entry, "provisional") } }
     let!(:committed) { create_reads_spec_entry(locked: false).tap { |entry| reserve_entry(entry, "committed") } }
+    let!(:retained) do
+      create_reads_spec_entry(locked: false).tap { |entry| reserve_entry(entry, "committed", disposition: "retained") }
+    end
 
     it "follows reservation rows on show, not the stored column" do
       expect(show_body(unreserved)["locked"]).to be(false)
       expect(show_body(provisional)["locked"]).to be(true)
       expect(show_body(committed)["locked"]).to be(true)
+      expect(show_body(retained)["locked"]).to be(true)
     end
 
     it "follows reservation rows on list, not the stored column" do
       get "/v1/companies/#{company_a}/entries", headers: { "Authorization" => "Bearer #{owner_token}" }
       locked_by_id = response.parsed_body["entries"].to_h { |entry| [entry["id"], entry["locked"]] }
 
-      expect(locked_by_id).to eq(unreserved.id => false, provisional.id => true, committed.id => true)
+      expect(locked_by_id).to eq(
+        unreserved.id => false, provisional.id => true, committed.id => true, retained.id => true
+      )
     end
   end
 

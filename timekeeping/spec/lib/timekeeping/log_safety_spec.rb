@@ -44,6 +44,52 @@ RSpec.describe Timekeeping::LogSafety do
     end
   end
 
+  describe ".request_id_tag with a UUID service token" do
+    it "digests a UUID that equals the configured service token, and keeps any other UUID" do
+      uuid_service_token = SecureRandom.uuid
+      other_uuid = SecureRandom.uuid
+
+      expect(described_class.request_id_tag(uuid_service_token, service_token: uuid_service_token))
+        .to match(/\Asha256:\h{16}\z/)
+      expect(described_class.request_id_tag(other_uuid, service_token: uuid_service_token)).to eq(other_uuid)
+    end
+  end
+
+  describe ".loggable_method" do
+    it "keeps a known HTTP method and masks any other text" do
+      expect(described_class.loggable_method("GET")).to eq("GET")
+      expect(described_class.loggable_method(hex_token)).to eq("[FILTERED]")
+    end
+  end
+
+  describe ".loggable_query" do
+    it "masks a part whose name is a credential, at the top level or in brackets under an allowed name" do
+      expect(described_class.loggable_query("#{hex_token}=value&project_id=5"))
+        .to eq("[FILTERED]&project_id=5")
+      expect(described_class.loggable_query("project_id[#{hex_token}]=5")).to eq("[FILTERED]")
+      expect(described_class.loggable_query(jwt)).to eq("[FILTERED]")
+    end
+
+    it "keeps allowed names and masks a value of the wrong shape" do
+      expect(described_class.loggable_query("entry_ids[]=1&entry_ids[]=2;from=2026-01-01"))
+        .to eq("entry_ids[]=1&entry_ids[]=2;from=2026-01-01")
+      expect(described_class.loggable_query("project_id=#{jwt}")).to eq("project_id=[FILTERED]")
+    end
+  end
+
+  describe ".loggable_params" do
+    it "masks names outside the allow-list at any depth" do
+      loggable = described_class.loggable_params(
+        hex_token => "[FILTERED]", "project_id" => { jwt => "[FILTERED]" }, "entry_ids" => [{ jwt => "x" }, "1"]
+      )
+
+      expect(loggable).to eq(
+        "[FILTERED]" => "[FILTERED]", "project_id" => { "[FILTERED]" => "[FILTERED]" },
+        "entry_ids" => [{ "[FILTERED]" => "[FILTERED]" }, "1"]
+      )
+    end
+  end
+
   describe ".loggable_path" do
     it "keeps route words, ids and dates, and masks every other segment" do
       expect(described_class.loggable_path("/v1/companies/12/entries/34")).to eq("/v1/companies/12/entries/34")

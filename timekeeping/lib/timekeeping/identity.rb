@@ -47,11 +47,12 @@ module Timekeeping
       anonymous(:invalid)
     end
 
+    # Also used by Timekeeping::LogSafety, so a value equal to the service
+    # token is never logged in clear.
     def self.service_token?(token, service_token)
       return false if service_token.to_s.empty?
 
-      ActiveSupport::SecurityUtils.secure_compare(token, service_token.to_s)
+      ActiveSupport::SecurityUtils.secure_compare(token.to_s, service_token.to_s)
     end
-    private_class_method :service_token?
   end
 end
