@@ -9,9 +9,18 @@ module Timekeeping
   #
   # kind:   :user, :service or :anonymous (the actor kind written to logs)
   # status: :verified, :expired, :invalid or :missing
-  Identity = Data.define(:kind, :status, :user_id, :company_id, :role) do
-    def self.anonymous(status)
-      new(kind: :anonymous, status:, user_id: nil, company_id: nil, role: nil)
+  #
+  # signed_company_id is the company_id claim of a token whose signature
+  # verified, expired or not. Only write metrics read it, so an expired token
+  # is counted under its own company; access decisions and log tags read
+  # company_id, which stays nil for an expired token.
+  Identity = Data.define(:kind, :status, :user_id, :company_id, :role, :signed_company_id) do
+    def initialize(signed_company_id: nil, **fields)
+      super
+    end
+
+    def self.anonymous(status, signed_company_id: nil)
+      new(kind: :anonymous, status:, user_id: nil, company_id: nil, role: nil, signed_company_id:)
     end
 
     def self.service
@@ -24,7 +33,8 @@ module Timekeeping
         status: :verified,
         user_id: claims.fetch("sub"),
         company_id: claims.fetch("company_id"),
-        role: claims.fetch("role")
+        role: claims.fetch("role"),
+        signed_company_id: claims.fetch("company_id")
       )
     end
 
@@ -41,8 +51,8 @@ module Timekeeping
       return service if service_token?(token, service_token)
 
       user(TokenVerifier.verify(token, public_key:))
-    rescue TokenVerifier::ExpiredToken
-      anonymous(:expired)
+    rescue TokenVerifier::ExpiredToken => e
+      anonymous(:expired, signed_company_id: e.company_id)
     rescue TokenVerifier::InvalidToken
       anonymous(:invalid)
     end

@@ -1,0 +1,100 @@
+# frozen_string_literal: true
+
+require "rails_helper"
+
+# GET /internal/v1/metrics answers every company's write counts, so only the
+# service token may read it.
+RSpec.describe "Timekeeping internal write metrics" do
+  let(:metrics_service_token) { "service-#{SecureRandom.hex(24)}" }
+  let(:unauthorized_body) { { "reason" => "unauthorized" } }
+
+  around do |example|
+    with_timekeeping_env(
+      Timekeeping::Environment::TOKEN_PUBLIC_KEY => rsa_key_pair.public_key.to_pem,
+      Timekeeping::Environment::SERVICE_TOKEN => metrics_service_token
+    ) { example.run }
+  end
+
+  def get_metrics(authorization)
+    headers = authorization ? { "Authorization" => authorization } : {}
+    get "/internal/v1/metrics", headers: headers
+    [response.status, response.parsed_body]
+  end
+
+  def record_metric_for_spec(company_id, at, outcome: :write, latency_ms: 40)
+    Timekeeping::WriteMetrics.new(clock: -> { at }).record(company_id:, outcome:, latency_ms:)
+  end
+
+  describe "refusals" do
+    it "refuses every bearer when TIMEKEEPING_SERVICE_TOKEN is empty" do
+      with_timekeeping_env(Timekeeping::Environment::SERVICE_TOKEN => "") do
+        expect(get_metrics("Bearer ")).to eq([401, unauthorized_body])
+        expect(get_metrics("Bearer #{metrics_service_token}")).to eq([401, unauthorized_body])
+        expect(get_metrics("Bearer anything")).to eq([401, unauthorized_body])
+      end
+    end
+
+    it "refuses an owner user token" do
+      token = mint_token({ sub: 7, company_id: 1, role: "owner" })
+
+      expect(get_metrics("Bearer #{token}")).to eq([401, unauthorized_body])
+    end
+
+    it "refuses an admin user token" do
+      token = mint_token({ sub: 7, company_id: 1, role: "admin" })
+
+      expect(get_metrics("Bearer #{token}")).to eq([401, unauthorized_body])
+    end
+
+    it "refuses a wrong service token" do
+      expect(get_metrics("Bearer #{metrics_service_token}x")).to eq([401, unauthorized_body])
+    end
+
+    it "refuses a request with no Authorization header" do
+      expect(get_metrics(nil)).to eq([401, unauthorized_body])
+    end
+  end
+
+  describe "with the service token" do
+    it "answers each window under its own company, with the bucket bounds and no cross-company totals" do
+      window = Time.utc(2026, 3, 3, 12)
+      record_metric_for_spec(2, window + 10)
+      record_metric_for_spec(1, window + 20, latency_ms: 350)
+      record_metric_for_spec(1, window + 30, outcome: :reference_unavailable)
+      record_metric_for_spec(1, window + 300)
+
+      status, body = get_metrics("Bearer #{metrics_service_token}")
+
+      expect(status).to eq(200)
+      expect(body).to eq(
+        "latency_bucket_bounds_ms" => [25, 50, 100, 200, 300, 500, 1000, 2500, 5000],
+        "overflow_bucket" => "inf",
+        "total_field" => "writes + reference_unavailable",
+        "companies" => [
+          {
+            "company_id" => 1,
+            "windows" => [
+              { "window_start" => "2026-03-03T12:00:00Z", "writes" => 1, "reference_unavailable" => 1,
+                "latency_ms_sum" => 390, "latency_ms_buckets" => { "50" => 1, "500" => 1 } },
+              { "window_start" => "2026-03-03T12:05:00Z", "writes" => 1, "reference_unavailable" => 0,
+                "latency_ms_sum" => 40, "latency_ms_buckets" => { "50" => 1 } }
+            ]
+          },
+          {
+            "company_id" => 2,
+            "windows" => [
+              { "window_start" => "2026-03-03T12:00:00Z", "writes" => 1, "reference_unavailable" => 0,
+                "latency_ms_sum" => 40, "latency_ms_buckets" => { "50" => 1 } }
+            ]
+          }
+        ]
+      )
+    end
+
+    it "answers an empty companies list when nothing has been recorded" do
+      status, body = get_metrics("Bearer #{metrics_service_token}")
+
+      expect([status, body.fetch("companies")]).to eq([200, []])
+    end
+  end
+end

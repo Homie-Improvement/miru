@@ -4,9 +4,13 @@ class Timekeeping::V1::EntriesController < ApplicationController
   LIST_FILTERS = %w[from to user_id project_id].freeze
   WRITE_ACTIONS = %i[create update destroy bulk_move bulk_delete].freeze
 
+  include Timekeeping::WriteMetricsRecording
+
   # Writes answer an expired token with 503 instead of the read routes' 401,
   # so they take their own access decision.
   skip_before_action :authorize_read!, only: WRITE_ACTIONS
+  # Declared before the access check so refusals are measured too.
+  around_action :record_write_metric, only: WRITE_ACTIONS
   before_action :authorize_write!, only: WRITE_ACTIONS
 
   # A body that is not JSON, or holds a value of the wrong shape, gets the same
