@@ -91,6 +91,49 @@ RSpec.describe TimesheetEntry, type: :model do
     it { is_expected.to callback(:ensure_billed_status_should_not_be_changed).before(:validation) }
   end
 
+  describe "stored company_id" do
+    def stored_company_id(entry)
+      ActiveRecord::Base.connection.select_value("SELECT company_id FROM timesheet_entries WHERE id = #{entry.id}")
+    end
+
+    it "is the project's client's company on create" do
+      expect(stored_company_id(timesheet_entry)).to eq(company.id)
+    end
+
+    it "follows a project move made through the association" do
+      timesheet_entry.project = project2
+      timesheet_entry.save!
+
+      expect(stored_company_id(timesheet_entry)).to eq(company2.id)
+    end
+
+    it "follows a project move made with update(project_id:), as the bulk move does" do
+      TimesheetEntry.where(id: timesheet_entry.id).each { |entry| entry.update(project_id: project2.id) }
+
+      expect(stored_company_id(timesheet_entry)).to eq(company2.id)
+    end
+
+    it "is filled on the next save when it is missing" do
+      timesheet_entry.update_columns(company_id: nil)
+
+      timesheet_entry.reload.update!(note: "edited")
+
+      expect(stored_company_id(timesheet_entry)).to eq(company.id)
+    end
+
+    it "keeps the entry's company resolved through its client" do
+      timesheet_entry.update_columns(company_id: company2.id)
+
+      expect(timesheet_entry.reload.company).to eq(company)
+    end
+
+    it "is not recorded in the audit log" do
+      timesheet_entry.update!(project: project2)
+
+      expect(timesheet_entry.audits.map { |audit| audit.audited_changes.keys }.flatten).not_to include("company_id")
+    end
+  end
+
   describe "Scopes" do
     before do
       @timesheet_entry1 = create(:timesheet_entry, project:)

@@ -16,10 +16,11 @@ RSpec.describe TimekeepingContract do
   end
 
   describe ".load" do
-    it "gives the snapshot entry exactly the timesheet_entries columns plus company_id and version" do
+    it "gives the snapshot entry exactly the timesheet_entries columns, company_id and version included" do
       entry_fields = described_class.load(:entry_snapshots).fetch("entry_fields")
 
-      expect(entry_fields).to match_array(timesheet_entries_columns_from_schema + ["company_id", "version"])
+      expect(timesheet_entries_columns_from_schema).to include("company_id", "version")
+      expect(entry_fields).to match_array(timesheet_entries_columns_from_schema)
       expect(entry_fields.size).to eq(21)
     end
 

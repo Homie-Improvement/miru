@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_10_20_120000) do
+ActiveRecord::Schema[8.1].define(version: 2026_10_25_120000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pg_stat_statements"
@@ -411,6 +411,53 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_20_120000) do
     t.index ["user_id"], name: "index_employments_on_user_id"
   end
 
+  create_table "entries", force: :cascade do |t|
+    t.bigint "agent_id"
+    t.string "bill_status", null: false
+    t.bigint "company_id", null: false
+    t.datetime "created_at", null: false
+    t.datetime "discarded_at"
+    t.float "duration", null: false
+    t.string "external_run_id"
+    t.string "external_session_id"
+    t.boolean "locked", default: false
+    t.text "note", default: ""
+    t.bigint "project_id", null: false
+    t.jsonb "proof_metadata", default: {}, null: false
+    t.text "proof_url"
+    t.string "review_status", default: "not_required", null: false
+    t.string "source", default: "manual", null: false
+    t.jsonb "source_metadata", default: {}, null: false
+    t.datetime "updated_at", null: false
+    t.bigint "user_id", null: false
+    t.integer "version", default: 1, null: false
+    t.date "work_date", null: false
+    t.index ["company_id", "id"], name: "index_entries_on_company_id_and_id", unique: true
+    t.index ["company_id", "project_id", "work_date"], name: "index_entries_on_company_id_and_project_id_and_work_date"
+    t.index ["company_id", "user_id", "work_date"], name: "index_entries_on_company_id_and_user_id_and_work_date"
+  end
+
+  create_table "entry_audits", force: :cascade do |t|
+    t.string "action", null: false
+    t.string "actor_id"
+    t.string "actor_type", null: false
+    t.jsonb "changed_fields", default: {}, null: false
+    t.bigint "company_id", null: false
+    t.datetime "created_at", null: false
+    t.bigint "entry_id", null: false
+    t.index ["company_id", "entry_id"], name: "index_entry_audits_on_company_id_and_entry_id"
+  end
+
+  create_table "entry_outbox_items", primary_key: "outbox_position", force: :cascade do |t|
+    t.bigint "company_id", null: false
+    t.datetime "created_at", null: false
+    t.bigint "entry_id", null: false
+    t.bigint "generation", null: false
+    t.jsonb "payload", null: false
+    t.datetime "sent_at"
+    t.index ["company_id", "entry_id"], name: "index_entry_outbox_items_on_company_id_and_entry_id"
+  end
+
   create_table "exchange_rate_usages", force: :cascade do |t|
     t.datetime "created_at", null: false
     t.datetime "last_fetched_at"
@@ -504,6 +551,21 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_20_120000) do
     t.index ["discarded_at"], name: "index_holidays_on_discarded_at"
   end
 
+  create_table "idempotency_records", force: :cascade do |t|
+    t.string "actor_id", null: false
+    t.string "actor_type", null: false
+    t.bigint "company_id", null: false
+    t.datetime "created_at", null: false
+    t.datetime "expires_at", null: false
+    t.string "key", null: false
+    t.string "operation", null: false
+    t.string "request_digest", null: false
+    t.jsonb "response_body", default: {}, null: false
+    t.integer "response_status", null: false
+    t.index ["company_id", "actor_type", "actor_id", "operation", "key"], name: "index_idempotency_records_on_scope_and_key", unique: true
+    t.index ["expires_at"], name: "index_idempotency_records_on_expires_at"
+  end
+
   create_table "identities", force: :cascade do |t|
     t.datetime "created_at", null: false
     t.string "provider"
@@ -564,6 +626,33 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_20_120000) do
     t.index ["invoice_id"], name: "index_invoice_line_items_on_invoice_id"
     t.index ["timesheet_entry_id", "date"], name: "index_invoice_line_items_on_timesheet_entry_date"
     t.index ["timesheet_entry_id"], name: "index_invoice_line_items_on_timesheet_entry_id"
+  end
+
+  create_table "invoice_operation_intents", force: :cascade do |t|
+    t.bigint "company_id", null: false
+    t.datetime "created_at", null: false
+    t.datetime "finished_at"
+    t.bigint "generation", null: false
+    t.bigint "invoice_id", null: false
+    t.uuid "operation_id", null: false
+    t.string "state", null: false
+    t.index ["company_id", "invoice_id", "operation_id"], name: "index_invoice_operation_intents_on_company_invoice_operation", unique: true
+    t.check_constraint "state::text = ANY (ARRAY['pending'::character varying, 'committed'::character varying, 'failed'::character varying]::text[])", name: "invoice_operation_intents_state_check"
+  end
+
+  create_table "invoice_operations", force: :cascade do |t|
+    t.bigint "company_id", null: false
+    t.datetime "created_at", null: false
+    t.bigint "desired_entry_ids", default: [], null: false, array: true
+    t.string "disposition", null: false
+    t.datetime "finished_at"
+    t.bigint "generation", null: false
+    t.bigint "invoice_id", null: false
+    t.uuid "operation_id", null: false
+    t.string "state", null: false
+    t.index ["company_id", "invoice_id"], name: "index_invoice_operations_one_prepared_per_invoice", unique: true, where: "((state)::text = 'prepared'::text)"
+    t.check_constraint "disposition::text = ANY (ARRAY['active'::character varying, 'retained'::character varying]::text[])", name: "invoice_operations_disposition_check"
+    t.check_constraint "state::text = ANY (ARRAY['prepared'::character varying, 'committed'::character varying, 'aborted'::character varying]::text[])", name: "invoice_operations_state_check"
   end
 
   create_table "invoice_taxes", force: :cascade do |t|
@@ -922,6 +1011,21 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_20_120000) do
     t.index ["requested_by_id"], name: "index_razorpay_payouts_on_requested_by_id"
   end
 
+  create_table "reservations", id: false, force: :cascade do |t|
+    t.bigint "company_id", null: false
+    t.datetime "created_at", null: false
+    t.string "disposition", null: false
+    t.bigint "entry_id", null: false
+    t.bigint "invoice_id", null: false
+    t.uuid "operation_id", null: false
+    t.string "state", null: false
+    t.index ["company_id", "entry_id"], name: "index_reservations_on_company_id_and_entry_id"
+    t.index ["company_id", "entry_id"], name: "index_reservations_one_committed_per_entry", unique: true, where: "((state)::text = 'committed'::text)"
+    t.index ["company_id", "entry_id"], name: "index_reservations_one_provisional_per_entry", unique: true, where: "((state)::text = 'provisional'::text)"
+    t.check_constraint "disposition::text = ANY (ARRAY['active'::character varying, 'retained'::character varying]::text[])", name: "reservations_disposition_check"
+    t.check_constraint "state::text = ANY (ARRAY['provisional'::character varying, 'committed'::character varying]::text[])", name: "reservations_state_check"
+  end
+
   create_table "roles", force: :cascade do |t|
     t.datetime "created_at", null: false
     t.string "name"
@@ -1085,6 +1189,17 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_20_120000) do
     t.index ["discarded_at"], name: "index_tax_configurations_on_discarded_at"
   end
 
+  create_table "timekeeping_ownership", force: :cascade do |t|
+    t.datetime "changed_at", default: -> { "CURRENT_TIMESTAMP" }, null: false
+    t.string "changed_by", default: "system", null: false
+    t.bigint "generation", default: 1, null: false
+    t.string "handoff_step"
+    t.string "owner", default: "monolith", null: false
+    t.check_constraint "handoff_step IS NULL OR (handoff_step::text = ANY (ARRAY['close_admission'::character varying, 'settle'::character varying, 'freeze'::character varying, 'checkpoint'::character varying, 'sequence'::character varying, 'reconcile'::character varying]::text[]))", name: "timekeeping_ownership_handoff_step_check"
+    t.check_constraint "id = 1", name: "timekeeping_ownership_single_row_check"
+    t.check_constraint "owner::text = ANY (ARRAY['monolith'::character varying, 'timekeeping'::character varying]::text[])", name: "timekeeping_ownership_owner_check"
+  end
+
   create_table "timeoff_entries", force: :cascade do |t|
     t.datetime "created_at", null: false
     t.bigint "custom_leave_id"
@@ -1106,6 +1221,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_20_120000) do
   create_table "timesheet_entries", force: :cascade do |t|
     t.bigint "agent_id"
     t.integer "bill_status", null: false
+    t.bigint "company_id"
     t.datetime "created_at", null: false
     t.datetime "discarded_at"
     t.float "duration", null: false
@@ -1121,6 +1237,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_20_120000) do
     t.jsonb "source_metadata", default: {}, null: false
     t.datetime "updated_at", null: false
     t.bigint "user_id", null: false
+    t.integer "version", default: 0, null: false
     t.date "work_date", null: false
     t.index ["agent_id", "review_status"], name: "index_timesheet_entries_on_agent_id_and_review_status"
     t.index ["agent_id"], name: "index_timesheet_entries_on_agent_id"
@@ -1266,6 +1383,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_20_120000) do
   add_foreign_key "devices", "users"
   add_foreign_key "employments", "companies"
   add_foreign_key "employments", "users"
+  add_foreign_key "entry_audits", "entries", column: ["company_id", "entry_id"], primary_key: ["company_id", "id"]
   add_foreign_key "expense_categories", "companies"
   add_foreign_key "expenses", "companies"
   add_foreign_key "expenses", "expense_categories"
@@ -1309,6 +1427,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_20_120000) do
   add_foreign_key "quickbooks_sync_runs", "quickbooks_connections", column: ["quickbooks_connection_id", "company_id"], primary_key: ["id", "company_id"], name: "fk_qbo_runs_connection_company"
   add_foreign_key "razorpay_payouts", "payments"
   add_foreign_key "razorpay_payouts", "users", column: "requested_by_id"
+  add_foreign_key "reservations", "entries", column: ["company_id", "entry_id"], primary_key: ["company_id", "id"]
   add_foreign_key "solid_queue_blocked_executions", "solid_queue_jobs", column: "job_id", on_delete: :cascade
   add_foreign_key "solid_queue_claimed_executions", "solid_queue_jobs", column: "job_id", on_delete: :cascade
   add_foreign_key "solid_queue_failed_executions", "solid_queue_jobs", column: "job_id", on_delete: :cascade

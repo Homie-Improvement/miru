@@ -50,6 +50,7 @@ class TimesheetEntry < ApplicationRecord
   before_validation :ensure_billed_status_should_not_be_changed, on: :update
   before_validation :normalize_source_fields
   before_validation :normalize_proof_metadata
+  before_save :assign_company_from_project, if: -> { company_id.nil? || will_save_change_to_project_id? }
   after_create { Rails.event.notify(TimesheetEntries::Created.new(self)) }
 
   validates :duration, :work_date, :bill_status, :review_status, presence: true
@@ -130,6 +131,13 @@ class TimesheetEntry < ApplicationRecord
   end
 
   private
+
+    # Keeps the stored company_id equal to project -> client -> company, the
+    # tenant the Timekeeping handoff copies entries under. Reads of the entry's
+    # company still go through the has_one :company association.
+    def assign_company_from_project
+      self.company_id = project.client.company_id
+    end
 
     def ensure_bill_status_is_set
       return if bill_status.present? || project.nil?

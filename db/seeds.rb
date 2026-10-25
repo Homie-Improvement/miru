@@ -151,6 +151,9 @@ end
 # is fixed to AS_OF, so the same seed always produces the same entries,
 # invoices and report totals.
 
+# A database loaded from db/schema.rb has no ownership row; migrated ones do.
+TimekeepingOwnership.ensure_initial!
+
 company = Company.find_or_initialize_by(name: "Fork & Leaf Salads")
 company.update!(
   address: "212 Market Row, Springfield, OR 97477",
