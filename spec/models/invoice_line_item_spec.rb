@@ -44,6 +44,43 @@ RSpec.describe InvoiceLineItem, type: :model do
     end
   end
 
+  describe "company of the timesheet entries" do
+    let(:invoice) { create(:invoice) }
+    let(:other_company) { create(:company) }
+    let(:other_company_entry) do
+      project = create(:project, client: create(:client, company: other_company), billable: true)
+      user = create(:user, current_workspace: other_company)
+      create(:timesheet_entry, user:, project:, bill_status: "unbilled")
+    end
+    let(:same_company_entry) do
+      project = create(:project, client: invoice.client, billable: true)
+      user = create(:user, current_workspace: invoice.company)
+      create(:timesheet_entry, user:, project:, bill_status: "unbilled")
+    end
+
+    it "is invalid when a linked timesheet entry belongs to another company" do
+      line_item = build(:invoice_line_item, invoice:, timesheet_entry: nil)
+      line_item.linked_timesheet_entries = [same_company_entry, other_company_entry]
+
+      expect(line_item).not_to be_valid
+      expect(line_item.errors[:linked_timesheet_entries]).to include("must belong to the same company")
+    end
+
+    it "is valid when every linked timesheet entry belongs to the invoice's company" do
+      line_item = build(:invoice_line_item, invoice:, timesheet_entry: nil)
+      line_item.linked_timesheet_entries = [same_company_entry]
+
+      expect(line_item).to be_valid
+    end
+
+    it "is invalid when the direct timesheet entry belongs to another company" do
+      line_item = build(:invoice_line_item, invoice:, timesheet_entry: other_company_entry)
+
+      expect(line_item).not_to be_valid
+      expect(line_item.errors[:timesheet_entry]).to include("must belong to the same company")
+    end
+  end
+
   describe "callbacks" do
     it { is_expected.to callback(:unlock_timesheet_entries).before(:destroy) }
   end
