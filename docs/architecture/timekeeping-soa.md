@@ -244,7 +244,13 @@ These are not proven by the repository. They are stated here so later sections d
 
 ### 3.1 One new service, Timekeeping
 
-The target extracts exactly one service, **Timekeeping**. It is a separate deployable application with its own database. The monolith keeps everything else.
+The target extracts exactly one service, **Timekeeping**. It is an independently deployable application with its own database, kept in this repository. Identity, catalogue, billing and reporting stay in the monolith. There is no second service.
+
+The time-locking callbacks of section 1.4 become three parts, each of which can be read on its own:
+
+1. **The gateway**: one module in the monolith that is the only code allowed to write entry state or reservations.
+2. **The reservation rule**: an entry has at most one reservation by a kept invoice (section 7).
+3. **The read model**: `timesheet_entries`, kept as a read-only projection of Timekeeping (section 3.3).
 
 ```mermaid
 flowchart LR
@@ -256,59 +262,104 @@ flowchart LR
   end
   subgraph Monolith["Rails monolith"]
     AUTH[Sign-in, roles, companies, projects, clients]
+    GW[Timekeeping gateway]
     BILL[Invoices, line items, payments, tax, currency]
     REP[Reports + analytics]
-    PROJ[(Reporting projection of entries)]
-    MOB[(monolith DB + outbox)]
+    PC[Projection consumer]
+    PROJ[(timesheet_entries projection)]
   end
   subgraph TK["Timekeeping service"]
-    API[Entry API + billing-hold commands]
+    API[Entry API + prepare / commit / abort]
     TDB[(timekeeping DB + outbox)]
+    RELAY[Relay worker, dedicated queue]
   end
   Web --> AUTH
   CLI --> AUTH
-  MCP --> AUTH
+  MCP -->|in-process Rack call to CLI API| AUTH
   Agent --> AUTH
-  AUTH -->|signed user token| API
-  BILL -->|claim / release / mark-billed, service identity| API
+  AUTH --> GW
+  BILL -->|invoice reservation boundary| GW
+  GW -->|signed user token or service identity, ownership generation| API
   API -->|reference-data read, service identity| AUTH
-  TDB -->|entry events| PROJ
-  MOB -->|project, membership, company events| API
-  REP --> PROJ
-  BILL --> MOB
   API --> TDB
+  TDB --> RELAY
+  RELAY -->|entry snapshots over HTTP| PC
+  PC --> PROJ
+  REP --> PROJ
 ```
 
-Clients keep calling the monolith's existing routes. The monolith checks the session, mints a short-lived signed token (section 6) and forwards entry requests to Timekeeping. This keeps every client URL, the MCP proxy in `app/mcp/tools/base_tool.rb`, and the mobile routes unchanged. A later phase may let clients call Timekeeping directly; that is future work, not part of this migration.
+Clients keep calling the monolith's existing routes. The monolith checks the session as it does today, and the gateway forwards the write to Timekeeping with a short-lived signed token (section 6) and the current ownership generation (section 10). Every client URL, the mobile routes and the MCP path stay unchanged. MCP needs no path of its own, because its tools call the CLI controller in-process (section 1.3).
+
+**The gateway (proposed).** While Timekeeping owns the data, every entry-writing flow goes through the gateway. Each call carries the current ownership generation, and a stale generation is refused. The gateway covers:
+
+- the web and mobile controller;
+- the bulk controller;
+- the CLI controller, which also serves MCP: MCP calls it in-process through `Rack::MockRequest` (`app/mcp/api_proxy.rb:40`), not over HTTP;
+- the agent controller;
+- the Harvest import;
+- the invoice reservation boundary, which replaces the lock callbacks in `app/models/invoice.rb` and `app/models/invoice_line_item.rb` and `Invoice#update_timesheet_entry_status!`;
+- **agent destroy:** `has_many :timesheet_entries, dependent: :nullify` (`app/models/agent.rb:11`) becomes a Timekeeping command that nulls `agent_id` on that company's entries, with an audit row;
+- the seed and demo writers of section 1.3 (`db/seeds.rb`, `db/seeds/timesheet_data.rb`, `Analytics::DemoSeeder`). Before cutover they create the two seeded businesses that the cutover moves. Once Timekeeping owns the data, they write through the gateway like every other flow.
+
+The gateway also sends the **user-retire check** before a user hard delete (section 3.3), because that delete depends on whether the user has entries.
+
+Rules the gateway applies to every writer:
+
+- **Generation on every write.** A writer that makes many writes checks the generation on each one, not once per job. These writers are the Harvest import, the bulk move, agent destroy and the seed and demo writers. When the generation rises partway through, the remaining writes are refused. The writer fails visibly, and it is retried against the new owner.
+- **Stale generation in the bulk move.** A generation refusal fails the whole bulk request with an error. It is not one of the silently skipped entries of A9. A9 covers entries that fail validation; the generation is an admission decision. This order between the two rules is a design choice.
+- **The invoice-number rewrite is not a reservation change.** The invoice reservation boundary runs only when an invoice changes which entries it holds, or is discarded or destroyed. It never runs on every invoice save. A discarded draft's `update_invoice_number` save (`app/models/invoice.rb:323-325`) therefore cannot reserve its entries again (L2).
+
+A single-writer guard test runs every flow above and fails if anything other than the projection consumer changes a `timesheet_entries` row (section 12).
 
 ### 3.2 Responsibilities
 
 | Service | Owns and decides | Does not own |
 |---|---|---|
-| **Timekeeping** | Time entries (`duration`, `work_date`, `note`, `project_id`, `user_id`, `agent_id`, `source`, `source_metadata`, proof fields, `discarded_at`); `bill_status`; `review_status`; billing holds (the replacement for `locked`); entry audit history; entry authorization checks A1–A11; entry idempotency records; the entry outbox. | Users, roles, companies, projects, clients, rates, invoices, money. |
+| **Timekeeping** | Time entries (`duration`, `work_date`, `note`, `project_id`, `user_id`, `agent_id`, `source`, `source_metadata`, proof fields, `discarded_at`); `bill_status`; `review_status`; reservations (the replacement for `locked`, section 7) and their terminal operation records; entry audit history; entry rules A1–A11 for the callers section 6 names; entry idempotency receipts; the entry outbox. | Users, roles, companies, projects, clients, rates, invoices, money. |
 | **Monolith: identity and catalogue** | Users, sessions, API tokens, roles (rolify), companies and `timesheet_edit_days`, clients, projects (`billable`, membership, hourly rates), agents. | Entry rows. |
-| **Monolith: billing** | Invoices, line items (with their copied `rate` and `quantity`), invoice taxes, payments, exchange rates, invoice audit history, the choice of which entries to invoice. | Entry state. It changes entry state only through Timekeeping commands. |
-| **Monolith: reporting** | Reports, analytics and metrics, read from a company-keyed projection of entries fed by Timekeeping events (section 5.4). | Entry state. The projection is read-only and never authoritative. |
+| **Monolith: gateway** | Forwarding every entry write and every reservation operation to the current owner, with the current ownership generation (section 3.1). | Any decision about entry rules. It checks its input and hands off. |
+| **Monolith: billing** | Invoices, line items (with their copied `rate` and `quantity`), invoice taxes, payments, exchange rates, invoice audit history, the choice of which entries to invoice, and the invoice operation ledger with its pending intents (section 9). | Entry state. It changes entry state only through the gateway. |
+| **Monolith: reporting** | Reports, analytics and metrics, read from `timesheet_entries` (section 3.3). | Entry state. The projection is read-only and never authoritative. |
 
 ### 3.3 Authoritative data ownership
 
 | Fact | Authority after migration | Others may hold |
 |---|---|---|
-| Entry fields, `bill_status`, `review_status` | Timekeeping | Reporting projection (read-only copy) |
-| Whether an entry is held for billing, and by whom | Timekeeping (`billing_holds`) | Billing keeps the hold token on its line-item association |
+| Entry fields, `bill_status`, `review_status` | Timekeeping | `timesheet_entries` projection (read-only copy) |
+| Whether an entry is reserved, and by which invoice | Timekeeping (section 7) | The projection's `locked` boolean, which says only that a reservation exists |
 | `company_id` of an entry | Timekeeping, stored on the entry (see 6.1) | Projection |
 | Project `billable`, client → company, membership, rates | Monolith | Timekeeping reads them fresh per write (section 3.4) |
 | Role of a user in a company, `timesheet_edit_days` | Monolith | Carried in the signed token per request |
 | Invoice and line-item money, line-item → entry links | Monolith billing | Nobody else |
 
-The billing tables lose their database foreign keys to `timesheet_entries` because the two tables live in different databases. The line-item columns `timesheet_entry_id` and `invoice_line_item_time_entries.timesheet_entry_id` stay as plain ids, valid only together with the hold token that Timekeeping returned for them.
+**One read model, one writer.** `timesheet_entries` stays in the monolith's database as a read-only projection of Timekeeping. Only the projection consumer writes it (section 5.4). No request path writes it as well ("write-through"). Aggregate readers keep their current queries unchanged.
+
+**Two read rules.**
+
+- **Reads that decide money, or that a user makes right after writing, read Timekeeping.** These are the entry API's own list and show reads (web, mobile, CLI, MCP, agent), including `TimeTrackingIndexService` behind `app/controllers/api/v1/timesheet_entry_controller.rb` and `app/controllers/api/v1/time_tracking_controller.rb`. They also include invoice candidate selection (`GenerateInvoice::NewLineItemsService`) and invoice validation.
+- **Every aggregate reads the projection and may lag.** These are reports, analytics, metrics, the dashboard, project, client and team totals, and reminders: the readers listed in section 1.7.
+
+**Billing rows hold no tokens.** The line-item columns `timesheet_entry_id` and `invoice_line_item_time_entries.timesheet_entry_id` stay as plain ids. A reservation is identified by (entry, invoice) and lives in Timekeeping, so rollback never edits billing tables.
+
+**Foreign keys.** Three keys point from or into `timesheet_entries` at rows that can change on the other side of the boundary. They are dropped before cutover, in their own migration (section 10):
+
+- `invoice_line_item_time_entries → timesheet_entries` (`db/schema.rb:1282`) and `invoice_line_items → timesheet_entries` (`:1284`). Otherwise a new entry can be invoiced before the projection holds its row, and the key rejects the line item. Existence and same-company (L8) are checked by the prepare response, which is authoritative (section 5.3).
+- `timesheet_entries → agents` (`:1325`). Agent destroy nulls `agent_id` in Timekeeping, and the null reaches the projection later. A kept key would either refuse the agent delete or stop the relay on a snapshot it cannot insert. While the relay is behind, an aggregate join can see an `agent_id` whose agent row is gone. This is a design choice, disclosed here.
+
+The keys `timesheet_entries → projects` (`:1326`) and `timesheet_entries → users` (`:1327`) stay. Today the users key is the only check that stops a user with time entries from being hard-deleted (section 1.3). A projection key cannot keep that check alone, because an entry Timekeeping accepted may not have reached the projection yet. So the check moves to the owner of the entries:
+
+- **User-retire check.** Before a user hard delete, the gateway sends the user-retire command (section 5.3). In one Timekeeping transaction, the command refuses if any entry references the user, and otherwise marks the user retired. After that, Timekeeping refuses new entries for a retired user, so a create cannot race the check. The monolith destroys the user row only after the command succeeds. While the prepared monolith owns the data (section 10), the same check runs against its own entry table.
+- The same rule applies to a project hard delete. No code in `app/` destroys a project, so the rule has no caller today.
+- Agent destroys that run through `User` (`app/models/user.rb:39`) happen only after the user check has passed.
 
 ### 3.4 Reference data Timekeeping needs, and how it reads it
 
-Timekeeping's rules read facts the monolith owns: project `billable` (S1, S3), client → company (tenancy), project membership, the agent's user and company (S7), the user's role and `timesheet_edit_days` (A1–A7). Today these are read in the same transaction as the write, so a settings or permission change takes effect at once. The target keeps that freshness:
+Timekeeping's rules read facts the monolith owns: project `billable` (S1, S3), client → company (tenancy), project membership, the agent's user and company (S7), the user's role and `timesheet_edit_days` (A1–A7).
+
+Today (observed), the role and `timesheet_edit_days` are read in `authorize`, before the write's transaction opens. The controller calls `authorize` (`app/controllers/api/v1/timesheet_entry_controller.rb:30`, `:40`, `:48`), and the policy reads `record.project.client.company.timesheet_edit_days` (`app/policies/timesheet_entry_policy.rb:46`). Only the model validations, which read project `billable` and the agent's company, run inside the save's transaction. The target reads the same facts once per request, as fresh as today:
 
 - **User-delegated writes.** The monolith mints the signed token per request. Its claims carry the user's current role in the company, `timesheet_edit_days`, and for each project the request touches: `company_id`, `billable` and whether the user is a member. Timekeeping takes these claims as the facts for that write.
-- **Background writes** (billing commands, imports, jobs). Timekeeping calls a monolith read endpoint, `GET /internal/v1/companies/{company_id}/reference?project_ids=…`, with its own service identity, before deciding.
+- **Background writes** (reservation operations, imports, agent destroy, seed and demo writers). Timekeeping calls a monolith read endpoint, `GET /internal/v1/companies/{company_id}/reference?project_ids=…`, with its own service identity, before deciding.
 - **When the facts cannot be read** (expired token, missing project claim, monolith endpoint down), the write is refused with a retryable `503 reference_unavailable`. It fails closed: Timekeeping never guesses and never falls back to an older copy.
 - There are no cross-database joins.
 
@@ -326,7 +377,7 @@ The cost: entry writes depend on the monolith being up. Today they do too, becau
 |---|---|---|
 | A. Move timekeeping code into modules or service classes inside the monolith | No independent deployment and no separate data ownership, which the goal rules out explicitly. Billing callbacks could still write entry rows. | Rejected. Useful only as a preparatory refactor before extraction. |
 | B. Separate deploy, shared database | Deploys split, but both apps write `timesheet_entries`, so nobody owns the data. Schema changes need lock-step deploys. | Rejected. It keeps the coupling in section 1.4 and adds deploy coordination. |
-| **C. One Timekeeping service with its own database (recommended)** | One new network boundary, an outbox per side, a hold protocol, and a migration. | Chosen. It is the smallest change that gives timekeeping its own deploy and data, and it removes billing's direct writes. |
+| **C. One Timekeeping service with its own database (recommended)** | One new network boundary, one outbox, a reservation protocol, and a migration. | Chosen. It is the smallest change that gives timekeeping its own deploy and data, and it removes billing's direct writes. |
 | D. Two services: Timekeeping and Billing | Billing would have to call back for users, clients, projects, payments and rates. Every invoice screen becomes a cross-service read. | Rejected as unnecessary distributed complexity. It may be revisited later on its own merits. |
 | E. Timekeeping plus a separate Reporting service | Another service and database for read-only data. Revenue reports would need billing data replicated too. | Rejected. The projection inside the monolith is enough. |
 | F. Event-fed copies of reference data inside Timekeeping (instead of section 3.4) | Fewer synchronous calls, but a role, edit-window or project change would apply only when its event arrives. That weakens authorization rules A1–A7 for a period. | Rejected, recorded for review. It could return only with an owner decision that accepts the delay. |
@@ -338,8 +389,9 @@ The cost: entry writes depend on the monolith being up. Today they do too, becau
 - Every request and every event carries `company_id`. Timekeeping checks it against the entry's stored `company_id` and against the caller's identity (section 6). A mismatch returns `404 not_found`, the same answer as for a missing id, so a caller cannot probe other tenants.
 - Every state-changing request carries an `Idempotency-Key` header. Timekeeping stores it in `idempotency_records`, keyed by `(company_id, actor_type, actor_id, operation, key)` and kept for at least 24 hours, which matches the MCP store (`app/mcp/idempotency_store.rb`). Only successful (2xx) responses are stored, as in the MCP store. A retry with the same key and the same body returns the stored success; a retry after an error, including a `409`, is evaluated again, so a conflict that has since cleared does not keep failing. The same key with a different body returns `422 idempotency_key_reused`. A key from another company or actor never matches.
 - Every API path is versioned in the URL (`/v1/…`). Every event carries `schema_version`. Additive changes (new optional fields) keep the version. Removing or retyping a field needs a new version, and both versions run in parallel until every consumer has moved.
-- Money travels as decimal strings, for example `"125.50"`, never as floats (section 8). Durations travel as decimal strings of minutes (section 8.3).
-- Write responses return the entry's `version` (a counter that rises on every change). Updates may send `If-Match: <version>`; a stale version returns `409 version_conflict`. Clients that do not send it keep today's last-write-wins behaviour.
+- Money travels as decimal strings, for example `"125.50"`, never as floats (section 8). Timekeeping's contracts carry no money: billing keeps its own money, rate and quantity values. `duration` travels as a JSON number holding the stored float unchanged. It is never converted or rounded on the way (section 8.3).
+- Write responses return the entry's `version` (a counter that rises on every change). Versions only advance, across cutover, rollback and re-cutover too (section 10). Updates may send `If-Match: <version>`; a stale version returns `409 version_conflict`. Clients that do not send it keep today's last-write-wins behaviour.
+- Every state-changing request from the gateway carries the current ownership generation. A request with a stale generation returns `409 stale_generation` and changes nothing.
 
 ### 5.2 Entry API (user-delegated)
 
@@ -349,92 +401,125 @@ Illustrative shapes. Field names follow the current JSON in `app/views/api/v1/` 
 POST   /v1/companies/{company_id}/entries
 PATCH  /v1/companies/{company_id}/entries/{entry_id}
 DELETE /v1/companies/{company_id}/entries/{entry_id}
+GET    /v1/companies/{company_id}/entries/{entry_id}
 GET    /v1/companies/{company_id}/entries?from=&to=&user_id=&project_id=
 POST   /v1/companies/{company_id}/entries/bulk-move
 POST   /v1/companies/{company_id}/entries/bulk-delete
 
-Headers: Authorization: Bearer <signed user token>, Idempotency-Key: <uuid>
-Entry body: { project_id, user_id?, work_date, duration: "90.0", note, bill_status?,
+Headers: Authorization: Bearer <signed user token>, Idempotency-Key: <uuid>,
+         Ownership-Generation: <n>
+Entry body: { project_id, user_id?, work_date, duration: 90.0, note, bill_status?,
               source, source_metadata, agent_id?, proof_url?, proof_metadata? }
-Response:   { id, company_id, version, ...fields, held: true|false }
+Response:   { id, company_id, version, ...fields, locked: true|false }
 ```
 
-`held` replaces `locked` in responses. The monolith keeps exposing `locked` to clients, set from `held`, so client JSON does not change. Bulk endpoints return a per-entry result list. To preserve A9, the monolith's bulk route still reports overall success as it does today; the per-entry list is new information it may log.
+`locked` in responses is `true` when the entry has a reservation (section 7), so client JSON does not change. The list and show reads are the entry API's own reads, served by Timekeeping (section 3.3). Bulk endpoints return a per-entry result list. To preserve A9, the monolith's bulk route still reports overall success as it does today; the per-entry list is new information it may log. A stale generation is not a per-entry result: it fails the whole bulk request (section 3.1).
 
-### 5.3 Billing-hold commands (service identity)
+### 5.3 Reservation operations and service commands (service identity)
+
+The invoice reservation boundary uses three operations: prepare, commit and abort. Each is idempotent by a stable `operation_id`, which the monolith writes into its pending operation intent before it calls prepare (section 9). `invoice_id` is the stable invoice identity. It stays valid after the invoice row is hard-deleted, so the same operations cover invoice creation and deletion.
 
 ```text
-POST /v1/companies/{company_id}/holds/claim
-  { invoice_id, claims: [ { entry_id, association_id } ], seq, idempotency_key,
-    prior_outcomes: [ { seq, outcome: "committed" | "failed" } ] }   -- earlier attempts of this invoice not yet acknowledged
-  -> 200 { holds: [ { entry_id, hold_token | null, outcome: "held" | "stale_claim" | "attempt_closed" } ] }
-  -> 409 { conflicts: [ { entry_id, reason: "held_by_other" | "not_billable_state" } ] }   (whole batch rejected)
+POST /v1/companies/{company_id}/reservations/prepare
+  { invoice_id, operation_id, generation, disposition: "active" | "retained",
+    entries: [ entry_id, ... ] }                       -- the invoice's desired entry set
+  -> 200 { operation_id, state: "prepared" | "committed" | "aborted",
+           entries: [ { entry_id, company_id } ] }     -- company of each entry, authoritative for L8
+  -> 409 { reason: "conflict", conflicts: [ { entry_id,
+           reason: "on_another_invoice" | "provisional_elsewhere" | "not_found" } ] }   (nothing reserved)
+  -> 409 { reason: "unresolved_operation", operation_id, retryable: true }
+  -> 409 { reason: "stale_generation" }
 
-POST /v1/companies/{company_id}/holds/confirm      -- the save that sent claim seq committed
-  { invoice_id, seq, idempotency_key }
-  -> 200 { confirmed: <count> }
+POST /v1/companies/{company_id}/reservations/commit
+  { invoice_id, operation_id, generation }
+  -> 200 { reserved: <count>, released: <count> }
 
-POST /v1/companies/{company_id}/holds/abandon      -- the save that sent claim seq did not commit
-  { invoice_id, seq, idempotency_key }
-  -> 200 { abandoned: <count>, restored: <count> }
-
-POST /v1/companies/{company_id}/holds/release
-  { releases: [ { entry_id, hold_token } ], invoice_id, seq, idempotency_key }
-  -> 200 { results: [ { entry_id, outcome: "released" | "no_matching_hold" } ] }
-
-POST /v1/companies/{company_id}/entries/mark-billed
-  { entries: [ { entry_id, hold_token } ], idempotency_key }
-  -> 200 { results: [ { entry_id, outcome: "billed" | "no_matching_hold" } ] }
+POST /v1/companies/{company_id}/reservations/abort
+  { invoice_id, operation_id, generation }
+  -> 200 { dropped: <count> }
 ```
 
-`association_id` identifies one link between an invoice and an entry: the line item id for a direct link, or the `invoice_line_item_time_entries` row id for an aggregate link. Each entry in `claims` carries its own `association_id`, so one request covers a draft with many line items. The batch is all or nothing: a `409` on any entry rejects every claim in it. Section 7.2 defines how claim and release behave.
+- **prepare** reserves the invoice's new entries provisionally and keeps its committed ones.
+- **commit** makes the desired entry set the reservation set and releases the entries it removed.
+- **abort** drops only this operation's provisional reservations.
+- `disposition: "retained"` is sent for a discarded or destroyed non-draft invoice, which keeps its reservations as a known owner. A discarded or destroyed draft sends an empty desired set, which releases its reservations at commit. Section 7 holds the rule these follow.
+- A prepare is all or nothing: one conflict reserves nothing. `not_found` covers an entry outside `company_id`, so a caller cannot probe other tenants.
+- A prepare for an operation that is already terminal returns its stored state and changes nothing. A new prepare for an invoice whose earlier operation is not yet terminal either carries that operation's outcome or gets `unresolved_operation` (retryable). Timekeeping keeps a terminal record (committed or aborted) for each (invoice, operation).
+- `operation_id` is unique only within `company_id`. A replayed or guessed id from another company never matches.
 
-`mark-billed` exists for parity with `Invoice#update_timesheet_entry_status!`, which today runs only from the uncalled mailer path (L5). Nothing in the migration starts calling it more often. Marking entries billed when an invoice is sent is listed under future work (section 7.4).
+```text
+POST /v1/companies/{company_id}/invoices/{invoice_id}/mark-billed
+  { operation_id, generation }
+  -> 200 { billed: <count> }
 
-### 5.4 Events
+POST /v1/companies/{company_id}/agents/{agent_id}/detach-entries
+  { operation_id, generation }
+  -> 200 { detached: <count> }
 
-Timekeeping writes events to its outbox in the same transaction as the change. Names follow the existing pattern in `app/events/` (`TimesheetEntries::Created`):
+POST /v1/users/{user_id}/retire
+  { operation_id, generation }
+  -> 200 { retired: true }
+  -> 409 { reason: "user_has_entries" }
+```
 
-| Event | Payload (besides the envelope) |
-|---|---|
-| `TimesheetEntries::Created`, `TimesheetEntries::Updated`, `TimesheetEntries::Discarded` | the entry snapshot, plus `changed_fields` |
-| `TimesheetEntries::HoldClaimed`, `TimesheetEntries::HoldReleased` | the same entry snapshot as `Updated`, plus `holder.invoice_id`, `holder.association_id`, `hold_token` |
-| `TimesheetEntries::Billed` | the same entry snapshot as `Updated` |
+- **mark-billed** replaces `Invoice#update_timesheet_entry_status!`. It sets `bill_status: billed` on the kept entries that the invoice holds by committed reservation. Today that method runs only from the uncalled mailer path (L5), and the migration does not call it more often.
+- **detach-entries** is agent destroy. It nulls `agent_id` on that company's entries for the agent and writes an audit row for each entry.
+- **retire** is the user-retire check of section 3.3. It is the one command not scoped to a company, because one user can hold entries in several companies. Its answer is only yes or no, and it returns no entry data.
 
-The **entry snapshot** is every column of the entry row: `entry_id`, `company_id`, `version`, `project_id`, `user_id`, `agent_id`, `work_date`, `duration`, `note`, `bill_status`, `review_status`, `source`, `source_metadata`, `external_run_id`, `external_session_id`, `proof_url`, `proof_metadata`, `discarded_at`, `created_at`, `updated_at` and `held`. These are the columns of `timesheet_entries` in `db/schema.rb`, with `held` in place of `locked` and the new `company_id` and `version`. The same snapshot is what the Timekeeping → monolith sync and rollback (section 10.5) write back, so every field can be restored. A column added later must be added to the snapshot in the same release.
+### 5.4 The entry snapshot stream
 
-Every event that raises an entry's `version` carries the full entry snapshot. Without it, a consumer that keeps only the highest version would drop an older `Updated` that arrived after a newer `HoldClaimed`, and it would never learn the new `duration`.
+There is one event stream, one consumer and no broker. The stream exists so that `timesheet_entries` keeps every aggregate reader working (section 3.3).
 
-The monolith writes `Projects::Changed`, `ProjectMemberships::Changed` and `Companies::SettingsChanged` to its outbox. These are used for the reporting projection and for operator visibility, never for authorization decisions (section 3.4).
+**The outbox.** Every change to an entry, including a reservation change that flips `locked`, writes one **entry snapshot** row to Timekeeping's outbox in the same transaction as the change. The snapshot is the whole entry row:
 
-Envelope: `{ event_id, event_type, schema_version, company_id, occurred_at, actor: { type, id }, data }`. Payloads carry ids, not user names or emails. Consumers look up display data from their own side.
+- the columns of `timesheet_entries` in `db/schema.rb`: `id`, `project_id`, `user_id`, `agent_id`, `work_date`, `duration`, `note`, `bill_status`, `review_status`, `locked`, `source`, `source_metadata`, `external_run_id`, `external_session_id`, `proof_url`, `proof_metadata`, `discarded_at`, `created_at`, `updated_at`;
+- `company_id` and `version`, which the projection gains as columns;
+- `generation`: the ownership generation under which the write was admitted;
+- `outbox_position`: the row's position in the owner's outbox.
 
-Rules:
+`locked` says only that a reservation exists. It cannot carry which invoice owns the reservation, so reservations never travel through this stream (section 10). A column added to entries later is added to the snapshot in the same release. Payloads carry ids, not user names or emails.
 
-- Delivery is at least once. A relay reads unsent outbox rows in order of id and publishes them; it marks a row sent only after the broker acknowledges it.
-- Consumers keep a `processed_events(event_id)` table and skip ids they have seen.
-- Consumers apply an entry event only when its `version` is higher than the one they hold, so a late or reordered event cannot overwrite newer data.
-- Receiving an event never authorizes a write. A consumer that needs to change entry state calls the command API with its own identity.
-- **`rails_event_viewer_entries` is not the delivery mechanism.** `docs/ai/events.md` calls it "best-effort observability, not a mandatory audit trail or delivery queue", and it is pruned after seven days. The existing `Rails.event.notify` calls stay as observability only.
+**The relay.** A relay job delivers outbox rows in `outbox_position` order, over HTTP, to an internal monolith endpoint:
 
-The broker product is an open decision for the risks and decisions section. Solid Queue already runs in the monolith and could carry relay jobs; a dedicated broker is the other option.
+```text
+POST /internal/v1/timekeeping/entry-snapshots
+  Authorization: <Timekeeping service identity>
+  { snapshots: [ { generation, outbox_position, entry: { ...snapshot } } ] }
+  -> 200 { applied: <count>, ignored: <count> }
+  -> 409 { reason: "stale_generation" }
+```
+
+The relay runs on its own queue, worked by its own dedicated worker. This follows the existing `billing_sync` worker in `config/solid_queue.yml`. Only that worker is started for the relay, not the `default` worker (section 11). The relay marks a row sent only after a `200`, so delivery is at least once.
+
+**The projection consumer** behind that endpoint is the only writer of `timesheet_entries`:
+
+- It upserts by entry `id` and applies a snapshot only when its `version` is higher than the row's. A duplicate or reordered snapshot leaves the row unchanged, so no separate table of processed events is needed.
+- A discard arrives as a snapshot with `discarded_at` set (a "tombstone"), never as a row delete. A delayed older snapshot therefore meets the newer row and cannot bring a discarded entry back.
+- It accepts a snapshot whose `generation` is the current owner's. During a handoff, between closing admission and the ownership flip, it also accepts the outgoing owner's previous-generation snapshots, but only up to the final outbox position captured when that owner was frozen. The flip removes that permission. Every other stale-generation snapshot is refused, so a late relay retry from a retired owner cannot overwrite a write accepted after the handoff (section 10).
+- While the prepared monolith owns the data after a rollback, its gateway writes its own entry tables and an outbox in one transaction, and the same relay and consumer write `timesheet_entries`.
+
+**Removed from the design.** The monolith's `Projects::Changed`, `ProjectMemberships::Changed` and `Companies::SettingsChanged` events are removed. Nothing consumed them, because authorization reads reference facts synchronously (section 3.4).
+
+**Not the delivery mechanism.** `rails_event_viewer_entries` is not used to deliver anything. `docs/ai/events.md` calls it "best-effort observability, not a mandatory audit trail or delivery queue", and it is pruned after seven days. The existing `Rails.event.notify` calls stay as observability only.
 
 ## 6. Tenant isolation, authorization and identity propagation (proposed)
 
 ### 6.1 Tenant on every row
 
-- Timekeeping stores `company_id` on every entry, hold, idempotency record, audit row and outbox row, and indexes queries by it.
-- The value is copied from the project's client's company when the entry is created or moved to another project. A project can change client, but `app/controllers/api/v1/projects_controller.rb` looks the new client up through `current_company.clients`, so a project cannot move to another company through that route. If such a move ever becomes possible, the monolith must emit `Projects::Changed` and Timekeeping must re-stamp the project's entries in one transaction. That is recorded as a risk, not built.
+- Timekeeping stores `company_id` on every entry, reservation, operation record, idempotency receipt, audit row and outbox row, and indexes queries by it. Today tenancy is enforced only by convention through `current_company` (section 1.2). In Timekeeping, the company is part of every key.
+- The value is copied from the project's client's company when the entry is created or moved to another project. A project can change client, but `app/controllers/api/v1/projects_controller.rb` looks the new client up through `current_company.clients`, so a project cannot move to another company through that route. If such a move ever becomes possible, Timekeeping must re-stamp the project's entries in one transaction. That is recorded as a risk, not built.
+- Idempotency receipts and invoice operation ids are keyed with `company_id`, in the API and in the handoff checkpoint (section 10). A key replayed or guessed from one company never returns or applies another company's stored result.
 - X1 and X2 (section 2.5) are replaced by company-scoped lookups. Every Timekeeping query starts with `WHERE company_id = :company_id`. **This is a deliberate departure from preserving behaviour as-is.** For any single tenant the visible result is the same.
 
 ### 6.2 Two kinds of caller
 
 | Kind | Who | Credential | Checks applied |
 |---|---|---|---|
-| **User-delegated** | Web, mobile, bulk, CLI, MCP, agent, desktop timer | Short-lived token signed by the monolith: `sub` (user id), `company_id`, `role` in that company, `edit_days`, `projects` facts, `agent_id` if any, `exp` (60 seconds), `jti` | All of A1–A7 and S1–S7, exactly as for that user today. A role claim is valid only for the `company_id` in the same token. |
-| **Background** | Billing commands, Harvest import, jobs | Service credential (mutual TLS or a signed service token) bound to one `company_id` per request and to a named operation list | Only the named operations: `holds.claim`, `holds.release`, `entries.mark_billed`, `entries.import`. Company scoping always applies. |
+| **User-delegated** | Web, mobile, bulk, CLI (which also serves MCP), desktop timer | Short-lived token signed by the monolith: `sub` (user id), `company_id`, `role` in that company, `edit_days`, `projects` facts, `exp` (60 seconds), `jti` | A1–A7 and S1–S7, exactly as for that user today. A role claim is valid only for the `company_id` in the same token. |
+| **Agent** | The agent API | The same signed token, for the agent's user, with `agent_id` set | Today's checks only: the project scope (the project must be in `ProjectPolicy::Scope` for the agent's user and company), then the model rules S1–S4 and S7. The agent API skips Pundit today (`app/controllers/api/v1/agent/base_controller.rb:7`, `timesheet_entries_controller.rb:4-18`), so A1–A5 do not apply to it. |
+| **Background** | Invoice reservation boundary, Harvest import, agent destroy, user hard delete, seed and demo writers | Service credential (mutual TLS or a signed service token) bound to one `company_id` per request and to a named operation list | Only the named operations: `reservations.prepare`, `reservations.commit`, `reservations.abort`, `invoices.mark_billed`, `entries.import`, `agents.detach_entries`, `entries.seed`, and `users.retire`. Company scoping applies to every operation except `users.retire` (section 5.3). |
 
-CLI and MCP calls are user-delegated, not background. `app/controllers/api/v1/cli/timesheet_entries_controller.rb` scopes to `current_user`, and the MCP tools forward the user's own credential. The monolith keeps checking those credentials and mints the user token for them.
+CLI and MCP calls are user-delegated, not background. `app/controllers/api/v1/cli/timesheet_entries_controller.rb` scopes to `current_user`, and the MCP tools call it in-process with the user's own credential (section 1.3). The monolith keeps checking those credentials and mints the user token for them.
 
 Timekeeping verifies the token signature with a public key it loads from configuration (`TIMEKEEPING_TOKEN_PUBLIC_KEY`). It never trusts a plain header or body field for user, company or role.
 
@@ -445,18 +530,19 @@ Timekeeping verifies the token signature with a public key it loads from configu
 | A1 scope | `TimesheetEntryPolicy::Scope` | Timekeeping, from the token's `role` and `sub` |
 | A2 billed refusal, A4 own entries, A3 edit window | Policy | Timekeeping, from the token |
 | A5 create for others | Web controller | Timekeeping, from the token |
-| A6 locked, A7 away from billed | Model, skipped when `Current.user` is nil | Timekeeping, for every user-delegated call (A6 now reads "held") |
+| A6 locked, A7 away from billed | Model, skipped when `Current.user` is nil | Timekeeping, for every user-delegated and agent call. A6 reads "the entry has a reservation". |
 | A8 nil-user bypass | Implicit, any code path | Allowed only to the named background operations above. An anonymous or user-delegated request never gets it. |
-| A9 bulk ignores `locked` | Bulk controller | Preserved: Timekeeping's bulk endpoints apply the same checks as the bulk controller today, and report per-entry results |
+| A9 bulk ignores `locked` | Bulk controller | Preserved: Timekeeping's bulk endpoints apply the same checks as the bulk controller today, and report per-entry results. A stale generation fails the whole request (section 3.1). |
 | A10 deletes skip A6 | `discard!` skips validations | Preserved: delete checks policy rules A2–A4, not A6 |
 | A11 users may set `billed` | Permitted params | Preserved |
-| L8 entry and invoice share a company | Line-item validations in the monolith | Timekeeping's `holds/claim`: an entry outside the request's `company_id` is reported as not found and the whole claim fails. The monolith keeps its own validation as a second check, reading the entry's company from the claim response. |
+| Agent project scope | Agent controller; no Pundit | Preserved: Timekeeping applies the project scope and S1–S4 and S7, nothing more |
+| L8 entry and invoice share a company | Line-item validations in the monolith | Timekeeping's prepare response, which is authoritative: an entry outside the request's `company_id` is reported as `not_found` and nothing is reserved. The line-item validation stays as a second check, using each entry's company from the prepare response. |
 
-A6, A8 and A9 are odd, but they are customer-visible, so they are carried forward. Changing them needs an owner decision, listed with the risks and decisions for review.
+A6, A8 and A9 are odd, but they are customer-visible, so they are carried forward (section 2.3).
 
 ### 6.4 Audit trail
 
-Timekeeping writes an audit row for every entry change, including holds. The row records `company_id`, actor kind and id (user, or service plus the operation) and the changed fields. This closes today's gap where `locked` changes leave no audit record. Existing `audits` rows for entries are copied during the backfill and stay readable from the monolith until retirement.
+Timekeeping writes an audit row for every entry change, including reservation changes and agent detach. The row records `company_id`, actor kind and id (user, or service plus the operation) and the changed fields. This closes today's gap where `locked` changes leave no audit record. Existing `audits` rows for entries are copied into Timekeeping at cutover and travel in the handoff checkpoint in both directions (section 10).
 
 ## 7. Review, locking, billing associations and state transitions (proposed)
 
