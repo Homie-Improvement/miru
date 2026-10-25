@@ -70,6 +70,30 @@ RSpec.describe Timekeeping::SeedDispositionRecorder do
         { entry_id: grouped_entry.id, invoice_id: invoice.id, draft: false, discarded: false })
       expect(facts[:invoices]).to eq(invoice.id => "RC-0001")
     end
+
+    it "includes discarded invoices and entries, with their draft and discarded state" do
+      retained_entry = recorder_spec_entry(locked: true)
+      relocked_entry = recorder_spec_entry(locked: true)
+      retained_entry.update_columns(discarded_at: Time.current)
+      discarded_sent = recorder_spec_sent_invoice("RC-0003")
+      recorder_spec_aggregate_line(discarded_sent, [retained_entry])
+      discarded_draft = create(:invoice, company:, client:, invoice_number: "RC-0004")
+      recorder_spec_aggregate_line(discarded_draft, [relocked_entry])
+      [discarded_sent, discarded_draft].each { |invoice| invoice.update_columns(discarded_at: Time.current) }
+
+      facts = described_class.snapshot(company)
+
+      expect(facts[:entries]).to contain_exactly(
+        { id: retained_entry.id, locked: true }, { id: relocked_entry.id, locked: true })
+      expect(facts[:links]).to contain_exactly(
+        { entry_id: retained_entry.id, invoice_id: discarded_sent.id, draft: false, discarded: true },
+        { entry_id: relocked_entry.id, invoice_id: discarded_draft.id, draft: true, discarded: true })
+      expect(facts[:invoices]).to eq(discarded_sent.id => "RC-0003", discarded_draft.id => "RC-0004")
+
+      classification = Timekeeping::Preflight.classify(entries: facts[:entries], links: facts[:links])
+      expect(classification[:retained]).to eq([retained_entry.id])
+      expect(classification[:relock_releases]).to eq([relocked_entry.id])
+    end
   end
 
   describe ".write!" do
@@ -105,6 +129,20 @@ RSpec.describe Timekeeping::SeedDispositionRecorder do
 
       expect { described_class.write!(path: @recorder_spec_path, as_of: "2026-10-23") }
         .to raise_error(described_class::Error, /Recorder Co has orphans: entries #{orphan.id}/)
+      expect(File).not_to exist(@recorder_spec_path)
+    end
+
+    it "writes nothing when an entry has two discarded non-draft owners" do
+      contested_entry = recorder_spec_entry(locked: true)
+      invoices = %w[RC-0005 RC-0006].map do |number|
+        invoice = recorder_spec_sent_invoice(number)
+        recorder_spec_aggregate_line(invoice, [contested_entry])
+        invoice
+      end
+      invoices.each { |invoice| invoice.update_columns(discarded_at: Time.current) }
+
+      expect { described_class.write!(path: @recorder_spec_path, as_of: "2026-10-23") }
+        .to raise_error(described_class::Error, /Recorder Co has conflicts: entries #{contested_entry.id}/)
       expect(File).not_to exist(@recorder_spec_path)
     end
 
