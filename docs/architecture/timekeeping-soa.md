@@ -221,7 +221,7 @@ Each row below is current behaviour, cited to its source. The target design must
 | L5 **(quirk)** | Among invoice flows, only `InvoiceMailer#invoice` marks entries `billed`, through `after_action :update_status` (`app/mailers/invoice_mailer.rb:4`, `:73`). That mailer is enqueued only by `Invoice#send_to_email` (`app/models/concerns/invoice_sendable.rb`). A repository search finds no production caller of `send_to_email`; only `spec/models/invoice_spec.rb:200-215` calls it. Outside invoices, `billed` is also set by the Harvest import (L7), by any user allowed to edit the entry (A11), and by the seed data (section 1.3). | Search for `send_to_email` and `bill_status: :billed` |
 | L6 **(quirk)** | The live send path, `send_invoice` in `app/controllers/api/v1/invoices_controller.rb`, uses `InvoiceMailer#send_invoice` and `record_send!`. These set the invoice to `sent` and emit `Invoices::Sent`, but never mark entries billed. **Entries on sent invoices therefore usually stay `locked` and `unbilled`.** | `app/controllers/api/v1/invoices_controller.rb:64`; `app/models/concerns/invoice_sendable.rb` |
 | L7 **(quirk)** | The Harvest import creates entries as `unbilled` and then calls `entry.update!(bill_status: :billed)` with no invoice. So `billed` is not always backed by an invoice link. | `app/services/imports/harvest_time_entries_importer.rb` (`create_entry`); `spec/services/imports/harvest_time_entries_importer_spec.rb` |
-| L8 | A line item's linked entries must belong to the invoice's company. | `app/models/invoice_line_item.rb` validations; no spec in `spec/models/invoice_line_item_spec.rb` covers this rule |
+| L8 | A line item's linked entries must belong to the invoice's company. | `app/models/invoice_line_item.rb` validations; `spec/models/invoice_line_item_spec.rb` ("company of the timesheet entries") |
 
 **Deliberate fixes.** The repository owner chose to fix three legacy billing behaviours. Historical invoices and amounts do not change. These three are the only rows in section 2 the target design changes, and all three fixes are kept through rollback.
 
@@ -1012,18 +1012,17 @@ These existing specs cover the observed behaviour in section 2. They run against
 | CLI and MCP | `spec/requests/api/v1/cli/timesheet_entries/create_spec.rb`, `update_spec.rb`, `destroy_spec.rb`; `spec/mcp/tools/write_tools_spec.rb`; `spec/mcp/idempotency_store_spec.rb` |
 | Agent S4, S7 | `spec/requests/api/v1/agent/timesheet_entries/create_spec.rb` |
 | Locking L1, mark billed L5 | `spec/requests/api/v1/invoices/create_spec.rb`, `spec/models/invoice_spec.rb` |
-| Line-item company rule L8 | `spec/models/invoice_line_item_spec.rb` (a spec for L8 must be added first; none exists today) |
+| Line-item company rule L8 | `spec/models/invoice_line_item_spec.rb` |
 | Send path L6 | `spec/requests/api/v1/invoices/send_invoice_spec.rb`, `spec/system/invoices/send_invoice_spec.rb` |
 | Import L7 | `spec/services/imports/harvest_time_entries_importer_spec.rb` |
 | Reports | `spec/services/reports/time_entries/`, `spec/services/analytics/team_productivity_analytics_spec.rb`, `spec/services/metrics/data_builder_spec.rb` |
+| Characterization (S0): L2, L3, L4, L6, A9, A10, S7, orphans, PDF totals, the lookup comparison | `spec/characterization/invoice_entry_locking_spec.rb`, `spec/characterization/timesheet_entry_rules_spec.rb`, `spec/characterization/entry_lookups_and_pdf_totals_spec.rb` |
 
-**Not every listed spec pins what its row says (observed).**
+**Not every listed spec pins what its row says (observed).** The characterization specs above fill these gaps; the other listed specs still do not:
 
-- The send specs never check `bill_status`, so nothing pins L6.
-- No spec checks S7 (an agent entry belongs to the agent's company and user).
-- No spec checks A10 (deletes skip A6).
-- The bulk specs never mention `locked`, so nothing pins A9's two quirks: the bulk move ignores `locked`, and it skips a failing entry silently while reporting success.
-- No spec covers L8 (see its row).
+- The send specs never check `bill_status`; L6 is pinned in `spec/characterization/invoice_entry_locking_spec.rb`.
+- `spec/models/timesheet_entry_spec.rb` and the agent create spec do not check S7 (an agent entry belongs to the agent's company and user); it is pinned in `spec/characterization/timesheet_entry_rules_spec.rb`.
+- The bulk specs do not check A10 (deletes skip A6), and never mention `locked`, so they do not pin A9's two quirks: the bulk move ignores `locked`, and it skips a failing entry silently while reporting success. Both are pinned in `spec/characterization/timesheet_entry_rules_spec.rb`.
 
 **Characterization work, first (step S0 in section 10.2).** Before any other change, add specs that pin today's real behaviour, including the behaviours an earlier version of this document described wrongly:
 
