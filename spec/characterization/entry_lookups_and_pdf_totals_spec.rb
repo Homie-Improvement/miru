@@ -3,10 +3,13 @@
 require "rails_helper"
 
 # Pins two read paths the Timekeeping extraction must keep:
-# - the entry ids a draft line item unlocks on destroy (`TimesheetEntry.where(id:)`, no
-#   company filter) and the ids the new-line-items picker hides as already allocated
-#   (`filtered_ids`, built from every company's kept invoices) give the same result for
-#   one company;
+# - the line-item unlock lookup (`TimesheetEntry.where(id:)` over
+#   `associated_timesheet_entry_ids`, no company filter), read while the line still exists,
+#   and the ids the new-line-items picker hides as already allocated (`filtered_ids`, built
+#   from every company's kept invoices) give the same result for one company. This is not
+#   the set a destroy unlocks: on a freshly loaded aggregate line the join rows are
+#   destroyed before `unlock_timesheet_entries` runs, so destroy unlocks only the direct
+#   entry (see the L4 examples in invoice_entry_locking_spec.rb);
 # - the invoice PDF prints a subtotal rounded to 3 places and an unrounded total, while
 #   the stored `amount` is rounded to 2 places.
 RSpec.describe "Characterization: entry lookups and PDF totals", type: :model do
