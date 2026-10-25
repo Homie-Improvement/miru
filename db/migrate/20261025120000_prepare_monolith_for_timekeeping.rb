@@ -23,13 +23,11 @@ class PrepareMonolithForTimekeeping < ActiveRecord::Migration[8.1]
 
     def add_entry_columns
       # Nullable: a NOT NULL would turn a write that bypasses the model into an
-      # error. TimesheetEntry stamps it on every save that needs it.
+      # error. TimesheetEntry stamps it on every save that needs it, and the
+      # next migration fills existing rows outside this transaction, so the
+      # table lock add_column takes is released before any row is rewritten.
       add_column :timesheet_entries, :company_id, :bigint
       add_column :timesheet_entries, :version, :integer, null: false, default: 0
-
-      reversible do |direction|
-        direction.up { Timekeeping::EntryCompanyBackfill.call(connection) }
-      end
     end
 
     # docs/architecture/timekeeping-soa.md section 10.1. One row for all

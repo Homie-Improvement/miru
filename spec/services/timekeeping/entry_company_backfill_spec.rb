@@ -23,6 +23,15 @@ RSpec.describe Timekeeping::EntryCompanyBackfill do
     expect(stored_company_id(correct)).to eq(correct.project.client.company_id)
   end
 
+  it "fixes rows in every id range when the table spans several batches" do
+    stub_const("#{described_class}::BATCH_SIZE", 1)
+    entries = create_list(:timesheet_entry, 3)
+    connection.execute("UPDATE timesheet_entries SET company_id = NULL")
+
+    expect(described_class.call(connection)).to eq(3)
+    expect(entries.map { |entry| stored_company_id(entry) }).to eq(entries.map { |entry| entry.project.client.company_id })
+  end
+
   it "changes nothing when run again" do
     create(:timesheet_entry)
     connection.execute("UPDATE timesheet_entries SET company_id = NULL")

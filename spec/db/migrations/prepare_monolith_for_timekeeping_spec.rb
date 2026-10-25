@@ -2,6 +2,7 @@
 
 require "rails_helper"
 require Rails.root.join("db/migrate/20261025120000_prepare_monolith_for_timekeeping")
+require Rails.root.join("db/migrate/20261025120100_backfill_timesheet_entry_company_ids")
 
 # Runs the migration's down and up inside the example's transaction, so every
 # column and table it drops or creates is rolled back after the example.
@@ -13,8 +14,8 @@ RSpec.describe PrepareMonolithForTimekeeping do
     entry_audits idempotency_records entry_outbox_items
   ].freeze
 
-  def run_migration(direction)
-    ActiveRecord::Migration.suppress_messages { described_class.new.migrate(direction) }
+  def run_migration(direction, migration_class = described_class)
+    ActiveRecord::Migration.suppress_messages { migration_class.new.migrate(direction) }
     TimesheetEntry.reset_column_information
   end
 
@@ -35,7 +36,7 @@ RSpec.describe PrepareMonolithForTimekeeping do
 
   after { TimesheetEntry.reset_column_information }
 
-  it "fills company_id from project, client and company and changes no other entry value or billing row" do
+  it "fills company_id in the backfill migration and changes no other entry value or billing row" do
     discarded_entry = create(:timesheet_entry)
     discarded_entry.discard!
     entry_on_discarded_project = create(:timesheet_entry)
@@ -47,6 +48,7 @@ RSpec.describe PrepareMonolithForTimekeeping do
     audit_count = Audited::Audit.count
 
     run_migration(:up)
+    run_migration(:up, BackfillTimesheetEntryCompanyIds)
 
     expect(entry_rows_without_new_columns).to eq(entries_before)
     expect(billing_rows).to eq(billing_before)

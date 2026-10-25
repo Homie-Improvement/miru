@@ -14,7 +14,7 @@ class DropTimesheetEntryForeignKeys < ActiveRecord::Migration[8.1]
     { from_table: :invoice_line_item_time_entries, to_table: :timesheet_entries, column: :timesheet_entry_id },
     { from_table: :invoice_line_items, to_table: :timesheet_entries, column: :timesheet_entry_id },
     { from_table: :timesheet_entries, to_table: :agents, column: :agent_id }
-  ].freeze
+  ].map(&:freeze).freeze
 
   class DanglingReferencesError < StandardError; end
 
