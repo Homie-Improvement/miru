@@ -1,0 +1,21 @@
+# The connection comes only from TIMEKEEPING_DATABASE_URL. The config is named
+# `timekeeping`, not `primary`, because Rails reads DATABASE_URL for a config
+# named `primary` only, so a monolith DATABASE_URL in the same process
+# environment can never replace this connection.
+default: &default
+  adapter: postgresql
+  encoding: unicode
+  pool: <%= ENV.fetch("RAILS_MAX_THREADS", 3) %>
+  url: <%= Timekeeping::Environment.database_url %>
+
+development:
+  timekeeping:
+    <<: *default
+
+test:
+  timekeeping:
+    <<: *default
+
+production:
+  timekeeping:
+    <<: *default

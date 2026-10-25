@@ -1,0 +1,9 @@
+/.bundle
+/vendor/bundle
+/log/*
+/tmp/*
+
+# Keys come from the process environment only; never check one in.
+/config/master.key
+/config/credentials/*.key
+*.pem
