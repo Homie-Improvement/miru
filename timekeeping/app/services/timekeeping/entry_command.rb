@@ -73,7 +73,7 @@ module Timekeeping
 
       new(
         route:, company_id:, actor_id: identity.user_id, role: identity.role, entry_id: target_id,
-        operation: "#{route} #{entry_id}", key:, fingerprint: Digest::SHA256.hexdigest(JSON.generate(body)),
+        operation: "#{route} #{target_id}", key:, fingerprint: Digest::SHA256.hexdigest(JSON.generate(body)),
         body:, project_id:, generation: headers["Ownership-Generation"], if_match: headers["If-Match"], facts:, today:
       )
     rescue ReferenceClient::Unavailable
