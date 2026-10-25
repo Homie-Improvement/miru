@@ -1,0 +1,31 @@
+# frozen_string_literal: true
+
+module Timekeeping
+  # The HTTP status for every reason a route can answer with. The service
+  # deploys without the contracts directory, so the statuses from
+  # contracts/timekeeping/entry_api.yml and idempotency.yml are written out
+  # here; spec/services/timekeeping/reasons_spec.rb compares them with the
+  # YAML. reference_unavailable and idempotency_key_required are this
+  # service's own answers, not yet listed in the contract.
+  module Reasons
+    STATUS = {
+      unauthorized: 401,
+      forbidden: 403,
+      not_found: 404,
+      stale_generation: 409,
+      version_conflict: 409,
+      credential_in_body: 422,
+      idempotency_key_reused: 422,
+      idempotency_key_required: 422,
+      reference_unavailable: 503
+    }.freeze
+
+    module_function
+
+    # Raises KeyError for a reason missing from STATUS, so a misspelled reason
+    # fails loudly instead of being sent to Rack as an unknown status symbol.
+    def status(reason)
+      STATUS.fetch(reason.to_sym)
+    end
+  end
+end
