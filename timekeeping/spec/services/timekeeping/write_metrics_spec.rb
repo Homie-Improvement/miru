@@ -113,6 +113,13 @@ RSpec.describe Timekeeping::WriteMetrics do
     end
   end
 
+  describe "OUTCOME_COUNTS" do
+    it "freezes the table and each of its increment rows" do
+      expect(described_class::OUTCOME_COUNTS).to be_frozen
+      expect(described_class::OUTCOME_COUNTS.values).to all(be_frozen)
+    end
+  end
+
   describe ".outcome_for" do
     it "maps 503 to reference_unavailable and every other status to write" do
       expect([503, 201, 500, 401].map { |status| described_class.outcome_for(status) })

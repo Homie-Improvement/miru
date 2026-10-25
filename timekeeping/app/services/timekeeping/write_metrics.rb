@@ -16,7 +16,7 @@ module Timekeeping
     LATENCY_BUCKET_BOUNDS_MS = [25, 50, 100, 200, 300, 500, 1000, 2500, 5000].freeze
     OVERFLOW_BUCKET = "inf"
     # The [writes, reference_unavailable] increments for each outcome.
-    OUTCOME_COUNTS = { write: [1, 0], reference_unavailable: [0, 1] }.freeze
+    OUTCOME_COUNTS = { write: [1, 0].freeze, reference_unavailable: [0, 1].freeze }.freeze
 
     # The start of the five-minute UTC window that holds time, in whole seconds.
     def self.window_start(time)
