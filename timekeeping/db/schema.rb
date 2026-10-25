@@ -10,9 +10,22 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_01_01_000000) do
+ActiveRecord::Schema[8.1].define(version: 2026_02_01_000000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
+
+  create_table "audit_events", force: :cascade do |t|
+    t.bigint "company_id", null: false
+    t.bigint "entry_id", null: false
+    t.string "actor_type", null: false
+    t.bigint "actor_id", null: false
+    t.string "action", null: false
+    t.jsonb "before"
+    t.jsonb "after", null: false
+    t.datetime "entry_created_at", null: false
+    t.datetime "created_at", null: false
+    t.index ["company_id", "entry_id"], name: "index_audit_events_on_company_id_and_entry_id"
+  end
 
   create_table "entries", force: :cascade do |t|
     t.bigint "company_id", null: false
@@ -38,6 +51,49 @@ ActiveRecord::Schema[8.1].define(version: 2026_01_01_000000) do
     t.index ["company_id", "id"], name: "index_entries_on_company_id_and_id", unique: true
     t.index ["company_id", "project_id", "work_date"], name: "index_entries_on_company_id_and_project_id_and_work_date"
     t.index ["company_id", "user_id", "work_date"], name: "index_entries_on_company_id_and_user_id_and_work_date"
+  end
+
+  create_table "idempotency_receipts", force: :cascade do |t|
+    t.bigint "company_id", null: false
+    t.string "actor_type", null: false
+    t.bigint "actor_id", null: false
+    t.string "operation", null: false
+    t.string "key", null: false
+    t.string "fingerprint", null: false
+    t.integer "status", null: false
+    t.text "body", null: false
+    t.datetime "created_at", null: false
+    t.index ["company_id", "actor_type", "actor_id", "operation", "key"], name: "index_idempotency_receipts_on_receipt_key", unique: true
+  end
+
+  create_table "outbox_snapshots", primary_key: "outbox_position", force: :cascade do |t|
+    t.bigint "id", null: false
+    t.bigint "project_id", null: false
+    t.bigint "user_id", null: false
+    t.bigint "agent_id"
+    t.date "work_date", null: false
+    t.float "duration", null: false
+    t.text "note"
+    t.string "bill_status", null: false
+    t.string "review_status", null: false
+    t.boolean "locked", null: false
+    t.string "source", null: false
+    t.jsonb "source_metadata", null: false
+    t.string "external_run_id"
+    t.string "external_session_id"
+    t.text "proof_url"
+    t.jsonb "proof_metadata", null: false
+    t.datetime "discarded_at"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.bigint "company_id", null: false
+    t.integer "version", null: false
+    t.bigint "generation", null: false
+    t.index ["company_id", "id"], name: "index_outbox_snapshots_on_company_id_and_id"
+  end
+
+  create_table "ownership_generations", primary_key: "company_id", id: :bigint, default: nil, force: :cascade do |t|
+    t.bigint "generation", null: false
   end
 
   create_table "reservations", id: false, force: :cascade do |t|
