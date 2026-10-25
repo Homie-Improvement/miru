@@ -51,6 +51,14 @@ RSpec.describe InvoiceLineItem, type: :model do
         expect(line_item.errors[:timesheet_entry]).to include("must exist")
       end
 
+      it "is invalid when timesheet_entry_id is 0, which names no entry" do
+        line_item = build(:invoice_line_item, timesheet_entry: nil)
+        line_item.timesheet_entry_id = 0
+
+        expect(line_item).not_to be_valid
+        expect(line_item.errors[:timesheet_entry]).to include("must exist")
+      end
+
       it "is valid with no timesheet entry, as a manual line" do
         line_item = build(:invoice_line_item, timesheet_entry: nil)
 

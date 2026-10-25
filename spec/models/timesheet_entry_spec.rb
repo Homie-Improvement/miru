@@ -76,6 +76,24 @@ RSpec.describe TimesheetEntry, type: :model do
       expect(entry).to be_valid
     end
 
+    it "is invalid when agent_id is 0, which names no agent" do
+      entry = build(:timesheet_entry, project:)
+      entry.agent_id = 0
+
+      expect(entry).not_to be_valid
+      expect(entry.errors[:agent]).to include("must exist")
+    end
+
+    it "refuses to save with an agent object whose row was deleted after it was loaded" do
+      cached_agent = create(:agent)
+      agent_project = create(:project, client: create(:client, company: cached_agent.company))
+      entry = build(:timesheet_entry, project: agent_project, user: cached_agent.user, agent: cached_agent)
+      Agent.find(cached_agent.id).destroy!
+
+      expect(entry.save).to be(false)
+      expect(entry.errors[:agent]).to include("must exist")
+    end
+
     it "validates an invalid bill status" do
       timesheet_entry = build(:timesheet_entry)
 

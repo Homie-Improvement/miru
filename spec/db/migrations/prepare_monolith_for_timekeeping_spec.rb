@@ -29,6 +29,8 @@ RSpec.describe PrepareMonolithForTimekeeping do
 
   def billing_rows
     {
+      invoices: rows("SELECT * FROM invoices ORDER BY id"),
+      invoice_taxes: rows("SELECT * FROM invoice_taxes ORDER BY id"),
       line_items: rows("SELECT * FROM invoice_line_items ORDER BY id"),
       links: rows("SELECT * FROM invoice_line_item_time_entries ORDER BY id")
     }
@@ -41,7 +43,10 @@ RSpec.describe PrepareMonolithForTimekeeping do
     discarded_entry.discard!
     entry_on_discarded_project = create(:timesheet_entry)
     entry_on_discarded_project.project.discard!
-    create(:invoice_line_item_time_entry, invoice_line_item: create(:invoice_line_item))
+    line_item = create(:invoice_line_item)
+    create(:invoice_line_item_time_entry, invoice_line_item: line_item)
+    create(:invoice_tax, invoice: line_item.invoice)
+    line_item.invoice.update_columns(discount: 5, tax: 12.5)
     run_migration(:down)
     entries_before = entry_rows_without_new_columns
     billing_before = billing_rows

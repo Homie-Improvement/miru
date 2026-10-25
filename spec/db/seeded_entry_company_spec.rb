@@ -8,9 +8,13 @@ require "rails_helper"
 RSpec.describe "Seeded timesheet entry companies" do
   seeded_businesses = ["Fork & Leaf Salads", "Copper Kettle Bakery"].freeze
 
-  it "stores project -> client -> company as company_id on every entry of both seeded businesses" do
+  it "creates the ownership record and stores project -> client -> company as every seeded entry's company_id" do
     allow($stdout).to receive(:write)
+    # A database loaded from db/schema.rb starts with no ownership row.
+    TimekeepingOwnership.delete_all
     load Rails.root.join("db/seeds.rb")
+
+    expect(TimekeepingOwnership.pluck(:generation, :owner, :handoff_step)).to eq([[1, "monolith", nil]])
 
     seeded_businesses.each do |name|
       company = Company.find_by!(name:)

@@ -7,6 +7,12 @@ class Agent < ApplicationRecord
   belongs_to :user
   belongs_to :default_project, class_name: "Project", optional: true
 
+  # No database key ties entries to agents. Locking the agent row before the
+  # entries are detached makes a concurrent entry save that names this agent
+  # either finish first, so it is detached too, or wait and then fail its
+  # agent existence check.
+  before_destroy :lock!, prepend: true
+
   has_many :agent_keys, dependent: :destroy
   has_many :timesheet_entries, dependent: :nullify
 

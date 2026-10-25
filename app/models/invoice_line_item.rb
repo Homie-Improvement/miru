@@ -16,7 +16,7 @@ class InvoiceLineItem < ApplicationRecord
   validates :quantity, numericality: { greater_than_or_equal_to: 0 }
   # No database key checks this column, so a supplied id must name a real entry.
   # Manual lines keep a NULL timesheet_entry_id.
-  validates :timesheet_entry, presence: { message: :required }, if: :timesheet_entry_id?
+  validates :timesheet_entry, presence: { message: :required }, unless: -> { timesheet_entry_id.nil? }
   validate :timesheet_entry_belongs_to_invoice_company
   validate :linked_timesheet_entries_belong_to_invoice_company
 
