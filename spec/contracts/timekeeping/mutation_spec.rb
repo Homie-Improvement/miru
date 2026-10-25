@@ -100,7 +100,11 @@ RSpec.describe "Timekeeping contract examples against fakes with one rule broken
     ["bills entries before refusing a reservation command", :reservations,
      { timekeeping: { refused_command_writes: ->(route:) { route == "mark_billed" } } }],
     ["detaches entries before refusing a reservation command", :reservations,
-     { timekeeping: { refused_command_writes: ->(route:) { route == "detach_entries" } } }]
+     { timekeeping: { refused_command_writes: ->(route:) { route == "detach_entries" } } }],
+    ["counts entries to bill but writes no bill_status", :reservations,
+     { timekeeping: { service_command_writes: ->(route:) { route != "mark_billed" } } }],
+    ["counts entries to detach but writes no agent_id", :reservations,
+     { timekeeping: { service_command_writes: ->(route:) { route != "detach_entries" } } }]
   ]
 
   it "passes every group with the unbroken fakes" do
