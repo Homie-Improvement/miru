@@ -80,7 +80,7 @@ RSpec.shared_examples "timekeeping idempotency contract" do |contracts: [:entry_
 
   if contracts.include?(:reservations)
     context "with reservation operation ids" do
-      let(:operations) { TimekeepingContract.load(:reservations).fetch("routes").keys }
+      let(:operations) { reservation_operations }
       let(:service) { timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations:) }
       let(:user) { timekeeping_arrange.user(company:, role: "employee") }
       let(:x) { timekeeping_arrange.entry(company:, user:, project:) }
