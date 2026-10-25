@@ -19,7 +19,12 @@ RSpec.shared_examples "timekeeping entry snapshot shape" do
   end
 
   it "publishes exactly the batch, item and entry keys of the contract, so no name or email can travel" do
-    entry_id = timekeeping_arrange.entry(company:, user:, project:, proof_metadata: { "run" => "nightly" })
+    seeded = {
+      "work_date" => "2026-03-04", "duration" => 135.5, "note" => "Release checklist", "bill_status" => "unbilled",
+      "source" => "manual", "source_metadata" => { "client" => "web" }, "proof_url" => "https://example.test/run/7",
+      "proof_metadata" => { "run" => "nightly" }
+    }
+    entry_id = timekeeping_arrange.entry(company:, user:, project:, **seeded.transform_keys(&:to_sym))
 
     batch = timekeeping_arrange.published_snapshots
 
@@ -30,7 +35,8 @@ RSpec.shared_examples "timekeeping entry snapshot shape" do
       expect(item.fetch("entry").keys).to match_array(snapshot_contract.fetch("entry_fields"))
     end
     expect(snapshots_for(entry_id).last.fetch("entry")).to include(
-      "id" => entry_id, "company_id" => company, "user_id" => user, "project_id" => project, "proof_metadata" => { "run" => "nightly" }
+      seeded.merge("id" => entry_id, "company_id" => company, "user_id" => user, "project_id" => project,
+                   "agent_id" => nil, "locked" => false, "discarded_at" => nil)
     )
   end
 
@@ -80,7 +86,7 @@ RSpec.shared_examples "timekeeping entry snapshot endpoint" do
   let(:entry_id) { 70_001 }
   let(:stale_generation) { timekeeping_contract_error(:entry_snapshots, "stale_generation") }
 
-  def deliver(*items, key: nil, credential: relay_identity)
+  def deliver(*items, key: new_key, credential: relay_identity)
     deliver_snapshots(credential, items, key:)
   end
 
@@ -152,6 +158,16 @@ RSpec.shared_examples "timekeeping entry snapshot endpoint" do
     expect(deliver(item, credential: nil).status).to eq(timekeeping_contract_error(:entry_snapshots, "unauthorized").fetch("status"))
     expect(deliver(item, credential: user_token).status).to eq(timekeeping_contract_error(:entry_snapshots, "forbidden").fetch("status"))
     expect(deliver(item, credential: other_service).status).to eq(timekeeping_contract_error(:entry_snapshots, "forbidden").fetch("status"))
+    expect(timekeeping_arrange.projected_entry(entry_id)).to be_nil
+  end
+
+  it "refuses a service bound to one company that delivers another company's snapshots" do
+    other_company = timekeeping_arrange.company
+    company_bound = timekeeping_arrange.service_identity(company:, name: "company-relay", operations: ["deliver"])
+
+    response = deliver(snapshot_item(entry_id:, company: other_company, version: 1), credential: company_bound)
+
+    expect(response.status).to eq(timekeeping_contract_error(:entry_snapshots, "forbidden").fetch("status"))
     expect(timekeeping_arrange.projected_entry(entry_id)).to be_nil
   end
 end

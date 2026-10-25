@@ -91,6 +91,11 @@ module TimekeepingContract
 
       snapshots = Array(batch["snapshots"])
       company_scope = snapshots.map { |item| item.dig("entry", "company_id") }.uniq.sort
+      # Only the relay's own Timekeeping identity is bound to no company; a
+      # company-bound service may deliver snapshots of its own company only.
+      bound_company = service.fetch("company_id")
+      return Wire.error(@contract, "forbidden") if bound_company && company_scope.any? { |company| company != bound_company }
+
       @receipts.answer(company_scope:, actor: ["service", service["name"]], operation: DELIVER_OPERATION,
                        key: headers["Idempotency-Key"], body: batch) do
         apply(snapshots)

@@ -153,6 +153,28 @@ RSpec.shared_examples "timekeeping idempotency contract" do |contracts: [:entry_
         expect(other_company_answer.body.fetch("entries")).to eq([{ "entry_id" => foreign_entry, "company_id" => other_company }])
       end
 
+      it "returns the first answer when the same abort, mark-billed or detach-entries is replayed" do
+        abort_operation = new_key
+        prepare_with(service, company, 501, [x], abort_operation)
+        commit_operation = new_key
+        prepare_with(service, company, 502, [y], commit_operation)
+        reservation_command(:commit, company, service, { "invoice_id" => 502, "operation_id" => commit_operation })
+        timekeeping_arrange.entry(company:, user:, project:, agent_id: 77)
+        commands = [
+          [:abort, { "invoice_id" => 501, "operation_id" => abort_operation }, {}, { "dropped" => 1 }],
+          [:mark_billed, { "operation_id" => new_key }, { invoice_id: 502 }, { "billed" => 1 }],
+          [:detach_entries, { "operation_id" => new_key }, { agent_id: 77 }, { "detached" => 1 }]
+        ]
+
+        commands.each do |route, body, path_params, expected|
+          first = reservation_command(route, company, service, body, **path_params)
+          replay = reservation_command(route, company, service, body, **path_params)
+
+          expect([route, first.status, first.body]).to eq([route, 200, expected])
+          expect([route, replay.status, replay.body]).to eq([route, 200, expected])
+        end
+      end
+
       it "returns the first commit's answer when the same commit is replayed" do
         operation_id = new_key
         prepare_with(service, company, 501, [x], operation_id)
@@ -199,6 +221,17 @@ RSpec.shared_examples "timekeeping idempotency contract" do |contracts: [:entry_
         other_company_answer = deliver_snapshots(relay_identity, [snapshot_item(entry_id: 80_002, company: other_company, version: 1)], key:)
 
         expect([other_company_answer.status, other_company_answer.body]).to eq([200, { "applied" => 1, "ignored" => 0 }])
+      end
+
+      it "does not match the same key and batch from another service" do
+        key = new_key
+        item = snapshot_item(entry_id: 80_001, company:, version: 1)
+        second_relay = timekeeping_arrange.service_identity(company: nil, name: "timekeeping-standby", operations: ["deliver"])
+        deliver_snapshots(relay_identity, [item], key:)
+
+        other_actor = deliver_snapshots(second_relay, [item], key:)
+
+        expect([other_actor.status, other_actor.body]).to eq([200, { "applied" => 0, "ignored" => 1 }])
       end
 
       it "evaluates a batch again after a 409 under the same key instead of replaying the refusal" do

@@ -24,7 +24,9 @@ module TimekeepingContractExampleHelpers
     TimekeepingContract.load(contract_name).dig("errors", name)
   end
 
-  def user_headers(token, generation: timekeeping_arrange.current_generation, key: nil)
+  # Every state-changing request carries an Idempotency-Key (section 5.1), so
+  # each request gets a fresh one unless an example replays a key on purpose.
+  def user_headers(token, generation: timekeeping_arrange.current_generation, key: new_key)
     headers = { "Authorization" => "Bearer #{token}", "Ownership-Generation" => generation.to_s }
     key ? headers.merge("Idempotency-Key" => key) : headers
   end
@@ -45,7 +47,7 @@ module TimekeepingContractExampleHelpers
     }.merge(overrides.transform_keys(&:to_s))
   end
 
-  def create_entry(company, token, body, key: nil)
+  def create_entry(company, token, body, key: new_key)
     timekeeping_request("POST", timekeeping_path(:entry_api, :create, company_id: company), headers: user_headers(token, key:), body:)
   end
 
@@ -70,16 +72,19 @@ module TimekeepingContractExampleHelpers
     TimekeepingContract.load(:reservations).fetch("routes").keys
   end
 
-  def deliver_snapshots(credential, snapshots, key: nil)
+  def deliver_snapshots(credential, snapshots, key: new_key)
     contract = TimekeepingContract.load(:entry_snapshots)
     timekeeping_request("POST", timekeeping_path(:entry_snapshots, :deliver), headers: bearer_headers(credential, key:),
                                                                               body: { "schema_version" => contract.fetch("schema_version"), "snapshots" => snapshots })
   end
 
-  # One snapshot item holding every contract entry field.
-  def snapshot_item(entry_id:, company:, version:, generation: timekeeping_arrange.current_generation, outbox_position: version, **fields)
+  # One snapshot item holding every contract entry field. Its project and user
+  # are arranged in the snapshot's company, so a projection that keeps
+  # foreign keys to them can store the row.
+  def snapshot_item(entry_id:, company:, version:, generation: timekeeping_arrange.current_generation, outbox_position: version,
+                    project: timekeeping_arrange.project(company:), user: timekeeping_arrange.user(company:, role: "employee"), **fields)
     entry = TimekeepingContract.load(:entry_snapshots).fetch("entry_fields").index_with(nil).merge(
-      "id" => entry_id, "company_id" => company, "version" => version, "project_id" => 1, "user_id" => 2,
+      "id" => entry_id, "company_id" => company, "version" => version, "project_id" => project, "user_id" => user,
       "work_date" => "2026-03-02", "duration" => 90.0, "note" => "v#{version}", "bill_status" => "unbilled",
       "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
       "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z", "updated_at" => "2026-03-02T09:00:00Z"

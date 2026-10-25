@@ -32,13 +32,14 @@ module TimekeepingContract
       fingerprint = JSON.generate(body)
       stored = @receipts[receipt_key]
       if stored
-        return stored.fetch(:response) if stored.fetch(:fingerprint) == fingerprint
+        return Response.new(status: stored.fetch(:status), body: Wire.copy(stored.fetch(:body))) if stored.fetch(:fingerprint) == fingerprint
         return Wire.error(@contract, "key_reused") if @reject_reused_key
       end
 
       response = yield
       if @store_answer.call(status: response.status, stored_statuses: @contract.fetch("stored_statuses"))
-        @receipts[receipt_key] = { fingerprint:, response: }
+        # A private copy, so a caller editing its answer cannot change what a replay returns.
+        @receipts[receipt_key] = { fingerprint:, status: response.status, body: Wire.copy(response.body) }
       end
       response
     end

@@ -367,9 +367,8 @@ module TimekeepingContract
 
       def prepare(company_id, actor, body)
         existing = operation(company_id, actor, body["operation_id"])
-        request = body.except("generation")
         if existing
-          return Wire.error(@idempotency_contract, "key_reused") unless existing[:request] == request
+          return Wire.error(@idempotency_contract, "key_reused") unless existing[:request] == body
           return prepare_answer(existing) if existing[:state] == "prepared" || @policies[:replay_terminal_prepare]
         end
 
@@ -404,7 +403,7 @@ module TimekeepingContract
 
         reserve_provisionally(free, company_id, body, operation_key)
         stored = {
-          key: operation_key, company_id:, operation_id:, invoice_id: body["invoice_id"], state: "prepared", request:,
+          key: operation_key, company_id:, operation_id:, invoice_id: body["invoice_id"], state: "prepared", request: body,
           desired_entry_ids: entry_ids, disposition: body["disposition"]
         }
         @operations[operation_key] = stored
@@ -441,7 +440,7 @@ module TimekeepingContract
       # Commit and abort act only on what prepare stored. After the first of
       # them, the operation is terminal and a later one changes nothing.
       def finish(route, company_id, actor, body)
-        @receipts.answer(company_scope: company_id, actor:, operation: route, key: body["operation_id"], body: body.except("generation")) do
+        @receipts.answer(company_scope: company_id, actor:, operation: route, key: body["operation_id"], body:) do
           stored = operation(company_id, actor, body["operation_id"])
           next Wire.error(@reservation_contract, "not_found") unless stored && stored[:invoice_id] == body["invoice_id"]
 
@@ -493,7 +492,7 @@ module TimekeepingContract
       def mark_billed(company_id, actor, params, body)
         invoice_id = integer(params["invoice_id"])
         @receipts.answer(company_scope: company_id, actor:, operation: "mark_billed #{invoice_id}", key: body["operation_id"],
-                         body: body.except("generation")) do
+                         body:) do
           held = @reservations.select do |reservation|
             reservation[:company_id] == company_id && reservation[:invoice_id] == invoice_id && reservation[:state] == "committed"
           end
@@ -507,7 +506,7 @@ module TimekeepingContract
       def detach_entries(company_id, actor, params, body)
         agent_id = integer(params["agent_id"])
         @receipts.answer(company_scope: company_id, actor:, operation: "detach_entries #{agent_id}", key: body["operation_id"],
-                         body: body.except("generation")) do
+                         body:) do
           entries = @entries.values.select do |entry|
             entry["company_id"] == company_id && entry["agent_id"] == agent_id
           end

@@ -71,6 +71,44 @@ RSpec.shared_examples "timekeeping entry API contract" do
       expect(list_entries(company, owner_token).body.fetch("entries")).to be_empty
     end
 
+    it "applies the same target-user rule when an update names a user_id" do
+      own_entry = create_entry(company, employee_token, entry_body(project:)).body
+      owner_entry = create_entry(company, owner_token, entry_body(project:)).body
+      foreign_user = timekeeping_arrange.user(company: other_company, role: "employee")
+
+      refused = write("PATCH", entry_path(:update, own_entry.fetch("id")), employee_token, { "user_id" => colleague })
+      foreign = write("PATCH", entry_path(:update, owner_entry.fetch("id")), owner_token, { "user_id" => foreign_user })
+      moved = write("PATCH", entry_path(:update, owner_entry.fetch("id")), owner_token, { "user_id" => colleague })
+
+      expect(refused.status).to eq(timekeeping_contract_error(:entry_api, "forbidden").fetch("status"))
+      expect([foreign.status, foreign.body]).to eq([not_found.fetch("status"), not_found.fetch("body")])
+      expect(show_entry(company, owner_token, own_entry.fetch("id")).body).to eq(own_entry)
+      expect(moved.status).to eq(200)
+      expect(moved.body.fetch("user_id")).to eq(colleague)
+    end
+
+    it "refuses a request with a missing or unknown token and changes nothing" do
+      entry_id = timekeeping_arrange.entry(company:, user: owner, project:)
+      before = show_entry(company, owner_token, entry_id).body
+      unauthorized = timekeeping_contract_error(:entry_api, "unauthorized")
+
+      [nil, "unknown-test-token"].each do |token|
+        headers = user_headers(token)
+        headers = headers.except("Authorization") if token.nil?
+        responses = [
+          timekeeping_request("GET", entry_path(:show, entry_id), headers:),
+          timekeeping_request("POST", timekeeping_path(:entry_api, :create, company_id: company), headers:, body: entry_body(project:)),
+          timekeeping_request("PATCH", entry_path(:update, entry_id), headers:, body: { "note" => "Anonymous" })
+        ]
+
+        responses.each do |response|
+          expect([response.status, response.body]).to eq([unauthorized.fetch("status"), unauthorized.fetch("body")])
+        end
+      end
+      expect(show_entry(company, owner_token, entry_id).body).to eq(before)
+      expect(list_entries(company, owner_token).body.fetch("entries").size).to eq(1)
+    end
+
     it "ignores role and acting-user claims in the body" do
       claimed_role = create_entry(company, employee_token, entry_body(project:, user_id: colleague, role: "owner"))
       claimed_actor = create_entry(company, employee_token, entry_body(project:, acting_user_id: colleague, sub: colleague))
@@ -110,6 +148,9 @@ RSpec.shared_examples "timekeeping entry API contract" do
 
       expect(show_entry(company, owner_token, free).body.fetch("locked")).to be(false)
       expect(show_entry(company, owner_token, reserved).body.fetch("locked")).to be(true)
+
+      provisional = timekeeping_arrange.reserved_entry(company:, invoice_id: 502, state: "provisional")
+      expect(show_entry(company, owner_token, provisional).body.fetch("locked")).to be(true)
     end
 
     it "updates an entry and raises its version" do
@@ -218,10 +259,18 @@ RSpec.shared_examples "timekeeping entry API contract" do
       expect(show_entry(other_company, foreign_owner_token, foreign_entry).body).to eq(before)
     end
 
-    it "answers a path company other than the token's company as not_found" do
-      response = create_entry(other_company, owner_token, entry_body(project:))
+    it "answers a path company other than the token's company as not_found, even for that company's own records" do
+      foreign_project = timekeeping_arrange.project(company: other_company)
+      responses = [
+        create_entry(other_company, owner_token, entry_body(project: foreign_project)),
+        show_entry(other_company, owner_token, foreign_entry),
+        list_entries(other_company, owner_token)
+      ]
 
-      expect([response.status, response.body]).to eq([not_found.fetch("status"), not_found.fetch("body")])
+      responses.each do |response|
+        expect([response.status, response.body]).to eq([not_found.fetch("status"), not_found.fetch("body")])
+      end
+      expect(list_entries(other_company, foreign_owner_token).body.fetch("entries").map { |entry| entry.fetch("id") }).to eq([foreign_entry])
     end
 
     it "lists only the path company's entries" do
