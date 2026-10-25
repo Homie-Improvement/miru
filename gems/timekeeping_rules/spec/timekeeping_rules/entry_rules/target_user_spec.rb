@@ -53,4 +53,9 @@ RSpec.describe TimekeepingRules::EntryRules, ".target_user" do
   it "raises when the role is not a String" do
     expect { decide(role: :owner, requested_user_id: 2) }.to raise_error(ArgumentError)
   end
+
+  it "keeps the target user table and each of its rows frozen" do
+    expect(TimekeepingRules::EntryRules::TARGET_USER_TABLE).to be_frozen
+    expect(TimekeepingRules::EntryRules::TARGET_USER_TABLE).to all(be_frozen)
+  end
 end
