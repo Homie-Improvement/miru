@@ -19,8 +19,10 @@ module TimekeepingCommittedSecrets
 
   PATTERNS = {
     pem_private_key: "#{DASHES}BEGIN (?:[A-Z]+ )?PRIVATE KEY#{DASHES}",
-    # A KEY=value line in an env file or shell script, with or without export.
-    env_file_value: "^[ \\t]*(?:export[ \\t]+)?#{KEY}[ \\t]*=[ \\t]*[\"']?#{LITERAL_START}",
+    # An unquoted KEY=value anywhere it starts a word: an env file line, an
+    # export, a YAML list item ("- KEY=value") or a "docker run -e KEY=value".
+    # A key inside quotes or brackets is left to the quoted patterns below.
+    env_file_value: "(?<![A-Za-z0-9_\"'\\[])#{KEY}[ \\t]*=(?![=>~])[ \\t]*[\"']?#{LITERAL_START}",
     # A KEY: value line in YAML.
     yaml_value: "^[ \\t]*#{KEY}[ \\t]*:[ \\t]*[\"']?#{LITERAL_START}",
     # A quoted string assigned to the key in Ruby (ENV[...] =, ||= or a hash pair).
@@ -57,6 +59,8 @@ RSpec.describe "No committed Timekeeping secrets" do
     it "flags a literal value in an env file" do
       expect(findings("#{service_key}=abc123\n")).to include(:env_file_value)
       expect(findings("export #{private_key_name}='abc'\n")).to include(:env_file_value)
+      expect(findings("environment:\n  - #{service_key}=#{SecureRandom.hex(16)}\n")).to include(:env_file_value)
+      expect(findings("docker run -e #{service_key}=#{SecureRandom.hex(16)} timekeeping\n")).to include(:env_file_value)
     end
 
     it "flags a quoted literal assigned in Ruby" do

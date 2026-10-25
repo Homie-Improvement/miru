@@ -152,6 +152,26 @@ RSpec.describe Timekeeping::UserToken do
       expect { mint(agent: other_agent) }.to raise_error(described_class::AgentMismatchError)
     end
 
+    it "refuses the user's own agent from another company" do
+      agent_in_b = create(:agent, company: company_b, user:)
+
+      expect { mint(agent: agent_in_b) }.to raise_error(described_class::AgentMismatchError)
+    end
+
+    it "marks an in-company project the user has not joined as member false" do
+      colleague = create(:user)
+      create(:employment, company: company_a, user: colleague)
+      other_project = create(:project, client: project_a.client, billable: false)
+      create(:project_member, project: other_project, user: colleague)
+
+      claims = described_class.verify(mint(project_ids: [project_a.id, other_project.id]), public_key:)
+
+      expect(claims.projects).to contain_exactly(
+        { "id" => project_a.id, "company_id" => company_a.id, "billable" => true, "member" => true },
+        { "id" => other_project.id, "company_id" => company_a.id, "billable" => false, "member" => false }
+      )
+    end
+
     it "adds agent_id for the user's own agent" do
       agent = create(:agent, company: company_a, user:)
 

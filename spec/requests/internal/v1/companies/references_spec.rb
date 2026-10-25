@@ -44,13 +44,16 @@ RSpec.describe "Internal::V1::Companies::References", type: :request do
     logger.level = Logger::DEBUG
     previous_rails_logger = Rails.logger
     previous_controller_logger = ActionController::Base.logger
+    previous_api_logger = ActionController::API.logger
     Rails.logger = logger
     ActionController::Base.logger = logger
+    ActionController::API.logger = logger
     yield
     io.string
   ensure
     Rails.logger = previous_rails_logger
     ActionController::Base.logger = previous_controller_logger
+    ActionController::API.logger = previous_api_logger
   end
 
   describe "refusals" do
@@ -99,9 +102,13 @@ RSpec.describe "Internal::V1::Companies::References", type: :request do
   describe "logging" do
     it "catches a token written at INFO, proving the capture sees request-level logs" do
       marker = SecureRandom.hex(16)
-      logs = capture_logs { Rails.logger.info("token=#{marker}") }
+      controller_marker = SecureRandom.hex(16)
+      logs = capture_logs do
+        Rails.logger.info("token=#{marker}")
+        Internal::V1::Companies::ReferencesController.logger.info("token=#{controller_marker}")
+      end
 
-      expect(logs).to include(marker)
+      expect(logs).to include(marker, controller_marker)
     end
 
     it "writes neither the service token nor a user token into the log or the body" do

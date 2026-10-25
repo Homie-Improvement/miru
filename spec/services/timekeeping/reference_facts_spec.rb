@@ -89,6 +89,14 @@ RSpec.describe Timekeeping::ReferenceFacts do
     expect(facts_for_a([project_a.id])[:projects].first[:member_user_ids]).to eq([])
   end
 
+  it "leaves out memberships of users not employed in the company, even on its own project" do
+    company_a.employments.find_by(user: a_only_user).discard!
+    create(:project_member, project: project_a, user: a_only_user)
+    create(:project_member, project: project_a, user: b_only_user)
+
+    expect(facts_for_a([project_a.id])[:projects].first[:member_user_ids]).to eq([shared_user.id])
+  end
+
   it "returns the named company's edit window and billable values" do
     facts = facts_for_a([project_a.id])
 
