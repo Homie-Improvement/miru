@@ -53,6 +53,10 @@ RSpec.shared_examples "timekeeping reservations contract" do
     [{ "invoice_id" => invoice_id, "state" => state }]
   end
 
+  def entry_fields(*entry_ids)
+    entry_ids.index_with { |entry_id| timekeeping_arrange.stored_entry(entry_id).slice("bill_status", "agent_id") }
+  end
+
   describe "prepare is all or nothing" do
     it "refuses an entry committed to another active invoice, keeps that reservation and reserves nothing else" do
       commit_invoice(invoice_a, [x])
@@ -211,25 +215,48 @@ RSpec.shared_examples "timekeeping reservations contract" do
   describe "the service commands" do
     it "marks billed the entries the invoice holds by committed reservation" do
       commit_invoice(invoice_a, [x, y])
+      # Entries the command must leave alone: one with no reservation, one
+      # committed to another invoice and one only provisionally held for this
+      # invoice, so billing too widely or ignoring the committed state shows.
+      other_invoice_entry = timekeeping_arrange.reserved_entry(company:, invoice_id: invoice_b, state: "committed")
+      provisional_entry = timekeeping_arrange.reserved_entry(company:, invoice_id: invoice_a, state: "provisional")
+      unbilled = { "bill_status" => "unbilled", "agent_id" => nil }
+      billed = { "bill_status" => "billed", "agent_id" => nil }
+      entries = [x, y, z, other_invoice_entry, provisional_entry]
+      expect(entry_fields(*entries)).to eq(entries.index_with { unbilled })
 
       response = reservation_command(:mark_billed, company, service, { "operation_id" => new_key }, invoice_id: invoice_a)
 
       expect(response.status).to eq(200)
       expect(response.body).to eq("billed" => 2)
+      expect(entry_fields(*entries)).to eq(
+        x => billed, y => billed, z => unbilled, other_invoice_entry => unbilled, provisional_entry => unbilled
+      )
     end
 
     it "detaches the agent from that company's entries only" do
       agent_id = 77
-      2.times { timekeeping_arrange.entry(company:, user:, project:, agent_id:) }
+      other_agent_id = 78
+      own_entries = Array.new(2) { timekeeping_arrange.entry(company:, user:, project:, agent_id:) }
+      other_agent_entry = timekeeping_arrange.entry(company:, user:, project:, agent_id: other_agent_id)
       foreign_user = timekeeping_arrange.user(company: other_company, role: "employee")
-      timekeeping_arrange.entry(company: other_company, user: foreign_user, project: timekeeping_arrange.project(company: other_company), agent_id:)
+      foreign_agent_entry = timekeeping_arrange.entry(company: other_company, user: foreign_user,
+                                                      project: timekeeping_arrange.project(company: other_company), agent_id:)
       other_service = timekeeping_arrange.service_identity(company: other_company, name: "agent-destroy", operations: reservation_operations)
+      entries = [*own_entries, other_agent_entry, foreign_agent_entry]
+      # The agent_id each entry in entries holds, in order.
+      agent_ids = -> { entry_fields(*entries).values.map { |fields| fields.fetch("agent_id") } }
+      expect(agent_ids.call).to eq([agent_id, agent_id, other_agent_id, agent_id])
 
       own = reservation_command(:detach_entries, company, service, { "operation_id" => new_key }, agent_id:)
-      foreign = reservation_command(:detach_entries, other_company, other_service, { "operation_id" => new_key }, agent_id:)
 
       expect(own.body).to eq("detached" => 2)
+      expect(agent_ids.call).to eq([nil, nil, other_agent_id, agent_id])
+
+      foreign = reservation_command(:detach_entries, other_company, other_service, { "operation_id" => new_key }, agent_id:)
+
       expect(foreign.body).to eq("detached" => 1)
+      expect(agent_ids.call).to eq([nil, nil, other_agent_id, nil])
     end
 
     it "answers a stale generation on every command with stale_generation and changes nothing" do
@@ -266,10 +293,6 @@ RSpec.shared_examples "timekeeping reservations contract" do
       when "mark_billed" then reservation_command(:mark_billed, company, credential, { "operation_id" => operation_id }, invoice_id: invoice_a)
       when "detach_entries" then reservation_command(:detach_entries, company, credential, { "operation_id" => operation_id }, agent_id: 77)
       end
-    end
-
-    def entry_fields(*entry_ids)
-      entry_ids.index_with { |entry_id| timekeeping_arrange.stored_entry(entry_id).slice("bill_status", "agent_id") }
     end
 
     it "refuses a missing credential, a user token, a service without the operation and another company's service" do
