@@ -2,12 +2,15 @@
 
 require "cgi"
 require "digest"
+require_relative "environment"
+require_relative "identity"
 
 module Timekeeping
   # Decides which request values may appear in a log line. A caller can send a
   # bearer token or the service token under any parameter name or as the
   # X-Request-Id header, so a value is shown in clear only when both its name
-  # and its shape say it cannot be a credential.
+  # and its shape say it cannot be a credential and it is not the configured
+  # service token.
   module LogSafety
     MASK = "[FILTERED]"
 
@@ -41,18 +44,24 @@ module Timekeeping
 
     module_function
 
+    # The configured service token can have any shape, an id, a date or a
+    # UUID included, so every value a shape rule would log in clear is first
+    # compared with it.
+    def held_credential?(value)
+      Identity.service_token?(value.to_s, Environment.service_token)
+    end
+
     def clear_param?(key, value)
       shape = CLEAR_PARAM_SHAPES[key.to_s]
-      shape.present? && shape.match?(value.to_s)
+      shape.present? && shape.match?(value.to_s) && !held_credential?(value)
     end
 
     # A UUID is the form Rails generates and sends, so it is kept for
-    # correlation, unless it is the configured service token, which may itself
-    # be a UUID. Any other value could be a credential; its digest still lets
-    # the same id be matched across lines.
-    def request_id_tag(request_id, service_token: nil)
+    # correlation. Any other value, or the service token itself, could be a
+    # credential; its digest still lets the same id be matched across lines.
+    def request_id_tag(request_id)
       id = request_id.to_s
-      return id if UUID.match?(id) && !Identity.service_token?(id, service_token)
+      return id if UUID.match?(id) && !held_credential?(id)
 
       "sha256:#{Digest::SHA256.hexdigest(id)[0, REQUEST_ID_DIGEST_LENGTH]}"
     end
@@ -99,7 +108,7 @@ module Timekeeping
       case value
       when Hash then loggable_params(value)
       when Array then value.map { |element| loggable_param_value(element) }
-      else value
+      else held_credential?(value) ? MASK : value
       end
     end
 
@@ -124,7 +133,10 @@ module Timekeeping
     end
 
     def clear_path_segment?(segment)
-      segment.empty? || PATH_WORDS.include?(segment) || ID.match?(segment) || DATE.match?(segment)
+      return true if segment.empty?
+      return false if held_credential?(segment)
+
+      PATH_WORDS.include?(segment) || ID.match?(segment) || DATE.match?(segment)
     end
 
     # ActiveSupport::ParameterFilter passes a copy of each value under an

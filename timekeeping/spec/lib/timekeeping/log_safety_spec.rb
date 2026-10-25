@@ -49,9 +49,27 @@ RSpec.describe Timekeeping::LogSafety do
       uuid_service_token = SecureRandom.uuid
       other_uuid = SecureRandom.uuid
 
-      expect(described_class.request_id_tag(uuid_service_token, service_token: uuid_service_token))
-        .to match(/\Asha256:\h{16}\z/)
-      expect(described_class.request_id_tag(other_uuid, service_token: uuid_service_token)).to eq(other_uuid)
+      with_timekeeping_env(Timekeeping::Environment::SERVICE_TOKEN => uuid_service_token) do
+        expect(described_class.request_id_tag(uuid_service_token)).to match(/\Asha256:\h{16}\z/)
+        expect(described_class.request_id_tag(other_uuid)).to eq(other_uuid)
+      end
+    end
+  end
+
+  describe "a service token shaped like an id or a date" do
+    %w[1234567890123456789 2026-01-01].each do |shaped_service_token|
+      it "is masked in parameters, the query, the path and parameter values, while other ids stay clear" do
+        with_timekeeping_env(Timekeeping::Environment::SERVICE_TOKEN => shaped_service_token) do
+          expect(described_class.clear_param?("project_id", shaped_service_token)).to be(false)
+          expect(described_class.clear_param?("from", shaped_service_token)).to be(false)
+          expect(described_class.loggable_query("project_id=#{shaped_service_token}&user_id=5"))
+            .to eq("project_id=[FILTERED]&user_id=5")
+          expect(described_class.loggable_path("/v1/companies/#{shaped_service_token}/entries/12"))
+            .to eq("/v1/companies/[FILTERED]/entries/12")
+          expect(described_class.loggable_params("user_id" => shaped_service_token, "entry_ids" => ["3"]))
+            .to eq("user_id" => "[FILTERED]", "entry_ids" => ["3"])
+        end
+      end
     end
   end
 

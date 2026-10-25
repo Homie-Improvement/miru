@@ -122,6 +122,22 @@ RSpec.describe "Timekeeping entry reads: request logging" do
     expect(log).not_to include(uuid_service_token)
   end
 
+  it "never logs a numeric service token sent as project_id or as a path id" do
+    numeric_service_token = Array.new(19) { SecureRandom.random_number(1..9) }.join
+    headers = { "Authorization" => "Bearer #{token}" }
+
+    log = with_timekeeping_env(Timekeeping::Environment::SERVICE_TOKEN => numeric_service_token) do
+      capture_entry_logs do
+        get "/v1/companies/#{company_a}/entries", params: { project_id: numeric_service_token }, headers: headers
+        get "/v1/companies/#{numeric_service_token}/entries", headers: headers
+        get "/v1/companies/#{company_a}/entries/#{numeric_service_token}", headers: headers
+      end
+    end
+
+    expect(log).to include("Started GET", "Parameters:")
+    expect(log).not_to include(numeric_service_token)
+  end
+
   it "logs an allowed id and a UUID request id in clear, and masks other values" do
     request_id = SecureRandom.uuid
 

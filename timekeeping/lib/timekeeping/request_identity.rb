@@ -25,7 +25,7 @@ module Timekeeping
     # Rails.application.config.log_tags: each proc receives the request.
     LOG_TAGS = [
       ->(request) { "company_id=#{company_tag(from(request.env))}" },
-      ->(request) { "request_id=#{LogSafety.request_id_tag(request.request_id, service_token: Environment.service_token)}" },
+      ->(request) { "request_id=#{LogSafety.request_id_tag(request.request_id)}" },
       ->(request) { "actor=#{from(request.env).kind}" }
     ].freeze
 
