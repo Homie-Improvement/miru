@@ -9,6 +9,12 @@ class Timekeeping::V1::EntriesController < ApplicationController
   skip_before_action :authorize_read!, only: WRITE_ACTIONS
   before_action :authorize_write!, only: WRITE_ACTIONS
 
+  # A body that is not JSON, or holds a value of the wrong shape, gets the same
+  # {reason: ...} body as every other refusal, never the framework's own page.
+  rescue_from ActionController::BadRequest, ActionDispatch::Http::Parameters::ParseError do
+    render_reason(:invalid_request)
+  end
+
   def index
     entries = Timekeeping::EntriesQuery.visible(**visibility, filters: request.query_parameters.slice(*LIST_FILTERS))
     render json: { entries: entries.map { |entry| Timekeeping::EntryPresenter.call(entry) } }

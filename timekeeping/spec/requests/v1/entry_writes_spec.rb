@@ -218,6 +218,69 @@ RSpec.describe "Entry write routes" do
     expect(response.parsed_body.fetch("user_id")).to eq(colleague)
   end
 
+  it "answers a body of the wrong shape or not JSON with 400 invalid_request and writes nothing" do
+    before = entry_write_counts
+
+    send_write(:post, entries_path, employee_token, entry_body(duration: "45"))
+    expect([response.status, response.parsed_body]).to eq([400, { "reason" => "invalid_request" }])
+
+    post entries_path, params: "{not json", headers: write_headers(employee_token)
+    expect([response.status, response.parsed_body]).to eq([400, { "reason" => "invalid_request" }])
+    expect(entry_write_counts).to eq(before)
+  end
+
+  it "replays a committed create on retry even after its project is no longer in the reference facts" do
+    key = SecureRandom.uuid
+    first = send_write(:post, entries_path, employee_token, entry_body, key:)
+    first_body = first.body
+    WebMock.stub_request(:get, %r{reference\.test/internal/v1/companies/#{company}/reference}).to_return(
+      status: 200, headers: { "Content-Type" => "application/json" },
+      body: JSON.generate(company_id: company, edit_days: 30, users: [{ id: employee, role: "employee" }],
+                          projects: [], missing_project_ids: [project])
+    )
+
+    replay = send_write(:post, entries_path, employee_token, entry_body, key:)
+    expect([replay.status, replay.body]).to eq([201, first_body])
+
+    send_write(:post, entries_path, employee_token, entry_body)
+    expect([response.status, reason]).to eq([404, "not_found"])
+    expect(Entry.count).to eq(1)
+  end
+
+  describe "an employee's single-entry change the entry rules refuse" do
+    def own_entry(**attributes)
+      timekeeping_arrange.entry(company:, user: employee, project:, **attributes)
+    end
+
+    def reserved_own_entry
+      own_entry.tap do |id|
+        Reservation.create!(company_id: company, entry_id: id, invoice_id: 601, state: "committed",
+                            disposition: "active", operation_id: SecureRandom.uuid, created_at: Time.current)
+      end
+    end
+
+    # A reserved entry is refused only for an update: the rules let an
+    # employee delete it.
+    {
+      "a colleague's entry" => [-> { timekeeping_arrange.entry(company:, user: colleague, project:) }, %i[patch delete]],
+      "an own billed entry" => [-> { own_entry(bill_status: "billed") }, %i[patch delete]],
+      "an own entry outside the edit window" => [-> { own_entry(work_date: "2026-01-02") }, %i[patch delete]],
+      "an own reserved entry" => [-> { reserved_own_entry }, %i[patch]]
+    }.each do |target, (arrange_entry, methods)|
+      methods.each do |method|
+        it "answers #{method.upcase} of #{target} with 403 forbidden and writes nothing" do
+          id = instance_exec(&arrange_entry)
+          before = entry_write_counts
+
+          send_write(method, "#{entries_path}/#{id}", employee_token, method == :patch ? { "note" => "x" } : nil)
+
+          expect([response.status, reason]).to eq([403, "forbidden"])
+          expect(entry_write_counts).to eq(before)
+        end
+      end
+    end
+  end
+
   describe "bulk routes" do
     it "reports a colleague's entry as not_found to an employee and writes nothing for it" do
       colleague_entry = timekeeping_arrange.entry(company:, user: colleague, project:)

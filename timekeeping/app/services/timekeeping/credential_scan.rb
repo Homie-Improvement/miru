@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-require "set"
-
 module Timekeeping
   # Finds a credential in an entry write's body before anything is stored, so
   # no entry, audit row, receipt or outbox snapshot can carry one. It reads the
@@ -16,6 +14,9 @@ module Timekeeping
     # Every JWT header is a JSON object, and base64url of '{"' starts with this.
     JWT_HEADER_START = "eyJ"
     JWT_SEGMENT_COUNT = 3
+    # Far longer than the base64url of any header the monolith signs, which
+    # holds only the algorithm.
+    MAX_HEADER_LENGTH = 512
 
     module_function
 
@@ -41,35 +42,42 @@ module Timekeeping
       end
     end
 
+    # Candidates are made and checked one at a time, so a body built to yield
+    # many of them never holds them all in memory, and the search stops at the
+    # first one that verifies.
     def user_token_in?(texts, public_key)
-      signature_length = signature_length(public_key)
-      return false unless signature_length
+      rsa = rsa_key(public_key)
+      return false unless rsa
 
-      candidates = texts.each_with_object(Set.new) do |text, found|
-        found.merge(token_candidates(text, signature_length))
-      end
-      candidates.any? { |candidate| verifies?(candidate, public_key) }
+      signature_length = signature_length(rsa)
+      texts.lazy.flat_map { |text| token_candidates(text, signature_length) }
+        .uniq.any? { |candidate| verifies?(candidate, rsa) }
     end
 
     # A token can sit inside a longer string with other base64url text glued
     # to either end ("x" + token + "y"), so each dotted run is cut into every
-    # window of three segments. The header is tried from each "eyJ" in its
-    # segment, and the signature is cut to the length an RS256 signature with
-    # this key has, so text appended after the token cannot hide it.
+    # window of three segments. The header is tried from each "eyJ" near the
+    # end of its segment, and the signature is cut to the length an RS256
+    # signature with this key has, so text appended after the token cannot
+    # hide it.
     def token_candidates(text, signature_length)
-      text.scan(DOTTED_SEGMENTS).flat_map do |run|
-        run.split(".").each_cons(JWT_SEGMENT_COUNT).flat_map do |head, payload, tail|
+      text.scan(DOTTED_SEGMENTS).lazy.flat_map do |run|
+        run.split(".").each_cons(JWT_SEGMENT_COUNT).lazy.flat_map do |head, payload, tail|
           next [] if tail.length < signature_length
 
           signature = tail[0, signature_length]
-          header_starts(head).map { |start| [head[start..], payload, signature].join(".") }
+          header_starts(head).lazy.map { |start| [head[start..], payload, signature].join(".") }
         end
       end
     end
 
+    # Only the last MAX_HEADER_LENGTH characters of a segment can hold the
+    # start of a token's header, because the header ends where the segment
+    # does. Searching the whole segment would make a long run of "eyJ" cost
+    # the square of its length.
     def header_starts(segment)
       starts = []
-      index = segment.index(JWT_HEADER_START)
+      index = segment.index(JWT_HEADER_START, [segment.length - MAX_HEADER_LENGTH, 0].max)
       while index
         starts << index
         index = segment.index(JWT_HEADER_START, index + 1)
@@ -77,8 +85,8 @@ module Timekeeping
       starts
     end
 
-    def verifies?(candidate, public_key)
-      TokenVerifier.verify(candidate, public_key:)
+    def verifies?(candidate, rsa)
+      TokenVerifier.verify(candidate, public_key: rsa)
       true
     rescue TokenVerifier::ExpiredToken
       true
@@ -86,16 +94,20 @@ module Timekeeping
       false
     end
 
-    # The unpadded base64url length of an RS256 signature: the modulus size in
-    # bytes. With no readable key nothing verifies, as in Identity.resolve.
-    def signature_length(public_key)
-      rsa = public_key.is_a?(OpenSSL::PKey::RSA) ? public_key : OpenSSL::PKey::RSA.new(public_key.to_s)
-      (rsa.n.num_bytes * 4 / 3.0).ceil
+    # With no readable key nothing verifies, as in Identity.resolve.
+    def rsa_key(public_key)
+      public_key.is_a?(OpenSSL::PKey::RSA) ? public_key : OpenSSL::PKey::RSA.new(public_key.to_s)
     rescue OpenSSL::PKey::PKeyError
       nil
     end
 
+    # The unpadded base64url length of an RS256 signature: the modulus size in
+    # bytes.
+    def signature_length(rsa)
+      (rsa.n.num_bytes * 4 / 3.0).ceil
+    end
+
     private_class_method :decoded_strings, :user_token_in?, :token_candidates, :header_starts, :verifies?,
-      :signature_length
+      :rsa_key, :signature_length
   end
 end

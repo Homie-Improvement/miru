@@ -5,8 +5,9 @@ module Timekeeping
   # deploys without the contracts directory, so the statuses from
   # contracts/timekeeping/entry_api.yml and idempotency.yml are written out
   # here; spec/services/timekeeping/reasons_spec.rb compares them with the
-  # YAML. reference_unavailable and idempotency_key_required are this
-  # service's own answers, not yet listed in the contract.
+  # YAML. reference_unavailable, idempotency_key_required and invalid_request
+  # (a write body that is not JSON or holds a value of the wrong shape) are
+  # this service's own answers, not yet listed in the contract.
   module Reasons
     STATUS = {
       unauthorized: 401,
@@ -17,7 +18,8 @@ module Timekeeping
       credential_in_body: 422,
       idempotency_key_reused: 422,
       idempotency_key_required: 422,
-      reference_unavailable: 503
+      reference_unavailable: 503,
+      invalid_request: 400
     }.freeze
 
     module_function

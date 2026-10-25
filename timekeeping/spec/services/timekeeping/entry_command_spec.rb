@@ -59,11 +59,17 @@ RSpec.describe Timekeeping::EntryCommand do
     expect(reference_client).not_to have_received(:fetch)
   end
 
-  it "answers a project id that is not an id, or one the facts do not hold, as not_found" do
+  it "answers a project id that is not an id as not_found before reading the facts" do
     expect(build(:create, body: create_body(project_id: "11; DROP"))).to eq(Timekeeping::WriteOutcome.refusal(:not_found))
+    expect(reference_client).not_to have_received(:fetch)
+  end
 
+  # The writer refuses a project the facts do not hold, after the receipt, so
+  # a retry of a committed write still replays.
+  it "leaves a project the facts do not hold for the writer to refuse" do
     allow(reference_client).to receive(:fetch).and_return(facts.with(projects: [], missing_project_ids: [11]))
-    expect(build(:create, body: create_body)).to eq(Timekeeping::WriteOutcome.refusal(:not_found))
+
+    expect(build(:create, body: create_body)).to be_a(described_class)
   end
 
   it "answers an entry id that is not an id as not_found" do

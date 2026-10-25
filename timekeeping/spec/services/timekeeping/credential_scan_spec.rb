@@ -97,4 +97,19 @@ RSpec.describe Timekeeping::CredentialScan do
     expect(found?({ "note" => other }, public_key: nil)).to be(false)
     expect(found?({ "note" => service_token }, public_key: nil)).to be(true)
   end
+
+  it "finds a user token behind a long run of eyJ glued to its header" do
+    other = mint_token({ sub: 9 })
+
+    expect(found?({ "note" => ("eyJ" * 70_000) + other })).to be(true)
+  end
+
+  it "scans a 200 KB run of eyJ in one segment in bounded time" do
+    signature = "s" * 400
+    body = { "note" => "#{"eyJ" * 70_000}.payload.#{signature}" }
+
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    expect(found?(body)).to be(false)
+    expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be < 2
+  end
 end

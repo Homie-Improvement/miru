@@ -10,9 +10,12 @@ module Timekeeping
   # 1. Lock the receipt key and re-read the receipt: a stored answer for the
   #    same body is replayed, and a different body is idempotency_key_reused.
   # 2. Seed and read the company's generation row FOR SHARE; a header that is
-  #    not that generation is stale_generation.
+  #    not that generation is stale_generation. A project the reference facts
+  #    do not hold for the company is not_found. Both come after the receipt,
+  #    so a retry of a committed write replays even if they have changed.
   # 3. Lock the target entries FOR UPDATE, by company (and the A1 scope on
-  #    bulk routes), in id order so two writers never wait on each other.
+  #    bulk routes), in id order, so two writers over the same entries wait in
+  #    turn and never deadlock.
   # 4. Check If-Match and the entry rules on the locked rows.
   # 5. Write the entries with version + 1 and one audit row per change.
   # 6. Under the outbox lock, insert one outbox snapshot per change.
@@ -77,6 +80,7 @@ module Timekeeping
         generation = locked_generation(command.company_id)
         checkpoint.call(:generation_checked)
         return WriteOutcome.refusal(:stale_generation) unless generation_matches?(command.generation, generation)
+        return WriteOutcome.refusal(:not_found) unless project_known?(command)
 
         written = send(ROUTE_WRITERS.fetch(command.route), command)
         return written if written.is_a?(WriteOutcome)
@@ -129,6 +133,12 @@ module Timekeeping
         connection.select_value(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, company_id]))
           SELECT generation FROM ownership_generations WHERE company_id = ? FOR SHARE
         SQL
+      end
+
+      # The project a body names must be one the facts hold for this company;
+      # one listed in missing_project_ids, or absent, is answered as not found.
+      def project_known?(command)
+        command.project_id.nil? || command.facts.projects.any? { |project| project.id == command.project_id }
       end
 
       # A missing header, or one that is not a plain integer, is never current.

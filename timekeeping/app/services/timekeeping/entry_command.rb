@@ -69,7 +69,6 @@ module Timekeeping
       check_fields!(route, body)
       project_ids = [project_id].compact
       facts = reference_client.fetch(company_id:, project_ids:)
-      return WriteOutcome.refusal(:not_found) unless (project_ids - facts.projects.map(&:id)).empty?
 
       new(
         route:, company_id:, actor_id: identity.user_id, role: identity.role, entry_id: target_id,
