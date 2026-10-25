@@ -9,4 +9,8 @@ Rails.application.routes.draw do
       end
     end
   end
+
+  scope "internal/v1", module: "timekeeping/internal/v1" do
+    get "metrics", to: "metrics#index"
+  end
 end
