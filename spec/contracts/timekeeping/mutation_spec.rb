@@ -96,7 +96,11 @@ RSpec.describe "Timekeeping contract examples against fakes with one rule broken
     ["stores a 409 as a snapshot receipt", :snapshot_idempotency, { relay: { store_answer: ->(**) { true } } }],
     ["accepts an entry body that carries a credential", :entry_api, { timekeeping: { credential_in_body: ->(**) { false } } }],
     ["keys snapshot receipts without the actor", :snapshot_idempotency,
-     { relay: { receipt_key: ->(company_scope:, operation:, key:, **) { [company_scope, operation, key] } } }]
+     { relay: { receipt_key: ->(company_scope:, operation:, key:, **) { [company_scope, operation, key] } } }],
+    ["bills entries before refusing a reservation command", :reservations,
+     { timekeeping: { refused_command_writes: ->(route:) { route == "mark_billed" } } }],
+    ["detaches entries before refusing a reservation command", :reservations,
+     { timekeeping: { refused_command_writes: ->(route:) { route == "detach_entries" } } }]
   ]
 
   it "passes every group with the unbroken fakes" do

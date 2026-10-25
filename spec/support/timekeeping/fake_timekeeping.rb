@@ -51,6 +51,9 @@ module TimekeepingContract
       operation_key: ->(company_id:, actor:, operation_id:) { [company_id, actor, operation_id] },
       # Which entries a refused prepare still reserves or releases: none.
       refused_prepare: ->(free_entry_ids:, conflicting_entry_ids:) { { reserve: [], release: [] } },
+      # Whether a reservation route refused for its credential still runs its
+      # command before answering the refusal: never.
+      refused_command_writes: ->(route:) { false },
       replay_terminal_prepare: true,
       snapshot_entry: ->(entry, credentials:) { entry },
       # Whether an entry write carries a credential Timekeeping holds anywhere
@@ -152,6 +155,10 @@ module TimekeepingContract
 
     def entry_locked?(entry_id)
       @entries.fetch(entry_id).fetch("locked")
+    end
+
+    def stored_entry(entry_id)
+      Wire.copy(@entries.fetch(entry_id))
     end
 
     def reservations_for(entry_id)
@@ -340,9 +347,16 @@ module TimekeepingContract
       def reservation_request(route, params, headers, body)
         company_id = integer(params["company_id"])
         actor, failure = authorize_service(Wire.bearer(headers), company_id, route)
-        return failure if failure
+        if failure
+          run_reservation_route(route, company_id, actor, params, body) if @policies[:refused_command_writes].call(route:)
+          return failure
+        end
         return Wire.error(@reservation_contract, "stale_generation") unless generation_current?(body["generation"])
 
+        run_reservation_route(route, company_id, actor, params, body)
+      end
+
+      def run_reservation_route(route, company_id, actor, params, body)
         case route
         when "prepare" then prepare(company_id, actor, body)
         when "commit", "abort" then finish(route, company_id, actor, body)
