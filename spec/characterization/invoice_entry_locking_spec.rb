@@ -157,7 +157,7 @@ RSpec.describe "Characterization: invoice timesheet entry locking", type: :reque
     end
   end
 
-  describe "L4: direct line removed from a draft (deliberate fix pending: may change)" do
+  describe "L4: direct line removed from a draft" do
     it "unlocks the line's direct entry when the line item is loaded fresh before destroy" do
       invoice = create(:invoice, company:, client:)
       line = locking_spec_direct_line(invoice)

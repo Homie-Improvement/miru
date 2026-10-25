@@ -64,19 +64,20 @@ RSpec.describe "Characterization: entry lookups and PDF totals", type: :model do
   describe "invoice PDF totals against the stored amount (M1)" do
     it "prints a 3-place subtotal and an unrounded total while the stored amount has 2 places" do
       workspace = lookup_spec_workspace
-      invoice = create(:invoice, company: workspace[:company], client: workspace[:client], currency: "USD", tax: 0, discount: 0)
-      # One minute at rate 1 costs 1/60 = 0.01666..., which rounds to 0.017 and 0.02.
+      invoice = create(:invoice, company: workspace[:company], client: workspace[:client], currency: "USD", tax: BigDecimal("0.01"), discount: 0)
+      # One minute at rate 1 costs 1/60 = 0.01666..., which rounds to 0.017 (PDF) and 0.02 (stored).
+      # With 0.01 tax the PDF total stays 0.027, while the stored amount is (0.02 + 0.01) = 0.03.
       create(:invoice_line_item, invoice:, timesheet_entry: lookup_spec_entry(workspace), quantity: 1, rate: 1)
 
       invoice.reload
-      expect(invoice.amount).to eq(BigDecimal("0.02"))
+      expect(invoice.amount).to eq(BigDecimal("0.03"))
 
       pdf_service = PdfGeneration::InvoiceService.new(invoice)
-      expect(pdf_service.send(:calculate_subtotal)).to eq(0.017)
-      expect(pdf_service.send(:calculate_total)).to eq(0.017)
-      expect(pdf_service.locals[:sub_total]).to eq(FormatAmountService.new("USD", 0.017).process)
-      expect(pdf_service.locals[:total]).to eq(FormatAmountService.new("USD", 0.017).process)
-      expect(pdf_service.locals[:invoice_amount]).to eq(FormatAmountService.new("USD", BigDecimal("0.02")).process)
+      expect(pdf_service.send(:calculate_subtotal)).to eq(BigDecimal("0.017"))
+      expect(pdf_service.send(:calculate_total)).to eq(BigDecimal("0.027"))
+      expect(pdf_service.locals[:sub_total]).to eq(FormatAmountService.new("USD", BigDecimal("0.017")).process)
+      expect(pdf_service.locals[:total]).to eq(FormatAmountService.new("USD", BigDecimal("0.027")).process)
+      expect(pdf_service.locals[:invoice_amount]).to eq(FormatAmountService.new("USD", BigDecimal("0.03")).process)
     end
   end
 end
