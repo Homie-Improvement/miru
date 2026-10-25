@@ -21,3 +21,9 @@ gem "timekeeping_rules", path: "../gems/timekeeping_rules"
 group :development, :test do
   gem "rspec-rails", "~> 8.0"
 end
+
+# The root Gemfile's pin. Specs stub the monolith's reference endpoint with it,
+# and it blocks any real network call a spec would make.
+group :test do
+  gem "webmock", "~> 3.26.2"
+end
