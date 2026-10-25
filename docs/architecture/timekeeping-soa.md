@@ -32,7 +32,7 @@ The repository owner reviewed and decided these against the code at `main`. They
 - **Every entry writer keeps its route and goes through one gateway** (sections 3.1 and 10.1).
 - **Characterization first:** today's real behaviour is pinned by specs before any change (section 12.1).
 - **The gateway and the invoice reservation boundary are inside the scope.**
-- **Two deliberate behaviour fixes,** kept through rollback (section 2.3).
+- **Three deliberate behaviour fixes,** kept through rollback (section 2.3).
 
 ## 1. Existing architecture and its important dependencies
 
@@ -109,7 +109,7 @@ Source: `app/models/timesheet_entry.rb`, table `timesheet_entries` in `db/schema
 
 The desktop timer client was not traced while writing this section. Whether it calls the web API or the CLI API is an open question for the review.
 
-**User hard delete (observed).** A super admin can permanently delete a user: `Api::V1::UsersController#destroy` calls `target_user.destroy!` (`app/controllers/api/v1/users_controller.rb:51-82`). `User` declares `has_many :timesheet_entries` with no `dependent:` option (`app/models/user.rb:38`). The foreign key `timesheet_entries → users` (`db/schema.rb:1327`) therefore makes the delete fail when the user has any entry. The destroy's transaction rolls back, including the agent destroys and their `agent_id` nulls; the `super_admin_delete` audit row the controller writes before calling `destroy!` is not part of that transaction. Today that key is the only check that stops a user with time entries from being deleted.
+**User hard delete (observed).** A super admin can permanently delete a user: `Api::V1::UsersController#destroy` calls `target_user.destroy!` (`app/controllers/api/v1/users_controller.rb:51-82`). `User` declares `has_many :timesheet_entries` with no `dependent:` option (`app/models/user.rb:38`), so the foreign key `timesheet_entries → users` (`db/schema.rb:1327`) makes the delete fail when the user has any entry. That key is the only check that stops a user with time entries from being deleted.
 
 ### 1.4 Billing writes timekeeping state directly (observed)
 
@@ -223,12 +223,13 @@ Each row below is current behaviour, cited to its source. The target design must
 | L7 **(quirk)** | The Harvest import creates entries as `unbilled` and then calls `entry.update!(bill_status: :billed)` with no invoice. So `billed` is not always backed by an invoice link. | `app/services/imports/harvest_time_entries_importer.rb` (`create_entry`); `spec/services/imports/harvest_time_entries_importer_spec.rb` |
 | L8 | A line item's linked entries must belong to the invoice's company. | `app/models/invoice_line_item.rb` validations; no spec in `spec/models/invoice_line_item_spec.rb` covers this rule |
 
-**Deliberate fixes.** The repository owner chose to fix two legacy billing behaviours. Historical invoices and amounts do not change. These two are the only rows in section 2 the target design changes, and both fixes are kept through rollback.
+**Deliberate fixes.** The repository owner chose to fix three legacy billing behaviours. Historical invoices and amounts do not change. These three are the only rows in section 2 the target design changes, and all three fixes are kept through rollback.
 
 | Case | Today (observed) | After (proposed) | What a user sees |
 |---|---|---|---|
 | An entry already on a kept invoice is put on a second one | Allowed. Both invoices lock one boolean. Candidate selection hides such entries (`filtered_ids`, section 1.5), but explicit ids through the API or MCP (`app/mcp/tools/invoice_create_tool.rb`) get through, and no database constraint stops it (section 1.5). | Prepare is refused: the entry is on another invoice. | An explicit double allocation fails with a clear error instead of billing the time twice. Normal selection is unchanged. |
 | A draft invoice is discarded (L2) | Its entries stay locked. `after_discard :unlock_timesheet_entries` runs, then `update_invoice_number` calls `update`, which fires `after_save :lock_timesheet_entries` again (`app/models/invoice.rb:62-64`, `:323-325`). | Its reservations are released. | An employee can edit time that was on a discarded draft. |
+| A project aggregate line is removed from a draft, or a draft is destroyed (L4) | Its linked entries can stay locked with no invoice referencing them (the callback-order quirk in L4). | The entries the removed line referenced are released at commit when no remaining direct or grouped line of the draft references them; a destroyed draft releases its whole set. | Removing a line from a draft frees the time it covered. The direct entry's behaviour is unchanged. |
 
 **Preserved as they are:** a discarded non-draft keeps its entries locked (L3); a line-item destroy releases only on a draft (L4); a sent invoice leaves entries unbilled (L6); the bulk move skips failing entries silently (A9); `bill_status` stays settable by any user who may edit the entry and by the import (A11, L7).
 
@@ -318,14 +319,13 @@ Clients keep calling the monolith's existing routes. The monolith checks the ses
 - the agent controller;
 - the Harvest import;
 - the invoice reservation boundary, which replaces the lock callbacks in `app/models/invoice.rb` and `app/models/invoice_line_item.rb` and `Invoice#update_timesheet_entry_status!`;
-- **agent destroy:** `has_many :timesheet_entries, dependent: :nullify` (`app/models/agent.rb:11`) becomes a Timekeeping command that nulls `agent_id` on that company's entries, with an audit row;
-- the seed and demo writers of section 1.3 (`db/seeds.rb`, `db/seeds/timesheet_data.rb`, `Analytics::DemoSeeder`). Before cutover they create the two seeded businesses that the cutover moves. Once Timekeeping owns the data, they write through the gateway like every other flow.
+- **agent destroy:** `has_many :timesheet_entries, dependent: :nullify` (`app/models/agent.rb:11`) becomes a Timekeeping command that nulls `agent_id` on that company's entries, with an audit row.
 
-The gateway also sends the **user-retire check** before a user hard delete (section 3.3), because that delete depends on whether the user has entries.
+Seed and demo-data builders (`db/seeds.rb`, `db/seeds/timesheet_data.rb`, `Analytics::DemoSeeder`) run only in the initial legacy state, before the first handoff begins. Each checks the ownership record before its first write and refuses once a handoff has begun, in either ownership state, and after a rollback: the prepared monolith writes its own authoritative tables and `timesheet_entries` stays a projection. Reseeding needs a fresh demo reset. The single-writer guard test (section 12.2) runs all three builders in each later state and asserts they change nothing.
 
 Rules the gateway applies to every writer:
 
-- **Generation on every write.** A writer that makes many writes checks the generation on each one, not once per job. These writers are the Harvest import, the bulk move, agent destroy and the seed and demo writers. When the generation rises partway through, the remaining writes are refused. The writer fails visibly, and it is retried against the new owner.
+- **Generation on every write.** A writer that makes many writes checks the generation on each one, not once per job. These writers are the Harvest import, the bulk move and agent destroy. When the generation rises partway through, the remaining writes are refused. The writer fails visibly, and it is retried against the new owner.
 - **Stale generation in the bulk move.** A generation refusal fails the whole bulk request with an error. It is not one of the silently skipped entries of A9. A9 covers entries that fail validation; the generation is an admission decision. This order between the two rules is a design choice.
 - **The invoice-number rewrite is not a reservation change.** The invoice reservation boundary runs only when an invoice changes which entries it holds, or is discarded or destroyed. It never runs on every invoice save. A discarded draft's `update_invoice_number` save (`app/models/invoice.rb:323-325`) therefore cannot reserve its entries again (L2).
 
@@ -366,11 +366,7 @@ A single-writer guard test runs every flow above and fails if anything other tha
 - `invoice_line_item_time_entries → timesheet_entries` (`db/schema.rb:1282`) and `invoice_line_items → timesheet_entries` (`:1284`). Otherwise a new entry can be invoiced before the projection holds its row, and the key rejects the line item. Existence and same-company (L8) are checked by the prepare response, which is authoritative (section 5.3).
 - `timesheet_entries → agents` (`:1325`). Agent destroy nulls `agent_id` in Timekeeping, and the null reaches the projection later. A kept key would either refuse the agent delete or stop the relay on a snapshot it cannot insert. While the relay is behind, an aggregate join can see an `agent_id` whose agent row is gone. This is a design choice, disclosed here.
 
-The keys `timesheet_entries → projects` (`:1326`) and `timesheet_entries → users` (`:1327`) stay. Today the users key is the only check that stops a user with time entries from being hard-deleted (section 1.3). A projection key cannot keep that check alone, because an entry Timekeeping accepted may not have reached the projection yet. So the check moves to the owner of the entries:
-
-- **User-retire check.** Before a user hard delete, the gateway sends the user-retire command (section 5.3). In one Timekeeping transaction, the command refuses if any entry references the user, and otherwise marks the user `retiring`. After that, Timekeeping refuses new entries for that user, so a create cannot race the check. The monolith destroys the user row only after the command succeeds. The destroy can still fail for another reason, for example the `expenses → users` foreign key (`db/schema.rb:1273`), so the mark follows the delete's outcome with the save-order pattern of section 9.2. Under an advisory lock on the user id, the monolith first writes a pending deletion intent outside the delete transaction, then sends retire. The `destroy!` transaction records the intent `committed`, and the monolith then delivers `retire/commit`, which makes the mark `retired` for good. If the destroy fails, the monolith records the intent `failed` first, then delivers `retire/abort`, which clears the mark so the user can log time again. Recovery picks up a pending intent under the same lock: if the user row is gone, it records `committed` and delivers commit; if the row still exists, it records `failed` and delivers abort. While the prepared monolith owns the data (section 10), the same check runs against its own entry table.
-- The same rule applies to a project hard delete. No code in `app/` destroys a project, so the rule has no caller today.
-- Agent destroys that run through `User` (`app/models/user.rb:39`) happen only after the user check has passed.
+The keys `timesheet_entries → projects` (`:1326`) and `timesheet_entries → users` (`:1327`) stay. Today the users key is the only check that stops a user with time entries from being hard-deleted (section 1.3). After cutover that key sits on the projection, which lags: a user with a freshly logged, not yet projected entry would delete cleanly, and that entry's snapshot would then fail the key and stall the one relay that feeds every report and rollback. So, from the first handoff on, the monolith refuses a user hard delete (the super-admin destroy, `app/controllers/api/v1/users_controller.rb:51-82`) with a clear error. It reads the ownership record (section 10.1) and nothing else. Un-gating it is a production-rollout item (section 15.4). The refusal runs first in the destroy, before its audit row and before any dependent effect (the agent destroys through `User`, `app/models/user.rb:39`), so a refused delete leaves no trace. It holds from the moment the first handoff begins, in either ownership state, during a handoff, after an aborted handoff and after a rollback: the gate reads the ownership record and refuses whenever `handoff_step` is set or the generation is above its initial value. Before the first handoff the monolith behaves as today. No new distributed check is added. Normal employment discard, team removal and project or client discard are unchanged. No code in `app/` destroys a project.
 
 ### 3.4 Reference data Timekeeping needs, and how it reads it
 
@@ -379,7 +375,7 @@ Timekeeping's rules read facts the monolith owns: project `billable` (S1, S3), c
 Today (observed), the role and `timesheet_edit_days` are read in `authorize`, before the write's transaction opens. The controller calls `authorize` (`app/controllers/api/v1/timesheet_entry_controller.rb:30`, `:40`, `:48`), and the policy reads `record.project.client.company.timesheet_edit_days` (`app/policies/timesheet_entry_policy.rb:46`). Only the model validations, which read project `billable` and the agent's company, run inside the save's transaction. The target reads the same facts once per request, as fresh as today:
 
 - **User-delegated writes.** The monolith mints the signed token per request. Its claims carry the user's current role in the company, `timesheet_edit_days`, and for each project the request touches: `company_id`, `billable` and whether the user is a member. Timekeeping takes these claims as the facts for that write.
-- **Background writes** (reservation operations, imports, agent destroy, seed and demo writers). Timekeeping calls a monolith read endpoint, `GET /internal/v1/companies/{company_id}/reference?project_ids=…`, with its own service identity, before deciding.
+- **Background writes** (reservation operations, imports and agent destroy). Timekeeping calls a monolith read endpoint, `GET /internal/v1/companies/{company_id}/reference?project_ids=…`, with its own service identity, before deciding.
 - **When the facts cannot be read** (expired token, missing project claim, monolith endpoint down), the write is refused with a retryable `503 reference_unavailable`. It fails closed: Timekeeping never guesses and never falls back to an older copy.
 - There are no cross-database joins.
 
@@ -475,24 +471,10 @@ POST /v1/companies/{company_id}/invoices/{invoice_id}/mark-billed
 POST /v1/companies/{company_id}/agents/{agent_id}/detach-entries
   { operation_id, generation }
   -> 200 { detached: <count> }
-
-POST /v1/users/{user_id}/retire
-  { operation_id, generation }
-  -> 200 { retiring: true }
-  -> 409 { reason: "user_has_entries" }
-
-POST /v1/users/{user_id}/retire/commit
-  { operation_id, generation }
-  -> 200 { retired: true }
-
-POST /v1/users/{user_id}/retire/abort
-  { operation_id, generation }
-  -> 200 { retiring: false }
 ```
 
 - **mark-billed** replaces `Invoice#update_timesheet_entry_status!`. It sets `bill_status: billed` on the kept entries that the invoice holds by committed reservation. Today that method runs only from the uncalled mailer path (L5), and the migration does not call it more often.
 - **detach-entries** is agent destroy. It nulls `agent_id` on that company's entries for the agent and writes an audit row for each entry.
-- **retire** is the user-retire check of section 3.3. It is the one command not scoped to a company, because one user can hold entries in several companies. Its answer is only yes or no, and it returns no entry data. `retire/commit` and `retire/abort` settle it from the monolith's deletion intent, idempotent by the same `operation_id`, as commit and abort settle a reservation operation. A handoff's settle step (section 10.5) resolves pending deletion intents too, so only `retired` marks travel in the checkpoint.
 
 ### 5.4 The entry snapshot stream
 
@@ -517,7 +499,7 @@ POST /internal/v1/timekeeping/entry-snapshots
   -> 409 { reason: "stale_generation" }
 ```
 
-The relay runs on its own queue, worked by its own dedicated worker. This follows the existing `billing_sync` worker in `config/solid_queue.yml`. Only that worker is started for the relay, not the `default` worker (section 11). The relay marks a row sent only after a `200`, so delivery is at least once.
+The relay runs on its own queue, worked by its own dedicated worker. This follows the existing `billing_sync` worker in `config/solid_queue.yml`. That worker is started for the relay; the `default` worker is not (section 11). The relay marks a row sent only after a `200`, so delivery is at least once.
 
 **The projection consumer** behind that endpoint is the only writer of `timesheet_entries`:
 
@@ -545,7 +527,7 @@ The relay runs on its own queue, worked by its own dedicated worker. This follow
 |---|---|---|---|
 | **User-delegated** | Web, mobile, bulk, CLI (which also serves MCP), desktop timer | Short-lived token signed by the monolith: `sub` (user id), `company_id`, `role` in that company, `edit_days`, `projects` facts, `exp` (60 seconds), `jti` | A1–A7 and S1–S7, exactly as for that user today. A role claim is valid only for the `company_id` in the same token. |
 | **Agent** | The agent API | The same signed token, for the agent's user, with `agent_id` set | Today's checks only: the project scope (the project must be in `ProjectPolicy::Scope` for the agent's user and company), then the model rules S1–S4 and S7. The agent API skips Pundit today (`app/controllers/api/v1/agent/base_controller.rb:7`, `timesheet_entries_controller.rb:4-18`), so A1–A5 do not apply to it. |
-| **Background** | Invoice reservation boundary, Harvest import, agent destroy, user hard delete, seed and demo writers | Service credential (mutual TLS or a signed service token) bound to one `company_id` per request and to a named operation list | Only the named operations: `reservations.prepare`, `reservations.commit`, `reservations.abort`, `invoices.mark_billed`, `entries.import`, `agents.detach_entries`, `entries.seed`, and `users.retire`. Company scoping applies to every operation except `users.retire` (section 5.3). |
+| **Background** | Invoice reservation boundary, Harvest import, agent destroy | Service credential (mutual TLS or a signed service token) bound to one `company_id` per request and to a named operation list | Only the named operations: `reservations.prepare`, `reservations.commit`, `reservations.abort`, `invoices.mark_billed`, `entries.import` and `agents.detach_entries`. Company scoping applies to every operation. |
 
 CLI and MCP calls are user-delegated, not background. `app/controllers/api/v1/cli/timesheet_entries_controller.rb` scopes to `current_user`, and the MCP tools call it in-process with the user's own credential (section 1.3). The monolith keeps checking those credentials and mints the user token for them.
 
@@ -655,7 +637,7 @@ Mapping of today's callbacks:
 | L1 draft save locks entries | The invoice reservation boundary prepares and commits the draft's desired entry set when it changes (section 9.2) |
 | L2 draft discard leaves entries locked (re-lock) | Empty desired set; reservations released at commit. **Deliberate fix** (section 2.3) |
 | L3 non-draft discard keeps locks | Reservations kept with `disposition: 'retained'`. **Preserved quirk.** |
-| L4 line-item destroy on draft unlocks; on non-draft does not | On a draft, the entry leaves the desired set and is released at commit. On a non-draft, the boundary sends no removal, so the reservation stays. Preserved. One difference: a removed aggregate line's linked entries also leave the desired set and are released, where today they can stay locked with no invoice referencing them (L4). Keeping them reserved would need an owner that no line references, which the one rule does not have. This is an open question for the owner (section 15.2). |
+| L4 line-item destroy on draft unlocks; on non-draft does not | On a draft, the entry leaves the desired set and is released at commit. On a non-draft, the boundary sends no removal, so the reservation stays. Preserved for direct entries. **Deliberate fix** (section 2.3, D7): a removed line's entries leave the desired set only when no remaining direct or grouped line of the draft references them, and are then released at commit; today a removed aggregate line's linked entries can stay locked with no invoice referencing them (L4). The same holds for every line of a draft destroyed by the bulk delete. |
 | Bulk hard destroy of an invoice | Draft: released. Non-draft: `retained`, carrying its own owner. Failed destroy: operation aborted, prior state kept (section 1.4) |
 | Two kept invoices on one entry | Refused at prepare: `on_another_invoice`. **Deliberate fix** (section 2.3) |
 | L5 mark billed via uncalled mailer | `mark-billed` (section 5.3), called only from the same path |
@@ -671,7 +653,7 @@ non_billable <-> unbilled          (user edit, project rules S1/S3)
 unbilled     ->  billed            (user edit A11, import L7, mark-billed L5)
 ```
 
-No path moves an entry out of `billed`. The policy refuses updates and deletes of billed entries for every role (A2), and none of the named background operations (`reservations.prepare`, `reservations.commit`, `reservations.abort`, `invoices.mark_billed`, `entries.import`, `agents.detach_entries`, `entries.seed`) moves an entry out of `billed`. Timekeeping still applies A7 as a second check, as the model does today.
+No path moves an entry out of `billed`. The policy refuses updates and deletes of billed entries for every role (A2), and none of the named background operations (`reservations.prepare`, `reservations.commit`, `reservations.abort`, `invoices.mark_billed`, `entries.import`, `agents.detach_entries`) moves an entry out of `billed`. Timekeeping still applies A7 as a second check, as the model does today.
 
 ### 7.4 Future work, not part of the migration
 
@@ -679,7 +661,7 @@ No path moves an entry out of `billed`. The policy refuses updates and deletes o
 - Releasing reservations when a non-draft invoice is discarded (would change L3).
 - A review queue (would change S5 and possibly S6).
 
-Each is a customer-visible change and is kept out of the migration's acceptance criteria and failure handling. Exclusivity (one kept invoice per entry) and the release on draft discard are not future work: they are the two deliberate fixes, inside this migration (section 2.3).
+Each is a customer-visible change and is kept out of the migration's acceptance criteria and failure handling. Exclusivity (one kept invoice per entry), the release on draft discard and the release of a removed line's entries on a draft are not future work: they are the three deliberate fixes, inside this migration (section 2.3).
 
 ## 8. Financial precision, rounding and historical invoices (proposed)
 
@@ -727,22 +709,35 @@ Timekeeping keeps its own terminal record of the same operations (`invoice_opera
 ```text
 1. Take the serialization lock on the stable invoice identity: a Postgres advisory lock on
    (company_id, invoice_id), not a lock on the invoice row, so creation and deletion are covered
-   where no row exists to lock. Then, in its own short transaction that commits at once, write the
-   pending operation intent (state 'pending', a new operation_id, the current generation).
+   where no row exists to lock. On creation the monolith allocates the invoice id from the invoices
+   sequence before step 1, and inserts with that id at step 3. Then, in its own short transaction
+   that commits at once, write the pending operation intent (state 'pending', a new operation_id,
+   the current generation).
 2. Call prepare with the invoice's desired entry set, synchronously, with a bounded timeout
    (proposed: 5 seconds).
-3. On a 200: in one transaction, save or destroy the invoice, set the intent to 'committed'
-   (WHERE state = 'pending'), and write an outbox row that asks for commit. Commit the transaction.
+3. Continue only when prepare returns 200 with state 'prepared'. A 200 with a terminal state
+   ('committed' or 'aborted') never re-runs the change: the save reconciles it with its durable
+   intent. If the intent is 'committed', the save returns the existing successful outcome; if it is
+   'failed' or 'aborted', the save fails; if the two disagree or the intent is still 'pending', the
+   save fails with a retryable reconciliation error and makes no second change. On 'prepared': in one
+   transaction, save or destroy the invoice, set the intent to 'committed' (WHERE state = 'pending'),
+   and write an outbox row that asks for commit. If that update changes no row, roll the transaction
+   back and fail the save with a retryable error. Otherwise commit.
 4. After the database commit, the outbox delivers commit, retrying until it is answered.
-   Every failure path (a 409, a timeout, a 5xx, or a failed database commit) first sets the intent
-   to 'failed' (WHERE state = 'pending'), then delivers abort through the outbox the same way.
+   Every failure path (a 409, a timeout, a 5xx, or a failed database commit) resolves the durable
+   outcome in one transaction: update the intent from 'pending' to 'failed', and only if that update
+   wins (one row changed) insert, in the same transaction, the outbox row that asks for abort. If the
+   update changes no row, read the intent: if it is 'committed', the commit outbox row already exists
+   and the save sends nothing more. If the outcome cannot be read, because the database is
+   unreachable, leave the durable outcome untouched and send no abort; recovery resolves it once the
+   outcome can be read.
 ```
 
 **Recovery.** A crash after prepare always leaves a `pending` intent to recover from, because step 1 committed it before the remote call. Recovery picks up an intent that has stayed `pending` longer than the save's time limit (proposed: 60 seconds). Age only selects which intents recovery looks at; it never releases anything by itself. Recovery then works in this order:
 
-1. It takes the same advisory lock on (company_id, invoice_id). Holding the lock rules out a commit still in progress, because a save holds that lock from step 1 to step 4.
+1. It takes the same advisory lock on (company_id, invoice_id). Holding the lock rules out a commit still in progress: the save holds the invoice's serialization lock from step 1 until the transaction that records the definitive intent outcome and its matching outbox row commits. Outbox delivery is asynchronous and does not extend the lock.
 2. It records a definitive failure: `UPDATE invoice_operation_intents SET state = 'failed' WHERE company_id = ? AND invoice_id = ? AND operation_id = ? AND state = 'pending'`, scoped to the same (company_id, invoice_id) whose lock it holds. If the update changes no row, the save already committed, and recovery leaves it alone.
-3. Only if its update won, it delivers abort.
+3. In the same transaction as its update, and only if the update won, it writes the outbox row that asks for abort.
 
 A missing response or elapsed time alone never releases a reservation. Only a commit that removes the entry, or an abort after the failure is recorded, releases it.
 
@@ -764,9 +759,11 @@ While the prepared monolith owns the data after a rollback, it runs the same ste
 | Prepare refused: `on_another_invoice` | Nothing reserved; intent `failed` | The save fails with "entry is on another invoice" (deliberate fix, section 2.3); abort is still delivered and changes nothing | Contract: invoice A commits entry X; invoice B prepares X by explicit id; 409 `on_another_invoice`; X still reserved by A only |
 | Prepare refused: `provisional_elsewhere` or `unresolved_operation` | Nothing reserved; intent `failed` | The save fails with a retryable error | Contract: an open operation of invoice A holds X provisionally; B prepares X; 409 `provisional_elsewhere`. A second prepare for A with a new operation while the first is unresolved gets `unresolved_operation` |
 | Database commit fails after a 200 prepare | Intent `failed`; abort drops this operation's provisional reservations; committed ones stay | Failure recorded first, then abort | Integration: force a commit failure after prepare on a saved draft that adds X and removes Y; X ends free, Y ends still reserved by the draft |
+| Crash after the intent is set `failed`, before the abort outbox row exists | Cannot happen: the `failed` update and the abort outbox row are one transaction (section 9.2 step 4), so either both exist or the intent is still `pending` | Recovery resolves the `pending` intent under the invoice-identity lock | Integration: kill the process between the prepare failure and the transaction commit; the intent is still `pending`; run recovery; it records `failed` and the abort is delivered |
 | Crash after prepare, before the invoice commits | Intent `pending`; provisional reservations kept | Recovery takes the invoice-identity lock, records `failed` only if the intent is still `pending`, then delivers abort | Integration: kill the worker after prepare; run recovery; entries back to their state before the save. Repeat with the save paused but still holding the lock: recovery waits and changes nothing |
 | Commit answer lost, or relay down after the invoice commits | Invoice and intent `committed`; outbox row unsent; provisional reservations already lock their entries | The outbox retries commit; commit is idempotent by `operation_id` | Integration: stop the relay after a save; the entries show `locked: true`; restart; commit applies once |
 | Prepare arrives after its operation is terminal | Terminal record unchanged | Timekeeping returns the stored state and changes nothing (section 5.3) | Contract: commit operation O; replay prepare O; 200 with `committed`; no reservation added. Same after abort |
+| Prepare answers 200 with a terminal state (`committed` or `aborted`) | Invoice and reservations as the earlier run left them; no second change | The step 3 reconciliation rule (section 9.2), on the matching pair of the remote operation state and the durable intent: remote `committed` with intent `committed` returns the existing success; remote `aborted` with intent `failed` fails the save; any other pair, including an intent still `pending`, fails with a retryable reconciliation error and makes no change | Contract: replay a save whose operation O is `committed`; the save returns the existing outcome and changes nothing. Replay one whose O is `aborted`; the save fails. Force the intent `pending` with O `committed`; a retryable reconciliation error and no change |
 | Commit or abort delivered twice or out of order | Terminal state of the first to apply | Both are idempotent by `operation_id`; an abort after commit, or a commit after abort, changes nothing | Contract: commit O, then abort O, then commit O; reservations equal those after the first commit |
 | Saved draft fails a save that removes an entry | Entry still reserved by the committed draft | Removals take effect only at commit; abort drops only provisional reservations | Integration: a draft holds X; a save removes X and its commit fails; X still shows `locked: true` |
 | Two saves of one invoice start together | Reservations of whichever saves commit | The advisory lock on the invoice identity makes the second save wait until the first ends | Integration: start two saves of one draft at once; the second waits; both commit; each entry has at most one committed reservation |
@@ -808,7 +805,7 @@ timekeeping_ownership(generation bigint, owner: 'monolith' | 'timekeeping',
 
 - **The generation only rises.** It starts at 1 with the monolith as owner. Every handoff raises it by one: the first cutover to 2, a rollback to 3, a re-cutover to 4. An aborted handoff does not lower it.
 - **Each owner admits writes at one generation.** Timekeeping, and the prepared monolith's local path (below), each store the generation they admit writes at, or none while fenced. A write, prepare, commit, abort or command that carries any other generation returns `409 stale_generation` and changes nothing (section 5.1). This also refuses a command that was queued before a handoff and delivered after it.
-- **The gateway reads the record on every write.** When `handoff_step` is set, the gateway refuses entry writes, prepares and service commands with a retryable `503 ownership_moving`, so invoice saves that change an entry set and user hard deletes fail with a retryable error during the pause. The monolith also refuses every other invoice, line-item, invoice-tax and payment write with the same `503` while `handoff_step` is set, so the financial snapshot comparison (10.4) compares two states with no billing write between them. Whether every client (web, mobile, CLI, MCP, timer) retries a `503` today was not checked; this is an open question in section 15.
+- **The gateway reads the record on every write.** When `handoff_step` is set, the gateway refuses entry writes, prepares and service commands with a retryable `503 ownership_moving`, so invoice saves that change an entry set fail with a retryable error during the pause. The monolith also refuses every other invoice, line-item, invoice-tax and payment write with the same `503` while `handoff_step` is set, so the financial snapshot comparison (10.4) compares two states with no billing write between them. Every monolith billing write transaction (invoice, line item, invoice tax, payment, mobile-collection payment included) takes FOR SHARE on the `timekeeping_ownership` row and reads `handoff_step` under that lock. Whether every client (web, mobile, CLI, MCP, timer) retries a `503` today was not checked; this is an open question in section 15.
 
 **Every writer goes through the gateway.** The writers are those of section 3.1:
 
@@ -818,12 +815,11 @@ timekeeping_ownership(generation bigint, owner: 'monolith' | 'timekeeping',
 - the agent controller (`app/controllers/api/v1/agent/timesheet_entries_controller.rb`);
 - the Harvest import (`app/services/imports/harvest_time_entries_importer.rb`);
 - the invoice reservation boundary, which replaces the lock callbacks in `app/models/invoice.rb` and `app/models/invoice_line_item.rb` and `Invoice#update_timesheet_entry_status!`;
-- agent destroy (`app/models/agent.rb:11`), as the `detach-entries` command;
-- the seed and demo writers (`db/seeds.rb`, `db/seeds/timesheet_data.rb`, `Analytics::DemoSeeder`).
+- agent destroy (`app/models/agent.rb:11`), as the `detach-entries` command.
 
-The gateway also sends the user-retire check before a user hard delete (section 3.3). Writers that make many writes check the generation on each write, and a refused remainder fails visibly (section 3.1). The single-writer guard test (section 12.2) runs every flow above and fails if anything other than the projection consumer changes a `timesheet_entries` row.
+Writers that make many writes check the generation on each write, and a refused remainder fails visibly (section 3.1). The single-writer guard test (section 12.2) runs every flow above and fails if anything other than the projection consumer changes a `timesheet_entries` row.
 
-**The prepared monolith.** Rollback returns to a monolith that already enforces the corrected reservation rule, never to the old boolean callbacks. Its local path holds the same tables as Timekeeping, in the monolith's database: entries, `reservations`, `invoice_operations`, entry audit rows, `idempotency_records`, retired-user marks, and an entry outbox. It uses the same shared decision table (section 7.2). Its outbox feeds `timesheet_entries` through the same relay and projection consumer (section 5.4). These tables stay empty until a rollback loads a checkpoint into them.
+**The prepared monolith.** Rollback returns to a monolith that already enforces the corrected reservation rule, never to the old boolean callbacks. Its local path holds the same tables as Timekeeping, in the monolith's database: entries, `reservations`, `invoice_operations`, entry audit rows, `idempotency_records` and an entry outbox. It uses the same shared decision table (section 7.2). Its outbox feeds `timesheet_entries` through the same relay and projection consumer (section 5.4). These tables stay empty until a rollback loads a checkpoint into them.
 
 **Before the first cutover,** the monolith is the legacy owner at generation 1. It writes `timesheet_entries` directly, as today, and `locked` is still today's boolean. The first cutover is the only handoff that reads that legacy source, which is why it alone runs the pre-flight (10.4). From the first cutover onward, `timesheet_entries` is only a projection, whichever application owns the data.
 
@@ -834,7 +830,7 @@ The gateway also sends the user-retire check before a user hard delete (section 
 | S0. Characterize | Pin today's real behaviour with specs, including the behaviours this document had wrong, and build the two-tenant seed fixtures (sections 12 and 14). | Monolith (legacy) | The characterization specs pass on `main` unchanged |
 | S1. Drop the foreign keys | One migration of its own drops `invoice_line_item_time_entries → timesheet_entries` (`db/schema.rb:1282`), `invoice_line_items → timesheet_entries` (`:1284`) and `timesheet_entries → agents` (`:1325`), for the reasons in section 3.3. The keys to `projects` and `users` stay. | Monolith (legacy) | Full existing suite green |
 | S2. Prepare the monolith | Add `company_id` and `version` to `timesheet_entries` (`company_id` backfilled from project → client → company, `version` defaulting to 0). Add the gateway, the ownership record (generation 1, owner `monolith`), `invoice_operation_intents` (section 9.2), the projection endpoint and consumer, and the prepared monolith's local tables, empty. No behaviour changes: until the first cutover, the gateway's local path writes `timesheet_entries` as today. | Monolith (legacy) | Full existing suite green; `company_id` matches the derived company for every row |
-| S3. Stand up Timekeeping | Deploy the service and its database with no traffic: entry API, reservation operations, service commands, outbox and relay worker. | Monolith (legacy) | Contract suite (section 12.3) green against a test instance |
+| S3. Stand up Timekeeping | Start the service and its database locally with no traffic: entry API, reservation operations, service commands, outbox and relay worker. | Monolith (legacy) | Contract suite (section 12.3) green against a test instance |
 | S4. First cutover | Run the handoff procedure (10.5) from the monolith to Timekeeping, with the pre-flight (10.4). | Timekeeping | Every check in 10.4 passes and ownership has flipped |
 
 After S4, the acceptance journey (section 13) continues with new writes, a rollback, more new writes and a re-cutover, each with the same procedure. There are no per-company waves, no shadow reads, no per-report read flags, no multi-day soak gates and no rollback window that ends. Those are deferred as rollout notes for a production move (section 15). `timesheet_entries` is never retired: as a projection it keeps every aggregate reader working with no rewrite.
@@ -850,7 +846,6 @@ Every handoff moves data with one frozen, verified checkpoint, taken from the ou
 - The entry audit rows, with their original timestamps and authors.
 - Every terminal invoice-operation receipt (`invoice_operations`, committed or aborted).
 - The entry API's idempotency receipts, keyed by tenant (section 6.1), so a client retry after the handoff returns its stored result.
-- The retired-user marks of the user-retire check (section 3.3), so a retired user stays retired on the other side.
 
 The checkpoint is read in one database snapshot of the frozen source and carries a row count and a checksum per table and per company. Loading it into the incoming owner is idempotent: it replaces the incoming owner's tables in one transaction, so a load that is interrupted and resumed gives the same result.
 
@@ -880,7 +875,7 @@ The checkpoint copies no money. The first cutover reads invoice links to derive 
 - entries locked only by the old draft-discard re-lock (section 2.3): released at cutover as a listed correction, only when no other committed or pending owner exists;
 - **unlocked links:** entries referenced by a kept invoice but with `locked = false`, for example on an invoice created directly as non-draft, which no draft save ever locked (10.3).
 
-Cutover proceeds only when the orphan, conflict and unlocked-link lists are empty, or every item has a recorded disposition. The pre-flight is an assertion the cutover runs, not an assumption: for the two seeded businesses, the characterization fixtures assert that the orphan and conflict lists are empty, and the cutover checks every list again on the live data.
+Cutover proceeds only when the orphan, conflict and unlocked-link lists are empty, or every item has a recorded disposition. The pre-flight is an assertion the cutover runs, not an assumption: for the two seeded businesses, the characterization fixtures assert that the orphan and conflict lists are empty and that the unlocked-link list equals the recorded seed disposition, and the cutover checks every list again on the live data. The seed disposition is a short reviewed list of the seeded invoices whose linked entries are unlocked, checked in with the fixtures. There is no general repair tool; money is unchanged.
 
 **Corrected entries reach the projection.** On the first cutover, an entry whose reservation state differs from its legacy `locked` value (a released draft-discard re-lock, or an orphan or unlocked link whose disposition changes it) is a listed correction. After loading the checkpoint, Timekeeping writes one snapshot per corrected entry to its outbox, at version 1 and the new generation. The relay delivers them after the flip, and the projection then shows the corrected `locked` value.
 
@@ -895,7 +890,6 @@ Cutover proceeds only when the orphan, conflict and unlocked-link lists are empt
 | Audit rows | Count and checksum per company | Equal |
 | Operation receipts | Every `invoice_operations` row, and every `invoice_operation_intents` row in the monolith | Equal; no operation `prepared` and no intent `pending`; each `committed` intent has a committed operation, and each `failed` intent has an aborted operation or none |
 | Idempotency receipts | Count and checksum per company, keyed by tenant | Equal |
-| Retired-user marks | Every mark | Equal |
 | Id sequence | The incoming owner's sequence against the highest checkpoint id | Sequence is higher |
 | Money | The financial snapshot: invoice `amount`, `tax`, `discount` and `outstanding_amount`, every line item's `rate` and `quantity`, every `invoice_taxes` row, and the rendered PDF totals, taken at the end of step 2, once every billing operation admitted before step 1 has settled, and again after step 6. Billing writes are refused between the two (10.1) | Identical (section 13). The audit log cannot prove this, because `audited` on `Invoice` omits `discount`, `tax` and `outstanding_amount`, and line items and taxes are not audited |
 
@@ -909,23 +903,24 @@ Cutover, rollback and re-cutover run the same seven steps. Only the direction ch
 handoff(outgoing, incoming):
   1. Close admission.
      In one monolith transaction: generation := generation + 1, handoff_step := 'close_admission'.
+     Its update of the ownership row waits for every billing write transaction that holds FOR SHARE
+     on that row (section 10.1), with the same 60 s timeout, so no billing write admitted before
+     step 1 commits after it.
      The outgoing owner stops admitting writes: every write transaction it runs holds a shared lock on
      its own ownership row, and closing takes an exclusive lock on that row, so it waits for the
      transactions already admitted and none can commit after it (timeout 60 s, else stop and resume
      or abort). New writes, new prepares, service commands and every queued command that carries the
      old generation are refused from here on. A writer that makes many writes (Harvest import, bulk
-     move, agent destroy, seed and demo writers) is not drained as a whole job: each of its writes is
-     its own admitted transaction, and its remaining writes are refused and fail visibly (section 3.1).
+     move, agent destroy) is not drained as a whole job: each of its writes is its own admitted
+     transaction, and its remaining writes are refused and fail visibly (section 3.1).
   2. Settle.
      Resolve every registered invoice operation from its durable outcome. The monolith delivers commit
      for each 'committed' intent and abort for each 'failed' one, and runs recovery (section 9.2) on
-     each intent still 'pending'. User deletion intents are settled the same way (section 3.3).
-     During this step only, the outgoing owner still applies a commit or
-     abort that carries the old generation, and only for an operation it registered: one in its own
-     invoice_operations, or a user-retire operation whose `retiring` mark it holds (retire/commit or
-     retire/abort). It accepts no new prepare or retire.
-     The step ends when no intent is 'pending', no operation is 'prepared' and no user is 'retiring':
-     no pending billing operation or user deletion crosses the handoff.
+     each intent still 'pending'. During this step only, the outgoing owner still applies a commit or
+     abort that carries the old generation, and only for an operation it registered in its own
+     invoice_operations. It accepts no new prepare.
+     The step ends when no intent is 'pending' and no operation is 'prepared': no pending billing
+     operation crosses the handoff.
   3. Freeze.
      The outgoing owner stops applying commit and abort, so nothing can change its data any more.
      Capture its final outbox position P. Drain the outbox into the projection through P. Until the
@@ -964,9 +959,10 @@ handoff(outgoing, incoming):
 
 ### 11.1 Deployment
 
-- Timekeeping is its own application image with its own Kamal configuration and its own `web` role. It has its own PostgreSQL database. It does not share the monolith's database user. Today `config/deploy.yml` deploys one service, `miru-web`, so the second Kamal configuration, the image and its CI job are new work (section 14).
+- Timekeeping is its own application image with its own `web` role and its own PostgreSQL database. It does not share the monolith's database user. **The demo environment is local only.** Both applications run on one developer machine, each from its own image, and there is no deploy lane for the demo: no Kamal configuration is written for Timekeeping. AC4's two deploys (section 13) rebuild and restart Timekeeping while the monolith stays at its prior artifact, then the monolith while Timekeeping stays unchanged, with versions recorded and the contract suite (section 12.3) green after each; there is no paired release. The second Kamal configuration and a demo host are production-rollout items (section 15.4).
 - **The relay runs on a dedicated queue, worked by a dedicated worker.** This follows the existing `billing_sync` worker in `config/solid_queue.yml`, which has its own queue next to `default`, with one thread and one process. The relay's queue is worked only by its own worker, so a slow or failing relay never delays other jobs, and other jobs never delay snapshots.
-- **Start only the relay worker.** In the demo environment, the `default` worker is not started for this work. The demo data already holds queued integration jobs, and the `default` worker would run them.
+- **The invoice operation outbox and recovery run on their own dedicated queue and worker in the monolith.** That worker delivers commit and abort from the invoice outbox (section 9.2 step 4) and runs the recovery sweep over intents pending past the save's time limit. It follows the same `billing_sync` pattern.
+- **Start only the dedicated workers: the relay worker and the invoice operation worker.** The default worker is not started, because the seeded data already holds queued integration jobs and the default worker would run them.
 - The monolith and Timekeeping deploy independently. The contract rules in section 5.1 (additive changes keep the version; breaking changes add a version) make this safe.
 - Database migrations on either side must be backward-compatible with the previous release of the other side.
 
@@ -982,7 +978,7 @@ handoff(outgoing, incoming):
 | `MONOLITH_REFERENCE_URL` | Timekeeping | Reference-data read endpoint (section 3.4) |
 | `MONOLITH_SNAPSHOT_URL` | Timekeeping | The projection endpoint the relay delivers to (section 5.4) |
 
-There is no broker, so there is no broker key. Keys that hold credentials (`TIMEKEEPING_DATABASE_URL`, the token keys and the service token) are Kamal secrets, supplied as `DATABASE_URL` is today under `env.secret` in `config/deploy.yml`. URLs that hold no credential are plain values under `env.clear`, as `REDIS_URL` is today (`config/deploy.yml:59`). This document names no values.
+There is no broker, so there is no broker key. In the local demo each application reads these keys from its own process environment, and the two applications share no database credential. Keys that hold credentials (`TIMEKEEPING_DATABASE_URL`, the token keys and the service token) are secrets and never sit in a checked-in file; a production move supplies them as `DATABASE_URL` is supplied today, under `env.secret` in `config/deploy.yml`, and URLs that hold no credential as plain values under `env.clear`, as `REDIS_URL` is today (`config/deploy.yml:59`). This document names no values.
 
 ### 11.3 Observability
 
@@ -1005,7 +1001,7 @@ The existing `Rails.event.notify` history stays as it is, as observability only.
 
 ### 12.1 Regression: existing specs stay green
 
-These existing specs cover the observed behaviour in section 2. They run against whichever application owns the data: against the monolith before cutover and after a rollback, and through a test adapter against Timekeeping after cutover. Any spec change during the migration must be explained as a disclosed behaviour change; the two deliberate fixes (section 2.3) are the only planned ones.
+These existing specs cover the observed behaviour in section 2. They run against whichever application owns the data: against the monolith before cutover and after a rollback, and through a test adapter against Timekeeping after cutover. Any spec change during the migration must be explained as a disclosed behaviour change; the three deliberate fixes (section 2.3) are the only planned ones.
 
 | Behaviour | Existing specs |
 |---|---|
@@ -1045,7 +1041,7 @@ The L2 spec pins today's re-lock. When the deliberate fix lands, that spec chang
 
 ### 12.2 Guard tests
 
-- **Single-writer guard.** While Timekeeping owns the data, a test runs every writer listed in section 10.1 and fails if anything other than the projection consumer changes a `timesheet_entries` row. The writers are the web and mobile controller, the bulk controller, the CLI controller and MCP, the agent controller, the Harvest import, the invoice reservation boundary, agent destroy (`detach-entries`), and the seed and demo writers. The test runs again while the prepared monolith owns the data after a rollback, where the same rule holds.
+- **Single-writer guard.** While Timekeeping owns the data, a test runs every writer listed in section 10.1 and fails if anything other than the projection consumer changes a `timesheet_entries` row. The writers are the web and mobile controller, the bulk controller, the CLI controller and MCP, the agent controller, the Harvest import, the invoice reservation boundary and agent destroy (`detach-entries`). It also runs the three seed and demo builders in each post-handoff state, rollback included, and asserts they write nothing (section 3.1). The test runs again while the prepared monolith owns the data after a rollback, where the same rule holds.
 - **Tenant guard.** On both seeded tenants, for each Timekeeping endpoint and command and for the projection endpoint: a request for company A carrying an entry id, invoice id, operation id or idempotency key from company B returns `404` or no match, and changes nothing.
 - **Money guard.** A test takes the financial snapshot of section 10.4 before and after the first cutover, a rollback and a re-cutover, with no user billing edit between them, and fails on any difference.
 
@@ -1071,15 +1067,15 @@ Three contracts are fixed first, each with a fake on its consumer's side, so eac
   - the handoff completes from the step that failed;
   - after the flip, a previous-generation snapshot redelivered by the relay is refused with `409 stale_generation` and leaves the row unchanged.
   It repeats the run with an abort instead of a resume, once after step 3 and once before it with snapshots still unsent. Each time it asserts that every unsent previous-generation snapshot reaches the projection before the outgoing owner admits writes again at the raised generation, and that its later snapshots reach the projection too.
-- **User delete with the relay paused.** Pause the relay. Create a user's first entry, then try to hard-delete that user as a super admin. The user-retire check refuses, and the user row stays, although the projection holds no row for the user yet. A second run starts an entry create and the delete at the same time: either the create wins and the delete is refused, or the retire wins and the create is refused. Never both. Resume the relay: the entry reaches the projection with no foreign-key error.
-- **Failed user delete clears the retire mark.** Take a user with an expense and no time entries. Hard-delete them as a super admin: retire succeeds, then `destroy!` fails on the `expenses → users` foreign key. The test asserts that the intent is `failed`, that `retire/abort` clears the mark, and that the user can create an entry afterwards. A second run kills the worker between retire and `destroy!`, runs recovery, and asserts the same outcome.
+- **User hard delete refused once extraction has begun.** With the relay paused, create a first entry for a user, then attempt the super-admin destroy: it is refused before its audit row and before any dependent effect, the user and the entry are unchanged, and the relay then resumes and projects the entry. Repeat after a rollback to the prepared monolith: still refused.
+- **Aggregate line removed from a draft.** A draft holds two lines: a direct line for entry X and a grouped (project aggregate) line that references X and Y. Removing the grouped line keeps X reserved, because the direct line still references it, and releases Y. Removing the remaining direct line releases X. Destroying the draft releases its whole set. A save or destroy that fails keeps every prior reservation. The rule under test is the desired set: the entries still referenced by the remaining direct and grouped lines; a removal releases only entries absent from it.
 - **Rollback waits for running writes.** Start a Timekeeping entry update that pauses before commit, then start a rollback. Step 1 waits until the update commits or aborts, and the update's change is in the checkpoint.
 - **Checkpoint load re-run.** Load the same checkpoint twice; the row counts and checksums are equal.
 - **Report parity.** On both seeded tenants, each reader in section 1.7 returns the same output from the projection after cutover as from `timesheet_entries` before it.
 
 ### 12.5 End-to-end tests
 
-Run in the demo environment with both applications, through the real clients, on both seeded tenants:
+Run locally with both applications, through the real clients, on both seeded tenants:
 
 - Create, edit and delete an entry from the web app, the CLI and an MCP tool; check that the entry list and the time report show the change.
 - Create a draft invoice from entries, save it twice, remove one entry, re-add it, send the invoice; check that entries show `locked` as today and stay `unbilled` (L6).
@@ -1090,14 +1086,14 @@ Run in the demo environment with both applications, through the real clients, on
 
 ## 13. Acceptance criteria for the implementation (proposed)
 
-The implementation is accepted in the demo environment only when every item below holds, each shown by the named test.
+The implementation is accepted, in the local demo, only when every item below holds, each shown by the named test.
 
 | # | Criterion | Shown by |
 |---|---|---|
 | AC1 | **The journey, end to end, on both tenants:** create and edit entries → a direct and a grouped draft invoice → reservations → reports and PDF → cutover → new writes → rollback → new writes → re-cutover. | End-to-end journey (sections 12.5 and 14) |
 | AC2 | **Financial parity by snapshot,** not by the audit log: before and after migration, rollback and re-cutover, compare invoice `amount`, `tax`, `discount` and `outstanding_amount`, every line item's `rate` and `quantity`, every `invoice_taxes` row, and the rendered PDF totals. Identical, or the run fails. (`audited` on `Invoice` omits `discount`, `tax` and `outstanding_amount`, and line items and taxes are not audited, so the audit log cannot prove this.) | Money guard (12.2); money check in reconciliation (10.4) |
 | AC3 | **Rollback and re-cutover** keep every write accepted on either side, every reservation owner, and every idempotency receipt. | Alternating writers test (12.4); reconciliation (10.4) |
-| AC4 | **Independent deployment:** two deploys, one of each application, with no paired release. | Two deploys in the demo environment, contract suite (12.3) green |
+| AC4 | **Independent deployment:** two deploys, one of each application, with no paired release. | Rebuild and restart Timekeeping while the monolith stays at its prior artifact, then the monolith while Timekeeping stays unchanged; versions recorded; contract suite (12.3) green after each (section 11.1) |
 | AC5 | **Relay paused:** a newly created entry can be invoiced at once and appears in the entry list; the projection catches up when the relay resumes. | Invoicing with the relay paused (12.4) |
 | AC6 | **Failure cases:** outage, retry, duplicate and reordered delivery; a lost response on prepare and on commit; a crash after prepare and before the invoice commits; a prepare that arrives after its operation is terminal; a stale generation; a failed and a successful hard delete of a non-draft invoice; an interrupted and resumed handoff. | The proving test of each row in section 9.3; interrupted handoff (12.4) |
 | AC7 | **Tenant isolation** and ownership guards on both tenants; the single-writer guard passes. | Tenant guard and single-writer guard (12.2) |
@@ -1116,7 +1112,7 @@ flowchart TD
   L5[Projection consumer]
   L6[Cutover and rollback tooling]
   L7[Deployment and runtime]
-  J[Join: end-to-end journey and independent deployment proof]
+  J[Join: end-to-end journey and independent rebuild-and-restart proof]
 
   F --> L1
   F --> L2
@@ -1133,10 +1129,12 @@ flowchart TD
   L7 --> J
 ```
 
-**Foundation, first.** Three pieces of work come before any lane:
+An edge from Foundation means the lane's own piece of it, not all of it.
+
+**Foundation, per lane.** Each lane starts when its own contract and fake (the 'Builds against' column) and the characterization specs that cover its behaviour are ready. No lane waits for the whole Foundation. The pieces are:
 
 - characterization specs that pin today's real behaviour: the true draft-discard re-lock, L3, L4, L6 and A9, and the PDF totals (section 12.1, step S0 in section 10.2);
-- the two-tenant seed fixtures, which also assert that the pre-flight's orphan and conflict lists are empty (section 10.4);
+- the two-tenant seed fixtures, which also assert that the pre-flight's orphan and conflict lists are empty and the unlocked-link list equals the recorded seed disposition (section 10.4);
 - three contracts, each with a fake on its consumer's side: the entry API (section 5.2), prepare, commit and abort (section 5.3), and the entry snapshot event (section 5.4). Section 12.3 tests them.
 
 **Then, each lane on its own contract and tests:**
@@ -1145,37 +1143,37 @@ flowchart TD
 |---|---|---|
 | Timekeeping core | The service shell, the entry API and its rules, idempotency, and the shared reservation decision table (section 7.2) | Entry API and reservation contracts |
 | Timekeeping outbox | The relay, on its dedicated queue and worker (section 11.1) | Snapshot event contract; a fake projection endpoint |
-| Gateway | Forwarding in every writer of section 10.1, agent destroy and the seed and demo writers included; the user token and its reference claims (section 3.4); the generation fence | Entry API contract; a fake Timekeeping |
-| Invoice boundary | The reservation module that replaces the lock callbacks; the foreign-key migration (step S1); candidate selection and validation through Timekeeping; the prepared monolith's local reservation table | Reservation contract; a fake Timekeeping |
+| Gateway | Forwarding in every writer of section 10.1, agent destroy included; the ownership check in the seed and demo writers (section 3.1); the user token and its reference claims (section 3.4); the generation fence | Entry API contract; a fake Timekeeping |
+| Invoice boundary | The reservation module that replaces the lock callbacks; the foreign-key migration (step S1); candidate selection and validation through Timekeeping; the prepared monolith's local reservation table; and the invoice operation worker (section 11.1) | Reservation contract; a fake Timekeeping |
 | Projection consumer | The version upsert into `timesheet_entries`, tombstones, the generation rule, and the split between the two read rules (section 3.3) | Snapshot event contract; a fake relay |
 | Cutover and rollback tooling | The fence, the pre-flight, the sequence and version handoff, the drain, the checkpoint, the reconcile, and the financial snapshot diff (section 10) | The ownership record and the checkpoint shape (sections 10.1 and 10.3) |
-| Deployment and runtime | The second Kamal configuration, the image and its CI job (section 11.1). Start early: it depends on nothing and every proof in section 13 needs it | Nothing |
+| Deployment and runtime | The second image, its CI build job and the local demo runtime (section 11.1). Start early: it depends on nothing and every proof in section 13 needs it | Nothing |
 
-**Join, last.** The end-to-end journey of AC1 and the independent deployment proof of AC4 (section 13). This is the one point where every lane meets, and it needs one owner.
+**Join, last.** The end-to-end journey of AC1 and the independent rebuild-and-restart proof of AC4 (section 13). This is the one point where every lane meets, and it needs one owner.
 
-**Runtime.** Start only the dedicated relay worker. The `default` worker would run the integration jobs already queued in the demo data (section 11.1).
+**Runtime.** Start only the dedicated workers: the relay worker and the invoice operation worker. The default worker is not started, because the seeded data already holds queued integration jobs and the default worker would run them (section 11.1).
 
 ## 15. Risks, unresolved questions and decisions that need review
 
 ### 15.1 Decisions
 
-The repository owner has decided D1 to D4. They are recorded here so a reader can see what was open in the first version of this design and how it was closed. D5 is kept as the design's own choice. D6, the rollback window, is removed: rollback has no end date, because `timesheet_entries` is never retired (section 10.2).
+The repository owner has decided D1 to D4 and D7. They are recorded here so a reader can see what was open in the first version of this design and how it was closed. D5 is kept as the design's own choice. D6, the rollback window, is removed: rollback has no end date, because `timesheet_entries` is never retired (section 10.2).
 
 | # | Decision | Decided |
 |---|---|---|
 | D1 | Refuse a reservation on an entry another kept invoice already holds (section 7.2) | **Decided: exclusive.** Prepare refuses the entry from the first cutover. There is no shadow mode (deliberate fix, section 2.3). |
 | D2 | Duration type | **Decided: keep `float`.** No conversion and no round-trip check (section 8.3). |
 | D3 | How snapshots are delivered | **Decided: a dedicated queue and worker** for the relay, on Solid Queue. There is no broker (section 11.1). |
-| D4 | Legacy quirks | **Decided:** the draft-discard re-lock (L2) and double allocation are fixed (section 2.3). L3, L6, A8, A9 and the `:billable` filter in `app/services/metrics/data_builder.rb` are kept as they are. |
+| D4 | Legacy quirks | **Decided:** the draft-discard re-lock (L2), double allocation and the release of a removed line's entries on a draft (L4, D7) are fixed (section 2.3). L3, L6, A8, A9 and the `:billable` filter in `app/services/metrics/data_builder.rb` are kept as they are. |
 | D5 | Entries kept locked by a discarded or destroyed non-draft (L3) | Kept as known owners with disposition `retained`, and released only when a successor invoice commits for them (section 7.2). The pre-flight lists them (section 10.4). |
+| D7 | Removing a project aggregate line from a draft, or destroying a draft (L4, section 7.2) | **Decided: released.** A removed line's entries leave the desired set only when no remaining direct or grouped line of the draft references them, and are then released at commit. Nothing on the invoice binds them once the line is gone. Third deliberate fix (section 2.3). |
 
 ### 15.2 Open questions
 
 - How does the desktop timer write entries (section 1.3)? Whichever API it calls, that controller is a gateway writer (section 10.1).
-- Does every client (web, mobile, CLI, MCP, timer) retry a `503 ownership_moving` answer (section 10.1)? Any client that does not loses the edits it sends during the write pause, so it needs a retry before the first cutover.
+- Which clients (web, mobile, CLI, MCP, timer) retry a `503 ownership_moving` answer (section 10.1)? For the demo a client that does not retry shows an explicit retryable failure and never a silent success. Adding a retry to each client is a production-rollout item (section 15.4).
 - What does `bill_status: :billable` in `app/services/metrics/data_builder.rb` return today? The answer decides what report parity compares against.
 - Are there external readers of `rails_event_viewer_entries` (section 2.6)?
-- Should removing a project aggregate line from a draft release its linked entries (section 7.2), or should today's behaviour, which can leave them locked with no invoice referencing them (L4), be kept? It is not one of the two deliberate fixes.
 
 ### 15.3 Risks
 
@@ -1198,5 +1196,8 @@ These are outside this design's scope. They are kept here so that a later produc
 - **Per-company waves, shadow reads, 7-day gates, 30-day observation, 90-day retirement.** A production rollout needs them. Two seeded businesses moved in one pause do not, and they bring mixed ownership and its ID and sync machinery.
 - **Retiring `timesheet_entries`, and a second reporting model.** The table as a projection keeps every aggregate reader working with no rewrite.
 - **Changing `duration` to a decimal.** It adds a conversion and a round-trip check and changes no result.
+- **User hard delete once the first handoff has begun.** The monolith refuses it (the super-admin destroy) with a clear error, in either ownership state (section 3.3); un-gating it is a production-rollout item.
+- **The second Kamal configuration and a deployed demo host.** The demo runs both applications locally. A production move writes the Kamal configuration and applies the independent-deploy rules of section 11.1 against a real host.
+- **Client retry of `503 ownership_moving`.** Every client retries before a production cutover. The demo needs only the explicit failure, never a silent success.
 - **More services, a broker, or a general event platform.** One consumer does not need them.
 - **Payroll, scheduling, or new features.** Out of scope.
