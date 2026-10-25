@@ -23,8 +23,8 @@ module TimekeepingCommittedSecrets
     env_file_value: "^[ \\t]*(?:export[ \\t]+)?#{KEY}[ \\t]*=[ \\t]*[\"']?#{LITERAL_START}",
     # A KEY: value line in YAML.
     yaml_value: "^[ \\t]*#{KEY}[ \\t]*:[ \\t]*[\"']?#{LITERAL_START}",
-    # A quoted string assigned to the key in Ruby (ENV[...] = or a hash pair).
-    quoted_assignment: "#{KEY}[\"']?\\]?[ \\t]*(?:=>|=|:)[ \\t]*[\"']#{LITERAL_START}",
+    # A quoted string assigned to the key in Ruby (ENV[...] =, ||= or a hash pair).
+    quoted_assignment: "#{KEY}[\"']?\\]?[ \\t]*(?:\\|\\|=|=>|=|:)[ \\t]*[\"']#{LITERAL_START}",
     # A quoted default passed beside the key, as in ENV.fetch(KEY, default).
     quoted_default: "#{KEY}[\"'][ \\t]*,[ \\t]*[\"']#{LITERAL_START}"
   }.transform_values { |source| Regexp.new(source.b) }.freeze
@@ -62,6 +62,8 @@ RSpec.describe "No committed Timekeeping secrets" do
     it "flags a quoted literal assigned in Ruby" do
       expect(findings(%(ENV["#{private_key_name}"] = "x"\n))).to include(:quoted_assignment)
       expect(findings(%(ENV.fetch("#{service_key}", "x")\n))).to include(:quoted_default)
+      expect(findings(%(ENV["#{service_key}"] ||= "abc123"\n))).to include(:quoted_assignment)
+      expect(findings(%(ENV["#{service_key}"] ||= SecureRandom.hex(32)\n))).to be_empty
     end
 
     it "flags a literal value in YAML" do

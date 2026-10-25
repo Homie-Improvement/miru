@@ -8,9 +8,6 @@ module Timekeeping
   # does not own is reported in missing_project_ids exactly like an id that
   # does not exist, so the result never reveals another company's records.
   class ReferenceFacts
-    # User#primary_role gives this role to a user with no role in the company.
-    DEFAULT_ROLE = "employee"
-
     def self.call(company:, project_ids:)
       new(company:, project_ids:).call
     end
@@ -24,7 +21,7 @@ module Timekeeping
       {
         company_id: company.id,
         edit_days: company.timesheet_edit_days,
-        users: user_ids.map { |id| { id:, role: roles_by_user_id.fetch(id, DEFAULT_ROLE) } },
+        users: User.primary_roles_for(company, user_ids).map { |id, role| { id:, role: } },
         projects: projects.map { |project| project_facts(project) },
         missing_project_ids: requested_project_ids - projects.map(&:id)
       }
@@ -52,16 +49,6 @@ module Timekeeping
           .where(id: company.employments.kept.select(:user_id))
           .order(:id)
           .pluck(:id)
-      end
-
-      # Matches User#primary_role: the role with the lowest id wins.
-      def roles_by_user_id
-        @roles_by_user_id ||= Role.where(resource: company)
-          .joins(:users)
-          .where(users: { id: user_ids })
-          .order("roles.id")
-          .pluck("users.id", "roles.name")
-          .each_with_object({}) { |(user_id, name), roles| roles[user_id] ||= name }
       end
 
       def member_user_ids_by_project_id
