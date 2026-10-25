@@ -98,6 +98,36 @@ RSpec.describe Timekeeping::CredentialScan do
     expect(found?({ "note" => service_token }, public_key: nil)).to be(true)
   end
 
+  describe "a user token whose signature is respelled without the signing key" do
+    # A token whose signature holds - or _, so the respelling differs from it.
+    let(:issued) do
+      token = nil
+      token = mint_token({ sub: 9, jti: SecureRandom.uuid }) until token&.split(".")&.last&.match?(/[-_]/)
+      token
+    end
+
+    def respell_signature(token)
+      head, payload, signature = token.split(".")
+      [head, payload, yield(signature)].join(".")
+    end
+
+    it "finds it with the signature in standard base64" do
+      expect(found?({ "proof_metadata" => { "token" => respell_signature(issued) { |s| s.tr("-_", "+/") } } })).to be(true)
+    end
+
+    it "finds it with the signature padded" do
+      padded = respell_signature(issued) { |signature| "#{signature}#{"=" * (-signature.length % 4)}" }
+
+      expect(found?({ "note" => padded })).to be(true)
+    end
+
+    it "finds it in standard base64 with text glued to both ends" do
+      respelled = respell_signature(issued) { |signature| "#{signature.tr("-_", "+/")}==/tail" }
+
+      expect(found?({ "note" => "x/+#{respelled}" })).to be(true)
+    end
+  end
+
   it "finds a user token behind a long run of eyJ glued to its header" do
     other = mint_token({ sub: 9 })
 

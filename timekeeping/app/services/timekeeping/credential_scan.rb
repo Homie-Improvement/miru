@@ -9,10 +9,13 @@ module Timekeeping
   # Pure: the caller's bearer token, the held credentials and the public key
   # are arguments, and nothing is read from ENV.
   module CredentialScan
-    # A run of base64url segments joined by dots. TokenVerifier accepts only
-    # three such segments, its header starting with HEADER_START and at most
+    # A run of base64 segments joined by dots. TokenVerifier accepts only three
+    # base64url segments, its header starting with HEADER_START and at most
     # MAX_HEADER_LENGTH long, so this search covers every token it accepts.
-    DOTTED_SEGMENTS = /[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+/
+    # Standard base64 characters and padding are also taken, because anyone
+    # holding an issued token can respell its signature that way without the
+    # signing key, and the spelling turns back into the live token.
+    DOTTED_SEGMENTS = %r{[A-Za-z0-9_+/=-]+(?:\.[A-Za-z0-9_+/=-]+)+}
     JWT_HEADER_START = TokenVerifier::HEADER_START
     JWT_SEGMENT_COUNT = TokenVerifier::SEGMENT_COUNT
     MAX_HEADER_LENGTH = TokenVerifier::MAX_HEADER_LENGTH
@@ -56,15 +59,18 @@ module Timekeeping
     # A token can sit inside a longer string with other base64url text glued
     # to either end ("x" + token + "y"), so each dotted run is cut into every
     # window of three segments. The header is tried from each "eyJ" near the
-    # end of its segment, and the signature is cut to the length an RS256
-    # signature with this key has, so text appended after the token cannot
-    # hide it.
+    # end of its segment. The signature is read back to base64url without
+    # padding, then cut to the length an RS256 signature with this key has,
+    # so neither a respelling nor text appended after the token can hide it.
+    # The header and payload are signed as written, so they are left as they
+    # are: any other spelling of them no longer verifies.
     def token_candidates(text, signature_length)
       text.scan(DOTTED_SEGMENTS).lazy.flat_map do |run|
         run.split(".").each_cons(JWT_SEGMENT_COUNT).lazy.flat_map do |head, payload, tail|
-          next [] if tail.length < signature_length
+          signature = tail.tr("+/", "-_").delete("=")
+          next [] if signature.length < signature_length
 
-          signature = tail[0, signature_length]
+          signature = signature[0, signature_length]
           header_starts(head).lazy.map { |start| [head[start..], payload, signature].join(".") }
         end
       end
