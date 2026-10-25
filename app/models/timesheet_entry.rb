@@ -56,6 +56,8 @@ class TimesheetEntry < ApplicationRecord
   validates :duration, numericality: { less_than_or_equal_to: 6000000, greater_than_or_equal_to: 0.0 }
   validates :source, inclusion: { in: SOURCES }
   validates :proof_url, length: { maximum: 2000 }, allow_blank: true
+  # No database key checks agent_id, so a supplied id must name a real agent.
+  validates :agent, presence: { message: :required }, if: :agent_id?
   validate :validate_billable_project
   validate :validate_agent_belongs_to_workspace
   validate :prevent_edit_if_locked, on: :update

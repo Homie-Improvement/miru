@@ -42,6 +42,22 @@ RSpec.describe InvoiceLineItem, type: :model do
       it { is_expected.to validate_numericality_of(:quantity).is_greater_than_or_equal_to(0) }
       it { is_expected.to validate_numericality_of(:rate).is_greater_than_or_equal_to(0) }
     end
+
+    describe "timesheet entry reference" do
+      it "is invalid when timesheet_entry_id names no entry" do
+        line_item = build(:invoice_line_item, timesheet_entry: nil)
+        line_item.timesheet_entry_id = TimesheetEntry.maximum(:id).to_i + 1_000
+
+        expect(line_item).not_to be_valid
+        expect(line_item.errors[:timesheet_entry]).to include("must exist")
+      end
+
+      it "is valid with no timesheet entry, as a manual line" do
+        line_item = build(:invoice_line_item, timesheet_entry: nil)
+
+        expect(line_item).to be_valid
+      end
+    end
   end
 
   describe "company of the timesheet entries" do

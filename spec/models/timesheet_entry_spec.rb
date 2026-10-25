@@ -62,6 +62,20 @@ RSpec.describe TimesheetEntry, type: :model do
         .is_greater_than_or_equal_to(0.0)
     end
 
+    it "is invalid when agent_id names no agent" do
+      entry = build(:timesheet_entry, project:)
+      entry.agent_id = Agent.maximum(:id).to_i + 1_000
+
+      expect(entry).not_to be_valid
+      expect(entry.errors[:agent]).to include("must exist")
+    end
+
+    it "is valid with no agent" do
+      entry = build(:timesheet_entry, project:, agent_id: nil)
+
+      expect(entry).to be_valid
+    end
+
     it "validates an invalid bill status" do
       timesheet_entry = build(:timesheet_entry)
 

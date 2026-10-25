@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_10_17_112000) do
+ActiveRecord::Schema[8.1].define(version: 2026_10_20_120000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pg_stat_statements"
@@ -1279,9 +1279,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_17_112000) do
   add_foreign_key "invitations", "companies"
   add_foreign_key "invitations", "users", column: "sender_id"
   add_foreign_key "invoice_line_item_time_entries", "invoice_line_items"
-  add_foreign_key "invoice_line_item_time_entries", "timesheet_entries"
   add_foreign_key "invoice_line_items", "invoices"
-  add_foreign_key "invoice_line_items", "timesheet_entries"
   add_foreign_key "invoice_taxes", "invoices"
   add_foreign_key "invoice_taxes", "tax_configurations"
   add_foreign_key "invoices", "clients"
@@ -1322,7 +1320,6 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_17_112000) do
   add_foreign_key "timeoff_entries", "custom_leaves", column: "custom_leave_id"
   add_foreign_key "timeoff_entries", "leave_types"
   add_foreign_key "timeoff_entries", "users"
-  add_foreign_key "timesheet_entries", "agents"
   add_foreign_key "timesheet_entries", "projects"
   add_foreign_key "timesheet_entries", "users"
   add_foreign_key "users", "companies", column: "current_workspace_id"
