@@ -1,0 +1,95 @@
+# Reservation operations and service commands
+# (docs/architecture/timekeeping-soa.md sections 5.3, 7.2 and 9.3).
+# Only a service identity bound to the path company and to the named
+# operation may call these routes.
+name: reservations
+source: docs/architecture/timekeeping-soa.md sections 5.3, 7.2 and 9.3
+
+routes:
+  prepare:
+    method: POST
+    path: /v1/companies/{company_id}/reservations/prepare
+    request_fields: [invoice_id, operation_id, generation, disposition, entries]
+    response_fields: [operation_id, state, entries]
+    response_entry_fields: [entry_id, company_id]
+  commit:
+    method: POST
+    path: /v1/companies/{company_id}/reservations/commit
+    request_fields: [invoice_id, operation_id, generation]
+    response_fields: [reserved, released]
+  abort:
+    method: POST
+    path: /v1/companies/{company_id}/reservations/abort
+    request_fields: [invoice_id, operation_id, generation]
+    response_fields: [dropped]
+  mark_billed:
+    method: POST
+    path: /v1/companies/{company_id}/invoices/{invoice_id}/mark-billed
+    request_fields: [operation_id, generation]
+    response_fields: [billed]
+  detach_entries:
+    method: POST
+    path: /v1/companies/{company_id}/agents/{agent_id}/detach-entries
+    request_fields: [operation_id, generation]
+    response_fields: [detached]
+
+headers:
+  authorization: "Authorization: <service identity bound to the company and the operation>"
+
+dispositions: [active, retained]
+operation_states: [prepared, committed, aborted]
+reservation_states: [provisional, committed]
+conflict_reasons: [on_another_invoice, provisional_elsewhere, not_found]
+
+rules:
+  all_or_nothing: One conflict reserves nothing; every entry keeps the reservations it had before the prepare.
+  terminal_prepare: A prepare for a committed or aborted operation returns that stored state and changes nothing.
+  commit_reads_operation: Commit applies the desired entry set stored by prepare, never one sent with the commit.
+  first_terminal_wins: After commit or abort, a later commit or abort of the same operation changes nothing.
+  abort_scope: Abort drops only this operation's provisional reservations.
+  company_mismatch: An entry outside the path company is a not_found conflict; any other foreign id answers not_found.
+  stale_generation: A stale generation answers stale_generation and changes nothing.
+
+errors:
+  conflict:
+    status: 409
+    body_fields: [reason, conflicts]
+    conflict_fields: [entry_id, reason]
+  unresolved_operation:
+    status: 409
+    body_fields: [reason, operation_id, retryable]
+    retryable: true
+  stale_generation:
+    status: 409
+    body: { reason: stale_generation }
+  not_found:
+    status: 404
+    body: { reason: not_found }
+  unauthorized:
+    status: 401
+    body: { reason: unauthorized }
+  forbidden:
+    status: 403
+    body: { reason: forbidden }
+
+# How the monolith decides the outcome of a replayed invoice save when prepare
+# answers 200 with a terminal state (section 9.2 step 3 and its section 9.3 row).
+# Any pair not listed takes the fallback outcome.
+save_reconciliation:
+  remote_states: [committed, aborted]
+  intent_states: [pending, committed, failed]
+  rows:
+    - remote_state: committed
+      intent_state: committed
+      outcome: existing_success
+      retryable: false
+      changed: false
+    - remote_state: aborted
+      intent_state: failed
+      outcome: save_failed
+      retryable: false
+      changed: false
+  fallback:
+    outcome: reconciliation_error
+    retryable: true
+    changed: false

@@ -1,0 +1,93 @@
+# The Timekeeping entry API (docs/architecture/timekeeping-soa.md section 5.2).
+# Callers act for a user: the acting user comes from the signed bearer token,
+# never from the request body.
+name: entry_api
+source: docs/architecture/timekeeping-soa.md section 5.2
+
+routes:
+  create:
+    method: POST
+    path: /v1/companies/{company_id}/entries
+  update:
+    method: PATCH
+    path: /v1/companies/{company_id}/entries/{entry_id}
+  destroy:
+    method: DELETE
+    path: /v1/companies/{company_id}/entries/{entry_id}
+  show:
+    method: GET
+    path: /v1/companies/{company_id}/entries/{entry_id}
+  index:
+    method: GET
+    path: /v1/companies/{company_id}/entries
+    query: [from, to, user_id, project_id]
+  bulk_move:
+    method: POST
+    path: /v1/companies/{company_id}/entries/bulk-move
+  bulk_delete:
+    method: POST
+    path: /v1/companies/{company_id}/entries/bulk-delete
+
+headers:
+  authorization: "Authorization: Bearer <signed user token>"
+  idempotency_key: "Idempotency-Key: <uuid>"
+  ownership_generation: "Ownership-Generation: <n>"
+  if_match: "If-Match: <version>"
+
+# Claims the provider reads from the signed bearer token.
+token_claims: [sub, company_id, role]
+privileged_roles: [owner, admin]
+
+request:
+  entry_required_fields: [project_id, work_date, duration, note, source, source_metadata]
+  entry_optional_fields: [user_id, bill_status, agent_id, proof_url, proof_metadata]
+  bulk_move_fields: [entry_ids, project_id]
+  bulk_delete_fields: [entry_ids]
+
+response:
+  # Every entry body field, plus the provider-owned fields.
+  entry_fields:
+    - id
+    - company_id
+    - version
+    - project_id
+    - user_id
+    - work_date
+    - duration
+    - note
+    - bill_status
+    - source
+    - source_metadata
+    - agent_id
+    - proof_url
+    - proof_metadata
+    - locked
+  bulk_fields: [results]
+  bulk_result_fields: [entry_id, result]
+  bulk_results: [moved, deleted, not_found]
+
+rules:
+  locked: true exactly when the entry has a reservation, provisional or committed.
+  duration: a JSON number holding the stored float unchanged, never converted or rounded.
+  target_user: >-
+    The body's user_id names the entry's target user, not the acting user.
+    An owner or admin may name a user of the same company; a user of another
+    company answers not_found. An employee may name only themselves; any other
+    user answers forbidden. A missing user_id means the acting user.
+  company_mismatch: An entry or user of another company answers not_found, exactly as a missing id does.
+  stale_generation: A stale Ownership-Generation answers stale_generation and changes nothing; on a bulk route it fails the whole request.
+  destroy: DELETE discards the entry and returns it; a later GET answers not_found.
+
+errors:
+  not_found:
+    status: 404
+    body: { reason: not_found }
+  forbidden:
+    status: 403
+    body: { reason: forbidden }
+  stale_generation:
+    status: 409
+    body: { reason: stale_generation }
+  version_conflict:
+    status: 409
+    body: { reason: version_conflict }

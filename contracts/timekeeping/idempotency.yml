@@ -1,0 +1,29 @@
+# Idempotency rules shared by all three Timekeeping contracts
+# (docs/architecture/timekeeping-soa.md section 5.1).
+# Same key and body returns the same answer; same key with a new body answers
+# idempotency_key_reused; a key or operation id from another company or actor
+# never matches.
+name: idempotency
+source: docs/architecture/timekeeping-soa.md section 5.1
+
+receipt_scope: [company_scope, actor_type, actor_id, operation, key]
+retention_hours: 24
+# Only successful answers are stored, so a retry after an error, a 409
+# included, is evaluated again.
+stored_statuses: 2xx
+
+key_sources:
+  entry_api:
+    key: Idempotency-Key header
+    company_scope: the path company_id
+  reservations:
+    key: operation_id in the body
+    company_scope: the path company_id
+  entry_snapshots:
+    key: Idempotency-Key header
+    company_scope: the sorted set of company_id values in the batch's entries
+
+errors:
+  key_reused:
+    status: 422
+    body: { reason: idempotency_key_reused }
