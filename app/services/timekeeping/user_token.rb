@@ -25,17 +25,20 @@ module Timekeeping
     Claims = Data.define(:user_id, :company_id, :role, :edit_days, :projects, :agent_id, :jti, :expires_at)
 
     def self.mint(user:, company:, project_ids: [], agent: nil, private_key: private_key_from_env, now: Time.current)
-      raise NotInCompanyError, "user is not employed in this company" unless employed?(user, company)
+      # The role comes from the same facts the reference endpoint serves, so the
+      # token and the endpoint always agree on a user's role in a company.
+      facts = ReferenceFacts.call(company:, project_ids:)
+      user_facts = facts[:users].find { |listed| listed[:id] == user.id }
+      raise NotInCompanyError, "user is not employed in this company" unless user_facts
       if agent && (agent.company_id != company.id || agent.user_id != user.id)
         raise AgentMismatchError, "agent must belong to the same user and company"
       end
 
-      facts = ReferenceFacts.call(company:, project_ids:)
       issued_at = now.to_i
       payload = {
         sub: user.id,
         company_id: company.id,
-        role: user.primary_role(company),
+        role: user_facts[:role],
         edit_days: facts[:edit_days],
         projects: facts[:projects].map do |project|
           {
@@ -82,11 +85,6 @@ module Timekeeping
     rescue OpenSSL::PKey::PKeyError
       raise MissingKeyError, "#{PRIVATE_KEY_ENV} is not an RSA private key"
     end
-
-    def self.employed?(user, company)
-      company.employments.kept.exists?(user_id: user.id)
-    end
-    private_class_method :employed?
 
     def self.rsa_key(key)
       rsa = key.is_a?(OpenSSL::PKey::RSA) ? key : OpenSSL::PKey::RSA.new(key.to_s)
