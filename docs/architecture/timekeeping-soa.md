@@ -758,113 +758,170 @@ Mark-billed on send is not in this table, because sending does not mark entries 
 - Entry updates take a row lock in Timekeeping and bump `version`. Clients that send `If-Match` get conflict detection; others keep last-write-wins, as today.
 - A user edit and a prepare on the same entry serialize on the entry row. A prepare that commits first makes a later employee edit fail with the locked error (A6), as today. Because a provisional reservation exists before the invoice change commits (section 9.2), there is no moment when a saved draft's entries are editable.
 
-## 10. Migration, backfill, reconciliation, phased cutover and rollback (proposed)
+## 10. Migration, checkpoint, reconciliation, cutover and rollback (proposed)
 
-### 10.1 The one rule: one writer per company at a time
+The whole dataset moves at once: both seeded businesses, in one bounded write pause, under one global ownership generation. Rollback and re-cutover use the same procedure in the other direction (10.5). The money and type preservation rule of section 8.1 governs every step in this section, and no step writes a billing table.
 
-Write ownership moves **per company**, never per entry point. Today the web API, bulk actions, CLI, MCP, mobile, agent, invoice callbacks, the Harvest import and jobs all write the same rows (section 1.3). Suppose only the web path moved first: a web edit would land in Timekeeping while a CLI edit to the same entry landed in the monolith. The two stores would then disagree about the employee's time.
+### 10.1 One owner at a time: the ownership generation
 
-So the monolith keeps one routing record per company:
+Exactly one application owns entry data at any moment: Timekeeping, or the monolith. Ownership never moves per company or per entry point. If it moved per entry point, a web edit could land in Timekeeping while a CLI edit to the same entry landed in the monolith, and the two stores would disagree about the employee's time.
+
+The monolith keeps one ownership record for the whole dataset:
 
 ```text
-timekeeping_ownership(company_id primary key, owner: 'monolith' | 'moving' | 'timekeeping' | 'returning',
-                      epoch integer, changed_at, changed_by)
+timekeeping_ownership(generation bigint, owner: 'monolith' | 'timekeeping',
+                      handoff_step: null | 'close_admission' | 'settle' | 'freeze' | 'checkpoint'
+                                    | 'sequence' | 'reconcile',
+                      changed_at, changed_by)                              -- exactly one row
 ```
 
-Every code path that writes an entry, a hold or `bill_status` reads this record first, through one shared function in the monolith (`TimekeepingRouting.owner_for(company)`):
+- **The generation only rises.** It starts at 1 with the monolith as owner. Every handoff raises it by one: the first cutover to 2, a rollback to 3, a re-cutover to 4. An aborted handoff does not lower it.
+- **Each owner admits writes at one generation.** Timekeeping, and the prepared monolith's local path (below), each store the generation they admit writes at, or none while fenced. A write, prepare, commit, abort or command that carries any other generation returns `409 stale_generation` and changes nothing (section 5.1). This also refuses a command that was queued before a handoff and delivered after it.
+- **The gateway reads the record on every write.** When `handoff_step` is set, the gateway refuses entry writes, prepares and service commands with a retryable `503 ownership_moving`, so invoice saves that change an entry set and user hard deletes fail with a retryable error during the pause. Whether every client (web, mobile, CLI, MCP, timer) retries a `503` today was not checked; this is an open question in section 15.
 
-- `monolith`: write locally, as today.
-- `timekeeping`: forward to Timekeeping with the current `epoch`.
-- `moving` or `returning`: refuse with a retryable `503 ownership_moving`. The window should last seconds to minutes per company. Whether every client (web, mobile, CLI, MCP, timer) retries a `503` today was not checked; any that does not must get a retry before its company moves, and this is listed as an open question in section 15.
+**Every writer goes through the gateway.** The writers are those of section 3.1:
 
-Timekeeping stores the epoch it was handed ownership at and rejects writes that carry an older one (`409 stale_epoch`). That stops a request that was routed just before a flip from landing on the wrong side. No per-entry-point feature flags exist. The paths that must call the routing function are: `app/controllers/api/v1/timesheet_entry_controller.rb`, `app/controllers/api/v1/timesheet_entry/bulk_action_controller.rb`, `app/controllers/api/v1/cli/timesheet_entries_controller.rb` (and through it the MCP tools), `app/controllers/api/v1/agent/timesheet_entries_controller.rb`, the lock callbacks in `app/models/invoice.rb` and `app/models/invoice_line_item.rb`, `Invoice#update_timesheet_entry_status!`, and `app/services/imports/harvest_time_entries_importer.rb`. A guard test (section 12.2) fails if any other code writes `TimesheetEntry` for a company that is not owned by the monolith.
+- the web and mobile controller (`app/controllers/api/v1/timesheet_entry_controller.rb`);
+- the bulk controller (`app/controllers/api/v1/timesheet_entry/bulk_action_controller.rb`);
+- the CLI controller (`app/controllers/api/v1/cli/timesheet_entries_controller.rb`), which also serves MCP in-process;
+- the agent controller (`app/controllers/api/v1/agent/timesheet_entries_controller.rb`);
+- the Harvest import (`app/services/imports/harvest_time_entries_importer.rb`);
+- the invoice reservation boundary, which replaces the lock callbacks in `app/models/invoice.rb` and `app/models/invoice_line_item.rb` and `Invoice#update_timesheet_entry_status!`;
+- agent destroy (`app/models/agent.rb:11`), as the `detach-entries` command;
+- the seed and demo writers (`db/seeds.rb`, `db/seeds/timesheet_data.rb`, `Analytics::DemoSeeder`).
 
-### 10.2 Phases
+The gateway also sends the user-retire check before a user hard delete (section 3.3). Writers that make many writes check the generation on each write, and a refused remainder fails visibly (section 3.1). The single-writer guard test (section 12.2) runs every flow above and fails if anything other than the projection consumer changes a `timesheet_entries` row.
 
-| Phase | What happens | Who writes entries | Exit check |
+**The prepared monolith.** Rollback returns to a monolith that already enforces the corrected reservation rule, never to the old boolean callbacks. Its local path holds the same tables as Timekeeping, in the monolith's database: entries, `reservations`, `invoice_operations`, entry audit rows, `idempotency_records`, retired-user marks, and an entry outbox. It uses the same shared decision table (section 7.2). Its outbox feeds `timesheet_entries` through the same relay and projection consumer (section 5.4). These tables stay empty until a rollback loads a checkpoint into them.
+
+**Before the first cutover,** the monolith is the legacy owner at generation 1. It writes `timesheet_entries` directly, as today, and `locked` is still today's boolean. The first cutover is the only handoff that reads that legacy source, which is why it alone runs the pre-flight (10.4). From the first cutover onward, `timesheet_entries` is only a projection, whichever application owns the data.
+
+### 10.2 Steps before the first cutover
+
+| Step | What happens | Who writes entries | Done when |
 |---|---|---|---|
-| P0. Prepare the monolith | Add `company_id` to `timesheet_entries`, backfilled from project → client → company and kept by a model callback. Add the monolith outbox, `TimekeepingRouting`, the ownership table (every company `monolith`), and the hold token columns on billing associations (empty). No behaviour change. | Monolith | Full existing suite green; `company_id` matches the derived company for 100% of rows |
-| P1. Stand up Timekeeping | Deploy the service and its database with no traffic. Build the entry API, hold commands, outbox and token check. | Monolith | Contract suite (section 12.3) green against a test instance |
-| P2. Backfill and shadow | Copy entries, audits and lock state to Timekeeping (10.3). Then stream monolith changes to it continuously, keyed by source id. Run shadow reads: for sampled requests, the monolith also asks Timekeeping and logs any difference. Claims run in shadow mode for the double-hold refusal (section 7.2). | Monolith | Reconciler (10.4) reports zero unexplained differences for 7 days |
-| P3. Cut over companies in waves | Move companies one at a time with the procedure in 10.5: first internal workspaces, then about 5% of companies, then 25%, then all. | Monolith for unmoved companies; Timekeeping for moved ones | Per-wave acceptance checks (section 13) pass; no rollback needed for 7 days |
-| P4. Reporting projection | Reports, analytics and metrics read from the projection fed by Timekeeping events instead of `timesheet_entries`. Each report switches behind a per-report read flag. The read flag only changes where a report reads; it never changes where anything is written. | Timekeeping | Report outputs match the old SQL for every moved company (12.4) |
-| P5. Retire | The monolith → Timekeeping sync already stops for each company when it moves (10.5). Keep the Timekeeping → monolith sync running for one full rollback window after the last company moves (proposed: 90 days, D6), so rollback stays possible. When the window ends, stop that sync, make `timesheet_entries` read-only, archive it, and drop the billing foreign keys to it. After that, rollback is no longer offered. | Timekeeping | All acceptance criteria in section 13 pass. Ending the rollback window needs an owner sign-off |
+| S0. Characterize | Pin today's real behaviour with specs, including the behaviours this document had wrong, and build the two-tenant seed fixtures (sections 12 and 14). | Monolith (legacy) | The characterization specs pass on `main` unchanged |
+| S1. Drop the foreign keys | One migration of its own drops `invoice_line_item_time_entries → timesheet_entries` (`db/schema.rb:1282`), `invoice_line_items → timesheet_entries` (`:1284`) and `timesheet_entries → agents` (`:1325`), for the reasons in section 3.3. The keys to `projects` and `users` stay. | Monolith (legacy) | Full existing suite green |
+| S2. Prepare the monolith | Add `company_id` and `version` to `timesheet_entries` (`company_id` backfilled from project → client → company, `version` defaulting to 0). Add the gateway, the ownership record (generation 1, owner `monolith`), `invoice_operation_intents` (section 9.2), the projection endpoint and consumer, and the prepared monolith's local tables, empty. No behaviour changes: until the first cutover, the gateway's local path writes `timesheet_entries` as today. | Monolith (legacy) | Full existing suite green; `company_id` matches the derived company for every row |
+| S3. Stand up Timekeeping | Deploy the service and its database with no traffic: entry API, reservation operations, service commands, outbox and relay worker. | Monolith (legacy) | Contract suite (section 12.3) green against a test instance |
+| S4. First cutover | Run the handoff procedure (10.5) from the monolith to Timekeeping, with the pre-flight (10.4). | Timekeeping | Every check in 10.4 passes and ownership has flipped |
 
-P4 can start as soon as P2 has a stable event stream, in parallel with P3 (section 14).
+After S4, the acceptance journey (section 13) continues with new writes, a rollback, more new writes and a re-cutover, each with the same procedure. There are no per-company waves, no shadow reads, no per-report read flags, no multi-day soak gates and no rollback window that ends. Those are deferred as rollout notes for a production move (section 15). `timesheet_entries` is never retired: as a projection it keeps every aggregate reader working with no rewrite.
 
-### 10.3 Backfill
+### 10.3 The checkpoint, ids and versions
 
-- It runs per company, in batches, and is safe to re-run. Each row is an upsert keyed on the monolith row id, which Timekeeping keeps as the entry id. Running it twice changes nothing.
-- It copies every column as stored, including `bill_status`, `review_status` and `discarded_at`. **It never infers `billed` from invoice links.** Entries that are billed with no invoice (L7), locked but unbilled on sent invoices (L6), and locked with no kept invoice (L3) are copied exactly as they are.
-- Locks become holds:
-  - Each `locked = true` entry with an association on a kept invoice becomes a `held` hold for that invoice and association, with a new token. The token is written back to the billing association in the same batch.
-  - A `locked = true` entry with no kept invoice (L3) becomes a **legacy hold**: `invoice_id = null`, `association_id = null`. It shows `locked: true` as today, and no billing release can match it. A claim by a new invoice takes it over (section 7.2), so these entries can still be invoiced again, as today. Otherwise only an approved operator command can clear it.
-  - An entry on two kept invoices at once (possible today, section 1.5) gets one hold for each of those invoices, each with its own token. This copies today's state as it is: the entry is locked, and in shadow mode a release by either invoice unlocks it, as today. The entry is listed in the reconciliation report. The invoices and their money are not touched.
-- `duration` is copied to `numeric(12,4)`. Each value is checked to round-trip to the same float; the batch stops on the first mismatch (section 8.3).
-- `audits` rows for entries are copied with their original timestamps and authors.
-- Money is never read or written by the backfill.
+Every handoff moves data with one frozen, verified checkpoint, taken from the outgoing owner after it is frozen (10.5, step 4). Nothing in the checkpoint is rebuilt from the projection or from the `locked` boolean. `locked` says only that a reservation exists, not which invoice owns it, so reservations travel in the checkpoint itself.
 
-### 10.4 Reconciliation
+**What the checkpoint holds.** Every row carries its `company_id`.
 
-A reconciler job runs per company: hourly during P2–P3, daily after. It compares the two sides and writes a report. It **never repairs to "intended" behaviour**. A difference is either explained by a known quirk or raised for an operator.
+- Every entry, as a full snapshot with every column as stored, including `bill_status`, `review_status`, `discarded_at` and its `version`. It never infers `billed` from invoice links. Entries billed with no invoice (L7), locked but unbilled on sent invoices (L6), and held by a discarded non-draft (L3) are copied as they are. `duration` is copied as the same float, never converted or rounded (section 8.3).
+- Each entry's reservation owner and state: `invoice_id`, `state`, `disposition`. This includes the owner metadata of destroyed invoices (tenant, stable invoice identity, disposition), which no billing row holds any more.
+- The entry audit rows, with their original timestamps and authors.
+- Every terminal invoice-operation receipt (`invoice_operations`, committed or aborted).
+- The entry API's idempotency receipts, keyed by tenant (section 6.1), so a client retry after the handoff returns its stored result.
+- The retired-user marks of the user-retire check (section 3.3), so a retired user stays retired on the other side.
 
-| Check | Source of truth | Action on difference |
+The checkpoint is read in one database snapshot of the frozen source and carries a row count and a checksum per table and per company. Loading it into the incoming owner is idempotent: it replaces the incoming owner's tables in one transaction, so a load that is interrupted and resumed gives the same result.
+
+**First cutover: reservations from the legacy boolean.** The legacy monolith has no reservation rows, so the first checkpoint derives them from `locked` and the invoice links, by the pre-flight's classification (10.4):
+
+- An entry with `locked = true` that is referenced by exactly one kept invoice becomes a committed reservation by that invoice, `disposition: 'active'`.
+- An entry with `locked = true` that is held by a discarded non-draft invoice, and by no kept invoice, becomes a committed reservation by that invoice, `disposition: 'retained'` (L3).
+- An entry locked only by the old draft-discard re-lock (L2) is released, as a listed correction, only when no other committed or pending owner exists.
+- An entry that is referenced by a kept invoice but has `locked = false` gets no reservation. Copying never adds a lock that does not exist today. The pre-flight reports such entries for information.
+- Orphans and conflicts are copied only with the disposition recorded for each (10.4).
+
+Later handoffs copy the reservation table as it is.
+
+**Ids: one owner, one allocator.** Timekeeping keeps the existing entry ids. At each handoff, inside the fence, the incoming owner's id sequence is set above the highest id in the checkpoint: at cutover Timekeeping's, at rollback the monolith's. A sequence only advances: it is set only if the new value is higher than its current one.
+
+**Versions: they only advance.** The checkpoint carries each entry's `version`, and the incoming owner continues from it, so its next write to that entry gets a higher version. No owner restarts or reuses a lower version. This is what lets the projection consumer compare versions across cutover, rollback and re-cutover (section 5.4). Rows the legacy monolith wrote carry version 0 from the S2 column default, so Timekeeping's first write to any of them is newer.
+
+The checkpoint copies no money. The first cutover reads invoice links to derive reservations, and no handoff step writes a billing table. Billing rows hold no tokens, so a rollback never edits them (section 8.1).
+
+### 10.4 Pre-flight and reconciliation
+
+**Pre-flight (first cutover only).** Today's legacy states are listed, never normalized quietly. Inside the write fence, before any copy, the pre-flight lists:
+
+- **orphans:** entries locked with no invoice, kept or discarded, that references them. Today a bulk hard destroy of a non-draft invoice creates exactly these, because its line items unlock only on a draft (section 1.4). Any such destroy run before the first cutover makes this list non-empty.
+- **conflicts:** entries referenced by two or more kept invoices, or with more than one plausible historical owner.
+- entries held by a discarded non-draft invoice: kept, as `retained` reservations (10.3).
+- entries locked only by the old draft-discard re-lock (section 2.3): released at cutover as a listed correction, only when no other committed or pending owner exists.
+
+Cutover proceeds only when the orphan and conflict lists are empty, or every item has a recorded disposition. The pre-flight is an assertion the cutover runs, not an assumption: for the two seeded businesses, the characterization fixtures assert that both lists are empty, and the cutover checks them again on the live data.
+
+**Reconciliation (every handoff, step 6).** It compares the loaded checkpoint against the frozen source and writes a report. It **never repairs to "intended" behaviour**. Any difference that the pre-flight did not list aborts the handoff.
+
+| Check | Compared | Must hold |
 |---|---|---|
-| Entry fields and `version` match (P2, and moved companies until P5) | Current owner from `timekeeping_ownership` | Re-copy from the owner, logged |
-| Count and sum of `duration` per company, per user, per month | Owner | Alert; never auto-fix money-related fields |
-| `locked` in the monolith equals "has a provisional or held hold" in Timekeeping | Owner | Re-copy from the owner |
-| Each billing association with `hold_state = 'held'` has a matching hold token | Timekeeping | Alert; association goes to `conflict` |
-| Associations `releasing` longer than 10 minutes | Monolith | Re-enqueue the release job |
-| Claim attempts still `open` after the save time limit (proposed: 60 seconds) | Monolith `hold_claim_attempts` | Close with `UPDATE … SET state = 'failed' WHERE id = ? AND state = 'open'`; only if that update wins, send `holds/abandon`. Younger open attempts are left alone, because their save can still commit |
-| Attempts `committed` or `failed` with `acknowledged_at` still empty | Monolith `hold_claim_attempts` | Re-send confirm or abandon. Both are idempotent, so a copy that arrives after a later claim already applied the outcome changes nothing |
-| Any `provisional` hold older than the save time limit, whatever the attempt's `acknowledged_at` | Monolith `hold_claim_attempts`, looked up by the hold's `acquired_seq` | `committed`: confirm. `failed`: abandon. `open`: close it first, as in the row above. This backstop finds a provisional hold even if it appeared after its attempt was acknowledged, so an acknowledgement never hides one from recovery |
-| Confirmed (`held`) holds whose invoice and association the monolith does not have, or whose invoice was discarded while still a draft | Monolith | Release, unless it is a legacy hold. Holds of invoices discarded after leaving draft stay (L3). Provisional holds are never released by this check; only their attempt's outcome decides them |
-| No invoice money column was changed by a migration operation | Invoice audit history (`audited` on `Invoice`) | For each money-column change since P0, check the audit actor. Changes by users, payments and normal billing jobs are expected. A change with a migration actor (backfill, sync, cutover, rollback, reconciler, event replay), or with no actor, pages an operator; this must never happen |
+| Entries | Every entry snapshot, field by field, with its `version` | Checkpoint equals source; `duration` compared as the stored float, bit for bit |
+| Totals | Count and sum of `duration` per company, per user, per month | Equal |
+| Reservations | Per entry: owner `invoice_id`, `state`, `disposition`, including destroyed-invoice owners | Equal; no `provisional` reservation remains; at most one committed reservation per entry. First cutover: equal to the pre-flight's classification (10.3) |
+| Projection | Every entry in the checkpoint against its `timesheet_entries` row, after the step 3 drain | Same fields and `version`; `locked` is true exactly when the entry has a reservation |
+| Audit rows | Count and checksum per company | Equal |
+| Operation receipts | Every `invoice_operations` row, and every `invoice_operation_intents` row in the monolith | Equal; no operation `prepared` and no intent `pending`; each `committed` intent has a committed operation, and each `failed` intent has an aborted operation or none |
+| Idempotency receipts | Count and checksum per company, keyed by tenant | Equal |
+| Retired-user marks | Every mark | Equal |
+| Id sequence | The incoming owner's sequence against the highest checkpoint id | Sequence is higher |
+| Money | The financial snapshot: invoice `amount`, `tax`, `discount` and `outstanding_amount`, every line item's `rate` and `quantity`, every `invoice_taxes` row, and the rendered PDF totals, taken before step 1 and after step 6, with no user billing edit between the two | Identical (section 13). The audit log cannot prove this, because `audited` on `Invoice` omits `discount`, `tax` and `outstanding_amount`, and line items and taxes are not audited |
 
 Every check is keyed by `company_id`. No report or result mixes companies.
 
-### 10.5 Moving one company, and moving it back
+### 10.5 The handoff procedure, in both directions
+
+Cutover, rollback and re-cutover run the same seven steps. Only the direction changes: the **outgoing owner** is the application that owns the data when the handoff starts, and the **incoming owner** is the other one. The procedure covers the whole dataset at once, under one global generation.
 
 ```text
-cutover(company):
-  1. ownership := 'moving'                  -- new writes for this company get 503 ownership_moving
-  2. wait for in-flight monolith requests and jobs for this company to finish (timeout 60 s, else abort)
-  3. drain the sync stream for this company to the last id
-  4. reconcile the company; abort on any unexplained difference
-  5. as the last step:
-       Timekeeping: convert this company's locks to holds again (the lock rules in 10.3) and accept
-       ownership at epoch + 1; then, in one monolith transaction, write each token back to its billing
-       association, stop the monolith -> Timekeeping sync for the company, and set
-       ownership := 'timekeeping', epoch := epoch + 1.
-     Re-running the conversion covers drafts that the old callbacks locked after the backfill.
-
-  Abort (any step before 5 commits): nothing outside the ownership record has changed, so set ownership
-  back to 'monolith'. If Timekeeping already created holds in step 5 but the monolith transaction failed,
-  Timekeeping drops ownership and those holds (they are not yet visible to anyone) before writes reopen.
-
-rollback(company):
-  1. ownership := 'returning'               -- the monolith stops sending this company's writes
-  2. Timekeeping sets its own copy of the company's ownership to 'returning'. Every Timekeeping write
-     transaction reads that row with a shared lock, and this change takes an exclusive lock, so it waits
-     for every write transaction already running and no write can commit after it (timeout 60 s, else abort).
-  3. drain the Timekeeping outbox for this company into the monolith tables (upsert by id and version).
-     The outbox is now final, because step 2 stopped new commits.
-  4. reconcile; abort on any unexplained difference
-  5. in one monolith transaction: clear the hold tokens and hold_state on this company's billing
-     associations (`locked` now carries the state), restart the monolith -> Timekeeping sync, and set
-     ownership := 'monolith', epoch := epoch + 1.
-
-  Abort (any step before 5 commits): no billing token has been cleared and no sync has changed, so
-  Timekeeping sets its own ownership back to 'timekeeping' and the monolith sets ownership back to
-  'timekeeping'. Writes reopen exactly as before the attempt.
+handoff(outgoing, incoming):
+  1. Close admission.
+     In one monolith transaction: generation := generation + 1, handoff_step := 'close_admission'.
+     The outgoing owner stops admitting writes: every write transaction it runs holds a shared lock on
+     its own ownership row, and closing takes an exclusive lock on that row, so it waits for the
+     transactions already admitted and none can commit after it (timeout 60 s, else stop and resume
+     or abort). New writes, new prepares, service commands and every queued command that carries the
+     old generation are refused from here on. A writer that makes many writes (Harvest import, bulk
+     move, agent destroy, seed and demo writers) is not drained as a whole job: each of its writes is
+     its own admitted transaction, and its remaining writes are refused and fail visibly (section 3.1).
+  2. Settle.
+     Resolve every registered invoice operation from its durable outcome. The monolith delivers commit
+     for each 'committed' intent and abort for each 'failed' one, and runs recovery (section 9.2) on
+     each intent still 'pending'. During this step only, the outgoing owner still applies a commit or
+     abort that carries the old generation, and only for an operation in its own invoice_operations.
+     The step ends when no intent is 'pending' and no operation is 'prepared': no pending billing
+     operation crosses the handoff.
+  3. Freeze.
+     The outgoing owner stops applying commit and abort, so nothing can change its data any more.
+     Capture its final outbox position P. Drain the outbox into the projection through P. Until the
+     flip, the projection consumer accepts the outgoing owner's previous-generation snapshots, but
+     only those with outbox_position <= P (section 5.4).
+  4. Checkpoint.
+     Take one frozen, verified checkpoint of the outgoing owner (10.3) and load it into the incoming
+     owner. On the first cutover only, run the pre-flight (10.4) inside the fence before any copy.
+  5. Sequence.
+     Advance the incoming owner's id sequence above the highest checkpoint id (10.3).
+  6. Reconcile.
+     Run every check in 10.4 against the source. Abort on any unexplained difference.
+  7. Flip.
+     In one monolith transaction: owner := incoming, handoff_step := null. The incoming owner admits
+     writes at the new generation. The projection consumer's permission for previous-generation
+     snapshots ends. From here on, a late commit, abort or snapshot from the retired owner is refused
+     with 409 stale_generation and cannot change the retired owner or the projection.
 ```
 
-Each procedure keeps every side effect that writes reopen depends on (tokens, sync direction, ownership) in its last step, which commits as a whole or not at all. An abort before that step therefore only has to reset the ownership record. No write is lost in either direction:
+**The first cutover.** The legacy monolith registers no invoice operations and has no entry outbox, so steps 2 and 3 have nothing to resolve or drain: `timesheet_entries` is itself the frozen source. Step 4 runs the pre-flight and derives reservations from `locked` (10.3).
 
-- During `moving` and `returning`, nobody accepts writes, and rollback waits for Timekeeping writes already running before it reads the final outbox position.
-- After a move, every Timekeeping change goes to its outbox and keeps flowing to the monolith tables until the rollback window ends in P5. Rollback therefore replays changes, and no one has to reconstruct them.
+**Fenced throughout.** The outgoing owner stays fenced from step 1 through the flip, including through copy, reconciliation, an interruption and a resume. After the flip it stays fenced, because it admits no generation, until a later handoff makes it the incoming owner.
 
-Billing holds follow the same rule. While a company is owned by the monolith, the existing `locked` callbacks run. After a move, billing calls the hold commands. The P0 token columns let both shapes exist side by side.
+**Resumable.** `handoff_step` records the last step that completed. After an interruption, the operator re-runs the handoff, and it resumes from the step that failed. Every step is safe to repeat: settle re-delivers idempotent operations, the drain stops at the same position P, the checkpoint load replaces the incoming owner's tables in one transaction, the sequence only advances, and reconciliation only reads.
+
+**Abort.** Before the flip, an operator may abort instead of resuming. The outgoing owner then admits writes again at the raised generation, and `handoff_step` returns to null. Nothing has changed outside the ownership record and the incoming owner's tables, which nothing reads until a flip, and which the next handoff's load replaces. The generation stays raised, so a command queued before the attempt is still refused.
+
+**Why no write is lost.**
+
+- Between steps 1 and 7, nobody admits writes. Step 1 waits for the transactions already admitted, so the outbox position captured at step 3 is final.
+- Step 2 resolves every pending billing operation before the freeze, so the checkpoint holds no provisional reservation and no operation crosses the handoff unresolved.
+- The checkpoint carries every write accepted on either side, every reservation owner, every operation receipt and every idempotency receipt, and step 6 checks each against the source.
+- The bounded drain lets the outgoing owner's last snapshots reach the projection. The flip then refuses any later one, so a delayed relay retry cannot overwrite a write the incoming owner accepted.
 
 ## 11. Deployment, configuration and operational observability (proposed)
 
