@@ -5,6 +5,7 @@ require "webmock/rspec"
 
 RSpec.describe "Entry write routes" do
   include_context "timekeeping entry writes"
+  include_context "timekeeping entry writes without transactional fixtures"
 
   let(:company) { timekeeping_arrange.company }
   let(:project) { timekeeping_arrange.project(company:) }

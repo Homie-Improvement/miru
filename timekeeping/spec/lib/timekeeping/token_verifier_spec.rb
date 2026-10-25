@@ -89,6 +89,35 @@ RSpec.describe Timekeeping::TokenVerifier do
         end
       end
     end
+
+    # Each is correctly signed, but in a spelling the monolith never mints and
+    # the write-body credential scan does not search for.
+    describe "a correctly signed token outside the compact form" do
+      def sign_raw_header(header_json)
+        encode = ->(value) { Base64.urlsafe_encode64(value, padding: false) }
+        signed = "#{encode.call(header_json)}.#{encode.call(JSON.generate(valid_token_claims))}"
+        "#{signed}.#{encode.call(rsa_key_pair.sign(OpenSSL::Digest.new("SHA256"), signed))}"
+      end
+
+      it "refuses a header longer than the compact form allows" do
+        token = mint_token({}, headers: { "kid" => "x" * 600 })
+
+        expect { verify(token) }.to raise_error(described_class::InvalidToken)
+      end
+
+      it "refuses a header whose JSON holds whitespace" do
+        expect { verify(sign_raw_header('{ "alg":"RS256" }')) }.to raise_error(described_class::InvalidToken)
+        expect(verify(sign_raw_header('{"alg":"RS256"}'))).to include("sub" => 7)
+      end
+
+      it "refuses a signature in standard base64 rather than base64url" do
+        token = nil
+        token = mint_token({ jti: SecureRandom.uuid }) until token&.split(".")&.last&.match?(/[-_]/)
+        head, payload, signature = token.split(".")
+
+        expect { verify([head, payload, signature.tr("-_", "+/")].join(".")) }.to raise_error(described_class::InvalidToken)
+      end
+    end
   end
 
   describe "a valid token" do

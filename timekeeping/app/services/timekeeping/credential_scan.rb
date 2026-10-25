@@ -9,14 +9,13 @@ module Timekeeping
   # Pure: the caller's bearer token, the held credentials and the public key
   # are arguments, and nothing is read from ENV.
   module CredentialScan
-    # A run of base64url segments joined by dots. A JWT is three of them.
+    # A run of base64url segments joined by dots. TokenVerifier accepts only
+    # three such segments, its header starting with HEADER_START and at most
+    # MAX_HEADER_LENGTH long, so this search covers every token it accepts.
     DOTTED_SEGMENTS = /[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+/
-    # Every JWT header is a JSON object, and base64url of '{"' starts with this.
-    JWT_HEADER_START = "eyJ"
-    JWT_SEGMENT_COUNT = 3
-    # Far longer than the base64url of any header the monolith signs, which
-    # holds only the algorithm.
-    MAX_HEADER_LENGTH = 512
+    JWT_HEADER_START = TokenVerifier::HEADER_START
+    JWT_SEGMENT_COUNT = TokenVerifier::SEGMENT_COUNT
+    MAX_HEADER_LENGTH = TokenVerifier::MAX_HEADER_LENGTH
 
     module_function
 

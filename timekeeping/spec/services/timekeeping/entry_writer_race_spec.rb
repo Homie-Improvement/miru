@@ -22,36 +22,49 @@ RSpec.describe Timekeeping::EntryWriter, "under concurrent requests" do
     build_entry_command(route, token: owner_token, **options)
   end
 
-  def on_own_connection(&)
-    Thread.new { ApplicationRecord.connection_pool.with_connection(&) }
+  # Runs the block on a connection of its own, first pushing that
+  # connection's server process id to backend_pids when one is given.
+  def on_own_connection(backend_pids = nil, &block)
+    Thread.new do
+      ApplicationRecord.connection_pool.with_connection do |connection|
+        backend_pids&.push(connection.select_value("SELECT pg_backend_pid()"))
+        block.call
+      end
+    end
   end
 
   # Runs the first command until it reaches hold_at, then runs second (a
-  # block) on another connection, and lets the first go on only once a lock
-  # wait shows the second is blocked behind it. Returns both results.
+  # block) on another connection, and lets the first go on only once the
+  # server reports the second connection blocked by the first one's locks.
+  # Returns both results.
   def race(first_command, hold_at:, &second)
     reached = Queue.new
     release = Queue.new
+    first_pid = Queue.new
+    other_pid = Queue.new
     checkpoint = lambda do |step|
       next unless step == hold_at
 
       reached << true
       release.pop
     end
-    first = on_own_connection { described_class.new(checkpoint:).call(first_command) }
+    first = on_own_connection(first_pid) { described_class.new(checkpoint:).call(first_command) }
     expect(reached.pop(timeout: wait_seconds)).to be(true)
-    other = on_own_connection(&second)
-    blocked = wait_for_lock_wait
+    other = on_own_connection(other_pid, &second)
+    blocked = blocked_by?(other_pid.pop(timeout: wait_seconds), first_pid.pop(timeout: wait_seconds))
     release << true
     results = [first.join(wait_seconds)&.value, other.join(wait_seconds)&.value]
     expect(blocked).to be(true), "the second request never waited on the first one's lock"
     results
   end
 
-  def wait_for_lock_wait
+  def blocked_by?(waiting_pid, holding_pid)
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 3
     while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
-      return true if ApplicationRecord.connection.select_value("SELECT count(*) FROM pg_locks WHERE NOT granted").positive?
+      blocked = ApplicationRecord.connection.select_value(
+        ApplicationRecord.sanitize_sql_array(["SELECT ? = ANY(pg_blocking_pids(?))", holding_pid, waiting_pid])
+      )
+      return true if blocked
 
       sleep 0.02
     end
@@ -77,6 +90,17 @@ RSpec.describe Timekeeping::EntryWriter, "under concurrent requests" do
     expect([first.status, second.status]).to eq([200, 200])
     expect(second.body).to eq(first.body)
     expect(Entry.find(entry_id).version).to eq(2)
+  end
+
+  it "makes a write to another entry, with another key, wait for the first write's outbox commit" do
+    other_entry_id = timekeeping_arrange.entry(company:, user: owner, project:)
+    first_patch = command(:update, entry_id:, body: { "note" => "First" })
+    second_patch = command(:update, entry_id: other_entry_id, body: { "note" => "Second" })
+
+    first, second = race(first_patch, hold_at: :outbox_written) { described_class.new.call(second_patch) }
+
+    expect([first.status, second.status]).to eq([200, 200])
+    expect(OutboxSnapshot.order(:outbox_position).pluck(:id)).to eq([entry_id, other_entry_id])
   end
 
   it "makes an advance of an existing generation row wait until the write that read it commits" do
