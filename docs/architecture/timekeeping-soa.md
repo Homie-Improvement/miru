@@ -927,7 +927,9 @@ handoff(outgoing, incoming):
 
 ### 11.1 Deployment
 
-- Timekeeping is its own application image with its own Kamal configuration, its own `web` role and its own job worker for the outbox relay. It has its own PostgreSQL database. It does not share the monolith's database user.
+- Timekeeping is its own application image with its own Kamal configuration and its own `web` role. It has its own PostgreSQL database. It does not share the monolith's database user. Today `config/deploy.yml` deploys one service, `miru-web`, so the second Kamal configuration, the image and its CI job are new work (section 14).
+- **The relay runs on a dedicated queue, worked by a dedicated worker.** This follows the existing `billing_sync` worker in `config/solid_queue.yml`, which has its own queue next to `default`, with one thread and one process. The relay's queue is worked only by its own worker, so a slow or failing relay never delays other jobs, and other jobs never delay snapshots.
+- **Start only the relay worker.** In the demo environment, the `default` worker is not started for this work. The demo data already holds queued integration jobs, and the `default` worker would run them.
 - The monolith and Timekeeping deploy independently. The contract rules in section 5.1 (additive changes keep the version; breaking changes add a version) make this safe.
 - Database migrations on either side must be backward-compatible with the previous release of the other side.
 
@@ -941,9 +943,9 @@ handoff(outgoing, incoming):
 | `TIMEKEEPING_SERVICE_TOKEN` (or mutual TLS certificates) | Both | Background service identity |
 | `TIMEKEEPING_BASE_URL` | Monolith | Where to forward entry requests |
 | `MONOLITH_REFERENCE_URL` | Timekeeping | Reference-data read endpoint (section 3.4) |
-| `EVENT_BROKER_URL` | Both | Outbox relay target, once the broker is chosen |
+| `MONOLITH_SNAPSHOT_URL` | Timekeeping | The projection endpoint the relay delivers to (section 5.4) |
 
-Secrets are supplied the same way as the existing `DATABASE_URL` and `REDIS_URL` keys in `config/deploy.yml`. This document names no values.
+There is no broker, so there is no broker key. Keys that hold credentials (`TIMEKEEPING_DATABASE_URL`, the token keys and the service token) are Kamal secrets, supplied as `DATABASE_URL` is today under `env.secret` in `config/deploy.yml`. URLs that hold no credential are plain values under `env.clear`, as `REDIS_URL` is today (`config/deploy.yml:59`). This document names no values.
 
 ### 11.3 Observability
 
@@ -951,14 +953,13 @@ Every log line and metric carries `company_id`, `request_id` and the actor kind.
 
 | Signal | Alert when |
 |---|---|
-| Outbox lag (oldest unsent row age), per side | Over 5 minutes |
-| Associations in `releasing` / `conflict` | Any `releasing` older than 10 minutes, or any `conflict` |
-| `503 ownership_moving` rate per company | Lasts longer than 5 minutes for one company |
-| `409 stale_epoch` count | Any during steady state |
+| Outbox lag (oldest unsent row age) of the current owner | Over 5 minutes |
+| Invoice operation intents still `pending` | Any older than 10 minutes |
+| `503 ownership_moving` | Lasts longer than the planned write pause |
+| `409 stale_generation` count | Any outside a handoff |
 | `503 reference_unavailable` rate | Over 1% of writes for 5 minutes |
-| Shadow-read differences (P2) | Any unexplained difference |
-| Shadow double-hold refusals (P2–P3) | Reported daily for the owner decision in section 15 |
-| Reconciler differences | Any unexplained difference; any invoice money change made by a migration actor pages at once |
+| Prepare refusals (`on_another_invoice`) | Reported, as the visible effect of the double-allocation fix |
+| Reconciliation differences (section 10.4) | Any unexplained difference; any change in the financial snapshot pages at once |
 | Timekeeping p95 latency for entry writes | Over 300 ms (proposed; to tune against today's baseline) |
 
 The existing `Rails.event.notify` history stays as it is, as observability only.
@@ -967,7 +968,7 @@ The existing `Rails.event.notify` history stays as it is, as observability only.
 
 ### 12.1 Regression: existing specs stay green
 
-These existing specs pin the observed behaviour in section 2. They run against the monolith for companies it owns and, through a test adapter, against Timekeeping for moved companies. Any spec change during the migration must be explained as a disclosed behaviour change.
+These existing specs cover the observed behaviour in section 2. They run against whichever application owns the data: against the monolith before cutover and after a rollback, and through a test adapter against Timekeeping after cutover. Any spec change during the migration must be explained as a disclosed behaviour change; the two deliberate fixes (section 2.3) are the only planned ones.
 
 | Behaviour | Existing specs |
 |---|---|
@@ -983,60 +984,85 @@ These existing specs pin the observed behaviour in section 2. They run against t
 | Import L7 | `spec/services/imports/harvest_time_entries_importer_spec.rb` |
 | Reports | `spec/services/reports/time_entries/`, `spec/services/analytics/team_productivity_analytics_spec.rb`, `spec/services/metrics/data_builder_spec.rb` |
 
-Before P0, add characterization specs for the quirks that have none today: L3 (non-draft discard leaves entries locked), L4 on a non-draft invoice, L6 (sent invoice leaves entries unbilled), and A9 (bulk move skips locked entries silently). These pin today's behaviour so that the migration cannot change it unnoticed.
+**Not every listed spec pins what its row says (observed).**
+
+- The send specs never check `bill_status`, so nothing pins L6.
+- No spec checks S7 (an agent entry belongs to the agent's company and user).
+- No spec checks A10 (deletes skip A6).
+- The bulk specs never mention `locked`, so nothing pins A9's two quirks: the bulk move ignores `locked`, and it skips a failing entry silently while reporting success.
+- No spec covers L8 (see its row).
+
+**Characterization work, first (step S0 in section 10.2).** Before any other change, add specs that pin today's real behaviour, including the behaviours an earlier version of this document described wrongly:
+
+- L2 as it really is: a discarded draft's entries end up locked again;
+- L3: a discarded non-draft leaves its entries locked;
+- L4: a line-item destroy on a non-draft leaves its entries locked;
+- L6: a sent invoice leaves its entries locked and `unbilled`;
+- A9: the bulk move ignores `locked`, and it skips a failing entry silently;
+- A10 and S7;
+- L8;
+- a bulk hard delete of a non-draft invoice leaves orphans (section 10.4);
+- the PDF totals: the printed subtotal rounded to 3 places and the unrounded total, against the stored `amount` (M1).
+
+The L2 spec pins today's re-lock. When the deliberate fix lands, that spec changes as a disclosed behaviour change (section 2.3).
 
 ### 12.2 Guard tests
 
-- **Single writer guard.** A test that, for a company owned by Timekeeping, runs every writer listed in section 10.1 and fails if any row in the monolith `timesheet_entries` changes other than through the sync stream.
-- **Tenant guard.** For each Timekeeping endpoint and command: a request for company A carrying an entry id from company B returns `404`, and changes nothing.
-- **Money guard.** A test that runs backfill, reconciliation, rollback and event replay against a fixture set of invoices, and asserts every money column in section 1.6 is byte-for-byte unchanged.
+- **Single-writer guard.** While Timekeeping owns the data, a test runs every writer listed in section 10.1 and fails if anything other than the projection consumer changes a `timesheet_entries` row. The writers are the web and mobile controller, the bulk controller, the CLI controller and MCP, the agent controller, the Harvest import, the invoice reservation boundary, agent destroy (`detach-entries`), and the seed and demo writers. The test runs again while the prepared monolith owns the data after a rollback, where the same rule holds.
+- **Tenant guard.** On both seeded tenants, for each Timekeeping endpoint and command and for the projection endpoint: a request for company A carrying an entry id, invoice id, operation id or idempotency key from company B returns `404` or no match, and changes nothing.
+- **Money guard.** A test takes the financial snapshot of section 10.4 before and after the first cutover, a rollback and a re-cutover, with no user billing edit between them, and fails on any difference.
 
 ### 12.3 Contract tests
 
-Consumer-driven contracts between the monolith (consumer) and Timekeeping (provider), run in both repositories' CI on every change:
+Three contracts are fixed first, each with a fake on its consumer's side, so each lane can build and test against the contract alone (section 14). Each runs in both applications' CI on every change:
 
-- Entry API request and response shapes, including `held` → `locked` mapping and decimal strings.
-- Hold commands, including every row of the failure table in section 9.3 marked "Contract".
-- Event envelope and payloads for each event in section 5.4, at each live `schema_version`.
-- Idempotency: same key and body returns the same answer; same key, new body gives `422`; same key from another company or actor does not match.
+- **The entry API** (section 5.2): request and response shapes, `locked` meaning "has a reservation", `duration` as the unconverted float, `409 stale_generation`.
+- **Prepare, commit and abort**, with the service commands (section 5.3): every row of the failure table in section 9.3 whose proving test is marked "Contract".
+- **The entry snapshot event** (section 5.4): the snapshot shape, the version upsert, tombstones, and the generation and outbox-position rules.
+- Idempotency, across all three: same key and body returns the same answer; same key, new body gives `422`; the same key or operation id from another company or actor does not match.
 
 ### 12.4 Integration tests
 
-- Each row of section 9.3 marked "Integration" or "Concurrency", against real databases for both sides and a real relay.
-- **Alternating writers across cutover and rollback.** For one entry in one company: a web edit, a CLI edit, then `cutover(company)` starts. A web edit and a CLI edit are sent during `moving` and must get `503`, and their retries succeed after the flip. More alternating web and CLI edits follow, then `rollback(company)`, then two more edits. The test asserts that the final `duration` and `note` are the last accepted values, and that both stores agree. It also asserts that the audit history lists every accepted edit exactly once.
-- **Aborted moves.** Abort `cutover(company)` at reconcile, and again with the monolith transaction in its step 5 forced to fail. Abort `rollback(company)` at reconcile. After each abort, the test asserts that ownership is back where it started, every billing hold token is still stored and still releases its hold, the sync direction is unchanged, and an edit afterwards succeeds.
-- **Rollback waits for running writes.** Start a Timekeeping entry update that pauses before commit, then start `rollback(company)`. The test asserts that step 2 waits until the update commits or aborts, and that the update's change is in the monolith table after rollback.
-- Backfill re-run: run it twice on the same company; the row counts and checksums are equal.
-- Report parity: for a fixture company, each report in section 1.7 returns the same output from the projection as from the old SQL.
+- Each row of section 9.3 whose proving test is marked "Integration" or "Concurrency", against real databases for both applications and a real relay.
+- **Invoicing with the relay paused.** Pause the relay. Create an entry through the web API. The entry list shows it at once, because it reads Timekeeping. Put the new entry on a draft invoice: candidate selection offers it, prepare reserves it, and the line item saves, because the foreign keys into `timesheet_entries` are gone (section 3.3). The projection does not have the row yet. Resume the relay: the projection catches up, with `locked: true`.
+- **Alternating writers across cutover, rollback and re-cutover, on both tenants.** For one entry in each seeded company: a web edit and a CLI edit, then the cutover starts. Edits sent during the pause get `503`, and their retries succeed after the flip. More alternating web and CLI edits follow, then a rollback, two more edits, a re-cutover and two more edits. The test asserts these hold for each tenant:
+  - the final `duration` and `note` are the last accepted values in Timekeeping and in the projection;
+  - the audit history lists every accepted edit exactly once;
+  - no write of one tenant appears in the other.
+- **Interrupted handoff with snapshots still queued.** Make writes so the outgoing owner's outbox holds undelivered snapshots, then start a handoff. Interrupt it after step 3 has captured the final outbox position, and again during step 4. Resume each time. The test asserts:
+  - the queued snapshots up to that position reach the projection;
+  - the handoff completes from the step that failed;
+  - after the flip, a previous-generation snapshot redelivered by the relay is refused with `409 stale_generation` and leaves the row unchanged.
+  It repeats the run with an abort instead of a resume, and asserts that the outgoing owner admits writes again at the raised generation.
+- **User delete with the relay paused.** Pause the relay. Create a user's first entry, then try to hard-delete that user as a super admin. The user-retire check refuses, and the user row stays, although the projection holds no row for the user yet. A second run starts an entry create and the delete at the same time: either the create wins and the delete is refused, or the retire wins and the create is refused. Never both. Resume the relay: the entry reaches the projection with no foreign-key error.
+- **Rollback waits for running writes.** Start a Timekeeping entry update that pauses before commit, then start a rollback. Step 1 waits until the update commits or aborts, and the update's change is in the checkpoint.
+- **Checkpoint load re-run.** Load the same checkpoint twice; the row counts and checksums are equal.
+- **Report parity.** On both seeded tenants, each reader in section 1.7 returns the same output from the projection after cutover as from `timesheet_entries` before it.
 
 ### 12.5 End-to-end tests
 
-Run in a staging environment with both services, through the real clients:
+Run in the demo environment with both applications, through the real clients, on both seeded tenants:
 
 - Create, edit and delete an entry from the web app, the CLI and an MCP tool; check that the entry list and the time report show the change.
-- Create a draft invoice from entries, save it twice, remove one entry, re-add it, send the invoice; check that entries show `locked` exactly as today and stay `unbilled` (L6).
+- Create a draft invoice from entries, save it twice, remove one entry, re-add it, send the invoice; check that entries show `locked` as today and stay `unbilled` (L6).
+- Put an entry that is already on a kept invoice onto a second invoice by explicit id; check that the save fails with "entry is on another invoice" (deliberate fix, section 2.3).
 - Discard a sent invoice; check that its entries stay locked (L3).
-- Open a draft invoice while its company is still owned by the monolith, so the old callback locks its entries. Cut the company over, then discard the draft; check that its entries are unlocked (L2). Repeat with removing one line item instead of discarding (L4).
+- Open a draft invoice before the first cutover, so the old callback locks its entries. Cut over, then discard the draft; check that its entries are unlocked (deliberate fix, L2). Repeat with removing one line item instead of discarding (L4).
 - As an employee, try to edit a locked entry and an entry outside the edit window; check that both are refused as today.
 
-## 13. Acceptance criteria for the completed migration (proposed)
+## 13. Acceptance criteria for the implementation (proposed)
 
-The migration is complete only when every item below holds for every company, and each is shown by the named test or query.
+The implementation is accepted in the demo environment only when every item below holds, each shown by the named test.
 
 | # | Criterion | Shown by |
 |---|---|---|
-| AC1 | Every company has `owner = 'timekeeping'`, and for 30 days the monolith `timesheet_entries` table receives no writes except from the Timekeeping → monolith sync. | Ownership table query; single writer guard; database write metrics |
-| AC2 | Every entry in Timekeeping equals its monolith row at the moment of cutover, field for field, except the declared `numeric` duration type. | Reconciler report with zero unexplained differences |
-| AC3 | Every observed behaviour in section 2.1–2.4 still holds. | Regression suite in 12.1, including the new characterization specs, green against Timekeeping |
-| AC4 | No migration operation (backfill, sync, cutover, rollback, reconciliation or event replay) has changed any invoice money column. Normal billing changes, such as payments and draft edits, continue as today. | Migration code runs under a database role with no column-level write grant on invoice and line-item money columns; reconciler audit-actor check (10.4) |
-| AC5 | No entry is held by two kept invoices, other than the pre-existing cases listed in the P2 conflict report. | Query on `billing_holds`; conflict report |
-| AC6 | A request for one company can never read or change another company's entry, hold or idempotency record. | Tenant guard on every endpoint |
-| AC7 | Each failure case in section 9.3 ends in its stated surviving state and is repaired. | The test named in each row |
-| AC8 | Alternating web and CLI edits across a cutover and a rollback lose no accepted write and leave both stores equal. | Alternating writers integration test (12.4) |
-| AC9 | Every entry, hold and bill-status change has an audit row naming the company and the actor, including hold changes. | Audit query in Timekeeping; contract tests |
-| AC10 | Reports, analytics and metrics return the same output as before for each company. | Report parity tests (12.4) |
-| AC11 | Timekeeping can be deployed while the monolith is unchanged, and the reverse, with contract tests green. | Two independent production deploys in a row with no paired release |
-| AC12 | The quirks L3, L6, L7, A8 (named operations only) and A9 still behave as section 2 describes, unless an owner decision in section 15 changed them. | Characterization specs |
+| AC1 | **The journey, end to end, on both tenants:** create and edit entries → a direct and a grouped draft invoice → reservations → reports and PDF → cutover → new writes → rollback → new writes → re-cutover. | End-to-end journey (sections 12.5 and 14) |
+| AC2 | **Financial parity by snapshot,** not by the audit log: before and after migration, rollback and re-cutover, compare invoice `amount`, `tax`, `discount` and `outstanding_amount`, every line item's `rate` and `quantity`, every `invoice_taxes` row, and the rendered PDF totals. Identical, or the run fails. (`audited` on `Invoice` omits `discount`, `tax` and `outstanding_amount`, and line items and taxes are not audited, so the audit log cannot prove this.) | Money guard (12.2); money check in reconciliation (10.4) |
+| AC3 | **Rollback and re-cutover** keep every write accepted on either side, every reservation owner, and every idempotency receipt. | Alternating writers test (12.4); reconciliation (10.4) |
+| AC4 | **Independent deployment:** two deploys, one of each application, with no paired release. | Two deploys in the demo environment, contract suite (12.3) green |
+| AC5 | **Relay paused:** a newly created entry can be invoiced at once and appears in the entry list; the projection catches up when the relay resumes. | Invoicing with the relay paused (12.4) |
+| AC6 | **Failure cases:** outage, retry, duplicate and reordered delivery; a lost response on prepare and on commit; a crash after prepare and before the invoice commits; a prepare that arrives after its operation is terminal; a stale generation; a failed and a successful hard delete of a non-draft invoice; an interrupted and resumed handoff. | The proving test of each row in section 9.3; interrupted handoff (12.4) |
+| AC7 | **Tenant isolation** and ownership guards on both tenants; the single-writer guard passes. | Tenant guard and single-writer guard (12.2) |
 
 ## 14. Implementation sequence and parallel work (proposed)
 
