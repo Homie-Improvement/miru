@@ -44,6 +44,15 @@ RSpec.describe Timekeeping::LogSafety do
     end
   end
 
+  describe ".loggable_path" do
+    it "keeps route words, ids and dates, and masks every other segment" do
+      expect(described_class.loggable_path("/v1/companies/12/entries/34")).to eq("/v1/companies/12/entries/34")
+      expect(described_class.loggable_path("/v1/companies/#{hex_token}/entries/#{jwt}"))
+        .to eq("/v1/companies/[FILTERED]/entries/[FILTERED]")
+      expect(described_class.loggable_path("/v1/secret-word/")).to eq("/v1/[FILTERED]/")
+    end
+  end
+
   describe "the application's parameter filter" do
     def filter(params)
       ActiveSupport::ParameterFilter.new(Rails.application.config.filter_parameters).filter(params)

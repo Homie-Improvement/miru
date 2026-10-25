@@ -48,6 +48,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_01_01_000000) do
     t.string "disposition", null: false
     t.uuid "operation_id", null: false
     t.datetime "created_at", null: false
+    t.index ["company_id", "entry_id"], name: "index_reservations_on_company_id_and_entry_id"
     t.index ["company_id", "entry_id"], name: "index_reservations_one_committed_per_entry", unique: true, where: "((state)::text = 'committed'::text)"
     t.index ["company_id", "entry_id"], name: "index_reservations_one_provisional_per_entry", unique: true, where: "((state)::text = 'provisional'::text)"
     t.check_constraint "disposition::text = ANY (ARRAY['active'::character varying, 'retained'::character varying]::text[])", name: "reservations_disposition_check"

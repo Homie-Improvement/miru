@@ -51,6 +51,23 @@ RSpec.describe "Timekeeping service boot" do
     expect(output.lines.last.split.take(3)).to eq(["timekeeping", timekeeping_database, timekeeping_database])
   end
 
+  # The routing error's log line is written by a logger fixed at boot, which a
+  # request spec cannot capture, so this runs in a production child process.
+  it "never logs a token sent as an id in a path that matches no route" do
+    planted = "eyJhbGciOiJSUzI1NiJ9.#{SecureRandom.hex(16)}.signature"
+    path_probe = <<~RUBY
+      status, = Rails.application.call(Rack::MockRequest.env_for("/v1/companies/1/entries/#{planted}"))
+      puts status
+    RUBY
+
+    output, status = boot_in_production(app_root, ruby_toolchain_keys, path_probe)
+
+    expect(status).to be_success, output
+    expect(output).to include(%(Started GET "/v1/companies/1/entries/[FILTERED]"))
+    expect(output.lines.last.strip).to eq("404")
+    expect(output).not_to include(planted)
+  end
+
   it "keeps no master key, credentials file or PEM in the app tree" do
     secret_files = Dir.glob(
       ["config/master.key", "config/credentials*", "config/credentials/**/*", "**/*.pem"],

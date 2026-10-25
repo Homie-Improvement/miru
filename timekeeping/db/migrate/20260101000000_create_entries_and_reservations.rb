@@ -47,6 +47,9 @@ class CreateEntriesAndReservations < ActiveRecord::Migration[8.1]
       t.uuid :operation_id, null: false
       t.datetime :created_at, null: false
 
+      # Serves the locked lookup, which has no state condition and so cannot
+      # use the partial indexes below, and the foreign key's referencing side.
+      t.index %i[company_id entry_id], name: "index_reservations_on_company_id_and_entry_id"
       t.index %i[company_id entry_id], unique: true, where: "state = 'committed'",
         name: "index_reservations_one_committed_per_entry"
       t.index %i[company_id entry_id], unique: true, where: "state = 'provisional'",

@@ -62,6 +62,7 @@ RSpec.describe Timekeeping::RequestIdentity do
   it "runs before the request logger so its start and end lines carry the tags" do
     stack = Rails.application.middleware.map(&:klass)
 
-    expect(stack.index(described_class)).to be < stack.index(Rails::Rack::Logger)
+    expect(stack).not_to include(Rails::Rack::Logger)
+    expect(stack.index(described_class)).to be < stack.index(Timekeeping::RequestLogger)
   end
 end

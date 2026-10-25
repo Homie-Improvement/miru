@@ -15,6 +15,10 @@ module Timekeeping
     UUID = /\A\h{8}-\h{4}-\h{4}-\h{4}-\h{12}\z/
     REQUEST_ID_DIGEST_LENGTH = 16
 
+    # The fixed words of the service's routes. Any other path segment is a
+    # caller's value, such as a company or entry id, and could be a credential.
+    PATH_WORDS = %w[v1 companies entries].freeze
+
     # The only parameters logged in clear, each with the one value shape it may
     # have. For entry_ids the shape applies to each element.
     CLEAR_PARAM_SHAPES = {
@@ -47,6 +51,17 @@ module Timekeeping
       return id if UUID.match?(id)
 
       "sha256:#{Digest::SHA256.hexdigest(id)[0, REQUEST_ID_DIGEST_LENGTH]}"
+    end
+
+    # Rails filters only the query string of the path it logs. This masks each
+    # path segment that is neither a route word nor a plain id or date, so a
+    # token sent in place of a company or entry id is never logged.
+    def loggable_path(path)
+      path.to_s.split("/", -1).map { |segment| clear_path_segment?(segment) ? segment : MASK }.join("/")
+    end
+
+    def clear_path_segment?(segment)
+      segment.empty? || PATH_WORDS.include?(segment) || ID.match?(segment) || DATE.match?(segment)
     end
 
     # ActiveSupport::ParameterFilter passes a copy of each value under an

@@ -13,6 +13,7 @@ require_relative "../lib/timekeeping/token_verifier"
 require_relative "../lib/timekeeping/identity"
 require_relative "../lib/timekeeping/log_safety"
 require_relative "../lib/timekeeping/request_identity"
+require_relative "../lib/timekeeping/request_logger"
 
 module TimekeepingService
   class Application < Rails::Application
@@ -21,7 +22,12 @@ module TimekeepingService
     # A JSON API: no cookies, sessions, views or assets.
     config.api_only = true
 
-    config.middleware.insert_before Rails::Rack::Logger, Timekeeping::RequestIdentity
     config.log_tags = Timekeeping::RequestIdentity::LOG_TAGS
+    config.middleware.swap Rails::Rack::Logger, Timekeeping::RequestLogger, config.log_tags
+    config.middleware.insert_before Timekeeping::RequestLogger, Timekeeping::RequestIdentity
+
+    # A routing error's log line repeats the raw path, which may hold a token
+    # sent in place of an id. The 404 it answers needs no log line.
+    config.action_dispatch.log_rescued_responses = false
   end
 end

@@ -72,6 +72,26 @@ RSpec.describe "Timekeeping entry reads: request logging" do
     expect(log).not_to include(service_token)
   end
 
+  it "never logs a token sent in place of the company or entry id in the path" do
+    planted_jwt = mint_token({ sub: 8, company_id: company_a, role: "admin" })
+    headers = { "Authorization" => "Bearer #{token}" }
+
+    log = capture_entry_logs do
+      get "/v1/companies/#{service_token}/entries", headers: headers
+      get "/v1/companies/#{company_a}/entries/#{service_token}", headers: headers
+      # A JWT holds dots, so this path matches no route and takes the routing error path.
+      get "/v1/companies/#{company_a}/entries/#{planted_jwt}", headers: headers
+    end
+
+    expect(log).to include(
+      %(Started GET "/v1/companies/[FILTERED]/entries"),
+      %(Started GET "/v1/companies/#{company_a}/entries/[FILTERED]")
+    )
+    expect(log).not_to include(service_token)
+    expect(log).not_to include(planted_jwt)
+    expect(log).not_to include(planted_jwt.split(".").first)
+  end
+
   it "logs an allowed id and a UUID request id in clear, and masks other values" do
     request_id = SecureRandom.uuid
 
