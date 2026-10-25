@@ -147,6 +147,20 @@ RSpec.describe "Timekeeping entry reads: request logging" do
     expect(log).not_to include("private words")
   end
 
+  it "logs the bulk-move and bulk-delete path words in clear" do
+    headers = { "Authorization" => "Bearer #{token}" }
+
+    log = capture_entry_logs do
+      post "/v1/companies/#{company_a}/entries/bulk-move", headers: headers
+      post "/v1/companies/#{company_a}/entries/bulk-delete", headers: headers
+    end
+
+    expect(log).to include(
+      %(Started POST "/v1/companies/#{company_a}/entries/bulk-move"),
+      %(Started POST "/v1/companies/#{company_a}/entries/bulk-delete")
+    )
+  end
+
   it "tags every line of a verified request with the token's company, the request id and the user actor" do
     request_id = SecureRandom.uuid
 

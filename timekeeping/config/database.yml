@@ -15,6 +15,8 @@ development:
 test:
   timekeeping:
     <<: *default
+    # The race specs hold two writer connections open beside the example's own.
+    pool: 5
 
 production:
   timekeeping:

@@ -43,7 +43,7 @@ One pure module, `Timekeeping::LogSafety`, decides what may appear in clear, and
 - `config.action_dispatch.log_rescued_responses = false` drops the routing-error line. The 404 response itself needs no log line.
 - `request_id_tag` keeps a UUID and logs any other value as `sha256:` plus 16 hex characters. A stable digest still lets readers match lines from one request.
 - `filter_parameters` has two layers: a regexp that masks every name outside the allow-list, then a lambda that masks an allowed name's value unless it has that name's shape.
-- Every rule that would show a value in clear also calls `held_credential?`, which compares the value with `TIMEKEEPING_SERVICE_TOKEN`. A 19-digit, date-shaped or UUID service token is therefore never shown in clear.
+- Every rule that would show a value in clear also calls `held_credential?`, which compares the value with every credential in `Timekeeping.config.service_credentials`: `TIMEKEEPING_SERVICE_TOKEN` plus each entry of `TIMEKEEPING_SERVICE_CREDENTIALS`. A 19-digit, date-shaped or UUID held credential is therefore never shown in clear.
 
 Test each field, not only query values. Plant a token in the path, the method, a parameter name, a parameter value, `X-Request-Id`, and a service token shaped as a number or a UUID. The routing-error line comes from a logger fixed at boot, so a request spec cannot capture it. `boot_spec.rb` checks it in a production child process.
 

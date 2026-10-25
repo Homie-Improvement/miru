@@ -23,6 +23,6 @@ class ApplicationController < ActionController::API
     end
 
     def render_reason(reason)
-      render json: { reason: }, status: reason
+      render json: { reason: }, status: Timekeeping::Reasons.status(reason)
     end
 end
