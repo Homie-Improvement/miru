@@ -78,9 +78,29 @@ RSpec.describe "Characterization: entry lookups and PDF totals", type: :model do
       pdf_service = PdfGeneration::InvoiceService.new(invoice)
       expect(pdf_service.send(:calculate_subtotal)).to eq(BigDecimal("0.017"))
       expect(pdf_service.send(:calculate_total)).to eq(BigDecimal("0.027"))
-      expect(pdf_service.locals[:sub_total]).to eq(FormatAmountService.new("USD", BigDecimal("0.017")).process)
-      expect(pdf_service.locals[:total]).to eq(FormatAmountService.new("USD", BigDecimal("0.027")).process)
-      expect(pdf_service.locals[:invoice_amount]).to eq(FormatAmountService.new("USD", BigDecimal("0.03")).process)
+      expect(pdf_service.locals[:sub_total]).to eq("$0.02")
+      expect(pdf_service.locals[:total]).to eq("$0.03")
+      expect(pdf_service.locals[:invoice_amount]).to eq("$0.03")
+    end
+
+    it "renders a grand total that differs from the stored amount when the 3-place subtotal ends in 5" do
+      workspace = lookup_spec_workspace
+      invoice = create(:invoice, company: workspace[:company], client: workspace[:client], currency: "USD", tax: BigDecimal("0.02"), discount: 0)
+      # 3 minutes at rate 0.5 costs exactly 0.025. The stored amount rounds it half up:
+      # 0.03 + 0.02 = 0.05. The PDF keeps 0.025 + 0.02 = 0.045, which prints as $0.04.
+      create(:invoice_line_item, invoice:, timesheet_entry: lookup_spec_entry(workspace), quantity: 3, rate: BigDecimal("0.5"))
+
+      invoice.reload
+      expect(invoice.amount).to eq(BigDecimal("0.05"))
+
+      pdf_service = PdfGeneration::InvoiceService.new(invoice)
+      expect(pdf_service.send(:calculate_subtotal)).to eq(BigDecimal("0.025"))
+      expect(pdf_service.send(:calculate_total)).to eq(BigDecimal("0.045"))
+
+      html = pdf_service.html_content
+      expect(html).to match(%r{<span class="totals-row-value">\$0\.02</span>})
+      expect(html).to match(%r{<span class="totals-grand-value">\$0\.04</span>})
+      expect(html).not_to include("$0.05")
     end
   end
 end

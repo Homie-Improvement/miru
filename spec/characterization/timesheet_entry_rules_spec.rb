@@ -38,6 +38,10 @@ RSpec.describe "Characterization: timesheet entry rules", type: :request do
         headers: auth_headers(employee)
 
       expect(response).to have_http_status(:ok)
+      # Silent: the response reports success and carries no error for the skipped entry.
+      expect(json_response["notice"]).to eq(I18n.t("timesheet_entry.update.message"))
+      expect(json_response).not_to have_key("error")
+      expect(json_response).not_to have_key("errors")
 
       moved = TimesheetEntry.find(unlocked_entry.id)
       expect(moved.project_id).to eq(other_project.id)
@@ -95,22 +99,34 @@ RSpec.describe "Characterization: timesheet entry rules", type: :request do
 
     before { create(:project_member, project:, user: agent_user) }
 
-    it "ignores a supplied user_id and saves the entry for the agent's user" do
-      other_user = rules_spec_member(:employee)
+    def agent_entry_request_with_user_override(other_user, inside_entry_payload:)
+      entry_params = { project_id: project.id, duration_minutes: 30, work_date: Date.current.iso8601 }
+      params = { timesheet_entry: entry_params }
+      if inside_entry_payload
+        entry_params[:user_id] = other_user.id
+      else
+        params[:user_id] = other_user.id
+      end
 
-      send_request :post, api_v1_agent_timesheet_entries_path, params: {
-        timesheet_entry: { project_id: project.id, duration_minutes: 30, work_date: Date.current.iso8601 },
-        user_id: other_user.id
-      }, headers: { "Authorization" => "Bearer #{agent_token}" }
+      send_request :post, api_v1_agent_timesheet_entries_path, params:,
+        headers: { "Authorization" => "Bearer #{agent_token}" }
+    end
 
-      expect(response).to have_http_status(:ok)
+    { "inside the timesheet_entry payload" => true, "at the top level" => false }.each do |placement, inside|
+      it "ignores a user_id supplied #{placement} and saves the entry for the agent's user" do
+        other_user = rules_spec_member(:employee)
 
-      entry = TimesheetEntry.find(json_response.dig("entry", "id"))
-      expect(entry.user_id).to eq(agent_user.id)
-      expect(entry.agent_id).to eq(agent.id)
-      expect(entry.company).to eq(company)
-      expect(entry.locked).to be(false)
-      expect(entry.bill_status).to eq("unbilled")
+        agent_entry_request_with_user_override(other_user, inside_entry_payload: inside)
+
+        expect(response).to have_http_status(:ok)
+
+        entry = TimesheetEntry.find(json_response.dig("entry", "id"))
+        expect(entry.user_id).to eq(agent_user.id)
+        expect(entry.agent_id).to eq(agent.id)
+        expect(entry.company).to eq(company)
+        expect(entry.locked).to be(false)
+        expect(entry.bill_status).to eq("unbilled")
+      end
     end
 
     it "refuses a project from another company and creates no entry" do
