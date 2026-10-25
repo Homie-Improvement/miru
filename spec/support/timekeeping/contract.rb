@@ -7,7 +7,7 @@ require "yaml"
 # so each fact of a contract is written once.
 module TimekeepingContract
   CONTRACTS_DIR = File.expand_path("../../../contracts/timekeeping", __dir__)
-  CONTRACT_NAMES = %i[entry_api reservations entry_snapshots idempotency].freeze
+  CONTRACT_NAMES = %i[entry_api reservations entry_snapshots idempotency reference].freeze
 
   class UnknownContractError < ArgumentError; end
 

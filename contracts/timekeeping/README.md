@@ -6,6 +6,7 @@ These files are the single written form of the three Timekeeping contracts that 
 - `reservations.yml`: prepare, commit and abort, the `mark-billed` and `detach-entries` service commands, and the save-reconciliation table for a replayed invoice save (sections 5.3, 7.2, 9.2 and 9.3).
 - `entry_snapshots.yml`: the entry snapshot event the relay delivers to the projection endpoint (section 5.4).
 - `idempotency.yml`: the idempotency rules shared by all three (section 5.1).
+- `reference.yml`: the company reference read the monolith serves to Timekeeping's background writes (section 3.4). `spec/requests/internal/v1/companies/references_spec.rb` checks the monolith's endpoint against it.
 
 The files are data. `TimekeepingContract.load(name)` in `spec/support/timekeeping/contract.rb` reads one and returns it frozen. The RSpec shared examples in `spec/contracts/timekeeping/` and the fakes in `spec/support/timekeeping/` take field lists, reasons and rules from the loader, so a change here reaches every implementation that runs the examples.
 
