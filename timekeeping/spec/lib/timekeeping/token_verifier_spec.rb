@@ -25,6 +25,20 @@ RSpec.describe Timekeeping::TokenVerifier do
     end
   end
 
+  describe "the company of an expired token" do
+    it "carries the signed company_id of a validly signed expired token" do
+      token = mint_token(expired_one_second_ago.merge(company_id: 9))
+
+      expect { verify(token) }.to raise_error(described_class::ExpiredToken) { |error| expect(error.company_id).to eq(9) }
+    end
+
+    it "carries no company when the expired token's claims have the wrong types" do
+      token = mint_token(expired_one_second_ago.merge(company_id: "9"))
+
+      expect { verify(token) }.to raise_error(described_class::ExpiredToken) { |error| expect(error.company_id).to be_nil }
+    end
+  end
+
   describe "refusals" do
     it "refuses an HS256 token signed with the public key's PEM text" do
       token = mint_token({}, key: public_key.to_pem, algorithm: "HS256")

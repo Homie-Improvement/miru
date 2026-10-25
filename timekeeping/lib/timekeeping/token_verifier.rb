@@ -21,7 +21,18 @@ module Timekeeping
 
     # Raised only after the signature verified, so a forged token is never
     # reported as expired. Writes answer it differently from InvalidToken.
-    class ExpiredToken < StandardError; end
+    #
+    # company_id is the signed company_id claim, or nil when the claims fail
+    # CLAIM_TYPES. It lets write metrics count the refusal under the company
+    # that signed token names; it grants no access.
+    class ExpiredToken < StandardError
+      attr_reader :company_id
+
+      def initialize(message = "expired Timekeeping user token", company_id: nil)
+        super(message)
+        @company_id = company_id
+      end
+    end
 
     module_function
 
@@ -29,22 +40,37 @@ module Timekeeping
     # x5u header. The jwt gem checks the signature before exp, so a forged
     # token that has also expired raises InvalidToken.
     def verify(token, public_key:)
+      payload = decode(token, public_key, verify_expiration: true)
+      raise InvalidToken, "invalid Timekeeping user token" unless typed_claims?(payload)
+
+      payload
+    rescue JWT::ExpiredSignature
+      raise ExpiredToken.new(company_id: expired_company_id(token, public_key))
+    rescue JWT::DecodeError, OpenSSL::PKey::PKeyError
+      raise InvalidToken, "invalid Timekeeping user token"
+    end
+
+    def decode(token, public_key, verify_expiration:)
       payload, _header = JWT.decode(
         token.to_s,
         rsa_public_key(public_key),
         true,
         algorithm: ALGORITHM,
         required_claims: REQUIRED_CLAIMS,
-        verify_expiration: true,
+        verify_expiration:,
         leeway: 0
       )
-      raise InvalidToken, "invalid Timekeeping user token" unless typed_claims?(payload)
-
       payload
-    rescue JWT::ExpiredSignature
-      raise ExpiredToken, "expired Timekeeping user token"
+    end
+
+    # Reached only after the jwt gem verified the signature and then found exp
+    # in the past, so decoding again without the exp check reads claims the
+    # monolith signed.
+    def expired_company_id(token, public_key)
+      payload = decode(token, public_key, verify_expiration: false)
+      payload["company_id"] if typed_claims?(payload)
     rescue JWT::DecodeError, OpenSSL::PKey::PKeyError
-      raise InvalidToken, "invalid Timekeeping user token"
+      nil
     end
 
     # Accepts a key object or PEM text; nil, empty or non-RSA text raises
@@ -58,6 +84,6 @@ module Timekeeping
       CLAIM_TYPES.all? { |claim, type| payload[claim].is_a?(type) }
     end
 
-    private_class_method :rsa_public_key, :typed_claims?
+    private_class_method :decode, :expired_company_id, :rsa_public_key, :typed_claims?
   end
 end
