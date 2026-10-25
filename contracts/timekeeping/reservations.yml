@@ -34,7 +34,7 @@ routes:
     response_fields: [detached]
 
 headers:
-  authorization: "Authorization: <service identity bound to the company and the operation>"
+  authorization: "Authorization: Bearer <service identity bound to the company and the operation>"
 
 dispositions: [active, retained]
 operation_states: [prepared, committed, aborted]

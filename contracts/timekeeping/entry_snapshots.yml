@@ -11,7 +11,7 @@ routes:
     path: /internal/v1/timekeeping/entry-snapshots
 
 headers:
-  authorization: "Authorization: <Timekeeping service identity>"
+  authorization: "Authorization: Bearer <Timekeeping service identity>"
   idempotency_key: "Idempotency-Key: <uuid>"
 
 batch_fields: [schema_version, snapshots]
