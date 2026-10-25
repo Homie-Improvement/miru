@@ -37,6 +37,14 @@ RSpec.describe "Characterization: invoice timesheet entry locking", type: :reque
     line
   end
 
+  # One direct line and one aggregate line with one linked entry; returns all their entries.
+  def locking_spec_mixed_line_entries(invoice)
+    line = locking_spec_direct_line(invoice)
+    aggregate_entries = [locking_spec_entry]
+    locking_spec_aggregate_line(invoice, aggregate_entries)
+    [line.timesheet_entry] + aggregate_entries
+  end
+
   def force_locked(entries, locked: true)
     entries.each { |entry| entry.update_columns(locked:) }
   end
@@ -165,10 +173,7 @@ RSpec.describe "Characterization: invoice timesheet entry locking", type: :reque
   describe "L2: discarding a draft (deliberate fix pending: may change)" do
     it "ends with the draft's entries locked again" do
       invoice = create(:invoice, company:, client:)
-      line = locking_spec_direct_line(invoice)
-      aggregate_entries = [locking_spec_entry]
-      locking_spec_aggregate_line(invoice, aggregate_entries)
-      entries = [line.timesheet_entry] + aggregate_entries
+      entries = locking_spec_mixed_line_entries(invoice)
       force_locked(entries)
 
       send_request :delete, api_v1_invoice_path(invoice), headers: auth_headers(admin)
@@ -182,10 +187,7 @@ RSpec.describe "Characterization: invoice timesheet entry locking", type: :reque
   describe "L3: discarding a non-draft" do
     it "leaves the invoice's entries locked" do
       invoice = create(:invoice, company:, client:, status: :sent)
-      line = locking_spec_direct_line(invoice)
-      aggregate_entries = [locking_spec_entry]
-      locking_spec_aggregate_line(invoice, aggregate_entries)
-      entries = [line.timesheet_entry] + aggregate_entries
+      entries = locking_spec_mixed_line_entries(invoice)
       force_locked(entries)
 
       send_request :delete, api_v1_invoice_path(invoice), headers: auth_headers(admin)
@@ -239,10 +241,7 @@ RSpec.describe "Characterization: invoice timesheet entry locking", type: :reque
   describe "L6: sending an invoice" do
     it "leaves the entries locked and unbilled" do
       invoice = create(:invoice, company:, client:)
-      line = locking_spec_direct_line(invoice)
-      aggregate_entries = [locking_spec_entry]
-      locking_spec_aggregate_line(invoice, aggregate_entries)
-      entries = [line.timesheet_entry] + aggregate_entries
+      entries = locking_spec_mixed_line_entries(invoice)
       force_locked(entries)
 
       send_request :post, send_invoice_api_v1_invoice_path(id: invoice.id),
@@ -258,10 +257,7 @@ RSpec.describe "Characterization: invoice timesheet entry locking", type: :reque
   describe "bulk hard delete of a non-draft invoice" do
     it "removes the invoice and leaves its entries locked with no invoice (orphans)" do
       invoice = create(:invoice, company:, client:, status: :sent)
-      line = locking_spec_direct_line(invoice)
-      aggregate_entries = [locking_spec_entry]
-      locking_spec_aggregate_line(invoice, aggregate_entries)
-      entries = [line.timesheet_entry] + aggregate_entries
+      entries = locking_spec_mixed_line_entries(invoice)
       force_locked(entries)
 
       send_request :post, api_v1_invoices_bulk_deletion_index_path,
