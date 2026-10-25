@@ -1,0 +1,59 @@
+# This file is auto-generated from the current state of the database. Instead
+# of editing this file, please use the migrations feature of Active Record to
+# incrementally modify your database, and then regenerate this schema definition.
+#
+# This file is the source Rails uses to define your schema when running `bin/rails
+# db:schema:load`. When creating a new database, `bin/rails db:schema:load` tends to
+# be faster and is potentially less error prone than running all of your
+# migrations from scratch. Old migrations may fail to apply correctly if those
+# migrations use external dependencies or application code.
+#
+# It's strongly recommended that you check this file into your version control system.
+
+ActiveRecord::Schema[8.1].define(version: 2026_01_01_000000) do
+  # These are extensions that must be enabled in order to support this database
+  enable_extension "pg_catalog.plpgsql"
+
+  create_table "entries", force: :cascade do |t|
+    t.bigint "company_id", null: false
+    t.integer "version", default: 1, null: false
+    t.bigint "project_id", null: false
+    t.bigint "user_id", null: false
+    t.bigint "agent_id"
+    t.date "work_date", null: false
+    t.float "duration", null: false
+    t.text "note", default: ""
+    t.string "bill_status", null: false
+    t.string "review_status", default: "not_required", null: false
+    t.boolean "locked", default: false
+    t.string "source", default: "manual", null: false
+    t.jsonb "source_metadata", default: {}, null: false
+    t.string "external_run_id"
+    t.string "external_session_id"
+    t.text "proof_url"
+    t.jsonb "proof_metadata", default: {}, null: false
+    t.datetime "discarded_at"
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["company_id", "id"], name: "index_entries_on_company_id_and_id", unique: true
+    t.index ["company_id", "project_id", "work_date"], name: "index_entries_on_company_id_and_project_id_and_work_date"
+    t.index ["company_id", "user_id", "work_date"], name: "index_entries_on_company_id_and_user_id_and_work_date"
+  end
+
+  create_table "reservations", id: false, force: :cascade do |t|
+    t.bigint "company_id", null: false
+    t.bigint "entry_id", null: false
+    t.bigint "invoice_id", null: false
+    t.string "state", null: false
+    t.string "disposition", null: false
+    t.uuid "operation_id", null: false
+    t.datetime "created_at", null: false
+    t.index ["company_id", "entry_id"], name: "index_reservations_on_company_id_and_entry_id"
+    t.index ["company_id", "entry_id"], name: "index_reservations_one_committed_per_entry", unique: true, where: "((state)::text = 'committed'::text)"
+    t.index ["company_id", "entry_id"], name: "index_reservations_one_provisional_per_entry", unique: true, where: "((state)::text = 'provisional'::text)"
+    t.check_constraint "disposition::text = ANY (ARRAY['active'::character varying, 'retained'::character varying]::text[])", name: "reservations_disposition_check"
+    t.check_constraint "state::text = ANY (ARRAY['provisional'::character varying, 'committed'::character varying]::text[])", name: "reservations_state_check"
+  end
+
+  add_foreign_key "reservations", "entries", column: ["company_id", "entry_id"], primary_key: ["company_id", "id"]
+end

@@ -247,6 +247,54 @@ jobs:
       - name: Run gem specs
         run: bundle exec rspec
 
+  # The Timekeeping service runs from its own bundle against its own database.
+  # Only TIMEKEEPING_DATABASE_URL is set, and no DATABASE_URL, so a passing run
+  # shows the service needs no monolith database setting.
+  timekeeping:
+    name: Timekeeping service specs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    if: github.event_name != 'push' || !contains(github.event.head_commit.message, 'skip ci')
+    env:
+      RAILS_ENV: test
+      TIMEKEEPING_DATABASE_URL: postgres://root:password@localhost:5432/timekeeping_test
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: timekeeping_test
+          POSTGRES_USER: root
+          POSTGRES_PASSWORD: password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U root -d timekeeping_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+    defaults:
+      run:
+        working-directory: timekeeping
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1
+        with:
+          ruby-version: '4.0.1'
+          bundler-cache: true
+          bundler: latest
+          working-directory: timekeeping
+
+      - name: Prepare database
+        run: bundle exec rails db:prepare
+
+      - name: Run service specs
+        run: bundle exec rspec
+
   security-audit:
     name: Security audit
     runs-on: ubuntu-latest
