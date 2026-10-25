@@ -5,6 +5,7 @@ class User < ApplicationRecord
   include PhoneNumberValidatable
 
   TOTP_ISSUER = "Miru"
+  DEFAULT_ROLE = "employee"
   RECOVERY_CODES_COUNT = 8
   MAX_AVATAR_SIZE_MB = 5
   ALLOWED_AVATAR_CONTENT_TYPES = %w[image/png image/jpeg image/jpg image/webp].freeze
@@ -134,10 +135,20 @@ class User < ApplicationRecord
   after_create { Rails.event.notify(Users::Registered.new(self)) }
 
   def primary_role(company)
-    roles = self.roles.where(resource: company)
-    return "employee" if roles.empty?
+    self.class.primary_roles_for(company, [id]).fetch(id)
+  end
 
-    roles.first.name
+  # The role each user holds in the company, keyed by user id: the role with
+  # the lowest id wins, and a user with no role there is an employee.
+  def self.primary_roles_for(company, user_ids)
+    held = Role.where(resource: company)
+      .joins(:users)
+      .where(users: { id: user_ids })
+      .order("roles.id")
+      .pluck("users.id", "roles.name")
+      .each_with_object({}) { |(user_id, name), roles| roles[user_id] ||= name }
+
+    user_ids.index_with { |user_id| held.fetch(user_id, DEFAULT_ROLE) }
   end
 
   def remove_roles_for(company)

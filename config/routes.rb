@@ -52,6 +52,7 @@ Rails.application.routes.draw do
   end
 
   draw(:api)
+  draw(:internal)
 
   match "/mcp", to: "api/v1/mcp#handle", via: [:get, :post, :delete], as: :mcp
 

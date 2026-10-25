@@ -1,0 +1,38 @@
+# The reference read Timekeeping makes before a background write
+# (docs/architecture/timekeeping-soa.md section 3.4). The monolith serves it;
+# every key list here is exact.
+name: reference
+source: docs/architecture/timekeeping-soa.md section 3.4
+schema_version: 1
+
+routes:
+  show:
+    method: GET
+    path: /internal/v1/companies/{company_id}/reference
+    query: "project_ids=1,2 (a comma-separated list or an array; absent means none)"
+
+headers:
+  authorization: "Authorization: Bearer <TIMEKEEPING_SERVICE_TOKEN>"
+  cache_control: "Cache-Control: no-store"
+
+max_project_ids: 200
+
+response_fields: [company_id, edit_days, users, projects, missing_project_ids]
+user_fields: [id, role]
+project_fields: [id, company_id, billable, member_user_ids]
+
+rules:
+  service_identity: Only the Timekeeping service token is accepted. A missing or wrong credential, or a user token, gets 401 and no data, whether or not the company exists.
+  company_scope: Every fact belongs to the company in the path. Users are the company's employed users, with their role in that company.
+  missing_project: A requested project the company does not own is listed in missing_project_ids exactly like an id that does not exist, with none of its facts.
+
+errors:
+  unauthorized:
+    status: 401
+    body: { reason: unauthorized }
+  not_found:
+    status: 404
+    body: { reason: not_found }
+  invalid_project_ids:
+    status: 422
+    body: { reason: invalid_project_ids }
