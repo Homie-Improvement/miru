@@ -552,76 +552,84 @@ Timekeeping owns `review_status`. The migration preserves S4, S5 and S6 exactly:
 
 A review workflow (approve or reject commands, and whether billing may claim `pending_review` entries) is **future work**. If built, it belongs in Timekeeping, behind its own versioned commands, and needs an owner decision on S6 first.
 
-### 7.2 Billing holds replace `locked`
+### 7.2 One reservation rule replaces `locked`
 
-A hold is a row in Timekeeping:
+**The rule:** an entry has at most one reservation by a kept invoice. A reservation is identified by (entry, invoice) and is either **provisional** or **committed**. Nothing else is a billing lock.
+
+A reservation is a row in Timekeeping. It carries its own owner, so it does not depend on, or cascade from, any invoice row:
 
 ```text
-billing_holds(company_id, entry_id, invoice_id, association_id, hold_token, state, acquired_seq,
-              replaced_hold_id, created_at, released_at)
-  state: 'provisional' | 'held' | 'replaced' | 'released' | 'abandoned'
-unique (company_id, entry_id, invoice_id) where state in ('provisional', 'held')
+reservations(company_id, entry_id, invoice_id, state: 'provisional' | 'committed',
+             disposition: 'active' | 'retained', operation_id, created_at)
+  unique (company_id, entry_id) where state = 'committed'
+  unique (company_id, entry_id) where state = 'provisional'
 
-hold_sequences(company_id, invoice_id, entry_id, last_seq)   -- kept after release
-invoice_claim_floors(company_id, invoice_id, closed_seq)      -- highest claim attempt with a known outcome; kept for good
+invoice_operations(company_id, invoice_id, operation_id, state: 'prepared' | 'committed' | 'aborted',
+                   generation, created_at, finished_at)
+  unique (company_id, invoice_id) where state = 'prepared'    -- at most one unresolved operation per invoice
 ```
 
-- An entry is "locked" exactly when it has at least one row in state `provisional` or `held`. The monolith shows that as `locked: true`. A provisional hold therefore protects the entry from the moment it is claimed, before the invoice save commits. More than one invoice can hold an entry only while double holds are not refused (see "Two holder modes" below).
-- Every claim and every release carries `seq`. For a claim, `seq` is the id of the monolith's claim attempt row (section 9.2); for a release, it is the id of the outbox row that asked for it. Both come from one monolith sequence that only rises, so a later request from billing always has a larger `seq`. `hold_sequences` keeps the highest `seq` seen for each `(company_id, invoice_id, entry_id)`, and keeps it after the hold is released.
-- **Claim** takes the entry's row lock, then works in one transaction, keyed by the caller's idempotency key. Every hold it creates is `provisional`, with `acquired_seq = seq`. Before it looks at any hold, it applies `prior_outcomes`: a confirm for each committed earlier attempt and an abandon for each failed one (the rules below). So a claim never reuses or replaces a provisional hold whose creator's outcome is still unknown to Timekeeping, and a delayed confirm or abandon for those earlier attempts arrives later as a no-op.
-  - Closed attempts acquire nothing. Every confirm, every abandon, and every outcome in `prior_outcomes` raises `invoice_claim_floors.closed_seq` for the invoice to at least that `seq`, even when no hold matched. A claim first takes that floor row's lock. If its `seq` is not above `closed_seq`, its attempt has already ended, so it returns `attempt_closed` for every entry and changes nothing. This covers a claim delivered for the first time after its own abandon, including for entries that the retry left out, and a delayed claim from any earlier attempt of the invoice. Because saves of one invoice run one after the other (section 9.2) and seq only rises, every attempt at or below the floor is finished. The floor row lock makes a claim and an abandon of the same seq serialize: whichever runs second sees the other's result.
-  - Backstop: a provisional hold of this invoice whose `acquired_seq` is neither `seq` nor in `prior_outcomes` means an earlier save's outcome was not passed on. The claim is refused with `409 claim_in_progress`, and the save fails with a retryable error. The monolith's invoice row lock (section 9.2) is meant to make this impossible.
-  - `seq` not above `last_seq` for this invoice and entry: a stale claim. Return `stale_claim` and change nothing. This stops a delayed claim for an association that was later removed, or removed and added again, from replacing or recreating a hold.
-  - No current hold by this invoice: insert a provisional hold with a fresh random `hold_token`.
-  - Current hold by this invoice with the same `association_id`: return the existing token and change nothing. After `prior_outcomes` is applied, this hold is always `held`, created by an earlier committed save. It is **reused**: it keeps its own `acquired_seq`, and nothing this attempt does later can remove it. This is what lets every draft save (L1) re-send its claims.
-  - Current hold by this invoice with a **different** `association_id`: the draft removed the entry and added it again. Mark the current hold `replaced`, and insert a provisional hold with a new token and `replaced_hold_id` pointing to it. The old token stops matching. Until the save commits, the old hold can still be restored.
-  - Current legacy hold (`invoice_id = null`, created by the backfill for L3 entries, section 10.3): mark it `replaced` and insert a provisional hold for the claiming invoice, as above. Today an unbilled entry still locked after a non-draft discard can be put on a new invoice (section 1.5), so a legacy hold must not block a claim.
-  - Current hold by another invoice: depends on the holder mode below.
-  - On success, `last_seq` becomes `seq`.
-  - A retry with the same idempotency key returns the stored success. A refusal is not stored, so a retry is checked again (section 5.1).
-- **Release** names the `hold_token` and its own `seq`. It raises `last_seq` to `seq` whether or not a hold matches. It clears a hold only when the token matches that hold, in one statement (`UPDATE … WHERE entry_id = ? AND hold_token = ? AND state IN ('provisional', 'held')`). Billing only sends tokens stored on committed associations, so a matching provisional hold belongs to a save that has committed and whose confirm has not arrived yet. If nothing matches, it returns `no_matching_hold` and changes nothing else. A stale or foreign token therefore never clears anything. What a matching release clears depends on the holder mode below.
-- **Confirm** `(invoice_id, seq)` turns every `provisional` hold with `acquired_seq = seq` into `held`, and drops the restore link on the holds they replaced. After a confirm, abandon can no longer touch them.
-- **Abandon** `(invoice_id, seq)` undoes exactly what claim `seq` acquired, and nothing else. For each `provisional` hold with `acquired_seq = seq`, it marks that hold `abandoned`, and if the hold has a `replaced_hold_id`, it puts the replaced hold back to `held` with its original token. Reused holds were not acquired by `seq`, so they are untouched. In shadow mode, abandon removes only the attempt's own provisional hold; it never uses the release rule that clears every hold on the entry. Abandon after confirm, or a repeated abandon, changes nothing.
+- `invoice_id` is the stable invoice identity. It has no foreign key, so a reservation of a hard-destroyed invoice keeps its owner: the tenant (`company_id`), the invoice identity and the disposition.
+- `disposition: 'retained'` marks a reservation held by a discarded or destroyed **non-draft** invoice. It is a known owner. It keeps the entry locked against edits, and it can pass to a successor invoice (below).
+- `invoice_operations` is Timekeeping's terminal record per (invoice, operation): committed or aborted. It is never deleted with an invoice.
+- An entry is "locked" exactly when it has a reservation, provisional or committed. The monolith shows that as `locked: true`, so client JSON does not change, and A6 reads "the entry has a reservation".
 
-**Two holder modes.** The mode is a per-company setting, `refuse_double_holds`, and it defaults to off:
+**One decision table.** The rule lives in one shared library that both applications use: Timekeeping, and the prepared monolith that rollback returns to (section 10). Neither re-implements it. For each entry in an invoice's desired set, prepare decides:
 
-- **Off (shadow).** This mode copies today's single `locked` flag. A claim on an entry another invoice holds still succeeds and adds a second hold. Timekeeping logs a `would_refuse_double_hold` metric with both invoice ids. A release whose token matches clears **every** hold on that entry, because today `Invoice#unlock_timesheet_entries` writes `locked: false` without checking other invoices. So when drafts A and B share an entry, discarding A unlocks it, as today. B's next draft save claims it again (L1 re-locks on every save), and B stores the new token. This is the mode for every company until D1 is decided.
-- **On (enforced).** That claim is refused with `409 held_by_other`. The entry row lock makes two simultaneous claims serialize, so exactly one wins. With only one hold per entry, a release clears that hold only.
+| The entry's current reservations | prepare by invoice I |
+|---|---|
+| None | Add a provisional reservation by I |
+| Committed by I | Keep it; no change |
+| Committed by another invoice J, `active` | Refuse: `on_another_invoice` (deliberate fix, section 2.3) |
+| Committed by another invoice J, `retained` | Add a provisional reservation by I; J's committed reservation stays until I commits |
+| Provisional by another operation | Refuse: `provisional_elsewhere` |
+| Entry not in the request's company | Refuse: `not_found` |
 
-P3 waves can therefore run before D1 is decided, with no change in whether an invoice save succeeds.
+A prepare is all or nothing: one refusal reserves nothing. The three operations then act only on what prepare recorded:
 
-Billing stores the returned `hold_token` on the line item (direct link) or the `invoice_line_item_time_entries` row (aggregate link).
+- **prepare:** reserve the invoice's new entries provisionally; keep its committed ones.
+- **commit:** make the desired entry set the reservation set; release the entries it removed. A provisional reservation becomes committed, and any `retained` reservation of another invoice on the same entry is dropped.
+- **abort:** drop only this operation's provisional reservations. Committed reservations, including a `retained` one a successor was trying to take over, stay as they were.
+
+Each operation is idempotent by its stable `operation_id`. A prepare that arrives after its own operation is terminal changes nothing. An invoice has at most one unresolved operation: a new prepare whose earlier operation is not yet terminal either carries that operation's outcome or is refused as retryable (section 5.3). Removals take effect only at commit, so a failed save never unlocks an entry the committed draft still holds.
+
+**Discarded and deleted invoices.**
+
+- A **discarded draft** sends an empty desired set. Its reservations are released at commit (deliberate fix, section 2.3). The discard's later `update_invoice_number` save is not a reservation operation, so it cannot reserve them again (section 3.1).
+- A **discarded non-draft** keeps its reservations as a known owner: the boundary commits them with `disposition: 'retained'` (L3 preserved). The entry stays locked against edits until another invoice's operation commits for it. While that operation is provisional, the old committed reservation stays. If it aborts, the old state is untouched. A second prepare for the same entry while one is provisional is refused.
+- A **bulk invoice delete** is a hard destroy today (section 1.4). It goes through the same boundary:
+  - A destroyed draft releases its reservations, as a line-item destroy on a draft does today (L4).
+  - A destroyed non-draft keeps them as a known owner, like a discarded non-draft. Its invoice and line-item rows are gone, so the reservation itself carries the owner: the tenant, the stable invoice identity, and the disposition (`retained`, and passable to a successor). There is no invoice snapshot and no replacement chain.
+  - A failed delete, for example an invoice with payments, leaves the prior state as it was: its operation aborts. A successful delete keeps the edit lock and allows the same provisional successor transition as above.
 
 ```mermaid
 stateDiagram-v2
   [*] --> Free
-  Free --> Provisional: claim (new token T1, acquired by seq S)
-  Provisional --> Held: confirm S (the save committed)
-  Provisional --> Free: abandon S (the save failed)
-  Provisional --> Free: release with current token (save committed, confirm not yet arrived)
-  Held --> Held: claim, same invoice + same association (returns T1, reused; abandon of the new seq leaves it)
-  Held --> Provisional: claim, same invoice + new association (T1 replaced by T2, acquired by seq S)
-  Provisional --> Held: abandon S of a replacement (T2 dropped, T1 restored)
-  Held --> Free: release with current token
-  Held --> Held: release with old token (no change)
-  Held --> Held: claim by another invoice (refused when enforced; second hold added in shadow mode)
-  Held --> Held: claim with seq not above last_seq (stale_claim, no change)
-  Free --> Free: claim with seq not above last_seq (stale_claim, no change)
+  Free --> Provisional: prepare by invoice I
+  Provisional --> Committed: commit (I's operation)
+  Provisional --> Free: abort (I's operation)
+  Committed --> Committed: prepare by I again (kept, no change)
+  Committed --> Free: commit of a set without the entry (removal), or of a discarded or destroyed draft
+  Committed --> Retained: commit of a discarded or destroyed non-draft
+  Retained --> Retained: prepare by successor J (J provisional; retained reservation stays)
+  Retained --> Retained: abort of J's operation (old state untouched)
+  Retained --> Committed: commit of J's operation (owner becomes J)
+  Committed --> Committed: prepare by another invoice (refused, on_another_invoice)
 ```
 
 Mapping of today's callbacks:
 
 | Today | Target |
 |---|---|
-| L1 draft save locks entries | Billing sends `holds/claim` for every association on the draft |
-| L2 draft discard unlocks | Billing sends `holds/release` with each stored token |
-| L3 non-draft discard keeps locks | Billing sends nothing; holds stay. **Preserved quirk.** |
-| L4 line-item destroy on draft unlocks; on non-draft does not | Release on draft only. Preserved. |
-| L5 mark billed via uncalled mailer | `entries/mark-billed`, called only from the same path |
+| L1 draft save locks entries | The invoice reservation boundary prepares and commits the draft's desired entry set when it changes (section 9.2) |
+| L2 draft discard leaves entries locked (re-lock) | Empty desired set; reservations released at commit. **Deliberate fix** (section 2.3) |
+| L3 non-draft discard keeps locks | Reservations kept with `disposition: 'retained'`. **Preserved quirk.** |
+| L4 line-item destroy on draft unlocks; on non-draft does not | On a draft, the entry leaves the desired set and is released at commit. On a non-draft, the boundary sends no removal, so the reservation stays. Preserved. |
+| Bulk hard destroy of an invoice | Draft: released. Non-draft: `retained`, carrying its own owner. Failed destroy: operation aborted, prior state kept (section 1.4) |
+| Two kept invoices on one entry | Refused at prepare: `on_another_invoice`. **Deliberate fix** (section 2.3) |
+| L5 mark billed via uncalled mailer | `mark-billed` (section 5.3), called only from the same path |
 | L6 sent invoices leave entries unbilled | Preserved: sending does not call `mark-billed` |
-| L7 import marks billed without invoice | Import calls the entry API with `bill_status: billed` under its service identity |
-
-**Disclosed change:** today nothing stops two invoices from locking the same entry (section 1.5). Refusing a claim held by another invoice closes that path to double billing. Because it can make an invoice save fail where it succeeded before, every company starts with `refuse_double_holds` off (shadow mode, defined above). Shadow mode logs would-be refusals and still accepts the second hold, for companies owned by either side. Turning it on needs an owner decision, listed with the risks and decisions for review.
+| L7 import marks billed without invoice | Import writes through the gateway with `bill_status: billed` under its service identity |
 
 ### 7.3 Bill status
 
@@ -632,31 +640,35 @@ non_billable <-> unbilled          (user edit, project rules S1/S3)
 unbilled     ->  billed            (user edit A11, import L7, mark-billed L5)
 ```
 
-No path moves an entry out of `billed`. The policy refuses updates and deletes of billed entries for every role (A2), and none of the named background operations (`holds.claim`, `holds.release`, `entries.mark_billed`, `entries.import`) changes a billed entry. Timekeeping still applies A7 as a second check, as the model does today.
+No path moves an entry out of `billed`. The policy refuses updates and deletes of billed entries for every role (A2), and none of the named background operations (`reservations.prepare`, `reservations.commit`, `reservations.abort`, `invoices.mark_billed`, `entries.import`, `agents.detach_entries`, `entries.seed`) moves an entry out of `billed`. Timekeeping still applies A7 as a second check, as the model does today.
 
 ### 7.4 Future work, not part of the migration
 
 - Marking entries billed when an invoice is sent (would change L6).
-- Releasing holds when a non-draft invoice is discarded (would change L3).
+- Releasing reservations when a non-draft invoice is discarded (would change L3).
 - A review queue (would change S5 and possibly S6).
 
-Each is a customer-visible change and is kept out of the migration's acceptance criteria and failure handling.
+Each is a customer-visible change and is kept out of the migration's acceptance criteria and failure handling. Exclusivity (one kept invoice per entry) and the release on draft discard are not future work: they are the two deliberate fixes, inside this migration (section 2.3).
 
 ## 8. Financial precision, rounding and historical invoices (proposed)
 
 ### 8.1 What never changes
 
-The monolith keeps every money column and every rounding rule in section 1.6. Migration, replay, backfill and reconciliation never recalculate a stored `amount`, `tax`, `discount`, `amount_due`, `base_currency_amount`, line-item `rate` or `quantity`. Billing stays in the monolith partly so that this code does not move.
+The monolith keeps every money column and every rounding rule in section 1.6. Billing stays in the monolith partly so that this code does not move.
+
+**Money and type preservation applies to the migration and the handoff. Moving data between owners never recomputes or converts a value. Normal billing operations a user is authorized to make keep their existing recalculation behaviour.**
+
+So migration, cutover, rollback, re-cutover and reconciliation never recompute a stored `amount`, `tax`, `discount`, `amount_due`, `outstanding_amount`, `base_currency_amount`, line-item `rate` or `quantity`, or any `invoice_taxes` row. No step of those procedures writes a billing table (section 10). Billing rows hold no tokens, so there is nothing in them to rewrite. Section 10 refers to this rule rather than repeating it.
 
 ### 8.2 Line items are snapshots
 
-M2 is kept: line items copy `rate` and `quantity` at creation. An `Updated` event for an entry that is already on a line item does not change that line item. If billing wants to warn that an entry changed after it was invoiced, it may record a note; it never edits the amount.
+M2 is kept: line items copy `rate` and `quantity` at creation. A later entry snapshot for an entry that is already on a line item does not change that line item. If billing wants to warn that an entry changed after it was invoiced, it may record a note; it never edits the amount.
 
 ### 8.3 On the wire
 
 - Money: decimal strings with the column's scale (`"125.50"`, exchange rates with up to 10 places). Never JSON numbers.
-- Duration: `duration` is a float column today. Timekeeping stores it as `numeric(12,4)` and transmits it as a decimal string of minutes. The backfill compares every copied value with the float source and reports any value that does not round-trip. Whether `numeric(12,4)` is enough, or the float type must be kept, is an open decision for review.
-- Line-item `quantity` stays an integer, computed in the monolith as today.
+- Duration: `duration` stays a float in Timekeeping, the same type as today's column. It travels as a JSON number holding the stored float unchanged, and the copy at cutover moves it unchanged. No step converts or rounds it. Changing it to a decimal is deferred (section 15).
+- Line-item `quantity` stays an integer of minutes in the monolith. Today (observed) the client posts it: `GenerateInvoice::NewLineItemsService` only suggests the float `duration` for a direct line and the float sum of durations for a project aggregate (`app/services/generate_invoice/new_line_items_service.rb:110`, `:140`). Because `invoice_line_items.quantity` is an `integer` column (`db/schema.rb:560`), fractional minutes are cast away when the line item is stored. The target keeps this unchanged.
 
 ### 8.4 The status-change recalculation
 
@@ -667,97 +679,84 @@ M2 is kept: line items copy `rate` and `quantity` at creation. An `Updated` even
 ### 9.1 Transaction boundaries
 
 - Timekeeping: an entry change, its audit row, its idempotency record and its outbox row commit together in one transaction.
-- Monolith billing: an invoice or line-item change and its outbox row commit together. The one exception is the draft-save claim (9.2): it is sent while the save transaction is still open, so the save commits only after its entries are held. Release calls are made after commit.
-- Between them there is no shared transaction. Consistency comes from ordered steps, idempotent commands and a reconciler.
+- Monolith billing: an invoice or line-item change, its successful operation outcome and the outbox row that delivers commit, commit together in one transaction. The pending operation intent is the one write outside it: it commits on its own, before the remote prepare, so that a rollback of the invoice transaction cannot erase it (9.2).
+- Between the two applications there is no shared transaction. Consistency comes from the durable intent, the ordered save, idempotent operations and recovery.
 
-### 9.2 Ordering of a draft save
+### 9.2 Save order
+
+Every invoice change that alters which entries the invoice holds goes through the same four steps: a draft save that changes its entry set, a discard, a line-item destroy on a draft, and a bulk hard destroy. The monolith keeps one operation ledger for this, with no foreign key to `invoices`, so it survives invoice deletion:
 
 ```text
-0. In its own short transaction, which commits at once, insert a claim attempt row:
-     hold_claim_attempts(id, company_id, invoice_id, state: 'open' | 'committed' | 'failed', started_at,
-                         acknowledged_at)   -- set when Timekeeping answers confirm, abandon or a claim carrying it
-   Its id is this save's seq and idempotency key. This row is the durable record of whether the save
-   committed; nothing else decides it.
-1. Open the save transaction and lock the invoice row (SELECT … FOR UPDATE). Two saves of one invoice
-   now run one after the other, so every earlier save of this invoice has ended. In this transaction,
-   mark any earlier attempt of this invoice still 'open' as 'failed' (WHERE state = 'open'): its
-   transaction ended without setting 'committed'. Collect every earlier attempt of this invoice that
-   Timekeeping has not yet acknowledged (acknowledged_at is null), with its outcome. Save the invoice
-   and its associations.
-2. With the transaction still open, send one holds/claim listing every association of the draft
-   and the collected prior_outcomes (section 5.3). Timekeeping applies those outcomes first, so the
-   claim never builds on a provisional hold from a save whose result it does not know. Timeout: 5 seconds. Every hold the claim creates is provisional and already locks
-   its entry (section 7.2).
-3. Read the answer to this request only. No other request writes these association rows while this
-   transaction holds them:
-   - 200, every entry "held": store each hold_token and set hold_state = 'held'. Then, still in the save
-     transaction, run UPDATE hold_claim_attempts SET state = 'committed' WHERE id = seq AND state = 'open'.
-     If it changes one row, also write an outbox row "claim committed" (seq), commit and answer the user.
-     If it changes no row, the attempt was already closed as failed (step 4); roll back.
-   - 200 with any entry "stale_claim" or "attempt_closed": a newer request for this invoice already
-     reached Timekeeping, or the reconciler already closed this attempt; the invoice row lock and the
-     time limit make both rare. Roll back and tell the user the draft changed and must be
-     reloaded.
-   - 409 claim_in_progress: roll back; the save fails with a retryable error (section 7.2 backstop).
-   - 409 (enforced mode only): roll back; the save fails with "entry is on another invoice".
-   - Timeout or 5xx: roll back; the save fails with a retryable error. Today this save would succeed,
-     so this is a disclosed availability change (section 15.3).
-4. Whenever the save transaction ends without committing (any rollback above, or a failed commit),
-   set the attempt to 'failed' (only WHERE state = 'open') and send holds/abandon (invoice_id, seq), retried by a job until answered.
-   Abandon removes only what this attempt acquired and restores any hold it replaced (section 7.2), so a
-   reused hold of the already-saved draft keeps protecting its entry. This works even when the claim
-   answer was lost, because abandon is keyed by seq, not by tokens.
-   If the process dies before this step, the attempt stays 'open'. The reconciler closes it: once the
-   attempt is older than the save transaction's time limit (proposed: 60 seconds), it runs
-   UPDATE hold_claim_attempts SET state = 'failed' WHERE id = seq AND state = 'open'. That update and the
-   save's own 'committed' update take the same row lock, so exactly one wins: either the save committed
-   and the reconciler changes nothing, or the reconciler wins and the save can no longer commit. Only
-   after its update wins does the reconciler send holds/abandon.
-5. After a commit, the relay delivers "claim committed" as holds/confirm (invoice_id, seq), which makes
-   the provisional holds permanent. Until it arrives they already lock their entries, and release works.
-6. Removal or draft discard: in the same transaction as the change, set each affected association to
-   hold_state = 'releasing'. After commit, a job sends holds/release with the stored token and a new seq,
-   retrying until it gets an answer. The new seq makes any delayed claim for it stale (section 7.2).
+invoice_operation_intents(company_id, invoice_id, operation_id, state: 'pending' | 'committed' | 'failed',
+                          generation, created_at, finished_at)
 ```
 
-Entries are held before the invoice save commits, as with L1 today, so no one can edit an entry that is on a saved draft. A failed save undoes only its own provisional holds, and only after the attempt row says, durably, that the save can no longer commit. So neither a failed update nor a cleanup run can unlock an entry of a draft that is saved, or about to be. The cost is that the open transaction waits for one HTTP call, bounded by the timeout. While Timekeeping is down, draft saves fail instead of succeeding without a lock. On removal or discard, the entry stays locked until the release job runs, a short delay after commit. That only makes the lock last longer, never shorter, so no edit gets through that today's rules refuse.
+Timekeeping keeps its own terminal record of the same operations (`invoice_operations`, section 7.2).
+
+```text
+1. Take the serialization lock on the stable invoice identity: a Postgres advisory lock on
+   (company_id, invoice_id), not a lock on the invoice row, so creation and deletion are covered
+   where no row exists to lock. Then, in its own short transaction that commits at once, write the
+   pending operation intent (state 'pending', a new operation_id, the current generation).
+2. Call prepare with the invoice's desired entry set, synchronously, with a bounded timeout
+   (proposed: 5 seconds).
+3. On a 200: in one transaction, save or destroy the invoice, set the intent to 'committed'
+   (WHERE state = 'pending'), and write an outbox row that asks for commit. Commit the transaction.
+4. After the database commit, the outbox delivers commit, retrying until it is answered.
+   Every failure path (a 409, a timeout, a 5xx, or a failed database commit) first sets the intent
+   to 'failed' (WHERE state = 'pending'), then delivers abort through the outbox the same way.
+```
+
+**Recovery.** A crash after prepare always leaves a `pending` intent to recover from, because step 1 committed it before the remote call. Recovery picks up an intent that has stayed `pending` longer than the save's time limit (proposed: 60 seconds). Age only selects which intents recovery looks at; it never releases anything by itself. Recovery then works in this order:
+
+1. It takes the same advisory lock on (company_id, invoice_id). Holding the lock rules out a commit still in progress, because a save holds that lock from step 1 to step 4.
+2. It records a definitive failure: `UPDATE invoice_operation_intents SET state = 'failed' WHERE operation_id = ? AND state = 'pending'`. If the update changes no row, the save already committed, and recovery leaves it alone.
+3. Only if its update won, it delivers abort.
+
+A missing response or elapsed time alone never releases a reservation. Only a commit that removes the entry, or an abort after the failure is recorded, releases it.
+
+What this order gives:
+
+- Prepare makes its new reservations provisional before the invoice change commits, so no one can edit an entry on a saved draft, as with L1 today.
+- Removals take effect only at commit, so a failed save never unlocks an entry the committed draft still holds.
+- A successful outcome commits atomically with the invoice change.
+- The cost is that a save waits for one HTTP call, bounded by the timeout. While Timekeeping is down, saves that change an invoice's entry set fail with a retryable error, where today they succeed. This is a disclosed availability change.
+- Saves that do not change the entry set send no operation. Those include the invoice-number rewrite after a discard (section 3.1).
+
+While the prepared monolith owns the data after a rollback, it runs the same steps against its own reservation table, using the same shared decision table (sections 7.2 and 10).
 
 ### 9.3 Failure cases
 
 | Case | State that survives | How it is detected and repaired | Proving test |
 |---|---|---|---|
-| Claim call fails or times out during a draft save, answer lost | Invoice change rolled back; attempt `failed`; entries as before the save | Abandon by `seq` removes whatever the lost claim acquired and restores what it replaced. The user retries the save | Integration, in both holder modes: Timekeeping applies the claim but the answer is dropped; save fails; after abandon each entry's lock state equals its state before the save |
-| New invoice: claim succeeded, commit failed | Attempt `failed`; provisional holds abandoned; entries unlocked as before | Abandon by `seq` | Integration: force a commit failure after a 200 claim on a new draft; entry ends `locked: false` |
-| Saved draft re-saved unchanged: claim reuses T1, commit fails | Hold T1 still held; entry still locked | Abandon touches only holds with `acquired_seq` = this seq; T1 was acquired by an earlier save | Integration, in both holder modes: draft A holds T1; re-save fails at commit; entry still locked and T1 still releases it; in shadow mode another invoice's hold on the entry is also untouched |
-| Saved draft re-adds an entry under a new association: claim replaces T1 with T2, commit fails | T1 restored to held; T2 abandoned | Abandon follows `replaced_hold_id` back to T1 | Integration, in both holder modes: re-add then fail commit; entry still locked; release with T1 frees it; release with T2 does nothing |
-| Save paused after its claim while the reconciler runs | Provisional holds kept; attempt `open` | The reconciler leaves attempts younger than the time limit alone. An older one is closed by the conditional update, which the save's own update cannot also win | Integration: claim on a new draft, pause the save, run the reconciler, resume; the save commits and its entries stay locked. Then repeat with the pause past the time limit: the reconciler wins, the save rolls back, the holds are abandoned |
-| Process dies after the claim, before commit or abandon | Attempt `open` | Reconciler closes it as `failed` after the time limit and sends abandon | Integration: kill the worker after the claim; reconciler run; entry back to its state before the save |
-| Two saves of one draft start together | Holds of whichever saves commit | The invoice row lock makes the second save wait until the first ends; it then passes the first's outcome in `prior_outcomes`. A claim request delayed in the network still gets `stale_claim` and its save rolls back | Integration: start saves with seq 5 and 7 at once; save 7 waits for save 5; both commit; each entry has one hold |
-| Failed save, then retry with the same association, abandon of the failed save delayed | Retry's hold, `held` | The retry passes `failed` for the earlier seq, so Timekeeping abandons the earlier provisional hold first, then creates a fresh provisional hold for the retry. The late abandon is a no-op | Integration, in both holder modes: discard draft B so A's hold clears (shadow mode); re-save A (S1) and fail its commit; hold back abandon S1; retry (S2) commits; deliver abandon S1; entry still locked and S2's token releases it |
-| Failed save, then retry that replaces an association, abandon delayed | Retry's new hold; the committed hold it replaced can be restored if the retry fails | Prior outcome applied first restores the committed hold, which the retry then replaces | Integration, in both holder modes: S1 replaces T1 with T2 and fails; S2 re-adds again and commits with T3; late abandon S1 does nothing; release T3 frees the entry; T1 and T2 do nothing |
-| Earlier save committed, its confirm delayed, then the next save reuses its hold | Hold `held` | The next save passes `committed` for the earlier seq, so Timekeeping confirms first and the reused hold is no longer provisional. A failure of the next save cannot remove it | Integration, in both holder modes: S1 commits, hold back confirm S1; S2 reuses the hold and fails; entry still locked; late confirm S1 is a no-op |
-| Claim delivered for the first time after its attempt was abandoned, for an entry the retry left out | No hold on that entry | The abandon (or the retry's `prior_outcomes`) raised the invoice's claim floor; the late claim's seq is not above it, so it returns `attempt_closed` and creates nothing | Integration, in both holder modes, for a saved invoice with no time-linked lines: S1 adds entry X, its claim is held back past the timeout, S1 rolls back and abandon S1 is acknowledged; retry S2 adds entry Y and commits; deliver claim S1; X stays editable and has no hold, Y is held. Repeat with abandon S1 also held back, so only S2's `prior_outcomes` closes S1 |
-| Claim and abandon of one seq race | Either no hold, or a hold that the abandon removes | Both take the invoice's floor row lock; a claim after the abandon sees the floor, an abandon after the claim finds and removes its provisional holds | Concurrency: send claim S1 and abandon S1 in parallel many times; afterwards no hold with `acquired_seq` = S1 is provisional or held |
-| Earlier outcome not passed on (bug) | No change | Claim refused with `409 claim_in_progress`; save fails with a retryable error | Contract: claim seq 9 for an invoice with a provisional hold from seq 8 and no `prior_outcomes`; 409; hold unchanged |
-| Discard or line-item delete, release lost | Association `releasing`; hold still `held` | Job retries release with the stored token; reconciler lists `releasing` older than 10 minutes | Integration: drop the first release; retry releases; entry shows `locked: false` |
-| Stale release after the same draft re-adds the entry | New hold with token T2 | Late release carries T1, matches nothing, returns `no_matching_hold` | Contract: claim(A, assoc1) → T1; claim(A, assoc2) → T2; release(T1) → no change; entry still held |
-| Reordered release from another invoice | Hold of invoice B | Release from A carries A's token, which never matches B's hold | Contract: claim A → T1; release T1; claim B → T2; replay release T1 → no change |
-| Duplicate claim (retry, double click, re-save) | One hold | Same idempotency key returns the stored answer; same association returns the same token | Contract: send the same claim three times; one hold row, one token |
-| Two drafts claim one entry at once, `refuse_double_holds` on | One hold | Claims serialize on the entry row lock; the second sees the first hold and gets 409 | Concurrency: two parallel claims; exactly one 200 |
-| Two drafts claim one entry, `refuse_double_holds` off (shadow) | Two holds, entry locked | Second claim succeeds and logs `would_refuse_double_hold`; a matching release by either invoice clears both holds, as today's `locked: false` does | Contract: claim A, claim B; release A → entry free; B re-claims on its next save → entry held with a new token; release with B's old token → no change |
-| Claims for one invoice arrive in reverse order (delayed claim for a removed association) | Hold from the newer claim | The older claim's `seq` is not above `last_seq`; it returns `stale_claim` and changes nothing | Contract: claim(A, assoc2, seq 7) → T2; then claim(A, assoc1, seq 5) → stale_claim; release(T2, seq 8) → entry free; a further claim(seq 5) → still stale |
-| Draft discarded, release job lost | Associations `releasing`; holds still held | The job retries with the stored tokens. The reconciler also releases any hold whose invoice is discarded while still in `draft` status (L2), and leaves holds of invoices discarded after leaving draft (L3) | Integration: drop the release job; discard the draft; reconciler run; entry shows `locked: false` |
-| Hold event arrives before an older update | Projection has the new duration and the hold | Every version-raising event carries the full entry snapshot (section 5.4), so the highest version is complete | Contract: deliver HoldClaimed v3 (with duration 90) then Updated v2 (with duration 90); projection shows duration 90 and held |
+| Prepare answer lost (timeout or 5xx) | Invoice change not made; intent `failed`; any provisional reservations dropped by abort; committed reservations untouched | The save records the failure, then the outbox delivers abort until answered. The user retries the save | Integration: Timekeeping applies the prepare but the answer is dropped; the save fails; after abort each entry's reservation state equals its state before the save |
+| Prepare refused: `on_another_invoice` | Nothing reserved; intent `failed` | The save fails with "entry is on another invoice" (deliberate fix, section 2.3); abort is still delivered and changes nothing | Contract: invoice A commits entry X; invoice B prepares X by explicit id; 409 `on_another_invoice`; X still reserved by A only |
+| Prepare refused: `provisional_elsewhere` or `unresolved_operation` | Nothing reserved; intent `failed` | The save fails with a retryable error | Contract: an open operation of invoice A holds X provisionally; B prepares X; 409 `provisional_elsewhere`. A second prepare for A with a new operation while the first is unresolved gets `unresolved_operation` |
+| Database commit fails after a 200 prepare | Intent `failed`; abort drops this operation's provisional reservations; committed ones stay | Failure recorded first, then abort | Integration: force a commit failure after prepare on a saved draft that adds X and removes Y; X ends free, Y ends still reserved by the draft |
+| Crash after prepare, before the invoice commits | Intent `pending`; provisional reservations kept | Recovery takes the invoice-identity lock, records `failed` only if the intent is still `pending`, then delivers abort | Integration: kill the worker after prepare; run recovery; entries back to their state before the save. Repeat with the save paused but still holding the lock: recovery waits and changes nothing |
+| Commit answer lost, or relay down after the invoice commits | Invoice and intent `committed`; outbox row unsent; provisional reservations already lock their entries | The outbox retries commit; commit is idempotent by `operation_id` | Integration: stop the relay after a save; the entries show `locked: true`; restart; commit applies once |
+| Prepare arrives after its operation is terminal | Terminal record unchanged | Timekeeping returns the stored state and changes nothing (section 5.3) | Contract: commit operation O; replay prepare O; 200 with `committed`; no reservation added. Same after abort |
+| Commit or abort delivered twice or out of order | Terminal state of the first to apply | Both are idempotent by `operation_id`; an abort after commit, or a commit after abort, changes nothing | Contract: commit O, then abort O, then commit O; reservations equal those after the first commit |
+| Saved draft fails a save that removes an entry | Entry still reserved by the committed draft | Removals take effect only at commit; abort drops only provisional reservations | Integration: a draft holds X; a save removes X and its commit fails; X still shows `locked: true` |
+| Two saves of one invoice start together | Reservations of whichever saves commit | The advisory lock on the invoice identity makes the second save wait until the first ends | Integration: start two saves of one draft at once; the second waits; both commit; each entry has at most one committed reservation |
+| Two invoices prepare one entry at once | One provisional reservation | Prepares serialize on the entry row; the second sees the first and gets `provisional_elsewhere` | Concurrency: two parallel prepares for X; exactly one 200 |
+| Successor prepares an entry held by a discarded or destroyed non-draft, then aborts | The old `retained` committed reservation, unchanged | Abort drops only the successor's provisional reservation | Integration: discard non-draft A holding X; B prepares X (200); B aborts; X still reserved by A and still locked against edits |
+| Successor commits an entry held `retained` | Reservation by the successor only | Commit drops the retained reservation on that entry | Integration: as above, but B commits; X reserved by B only |
+| Draft discarded | Reservations released at commit | Discard sends an empty desired set; the `update_invoice_number` save sends nothing (deliberate fix, section 2.3) | Integration: a draft holds X; discard it; X shows `locked: false` and an employee can edit it |
+| Hard delete of a non-draft fails (payments) | Invoice, line items and reservations as before | The destroy rolls back; the intent is recorded `failed` and the operation aborts | Integration: bulk-delete a non-draft with a payment; 422; its entries' reservations unchanged |
+| Hard delete of a non-draft succeeds | Reservations `retained`, carrying tenant, invoice identity and disposition; the operation ledger kept | The commit sets `disposition: 'retained'`; nothing references the deleted rows | Integration: bulk-delete a non-draft holding X; X still locked against edits; a new invoice can prepare and commit X |
+| Stale ownership generation | No change | `409 stale_generation`; the save fails with a retryable error and is retried against the current owner | Contract: prepare with an old generation; 409; nothing reserved |
 | Reference facts unavailable | No change | Write refused with `503 reference_unavailable`; client or job retries | Integration: monolith reference endpoint down; entry write refused; nothing written |
-| Outbox relay down | Rows stay unsent | Relay resumes from the last sent id; consumers dedupe | Integration: stop relay, make changes, restart; projection matches, no duplicates |
-| Event delivered twice or out of order | Consumer state at highest version | `processed_events` and the version check | Contract: deliver v2, then v1, then v2 again; projection holds v2 |
+| Relay down | Outbox rows stay unsent | The relay resumes in `outbox_position` order | Integration: stop the relay, make changes, restart; projection matches, no duplicates |
+| Snapshot delivered twice or out of order | Projection row at the highest version | The version check in the consumer (section 5.4) | Contract: deliver v2, then v1, then v2 again; projection holds v2. A tombstone v3 followed by a late v2 leaves the entry discarded |
+| Late snapshot from a retired owner | Projection unchanged | The consumer refuses a stale generation outside the handoff window (section 5.4) | Contract: after the flip, deliver a previous-generation snapshot; 409; row unchanged |
 
 Mark-billed on send is not in this table, because sending does not mark entries billed (L6, section 7.4).
 
 ### 9.4 Concurrency on entries
 
 - Entry updates take a row lock in Timekeeping and bump `version`. Clients that send `If-Match` get conflict detection; others keep last-write-wins, as today.
-- A user edit and a claim on the same entry serialize on the entry row. A claim that commits first makes a later employee edit fail with the locked error (A6), as today. Because the invoice save commits only after its claim succeeds (section 9.2), there is no moment when a saved draft's entries are editable.
+- A user edit and a prepare on the same entry serialize on the entry row. A prepare that commits first makes a later employee edit fail with the locked error (A6), as today. Because a provisional reservation exists before the invoice change commits (section 9.2), there is no moment when a saved draft's entries are editable.
 
 ## 10. Migration, backfill, reconciliation, phased cutover and rollback (proposed)
 
