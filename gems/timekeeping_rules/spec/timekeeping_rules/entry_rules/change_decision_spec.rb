@@ -176,4 +176,9 @@ RSpec.describe TimekeepingRules::EntryRules, ".change_decision and .refusing_rul
       expect(decide(entry: frozen_entry, change: frozen_change)).to eq(:forbidden)
     end
   end
+
+  it "keeps the change rule table and each of its rows frozen" do
+    expect(TimekeepingRules::EntryRules::CHANGE_RULES).to be_frozen
+    expect(TimekeepingRules::EntryRules::CHANGE_RULES).to all(be_frozen)
+  end
 end
