@@ -12,5 +12,15 @@ Rails.application.routes.draw do
 
   scope "internal/v1", module: "timekeeping/internal/v1" do
     get "metrics", to: "metrics#index"
+
+    scope "handoff", module: "handoff" do
+      get "checkpoint", to: "checkpoints#show"
+      put "checkpoint", to: "checkpoints#update"
+      post "entry_id_sequence", to: "entry_id_sequences#create"
+      get "outbox_position", to: "outbox_positions#show"
+      put "correction_snapshots", to: "correction_snapshots#update"
+      post "admission/fence", to: "admissions#fence"
+      post "admission/admit", to: "admissions#admit"
+    end
   end
 end
