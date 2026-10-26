@@ -15,10 +15,19 @@ module TestDatabaseCleanup
 
   # Intents and outbox items can be committed on a connection other than the
   # example's, so rolling back the example's transaction leaves them behind.
+  # The deletes run on a connection outside the pool: this step runs while the
+  # example's stubs are still active, and some examples stub
+  # ActiveRecord::Base.connection or methods on a pooled connection.
   def delete_operation_ledger_rows!
-    connection = ActiveRecord::Base.connection
-    connection.execute("DELETE FROM invoice_operation_outbox_items")
-    connection.execute("DELETE FROM invoice_operation_intents")
+    ledger_cleanup_connection.execute("DELETE FROM invoice_operation_outbox_items")
+    ledger_cleanup_connection.execute("DELETE FROM invoice_operation_intents")
+  end
+
+  def ledger_cleanup_connection
+    @ledger_cleanup_connection ||= begin
+      db_config = ActiveRecord::Base.connection_pool.db_config
+      db_config.adapter_class.new(db_config.configuration_hash)
+    end
   end
 
   # System, committed_data and without_transaction examples run with no
