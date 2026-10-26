@@ -4,46 +4,44 @@
 
 require "rails_helper"
 
-RSpec.describe Timekeeping::BillingFence, "queued behind a handoff update", committed_data: true do
-  # "A billing write that starts after the handoff's row update is refused"
-  # The billing transaction starts while the update is still open; it must read handoff_step under the
-  # lock after the update commits, not a value read before the lock.
-  it "waits behind an uncommitted handoff update and then refuses the billing transaction" do
+RSpec.describe Timekeeping::BillingFence, "observed waiting behind a handoff update", committed_data: true do
+  it "is seen waiting on the handoff connection's lock before release and is still refused once the handoff commits" do
+    handoff_pids = Queue.new
+    billing_pids = Queue.new
     updated = Queue.new
     release = Queue.new
-
-    handoff = Thread.new do
-      ActiveRecord::Base.connection_pool.with_connection do
-        TimekeepingOwnership.transaction do
-          TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)
-            .update_all(handoff_step: "close_admission")
-          updated << true
-          release.pop
-        end
-      end
-    end
-    updated.pop
-
     block_ran = false
-    billing = Thread.new do
-      ActiveRecord::Base.connection_pool.with_connection do
-        described_class.transaction { block_ran = true }
-        :admitted
-      rescue Timekeeping::BillingFence::OwnershipMoving
-        :refused
+
+    handoff = committed_data_thread(handoff_pids) do
+      TimekeepingOwnership.transaction do
+        TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(handoff_step: "close_admission")
+        updated << true
+        release.pop(timeout: 10)
       end
     end
+    expect(updated.pop(timeout: 5)).to be(true)
 
-    expect(billing.join(0.5)).to be_nil
+    billing = committed_data_thread(billing_pids) do
+      described_class.transaction { block_ran = true }
+      :admitted
+    rescue Timekeeping::BillingFence::OwnershipMoving
+      :refused
+    end
 
-    release << true
-    handoff.join(5)
+    begin
+      # "Synchronize contender startup and observe the database blocker, with a bounded wait, before releasing the transaction."
+      blocked = blocked_by?(billing_pids.pop(timeout: 5), handoff_pids.pop(timeout: 5))
+    ensure
+      release << true
+    end
 
+    expect(blocked).to be(true), "the billing transaction never waited on the handoff update's lock"
+    # "Retain the completion and refusal assertions."
+    expect(handoff.join(5)).not_to be_nil
     expect(billing.join(5)&.value).to eq(:refused)
     expect(block_ran).to be(false)
   ensure
-    release << true if handoff&.alive?
-    handoff&.join(5)
-    billing&.join(5)
+    release << true
+    [handoff, billing].compact.each { |thread| thread.join(5) }
   end
 end
