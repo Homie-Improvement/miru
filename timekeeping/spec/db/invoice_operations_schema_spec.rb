@@ -17,12 +17,12 @@ RSpec.describe "Timekeeping invoice_operations table" do
 
   def create_invoice_operation(company_id:, invoice_id: 7, state: "prepared")
     InvoiceOperation.create!(
-      company_id:, invoice_id:, operation_id: SecureRandom.uuid, state:, disposition: "active",
+      company_id:, invoice_id:, operation_id: SecureRandom.uuid, actor_name: "invoice-service", state:, disposition: "active",
       generation: 2, created_at: Time.current
     )
   end
 
-  it "declares the same columns, defaults, index and checks as the monolith's table" do
+  it "declares the same columns, defaults, indexes and checks as the monolith's table" do
     expect(invoice_operations_schema_lines(Rails.root.join("db/schema.rb")))
       .to eq(invoice_operations_schema_lines(Rails.root.join("../db/schema.rb")))
   end

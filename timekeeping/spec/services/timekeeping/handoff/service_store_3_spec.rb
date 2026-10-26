@@ -17,7 +17,8 @@ RSpec.describe Timekeeping::Handoff::ServiceStore do
 
   def partial_failure_reservation_row(entry_id, company_id, invoice_id)
     { "company_id" => company_id, "entry_id" => entry_id, "invoice_id" => invoice_id, "state" => "committed",
-      "disposition" => "active", "operation_id" => SecureRandom.uuid, "created_at" => Time.utc(2026, 3, 1, 12) }
+      "disposition" => "active", "operation_id" => SecureRandom.uuid, "created_at" => Time.utc(2026, 3, 1, 12),
+      "invoice_operation_id" => nil }
   end
 
   # "Load: "replaces the incoming owner's tables in one transaction", so loading

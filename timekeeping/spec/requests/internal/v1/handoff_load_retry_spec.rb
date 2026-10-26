@@ -20,7 +20,7 @@ RSpec.describe "Timekeeping handoff load retried" do
               "external_run_id" => nil, "external_session_id" => nil, "proof_url" => nil, "proof_metadata" => {},
               "discarded_at" => nil, "created_at" => at, "updated_at" => at }
     audit = { "id" => 70, "company_id" => 5, "entry_id" => 300, "actor_type" => "user", "actor_id" => 12,
-              "action" => "create", "before" => nil, "after" => { "duration" => BigDecimal("45.5") },
+              "actor_name" => nil, "action" => "create", "before" => nil, "after" => { "duration" => BigDecimal("45.5") },
               "entry_created_at" => at, "created_at" => at }
     Timekeeping::Handoff::Checkpoint.build(tables: {
       "entries" => [entry], "reservations" => [], "invoice_operations" => [],

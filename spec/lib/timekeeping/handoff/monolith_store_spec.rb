@@ -77,8 +77,8 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
     connection.execute(<<~SQL.squish)
       INSERT INTO reservations (company_id, entry_id, invoice_id, state, disposition, operation_id, created_at)
       VALUES (#{company_id}, #{entry_id}, 77, 'committed', 'active', gen_random_uuid(), now());
-      INSERT INTO invoice_operations (company_id, invoice_id, operation_id, state, disposition, generation, created_at)
-      VALUES (#{company_id}, 77, gen_random_uuid(), 'committed', 'active', 1, now());
+      INSERT INTO invoice_operations (company_id, invoice_id, operation_id, actor_name, state, disposition, generation, created_at)
+      VALUES (#{company_id}, 77, gen_random_uuid(), 'monolith', 'committed', 'active', 1, now());
       INSERT INTO entry_audits (company_id, entry_id, actor_type, actor_id, action, after, entry_created_at, created_at)
       VALUES (#{company_id}, #{entry_id}, 'User', 7, 'create', '{"duration": 5}', now(), now());
       INSERT INTO idempotency_records (company_id, actor_type, actor_id, operation, key, fingerprint, status, body, created_at)
@@ -117,12 +117,12 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
       "invoice_operations" => [
         {
           "id" => 3, "company_id" => 1, "invoice_id" => 987_654, "operation_id" => "0b1f8a4c-9d2e-4f7a-8c3b-5e6d7f8a9b0c",
-          "state" => "committed", "desired_entry_ids" => [11], "disposition" => "retained", "generation" => 2,
+          "actor_name" => "monolith", "state" => "committed", "desired_entry_ids" => [11], "disposition" => "retained", "generation" => 2,
           "created_at" => checkpoint_stamp, "finished_at" => checkpoint_stamp
         },
         {
           "id" => 4, "company_id" => 2, "invoice_id" => 55, "operation_id" => "1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f",
-          "state" => "aborted", "desired_entry_ids" => [], "disposition" => "active", "generation" => 1,
+          "actor_name" => "monolith", "state" => "aborted", "desired_entry_ids" => [], "disposition" => "active", "generation" => 1,
           "created_at" => checkpoint_stamp, "finished_at" => nil
         }
       ],
@@ -175,8 +175,8 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
 
     it "refuses to export a prepared invoice operation and names the table and company" do
       connection.execute(<<~SQL.squish)
-        INSERT INTO invoice_operations (company_id, invoice_id, operation_id, state, disposition, generation, created_at)
-        VALUES (44, 1, gen_random_uuid(), 'prepared', 'active', 1, now())
+        INSERT INTO invoice_operations (company_id, invoice_id, operation_id, actor_name, state, disposition, generation, created_at)
+        VALUES (44, 1, gen_random_uuid(), 'monolith', 'prepared', 'active', 1, now())
       SQL
 
       expect { store.export_checkpoint }
@@ -321,9 +321,9 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
                (502, 2, 1, 11, 21, '2026-01-06', 1.5, '', 'unbilled', 'not_required', '2026-02-01 00:00:00.000001', '2026-01-06 10:00:00', '2026-01-06 10:00:00');
         INSERT INTO reservations (company_id, entry_id, invoice_id, state, disposition, operation_id, created_at)
         VALUES (1, 501, 999999, 'committed', 'retained', '00000000-0000-0000-0000-000000000001', '2026-01-07 09:00:00');
-        INSERT INTO invoice_operations (company_id, invoice_id, operation_id, state, desired_entry_ids, disposition, generation, created_at, finished_at)
-        VALUES (1, 999999, '00000000-0000-0000-0000-000000000001', 'committed', '{501}', 'retained', 1, '2026-01-07 09:00:00', '2026-01-07 09:00:01'),
-               (2, 888, '00000000-0000-0000-0000-000000000002', 'aborted', '{}', 'active', 1, '2026-01-07 09:00:00', '2026-01-07 09:00:02');
+        INSERT INTO invoice_operations (company_id, invoice_id, operation_id, actor_name, state, desired_entry_ids, disposition, generation, created_at, finished_at)
+        VALUES (1, 999999, '00000000-0000-0000-0000-000000000001', 'monolith', 'committed', '{501}', 'retained', 1, '2026-01-07 09:00:00', '2026-01-07 09:00:01'),
+               (2, 888, '00000000-0000-0000-0000-000000000002', 'monolith', 'aborted', '{}', 'active', 1, '2026-01-07 09:00:00', '2026-01-07 09:00:02');
         INSERT INTO entry_audits (company_id, entry_id, actor_type, actor_id, action, before, after, entry_created_at, created_at)
         VALUES (1, 501, 'User', 20, 'create', NULL, '{"duration": 0.30000000000000004}', '2026-01-05 10:00:00.123456', '2026-01-05 10:00:00.123456'),
                (1, 501, 'User', 20, 'update', '{"note": ""}', '{"note": "first"}', '2026-01-05 10:00:00.123456', '2026-01-05 10:05:00');
@@ -338,7 +338,9 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
         )
       end
       before = rows_with_duration_bits.call
-      expect(before.values.map(&:size)).to eq([2, 1, 2, 2, 2])
+      expect(before.transform_values(&:size)).to eq(
+        "entries" => 2, "reservations" => 1, "invoice_operations" => 2, "entry_audits" => 2, "idempotency_records" => 2
+      )
       expect(before["idempotency_records"].pluck("body")).to include('{"z": 1,  "a": [ 2 ]}')
 
       checkpoint = store.export_checkpoint
@@ -607,7 +609,7 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
         }],
         "invoice_operations" => [{
           "id" => 7, "company_id" => invoice.company_id, "invoice_id" => invoice.id, "operation_id" => operation_id,
-          "state" => "committed", "desired_entry_ids" => [501], "disposition" => "active", "generation" => 1,
+          "actor_name" => "monolith", "state" => "committed", "desired_entry_ids" => [501], "disposition" => "active", "generation" => 1,
           "created_at" => checkpoint_stamp, "finished_at" => checkpoint_stamp
         }]
       )
@@ -641,7 +643,7 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
   def loaded_ids_audit(id:, entry_id:)
     {
       "id" => id, "company_id" => 1, "entry_id" => entry_id, "actor_type" => "User", "actor_id" => 1,
-      "action" => "create", "before" => nil, "after" => { "note" => "" },
+      "actor_name" => nil, "action" => "create", "before" => nil, "after" => { "note" => "" },
       "entry_created_at" => Time.utc(2026, 1, 5, 9), "created_at" => Time.utc(2026, 1, 5, 9)
     }
   end

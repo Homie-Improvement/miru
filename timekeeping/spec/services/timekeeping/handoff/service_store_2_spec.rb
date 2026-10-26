@@ -11,7 +11,8 @@ RSpec.describe Timekeeping::Handoff::ServiceStore do
     now = Time.utc(2026, 3, 2, 9)
     Entry.create!(id: 71, company_id: 8, version: 1, project_id: 5, user_id: 7, work_date: Date.new(2026, 3, 2),
                   duration: 15.0, note: "", bill_status: "unbilled", created_at: now, updated_at: now)
-    InvoiceOperation.create!(company_id: 8, invoice_id: 3, operation_id: SecureRandom.uuid, state: "committed",
+    InvoiceOperation.create!(company_id: 8, invoice_id: 3, operation_id: SecureRandom.uuid, actor_name: "invoice-service",
+                             state: "committed",
                              desired_entry_ids: [71], disposition: "active", generation: 2, created_at: now,
                              finished_at: now)
 

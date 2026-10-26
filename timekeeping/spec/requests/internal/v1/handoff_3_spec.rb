@@ -34,16 +34,16 @@ RSpec.describe "Timekeeping handoff checkpoint load run twice" do
       }],
       "reservations" => [{
         "company_id" => company_id, "entry_id" => id, "invoice_id" => 5, "state" => "committed",
-        "disposition" => "active", "operation_id" => operation_id, "created_at" => at
+        "disposition" => "active", "operation_id" => operation_id, "created_at" => at, "invoice_operation_id" => id
       }],
       "invoice_operations" => [{
         "id" => id, "company_id" => company_id, "invoice_id" => 5, "operation_id" => operation_id,
-        "state" => "committed", "desired_entry_ids" => [id], "disposition" => "active", "generation" => 1,
+        "actor_name" => "invoice-service", "state" => "committed", "desired_entry_ids" => [id], "disposition" => "active", "generation" => 1,
         "created_at" => at, "finished_at" => at
       }],
       "entry_audits" => [{
         "id" => id, "company_id" => company_id, "entry_id" => id, "actor_type" => "user", "actor_id" => 20,
-        "action" => "create", "before" => Timekeeping::Handoff::Checkpoint::JSON_NULL,
+        "actor_name" => nil, "action" => "create", "before" => Timekeeping::Handoff::Checkpoint::JSON_NULL,
         "after" => { "duration" => BigDecimal("60.000000000000000001") }, "entry_created_at" => at, "created_at" => at
       }],
       "idempotency_records" => [{

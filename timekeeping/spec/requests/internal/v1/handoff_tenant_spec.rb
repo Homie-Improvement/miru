@@ -82,16 +82,17 @@ RSpec.describe "Timekeeping internal handoff keeps company ownership through loa
       }],
       "reservations" => [{
         "company_id" => company_id, "entry_id" => entry_id, "invoice_id" => 500, "state" => "committed",
-        "disposition" => "active", "operation_id" => SecureRandom.uuid, "created_at" => at
+        "disposition" => "active", "operation_id" => SecureRandom.uuid, "created_at" => at,
+        "invoice_operation_id" => nil
       }],
       "invoice_operations" => [{
         "id" => company_id, "company_id" => company_id, "invoice_id" => 500, "operation_id" => SecureRandom.uuid,
-        "state" => "committed", "desired_entry_ids" => [entry_id], "disposition" => "active", "generation" => 1,
+        "actor_name" => "invoice-service", "state" => "committed", "desired_entry_ids" => [entry_id], "disposition" => "active", "generation" => 1,
         "created_at" => at, "finished_at" => at
       }],
       "entry_audits" => [{
         "id" => company_id, "company_id" => company_id, "entry_id" => entry_id, "actor_type" => "user",
-        "actor_id" => 20 + company_id, "action" => "create", "before" => nil,
+        "actor_id" => 20 + company_id, "actor_name" => nil, "action" => "create", "before" => nil,
         "after" => { "note" => "company #{company_id}" }, "entry_created_at" => at, "created_at" => at
       }],
       "idempotency_records" => [{

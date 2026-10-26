@@ -39,16 +39,17 @@ RSpec.describe Timekeeping::Handoff::ServiceStore do
         "entries" => [service_store_entry_row(id: 900, company_id: 8), service_store_entry_row(id: 901, company_id: 9)],
         "reservations" => [
           { "company_id" => 8, "entry_id" => 900, "invoice_id" => 41, "state" => "committed", "disposition" => "active",
-            "operation_id" => "11111111-1111-4111-8111-111111111111", "created_at" => service_store_at }
+            "operation_id" => "11111111-1111-4111-8111-111111111111", "created_at" => service_store_at,
+            "invoice_operation_id" => nil }
         ],
         "invoice_operations" => [
           { "id" => 300, "company_id" => 9, "invoice_id" => 41, "operation_id" => "22222222-2222-4222-8222-222222222222",
-            "state" => "aborted", "desired_entry_ids" => [900, 901], "disposition" => "retained", "generation" => 2,
+            "actor_name" => "invoice-service", "state" => "aborted", "desired_entry_ids" => [900, 901], "disposition" => "retained", "generation" => 2,
             "created_at" => service_store_at, "finished_at" => nil }
         ],
         "entry_audits" => [
           { "id" => 400, "company_id" => 8, "entry_id" => 900, "actor_type" => "user", "actor_id" => 12,
-            "action" => "update", "before" => Timekeeping::Handoff::Checkpoint::JSON_NULL,
+            "actor_name" => nil, "action" => "update", "before" => Timekeeping::Handoff::Checkpoint::JSON_NULL,
             "after" => { "duration" => BigDecimal("0.1000000000000000000001") }, "entry_created_at" => service_store_at,
             "created_at" => service_store_at }
         ],
@@ -155,7 +156,7 @@ RSpec.describe Timekeeping::Handoff::ServiceStore do
                                            key: "key-after-load", fingerprint: "def", status: 201, body: "{}",
                                            created_at: Time.current)
       expect(receipt.id).to be > 500
-      operation = InvoiceOperation.create!(company_id: 9, invoice_id: 42, operation_id: SecureRandom.uuid,
+      operation = InvoiceOperation.create!(company_id: 9, invoice_id: 42, operation_id: SecureRandom.uuid, actor_name: "invoice-service",
                                            state: "committed", disposition: "active", generation: 2,
                                            created_at: Time.current)
       expect(operation.id).to be > 300
@@ -179,7 +180,8 @@ RSpec.describe Timekeeping::Handoff::ServiceStore do
     end
 
     it "refuses to export while a prepared invoice operation remains" do
-      InvoiceOperation.create!(company_id: 8, invoice_id: 3, operation_id: SecureRandom.uuid, state: "prepared",
+      InvoiceOperation.create!(company_id: 8, invoice_id: 3, operation_id: SecureRandom.uuid, actor_name: "invoice-service",
+                               state: "prepared",
                                disposition: "active", generation: 2, created_at: Time.current)
 
       expect { store.export_checkpoint }.to raise_error(Timekeeping::Handoff::Store::Error, /prepared operations/)

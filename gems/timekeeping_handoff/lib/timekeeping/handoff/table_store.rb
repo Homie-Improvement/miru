@@ -25,9 +25,10 @@ module Timekeeping
         "idempotency_records" => %w[id]
       }.freeze
 
-      # Entries go in first and come out last, because reservations and
-      # entry_audits hold composite foreign keys to them.
-      LOAD_ORDER = %w[entries reservations invoice_operations entry_audits idempotency_records].freeze
+      # A table goes in after, and comes out before, every table it holds a
+      # foreign key to: reservations to entries, and in Timekeeping also to the
+      # invoice_operations row named by invoice_operation_id.
+      LOAD_ORDER = %w[entries invoice_operations reservations entry_audits idempotency_records].freeze
       INSERT_BATCH_SIZE = 500
 
       # The tables whose rows go in with the ids the checkpoint carries. Each

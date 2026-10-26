@@ -15,7 +15,8 @@ RSpec.describe "Timekeeping handoff round trip of the monolith checkpoint file" 
     ) { example.run }
   end
 
-  after { ApplicationRecord.connection.execute("TRUNCATE invoice_operations") }
+  # reservations holds a foreign key to invoice_operations, so both go together.
+  after { ApplicationRecord.connection.execute("TRUNCATE reservations, invoice_operations") }
 
   # Issue: "Populated audits, idempotency receipts and operation receipts round-trip between the two stores unchanged"
   # The rows of one company must come back under that company and no other.
