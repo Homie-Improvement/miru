@@ -161,9 +161,11 @@ RSpec.describe "Billing fence on mobile collection payments", type: :request do
     # Starts the handoff after the collection's own fenced transaction has
     # committed and before the link service admits its write.
     handoff_started = false
+    committed_before_handoff = nil
     allow(PaymentProviders::RazorpayPaymentLinkService).to receive(:new).and_wrap_original do |original, **kwargs|
       unless handoff_started
         handoff_started = true
+        committed_before_handoff = mobile_fence_invoice_snapshot(kwargs.fetch(:invoice))
         TimekeepingOwnership.current.update!(handoff_step: "close_admission")
       end
       original.call(**kwargs)
@@ -192,6 +194,12 @@ RSpec.describe "Billing fence on mobile collection payments", type: :request do
     expect(committed.client).to be_present
     expect(committed.razorpay_payment_link_id).to be_nil
     expect(committed.razorpay_payment_link_url).to be_nil
+    # The refused link step must leave the committed invoice exactly as the
+    # collection's own transaction wrote it: unpaid, with nothing recorded.
+    expect(committed_before_handoff).to include(payments: 0, link: [nil, nil, nil])
+    expect(committed_before_handoff[:status]).not_to eq("paid")
+    expect(committed_before_handoff[:amount_due].to_d).to be > 0
+    expect(mobile_fence_invoice_snapshot(committed)).to eq(committed_before_handoff)
     counts_after_refusal = counts.call
 
     TimekeepingOwnership.current.update!(handoff_step: nil)
