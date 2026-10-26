@@ -27,12 +27,13 @@ module Timekeeping
     SNAPSHOT_EVENT = "Timekeeping::FinancialSnapshotChanged"
     PREPARE_REFUSAL_REASON = "on_another_invoice"
 
-    # Alert row name => [signals key, reader]. Each reader takes the current time.
+    # Alert row name => signals key, which is also the name of the reader that
+    # fills it. Each reader takes the current time.
     LOCAL_SIGNALS = {
-      "stale_generation" => [:stale_generation_refusals, :stale_generation_refusals],
-      "prepare_refusal" => [:prepare_refusals, :prepare_refusals],
-      "reconciliation_difference" => [:reconciliation_differences, :reconciliation_differences],
-      "financial_snapshot_change" => [:financial_snapshot_changes, :financial_snapshot_changes]
+      "stale_generation" => :stale_generation_refusals,
+      "prepare_refusal" => :prepare_refusals,
+      "reconciliation_difference" => :reconciliation_differences,
+      "financial_snapshot_change" => :financial_snapshot_changes
     }.freeze
 
     module_function
@@ -62,8 +63,8 @@ module Timekeeping
 
     # Returns [{ signals key => value }, [names of signals whose read failed]].
     def read_local_signals(now)
-      LOCAL_SIGNALS.each_with_object([{}, []]) do |(name, (key, reader)), (read, failed)|
-        read[key] = public_send(reader, now)
+      LOCAL_SIGNALS.each_with_object([{}, []]) do |(name, key), (read, failed)|
+        read[key] = public_send(key, now)
       rescue ActiveRecord::ActiveRecordError => error
         Rails.logger.warn("timekeeping alert signal #{name} not read: #{error.class}")
         failed << name
