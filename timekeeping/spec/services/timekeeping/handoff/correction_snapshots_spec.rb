@@ -14,9 +14,7 @@ RSpec.describe Timekeeping::Handoff::CorrectionSnapshots do
       Entry.create!(company_id:, project_id: 5, user_id: 6, work_date: Date.new(2026, 3, 2), duration: 30.0,
                     bill_status: "unbilled", version: 0, created_at: now, updated_at: now)
     end
-    snapshot_fields = Timekeeping::OutboxFields::ENTRY_FIELDS - ["version"]
-    snapshots = entries.map { |entry| entry.attributes.slice(*snapshot_fields).merge("locked" => true) }
-    Timekeeping::Admission.ensure_initial!
+    snapshots = entries.map { |entry| handoff_correction_snapshot(entry, locked: true) }
     Timekeeping::Admission.fence!
 
     2.times { described_class.write!(snapshots:, version: 1, generation: 2) }
@@ -25,12 +23,100 @@ RSpec.describe Timekeeping::Handoff::CorrectionSnapshots do
       rows = OutboxSnapshot.where(company_id: entry.company_id, id: entry.id, generation: 2)
       expect(rows.pluck(:version, :locked)).to eq([[1, true]])
     end
+    # Each snapshot stays under its own entry's company, with no copy under the other.
+    expect(OutboxSnapshot.where(generation: 2).order(:company_id).pluck(:company_id, :id, :version))
+      .to eq([[31, entries.first.id, 1], [32, entries.last.id, 1]])
 
     before_counts = OutboxSnapshot.count
     duplicate = [snapshots.first, snapshots.first.merge("locked" => false)]
     expect { described_class.write!(snapshots: duplicate, version: 1, generation: 3) }.to raise_error(StandardError)
     expect(OutboxSnapshot.count).to eq(before_counts)
     expect(OutboxSnapshot.where(generation: 3)).to be_empty
+  end
+
+  it "write! twice keeps one snapshot per entry and generation and leaves the other generation alone" do
+    now = Time.utc(2026, 3, 2, 9)
+    entry = Entry.create!(id: 61, company_id: 4, version: 0, project_id: 5, user_id: 7,
+                          work_date: Date.new(2026, 3, 2), duration: 45.0, note: "", bill_status: "unbilled",
+                          created_at: now, updated_at: now)
+    snapshot = handoff_correction_snapshot(entry, locked: false)
+    OutboxSnapshot.insert_all!([snapshot.merge("version" => 0, "generation" => 1, "locked" => true)])
+    Timekeeping::Admission.fence!
+
+    2.times { described_class.write!(snapshots: [snapshot], version: 1, generation: 2) }
+
+    expect(OutboxSnapshot.where(company_id: 4, id: 61).order(:generation).pluck(:generation, :version, :locked))
+      .to eq([[1, 0, true], [2, 1, false]])
+  end
+
+  # An entry belongs to the company it is stored under, so a snapshot that
+  # pairs company 202 with company 101's entry must not reach the outbox.
+  it "refuses a correction snapshot that names another company for an entry and writes nothing" do
+    entry = Entry.create!(company_id: 101, project_id: 1, user_id: 1, work_date: Date.new(2026, 3, 2),
+                          duration: 60.0, bill_status: "unbilled", version: 0)
+    snapshot = handoff_correction_snapshot(entry, locked: true).merge("company_id" => 202)
+    Timekeeping::Admission.fence!
+
+    expect { described_class.write!(snapshots: [snapshot], version: 1, generation: 2) }.to raise_error(StandardError)
+
+    expect(OutboxSnapshot.count).to eq(0)
+    expect(entry.reload.version).to eq(0)
+  end
+
+  # Two concurrent writes could each delete nothing and then each insert a row.
+  it "leaves one correction snapshot when two writes of the same corrections run at the same time" do
+    entry = Entry.create!(company_id: 9, user_id: 1, project_id: 2, work_date: "2026-03-02", duration: 60.0,
+                          note: "Corrected", bill_status: "unbilled", source: "manual", source_metadata: {})
+    snapshot = handoff_correction_snapshot(entry, locked: true)
+    Timekeeping::Admission.fence!
+
+    # A third connection holds the entry row, so both writers stop at the
+    # lock the replacement takes before it deletes and inserts.
+    held = Queue.new
+    release = Queue.new
+    holder_pid = Queue.new
+    holder = Thread.new do
+      ApplicationRecord.connection_pool.with_connection do |connection|
+        holder_pid << connection.select_value("SELECT pg_backend_pid()")
+        connection.transaction do
+          connection.execute("SELECT 1 FROM entries WHERE id = #{Integer(entry.id)} FOR UPDATE")
+          held << true
+          release.pop(timeout: 10)
+        end
+      end
+    end
+    expect(held.pop(timeout: 10)).to be(true)
+    pid = holder_pid.pop(timeout: 10)
+
+    writers = Array.new(2) do
+      Thread.new do
+        ApplicationRecord.connection_pool.with_connection do
+          described_class.write!(snapshots: [snapshot], version: 1, generation: 2)
+        end
+      end
+    end
+
+    # The second writer may queue behind the first rather than the holder, so
+    # this counts every session blocked by any lock, not only by the holder.
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+    waiting = 0
+    while waiting < 2 && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      waiting = ApplicationRecord.connection.select_value(ApplicationRecord.sanitize_sql_array(
+        ["SELECT COUNT(*) FROM pg_stat_activity WHERE pid <> ? AND cardinality(pg_blocking_pids(pid)) > 0", pid]
+      )).to_i
+      sleep 0.02
+    end
+    expect(waiting).to eq(2)
+
+    release << true
+    holder.join(10)
+    results = writers.map { |writer| writer.join(10)&.value }
+
+    expect(results).to eq([1, 1])
+    expect(OutboxSnapshot.where(company_id: 9, id: entry.id, generation: 2).pluck(:version)).to eq([1])
+  ensure
+    release&.push(true)
+    [holder, *writers].compact.each { |thread| thread.join(10) || thread.kill }
   end
 end
 
@@ -43,8 +129,7 @@ RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "stored data" do
   let(:project) { timekeeping_arrange.project(company:) }
 
   def correction_snapshot_for(entry_id)
-    entry = Entry.find(entry_id)
-    entry.attributes.slice(*described_class::SNAPSHOT_FIELDS).merge("locked" => true)
+    handoff_correction_snapshot(Entry.find(entry_id), locked: true)
   end
 
   def correction_table_state

@@ -2,6 +2,11 @@
 
 abort "Refusing to seed timesheet demo data in production." if Rails.env.production?
 
+# Runs only in the initial legacy state. A missing ownership row also refuses,
+# and this script never recreates it, because lost ownership state must not
+# let demo entries bypass the Timekeeping service.
+TimekeepingOwnership.refuse_if_handoff_begun!
+
 # Seed file for comprehensive timesheet test data
 # Run with: rails db:seed:timesheet_data
 
