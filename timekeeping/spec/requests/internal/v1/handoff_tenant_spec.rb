@@ -164,8 +164,9 @@ RSpec.describe "Timekeeping internal handoff correction snapshots stay within on
     )])
     Timekeeping::Admission.fence!
     headers = { "Authorization" => "Bearer #{correction_scope_service_token}", "Content-Type" => "application/json" }
-    body = JSON.generate(generation: 2, version: 1,
-                         snapshots: [correction_scope_entry_fields(1, 301, locked: false)])
+    # to_json writes the times as ISO 8601 text, as the monolith's store does;
+    # the route refuses any other time text.
+    body = { generation: 2, version: 1, snapshots: [correction_scope_entry_fields(1, 301, locked: false)] }.to_json
 
     2.times do
       put "/internal/v1/handoff/correction_snapshots", params: body, headers: headers
