@@ -247,10 +247,20 @@ RSpec.describe "timekeeping:alerts against a running Timekeeping service", if: E
     stub = start_e2e_reference_stub([writer])
     timekeeping = start_e2e_timekeeping(reference_url: stub[:url], write_delay_ms: 350)
     token = mint_e2e_token(writer)
+    warm_up_e2e_timekeeping(timekeeping, writer, token)
 
-    statuses = Array.new(5) { post_e2e_entry(timekeeping, writer, token) }
+    # Timing each write from the client shows the delay hook ran, so the alert
+    # below cannot come from one slow cold-start write alone.
+    write_seconds = []
+    statuses = Array.new(5) do
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      status = post_e2e_entry(timekeeping, writer, token)
+      write_seconds << (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started)
+      status
+    end
 
     expect(statuses).to all(eq(201))
+    expect(write_seconds).to all(be >= 0.35)
 
     result = run_e2e_alerts_task(timekeeping)
 
