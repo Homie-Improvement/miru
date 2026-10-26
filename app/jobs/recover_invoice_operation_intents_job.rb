@@ -20,6 +20,10 @@ class RecoverInvoiceOperationIntentsJob < ApplicationJob
   # How long an intent may stay pending before operators are signalled. Kept
   # separate from PICKUP_AGE so resolving a crash never waits for the signal.
   SIGNAL_AGE = 10.minutes
+  # How long the sweep waits for a live save's advisory lock before it leaves
+  # that intent pending for the next run, so one stuck save cannot stall the
+  # sweep for every other intent and every undelivered row.
+  LOCK_WAIT_TIMEOUT = "5s"
 
   # reservations: lets specs hand in the adapter; without it delivery uses
   # the adapter for the current entry owner.
@@ -45,10 +49,14 @@ class RecoverInvoiceOperationIntentsJob < ApplicationJob
       end
     end
 
-    # Each intent gets its own transaction and lock, so one company's live
-    # save or one failing intent never holds up the others.
+    # Each intent gets its own transaction and lock, and the lock wait is
+    # bounded, so one company's live save or one failing intent never holds
+    # up the others. An intent whose lock wait times out stays pending.
     def resolve(intent)
       ApplicationRecord.transaction do
+        ApplicationRecord.connection.execute(
+          ActiveRecord::Base.sanitize_sql_array(["SET LOCAL lock_timeout = ?", LOCK_WAIT_TIMEOUT])
+        )
         Invoices::OperationLock.acquire!(ApplicationRecord.connection, company_id: intent.company_id, invoice_id: intent.invoice_id)
         moved = InvoiceOperationIntent
           .where(company_id: intent.company_id, invoice_id: intent.invoice_id, operation_id: intent.operation_id, state: "pending")

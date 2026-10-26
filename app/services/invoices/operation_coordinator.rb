@@ -40,19 +40,24 @@ module Invoices
       raise OperationErrors::NoTransaction unless connection.transaction_open?
 
       OperationLock.acquire!(connection, company_id: request.company_id, invoice_id: request.invoice_id)
-      generation = write_pending_intent(request)
+      # The intent stores the ownership row's generation, and commit and abort
+      # are rebuilt from the intent, so a request built for another generation
+      # would settle under a different one than it prepared under.
+      raise Timekeeping::BillingFence::OwnershipMoving unless request.generation == TimekeepingOwnership.current.generation
+
+      write_pending_intent(request)
 
       settlement = { commit_item_id: nil }
       transaction = connection.current_transaction
       transaction.after_commit { deliver(settlement[:commit_item_id]) if settlement[:commit_item_id] }
-      transaction.after_rollback { record_failure(request, generation) }
+      transaction.after_rollback { after_outermost_transaction(connection) { record_failure(request) } }
 
       outcome = reservations.prepare(request)
       route = PREPARE_ROUTES.fetch(outcome.state)
       raise route.new(outcome) if route == OperationErrors::Refused
       raise route unless route == :settle
 
-      settlement[:commit_item_id] = settle(request, holding, generation)
+      settlement[:commit_item_id] = settle(request, holding)
       outcome
     end
 
@@ -60,9 +65,20 @@ module Invoices
 
       attr_reader :reservations
 
-      # Returns the ownership generation it stored on the intent.
+      # Rails runs after_rollback callbacks when a savepoint rolls back, while
+      # the enclosing transaction is still open. The failure write must commit
+      # on its own before the abort is delivered, so it waits until no
+      # transaction is open, re-registering on each enclosing one; exactly one
+      # of the two callbacks fires when that transaction ends.
+      def after_outermost_transaction(connection, &block)
+        return block.call unless connection.transaction_open?
+
+        enclosing = connection.current_transaction
+        enclosing.after_commit { after_outermost_transaction(connection, &block) }
+        enclosing.after_rollback { after_outermost_transaction(connection, &block) }
+      end
+
       def write_pending_intent(request)
-        generation = TimekeepingOwnership.current.generation
         InvoiceOperationsRecord.with_connection do |intent_connection|
           intent_connection.transaction do
             intent_connection.execute(ActiveRecord::Base.sanitize_sql_array([<<~SQL.squish,
@@ -70,17 +86,16 @@ module Invoices
                 (company_id, invoice_id, operation_id, state, generation, disposition, desired_entry_ids, created_at)
               VALUES (?, ?, ?, 'pending', ?, ?, ?::bigint[], ?)
             SQL
-              request.company_id, request.invoice_id, request.operation_id, generation,
+              request.company_id, request.invoice_id, request.operation_id, request.generation,
               request.disposition, "{#{request.entries.join(',')}}", Time.current]))
           end
         end
-        generation
       end
 
       # Runs in the invoice transaction. Raises when the intent is no longer
       # pending: recovery already failed it and wrote its abort, so the
       # invoice change and a commit row must not survive.
-      def settle(request, holding, generation)
+      def settle(request, holding)
         moved = pending_intent(request).update_all(state: "committed", finished_at: Time.current)
         raise OperationErrors::IntentNotPending unless moved == 1
 
@@ -89,20 +104,21 @@ module Invoices
             entry_ids: holding.fetch(:entry_ids), disposition: holding.fetch(:disposition) },
           unique_by: %i[company_id invoice_id]
         )
-        insert_outbox_item(request, "commit", generation)
+        insert_outbox_item(request, "commit")
       end
 
-      # Runs once the invoice transaction has rolled back. The advisory lock
-      # was released with it, so it is taken again before the guarded update.
+      # Runs once the outermost transaction around the save has ended. The
+      # advisory lock was released with it, so it is taken again before the
+      # guarded update.
       # When the update changes no row the intent was already settled
       # elsewhere and nothing is written. When this write itself fails, the
       # intent stays pending for recovery and the caller still sees the
       # original error.
-      def record_failure(request, generation)
+      def record_failure(request)
         abort_item_id = ApplicationRecord.transaction do
           OperationLock.acquire!(ApplicationRecord.connection, company_id: request.company_id, invoice_id: request.invoice_id)
           moved = pending_intent(request).update_all(state: "failed", finished_at: Time.current)
-          insert_outbox_item(request, "abort", generation) if moved == 1
+          insert_outbox_item(request, "abort") if moved == 1
         end
         deliver(abort_item_id) if abort_item_id
       rescue StandardError => error
@@ -116,10 +132,10 @@ module Invoices
         )
       end
 
-      def insert_outbox_item(request, kind, generation)
+      def insert_outbox_item(request, kind)
         InvoiceOperationOutboxItem.record!(
           kind:, company_id: request.company_id, invoice_id: request.invoice_id,
-          operation_id: request.operation_id, generation:,
+          operation_id: request.operation_id, generation: request.generation,
           disposition: request.disposition, desired_entry_ids: request.entries
         )
       end

@@ -17,36 +17,6 @@ end
 
 RSpec.describe Invoices::OperationLock, committed_data: true do
   # "Take `pg_advisory_xact_lock` keyed on (company_id, invoice_id) in the invoice transaction."
-  # One company's in-flight save must not hold up another company's save of the same invoice id.
-  it "does not block a save of the same invoice id in another company" do
-    holder_pids = Queue.new
-    release = Queue.new
-    holder = committed_data_thread(holder_pids) do
-      ActiveRecord::Base.transaction do
-        described_class.acquire!(ActiveRecord::Base.connection, company_id: 1, invoice_id: 10)
-        release.pop
-      end
-    end
-    holder_pid = holder_pids.pop
-
-    contender_pids = Queue.new
-    contender = committed_data_thread(contender_pids) do
-      ActiveRecord::Base.transaction do
-        described_class.acquire!(ActiveRecord::Base.connection, company_id: 2, invoice_id: 10)
-      end
-    end
-    contender_pid = contender_pids.pop
-
-    expect(blocked_by?(contender_pid, holder_pid, within: 1)).to be(false)
-    expect(contender.join(5)).to be_truthy
-  ensure
-    release&.push(true)
-    holder&.join
-  end
-end
-
-RSpec.describe Invoices::OperationLock, committed_data: true do
-  # "Take `pg_advisory_xact_lock` keyed on (company_id, invoice_id) in the invoice transaction."
   it "does not make a save in one company wait on another company's lock for the same invoice id" do
     holder_pids = Queue.new
     release = Queue.new

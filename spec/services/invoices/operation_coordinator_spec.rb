@@ -539,4 +539,47 @@ RSpec.describe Invoices::OperationCoordinator, committed_data: true do
     expect(InvoiceOperationIntent.where(company_id: request.company_id)).to be_empty
     expect(adapter.requests).to be_empty
   end
+
+  it "records the failure of a rolled-back savepoint only after the enclosing transaction ends, before sending abort" do
+    request = coordinator_order_request(create(:invoice))
+    state_seen_at_abort = nil
+    adapter = RecordingReservationAdapter.new(
+      prepare: coordinator_order_outcome("refused"),
+      commit: coordinator_order_outcome("committed"),
+      abort: lambda { |_received|
+        committed_data_thread do
+          state_seen_at_abort = [coordinator_order_intent(request).state, coordinator_order_rows(request).pluck(:kind)]
+        end.join
+        coordinator_order_outcome("aborted")
+      }
+    )
+
+    ApplicationRecord.transaction do
+      ApplicationRecord.transaction(requires_new: true) do
+        described_class.new(reservations: adapter).call(request, holding: { entry_ids: [501], disposition: "active" })
+      rescue Invoices::OperationErrors::Refused
+        raise ActiveRecord::Rollback
+      end
+      expect(adapter.requests.size).to eq(1)
+      raise ActiveRecord::Rollback
+    end
+
+    expect(state_seen_at_abort).to eq(["failed", ["abort"]])
+    expect(coordinator_order_intent(request).state).to eq("failed")
+    expect(coordinator_order_rows(request).pluck(:kind)).to eq(["abort"])
+    expect(adapter.requests.size).to eq(2)
+  end
+
+  it "refuses a request built for another ownership generation before writing an intent" do
+    request = Invoices::ReservationRequest.new(
+      company_id: 7601, invoice_id: 9601, operation_id: SecureRandom.uuid,
+      generation: TimekeepingOwnership.current.generation + 1, disposition: "active", entries: [501]
+    )
+    adapter = coordinator_order_adapter(prepare: coordinator_order_outcome("prepared"))
+
+    expect { coordinator_order_save(adapter, request) }.to raise_error(Timekeeping::BillingFence::OwnershipMoving)
+
+    expect(InvoiceOperationIntent.where(company_id: 7601)).to be_empty
+    expect(adapter.requests).to be_empty
+  end
 end

@@ -434,3 +434,36 @@ RSpec.describe RecoverInvoiceOperationIntentsJob do
     end
   end
 end
+
+RSpec.describe RecoverInvoiceOperationIntentsJob, committed_data: true do
+  it "leaves an intent whose save holds the lock past the wait bound pending and still fails another company's intent" do
+    stub_const("RecoverInvoiceOperationIntentsJob::LOCK_WAIT_TIMEOUT", "200ms")
+    aborted = Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
+    adapter = RecordingReservationAdapter.new(prepare: aborted, commit: aborted, abort: aborted)
+    stuck = InvoiceOperationIntent.create!(company_id: 7701, invoice_id: 9701, operation_id: SecureRandom.uuid,
+      state: "pending", generation: 1, disposition: "active", desired_entry_ids: [1], created_at: 2.minutes.ago)
+    crashed = InvoiceOperationIntent.create!(company_id: 7702, invoice_id: 9702, operation_id: SecureRandom.uuid,
+      state: "pending", generation: 1, disposition: "active", desired_entry_ids: [2], created_at: 2.minutes.ago)
+    locked = Queue.new
+    release = Queue.new
+
+    holder = committed_data_thread do
+      ApplicationRecord.transaction do
+        Invoices::OperationLock.acquire!(ActiveRecord::Base.connection, company_id: 7701, invoice_id: 9701)
+        locked << true
+        release.pop(timeout: 10)
+      end
+    end
+    expect(locked.pop(timeout: 5)).to be(true)
+
+    described_class.perform_now(reservations: adapter)
+
+    expect(stuck.reload.state).to eq("pending")
+    expect(InvoiceOperationOutboxItem.where(company_id: 7701)).to be_empty
+    expect(crashed.reload.state).to eq("failed")
+    expect(InvoiceOperationOutboxItem.where(company_id: 7702, kind: "abort").count).to eq(1)
+  ensure
+    release&.push(true)
+    holder&.join(5)
+  end
+end

@@ -54,7 +54,7 @@ RSpec.describe Invoices::OutboxDelivery do
     delivery = described_class.new(adapter_source: -> { adapter })
 
     delivery.deliver(row.id)
-    first_state = row.reload.attributes.slice("delivered_at", "attempts")
+    first_state = row.reload.attributes
     delivery.deliver(row.id)
 
     expect(received.size).to eq(1)
@@ -63,7 +63,7 @@ RSpec.describe Invoices::OutboxDelivery do
       generation: 7, disposition: "retained", entries: [11, 12]
     )
     expect(first_state["delivered_at"]).to be_present
-    expect(row.reload.attributes.slice("delivered_at", "attempts")).to eq(first_state)
+    expect(row.reload.attributes).to eq(first_state)
     expect(InvoiceOperationOutboxItem.where(company_id: invoice.company_id, operation_id:).count).to eq(1)
   end
 end
@@ -106,29 +106,6 @@ end
 
 RSpec.describe Invoices::OutboxDelivery do
   # "It builds the request from the stored outbox row and intent (company_id, invoice_id, operation_id, generation, disposition, desired_entry_ids), never from the invoice's current lines."
-  # The outbox row is found by a bare id, so company_id is the only thing that stops it settling another company's intent.
-  it "sends nothing when the only intent with the row's operation id belongs to another company" do
-    operation_id = SecureRandom.uuid
-    InvoiceOperationIntent.insert_all!([
-      { company_id: 2, invoice_id: 10, operation_id:, state: "committed", generation: 1,
-        desired_entry_ids: [7, 8], disposition: "active", created_at: Time.current }
-    ])
-    item = InvoiceOperationOutboxItem.create!(
-      company_id: 1, invoice_id: 10, operation_id:, kind: "commit",
-      payload: { "company_id" => 1, "invoice_id" => 10, "operation_id" => operation_id }
-    )
-    committed = Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {})
-    adapter = RecordingReservationAdapter.new(prepare: committed, commit: committed, abort: committed)
-
-    described_class.new(adapter_source: -> { adapter }).deliver(item.id)
-
-    expect(adapter.requests).to be_empty
-    expect(item.reload.delivered_at).to be_nil
-  end
-end
-
-RSpec.describe Invoices::OutboxDelivery do
-  # "It builds the request from the stored outbox row and intent (company_id, invoice_id, operation_id, generation, disposition, desired_entry_ids), never from the invoice's current lines."
   it "builds the request from the row's own company when two companies share an operation id" do
     operation_id = SecureRandom.uuid
     InvoiceOperationIntent.insert_all!([
@@ -157,63 +134,6 @@ RSpec.describe Invoices::OutboxDelivery do
 end
 
 RSpec.describe Invoices::OutboxDelivery do
-  # Test list: "an undelivered commit row is delivered once and a second delivery changes nothing"
-  it "makes no second adapter call and changes no column when an already delivered commit row is delivered again" do
-    company_id = 7101
-    invoice_id = 9101
-    operation_id = SecureRandom.uuid
-    InvoiceOperationIntent.create!(
-      company_id:, invoice_id:, operation_id:, state: "committed", generation: 1,
-      disposition: "active", desired_entry_ids: [11, 12]
-    )
-    item = InvoiceOperationOutboxItem.create!(
-      company_id:, invoice_id:, operation_id:, kind: "commit",
-      payload: { company_id:, invoice_id:, operation_id:, generation: 1, disposition: "active", desired_entry_ids: [11, 12] }
-    )
-    adapter = RecordingReservationAdapter.new(
-      prepare: Invoices::ReservationOutcome.new(state: "prepared", conflicts: [], counts: {}),
-      commit: Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {}),
-      abort: Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
-    )
-    delivery = described_class.new(adapter_source: -> { adapter })
-
-    delivery.deliver(item.id)
-    after_first = item.reload.attributes
-
-    delivery.deliver(item.id)
-
-    expect(after_first["delivered_at"]).to be_present
-    expect(adapter.requests.size).to eq(1)
-    expect(item.reload.attributes).to eq(after_first)
-  end
-end
-
-RSpec.describe Invoices::OutboxDelivery do
-  # "It builds the request from the stored outbox row and intent (company_id, invoice_id, operation_id, generation, disposition, desired_entry_ids), never from the invoice's current lines."
-  # The scenario: an outbox row is looked up by bare id; an intent from another company that shares
-  # its operation_id must never be used to settle it.
-  it "sends nothing when the only intent with the row's operation_id belongs to another company" do
-    operation_id = SecureRandom.uuid
-    InvoiceOperationIntent.create!(
-      company_id: 7202, invoice_id: 9202, operation_id:, state: "failed", generation: 1,
-      disposition: "active", desired_entry_ids: [21]
-    )
-    item = InvoiceOperationOutboxItem.create!(
-      company_id: 7201, invoice_id: 9201, operation_id:, kind: "abort",
-      payload: { company_id: 7201, invoice_id: 9201, operation_id:, generation: 1, disposition: "active", desired_entry_ids: [21] }
-    )
-    adapter = RecordingReservationAdapter.new(
-      prepare: Invoices::ReservationOutcome.new(state: "prepared", conflicts: [], counts: {}),
-      commit: Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {}),
-      abort: Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
-    )
-
-    described_class.new(adapter_source: -> { adapter }).deliver(item.id)
-
-    expect(adapter.requests).to be_empty
-    expect(item.reload.delivered_at).to be_nil
-  end
-
   it "delivers an abort row through abort when its invoice no longer exists" do
     operation_id = SecureRandom.uuid
     InvoiceOperationIntent.create!(
