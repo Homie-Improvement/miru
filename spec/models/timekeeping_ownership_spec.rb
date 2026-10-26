@@ -97,6 +97,17 @@ RSpec.describe TimekeepingOwnership, type: :model do
       expect(ownership.snapshot_generation_accepted?(generation: 2, outbox_position: 50)).to be(true)
     end
 
+    it "accepts the previous generation during a handoff only up to the final outbox position, and not after the flip" do
+      ownership.update_columns(generation: 2, handoff_step: "freeze", final_outbox_position: 10)
+
+      expect(ownership.snapshot_generation_accepted?(generation: 1, outbox_position: 9)).to be(true)
+      expect(ownership.snapshot_generation_accepted?(generation: 1, outbox_position: 10)).to be(true)
+      expect(ownership.snapshot_generation_accepted?(generation: 1, outbox_position: 11)).to be(false)
+
+      ownership.update_columns(handoff_step: nil)
+      expect(ownership.snapshot_generation_accepted?(generation: 1, outbox_position: 9)).to be(false)
+    end
+
     it "refuses a previous-generation snapshot whose outbox position is not an integer" do
       ownership.update_columns(generation: 2, handoff_step: "freeze", final_outbox_position: 10)
 
