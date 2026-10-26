@@ -525,7 +525,7 @@ The relay runs on its own queue, worked by its own dedicated worker. This follow
 
 | Kind | Who | Credential | Checks applied |
 |---|---|---|---|
-| **User-delegated** | Web, mobile, bulk, CLI (which also serves MCP), desktop timer | Short-lived token signed by the monolith: `sub` (user id), `company_id`, `role` in that company, `edit_days`, `projects` facts, `exp` (60 seconds), `jti` | A1–A7 and S1–S7, exactly as for that user today. A role claim is valid only for the `company_id` in the same token. |
+| **User-delegated** | Web, mobile, bulk, CLI (which also serves MCP), desktop timer | Short-lived token signed by the monolith: `sub` (user id), `company_id`, `role` in that company, `edit_days`, `projects` facts, `exp` (60 seconds), `jti`, and `purpose` (`read` or `write`) | A1–A7 and S1–S7, exactly as for that user today. A role claim is valid only for the `company_id` in the same token. A read token may carry an owner or admin role the user holds in that company in place of their primary role, so Timekeeping refuses it on every write route; a token without `purpose` is treated as a write token (section 11.2). |
 | **Agent** | The agent API | The same signed token, for the agent's user, with `agent_id` set | Today's checks only: the project scope (the project must be in `ProjectPolicy::Scope` for the agent's user and company), then the model rules S1–S4 and S7. The agent API skips Pundit today (`app/controllers/api/v1/agent/base_controller.rb:7`, `timesheet_entries_controller.rb:4-18`), so A1–A5 do not apply to it. |
 | **Background** | Invoice reservation boundary, Harvest import, agent destroy | Service credential (mutual TLS or a signed service token) bound to one `company_id` per request and to a named operation list | Only the named operations: `reservations.prepare`, `reservations.commit`, `reservations.abort`, `invoices.mark_billed`, `entries.import` and `agents.detach_entries`. Company scoping applies to every operation. |
 
@@ -986,6 +986,7 @@ handoff(outgoing, incoming):
 | `TIMEKEEPING_TOKEN_PRIVATE_KEY` | Monolith | Signs user tokens |
 | `TIMEKEEPING_SERVICE_TOKEN` (or mutual TLS certificates) | Both | Background service identity |
 | `TIMEKEEPING_BASE_URL` | Monolith | Where to forward entry requests |
+| `TIMEKEEPING_READ_TOKENS_ENABLED` | Monolith | When on, signs delegated entry reads as read tokens that carry an owner or admin role the user holds. Set it only once every running Timekeeping refuses read tokens on write routes. To roll Timekeeping back past that version: clear it on every monolith process and restart them, so none is still minting a read token; then wait at least the token lifetime (`Timekeeping::UserToken::TTL`, 60 seconds) after the last restart, so every issued read token has expired; only then deploy the older Timekeeping, which would accept a live read token's raised role for writes |
 | `MONOLITH_REFERENCE_URL` | Timekeeping | Reference-data read endpoint (section 3.4) |
 | `MONOLITH_SNAPSHOT_URL` | Timekeeping | The projection endpoint the relay delivers to (section 5.4) |
 
