@@ -17,6 +17,10 @@ class InvoicePayment::StripeCheckoutFulfillment < ApplicationService
     return false unless is_valid_event?
 
     settle_payment
+    rescue Timekeeping::BillingFence::OwnershipMoving
+      # Answered with a retryable 503 so Stripe redelivers the event after the
+      # handoff; swallowing it here would lose the customer's payment.
+      raise
     rescue StandardError => error
       Rails.logger.error error.message
       Rails.logger.error error.backtrace.join("\n")
@@ -26,11 +30,15 @@ class InvoicePayment::StripeCheckoutFulfillment < ApplicationService
 
   private
 
+    # The ownership lock is taken before the invoice lock, the order the other
+    # fenced payment paths use.
     def settle_payment
-      invoice.with_lock do
-        next true if duplicate_payment?
+      Timekeeping::BillingFence.transaction do
+        invoice.with_lock do
+          next true if duplicate_payment?
 
-        InvoicePayment::Settle.process(payment_params, invoice)
+          InvoicePayment::Settle.process(payment_params, invoice)
+        end
       end
     end
 

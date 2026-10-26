@@ -83,7 +83,7 @@ RSpec.describe InvoicePayment::PaypalCaptureFulfillment do
   it "sends payment emails on settlement" do
     allow(client).to receive(:capture_order).and_return(completed_order)
 
-    expect { fulfillment.process }.to have_enqueued_job(ActionMailer::MailDeliveryJob).at_least(:once)
+    expect { fulfillment.process }.to have_enqueued_mail(PaymentMailer, :payment)
   end
 
   it "reads the order when PayPal reports it already captured" do

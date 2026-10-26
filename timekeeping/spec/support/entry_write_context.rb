@@ -48,8 +48,8 @@ RSpec.shared_context "timekeeping entry writes without transactional fixtures" d
 
   after do
     ApplicationRecord.connection.execute(<<~SQL.squish)
-      TRUNCATE entries, reservations, audit_events, outbox_snapshots, idempotency_receipts, write_metric_windows,
-        write_metric_events
+      TRUNCATE entries, reservations, invoice_operations, service_idempotency_receipts, audit_events, outbox_snapshots,
+        idempotency_receipts, write_metric_windows, write_metric_events
     SQL
     Timekeeping::Admission.ensure_initial!
     Timekeeping::Admission.admit!(generation: 1)

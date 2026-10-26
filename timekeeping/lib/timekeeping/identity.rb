@@ -18,9 +18,15 @@ module Timekeeping
   # purpose is the token's signed purpose claim ("read" or "write"), or nil for
   # a token signed without one. Only WriteAccess reads it: a read token may
   # carry a raised role, so it must never authorize a write.
-  Identity = Data.define(:kind, :status, :user_id, :company_id, :role, :signed_company_id, :purpose) do
-    def initialize(signed_company_id: nil, purpose: nil, **fields)
-      super
+  #
+  # A service caller is either the raw shared TIMEKEEPING_SERVICE_TOKEN, which
+  # acts for no company and holds no operations, or a signed service token
+  # (Timekeeping::ServiceTokenVerifier), whose verified claims give its
+  # service_name, its one company_id and the operations it may run.
+  Identity = Data.define(:kind, :status, :user_id, :company_id, :role, :signed_company_id, :purpose,
+                         :service_name, :operations) do
+    def initialize(signed_company_id: nil, purpose: nil, service_name: nil, operations: [], **fields)
+      super(signed_company_id:, purpose:, service_name:, operations: operations.freeze, **fields)
     end
 
     def self.anonymous(status, signed_company_id: nil)
@@ -29,6 +35,18 @@ module Timekeeping
 
     def self.service
       new(kind: :service, status: :verified, user_id: nil, company_id: nil, role: nil)
+    end
+
+    def self.bound_service(claims)
+      new(
+        kind: :service,
+        status: :verified,
+        user_id: nil,
+        company_id: claims.fetch("company_id"),
+        role: nil,
+        service_name: claims.fetch("sub"),
+        operations: claims.fetch("operations")
+      )
     end
 
     def self.user(claims)
@@ -47,7 +65,7 @@ module Timekeeping
 
     # Pure: every input is an argument and nothing is read from ENV. An unset
     # or empty service token matches no caller, and a missing or unreadable
-    # public key verifies no token.
+    # public key verifies no user or service token.
     def self.resolve(authorization:, public_key:, service_token:)
       return anonymous(:missing) if authorization.to_s.strip.empty?
 
@@ -55,12 +73,25 @@ module Timekeeping
       return anonymous(:invalid) unless token
       return service if service_token?(token, service_token)
 
-      user(TokenVerifier.verify(token, public_key:))
+      signed(token, public_key:)
     rescue TokenVerifier::ExpiredToken => e
       anonymous(:expired, signed_company_id: e.company_id)
+    rescue ServiceTokenVerifier::ExpiredToken
+      anonymous(:expired)
     rescue TokenVerifier::InvalidToken
       anonymous(:invalid)
     end
+
+    # Both kinds are signed with the same key. A service token must carry
+    # typ "timekeeping_service", which no user token has, and a user token
+    # needs an integer sub and a role, which no service token has, so neither
+    # verifies as the other.
+    def self.signed(token, public_key:)
+      bound_service(ServiceTokenVerifier.verify(token, public_key:))
+    rescue ServiceTokenVerifier::InvalidToken
+      user(TokenVerifier.verify(token, public_key:))
+    end
+    private_class_method :signed
 
     # The token of a "Bearer <token>" Authorization header, or nil. Entry
     # writes also read it, to refuse a body that carries the caller's token.

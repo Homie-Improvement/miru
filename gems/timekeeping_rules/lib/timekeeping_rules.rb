@@ -2,3 +2,4 @@
 
 require_relative "timekeeping_rules/version"
 require_relative "timekeeping_rules/entry_rules"
+require_relative "timekeeping_rules/reservation_decision"

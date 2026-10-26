@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 class PaymentMailer < ApplicationMailer
+  self.delivery_job = BillingFencedMailDeliveryJob
+
   def payment
     @invoice = Invoice.find(params[:invoice_id])
     recipients = recipients_with_role
@@ -19,7 +21,8 @@ class PaymentMailer < ApplicationMailer
         )
       end
 
-      @invoice.update_columns(payment_sent_at: DateTime.current)
+      # update_columns skips the model's billing guard, so the fence is taken here.
+      Timekeeping::BillingFence.transaction { @invoice.update_columns(payment_sent_at: DateTime.current) }
     end
   end
 
