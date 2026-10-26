@@ -40,6 +40,15 @@ entry_fields:
   # Columns the projection gains.
   - company_id
   - version
+# The values the consumer accepts for its string-valued enum fields
+# (TimesheetEntry::SOURCES and the bill_status and review_status enums of
+# app/models/timesheet_entry.rb). A snapshot holding any other value is refused,
+# and a refused snapshot holds back every later one, so producers check these
+# lists before they write.
+entry_values:
+  sources: [manual, cli, mcp, automation, import]
+  bill_statuses: [non_billable, unbilled, billed]
+  review_statuses: [not_required, pending_review, approved, rejected]
 response_fields: [applied, ignored]
 
 rules:
