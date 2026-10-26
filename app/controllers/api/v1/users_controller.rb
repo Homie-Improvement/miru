@@ -64,22 +64,33 @@ class Api::V1::UsersController < Api::V1::BaseController
       return
     end
 
-    Audited::Audit.create!(
-      auditable: target_user,
-      associated: current_company,
-      user: current_user,
-      action: "super_admin_delete",
-      audited_changes: {
-        actor_id: current_user.id,
-        actor_email: current_user.email,
-        target_user_id: target_user.id,
-        target_user_email: target_user.email,
-        occurred_at: Time.current.iso8601
-      },
-      comment: "Super admin permanently deleted user"
-    )
+    # Once a timekeeping handoff has begun, the hard delete is refused. The
+    # audit row and the delete run under the ownership row's share lock, so a
+    # handoff cannot begin between the check and the delete.
+    deleted = TimekeepingOwnership.unless_handoff_begun do
+      Audited::Audit.create!(
+        auditable: target_user,
+        associated: current_company,
+        user: current_user,
+        action: "super_admin_delete",
+        audited_changes: {
+          actor_id: current_user.id,
+          actor_email: current_user.email,
+          target_user_id: target_user.id,
+          target_user_email: target_user.email,
+          occurred_at: Time.current.iso8601
+        },
+        comment: "Super admin permanently deleted user"
+      )
 
-    target_user.destroy!
+      target_user.destroy!
+    end
+
+    unless deleted
+      render json: { errors: I18n.t("user.super_admin_delete.handoff_begun") }, status: 422
+
+      return
+    end
 
     render json: {
       notice: I18n.t("user.super_admin_delete.success", email: target_user.email)
