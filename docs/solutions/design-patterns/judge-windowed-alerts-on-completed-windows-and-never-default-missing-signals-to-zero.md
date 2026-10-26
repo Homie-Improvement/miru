@@ -5,7 +5,7 @@ problem_type: design_pattern
 component: observability
 severity: medium
 evidence_grounding: anchored
-grounding_evidence: "app/services/timekeeping/alerts.rb in PR #121 has completed_windows/completed_recently? and treats a nil signal as no measurement; app/services/timekeeping/alert_signals.rb lists sourceless signals in unavailable; app/services/timekeeping/metrics_client.rb checks REQUIRED_FIELDS types; spec/services/timekeeping/alerts_2_spec.rb covers the partial-window cases."
+grounding_evidence: "app/services/timekeeping/alerts.rb in PR #121 has completed_windows/completed_recently? and treats a nil signal as no measurement; app/services/timekeeping/alert_signals.rb lists sourceless signals in unavailable; app/services/timekeeping/metrics_client.rb checks REQUIRED_FIELDS types; spec/services/timekeeping/alerts_spec.rb covers the partial-window cases."
 audience: both
 related_components:
   - metrics_client
@@ -53,5 +53,5 @@ Each wrong choice either pages someone for a blip or hides a real outage. None o
 - PR #121 adds `app/services/timekeeping/alerts.rb` with `completed_windows`, `completed_recently?`, `reference_unavailable_rate` and `p95_bound` returning `Float::INFINITY` for overflow.
 - PR #121 adds `app/services/timekeeping/alert_signals.rb` with `NO_SOURCE`, the `unavailable` list and the `metrics_error` rescue of `MetricsClient::Error`.
 - PR #121 adds `app/services/timekeeping/metrics_client.rb` with `REQUIRED_FIELDS` type checks and `Net::HTTPBadResponse` in the rescue list. `spec/services/timekeeping/metrics_client_spec.rb` covers a body without `window_seconds` and one with `"companies" => nil`.
-- PR #121's `spec/services/timekeeping/alerts_2_spec.rb` covers a healthy newer partial window that neither hides a failed completed window nor fires on its own. `spec/tasks/timekeeping_alerts_4_spec.rb` shows the pending-intent alert still printing before a non-zero exit.
+- `spec/services/timekeeping/alerts_spec.rb` covers a healthy newer partial window that neither hides a failed completed window nor fires on its own. `spec/tasks/timekeeping_alerts_spec.rb` shows the pending-intent alert still printing before a non-zero exit when the metrics read fails.
 - PR #121 adds `window_seconds` to `timekeeping/app/presenters/timekeeping/write_metrics_presenter.rb`.
