@@ -5,7 +5,7 @@ problem_type: design_pattern
 component: payments
 severity: high
 evidence_grounding: anchored
-grounding_evidence: app/services/invoice_payment/stripe_payment_succeeded.rb, stripe_checkout_fulfillment.rb, stripe_checkout_failed.rb and app/controllers/webhooks/razorpay_controller.rb add rescue Timekeeping::BillingFence::OwnershipMoving with raise ahead of rescue StandardError; app/controllers/webhooks/paypal_controller.rb includes OwnershipMovingResponse because it inherits ActionController::API; spec/services/invoice_payment/stripe_payment_succeeded_fence_spec.rb proves the refusal escapes and a replay records one payment
+grounding_evidence: app/services/invoice_payment/stripe_payment_succeeded.rb, stripe_checkout_fulfillment.rb, stripe_checkout_failed.rb and app/controllers/webhooks/razorpay_controller.rb add rescue Timekeeping::BillingFence::OwnershipMoving with raise ahead of rescue StandardError; app/controllers/webhooks/paypal_controller.rb includes OwnershipMovingResponse because it inherits ActionController::API; spec/services/invoice_payment/stripe_payment_succeeded_spec.rb proves the refusal escapes and a replay records one payment
 audience: both
 related_components:
   - Timekeeping::BillingFence
@@ -61,5 +61,5 @@ PR #86, head commit `5b757b144b064084341ef0a7543debbe92f7abbd`:
 - `app/services/invoice_payment/stripe_payment_succeeded.rb`, `app/services/invoice_payment/stripe_checkout_fulfillment.rb`, `app/services/invoice_payment/stripe_checkout_failed.rb` and `app/controllers/webhooks/razorpay_controller.rb` each add a re-raising `rescue Timekeeping::BillingFence::OwnershipMoving` ahead of `rescue StandardError`.
 - `app/controllers/webhooks/paypal_controller.rb` includes `OwnershipMovingResponse` and renders the refusal before its `StandardError` rescue.
 - `app/controllers/concerns/ownership_moving_response.rb` says in a comment that it is kept apart from `ErrorHandler` for controllers built on `ActionController::API`.
-- `spec/services/invoice_payment/stripe_payment_succeeded_fence_spec.rb` expects the refusal to escape with no payment, then one payment on replay and none on a second replay.
+- `spec/services/invoice_payment/stripe_payment_succeeded_spec.rb` expects the refusal to escape with no payment, then one payment on replay and none on a second replay.
 - `spec/requests/webhooks/billing_fence_spec.rb` expects a signed Razorpay event to get 503, not 500, and a bad signature to still get 401.
