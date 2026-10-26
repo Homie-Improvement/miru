@@ -245,6 +245,21 @@ RSpec.describe Timekeeping::Handoff::ServiceStore do
       end
     end
 
+    # The checkpoint shape check requires an Integer company_id only, so an
+    # invalid id can carry any text; the message must not repeat it.
+    it "names an invalid entry id as invalid without repeating its text in the error message" do
+      Timekeeping::Admission.fence!
+      tables = handoff_checkpoint_tables(company_id: 8, id: 900,
+                                         overrides: { "entries" => { "id" => "private-id-text" } })
+
+      expect { store.load_checkpoint(Timekeeping::Handoff::Checkpoint.build(tables:)) }
+        .to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError) { |error|
+          expect(error.message).to include("company_id 8 id invalid (id)")
+          expect(error.message).not_to include("private-id-text")
+        }
+      expect(Entry.count).to eq(0)
+    end
+
     # "A monolith row with a source such as "agent" is therefore stored in
     # Timekeeping's entries table, and any later write republishes it to the
     # outbox, where the projection refuses it and delivery stops."

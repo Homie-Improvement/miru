@@ -30,6 +30,23 @@ RSpec.describe Timekeeping::Handoff::CheckpointEntryValues do
     expect(described_class.invalid_entries(rows)).to eq([{ company_id: 9, id: 901, fields: ["source"] }])
   end
 
+  # One item per bad row, in row order, each naming every invalid field in
+  # SnapshotValues::RULES order with version last; a valid row between them is skipped.
+  it "names every invalid row in row order with all of its invalid fields" do
+    rows = [
+      handoff_checkpoint_tables(company_id: 8, id: 900,
+                                overrides: { "entries" => { "source" => "agent", "bill_status" => "paid",
+                                                            "version" => 0 } }),
+      handoff_checkpoint_tables(company_id: 8, id: 901),
+      handoff_checkpoint_tables(company_id: 9, id: 902, overrides: { "entries" => { "review_status" => "done" } })
+    ].flat_map { |tables| tables.fetch("entries") }
+
+    expect(described_class.invalid_entries(rows)).to eq([
+      { company_id: 8, id: 900, fields: %w[bill_status source version] },
+      { company_id: 9, id: 902, fields: ["review_status"] }
+    ])
+  end
+
   # The projection refuses a non-positive version, an unknown status and a
   # duration JSON cannot carry; the checkpoint load is the only check before
   # write_outbox republishes them.
