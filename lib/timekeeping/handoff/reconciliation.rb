@@ -171,7 +171,42 @@ module Timekeeping
           Result.new(companies: companies.freeze, unassigned: unassigned.freeze)
         end
 
+        # Emits one ReconciliationDifferenceFound per difference of a finished
+        # result, listed ones included, and passes each company's changed money
+        # values to FinancialSnapshot.report so the financial change signal
+        # fires as well. Returns the result unchanged. It runs after run has
+        # decided the verdict, so a signal that fails cannot alter the verdict.
+        def report(result)
+          result.companies.each_value do |company_report|
+            company_report.listed.each { |difference| notify_difference(difference, listed: true) }
+            company_report.unlisted.each { |difference| notify_difference(difference, listed: false) }
+            FinancialSnapshot.report(financial_changes(company_report))
+          end
+          result.unassigned.each { |difference| notify_difference(difference, listed: false) }
+          result
+        end
+
         private
+
+          def notify_difference(difference, listed:)
+            Rails.event.notify(ReconciliationDifferenceFound.new(difference, listed:))
+          end
+
+          # Rebuilds the FinancialSnapshot::Difference that FinancialSnapshotChanged
+          # reads from the stored identifiers. The money values are not kept in a
+          # result, and the event never reads them, so they stay nil. A missing
+          # snapshot names no invoice row, so it has no financial change to send.
+          def financial_changes(company_report)
+            company_report.checks.fetch(:money).filter_map do |difference|
+              next unless difference.reason == :changed
+
+              kind, record_id = difference.row_key
+              FinancialSnapshot::Difference.new(
+                company_id: difference.company_id, kind:, record_id:, field: difference.field,
+                old_value: nil, new_value: nil
+              )
+            end
+          end
 
           def company_report(inputs, company_id, corrections)
             checks = CHECKS.to_h { |check, method| [check, send(method, inputs, company_id).freeze] }.freeze

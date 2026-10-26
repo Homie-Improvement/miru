@@ -577,6 +577,43 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
     expect(result.companies.fetch(101).listed).to eq([])
   end
 
+  it "signals a listed difference with listed true" do
+    tables = recon_checks_tables(entries: [recon_checks_entry(101, note: "changed")])
+    correction = described_class::Correction.new(check: :entries, row_key: [1], field: "note")
+    result = recon_checks_run(checkpoint_tables: tables, listed_corrections: { 101 => [correction] })
+    expect(result).not_to be_abort
+
+    stored = RailsEventViewer::Entry.where(name: "Timekeeping::ReconciliationDifferenceFound")
+    expect { described_class.report(result) }.to change { stored.count }.by(1)
+
+    data = stored.order(:id).last.payload["data"]
+    expect(data).to include("company_id" => 101, "check" => "entries", "field" => "note", "listed" => true)
+  end
+
+  it "signals a missing money snapshot only as a reconciliation difference" do
+    money = { 202 => { company_id: 202, values: {} } }
+    result = described_class.run(
+      source: Timekeeping::Handoff::Checkpoint.build(tables: recon_checks_tables),
+      checkpoint: Timekeeping::Handoff::Checkpoint.build(tables: recon_checks_tables),
+      projection: recon_checks_tables["entries"].map do |row|
+        row.merge(
+          "bill_status" => TimesheetEntry.bill_statuses.fetch(row["bill_status"]),
+          "review_status" => TimesheetEntry.review_statuses.fetch(row["review_status"])
+        )
+      end,
+      source_intents: [recon_checks_intent(101), recon_checks_intent(202)],
+      intents: [recon_checks_intent(101), recon_checks_intent(202)],
+      next_entry_id: 2, money_before: money, money_after: money
+    )
+    expect(result.companies.fetch(101).unlisted.map(&:reason)).to eq(%i[snapshot_missing snapshot_missing])
+
+    stored = RailsEventViewer::Entry.where(name: "Timekeeping::ReconciliationDifferenceFound")
+    assert_no_event_reported("Timekeeping::FinancialSnapshotChanged") do
+      expect { described_class.report(result) }.to change { stored.count }.by(2)
+    end
+    expect(stored.order(:id).last(2).map { |row| row.payload["data"]["company_id"] }).to eq([101, 101])
+  end
+
   it "keeps the check table frozen" do
     expect(described_class::CHECKS).to be_frozen
     expect(described_class::INTENT_RULES).to be_frozen
