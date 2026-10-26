@@ -30,7 +30,7 @@ RSpec.describe "Timekeeping service commands: a failed outbox insert" do
     end
     mark_path = "/v1/companies/#{company}/invoices/501/mark-billed"
     detach_path = "/v1/companies/#{company}/agents/77/detach-entries"
-    counts = [AuditEvent.count, OutboxSnapshot.count, IdempotencyReceipt.count, Entry.sum(:version)]
+    counts = [AuditEvent.count, OutboxSnapshot.count, ServiceIdempotencyReceipt.count, InvoiceOperation.count, Entry.sum(:version)]
 
     allow(OutboxSnapshot).to receive(:insert_all!).and_raise(ActiveRecord::StatementInvalid, "outbox down")
     command.call(mark_path, mark_key)
@@ -38,7 +38,7 @@ RSpec.describe "Timekeeping service commands: a failed outbox insert" do
 
     expect(Entry.find(billable).bill_status).to eq("unbilled")
     expect(Entry.find(agent_entry).agent_id).to eq(77)
-    expect([AuditEvent.count, OutboxSnapshot.count, IdempotencyReceipt.count, Entry.sum(:version)]).to eq(counts)
+    expect([AuditEvent.count, OutboxSnapshot.count, ServiceIdempotencyReceipt.count, InvoiceOperation.count, Entry.sum(:version)]).to eq(counts)
 
     allow(OutboxSnapshot).to receive(:insert_all!).and_call_original
     expect(JSON.parse(command.call(mark_path, mark_key).body)).to eq("billed" => 1)
@@ -81,13 +81,13 @@ RSpec.describe "Timekeeping reservation commit: a failed outbox insert" do
     second = SecureRandom.uuid
     expect(command.call("prepare", second, "disposition" => "active", "entries" => [kept]).status).to eq(200)
     before = Reservation.order(:entry_id).pluck(:entry_id, :invoice_id, :state)
-    counts = [AuditEvent.count, OutboxSnapshot.count, IdempotencyReceipt.count, Entry.sum(:version)]
+    counts = [AuditEvent.count, OutboxSnapshot.count, ServiceIdempotencyReceipt.count, InvoiceOperation.count, Entry.sum(:version)]
 
     allow(OutboxSnapshot).to receive(:insert_all!).and_raise(ActiveRecord::StatementInvalid, "outbox down")
     command.call("commit", second)
 
     expect(Reservation.order(:entry_id).pluck(:entry_id, :invoice_id, :state)).to eq(before)
-    expect([AuditEvent.count, OutboxSnapshot.count, IdempotencyReceipt.count, Entry.sum(:version)]).to eq(counts)
+    expect([AuditEvent.count, OutboxSnapshot.count, ServiceIdempotencyReceipt.count, InvoiceOperation.count, Entry.sum(:version)]).to eq(counts)
 
     allow(OutboxSnapshot).to receive(:insert_all!).and_call_original
     expect(JSON.parse(command.call("commit", second).body)).to eq("reserved" => 0, "released" => 1)

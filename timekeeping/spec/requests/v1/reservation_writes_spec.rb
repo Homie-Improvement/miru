@@ -184,7 +184,7 @@ RSpec.describe "Reservation prepare when the outbox insert fails" do
     end
     persisted = lambda do
       { reservations: Reservation.count, audit_events: AuditEvent.count, outbox_snapshots: OutboxSnapshot.count,
-        receipts: IdempotencyReceipt.count, versions: Entry.sum(:version) }
+        operations: InvoiceOperation.count, receipts: ServiceIdempotencyReceipt.count, versions: Entry.sum(:version) }
     end
     before = persisted.call
 
