@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_03_01_000000) do
+ActiveRecord::Schema[8.1].define(version: 2026_04_01_000000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -118,6 +118,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_03_01_000000) do
     t.bigint "reference_unavailable", default: 0, null: false
     t.bigint "latency_ms_sum", default: 0, null: false
     t.jsonb "latency_ms_buckets", default: {}, null: false
+    t.bigint "stale_generation", default: 0, null: false
     t.index ["company_id", "window_start"], name: "index_write_metric_windows_on_company_id_and_window_start", unique: true
   end
 

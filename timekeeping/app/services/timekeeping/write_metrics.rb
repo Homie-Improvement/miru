@@ -9,6 +9,10 @@ module Timekeeping
   # recorded request adds its latency to latency_ms_sum and to exactly one
   # bucket, so the bucket counts sum to writes + reference_unavailable and the
   # alert evaluator can read the p95 latency from them.
+  #
+  # stale_generation counts the writes refused with 409 stale_generation. They
+  # also count in writes, so it is a subset of writes. It is decided by the
+  # answered reason, because version_conflict shares status 409.
   class WriteMetrics
     WINDOW_SECONDS = 300
     # Upper bounds in ms. 300 is an exact edge, so the p95 alert at 300 ms
@@ -43,25 +47,29 @@ module Timekeeping
 
     # One statement adds to the stored counts, so two processes recording into
     # the same window at once both count; the row is never read into Ruby.
-    def record(company_id:, outcome:, latency_ms:)
+    # reason is the reason the write was answered with, or nil for an answer
+    # that carries none.
+    def record(company_id:, outcome:, latency_ms:, reason: nil)
       writes, reference_unavailable = OUTCOME_COUNTS.fetch(outcome) do
         raise ArgumentError, "unknown write metric outcome: #{outcome.inspect}"
       end
+      stale_generation = outcome == :write && reason&.to_sym == :stale_generation ? 1 : 0
       latency = latency_ms.ceil
       bucket = self.class.bucket_key(latency)
 
       ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish,
         INSERT INTO write_metric_windows
-          (company_id, window_start, writes, reference_unavailable, latency_ms_sum, latency_ms_buckets)
-        VALUES (?, ?, ?, ?, ?, jsonb_build_object(?::text, 1))
+          (company_id, window_start, writes, reference_unavailable, stale_generation, latency_ms_sum, latency_ms_buckets)
+        VALUES (?, ?, ?, ?, ?, ?, jsonb_build_object(?::text, 1))
         ON CONFLICT (company_id, window_start) DO UPDATE SET
           writes = write_metric_windows.writes + EXCLUDED.writes,
           reference_unavailable = write_metric_windows.reference_unavailable + EXCLUDED.reference_unavailable,
+          stale_generation = write_metric_windows.stale_generation + EXCLUDED.stale_generation,
           latency_ms_sum = write_metric_windows.latency_ms_sum + EXCLUDED.latency_ms_sum,
           latency_ms_buckets = write_metric_windows.latency_ms_buckets
             || jsonb_build_object(?::text, COALESCE((write_metric_windows.latency_ms_buckets ->> ?::text)::bigint, 0) + 1)
       SQL
-        company_id, self.class.window_start(@clock.call), writes, reference_unavailable, latency,
+        company_id, self.class.window_start(@clock.call), writes, reference_unavailable, stale_generation, latency,
         bucket, bucket, bucket]))
     end
   end

@@ -30,6 +30,7 @@ module Timekeeping
         "window_start" => window.window_start.utc.iso8601,
         "writes" => window.writes,
         "reference_unavailable" => window.reference_unavailable,
+        "stale_generation" => window.stale_generation,
         "latency_ms_sum" => window.latency_ms_sum,
         "latency_ms_buckets" => window.latency_ms_buckets
       }
