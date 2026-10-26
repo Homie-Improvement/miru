@@ -55,6 +55,7 @@ en:
   application_controller:
     not_found: Route not found
   errors:
+    ownership_moving: Billing is paused for a moment while timesheet data moves. Please try again shortly.
     stripe:
       connect_not_enabled: Stripe Connect is not enabled for this Stripe account. Enable Connect in Stripe Dashboard and try again.
       generic: "%{message}"
