@@ -16,7 +16,9 @@ module Invoices
   #    outbox row in one new transaction.
   #
   # After the invoice transaction ends, the settlement row is delivered once
-  # inline; a failed delivery is left for the invoice_operations worker.
+  # inline; a failed delivery is left for the invoice_operations worker. A
+  # `refused` answer is also recorded for the prepare_refusal alert once the
+  # outermost transaction ends, whether it committed or rolled back.
   class OperationCoordinator
     # What each prepare answer leads to. Only `prepared` settles the save;
     # every other answer raises its error through the invoice transaction. A
@@ -46,6 +48,7 @@ module Invoices
       register_settlement_callbacks(connection, request, settlement)
 
       outcome = reservations.prepare(request)
+      settlement[:refusal] = outcome if outcome.state == "refused"
       raise_unless_prepared!(outcome)
 
       settlement[:commit_item_id] = settle(request, holding)
@@ -65,11 +68,22 @@ module Invoices
       end
 
       # After commit, the commit row is delivered inline. After rollback, the
-      # failure is recorded once the outermost transaction has ended.
+      # failure is recorded once the outermost transaction has ended. A
+      # refused prepare is recorded on either end, because a caller may rescue
+      # the refusal and commit; Rails fires exactly one of the two callbacks,
+      # so it is recorded once.
       def register_settlement_callbacks(connection, request, settlement)
         transaction = connection.current_transaction
-        transaction.after_commit { deliver(settlement[:commit_item_id]) if settlement[:commit_item_id] }
-        transaction.after_rollback { after_outermost_transaction(connection) { record_failure(request) } }
+        transaction.after_commit do
+          record_refusal(request, settlement[:refusal]) if settlement[:refusal]
+          deliver(settlement[:commit_item_id]) if settlement[:commit_item_id]
+        end
+        transaction.after_rollback do
+          after_outermost_transaction(connection) do
+            record_failure(request)
+            record_refusal(request, settlement[:refusal]) if settlement[:refusal]
+          end
+        end
       end
 
       def raise_unless_prepared!(outcome)
@@ -136,6 +150,17 @@ module Invoices
         deliver(abort_item_id) if abort_item_id
       rescue StandardError => error
         Rails.error.report(error, handled: true, context: { company_id: request.company_id, operation_id: request.operation_id })
+      end
+
+      # Keeps the refusal for the prepare_refusal alert (section 11.3): one
+      # row per conflict reason, or one row with no reason when the outcome
+      # named none. A backstop for a database fault here: the refusal is
+      # already decided, and a lost record must not replace the caller's error.
+      def record_refusal(request, outcome)
+        reasons = outcome.conflicts.map { |conflict| conflict.fetch(:reason) }.uniq.presence || [nil]
+        TimekeepingPrepareRefusal.insert_all!(reasons.map { |reason| { company_id: request.company_id, reason: } })
+      rescue StandardError => error
+        Rails.logger.warn("prepare refusal not recorded: #{error.class}")
       end
 
       def pending_intent(request)

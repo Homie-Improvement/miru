@@ -25,10 +25,10 @@ RSpec.describe Timekeeping::AlertSignals do
   it "lists the signals with no producer as unavailable and leaves them out of the signals" do
     gathered = gather_alert_signals
 
-    expect(gathered[:unavailable]).to include("ownership_moving", "prepare_refusal")
-    expect(gathered[:unavailable]).not_to include("reconciliation_difference", "financial_snapshot_change")
-    expect(gathered[:signals].keys).not_to include(:ownership_moving, :prepare_refusals)
-    expect(gathered[:signals]).to include(reconciliation_differences: [], financial_snapshot_changes: [])
+    expect(gathered[:unavailable]).to include("ownership_moving")
+    expect(gathered[:unavailable]).not_to include("prepare_refusal", "reconciliation_difference", "financial_snapshot_change")
+    expect(gathered[:signals].keys).not_to include(:ownership_moving)
+    expect(gathered[:signals]).to include(prepare_refusals: [], reconciliation_differences: [], financial_snapshot_changes: [])
     expect(gathered[:metrics_error]).to be_nil
   end
 

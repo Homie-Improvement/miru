@@ -19,16 +19,18 @@ module Timekeeping
     SIGNAL_LOOKBACK = 10.minutes
 
     # Named as the Timekeeping::Alerts rows they would feed.
-    NO_SOURCE = %w[ownership_moving prepare_refusal].freeze
+    NO_SOURCE = %w[ownership_moving].freeze
     METRICS_SIGNALS = %w[reference_unavailable_rate entry_write_p95_latency].freeze
     OUTBOX_LAG = "outbox_lag"
 
     RECONCILIATION_EVENT = "Timekeeping::ReconciliationDifferenceFound"
     SNAPSHOT_EVENT = "Timekeeping::FinancialSnapshotChanged"
+    PREPARE_REFUSAL_REASON = "on_another_invoice"
 
     # Alert row name => [signals key, reader]. Each reader takes the current time.
     LOCAL_SIGNALS = {
       "stale_generation" => [:stale_generation_refusals, :stale_generation_refusals],
+      "prepare_refusal" => [:prepare_refusals, :prepare_refusals],
       "reconciliation_difference" => [:reconciliation_differences, :reconciliation_differences],
       "financial_snapshot_change" => [:financial_snapshot_changes, :financial_snapshot_changes]
     }.freeze
@@ -90,6 +92,14 @@ module Timekeeping
       TimekeepingStaleGenerationRefusal.where(created_at: lookback(now))
                                        .group(:company_id, :handoff_step).count
                                        .map { |(company_id, handoff_step), count| { company_id:, handoff_step:, count: } }
+    end
+
+    # Section 11.3 names prepare refusals for on_another_invoice only; other
+    # conflict reasons are recorded but raise no alert.
+    def prepare_refusals(now)
+      TimekeepingPrepareRefusal.where(reason: PREPARE_REFUSAL_REASON, created_at: lookback(now))
+                               .group(:company_id).count
+                               .map { |company_id, count| { company_id:, count: } }
     end
 
     # Section 11.3 alerts on "any unexplained difference": a difference the
