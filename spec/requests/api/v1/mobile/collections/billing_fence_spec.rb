@@ -82,6 +82,13 @@ RSpec.describe "Billing fence on mobile collection manual payment", type: :reque
     expect(response).to have_http_status(:ok)
     expect(Payment.where(invoice_id: invoice.id).count).to eq(1)
     expect(Invoice.find(invoice.id).status).to eq("paid")
+
+    # The collector's app may resend the same request after a timeout.
+    post "/api/v1/mobile/collections/#{invoice.id}/manual_payment", params:, headers: auth_headers(user)
+
+    expect(response).to have_http_status(:unprocessable_content)
+    expect(Payment.where(invoice_id: invoice.id).count).to eq(1)
+    expect(Invoice.find(invoice.id).status).to eq("paid")
   end
 end
 
@@ -177,6 +184,7 @@ RSpec.describe "Billing fence between mobile collection commit and payment link"
     allow(razorpay_client).to receive(:create_payment_link).and_return(
       { "id" => "plink_mid_create_1", "short_url" => "https://rzp.io/rzp/mid-create", "status" => "created" }
     )
+    allow(razorpay_client).to receive(:fetch_payment_link).and_return({ "status" => "created" })
     # Starts the handoff after the collection's own fenced transaction has
     # committed and before the link service admits its write.
     handoff_started = false
@@ -224,5 +232,87 @@ RSpec.describe "Billing fence between mobile collection commit and payment link"
     stored = Invoice.find(committed.id)
     expect(stored.razorpay_payment_link_id).to eq("plink_mid_create_1")
     expect(stored.razorpay_payment_link_url).to eq("https://rzp.io/rzp/mid-create")
+
+    # A client that did not see the first success sends the same key again.
+    post "/api/v1/mobile/collections", params:, headers: auth_headers(user)
+
+    expect(response).to have_http_status(:ok)
+    expect(counts.call).to eq(counts_after_refusal)
+    expect(keyed_invoices.call.count).to eq(1)
+    expect(razorpay_client).to have_received(:create_payment_link).once
+    expect(Invoice.find(committed.id).razorpay_payment_link_id).to eq("plink_mid_create_1")
+  end
+end
+
+RSpec.describe "Billing fence on mobile collection payment link without SMS", type: :request do
+  # "Check the response, unchanged payment and invoice data, and absence of a provider creation call."
+  # Covers only an invoice with no stored link; reusing a stored link is not fenced and is not claimed here.
+  it "creates no provider link during a handoff and exactly one link when the refused payment link request is resent after the handoff ends" do
+    company = create(:india_company, base_currency: "INR", plan_tier: "paid")
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    sign_in user
+    provider = build(
+      :payments_provider,
+      company:,
+      name: PaymentsProvider::RAZORPAY_PROVIDER,
+      connected: true,
+      enabled: true,
+      accepted_payment_methods: ["razorpay"],
+      settings: { enabled_on_invoices: true, key_id: "rzp_test_123", sms_notifications_enabled: true }
+    )
+    provider.key_secret = "secret"
+    provider.save!
+    client = create(:client, company:, currency: "INR", phone: "+919876543210")
+    invoice = create(
+      :invoice,
+      company:,
+      client:,
+      amount_value: 1600,
+      currency: "INR",
+      status: :sent,
+      payment_infos: { mobile_collection_source: "mobile" }
+    )
+    razorpay_client = instance_double(PaymentProviders::RazorpayClient)
+    allow(PaymentProviders::RazorpayClient).to receive(:new).and_return(razorpay_client)
+    allow(razorpay_client).to receive(:create_payment_link).and_return(
+      { "id" => "plink_retry_1", "short_url" => "https://rzp.io/rzp/retry", "status" => "created" }
+    )
+
+    invoice.reload
+    snapshot = lambda do
+      invoice.reload
+      {
+        payments: Payment.count,
+        status: invoice.status,
+        amount_paid: invoice.amount_paid,
+        amount_due: invoice.amount_due,
+        payment_infos: invoice.payment_infos,
+        link_id: invoice.razorpay_payment_link_id,
+        link_url: invoice.razorpay_payment_link_url,
+        link_status: invoice.razorpay_payment_link_status
+      }
+    end
+    baseline = snapshot.call
+    expect(baseline[:link_id]).to be_nil
+    expect(baseline[:link_url]).to be_nil
+    expect(baseline[:amount_due]).to be > 0
+
+    TimekeepingOwnership.current.update!(handoff_step: "close_admission")
+    post "/api/v1/mobile/collections/#{invoice.id}/payment_link", params: { collection: { notify_sms: false } }, headers: auth_headers(user)
+
+    expect(response).to have_http_status(:service_unavailable)
+    expect(json_response["reason"]).to eq("ownership_moving")
+    expect(razorpay_client).not_to have_received(:create_payment_link)
+    expect(snapshot.call).to eq(baseline)
+
+    TimekeepingOwnership.current.update!(handoff_step: nil)
+    post "/api/v1/mobile/collections/#{invoice.id}/payment_link", params: { collection: { notify_sms: false } }, headers: auth_headers(user)
+
+    expect(response).to have_http_status(:ok)
+    expect(razorpay_client).to have_received(:create_payment_link).once
+    expect(invoice.reload.razorpay_payment_link_id).to eq("plink_retry_1")
+    expect(Payment.count).to eq(baseline[:payments])
   end
 end
