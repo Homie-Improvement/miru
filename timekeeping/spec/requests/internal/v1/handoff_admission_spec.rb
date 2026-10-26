@@ -4,37 +4,136 @@
 
 require "rails_helper"
 
-RSpec.describe "Timekeeping internal handoff admission fence" do
-  let(:fence_service_token) { "service-#{SecureRandom.hex(24)}" }
+RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
+  include_context "timekeeping entry writes without transactional fixtures"
 
   around do |example|
-    with_timekeeping_env(
-      Timekeeping::Environment::TOKEN_PUBLIC_KEY => rsa_key_pair.public_key.to_pem,
-      Timekeeping::Environment::SERVICE_TOKEN => fence_service_token
-    ) { example.run }
+    with_handoff_env(public_key: true) { example.run }
   end
 
-  def post_fence_for_spec(authorization)
-    post "/internal/v1/handoff/admission/fence", headers: { "Authorization" => authorization }
+  def handoff_answer_for_spec(route, **options)
+    handoff_request(route, **options)
     [response.status, response.parsed_body]
+  end
+
+  # The sequence's own state, read beside the route rather than through it, so
+  # a refused request that moved the sequence is seen even if the route's
+  # answer hides it.
+  def entry_id_sequence_state_for_spec
+    ApplicationRecord.connection.select_rows(<<~SQL.squish)
+      SELECT last_value, is_called FROM entries_id_seq
+    SQL
   end
 
   # "Admission: fence and admit through `Timekeeping::Admission.fence!` and
   # `Timekeeping::Admission.admit!`, from the admission-fence work this depends on.
   # This endpoint only calls them."
   it "fences the real admission row only for the service bearer and never answers success for a missing row" do
-    Timekeeping::Admission.ensure_initial!
     Timekeeping::Admission.admit!(generation: 1)
 
     owner_token = mint_token({ sub: 7, company_id: 1, role: "owner" })
-    expect(post_fence_for_spec("Bearer #{owner_token}")).to eq([401, { "reason" => "unauthorized" }])
+    expect(handoff_answer_for_spec(:admission_fence, authorization: "Bearer #{owner_token}"))
+      .to eq([401, { "reason" => "unauthorized" }])
     expect(Timekeeping::Admission.current.generation).to eq(1)
 
-    expect(post_fence_for_spec("Bearer #{fence_service_token}")).to eq([200, { "generation" => nil }])
+    expect(handoff_answer_for_spec(:admission_fence)).to eq([200, { "generation" => nil }])
     expect(Timekeeping::Admission.current.generation).to be_nil
 
     Timekeeping::Admission.delete_all
-    status, body = post_fence_for_spec("Bearer #{fence_service_token}")
-    expect([status, body]).to eq([409, { "reason" => "admission_missing" }])
+    expect(handoff_answer_for_spec(:admission_fence)).to eq([409, { "reason" => "admission_missing" }])
+  end
+
+  it "fences and then admits generation 2 on the real admission row, and a refused admit keeps generation 2" do
+    expect(handoff_answer_for_spec(:admission_fence)).to eq([200, { "generation" => nil }])
+    expect(Timekeeping::Admission.current.generation).to be_nil
+
+    expect(handoff_answer_for_spec(:admission_admit, body: { generation: 2 })).to eq([200, { "generation" => 2 }])
+    expect(Timekeeping::Admission.current.generation).to eq(2)
+
+    expect(handoff_answer_for_spec(:admission_admit, body: { generation: 0 }))
+      .to eq([400, { "reason" => "invalid_request" }])
+    expect(Timekeeping::Admission.current.generation).to eq(2)
+  end
+
+  # admit! refuses anything but a positive Integer. A refused admit must never
+  # answer success, or the caller would believe writes are admitted while
+  # Timekeeping is still fenced.
+  it "refuses an admit generation that is a string, zero or missing and leaves Timekeeping fenced after each" do
+    Timekeeping::Admission.fence!
+    expect(Timekeeping::Admission.current.generation).to be_nil
+
+    { "string" => { generation: "3" }, "zero" => { generation: 0 }, "missing" => {} }.each do |row, body|
+      answer = handoff_answer_for_spec(:admission_admit, body:)
+
+      expect([row, answer]).to eq([row, [400, { "reason" => "invalid_request" }]])
+      expect([row, Timekeeping::Admission.current.generation]).to eq([row, nil])
+    end
+  end
+
+  # "Advance sequence: set the `entries` id sequence above a given id "only if
+  # the new value is higher than its current one"."
+  it "advances the entry id sequence above 100 and keeps it there for a lower, string, negative or missing target" do
+    expect(handoff_answer_for_spec(:entry_id_sequence, body: { above: 100 })).to eq([200, { "next_id" => 101 }])
+    baseline = entry_id_sequence_state_for_spec
+    expect(baseline).to eq([[100, true]])
+
+    rows = {
+      "lower" => [{ above: 10 }, [200, { "next_id" => 101 }]],
+      "string" => [{ above: "3" }, [400, { "reason" => "invalid_request" }]],
+      "negative" => [{ above: -1 }, [400, { "reason" => "invalid_request" }]],
+      "missing" => [{}, [400, { "reason" => "invalid_request" }]]
+    }
+    rows.each do |row, (body, expected)|
+      answer = handoff_answer_for_spec(:entry_id_sequence, body:)
+
+      expect([row, answer]).to eq([row, expected])
+      expect([row, entry_id_sequence_state_for_spec]).to eq([row, baseline])
+    end
+
+    entry = Entry.create!(company_id: 1, user_id: 7, project_id: 3, work_date: "2026-03-02", duration: 90.0,
+                          note: "After advance", bill_status: "unbilled", source: "manual", source_metadata: {})
+    expect(entry.id).to eq(101)
+  end
+
+  # A fence that timed out must never answer success: the caller would go on
+  # with a handoff while entry writes are still admitted.
+  it "answers fence_timeout and keeps admitting writes while another transaction holds the admission row" do
+    stub_const("Timekeeping::Admission::FENCE_LOCK_TIMEOUT", 0.2.seconds)
+    Timekeeping::Admission.admit!(generation: 1)
+    held = Queue.new
+    release = Queue.new
+    holder = Thread.new do
+      ApplicationRecord.connection_pool.with_connection do |connection|
+        connection.transaction do
+          connection.execute("SELECT generation FROM admission WHERE id = 1 FOR SHARE")
+          held << true
+          release.pop(timeout: 10)
+        end
+      end
+    end
+    expect(held.pop(timeout: 10)).to be(true)
+
+    answer = begin
+      handoff_answer_for_spec(:admission_fence)
+    ensure
+      release << true
+      holder.join
+    end
+
+    expect(answer).to eq([503, { "reason" => "fence_timeout" }])
+    expect(Timekeeping::Admission.current.generation).to eq(1)
+  end
+
+  it "reports the highest outbox_snapshots outbox_position" do
+    at = Time.utc(2026, 3, 2, 9)
+    snapshot = {
+      id: 5, company_id: 1, version: 1, generation: 1, project_id: 10, user_id: 20, work_date: Date.new(2026, 3, 2),
+      duration: 30.0, bill_status: "unbilled", review_status: "not_required", locked: false, source: "manual",
+      source_metadata: {}, proof_metadata: {}, created_at: at, updated_at: at
+    }
+    OutboxSnapshot.insert_all!([snapshot.merge(outbox_position: 17), snapshot.merge(outbox_position: 42, version: 2)])
+
+    # "Outbox position: report the highest `outbox_snapshots.outbox_position`."
+    expect(handoff_answer_for_spec(:outbox_position)).to eq([200, { "outbox_position" => 42 }])
   end
 end
