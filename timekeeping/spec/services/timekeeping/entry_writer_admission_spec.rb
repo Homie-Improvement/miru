@@ -54,6 +54,31 @@ RSpec.describe Timekeeping::EntryWriter, "admission" do
   end
 
   # "While fenced, Timekeeping refuses every entry write at every generation with stale_generation, including for a company it has never seen"
+  it "refuses a delete, a bulk move and a bulk delete while fenced and leaves the entries as stored" do
+    entry_ids = Array.new(2) { timekeeping_arrange.entry(company:, user: owner, project:) }
+    other_project = timekeeping_arrange.project(company:)
+    stored = Entry.where(id: entry_ids).order(:id).map(&:attributes)
+    baseline = entry_write_counts
+    expect(baseline).to include(entries: 2, versions: 2)
+    Timekeeping::Admission.fence!(lock_timeout: 1)
+    commands = lambda do |generation|
+      [build_entry_command(:destroy, token:, entry_id: entry_ids.first, generation:),
+       build_entry_command(:bulk_move, token:, generation:,
+                                       body: { "entry_ids" => entry_ids, "project_id" => other_project }),
+       build_entry_command(:bulk_delete, token:, generation:, body: { "entry_ids" => entry_ids })]
+    end
+
+    [1, 2].each do |generation|
+      commands.call(generation).each do |command|
+        expect(admission_answer(described_class.new.call(command))).to eq(stale),
+          "#{command.route} at #{generation} was not refused"
+        expect(entry_write_counts).to eq(baseline)
+      end
+    end
+    expect(Entry.where(id: entry_ids).order(:id).map(&:attributes)).to eq(stored)
+  end
+
+  # "While fenced, Timekeeping refuses every entry write at every generation with stale_generation, including for a company it has never seen"
   it "refuses a create for a company never seen before while fenced and creates no rows or admission state" do
     Timekeeping::Admission.fence!(lock_timeout: 1)
     expect(Entry.where(company_id: company).count).to eq(0)
@@ -175,13 +200,12 @@ RSpec.describe Timekeeping::EntryWriter, "admission" do
   end
 
   # "The fence stays in place until a later admission"
+  # The full set of rejected values is checked in spec/models/timekeeping/admission_spec.rb.
   it "leaves the fence in place when admit! is given a value that is not a positive integer" do
     entry_id = timekeeping_arrange.entry(company:, user: owner, project:)
     Timekeeping::Admission.fence!(lock_timeout: 1)
 
-    [nil, 0, -4, "4", 4.0].each do |value|
-      expect { Timekeeping::Admission.admit!(generation: value) }.to raise_error(ArgumentError)
-    end
+    expect { Timekeeping::Admission.admit!(generation: "4") }.to raise_error(ArgumentError)
 
     expect(Timekeeping::Admission.current.generation).to be_nil
     baseline = entry_write_counts

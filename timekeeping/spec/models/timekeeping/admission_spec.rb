@@ -79,4 +79,21 @@ RSpec.describe Timekeeping::Admission do
     expect(described_class.count).to eq(1)
     expect(described_class.current.generation).to be_nil
   end
+
+  # A database loaded from db/schema.rb has no rows, so db/seeds.rb is what
+  # gives a fresh database its admission row.
+  it "db/seeds.rb creates the row at generation 1 and leaves an existing fenced row fenced" do
+    seeds = Rails.root.join("db/seeds.rb")
+    described_class.delete_all
+
+    load seeds
+    expect(described_class.count).to eq(1)
+    expect(described_class.current.generation).to eq(1)
+
+    described_class.fence!(lock_timeout: 1)
+    load seeds
+
+    expect(described_class.count).to eq(1)
+    expect(described_class.current.generation).to be_nil
+  end
 end
