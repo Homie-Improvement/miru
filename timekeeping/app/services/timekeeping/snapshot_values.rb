@@ -25,11 +25,12 @@ module Timekeeping
     ISO_DATE = /\A[0-9]{4}-[0-9]{2}-[0-9]{2}\z/
 
     def self.json_depth(value)
-      children = case value
-                 when Hash then value.values
-                 when Array then value
-                 else return 0
-                 end
+      children =
+        case value
+        when Hash then value.values
+        when Array then value
+        else return 0
+        end
       1 + (children.map { |child| json_depth(child) }.max || 0)
     end
     private_class_method :json_depth
