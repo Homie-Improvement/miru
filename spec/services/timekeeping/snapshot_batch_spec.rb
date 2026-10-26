@@ -58,6 +58,14 @@ RSpec.describe Timekeeping::SnapshotBatch do
     end
   end
 
+  it "accepts exactly the enum values the contract lists" do
+    values = TimekeepingContract.load(:entry_snapshots).fetch("entry_values")
+
+    expect(TimesheetEntry::SOURCES).to eq(values.fetch("sources"))
+    expect(TimesheetEntry.bill_statuses.keys).to eq(values.fetch("bill_statuses"))
+    expect(TimesheetEntry.review_statuses.keys).to eq(values.fetch("review_statuses"))
+  end
+
   it "casts an Integer duration to a Float" do
     row = described_class.parse(batch_spec_batch(batch_spec_entry(duration: 90))).sole.row
 
