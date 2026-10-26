@@ -89,9 +89,10 @@ module Timekeeping
     }.freeze
 
     # The names of the snapshot's fields whose value breaks its rule, in
-    # RULES order; [] when every value is valid.
-    def self.invalid_fields(snapshot)
-      RULES.reject { |field, valid| valid.call(snapshot[field]) }.keys
+    # rules order; [] when every value is valid. A caller whose input does not
+    # carry every field as a snapshot does passes the subset that applies.
+    def self.invalid_fields(snapshot, rules: RULES)
+      rules.reject { |field, valid| valid.call(snapshot[field]) }.keys
     end
   end
 end
