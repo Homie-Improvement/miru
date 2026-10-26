@@ -153,6 +153,9 @@ end
 
 # A database loaded from db/schema.rb has no ownership row; migrated ones do.
 TimekeepingOwnership.ensure_initial!
+# Seeds run only in the initial legacy state: once a handoff has begun, these
+# writes would bypass the Timekeeping service. Reseeding needs a fresh demo reset.
+TimekeepingOwnership.refuse_if_handoff_begun!
 
 company = Company.find_or_initialize_by(name: "Fork & Leaf Salads")
 company.update!(
