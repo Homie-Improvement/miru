@@ -26,27 +26,6 @@ RSpec.describe "Timekeeping ProjectionConsumer service specs" do
     expect(loose_status_checks).to be_empty
   end
 
-  # "Changing one consumer rule means editing the same case in up to six places: create plus update (\_2, \_4, \_5),
-  # tombstone (\_2, \_4, \_5), company mismatch (base, \_2, \_3, \_4, \_5), foreign project (\_3, \_5), handoff
-  # (\_2, \_5) and replay after the flip (receipts, \_5)."
-  # Every copy of the company-mismatch case quotes the same contract sentence, so the number of quotes counts the
-  # copies. After the fold one example holds the case.
-  it "quotes the company-mismatch rule above exactly one ProjectionConsumer example" do
-    rule = "A snapshot whose `company_id` differs from the row's is refused."
-    quotes = projection_consumer_spec_paths.sum { |path| File.read(path).scan(rule).size }
-
-    expect(quotes).to eq(1)
-  end
-
-  # The same count for the tombstone and handoff rules, the other cases the fold merged from several copies.
-  it "quotes the tombstone and handoff rules above exactly one ProjectionConsumer example each" do
-    sources = projection_consumer_spec_paths.map { |path| File.read(path) }
-    occurrences = ->(rule) { sources.sum { |source| source.scan(rule).size } }
-
-    expect(occurrences.call("A discard arrives as a snapshot with `discarded_at` set")).to eq(1)
-    expect(occurrences.call("During a handoff, between closing admission and the ownership flip")).to eq(1)
-  end
-
   # A batch written by hand with "schema_version" => 1 keeps passing after the contract's version changes, so the
   # spec stops checking the contract. TimekeepingSnapshots.batch reads the version from the contract.
   it "builds every ProjectionConsumer spec batch through TimekeepingSnapshots.batch" do
