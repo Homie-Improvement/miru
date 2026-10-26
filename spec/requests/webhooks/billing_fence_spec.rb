@@ -151,56 +151,6 @@ RSpec.describe "Stripe webhook signature check during a handoff", type: :request
   end
 end
 
-RSpec.describe "Stripe payment webhook refused during a handoff through the endpoint", type: :request do
-  it "refuses a really signed Stripe payment_intent.succeeded event during a handoff with a retryable 503 and writes nothing" do
-    secret = "whsec_fence_refusal_test"
-    allow(ENV).to receive(:[]).and_call_original
-    allow(ENV).to receive(:[]).with("STRIPE_WEBHOOK_ENDPOINT_SECRET").and_return(secret)
-    allow(PaymentMailer).to receive_message_chain(:with, :payment, :deliver_later)
-    allow_any_instance_of(Invoice).to receive(:send_to_client_email)
-
-    company = create(:company, base_currency: "USD")
-    client = create(:client, company:, currency: "USD")
-    invoice = create(
-      :invoice, company:, client:, currency: "USD", status: "sent",
-      amount: 100, amount_due: 100, amount_paid: 0,
-      payment_infos: { "stripe_payment_intent" => "pi_fence_endpoint_1" }
-    )
-    payload = {
-      id: "evt_fence_endpoint_1",
-      object: "event",
-      type: "payment_intent.succeeded",
-      created: Time.current.to_i,
-      data: {
-        object: { id: "pi_fence_endpoint_1", object: "payment_intent", amount: 10_000, amount_received: 10_000, currency: "usd" }
-      }
-    }.to_json
-    timestamp = Time.now.to_i
-    signature = Stripe::Webhook::Signature.compute_signature(Time.at(timestamp), payload, secret)
-    TimekeepingOwnership.current.update!(handoff_step: "close_admission")
-
-    # Baseline seeded and asserted first, so an unchanged read after the
-    # refusal proves nothing was written rather than a broken read.
-    expect(Payment.where(invoice_id: invoice.id).count).to eq(0)
-    expect(invoice.reload.status).to eq("sent")
-    expect(invoice.amount_due).to eq(100)
-
-    post "/webhooks/stripe/checkout/fulfillment", params: payload, headers: {
-      "CONTENT_TYPE" => "application/json",
-      "HTTP_STRIPE_SIGNATURE" => "t=#{timestamp},v1=#{signature}"
-    }
-
-    # "Verify valid events return ownership_moving without writes, invalid signatures retain their existing response, and replay succeeds after handoff."
-    expect(response).to have_http_status(:service_unavailable)
-    expect(response.headers["Retry-After"]).to eq("5")
-    expect(response.parsed_body["reason"]).to eq("ownership_moving")
-    expect(response.body).not_to include("close_admission")
-    expect(Payment.where(invoice_id: invoice.id).count).to eq(0)
-    expect(invoice.reload.status).to eq("sent")
-    expect(invoice.amount_due).to eq(100)
-  end
-end
-
 RSpec.describe "Stripe webhook replay after a handoff", type: :request do
   # "Verify valid events return ownership_moving without writes, invalid signatures retain their existing response, and replay succeeds after handoff."
   it "records a signed Stripe payment_intent.succeeded event refused during a handoff exactly once when redelivered after it" do
@@ -235,6 +185,7 @@ RSpec.describe "Stripe webhook replay after a handoff", type: :request do
     expect(response).to have_http_status(:service_unavailable)
     expect(response.headers["Retry-After"]).to eq("5")
     expect(response.parsed_body["reason"]).to eq("ownership_moving")
+    expect(response.body).not_to include("close_admission")
     expect(Payment.where(invoice_id: invoice.id).count).to eq(0)
     expect(invoice.reload).to have_attributes(status: "sent", amount_due: 100)
 
