@@ -23,3 +23,42 @@ RSpec.describe BillingFencedMailDeliveryJob, type: :job do
     expect(invoice.reload.client_payment_sent_at).to be_nil
   end
 end
+
+RSpec.describe BillingFencedMailDeliveryJob, "for a payment mail queued before a handoff", type: :job do
+  include ActiveJob::TestHelper
+
+  let(:company) { create :company }
+  let(:client) { create :client, company: }
+  let(:invoice) { create :invoice, client: }
+  let(:user) { create(:user, current_workspace_id: company.id, companies: [company]) }
+
+  # Acceptance bar: "Every invoice, line-item, invoice-tax and payment write, mobile-collection payments included,
+  # gets 503 ownership_moving while handoff_step is set and writes nothing"
+  # A refused mail must be retried later, not dropped, and must not be sent twice.
+  it "reschedules a payment mail refused during a handoff and delivers it exactly once after the handoff" do
+    user.add_role :admin, company
+    invoice
+    # Creating the user enqueues an unrelated HubSpot signup job; drop it so
+    # perform_enqueued_jobs runs only the mail delivery under test.
+    clear_enqueued_jobs
+    ownership = TimekeepingOwnership.current
+    ActionMailer::Base.deliveries.clear
+
+    PaymentMailer.with(invoice_id: invoice.id, subject: "Paid").payment.deliver_later
+    expect(enqueued_jobs.map { |job| job["job_class"] || job[:job].to_s }).to include("BillingFencedMailDeliveryJob")
+
+    ownership.update!(handoff_step: "settle")
+    perform_enqueued_jobs
+
+    expect(ActionMailer::Base.deliveries).to be_empty
+    expect(invoice.reload.payment_sent_at).to be_nil
+    expect(enqueued_jobs.size).to eq(1)
+
+    ownership.update!(handoff_step: nil)
+    perform_enqueued_jobs
+
+    expect(ActionMailer::Base.deliveries.size).to eq(1)
+    expect(invoice.reload.payment_sent_at).to be_present
+    expect(enqueued_jobs).to be_empty
+  end
+end
