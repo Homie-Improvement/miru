@@ -620,18 +620,27 @@ RSpec.describe "timekeeping:alerts with an unreadable event history" do
     task = Rake::Task["timekeeping:alerts"]
     task.reenable
     output = StringIO.new
+    errors = StringIO.new
     original_stdout = $stdout
+    original_stderr = $stderr
+    exit_status = 0
     begin
       $stdout = output
+      $stderr = errors
       with_timekeeping_env("TIMEKEEPING_BASE_URL" => base_url, "TIMEKEEPING_SERVICE_TOKEN" => service_token) do
         task.invoke
-      rescue SystemExit
-        nil
+      rescue SystemExit => e
+        exit_status = e.status
       end
     ensure
       $stdout = original_stdout
+      $stderr = original_stderr
     end
     lines = output.string.lines
+
+    # A database fault that hides local alerts must not look like a successful run to the scheduler.
+    expect(exit_status).not_to eq(0)
+    expect(errors.string).to include("reconciliation_difference", "financial_snapshot_change")
 
     # "Printing unavailable is honest, but it does not deliver the requested local alerts."
     %w[reconciliation_difference financial_snapshot_change].each do |signal|

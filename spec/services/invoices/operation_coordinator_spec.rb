@@ -488,6 +488,7 @@ RSpec.describe Invoices::OperationCoordinator, "prepare refusal record write fai
       abort: Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
     )
     allow(TimekeepingPrepareRefusal).to receive(:insert_all!).and_raise(ActiveRecord::StatementInvalid, "refusal table down")
+    allow(Rails.error).to receive(:report).and_call_original
 
     expect do
       ApplicationRecord.transaction do
@@ -498,23 +499,27 @@ RSpec.describe Invoices::OperationCoordinator, "prepare refusal record write fai
     intent = InvoiceOperationIntent.find_by!(company_id: request.company_id, operation_id: request.operation_id)
     expect(intent.state).to eq("failed")
     expect(TimekeepingPrepareRefusal.where(company_id: invoice.company_id)).not_to exist
+    # The lost record is the only source of the prepare_refusal alert, so error tracking hears of it.
+    expect(Rails.error).to have_received(:report).with(
+      an_instance_of(ActiveRecord::StatementInvalid), handled: true,
+      context: { company_id: request.company_id, operation_id: request.operation_id }
+    )
   end
 end
 
-RSpec.describe Invoices::OperationCoordinator, "prepare refusal record", committed_data: true do
-  def refusal_record_outcome(state, conflicts: [])
-    Invoices::ReservationOutcome.new(state:, conflicts:, counts: {})
-  end
-
+RSpec.describe Invoices::OperationCoordinator, "prepare refusal record inside a committed savepoint", committed_data: true do
+  # The savepoint's rollback and the outer transaction's commit are two transaction ends for one
+  # refused call. Writing on both would double the count the operator sees.
   it "records a refusal inside a savepoint exactly once after the outer transaction commits" do
     invoice = create(:invoice)
     request = Invoices::ReservationRequest.new(
       company_id: invoice.company_id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
       generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [701]
     )
+    outcome = ->(state, conflicts = []) { Invoices::ReservationOutcome.new(state:, conflicts:, counts: {}) }
     adapter = RecordingReservationAdapter.new(
-      prepare: refusal_record_outcome("refused", conflicts: [{ entry_id: 701, reason: "on_another_invoice" }]),
-      commit: refusal_record_outcome("committed"), abort: refusal_record_outcome("aborted")
+      prepare: outcome.call("refused", [{ entry_id: 701, reason: "on_another_invoice" }]),
+      commit: outcome.call("committed"), abort: outcome.call("aborted")
     )
     rows_while_open = nil
 
@@ -534,113 +539,5 @@ RSpec.describe Invoices::OperationCoordinator, "prepare refusal record", committ
     rows = TimekeepingPrepareRefusal.where(company_id: invoice.company_id)
     expect(rows.count).to eq(1)
     expect(rows.sole.reason).to eq("on_another_invoice")
-  end
-end
-
-RSpec.describe Invoices::OperationCoordinator, committed_data: true do
-  def refusal_record_request(invoice)
-    Invoices::ReservationRequest.new(
-      company_id: invoice.company_id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
-      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [701]
-    )
-  end
-
-  def refusal_record_adapter
-    refused = Invoices::ReservationOutcome.new(
-      state: "refused", conflicts: [{ entry_id: 701, reason: "on_another_invoice" }], counts: {}
-    )
-    aborted = Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
-    committed = Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {})
-    RecordingReservationAdapter.new(prepare: refused, commit: committed, abort: aborted)
-  end
-
-  # "Add units that gather the required real signals and prove the command reports them."
-  # The refusal happened when prepare answered; a caller that swallows the error and commits
-  # must not make it disappear from the prepare_refusal signal.
-  it "records a refused prepare once when the caller rescues the refusal and commits its transaction" do
-    invoice = create(:invoice)
-    request = refusal_record_request(invoice)
-
-    ApplicationRecord.transaction do
-      described_class.new(reservations: refusal_record_adapter)
-        .call(request, holding: { entry_ids: [701], disposition: "active" })
-    rescue Invoices::OperationErrors::Refused
-      nil
-    end
-
-    rows = TimekeepingPrepareRefusal.where(company_id: invoice.company_id)
-    expect(rows.count).to eq(1)
-    expect(rows.sole.reason).to eq("on_another_invoice")
-  end
-end
-
-RSpec.describe Invoices::OperationCoordinator, committed_data: true do
-  def savepoint_refusal_request(invoice)
-    Invoices::ReservationRequest.new(
-      company_id: invoice.company_id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
-      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [702]
-    )
-  end
-
-  def savepoint_refusal_adapter
-    refused = Invoices::ReservationOutcome.new(
-      state: "refused", conflicts: [{ entry_id: 702, reason: "on_another_invoice" }], counts: {}
-    )
-    aborted = Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
-    committed = Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {})
-    RecordingReservationAdapter.new(prepare: refused, commit: committed, abort: aborted)
-  end
-
-  # "Add units that gather the required real signals and prove the command reports them."
-  # The savepoint's rollback and the outer transaction's commit are two transaction ends for one
-  # refused call. Writing on both would double the count the operator sees.
-  it "records a refusal raised inside a rolled-back savepoint exactly once after the outer transaction commits" do
-    invoice = create(:invoice)
-    request = savepoint_refusal_request(invoice)
-
-    ApplicationRecord.transaction do
-      begin
-        ApplicationRecord.transaction(requires_new: true) do
-          described_class.new(reservations: savepoint_refusal_adapter)
-            .call(request, holding: { entry_ids: [702], disposition: "active" })
-        end
-      rescue Invoices::OperationErrors::Refused
-        nil
-      end
-      expect(TimekeepingPrepareRefusal.where(company_id: invoice.company_id)).not_to exist
-    end
-
-    expect(TimekeepingPrepareRefusal.where(company_id: invoice.company_id).count).to eq(1)
-  end
-end
-
-RSpec.describe Invoices::OperationCoordinator, committed_data: true do
-  # "Add units that gather the required real signals and prove the command reports them."
-  # Recording the signal must never change what the invoice save returns or how its intent settles.
-  it "keeps the Refused error and the failed intent when the refusal record cannot be written" do
-    invoice = create(:invoice)
-    request = Invoices::ReservationRequest.new(
-      company_id: invoice.company_id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
-      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [703]
-    )
-    refused = Invoices::ReservationOutcome.new(
-      state: "refused", conflicts: [{ entry_id: 703, reason: "on_another_invoice" }], counts: {}
-    )
-    adapter = RecordingReservationAdapter.new(
-      prepare: refused,
-      commit: Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {}),
-      abort: Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
-    )
-    allow(TimekeepingPrepareRefusal).to receive(:insert_all!).and_raise(ActiveRecord::StatementInvalid, "refusal table down")
-
-    expect do
-      ApplicationRecord.transaction do
-        described_class.new(reservations: adapter).call(request, holding: { entry_ids: [703], disposition: "active" })
-      end
-    end.to raise_error(Invoices::OperationErrors::Refused) { |error| expect(error.outcome).to eq(refused) }
-
-    intent = InvoiceOperationIntent.find_by!(company_id: request.company_id, operation_id: request.operation_id)
-    expect(intent.state).to eq("failed")
-    expect(TimekeepingPrepareRefusal.where(company_id: invoice.company_id)).not_to exist
   end
 end

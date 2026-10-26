@@ -8,9 +8,10 @@ module Timekeeping
   # A signal with no source is listed in unavailable and left out of signals,
   # never set to zero, because a zero would read as healthy. Signals with no
   # producer in this repository yet are always unavailable. A local read that
-  # fails makes only its own signal unavailable. A failed metrics read makes
-  # the metrics-based signals unavailable too, and sets metrics_error, so the
-  # caller can still report the monolith-side alerts and then fail.
+  # fails makes only its own signal unavailable and is named in
+  # failed_local_reads. A failed metrics read makes the metrics-based signals
+  # unavailable too, and sets metrics_error. Either way the caller can still
+  # report every alert it could evaluate and then fail.
   #
   # Every read is read-only: the event history stays as observability, and a
   # second run inside the lookback sees the same records.
@@ -38,7 +39,8 @@ module Timekeeping
 
     module_function
 
-    # Returns { signals:, unavailable: [signal names], metrics_error: String or nil }.
+    # Returns { signals:, unavailable: [signal names], metrics_error: String or nil,
+    # failed_local_reads: [names of local signals whose read raised] }.
     def gather(metrics_client:, now:)
       metrics, metrics_error = read_metrics(metrics_client)
       owner = TimekeepingOwnership.current.owner
@@ -52,7 +54,7 @@ module Timekeeping
         outbox_lag_by_owner: outbox_lag_by_owner(metrics)
       }.compact
 
-      { signals:, unavailable: unavailable(metrics, owner) + failed, metrics_error: }
+      { signals:, unavailable: unavailable(metrics, owner) + failed, metrics_error:, failed_local_reads: failed }
     end
 
     def read_metrics(metrics_client)

@@ -160,7 +160,7 @@ module Invoices
         reasons = outcome.conflicts.map { |conflict| conflict.fetch(:reason) }.uniq.presence || [nil]
         TimekeepingPrepareRefusal.insert_all!(reasons.map { |reason| { company_id: request.company_id, reason: } })
       rescue StandardError => error
-        Rails.logger.warn("prepare refusal not recorded: #{error.class}")
+        Rails.error.report(error, handled: true, context: { company_id: request.company_id, operation_id: request.operation_id })
       end
 
       def pending_intent(request)
