@@ -44,6 +44,15 @@ RSpec.describe Timekeeping::MetricsClient, "unusable answers" do
     expect(unusable_metrics_client.fetch).to eq(complete)
   end
 
+  it "raises its own Error for a 200 body whose companies list is null" do
+    body = { "window_seconds" => 300, "latency_bucket_bounds_ms" => [300], "overflow_bucket" => "inf",
+             "companies" => nil, "outbox_lag" => [] }
+    WebMock.stub_request(:get, unusable_metrics_url).to_return(status: 200, body: JSON.generate(body))
+
+    expect { unusable_metrics_client.fetch }
+      .to raise_error(Timekeeping::MetricsClient::Error, "Timekeeping metrics body is missing fields")
+  end
+
   it "raises its own Error for a garbled HTTP answer" do
     WebMock.stub_request(:get, unusable_metrics_url).to_raise(Net::HTTPBadResponse)
 

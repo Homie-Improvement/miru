@@ -13,10 +13,14 @@ module Timekeeping
   class MetricsClient
     METRICS_PATH = "/internal/v1/metrics"
     TIMEOUT_SECONDS = 5
-    # The top-level fields Timekeeping::Alerts reads. A body without one, such
-    # as one from an older Timekeeping, is a failed read rather than a crash
-    # later in evaluation.
-    REQUIRED_FIELDS = %w[window_seconds latency_bucket_bounds_ms overflow_bucket companies outbox_lag].freeze
+    # The top-level fields Timekeeping::Alerts reads, each with the type it
+    # needs. A body that lacks one or holds another type, such as one from an
+    # older Timekeeping, is a failed read rather than a crash later in
+    # evaluation.
+    REQUIRED_FIELDS = {
+      "window_seconds" => Integer, "latency_bucket_bounds_ms" => Array, "overflow_bucket" => String,
+      "companies" => Array, "outbox_lag" => Array
+    }.freeze
 
     class Error < StandardError; end
 
@@ -34,7 +38,7 @@ module Timekeeping
       raise Error, "Timekeeping metrics answered #{response.code}" unless response.is_a?(Net::HTTPOK)
 
       body = JSON.parse(response.body)
-      complete = body.is_a?(Hash) && REQUIRED_FIELDS.all? { |field| body.key?(field) }
+      complete = body.is_a?(Hash) && REQUIRED_FIELDS.all? { |field, type| body[field].is_a?(type) }
       raise Error, "Timekeeping metrics body is missing fields" unless complete
 
       body
