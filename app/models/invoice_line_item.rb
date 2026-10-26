@@ -99,10 +99,12 @@ class InvoiceLineItem < ApplicationRecord
 
     # Missing ids, other companies' ids and entries with no company get the same
     # error, so no response shows whether an id exists in another company.
-    # No database key checks timesheet_entry_id, so the row is share-locked to
-    # stop it being deleted before this save commits.
+    # No database key checks timesheet_entry_id, so the row is locked to stop it
+    # being deleted before this save commits. FOR KEY SHARE still blocks a
+    # delete but not the later update of the entry's locked flag; FOR SHARE
+    # would deadlock two invoices saving the same entry at once.
     def timesheet_entry_found_in_invoice_company
-      return if entries_in_invoice_company.where(id: timesheet_entry_id).lock("FOR SHARE").exists?
+      return if entries_in_invoice_company.where(id: timesheet_entry_id).lock("FOR KEY SHARE").exists?
 
       errors.add(:timesheet_entry, :not_found)
     end
