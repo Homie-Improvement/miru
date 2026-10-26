@@ -82,6 +82,30 @@ module HandoffRows
     end
 end
 
+# Reads the stored state a handoff call can change, so every spec that proves a
+# refused call changed nothing compares the same tables in the same way.
+module HandoffStoredState
+  # Every table a handoff load or correction can write.
+  HANDOFF_STORED_TABLES = %w[entries reservations invoice_operations audit_events idempotency_receipts
+                             outbox_snapshots].freeze
+
+  # Every row of every stored table, read as Postgres returns it, so a change
+  # to any value shows up.
+  def handoff_stored_rows
+    HANDOFF_STORED_TABLES.index_with do |table|
+      ApplicationRecord.connection.select_rows("SELECT * FROM #{table} ORDER BY 1, 2")
+    end
+  end
+
+  # The id the table's sequence hands out next, without consuming it.
+  def handoff_next_id(table)
+    ApplicationRecord.connection.select_value(
+      "SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END FROM #{table}_id_seq"
+    ).to_i
+  end
+end
+
 RSpec.configure do |config|
   config.include HandoffRows
+  config.include HandoffStoredState
 end

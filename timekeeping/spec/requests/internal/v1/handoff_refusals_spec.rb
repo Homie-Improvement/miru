@@ -14,12 +14,8 @@ RSpec.describe "Timekeeping internal handoff routes refuse callers without the s
   # Every stored row a handoff route could write, plus the admission generation
   # and the next entry id, so a refusal answered after any write is caught.
   def refused_handoff_state
-    tables = %w[entries reservations invoice_operations audit_events idempotency_receipts outbox_snapshots]
-    tables.index_with { |table| ApplicationRecord.connection.select_rows("SELECT * FROM #{table} ORDER BY 1, 2") }
-      .merge("admission_generation" => Timekeeping::Admission.current.generation,
-             "next_entry_id" => ApplicationRecord.connection.select_value(
-               "SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END FROM entries_id_seq"
-             ).to_i)
+    handoff_stored_rows.merge("admission_generation" => Timekeeping::Admission.current.generation,
+                              "next_entry_id" => handoff_next_id("entries"))
   end
 
   def refused_handoff_callers
@@ -34,7 +30,8 @@ RSpec.describe "Timekeeping internal handoff routes refuse callers without the s
 
   # Bodies that would change stored state if a refused call reached its
   # controller: an empty checkpoint deletes the seeded entry, the sequence
-  # target moves the next id, and the snapshot raises the entry's version.
+  # target moves the next id, and the snapshot at version 2 raises the
+  # version-1 entry to 2.
   def refused_handoff_bodies(entry)
     empty_checkpoint = Timekeeping::Handoff::Checkpoint.build(
       tables: Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }
@@ -42,7 +39,7 @@ RSpec.describe "Timekeeping internal handoff routes refuse callers without the s
     {
       checkpoint_load: empty_checkpoint,
       entry_id_sequence: { above: 9_000_000_000 },
-      correction_snapshots: { generation: 2, version: 1, snapshots: [handoff_correction_snapshot(entry, locked: true)] },
+      correction_snapshots: { generation: 2, version: 2, snapshots: [handoff_correction_snapshot(entry, locked: true)] },
       admission_admit: { generation: 4 }
     }
   end

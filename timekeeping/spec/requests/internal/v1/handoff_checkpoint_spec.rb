@@ -17,14 +17,6 @@ RSpec.describe "Timekeeping internal handoff checkpoint" do
     Timekeeping::Handoff::Checkpoint.from_json(response.body)
   end
 
-  # Every stored row of every table a load could write, read as Postgres
-  # returns it, so a refused load that changed any value shows up.
-  def checkpoint_spec_table_rows
-    %w[entries reservations invoice_operations audit_events idempotency_receipts outbox_snapshots].index_with do |table|
-      ApplicationRecord.connection.select_rows("SELECT * FROM #{table} ORDER BY 1, 2")
-    end
-  end
-
   def checkpoint_spec_entry(note, **attributes)
     Entry.create!(company_id: 1, user_id: 7, project_id: 3, work_date: "2026-03-02", duration: 90.0,
                   note:, bill_status: "unbilled", source: "manual", source_metadata: {}, **attributes)
@@ -84,7 +76,7 @@ RSpec.describe "Timekeeping internal handoff checkpoint" do
 
     first_status = handoff_request(:checkpoint_load, body: checkpoint.to_json).status
     first = checkpoint_from(response)
-    rows_after_first = checkpoint_spec_table_rows
+    rows_after_first = handoff_stored_rows
     second_status = handoff_request(:checkpoint_load, body: checkpoint.to_json).status
     second = checkpoint_from(response)
 
@@ -92,7 +84,7 @@ RSpec.describe "Timekeeping internal handoff checkpoint" do
     expect(first.digest).to eq(checkpoint.digest)
     expect(second.digest).to eq(first.digest)
     expect(Timekeeping::Handoff::Checkpoint.verify(second)).to eq([])
-    expect(checkpoint_spec_table_rows).to eq(rows_after_first)
+    expect(handoff_stored_rows).to eq(rows_after_first)
     expect([Entry.count, Reservation.count, InvoiceOperation.count, AuditEvent.count, IdempotencyReceipt.count])
       .to eq([2, 2, 2, 2, 2])
     # Stored text, not decoded values: a decoded comparison hides decimal rounding.
@@ -268,7 +260,7 @@ RSpec.describe "Timekeeping internal handoff checkpoint" do
       # the delete would lose this row.
       checkpoint_spec_entry("Written after export")
 
-      before = checkpoint_spec_table_rows
+      before = handoff_stored_rows
       expect(Entry.order(:id).pluck(:note, :version)).to eq([["Design review", 3], ["Written after export", 1]])
       expect(before.transform_values(&:size)).to eq(
         "entries" => 2, "reservations" => 1, "invoice_operations" => 0, "audit_events" => 1,
@@ -282,7 +274,7 @@ RSpec.describe "Timekeeping internal handoff checkpoint" do
         row.fetch(:during, ->(&deliver) { deliver.call }).call(&send_load)
 
         expect([row.fetch(:name), response.status, response.parsed_body]).to eq([row.fetch(:name), *row.fetch(:answer)])
-        expect([row.fetch(:name), checkpoint_spec_table_rows, Timekeeping::Admission.current.generation])
+        expect([row.fetch(:name), handoff_stored_rows, Timekeeping::Admission.current.generation])
           .to eq([row.fetch(:name), before, nil])
         row[:extra]&.call
       end
