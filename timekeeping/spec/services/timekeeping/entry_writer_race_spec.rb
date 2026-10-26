@@ -189,4 +189,56 @@ RSpec.describe Timekeeping::EntryWriter, "fencing behind an admitted write" do
     expect(Timekeeping::Admission.current.generation).to eq(1)
     expect(ApplicationRecord.connection.select_value("SHOW lock_timeout")).to eq("0")
   end
+
+  # "Fencing waits for writes already admitted, with a lock timeout of 60 s in production use"
+  it "keeps the generation admitted while a fence waits behind an admitted write, then fences once it commits" do
+    company = timekeeping_arrange.company
+    project = timekeeping_arrange.project(company:)
+    owner = timekeeping_arrange.user(company:, role: "owner")
+    entry_id = timekeeping_arrange.entry(company:, user: owner, project:)
+    patch = build_entry_command(:update, token: timekeeping_arrange.token_for(owner), entry_id:, body: { "note" => "Held" })
+    reached = Queue.new
+    release = Queue.new
+    pids = Queue.new
+    checkpoint = lambda do |step|
+      next unless step == :generation_checked
+
+      reached << true
+      release.pop
+    end
+
+    writer = Thread.new do
+      ApplicationRecord.connection_pool.with_connection do |connection|
+        pids << connection.select_value("SELECT pg_backend_pid()")
+        described_class.new(checkpoint:).call(patch)
+      end
+    end
+    expect(reached.pop(timeout: 10)).to be(true)
+    writer_pid = pids.pop(timeout: 10)
+    fencer = Thread.new do
+      ApplicationRecord.connection_pool.with_connection do |connection|
+        pids << connection.select_value("SELECT pg_backend_pid()")
+        Timekeeping::Admission.fence!(lock_timeout: 10)
+      end
+    end
+    fencer_pid = pids.pop(timeout: 10)
+
+    blocked = false
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 3
+    until blocked || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+      blocked = ApplicationRecord.connection.select_value(
+        ApplicationRecord.sanitize_sql_array(["SELECT ? = ANY(pg_blocking_pids(?))", writer_pid, fencer_pid])
+      )
+      sleep 0.02 unless blocked
+    end
+    expect(Timekeeping::Admission.current.generation).to eq(1)
+    release << true
+    outcome = writer.join(10)&.value
+    fencer.join(10)
+
+    expect(blocked).to be(true), "fence! never waited on the admitted write's shared lock"
+    expect(outcome.status).to eq(200)
+    expect(Entry.find(entry_id).note).to eq("Held")
+    expect(Timekeeping::Admission.current.generation).to be_nil
+  end
 end
