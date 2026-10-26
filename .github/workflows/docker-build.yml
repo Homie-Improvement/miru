@@ -131,3 +131,72 @@ jobs:
               -H "Content-Type: application/json" \
               "https://api.render.com/v1/services/${service_id}/deploys"
           done
+
+  # The Timekeeping demo runs locally only, so its image is built to prove the
+  # Dockerfile works and is never pushed or deployed. The job has no registry
+  # login, no image tags under IMAGE_NAME and no Render secret.
+  timekeeping-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        with:
+          version: v0.36.0
+          driver-opts: |
+            network=host
+            image=moby/buildkit@sha256:1f8167fcb0eca5b7126353d35299386945cbb8949cc516c592a49f80cfce4fa2
+
+      # Files a developer might leave in a checkout. The check after the build
+      # fails if timekeeping/Dockerfile.dockerignore lets any of them into the
+      # image.
+      - name: Plant secret sentinel files
+        run: |
+          mkdir -p timekeeping/config/credentials timekeeping/.bundle timekeeping/spec
+          for path in \
+            timekeeping/config/master.key \
+            timekeeping/config/credentials/test.key \
+            timekeeping/sentinel.pem \
+            timekeeping/.bundle/config \
+            timekeeping/.env \
+            timekeeping/spec/sentinel; do
+            echo "sentinel" > "$path"
+          done
+
+      - name: Build Timekeeping image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: ./timekeeping/Dockerfile
+          push: false
+          load: true
+          tags: timekeeping:ci
+          cache-from: type=gha,scope=timekeeping
+          cache-to: type=gha,mode=max,scope=timekeeping
+          platforms: linux/amd64
+          build-args: |
+            RUBY_VERSION=4.0.1
+
+      - name: Check no sentinel file reached the image
+        run: |
+          docker run --rm --entrypoint sh timekeeping:ci -c '
+            status=0
+            for path in \
+              /app/timekeeping/config/master.key \
+              /app/timekeeping/config/credentials/test.key \
+              /app/timekeeping/sentinel.pem \
+              /app/timekeeping/.bundle/config \
+              /app/timekeeping/.env \
+              /app/timekeeping/spec/sentinel; do
+              if [ -e "$path" ]; then
+                echo "found in image: $path"
+                status=1
+              fi
+            done
+            exit $status
+          '

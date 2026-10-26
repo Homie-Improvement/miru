@@ -1,0 +1,26 @@
+# BuildKit reads this file in place of the root .dockerignore when it builds
+# timekeeping/Dockerfile. The build context is the repository root, so this
+# file starts by ignoring everything and lets in only the service and the
+# rules gem it loads.
+*
+!timekeeping/
+!gems/timekeeping_rules/
+
+# Docker does not read .gitignore, so the keys, credentials and local files
+# timekeeping/.gitignore keeps out of git are listed again here. Without these
+# lines a file left in a developer's checkout would be copied into an image
+# layer that anyone who pulls the image can read.
+**/.env*
+**/.bundle
+**/vendor/bundle
+**/config/master.key
+**/config/credentials/*.key
+**/*.pem
+
+# Not needed to run the service.
+**/spec
+**/log
+**/tmp
+**/.rspec
+timekeeping/Dockerfile
+timekeeping/Dockerfile.dockerignore
