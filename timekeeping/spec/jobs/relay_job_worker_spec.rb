@@ -6,6 +6,8 @@ require "puma/server"
 require "tempfile"
 require_relative "../../../spec/support/timekeeping/fake_relay"
 
+# Runs the queue processes config/solid_queue.yml names in a child process, so
+# delivery is seen only if the dispatcher schedules RelayJob and the worker runs it.
 RSpec.describe RelayJob, "through the configured queue worker", type: :request do
   self.use_transactional_tests = false
 
@@ -24,7 +26,7 @@ RSpec.describe RelayJob, "through the configured queue worker", type: :request d
     fake_timekeeping = TimekeepingContract::FakeTimekeeping.new
     credential = fake_timekeeping.add_service(company_id: nil, name: "timekeeping", operations: ["deliver"])
     projection = TimekeepingContract::FakeRelay.new(source: fake_timekeeping)
-    posted_entry_ids = []
+    posted_positions = []
     posted_lock = Mutex.new
 
     # A real socket: a WebMock stub in this process cannot see a POST sent
@@ -32,7 +34,7 @@ RSpec.describe RelayJob, "through the configured queue worker", type: :request d
     listener_app = lambda do |env|
       body = JSON.parse(env["rack.input"].read)
       posted_lock.synchronize do
-        posted_entry_ids.concat(body.fetch("snapshots").map { |item| item.dig("entry", "id") })
+        posted_positions.concat(body.fetch("snapshots").map { |item| item.fetch("outbox_position") })
         answer = projection.call("POST", env["PATH_INFO"],
                                  headers: { "Authorization" => env["HTTP_AUTHORIZATION"],
                                             "Idempotency-Key" => env["HTTP_IDEMPOTENCY_KEY"] },
@@ -81,62 +83,70 @@ RSpec.describe RelayJob, "through the configured queue worker", type: :request d
 
     pid = nil
     first_sent_at = nil
-    with_timekeeping_env(Timekeeping::Environment::SERVICE_TOKEN => credential) do
-      pid = Process.spawn(child_env, RbConfig.ruby, "bin/rails", "runner", supervisor_script,
-                          chdir: app_root, unsetenv_others: true, pgroup: true,
-                          out: child_log.path, err: [:child, :out])
-      wait_for.call("Worker and Dispatcher processes", 30) do
-        connection.select_values("SELECT kind FROM solid_queue_processes").to_set >= Set["Worker", "Dispatcher"]
+    begin
+      with_timekeeping_env(Timekeeping::Environment::SERVICE_TOKEN => credential) do
+        pid = Process.spawn(child_env, RbConfig.ruby, "bin/rails", "runner", supervisor_script,
+                            chdir: app_root, unsetenv_others: true, pgroup: true,
+                            out: child_log.path, err: [:child, :out])
+        wait_for.call("Worker and Dispatcher processes", 30) do
+          connection.select_values("SELECT kind FROM solid_queue_processes").to_set >= Set["Worker", "Dispatcher"]
+        end
+
+        post "/internal/v1/test-hooks/relay/pause", headers: { "Authorization" => "Bearer #{credential}" }
+        expect(response).to have_http_status(:success)
+
+        stamp = Time.utc(2026, 3, 2, 9)
+        OutboxSnapshot.insert_all!([{
+          outbox_position: entry_id, id: entry_id, project_id: 3, user_id: 4, work_date: "2026-03-02", duration: 60.0,
+          bill_status: "unbilled", review_status: "not_required", locked: false, source: "manual",
+          source_metadata: {}, proof_metadata: {}, created_at: stamp, updated_at: stamp,
+          company_id: 1, version: 1, generation: TimekeepingContract::FakeTimekeeping::INITIAL_GENERATION
+        }])
+        inserted_at = connection.select_value("SELECT clock_timestamp()")
+
+        # "Include pause and resume across the request and worker processes so the same check covers the required process boundary."
+        # A run must have finished while paused, so a worker that ignored the
+        # pause would have delivered by now, and a configuration that never
+        # schedules RelayJob fails this wait.
+        wait_for.call("a RelayJob run finished while paused", 25) { finished_relay_run_since.call(inserted_at) }
+        expect(posted_lock.synchronize { posted_positions.dup }).to be_empty
+        expect(sent_at.call).to be_nil
+        expect(projection.projected_entry(entry_id)).to be_nil
+
+        post "/internal/v1/test-hooks/relay/resume", headers: { "Authorization" => "Bearer #{credential}" }
+        expect(response).to have_http_status(:success)
+
+        # "Add a focused integration example that starts the configured queue processes, inserts a committed outbox row, and observes delivery to the fake projection endpoint without calling the job directly."
+        wait_for.call("sent_at set on the delivered row", 25) { !sent_at.call.nil? }
+        delivered_at = connection.select_value("SELECT clock_timestamp()")
+        first_sent_at = sent_at.call
+
+        # A later scheduled run must not send the row again or clear its mark.
+        wait_for.call("a RelayJob run finished after delivery", 25) { finished_relay_run_since.call(delivered_at) }
       end
 
-      post "/internal/v1/test-hooks/relay/pause", headers: { "Authorization" => "Bearer #{credential}" }
-      expect(response).to have_http_status(:success)
-
-      stamp = Time.utc(2026, 3, 2, 9)
-      OutboxSnapshot.insert_all!([{
-        id: entry_id, project_id: 3, user_id: 4, work_date: "2026-03-02", duration: 60.0,
-        bill_status: "unbilled", review_status: "not_required", locked: false, source: "manual",
-        source_metadata: {}, proof_metadata: {}, created_at: stamp, updated_at: stamp,
-        company_id: 1, version: 1, generation: TimekeepingContract::FakeTimekeeping::INITIAL_GENERATION
-      }])
-      inserted_at = connection.select_value("SELECT clock_timestamp()")
-
-      # "Include pause and resume across the request and worker processes so the same check covers the required process boundary."
-      # A run must have finished while paused, so a worker that ignored the
-      # pause would have delivered by now.
-      wait_for.call("a RelayJob run finished while paused", 25) { finished_relay_run_since.call(inserted_at) }
-      expect(posted_entry_ids).to be_empty
-      expect(sent_at.call).to be_nil
-
-      post "/internal/v1/test-hooks/relay/resume", headers: { "Authorization" => "Bearer #{credential}" }
-      expect(response).to have_http_status(:success)
-
-      # "Add a focused integration example that starts the configured queue processes, inserts a committed outbox row, and observes delivery to the fake projection endpoint without calling the job directly."
-      wait_for.call("sent_at set on the delivered row", 25) { !sent_at.call.nil? }
-      delivered_at = connection.select_value("SELECT clock_timestamp()")
-      first_sent_at = sent_at.call
-
-      # A later scheduled run must not send the row again or clear its mark.
-      wait_for.call("a RelayJob run finished after delivery", 25) { finished_relay_run_since.call(delivered_at) }
-    end
-
-    expect(projection.projected_entry(entry_id)).to include("id" => entry_id, "version" => 1, "company_id" => 1)
-    expect(posted_lock.synchronize { posted_entry_ids.count(entry_id) }).to eq(1)
-    expect(sent_at.call).to eq(first_sent_at)
-  ensure
-    if pid
-      begin
-        Process.kill("TERM", -pid)
-        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
-        sleep 0.1 while Process.waitpid(pid, Process::WNOHANG).nil? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
-        Process.kill("KILL", -pid)
-        Process.waitpid(pid)
-      rescue Errno::ESRCH, Errno::ECHILD
-        nil
+      expect(projection.projected_entry(entry_id)).to include("id" => entry_id, "version" => 1, "company_id" => 1)
+      expect(posted_lock.synchronize { posted_positions.dup }).to eq([entry_id])
+      expect(sent_at.call).to eq(first_sent_at)
+    ensure
+      Timekeeping::TestHooks.resume_relay!
+      if pid
+        begin
+          Process.kill("TERM", -pid)
+          deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
+          sleep 0.1 while Process.waitpid(pid, Process::WNOHANG).nil? && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+          Process.kill("KILL", -pid)
+          Process.waitpid(pid)
+        rescue Errno::ESRCH, Errno::ECHILD
+          nil
+        end
       end
+      listener.stop(true)
+      child_log.close!
     end
-    listener&.stop(true)
-    Timekeeping::TestHooks.resume_relay!
-    child_log&.close!
+
+    # No queue process and no pause outlives the example.
+    expect(File.exist?(Timekeeping::TestHooks.relay_pause_file)).to be(false)
+    expect { Process.kill(0, -pid) }.to raise_error(Errno::ESRCH)
   end
 end
