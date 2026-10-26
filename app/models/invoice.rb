@@ -60,8 +60,12 @@ class Invoice < ApplicationRecord
   before_validation :calculate_amounts, if: :totals_recalculation_needed?
   before_validation :calculate_base_currency_amount
   after_save :sync_nested_line_item_totals, if: -> { skip_line_item_total_sync && !syncing_nested_line_item_totals }
-  after_save :lock_timesheet_entries, if: :draft?
-  after_discard :unlock_timesheet_entries, if: :draft?
+  # Registered before any write, so the reservation boundary sees the entries
+  # the invoice referenced before this transaction changed them; prepended on
+  # destroy so it runs before the line items are destroyed.
+  before_save :register_reservation_change
+  before_destroy :register_reservation_change, prepend: true
+  after_create :register_reservation_change
   after_discard :update_invoice_number
   after_commit :reset_skip_line_item_total_sync
   after_rollback :reset_skip_line_item_total_sync
@@ -122,10 +126,6 @@ class Invoice < ApplicationRecord
 
   def recently_sent_mail?
     sent_at.nil? || (sent_at && !(sent_at > 1.minute.ago))
-  end
-
-  def update_timesheet_entry_status!
-    TimesheetEntry.kept.where(id: invoice_timesheet_entry_ids).update!(bill_status: :billed)
   end
 
   def create_checkout_session!(success_url:, cancel_url:)
@@ -198,22 +198,8 @@ class Invoice < ApplicationRecord
       end
     end
 
-    def lock_timesheet_entries
-      TimesheetEntry.in_workspace(company).where(id: invoice_timesheet_entry_ids).update!(locked: true)
-    end
-
-    def unlock_timesheet_entries
-      TimesheetEntry.in_workspace(company).where(id: invoice_timesheet_entry_ids).update!(locked: false)
-    end
-
-    def invoice_timesheet_entry_ids
-      direct_ids = invoice_line_items.pluck(:timesheet_entry_id)
-      linked_ids = InvoiceLineItemTimeEntry
-        .joins(:invoice_line_item)
-        .where(invoice_line_items: { invoice_id: id })
-        .pluck(:timesheet_entry_id)
-
-      (direct_ids + linked_ids).compact.uniq
+    def register_reservation_change
+      Invoices::ReservationBoundary.register(self)
     end
 
     def same_currency?

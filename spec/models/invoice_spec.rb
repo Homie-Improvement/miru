@@ -185,8 +185,9 @@ RSpec.describe Invoice, type: :model do
 
   describe "callbacks" do
     it { is_expected.to callback(:set_external_view_key).before(:validation).on(:create) }
-    it { is_expected.to callback(:lock_timesheet_entries).after(:save).if(:draft?) }
-    it { is_expected.to callback(:unlock_timesheet_entries).after(:discard).if(:draft?) }
+    it { is_expected.to callback(:register_reservation_change).before(:save) }
+    it { is_expected.to callback(:register_reservation_change).before(:destroy) }
+    it { is_expected.to callback(:update_invoice_number).after(:discard) }
   end
 
   describe ".client_name" do
@@ -207,15 +208,6 @@ RSpec.describe Invoice, type: :model do
 
     it "sends the invoice on email" do
       expect { invoice.send_to_email(subject:, recipients:, message:) }.to have_enqueued_mail(InvoiceMailer, :invoice)
-    end
-  end
-
-  describe ".update_timesheet_entry_status" do
-    it "updates the time_sheet_entries status to billed" do
-      invoice.update_timesheet_entry_status!
-      invoice.invoice_line_items.reload.each do |line_item|
-        expect(line_item.timesheet_entry.bill_status).to eq("billed")
-      end
     end
   end
 

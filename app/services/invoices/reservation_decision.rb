@@ -4,29 +4,33 @@ module Invoices
   # Decides what an invoice save sends to the reservation port: nil when
   # nothing changes, or the entry set and disposition the invoice should hold.
   #
-  # A draft holds exactly its lines, and a discarded or destroyed draft holds
-  # nothing. A non-draft never releases an entry: it holds what it held plus
-  # its lines, and a discarded or destroyed non-draft keeps what it held as
-  # retained. A result equal to what is already held sends nothing, so a
-  # repeated save or discard never sends an operation that changes nothing.
+  # A draft holds what it held plus its lines; a discarded or destroyed draft
+  # sends nothing, so its entries stay locked as they do today. A live
+  # non-draft sends nothing either: only draft saves lock entries, so a sent
+  # invoice saved directly keeps its entries' lock state as it is, and
+  # removing its line never releases one. A discarded or destroyed non-draft
+  # keeps what it held as retained. A result equal to what is already held
+  # sends nothing, so a repeated save or discard never sends an operation
+  # that changes nothing.
   module ReservationDecision
     ACTIVE, RETAINED = ReservationRequest::DISPOSITIONS
     DRAFT_STATUS = "draft"
     NOTHING_HELD = { entries: [].freeze, disposition: ACTIVE }.freeze
 
+    SEND_NOTHING = ->(held:, lines:) { nil }
+
     # Named on its own, apart from the destroyed-draft row, so that changing
     # what a discarded draft sends stays a one-row change.
-    DISCARDED_DRAFT = ->(held:, lines:) { { entries: [], disposition: ACTIVE } }.freeze
+    DISCARDED_DRAFT = SEND_NOTHING
 
-    RELEASE_ALL = ->(held:, lines:) { { entries: [], disposition: ACTIVE } }
     RETAIN_HELD = ->(held:, lines:) { { entries: held[:entries], disposition: RETAINED } }
 
     # Keyed by [draft?, lifecycle]; destroyed takes precedence over discarded.
     TABLE = {
-      [true, :live] => ->(held:, lines:) { { entries: lines, disposition: ACTIVE } },
+      [true, :live] => ->(held:, lines:) { { entries: held[:entries] | lines, disposition: ACTIVE } },
       [true, :discarded] => DISCARDED_DRAFT,
-      [true, :destroyed] => RELEASE_ALL,
-      [false, :live] => ->(held:, lines:) { { entries: held[:entries] | lines, disposition: ACTIVE } },
+      [true, :destroyed] => SEND_NOTHING,
+      [false, :live] => SEND_NOTHING,
       [false, :discarded] => RETAIN_HELD,
       [false, :destroyed] => RETAIN_HELD
     }.to_h { |key, rule| [key.freeze, rule.freeze] }.freeze
