@@ -257,8 +257,10 @@ RSpec.describe Timekeeping::UserToken, "purpose stays a separate claim" do
     end
 
     expect(signed).to eq([%w[admin read employee], %w[admin write employee]])
-    expect { described_class.mint(user: member, company:, private_key: timekeeping_key_pair, purpose: "write") }
-      .to raise_error(ArgumentError)
+    [:admin, "read", "write"].each do |unsupported|
+      expect { described_class.mint(user: member, company:, private_key: timekeeping_key_pair, purpose: unsupported) }
+        .to raise_error(ArgumentError)
+    end
   end
 end
 

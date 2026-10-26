@@ -43,7 +43,7 @@ Put the limit where the credential is accepted, and type it strictly:
 - Once `ReadAccess.decide` allows the request, `WriteAccess.decide` answers `:forbidden` unless the purpose is `nil` or `"write"`; an expired token still answers `:reference_unavailable`, and another company's path still answers ReadAccess's refusal (such as `:not_found`), whatever the purpose. A missing purpose is allowed only because tokens signed before this change carry the primary role, as before.
 - Because a missing purpose may write, `TokenVerifier` rejects a purpose that is present but not a String (`OPTIONAL_CLAIM_TYPES`). Otherwise a wrong-type value could be read as missing and gain write access.
 
-Then stage the rollout, because the monolith and Timekeeping deploy apart:
+Then stage the rollout, because the monolith and Timekeeping deploy apart. The steps below describe how this was staged when only read tokens carried a raised role. They no longer hold on their own: write tokens now sign the same raised role, beside a `primary_role` claim that Timekeeping's locked and billed rules read. Turning the flag off no longer keeps a raised role off the wire. For the current deploy and rollback order, see `docs/architecture/timekeeping-soa.md` section 6.2 (user-delegated row) and section 11.2 (`TIMEKEEPING_READ_TOKENS_ENABLED`).
 
 - The monolith mints raised read tokens only when `TIMEKEEPING_READ_TOKENS_ENABLED` is `"true"`. Until then, reads send the default write token with the primary role.
 - Set the flag only once every running Timekeeping refuses read tokens on write routes.
