@@ -22,6 +22,9 @@ module Timekeeping
       def entry_id = row.fetch("id")
       def company_id = row.fetch("company_id")
       def project_id = row.fetch("project_id")
+      def user_id = row.fetch("user_id")
+      def agent_id = row.fetch("agent_id")
+      def version = row.fetch("version")
     end
 
     class InvalidValue < StandardError; end

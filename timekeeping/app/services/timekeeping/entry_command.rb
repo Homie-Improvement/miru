@@ -23,6 +23,13 @@ module Timekeeping
     WRITABLE_FIELDS = %w[project_id work_date duration note source source_metadata bill_status agent_id proof_url
                          proof_metadata].freeze
 
+    # The values the monolith's timesheet_entries accepts (TimesheetEntry::SOURCES
+    # and its bill_status enum). Every write here is projected there, and the
+    # projection refuses a batch holding any other value, so accepting one
+    # would stop snapshot delivery for every later entry.
+    SOURCES = %w[manual cli mcp automation import].freeze
+    BILL_STATUSES = %w[non_billable unbilled billed].freeze
+
     # The shape each writable field must have when the body sends it, so a
     # value the entries table cannot store is refused as a bad request rather
     # than failing inside the transaction.
@@ -30,9 +37,9 @@ module Timekeeping
       "work_date" => ->(value) { value.is_a?(String) && DATE.match?(value) && Date.iso8601(value) },
       "duration" => ->(value) { value.is_a?(Numeric) },
       "note" => ->(value) { value.nil? || value.is_a?(String) },
-      "source" => ->(value) { value.is_a?(String) },
+      "source" => ->(value) { SOURCES.include?(value) },
       "source_metadata" => ->(value) { value.is_a?(Hash) },
-      "bill_status" => ->(value) { value.is_a?(String) },
+      "bill_status" => ->(value) { BILL_STATUSES.include?(value) },
       "agent_id" => ->(value) { value.nil? || value.is_a?(Integer) },
       "proof_url" => ->(value) { value.nil? || value.is_a?(String) },
       "proof_metadata" => ->(value) { value.is_a?(Hash) }

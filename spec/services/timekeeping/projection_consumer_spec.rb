@@ -139,20 +139,121 @@ RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
       end
     end
 
-    it "keeps the higher version when two deliveries of one entry run at the same time" do
+    # Holds a delivery started on a thread with :rules_pause set just before
+    # its writes, after its generation check and row locks, until released.
+    def rules_pause_before_write(paused, release)
+      allow_any_instance_of(described_class).to receive(:refuse_foreign_agents!).and_wrap_original do |method, *args|
+        if Thread.current[:rules_pause]
+          paused << true
+          release.pop
+        end
+        method.call(*args)
+      end
+    end
+
+    def rules_thread(pause: false, &block)
+      Thread.new do
+        Thread.current[:rules_pause] = pause
+        ActiveRecord::Base.connection_pool.with_connection(&block)
+      end
+    end
+
+    it "keeps v3 when a v2 delivery that started first writes after v3 has committed" do
       rules_without_cleaner_transaction do
-        entries = [rules_entry(id: 91_006, version: 2), rules_entry(id: 91_006, version: 3)]
+        paused = Queue.new
+        release = Queue.new
+        rules_pause_before_write(paused, release)
 
-        entries.map do |entry|
-          Thread.new do
-            ActiveRecord::Base.connection_pool.with_connection do
-              described_class.call(batch: rules_batch(entry), idempotency_key: nil)
-            end
-          end
-        end.each(&:join)
+        older = rules_thread(pause: true) { rules_deliver(rules_entry(id: 91_006, version: 2)) }
+        paused.pop
+        newer = rules_thread { rules_deliver(rules_entry(id: 91_006, version: 3)) }.value
+        release << true
 
+        expect(newer).to eq([200, { "applied" => 1, "ignored" => 0 }])
+        expect(older.value).to eq([200, { "applied" => 0, "ignored" => 1 }])
         expect(rules_row(91_006)).to include("version" => 3, "note" => "v3")
       end
     end
+
+    it "makes the ownership flip wait for an accepted previous-generation batch, then refuses that generation" do
+      rules_without_cleaner_transaction do
+        TimekeepingOwnership.current.update!(generation: 2, handoff_step: "freeze", final_outbox_position: 10)
+        paused = Queue.new
+        release = Queue.new
+        rules_pause_before_write(paused, release)
+        previous = lambda do |id|
+          described_class.call(batch: rules_batch(rules_entry(id:, version: 1), generation: 1, outbox_position: 5),
+                               idempotency_key: nil)
+        end
+
+        delivery = rules_thread(pause: true) { previous.call(91_007) }
+        paused.pop
+        flip = rules_thread { TimekeepingOwnership.current.update!(handoff_step: nil) }
+
+        expect(flip.join(0.5)).to be_nil
+        release << true
+        expect(delivery.value.status).to eq(200)
+        flip.join
+
+        expect(rules_row(91_007)).to include("version" => 1)
+        expect(previous.call(91_008).status).to eq(409)
+        expect(rules_row(91_008)).to be_nil
+      end
+    end
+  end
+end
+
+RSpec.describe Timekeeping::ProjectionConsumer, "references of applying snapshots" do
+  let(:reference_company) { create(:company) }
+  let(:reference_project) { create(:project, client: create(:client, company: reference_company)) }
+  let(:reference_user) { create(:user).tap { |user| create(:employment, company: reference_company, user:) } }
+
+  def reference_entry(id:, version:, **fields)
+    TimekeepingContract.load(:entry_snapshots).fetch("entry_fields").index_with(nil).merge(
+      "id" => id, "company_id" => reference_company.id, "version" => version,
+      "project_id" => reference_project.id, "user_id" => reference_user.id, "work_date" => "2026-03-02",
+      "duration" => 90.0, "note" => "v#{version}", "bill_status" => "unbilled", "review_status" => "not_required",
+      "locked" => false, "source" => "manual", "source_metadata" => {}, "proof_metadata" => {},
+      "created_at" => "2026-03-02T09:00:00Z", "updated_at" => "2026-03-02T09:00:00Z"
+    ).merge(fields.transform_keys(&:to_s))
+  end
+
+  def reference_deliver(entry)
+    batch = { "schema_version" => 1, "snapshots" => [{ "generation" => 1, "outbox_position" => 1, "entry" => entry }] }
+    result = described_class.call(batch:, idempotency_key: nil)
+    [result.status, result.body]
+  end
+
+  def reference_row(id)
+    ActiveRecord::Base.connection.select_one("SELECT * FROM timesheet_entries WHERE id = #{Integer(id)}")
+  end
+
+  it "refuses a snapshot naming another company's agent, or an agent of another user, and writes nothing" do
+    foreign_agent = create(:agent)
+    other_users_agent = create(:agent, company: reference_company)
+
+    [foreign_agent, other_users_agent].each_with_index do |agent, index|
+      expect(reference_deliver(reference_entry(id: 94_001 + index, version: 1, agent_id: agent.id)))
+        .to eq([422, { "reason" => "invalid_snapshot" }])
+      expect(reference_row(94_001 + index)).to be_nil
+    end
+  end
+
+  it "applies a snapshot naming the user's own agent" do
+    own_agent = create(:agent, company: reference_company, user: reference_user)
+
+    expect(reference_deliver(reference_entry(id: 94_011, version: 1, agent_id: own_agent.id)))
+      .to eq([200, { "applied" => 1, "ignored" => 0 }])
+    expect(reference_row(94_011)).to include("agent_id" => own_agent.id)
+  end
+
+  it "ignores an older snapshot whose project has since been deleted" do
+    former_project = create(:project, client: reference_project.client)
+    reference_deliver(reference_entry(id: 94_021, version: 2))
+    stale = reference_entry(id: 94_021, version: 1, project_id: former_project.id)
+    former_project.destroy!
+
+    expect(reference_deliver(stale)).to eq([200, { "applied" => 0, "ignored" => 1 }])
+    expect(reference_row(94_021)).to include("version" => 2, "project_id" => reference_project.id)
   end
 end

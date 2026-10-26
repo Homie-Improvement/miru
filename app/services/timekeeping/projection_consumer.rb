@@ -10,9 +10,9 @@ module Timekeeping
   # ownership record does not accept, or names another company than the
   # stored row (409 stale_generation, as the contract answers any refused
   # snapshot), or breaks the contract or files an entry under another
-  # company's project (422 invalid_snapshot). Company reports reach entries
-  # through clients and projects, so that last check keeps one company's entry
-  # out of another company's reports.
+  # company's project or agent (422 invalid_snapshot). Company reports reach
+  # entries through clients and projects, so the project check keeps one
+  # company's entry out of another company's reports.
   class ProjectionConsumer
     Result = Data.define(:status, :body)
 
@@ -70,9 +70,14 @@ module Timekeeping
 
       def write(items)
         refuse_stale_generations!(items)
-        stored_companies = lock_stored_rows(items.map(&:entry_id))
-        refuse_company_mismatch!(items, stored_companies)
-        refuse_foreign_projects!(items)
+        stored_rows = lock_stored_rows(items.map(&:entry_id))
+        refuse_company_mismatch!(items, stored_rows.transform_values(&:first))
+        # Only a snapshot that will be written can file an entry under a
+        # project or agent; one the version guard ignores names a project or
+        # agent that may have been deleted since, and must still be ignored.
+        applying = applying_items(items, stored_rows.transform_values(&:last))
+        refuse_foreign_projects!(applying)
+        refuse_foreign_agents!(applying)
 
         applied = items.count { |item| upsert(item) }
         Result.new(status: 200, body: { "applied" => applied, "ignored" => items.size - applied })
@@ -89,12 +94,25 @@ module Timekeeping
       end
 
       # Locks the batch's existing rows in id order, so two batches touching the
-      # same entries cannot deadlock, and returns { id => stored company_id }.
+      # same entries cannot deadlock, and returns
+      # { id => [stored company_id, stored version] }.
       def lock_stored_rows(entry_ids)
         connection.select_rows(TimesheetEntry.sanitize_sql_array([<<~SQL.squish, entry_ids.uniq]))
-          SELECT id, company_id FROM timesheet_entries WHERE id IN (?) ORDER BY id FOR UPDATE
+          SELECT id, company_id, version FROM timesheet_entries WHERE id IN (?) ORDER BY id FOR UPDATE
         SQL
-          .to_h
+          .to_h { |id, company_id, version| [id, [company_id, version]] }
+      end
+
+      # The snapshots the version guard will write, in outbox order: each one
+      # newer than the stored row and than any earlier snapshot of its entry
+      # in this batch.
+      def applying_items(items, stored_versions)
+        versions = stored_versions.dup
+        items.select do |item|
+          newer = versions[item.entry_id].nil? || item.version > versions[item.entry_id]
+          versions[item.entry_id] = item.version if newer
+          newer
+        end
       end
 
       # A stored row without a company_id counts as a mismatch, so no snapshot
@@ -116,6 +134,26 @@ module Timekeeping
         SQL
           .to_h
         foreign = items.any? { |item| project_companies[item.project_id] != item.company_id }
+        raise Refused, INVALID_SNAPSHOT if foreign
+      end
+
+      # An agent of another company or user would show its name beside this
+      # company's entry. An agent id that names no agent row is not decided
+      # here: the timesheet_entries -> agents foreign key, which the schema
+      # still keeps, refuses it. The share lock keeps each agent's company and
+      # user until this batch commits.
+      def refuse_foreign_agents!(items)
+        agent_ids = items.filter_map(&:agent_id).uniq
+        return if agent_ids.empty?
+
+        agents = connection.select_rows(TimesheetEntry.sanitize_sql_array([<<~SQL.squish, agent_ids]))
+          SELECT id, company_id, user_id FROM agents WHERE id IN (?) FOR SHARE
+        SQL
+          .to_h { |id, company_id, user_id| [id, [company_id, user_id]] }
+        foreign = items.any? do |item|
+          owner = agents[item.agent_id]
+          owner && owner != [item.company_id, item.user_id]
+        end
         raise Refused, INVALID_SNAPSHOT if foreign
       end
 
