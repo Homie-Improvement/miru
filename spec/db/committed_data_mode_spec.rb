@@ -5,6 +5,8 @@
 require "rails_helper"
 
 RSpec.describe "Committed-data test mode", committed_data: true do
+  include InnerExampleThroughSuiteHooks
+
   def committed_data_count_elsewhere(sql)
     Thread.new do
       ActiveRecord::Base.connection_pool.with_connection { |connection| connection.select_value(sql) }
@@ -59,36 +61,12 @@ RSpec.describe "Committed-data test mode", committed_data: true do
     expect { TimekeepingOwnership.current }.not_to raise_error
   end
 
-  # Runs one inner example with the suite's registered hooks, in a group the
-  # surrounding run does not report, and returns its execution result.
-  def run_committed_data_inner_example(metadata, &body)
-    inner_results = []
-    listener = Object.new
-    listener.define_singleton_method(:example_finished) { |notification| inner_results << notification.example.execution_result }
-    reporter = RSpec::Core::Reporter.new(RSpec::Core::Configuration.new)
-    reporter.register_listener(listener, :example_finished)
-    group = RSpec::Core::ExampleGroup.subclass(RSpec::Core::ExampleGroup, "inner example", [metadata], []) do
-      it("runs the inner body", &body)
-    end
-
-    outer_example = RSpec.current_example
-    begin
-      group.run(reporter)
-    ensure
-      RSpec.current_example = outer_example
-      RSpec.current_scope = :example
-    end
-
-    expect(inner_results.size).to eq(1)
-    inner_results.first
-  end
-
   # "the ownership row exists after it"
   it "restores the ownership row after a committed_data example that emptied it" do
     # The inner example empties the ownership table and commits that, as a
     # deletion or a separate connection would; the tag's cleanup must put the
     # row back once the example ends.
-    result = run_committed_data_inner_example(committed_data: true) { TimekeepingOwnership.delete_all }
+    result = run_inner_example_through_suite_hooks(committed_data: true) { TimekeepingOwnership.delete_all }
 
     expect(result.exception).to be_nil
     expect(TimekeepingOwnership.count).to eq(1)
@@ -101,7 +79,7 @@ RSpec.describe "Committed-data test mode", committed_data: true do
   # transactional example whose intent and outbox rows were committed on
   # another connection leaves none of them behind.
   it "removes ledger rows another connection committed during an ordinary transactional example" do
-    result = run_committed_data_inner_example({}) do
+    result = run_inner_example_through_suite_hooks({}) do
       operation_id = SecureRandom.uuid
       Thread.new do
         ActiveRecord::Base.connection_pool.with_connection do
@@ -112,6 +90,55 @@ RSpec.describe "Committed-data test mode", committed_data: true do
     end
 
     expect(result.exception).to be_nil
+    expect(committed_data_count_elsewhere("SELECT count(*) FROM invoice_operation_intents")).to eq(0)
+    expect(committed_data_count_elsewhere("SELECT count(*) FROM invoice_operation_outbox_items")).to eq(0)
+  end
+
+  # "Limit the stubs in `spec/lib/timekeeping/preflight_spec.rb` and `spec/requests/health_spec.rb` to the operations they test, then use the normal connection for these deletes."
+  # A delete sent on any other connection object is the second database connection path the change removes.
+  it "sends both ledger deletes through the pooled connection, outbox items first, with no second connection" do
+    pooled_connection = ActiveRecord::Base.connection
+    ledger_deletes = []
+    record_delete = lambda do |*, payload|
+      sql = payload[:sql].to_s
+      next unless sql.match?(/\ADELETE FROM invoice_operation_(outbox_items|intents)\b/)
+
+      ledger_deletes << { sql:, connection: payload[:connection] }
+    end
+
+    ActiveSupport::Notifications.subscribed(record_delete, "sql.active_record") do
+      TestDatabaseCleanup.delete_operation_ledger_rows!
+    end
+
+    expect(ledger_deletes.pluck(:sql)).to eq(
+      ["DELETE FROM invoice_operation_outbox_items", "DELETE FROM invoice_operation_intents"]
+    )
+    expect(ledger_deletes.pluck(:connection)).to all(equal(pooled_connection))
+  end
+
+  # "then use the normal connection for these deletes"
+  # The inner example records every statement its pooled connection runs,
+  # including those the after hooks run, so a delete sent through a second,
+  # separately built connection is missing from the list.
+  it "deletes another connection's ledger rows through the pooled connection in the registered after hook" do
+    pooled_statements = []
+    result = run_inner_example_through_suite_hooks({}) do
+      allow(ActiveRecord::Base.connection).to receive(:execute).and_wrap_original do |original, sql, *rest|
+        pooled_statements << sql
+        original.call(sql, *rest)
+      end
+      operation_id = SecureRandom.uuid
+      Thread.new do
+        ActiveRecord::Base.connection_pool.with_connection do
+          InvoiceOperationIntent.create!(company_id: 1, invoice_id: 10, operation_id:, state: "pending", generation: 1)
+          InvoiceOperationOutboxItem.create!(company_id: 1, invoice_id: 10, operation_id:, kind: "commit", payload: {})
+        end
+      end.join
+    end
+
+    expect(result.exception).to be_nil
+    ledger_deletes = pooled_statements.grep(/\ADELETE FROM invoice_operation_/)
+    expect(ledger_deletes).to eq(["DELETE FROM invoice_operation_outbox_items", "DELETE FROM invoice_operation_intents"])
     expect(committed_data_count_elsewhere("SELECT count(*) FROM invoice_operation_intents")).to eq(0)
     expect(committed_data_count_elsewhere("SELECT count(*) FROM invoice_operation_outbox_items")).to eq(0)
   end
@@ -297,5 +324,30 @@ RSpec.describe "Committed-data lock-wait helpers", committed_data: true do
     go&.push(true)
     release&.push(true)
     [holder, contender].compact.each { |thread| thread.join(5) }
+  end
+end
+
+# Generated by Descant: acceptance tests below.
+RSpec.describe "TestDatabaseCleanup ledger deletes" do
+  # "Limit the stubs in `spec/lib/timekeeping/preflight_spec.rb` and `spec/requests/health_spec.rb` to the operations they test, then use the normal connection for these deletes."
+  # This example runs inside the per-example transaction, so the rows below are
+  # visible only on ActiveRecord::Base.connection. A delete sent on any other
+  # connection cannot see them and leaves them in place.
+  it "deletes ledger rows through the example's own pooled connection and is safe to repeat" do
+    operation_id = SecureRandom.uuid
+    InvoiceOperationIntent.create!(company_id: 1, invoice_id: 10, operation_id:, state: "pending", generation: 1)
+    InvoiceOperationOutboxItem.create!(company_id: 1, invoice_id: 10, operation_id:, kind: "commit", payload: {})
+    expect(ActiveRecord::Base.connection.transaction_open?).to be(true)
+
+    TestDatabaseCleanup.delete_operation_ledger_rows!
+
+    expect(InvoiceOperationIntent.count).to eq(0)
+    expect(InvoiceOperationOutboxItem.count).to eq(0)
+
+    # The hook runs after every example, so a second run over empty tables must
+    # succeed and leave them empty.
+    expect { TestDatabaseCleanup.delete_operation_ledger_rows! }.not_to raise_error
+    expect(InvoiceOperationIntent.count).to eq(0)
+    expect(InvoiceOperationOutboxItem.count).to eq(0)
   end
 end
