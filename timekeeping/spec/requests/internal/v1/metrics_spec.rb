@@ -181,8 +181,6 @@ RSpec.describe "Timekeeping internal write metrics for the alert task" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping internal metrics window length" do
   include ActiveSupport::Testing::TimeHelpers
 
