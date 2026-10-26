@@ -49,6 +49,7 @@ module Timekeeping
 
       apply(items)
     rescue Refused => refusal
+      record_stale_generation(items) if refusal.result == STALE_GENERATION
       refusal.result
     rescue ActiveRecord::InvalidForeignKey
       INVALID_SNAPSHOT
@@ -58,6 +59,19 @@ module Timekeeping
 
       def connection
         TimesheetEntry.connection
+      end
+
+      # Runs after the refused batch has rolled back, so the record survives
+      # for the stale_generation alert (section 11.3): one row per company in
+      # the batch, with the handoff step in progress at this moment. A backstop
+      # for a database fault here: the 409 is already decided, and a lost
+      # record must not replace it.
+      def record_stale_generation(items)
+        handoff_step = TimekeepingOwnership.current.handoff_step
+        rows = items.map(&:company_id).uniq.map { |company_id| { company_id:, handoff_step: } }
+        TimekeepingStaleGenerationRefusal.insert_all!(rows)
+      rescue StandardError => error
+        Rails.logger.warn("stale_generation refusal not recorded: #{error.class}")
       end
 
       def apply(items)

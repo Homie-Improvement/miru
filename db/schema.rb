@@ -1219,6 +1219,13 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_26_130000) do
     t.check_constraint "owner::text = ANY (ARRAY['monolith'::character varying, 'timekeeping'::character varying]::text[])", name: "timekeeping_ownership_owner_check"
   end
 
+  create_table "timekeeping_stale_generation_refusals", force: :cascade do |t|
+    t.bigint "company_id", null: false
+    t.datetime "created_at", null: false
+    t.string "handoff_step"
+    t.index ["created_at"], name: "index_timekeeping_stale_generation_refusals_on_created_at"
+  end
+
   create_table "timeoff_entries", force: :cascade do |t|
     t.datetime "created_at", null: false
     t.bigint "custom_leave_id"
