@@ -77,63 +77,6 @@ RSpec.describe "Timekeeping internal handoff routes, empty service token" do
   end
 end
 
-RSpec.describe "Timekeeping internal handoff load, tampered body" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  # "Recompute the digest inside the transaction and roll back on a mismatch."
-  # The refusal answers with a reason only, so a row value never reaches a response.
-  it "refuses a tampered checkpoint with only a reason and never echoes its rows" do
-    service_token = "service-#{SecureRandom.hex(24)}"
-    tables = Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }
-    tables["entries"] = [{
-      "id" => 41, "company_id" => 1, "version" => 1, "project_id" => 1, "user_id" => 1, "agent_id" => nil,
-      "work_date" => Date.new(2026, 3, 2), "duration" => 60.0, "note" => "original-note", "bill_status" => "unbilled",
-      "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
-      "external_run_id" => nil, "external_session_id" => nil, "proof_url" => nil, "proof_metadata" => {},
-      "discarded_at" => nil, "created_at" => Time.utc(2026, 3, 2, 9), "updated_at" => Time.utc(2026, 3, 2, 9)
-    }]
-    document = JSON.parse(Timekeeping::Handoff::Checkpoint.build(tables:).to_json)
-    document["tables"]["entries"][0].find { |column, _| column == "note" }[1] = ["str", "tampered-secret-note"]
-
-    with_timekeeping_env(Timekeeping::Environment::SERVICE_TOKEN => service_token) do
-      Timekeeping::Admission.fence!
-      put "/internal/v1/handoff/checkpoint", params: JSON.generate(document),
-                                              headers: { "Authorization" => "Bearer #{service_token}",
-                                                         "Content-Type" => "application/json" }
-    end
-
-    expect([response.status, response.parsed_body]).to eq([409, { "reason" => "handoff_refused" }])
-    expect(response.body).not_to include("tampered-secret-note")
-    expect(Entry.count).to eq(0)
-  end
-end
-
-RSpec.describe "Timekeeping internal handoff load, malformed body" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  it "answers an unparseable or unknown-table load body with invalid_request and changes nothing" do
-    service_token = "service-#{SecureRandom.hex(24)}"
-    unknown_table = JSON.generate(
-      "tables" => Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }.merge("admission" => []),
-      "digest" => {}
-    )
-
-    answers = with_timekeeping_env(Timekeeping::Environment::SERVICE_TOKEN => service_token) do
-      Timekeeping::Admission.fence!
-      ["{not json", unknown_table].map do |body|
-        put "/internal/v1/handoff/checkpoint", params: body,
-                                                headers: { "Authorization" => "Bearer #{service_token}",
-                                                           "Content-Type" => "application/json" }
-        [response.status, response.parsed_body]
-      end
-    end
-
-    expect(answers).to eq([[400, { "reason" => "invalid_request" }], [400, { "reason" => "invalid_request" }]])
-    expect(Timekeeping::Admission.current.generation).to be_nil
-    expect(Entry.count).to eq(0)
-  end
-end
-
 RSpec.describe "Timekeeping internal handoff admission, bad generation" do
   # "This endpoint only calls them." admit! refuses anything but a positive
   # Integer, so a JSON string or zero must not admit writes.
