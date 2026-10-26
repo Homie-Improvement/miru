@@ -6,7 +6,8 @@
 # made with the plain Rails verbs (post, patch) are not tracked; these specs send through
 # send_request.
 module CompanyScopeRequestSpecScan
-  REQUEST_CALL = /\bsend_request\b/
+  # A call, not the name used as a symbol (:send_request) or written inside a string.
+  REQUEST_CALL = /(?<![\w:"'])send_request\b(?!["'])/
   METHOD_START = /^(?<indent>\s*)def\s+(?<name>\w+[?!]?)/
   # "def ok?(r) = r.first == 200" or "def x; true; end": the whole method sits on its "def" line.
   # The parameter list is matched with balanced parentheses, so a default such as "ref = x.to_s()"

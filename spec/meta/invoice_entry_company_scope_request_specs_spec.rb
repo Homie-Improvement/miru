@@ -100,6 +100,31 @@ RSpec.describe "Company-scope params builder report with one-line assertion help
   end
 end
 
+RSpec.describe "Company-scope params builder report with send_request named in assertions" do
+  it "does not take a string or symbol naming send_request as a request call" do
+    section = <<~RUBY
+      RSpec.describe "Api::V1::Invoices#create timesheet entry company scope", type: :request do
+        def post_company_scope_invoice(*entry_refs)
+          send_request :post, api_v1_invoices_path, params: { invoice: { entries: entry_refs } }
+        end
+
+        def expect_safe_message(message)
+          expect(message).not_to include("send_request")
+        end
+
+        def expect_request_sent
+          expect(self).to have_received(:send_request)
+        end
+      end
+    RUBY
+
+    report = params_builder_report(section)
+
+    expect(report[:builders]).to eq(["post_company_scope_invoice"])
+    expect(report[:stray_requests]).to eq(0)
+  end
+end
+
 RSpec.describe "Company-scope params builder report with an endless builder" do
   # A nested parenthesis in a default argument must not hide that the builder ends on its def line.
   it "ends an endless builder with a parenthesized default on its def line and counts a later request as stray" do
