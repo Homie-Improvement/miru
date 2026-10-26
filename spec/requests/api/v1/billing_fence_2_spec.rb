@@ -151,9 +151,9 @@ RSpec.describe "Billing fence on invoice update", type: :request do
       send_request :patch, api_v1_invoice_path(invoice), params:, headers: auth_headers(user)
       expect(response).to have_http_status(:service_unavailable)
       expect(response.parsed_body["reason"]).to eq("ownership_moving")
+      # Checked after each attempt, so a write by the first attempt that the retry undoes is still caught.
+      expect(stored_invoice_tax_rows(invoice.id)).to eq(baseline)
     end
-
-    expect(stored_invoice_tax_rows(invoice.id)).to eq(baseline)
   end
 
   # "Seed and assert a nonempty tax baseline, attempt nested tax changes during handoff, and compare the stored rows after refusal."
