@@ -5,71 +5,176 @@
 require "rails_helper"
 
 RSpec.describe Timekeeping::RelayOutboxSource do
-  # "Payloads carry ids, not user names or emails."
-  # The entry is built from the contract's field list, so a column the outbox
-  # gains for the relay (enqueued_at, sent_at) never crosses to the monolith.
-  it "offers each unsent row with exactly the contract entry fields and no relay bookkeeping" do
-    now = Time.current
-    OutboxSnapshot.insert_all!([{
-      "id" => 11, "project_id" => 3, "user_id" => 5, "agent_id" => nil, "work_date" => Date.new(2026, 3, 3),
-      "duration" => 60.0, "note" => "n", "bill_status" => "unbilled", "review_status" => "not_required",
-      "locked" => false, "source" => "manual", "source_metadata" => {}, "external_run_id" => nil,
-      "external_session_id" => nil, "proof_url" => nil, "proof_metadata" => {}, "discarded_at" => nil,
-      "created_at" => now, "updated_at" => now, "company_id" => 1, "version" => 1, "generation" => 1
-    }])
+  let(:source) { described_class.new }
 
-    rows = described_class.new.unsent_after(0, 10)
-
-    expect(rows.size).to eq(1)
-    expect(rows.first.keys).to match_array(%w[generation outbox_position entry])
-    expect(rows.first.fetch("entry").keys).to match_array(Timekeeping::OutboxFields::ENTRY_FIELDS)
-    expect(rows.first.fetch("entry").keys).not_to include("enqueued_at", "sent_at")
+  def unsent_positions(position = 0, limit = 10)
+    source.unsent_after(position, limit).map { |row| row.fetch("outbox_position") }
   end
-end
 
+  describe "#unsent_after" do
+    # "Payloads carry ids, not user names or emails."
+    # The entry is built from the contract's field list, so a column the outbox
+    # gains for the relay (enqueued_at, sent_at) never crosses to the monolith.
+    it "offers each unsent row as exactly the contract entry fields with record ids and no relay bookkeeping" do
+      insert_outbox_rows(outbox_row(id: 501, project_id: 61, user_id: 71, company_id: 11, note: "Design review"))
 
-RSpec.describe Timekeeping::RelayOutboxSource do
-  # No token is written to a payload or a log line.
-  it "offers rows whose serialized form holds no credential the service holds" do
-    service_token = "service-#{SecureRandom.hex(24)}"
-    extra_credential = "held-#{SecureRandom.hex(24)}"
-    now = Time.current
-    OutboxSnapshot.insert_all!([{
-      id: 51, project_id: 2, user_id: 3, work_date: "2026-03-02", duration: 30.0, note: "Pairing",
-      bill_status: "unbilled", review_status: "not_required", locked: false, source: "manual",
-      source_metadata: { "tool" => "cli" }, proof_metadata: { "kind" => "screenshot" },
-      created_at: now, updated_at: now, company_id: 4, version: 2, generation: 1
-    }])
+      rows = source.unsent_after(0, 10)
 
-    rows = with_timekeeping_env(
-      Timekeeping::Environment::SERVICE_TOKEN => service_token,
-      Timekeeping::Environment::SERVICE_CREDENTIALS => extra_credential
-    ) do
-      described_class.new.unsent_after(0, 10)
+      expect(rows.size).to eq(1)
+      expect(rows.first.keys).to match_array(%w[generation outbox_position entry])
+      entry = rows.first.fetch("entry")
+      expect(entry.keys).to match_array(Timekeeping::OutboxFields::ENTRY_FIELDS)
+      expect(entry).to include("id" => 501, "project_id" => 61, "user_id" => 71, "company_id" => 11)
+      expect(entry.keys.grep(/name|email|token|sent_at|enqueued_at/)).to be_empty
     end
 
-    serialized = JSON.generate(rows)
-    expect(rows.size).to eq(1)
-    expect(rows.first.fetch("entry").fetch("company_id")).to eq(4)
-    expect(serialized).not_to include(service_token)
-    expect(serialized).not_to include(extra_credential)
-    expect(serialized).not_to match(/email|name/i)
+    # No token is written to a payload or a log line.
+    it "offers rows whose serialized form holds no credential the service holds, no email and no relay bookkeeping" do
+      service_token = "service-#{SecureRandom.hex(24)}"
+      extra_credential = "held-#{SecureRandom.hex(24)}"
+      insert_outbox_rows(outbox_row(
+        id: 51, project_id: 2, user_id: 3, note: "Pairing", company_id: 4, version: 2,
+        source_metadata: { "tool" => "cli" }, proof_metadata: { "kind" => "screenshot" }
+      ))
+
+      rows, held_credentials = with_timekeeping_env(
+        Timekeeping::Environment::SERVICE_TOKEN => service_token,
+        Timekeeping::Environment::SERVICE_CREDENTIALS => extra_credential
+      ) do
+        [source.unsent_after(0, 10), Timekeeping::Config.service_credentials]
+      end
+
+      serialized = JSON.generate(rows)
+      expect(rows.size).to eq(1)
+      expect(rows.first.fetch("entry").fetch("company_id")).to eq(4)
+      expect(serialized).not_to include(service_token)
+      expect(serialized).not_to include(extra_credential)
+      held_credentials.each { |credential| expect(serialized).not_to include(credential) }
+      expect(serialized).not_to match(/email|name/i)
+      expect(serialized).not_to include("@")
+      expect(serialized).not_to include("enqueued_at")
+      expect(serialized).not_to include("sent_at")
+    end
+
+    # "Payloads carry the full entry row": a timestamp keeps its microseconds on the wire.
+    it "sends entry timestamps as ISO 8601 UTC with microseconds" do
+      sub_second = Time.utc(2026, 3, 2, 9, 0, 0, 123_456)
+      insert_outbox_rows(outbox_row(
+        id: 71, work_date: Date.new(2026, 3, 2), created_at: sub_second, updated_at: sub_second,
+        discarded_at: sub_second
+      ))
+
+      entry = JSON.parse(JSON.generate(source.unsent_after(0, 10))).first.fetch("entry")
+
+      expect(entry.values_at("created_at", "updated_at", "discarded_at")).to all(eq("2026-03-02T09:00:00.123456Z"))
+      expect(entry.fetch("work_date")).to eq("2026-03-02")
+    end
+
+    # Positions are set far above the sequence's reach so they never collide
+    # with a position the sequence hands out in another example.
+    it "reads unsent rows above a position in ascending order across gaps, up to the limit" do
+      insert_outbox_rows(
+        outbox_row(id: 12, outbox_position: 900_030),
+        outbox_row(id: 3, outbox_position: 900_010),
+        outbox_row(id: 7, outbox_position: 900_020)
+      )
+
+      expect(unsent_positions(0, 10)).to eq([900_010, 900_020, 900_030])
+      expect(unsent_positions(0, 2)).to eq([900_010, 900_020])
+      expect(unsent_positions(900_010, 10)).to eq([900_020, 900_030])
+      expect(unsent_positions(900_015, 1)).to eq([900_020])
+      expect(unsent_positions(900_030, 10)).to eq([])
+    end
+
+    it "keeps each row's own company_id in its entry when one read spans several companies" do
+      positions = insert_outbox_rows(
+        outbox_row(id: 1, company_id: 41),
+        outbox_row(id: 2, company_id: 42),
+        outbox_row(id: 3, company_id: 41)
+      )
+
+      rows = source.unsent_after(0, 10)
+
+      expect(rows.map { |row| row.fetch("outbox_position") }).to eq(positions)
+      expect(rows.map { |row| [row.dig("entry", "id"), row.dig("entry", "company_id")] })
+        .to eq([[1, 41], [2, 42], [3, 41]])
+    end
+
+    it "keeps nested metadata as stored and passes the row's generation through" do
+      insert_outbox_rows(
+        outbox_row(
+          id: 77, company_id: 1, version: 3, generation: 4, source: "agent",
+          source_metadata: { "run" => { "step" => 2 } }, proof_metadata: { "files" => [{ "name" => "diff.txt" }] }
+        ),
+        outbox_row(
+          id: 88, company_id: 2, version: 3, generation: 4, source: "agent",
+          source_metadata: { "run" => { "step" => 2 } }, proof_metadata: { "nested" => { "ref" => 3 } }
+        )
+      )
+
+      rows = source.unsent_after(0, 10)
+
+      expect(rows.map { |row| [row.dig("entry", "id"), row.dig("entry", "company_id"), row.fetch("generation")] })
+        .to eq([[77, 1, 4], [88, 2, 4]])
+      expect(rows.map { |row| row.dig("entry", "proof_metadata") })
+        .to eq([{ "files" => [{ "name" => "diff.txt" }] }, { "nested" => { "ref" => 3 } }])
+      expect(rows.map { |row| row.dig("entry", "source_metadata") }).to all(eq("run" => { "step" => 2 }))
+    end
   end
-end
 
-RSpec.describe Timekeeping::RelayOutboxSource do
-  # "Payloads carry the full entry row": a timestamp keeps its microseconds on the wire.
-  it "sends entry timestamps as ISO 8601 UTC with microseconds" do
-    sub_second = Time.utc(2026, 3, 2, 9, 0, 0, 123_456)
-    OutboxSnapshot.insert_all!([{
-      id: 71, project_id: 2, user_id: 3, work_date: "2026-03-02", duration: 30.0, bill_status: "unbilled",
-      review_status: "not_required", locked: false, source: "manual", source_metadata: {}, proof_metadata: {},
-      created_at: sub_second, updated_at: sub_second, discarded_at: sub_second, company_id: 4, version: 1, generation: 1
-    }])
+  describe "#mark_sent" do
+    it "marks every selected position and leaves exactly the rows between them unsent, also on a repeated mark" do
+      first, second, third, fourth = insert_outbox_rows(
+        outbox_row(id: 301, company_id: 1, version: 1),
+        outbox_row(id: 302, company_id: 1, version: 1),
+        outbox_row(id: 303, company_id: 1, version: 1),
+        outbox_row(id: 304, company_id: 1, version: 1)
+      )
 
-    entry = JSON.parse(JSON.generate(described_class.new.unsent_after(0, 10))).first.fetch("entry")
+      source.mark_sent([first, third])
+      expect(unsent_positions).to eq([second, fourth])
 
-    expect(entry.values_at("created_at", "updated_at", "discarded_at")).to all(eq("2026-03-02T09:00:00.123456Z"))
-    expect(entry.fetch("work_date")).to eq("2026-03-02")
+      # Marking an already-sent position again must not raise or mark any other row.
+      expect { source.mark_sent([first]) }.not_to raise_error
+      expect(unsent_positions).to eq([second, fourth])
+    end
+
+    # One entry can have several snapshot rows; marking by entry id would hide
+    # the later one, which is still waiting.
+    it "marks one snapshot by position, keeps its first sent_at, and leaves a later version of the entry unsent" do
+      first, later = insert_outbox_rows(
+        outbox_row(id: 6100, company_id: 1, version: 1, generation: 1),
+        outbox_row(id: 6100, company_id: 1, version: 2, generation: 1)
+      )
+
+      source.mark_sent([first])
+      first_sent_at = OutboxSnapshot.where(outbox_position: first).pick(:sent_at)
+      source.mark_sent([first])
+
+      rows = source.unsent_after(0, 10)
+      expect(rows.map { |row| row.fetch("outbox_position") }).to eq([later])
+      expect(rows.first.fetch("entry").keys).to match_array(Timekeeping::OutboxFields::ENTRY_FIELDS)
+      expect(rows.first.fetch("entry")).to include("id" => 6100, "version" => 2, "company_id" => 1)
+      expect(first_sent_at).not_to be_nil
+      expect(OutboxSnapshot.where(outbox_position: first).pick(:sent_at)).to eq(first_sent_at)
+    end
+
+    # Both companies hold entry 7, so a mark that matched by entry id instead of
+    # position would also mark the other company's row.
+    it "leaves the same entry id in another company unsent" do
+      first, later, other_company = insert_outbox_rows(
+        outbox_row(id: 7, company_id: 5, version: 1, generation: 1),
+        outbox_row(id: 7, company_id: 5, version: 2, generation: 2),
+        outbox_row(id: 7, company_id: 6, version: 1, generation: 1)
+      )
+
+      source.mark_sent([first])
+
+      remaining = source.unsent_after(0, 10)
+      expect(remaining.map { |row| row.fetch("outbox_position") }).to eq([later, other_company])
+      expect(remaining.map { |row| row.dig("entry", "company_id") }).to eq([5, 6])
+      expect(OutboxSnapshot.where(outbox_position: first).pick(:sent_at)).not_to be_nil
+      expect(OutboxSnapshot.where(outbox_position: [later, other_company]).pluck(:sent_at)).to all(be_nil)
+    end
   end
 end
