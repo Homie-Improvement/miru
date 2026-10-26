@@ -298,4 +298,169 @@ RSpec.describe Timekeeping::LocalOwner, "request checks" do
     expect(entry.reload.discarded_at).not_to be_nil
     expect(Timekeeping::LocalOutboxEntry.where(company_id: company.id, entry_id: entry.id).count).to eq(1)
   end
+
+  # The entry API takes only YYYY-MM-DD, although the snapshot cast reads any ISO 8601 date.
+  %w[20260302 2026-03-02T00:00:00Z].each do |work_date|
+    it "refuses work_date #{work_date} with 400 invalid_request and writes nothing" do
+      seed_entry
+      before = timekeeping_row_counts
+      expect(before["entries"]).to eq(1)
+
+      outcome = call_as_owner(:create, { "idempotency_key" => "date-#{work_date}",
+                                         "body" => entry_body.merge("work_date" => work_date) })
+
+      expect(outcome.status).to eq(400)
+      expect(outcome.body["reason"]).to eq("invalid_request")
+      expect(timekeeping_row_counts).to eq(before)
+    end
+  end
+
+  it "answers a stale If-Match with 409 version_conflict and leaves the entry as stored" do
+    entry = seed_entry
+    attributes_before = entry.reload.attributes
+    before = timekeeping_row_counts
+
+    outcome = call_as_owner(:update, { "idempotency_key" => "stale-if-match", "entry_id" => entry.id,
+                                       "if_match" => (entry.version + 1).to_s, "body" => { "note" => "changed" } })
+
+    expect(outcome.status).to eq(409)
+    expect(outcome.body["reason"]).to eq("version_conflict")
+    expect(entry.reload.attributes).to eq(attributes_before)
+    expect(timekeeping_row_counts).to eq(before)
+  end
+end
+
+RSpec.describe Timekeeping::LocalOwner, "who may act" do
+  # Access is decided on the role Timekeeping::ReferenceFacts reads for the company,
+  # never on the role the actor claims, and the actor comes only from the keyword.
+  let(:company) { create(:company) }
+  let(:project) { create(:project, client: create(:client, company:)) }
+  let(:entry_body) do
+    { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 8.0,
+      "note" => "who", "source" => TimesheetEntry::SOURCES.first, "source_metadata" => {} }
+  end
+
+  before { prepare_local_ownership! }
+
+  def call_as(actor, key, body)
+    described_class.call(operation: :create, company_id: company.id,
+                         generation: TimekeepingOwnership.current.generation.to_s, actor:,
+                         params: { "idempotency_key" => key, "body" => body })
+  end
+
+  it "refuses an employee who claims the admin role to write for a colleague, with 403 forbidden and no write" do
+    employee = timekeeping_member(company, "employee")
+    colleague = timekeeping_member(company, "employee")
+    before = timekeeping_row_counts
+
+    outcome = call_as(described_class::Actor.user(user_id: employee.id, role: "admin"), "claimed-admin",
+                      entry_body.merge("user_id" => colleague.id))
+
+    expect(outcome.status).to eq(403)
+    expect(outcome.body["reason"]).to eq("forbidden")
+    expect(timekeeping_row_counts).to eq(before)
+  end
+
+  it "refuses a service actor with 403 forbidden and writes nothing" do
+    before = timekeeping_row_counts
+
+    outcome = call_as(described_class::Actor.service(name: "relay", company_id: company.id, operations: ["create"]),
+                      "service-actor", entry_body)
+
+    expect(outcome.status).to eq(403)
+    expect(outcome.body["reason"]).to eq("forbidden")
+    expect(timekeeping_row_counts).to eq(before)
+  end
+
+  it "takes the acting user from the actor keyword, not from actor or company fields in params and the body" do
+    owner = timekeeping_member(company, "owner")
+    other = timekeeping_member(company, "owner")
+    other_company = create(:company)
+
+    outcome = described_class.call(
+      operation: :create, company_id: company.id, generation: TimekeepingOwnership.current.generation.to_s,
+      actor: described_class::Actor.user(user_id: owner.id, role: "owner"),
+      params: { "idempotency_key" => "body-actor", "actor_id" => other.id, "company_id" => other_company.id,
+                "body" => entry_body.merge("actor_id" => other.id, "company_id" => other_company.id) }
+    )
+
+    expect(outcome.status).to eq(201)
+    entry = Timekeeping::LocalEntry.find(outcome.body["id"])
+    expect([entry.company_id, entry.user_id]).to eq([company.id, owner.id])
+    expect(described_class::Receipt.sole.actor_id).to eq(owner.id)
+  end
+end
+
+RSpec.describe Timekeeping::LocalOwner, "answers and snapshots" do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, client: create(:client, company:)) }
+  let(:owner) { timekeeping_member(company, "owner") }
+
+  before { prepare_local_ownership! }
+
+  def call_as_owner(operation, params, checkpoint: ->(_step) { })
+    described_class.call(operation:, company_id: company.id, generation: TimekeepingOwnership.current.generation.to_s,
+                         actor: described_class::Actor.user(user_id: owner.id, role: "owner"), params:, checkpoint:)
+  end
+
+  def create_params(key)
+    { "idempotency_key" => key,
+      "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 1.5,
+                  "note" => "answer", "source" => TimesheetEntry::SOURCES.first, "source_metadata" => {} } }
+  end
+
+  def seed_entry(note)
+    Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
+                                    work_date: Date.current, duration: 2.0, note:, bill_status: "unbilled")
+  end
+
+  it "answers a create with exactly the entry API's response fields and snapshots times with microseconds" do
+    contract_fields = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/entry_api.yml"))
+      .dig("response", "entry_fields")
+
+    outcome = call_as_owner(:create, create_params("response-fields"))
+
+    expect(outcome.status).to eq(201)
+    expect(outcome.body.keys).to eq(contract_fields)
+    expect(outcome.body).to include("version" => 1, "duration" => 1.5, "work_date" => Date.current.iso8601,
+                                    "locked" => false, "user_id" => owner.id, "company_id" => company.id)
+    payload = Timekeeping::LocalOutboxEntry.where(company_id: company.id).sole.payload
+    expect(payload["updated_at"]).to match(/\.\d{6}Z\z/)
+  end
+
+  it "replays a retry right after receipt_checked, before any later step runs" do
+    expect(call_as_owner(:create, create_params("replay-steps")).status).to eq(201)
+    steps = []
+
+    replay = call_as_owner(:create, create_params("replay-steps"), checkpoint: ->(step) { steps << step })
+
+    expect(replay.status).to eq(201)
+    expect(steps).to eq(%i[receipt_key_locked generation_checked request_checked receipt_checked])
+  end
+
+  it "moves entries to another project with version + 1 and draws outbox positions in entry id order" do
+    entries = [seed_entry("first"), seed_entry("second")]
+    target = create(:project, client: create(:client, company:))
+
+    outcome = call_as_owner(:bulk_move, { "idempotency_key" => "bulk-move",
+                                          "body" => { "entry_ids" => entries.map(&:id), "project_id" => target.id } })
+
+    expect(outcome.status).to eq(200)
+    expect(outcome.body["results"]).to eq(entries.map { |entry| { "entry_id" => entry.id, "result" => "moved" } })
+    entries.each(&:reload)
+    expect(entries.map(&:project_id)).to eq([target.id, target.id])
+    expect(entries.map(&:version)).to eq([2, 2])
+    expect(Timekeeping::LocalOutboxEntry.where(company_id: company.id).order(:id).pluck(:entry_id))
+      .to eq(entries.map(&:id).sort)
+  end
+
+  it "deletes the listed entries on a bulk_delete body that holds only entry_ids" do
+    entry = seed_entry("bulk delete")
+
+    outcome = call_as_owner(:bulk_delete, { "idempotency_key" => "bulk-delete", "body" => { "entry_ids" => [entry.id] } })
+
+    expect(outcome.status).to eq(200)
+    expect(outcome.body["results"]).to eq([{ "entry_id" => entry.id, "result" => "deleted" }])
+    expect(entry.reload.discarded_at).not_to be_nil
+  end
 end

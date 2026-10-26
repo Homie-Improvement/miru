@@ -145,6 +145,27 @@ RSpec.describe Timekeeping::LocalOwner, "when a failure is injected before commi
     expect(Timekeeping::LocalEntry.where(note: "injected")).to be_empty
   end
 
+  # LocalOwner writes in its own savepoint, so a caller that keeps its
+  # transaction open after rescuing the failure still commits none of the write.
+  it "rolls back its own write when the caller's open transaction rescues the failure" do
+    seed_entry
+    baseline = timekeeping_row_counts
+    expect(baseline["entries"]).to eq(1)
+    injected = Class.new(StandardError)
+    rescued = false
+
+    ApplicationRecord.transaction do
+      create_as_employee("rescued-by-caller", checkpoint: failing_at(:outbox_written, injected))
+    rescue injected
+      rescued = true
+      expect(timekeeping_row_counts).to eq(baseline)
+    end
+
+    expect(rescued).to be(true)
+    expect(timekeeping_row_counts).to eq(baseline)
+    expect(Timekeeping::LocalEntry.where(note: "injected")).to be_empty
+  end
+
   # Only a collision on the receipt insert is retried; a uniqueness error from
   # anywhere else must escape, or an injected failure would end in a commit.
   it "lets a uniqueness error raised by a checkpoint escape instead of retrying the write" do
