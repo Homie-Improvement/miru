@@ -59,7 +59,7 @@ Add specs for an id of `0` and for a cached parent whose row was deleted. These 
 
 ## Release the checks first
 
-Ship the validations in one release and drop the key in a later one. Deploys here migrate while processes from the previous release still write: `bin/docker-entrypoint` runs `db:prepare` in the first new container of a rolling boot, and the Solid Queue workers run old code until they are replaced. If the key and its validation change together, those old processes write with neither. An app-only rollback to that release would do the same with no time limit. PR #44 first shipped them together; `db/migrate/20261020120000_drop_timesheet_entry_foreign_keys.rb` now keeps the keys, and step S1 in `docs/architecture/timekeeping-soa.md` section 10.2 records the order and how to restore the keys on a database that already lost them.
+Ship the validations in one release and drop the key in a later one. Deploys here migrate while processes from the previous release still write. With `config/deploy.kamal.yml`, `bin/docker-entrypoint` runs `db:prepare` in the first new container of a rolling boot. With `config/deploy.yml`, the `db-migrate` alias runs in a running container. The Solid Queue workers run old code until they are replaced. If the key and its validation change together, those old processes write with neither. An app-only rollback to that release would do the same with no time limit. PR #44 first shipped them together; `db/migrate/20261020120000_drop_timesheet_entry_foreign_keys.rb` now keeps the keys, and step S1 in `docs/architecture/timekeeping-soa.md` section 10.2 records the order and how to restore the keys on a database that already lost them.
 
 ## Why it matters
 
