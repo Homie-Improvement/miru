@@ -32,19 +32,28 @@ module Timekeeping
 
     # The shape each writable field must have when the body sends it, so a
     # value the entries table cannot store is refused as a bad request rather
-    # than failing inside the transaction.
+    # than failing inside the transaction. Each shape is also at least as strict
+    # as the projection's check on the same field (the monolith's
+    # Timekeeping::SnapshotBatch): a committed snapshot the projection refuses
+    # would hold back every later snapshot, because the relay delivers in order.
     FIELD_SHAPES = {
       "work_date" => ->(value) { value.is_a?(String) && DATE.match?(value) && Date.iso8601(value) },
-      "duration" => ->(value) { value.is_a?(Numeric) },
+      "duration" => ->(value) { value.is_a?(Numeric) && !value.negative? },
       "note" => ->(value) { value.nil? || value.is_a?(String) },
       "source" => ->(value) { SOURCES.include?(value) },
       "source_metadata" => ->(value) { value.is_a?(Hash) },
       "bill_status" => ->(value) { BILL_STATUSES.include?(value) },
-      "agent_id" => ->(value) { value.nil? || value.is_a?(Integer) },
+      "agent_id" => ->(value) { value.nil? || (value.is_a?(Integer) && value.positive?) },
       "proof_url" => ->(value) { value.nil? || value.is_a?(String) },
       "proof_metadata" => ->(value) { value.is_a?(Hash) }
     }.freeze
     CREATE_REQUIRED_FIELDS = %w[work_date duration].freeze
+
+    # The deepest body accepted. A snapshot carries the entry three levels
+    # down (batch, snapshots list, item), and the projection endpoint parses a
+    # batch with JSON's default limit of 100 levels, so a deeper body could be
+    # stored but never delivered.
+    BODY_MAX_NESTING = 97
 
     # The routes whose body names a project, and whether it must.
     PROJECT_ROUTES = { create: :required, update: :optional, bulk_move: :required }.freeze
@@ -97,13 +106,17 @@ module Timekeeping
       body["bill_status"] || UNBILLED
     end
 
+    # The body as a Hash. Timekeeping::ReservationRequest reads its bodies
+    # the same way.
     def self.parse_body(raw_body)
       return {} if raw_body.to_s.strip.empty?
 
-      body = JSON.parse(raw_body)
+      body = JSON.parse(raw_body, max_nesting: BODY_MAX_NESTING)
       raise ActionController::BadRequest, "the body must be a JSON object" unless body.is_a?(Hash)
 
       body
+    rescue JSON::NestingError
+      raise ActionController::BadRequest, "the body is nested too deeply"
     rescue JSON::ParserError
       raise ActionController::BadRequest, "the body is not JSON"
     end
@@ -140,6 +153,6 @@ module Timekeeping
       raise ActionController::BadRequest, "invalid work_date"
     end
 
-    private_class_method :parse_body, :parse_entry_id, :parse_project_id, :check_fields!
+    private_class_method :parse_entry_id, :parse_project_id, :check_fields!
   end
 end
