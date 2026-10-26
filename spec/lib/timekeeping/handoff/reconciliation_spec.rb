@@ -152,6 +152,8 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
     expect(differences.map(&:reason)).to include(reason)
     expect(differences.map(&:field)).to include(field) unless field == :any
     expect(differences.map(&:company_id).uniq).to eq([101])
+    expect(result.unassigned).to eq([])
+    expect(result).to be_abort
     expect(result.companies.fetch(101)).to be_abort
     expect(result.companies.fetch(202)).not_to be_abort
     expect(result.companies.fetch(202).checks.values.flatten).to eq([])
@@ -785,6 +787,27 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
     expect(money_data.keys).to match_array(%w[company_id kind record_id field])
     expect(money_data).to include("company_id" => 101, "kind" => "invoice", "record_id" => 9, "field" => "discount")
     expect(JSON.generate(money_data)).not_to include("987654")
+  end
+
+  # Snapshot keys alone bring a company into reconciliation, so a company with no rows still gets a money verdict.
+  it "reports a changed discount for a company that appears only in the financial snapshots" do
+    discount_key = [:invoice, 9, :discount]
+    money_before = recon_checks_snapshots.merge(404 => recon_checks_snapshot(404, { discount_key => BigDecimal("5") }))
+    money_after = recon_checks_snapshots.merge(404 => recon_checks_snapshot(404, { discount_key => BigDecimal("15") }))
+    result = recon_checks_run(money_before:, money_after:)
+
+    snapshot_only = result.companies.fetch(404)
+    expect(snapshot_only.checks.fetch(:money)).not_to be_empty
+    expect(snapshot_only.checks.values.flatten.map(&:company_id).uniq).to eq([404])
+    expect(snapshot_only).to be_abort
+    expect(result).to be_abort
+    expect(result.companies.fetch(101)).not_to be_abort
+    expect(result.companies.fetch(202)).not_to be_abort
+
+    event = assert_event_reported("Timekeeping::FinancialSnapshotChanged") do
+      described_class.report(result)
+    end
+    expect(event[:payload].to_h[:data][:company_id]).to eq(404)
   end
 
   # Event history is readable across every workspace, so the payload names the row and field
