@@ -470,6 +470,7 @@ RSpec.describe "Entry write routes", "agent ownership on update" do
                 "Ownership-Generation" => timekeeping_arrange.current_generation.to_s,
                 "Idempotency-Key" => SecureRandom.uuid }
     outbox_before = OutboxSnapshot.count
+    version_before = Entry.find(entry_id).version
 
     patch "/v1/companies/#{company}/entries/#{entry_id}",
           params: JSON.generate("agent_id" => colleague_agent), headers: headers
@@ -477,7 +478,7 @@ RSpec.describe "Entry write routes", "agent ownership on update" do
     expect(response).to have_http_status(404)
     expect(response.parsed_body).to eq("reason" => "not_found")
     stored = Entry.find(entry_id)
-    expect([stored.agent_id, stored.user_id, stored.version]).to eq([nil, employee, 0])
+    expect([stored.agent_id, stored.user_id, stored.version]).to eq([nil, employee, version_before])
     expect(OutboxSnapshot.count).to eq(outbox_before)
   end
 end
@@ -881,5 +882,38 @@ RSpec.describe "Entry write routes updating only agent_id" do
     expect(response.parsed_body).to eq("reason" => "not_found")
     expect(entry_write_counts).to eq(before)
     expect(Entry.find(entry_id).agent_id).to be_nil
+  end
+end
+
+RSpec.describe "Entry write routes on an entry with its user's own agent" do
+  include_context "timekeeping entry writes"
+  include_context "timekeeping entry writes without transactional fixtures"
+
+  # Writes that keep the agent/user pair valid, or clear the agent, must not
+  # be refused by the agent ownership check.
+  it "clears the agent with a null agent_id, and moves and deletes agent entries" do
+    company = timekeeping_arrange.company
+    project = timekeeping_arrange.project(company:)
+    other_project = timekeeping_arrange.project(company:)
+    owner = timekeeping_arrange.user(company:, role: "owner")
+    owner_agent = timekeeping_arrange.agent(company:, user: owner)
+    cleared, moved, deleted = Array.new(3) { timekeeping_arrange.entry(company:, user: owner, project:, agent_id: owner_agent) }
+    headers = lambda do
+      { "Content-Type" => "application/json", "Authorization" => "Bearer #{timekeeping_arrange.token_for(owner)}",
+        "Ownership-Generation" => timekeeping_arrange.current_generation.to_s, "Idempotency-Key" => SecureRandom.uuid }
+    end
+
+    patch "/v1/companies/#{company}/entries/#{cleared}", params: JSON.generate("agent_id" => nil), headers: headers.call
+    expect(response.status).to eq(200)
+    post "/v1/companies/#{company}/entries/bulk-move",
+         params: JSON.generate("entry_ids" => [moved], "project_id" => other_project), headers: headers.call
+    expect(response.status).to eq(200)
+    expect(response.parsed_body.fetch("results")).to eq([{ "entry_id" => moved, "result" => "moved" }])
+    delete "/v1/companies/#{company}/entries/#{deleted}", headers: headers.call
+    expect(response.status).to eq(200)
+
+    expect(Entry.find(cleared).agent_id).to be_nil
+    expect([Entry.find(moved).project_id, Entry.find(moved).agent_id]).to eq([other_project, owner_agent])
+    expect(Entry.find(deleted).discarded_at).not_to be_nil
   end
 end
