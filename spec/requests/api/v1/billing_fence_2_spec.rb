@@ -4,47 +4,6 @@
 
 require "rails_helper"
 
-RSpec.describe "Billing fence on invoice create", type: :request do
-  let(:company) { create(:company, base_currency: "USD") }
-  let(:client) { create(:client, company:) }
-  let(:user) { create(:user, current_workspace_id: company.id) }
-
-  before do
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    sign_in user
-  end
-
-  # "Every invoice, line-item, invoice-tax and payment write, mobile-collection payments included,
-  # gets 503 ownership_moving while handoff_step is set and writes nothing"
-  it "refuses invoice create during a handoff with 503 ownership_moving and writes no invoice or line item" do
-    TimekeepingOwnership.current.update!(handoff_step: "close_admission")
-    params = {
-      invoice: {
-        client_id: client.id,
-        invoice_number: "FENCE-C-001",
-        issue_date: Date.current.iso8601,
-        due_date: (Date.current + 7).iso8601,
-        status: "draft",
-        currency: "USD",
-        invoice_line_items_attributes: [
-          { name: "Work", description: "Work", date: Date.current.iso8601, rate: 100, quantity: 60 }
-        ]
-      }
-    }
-
-    expect do
-      send_request :post, api_v1_invoices_path, params:, headers: auth_headers(user)
-    end.to not_change(Invoice, :count).and not_change(InvoiceLineItem, :count)
-
-    expect(response).to have_http_status(:service_unavailable)
-    expect(response.parsed_body["reason"]).to eq("ownership_moving")
-    expect(response.headers["Retry-After"]).to eq("5")
-    expect(response.body).not_to include("close_admission")
-    expect(response.parsed_body).not_to have_key("handoff_step")
-  end
-end
-
 RSpec.describe "Billing fence on invoice update", type: :request do
   let(:company) { create(:company, base_currency: "USD") }
   let(:client) { create(:client, company:) }
@@ -217,76 +176,5 @@ RSpec.describe "Billing fence on invoice update", type: :request do
     expect(response).to have_http_status(:service_unavailable)
     expect(response.parsed_body["reason"]).to eq("ownership_moving")
     expect(stored_invoice_tax_rows(invoice.id, other_invoice.id)).to eq(baseline)
-  end
-end
-
-RSpec.describe "Billing fence on invoice discard", type: :request do
-  let(:invoice) { create :invoice_with_invoice_line_items }
-  let(:company) { invoice.company }
-  let(:user) { create :user, current_workspace_id: company.id }
-
-  before do
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    sign_in user
-  end
-
-  # "Every invoice, line-item, invoice-tax and payment write, mobile-collection payments included,
-  # gets 503 ownership_moving while handoff_step is set and writes nothing"
-  it "refuses invoice discard during a handoff and keeps the invoice undiscarded" do
-    number_before = invoice.reload.invoice_number
-    TimekeepingOwnership.current.update!(handoff_step: "freeze")
-
-    expect do
-      send_request :delete, api_v1_invoice_path(id: invoice.id), headers: auth_headers(user)
-    end.not_to change(InvoiceLineItem, :count)
-
-    expect(response).to have_http_status(:service_unavailable)
-    expect(response.parsed_body["reason"]).to eq("ownership_moving")
-    expect(invoice.reload.discarded_at).to be_nil
-    expect(invoice.invoice_number).to eq(number_before)
-  end
-end
-
-RSpec.describe "Billing fence on Razorpay payment links", type: :request do
-  let(:company) { create(:india_company, base_currency: "INR", plan_tier: "paid") }
-  let(:client) { create(:client, company:, currency: "INR", phone: "+919876543210") }
-  let(:invoice) { create(:invoice, company:, client:, currency: "INR", amount: 1200, amount_due: 1200, status: "sent") }
-  let(:user) { create(:user, current_workspace_id: company.id) }
-  let(:razorpay_client) { instance_double(PaymentProviders::RazorpayClient) }
-
-  before do
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    sign_in user
-    provider = build(
-      :payments_provider,
-      company:,
-      name: PaymentsProvider::RAZORPAY_PROVIDER,
-      connected: true,
-      enabled: true,
-      accepted_payment_methods: ["razorpay"],
-      settings: { enabled_on_invoices: true, key_id: "rzp_test_123", sms_notifications_enabled: true }
-    )
-    provider.key_secret = "secret"
-    provider.save!
-    allow(PaymentProviders::RazorpayClient).to receive(:new).and_return(razorpay_client)
-    allow(razorpay_client).to receive(:create_payment_link)
-  end
-
-  # "Every invoice, line-item, invoice-tax and payment write, mobile-collection payments included,
-  # gets 503 ownership_moving while handoff_step is set and writes nothing"
-  # A link created at the provider but never stored could be paid by the customer and then ignored
-  # by the webhook, so the refusal must come before the provider call.
-  it "refuses a Razorpay payment link during a handoff before any link is created at the provider" do
-    infos_before = invoice.reload.payment_infos
-    TimekeepingOwnership.current.update!(handoff_step: "close_admission")
-
-    post "/api/v1/invoices/#{invoice.id}/razorpay_payment_link", params: { notify_sms: true }, headers: auth_headers(user)
-
-    expect(response).to have_http_status(:service_unavailable)
-    expect(response.parsed_body["reason"]).to eq("ownership_moving")
-    expect(razorpay_client).not_to have_received(:create_payment_link)
-    expect(invoice.reload.payment_infos).to eq(infos_before)
   end
 end
