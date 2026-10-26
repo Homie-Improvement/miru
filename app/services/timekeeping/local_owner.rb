@@ -119,6 +119,7 @@ module Timekeeping
       new(operation:, company_id:, generation:, actor:, params:, checkpoint:).call
     end
 
+    # :reek:LongParameterList
     def initialize(operation:, company_id:, generation:, actor:, params:, checkpoint:)
       @operation = operation.to_sym
       raise ArgumentError, "unknown operation #{operation.inspect}" unless ROUTE_WRITERS.key?(@operation)
@@ -149,6 +150,19 @@ module Timekeeping
         lock_receipt_key unless key.empty?
         checkpoint.call(:receipt_key_locked)
         stored_generation = admitted_generation
+        refusal = admission_refusal(stored_generation)
+        return refusal if refusal
+
+        receipt = find_receipt
+        return answer_from(receipt) if receipt
+
+        checkpoint.call(:receipt_checked)
+        write_change(stored_generation)
+      end
+
+      # The generation fence, then the checks on the request itself. Both come
+      # before the receipt, so a fenced or malformed request is never replayed.
+      def admission_refusal(stored_generation)
         return Outcome.refusal(:stale_generation) unless generation_matches?(stored_generation)
 
         checkpoint.call(:generation_checked)
@@ -156,10 +170,10 @@ module Timekeeping
         return Outcome.refusal(refusal) if refusal
 
         checkpoint.call(:request_checked)
-        receipt = find_receipt
-        return answer_from(receipt) if receipt
+        nil
+      end
 
-        checkpoint.call(:receipt_checked)
+      def write_change(stored_generation)
         facts = reference_facts
         acting = facts && facts[:users].find { |user| user[:id] == actor.user_id }
         return Outcome.refusal(:not_found) unless acting && project_known?(facts)

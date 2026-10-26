@@ -114,6 +114,13 @@ module TimekeepingContract
       ENV.fetch(Internal::V1::BaseController::SERVICE_TOKEN_ENV)
     end
 
+    # An agent row of the company that belongs to user. Validations are
+    # skipped because the contract also builds an agent for a user outside
+    # its company, to prove the owner refuses it.
+    def agent(company:, user:)
+      FactoryBot.build(:agent, company_id: company, user_id: user).tap { |agent| agent.save!(validate: false) }.id
+    end
+
     def entry(company:, user:, project:, **attributes)
       Timekeeping::LocalEntry.create!(
         ENTRY_DEFAULTS.merge(attributes.transform_keys(&:to_s), "company_id" => company, "user_id" => user,
