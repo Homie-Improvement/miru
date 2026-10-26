@@ -5,23 +5,61 @@ require_relative "contract"
 require_relative "monolith_arrange"
 
 module TimekeepingContract
-  # Drives Timekeeping::LocalOwner from the shared entry API examples. The
-  # gateway, not LocalOwner, knows who is signed in, so this client stands in
-  # for it: it verifies the bearer token, maps the route, token and headers to
-  # LocalOwner.call's keywords, and answers the read routes and 401 itself.
-  # Token handling lives only here, in spec support; production code never
-  # takes a token in place of the gateway's user.
+  # A company-bound service credential for the local owner's reservation
+  # routes: an RS256 token signed with the key user tokens are signed with, so
+  # LocalOwner's credential scan finds one nested in an entry body by its
+  # signature. The monolith has no service token of its own, so minting and
+  # verifying one lives only here, in spec support.
+  module LocalServiceToken
+    TYPE = "timekeeping_service"
+    ALGORITHM = Timekeeping::UserToken::ALGORITHM
+
+    # operations are route names (prepare, mark_billed, ...), signed as the
+    # background operation names Timekeeping::LocalOwner::ServiceAccess reads.
+    def self.mint(company:, name:, operations:, private_key:)
+      granted = operations.map { |operation| Timekeeping::LocalOwner::ServiceAccess::ROUTE_OPERATIONS.fetch(operation.to_sym, operation) }
+      JWT.encode({ typ: TYPE, sub: name, company_id: company, operations: granted, jti: SecureRandom.uuid },
+                 private_key, ALGORITHM)
+    end
+
+    # The service actor a credential names, or nil when it is not a service
+    # token signed with the key.
+    def self.actor(credential, public_key:)
+      claims, = JWT.decode(credential, public_key, true, algorithm: ALGORITHM)
+      return unless claims["typ"] == TYPE
+
+      Timekeeping::LocalOwner::Actor.service(name: claims.fetch("sub"), company_id: claims.fetch("company_id"),
+                                             operations: claims.fetch("operations"))
+    rescue JWT::DecodeError
+      nil
+    end
+  end
+
+  # Drives Timekeeping::LocalOwner from the shared entry API and reservation
+  # examples. The gateway, not LocalOwner, knows who is calling, so this
+  # client stands in for it: it verifies the bearer credential, maps the
+  # route, credential, headers and body to LocalOwner.call's keywords, and
+  # answers the entry read routes and the entry routes' 401 itself.
+  # Credential handling lives only here, in spec support; production code
+  # never takes a token in place of the gateway's actor.
   class LocalOwnerClient
     ENTRY_API = TimekeepingContract.load(:entry_api)
+    RESERVATIONS = TimekeepingContract.load(:reservations)
     READ_ROUTES = %w[show index].freeze
+    # The path ids a service command names its target by.
+    TARGET_PARAMS = %w[invoice_id agent_id].freeze
 
     def initialize(public_key:)
       @public_key = public_key
       @router = Router.new(ENTRY_API.fetch("routes"))
+      @reservation_router = Router.new(RESERVATIONS.fetch("routes"))
     end
 
     def call(method, path, headers: {}, body: nil)
       headers = headers.to_h
+      reservation_route, reservation_params = @reservation_router.match(method, path)
+      return reservation_command(reservation_route, reservation_params, headers, body) if reservation_route
+
       route, params = @router.match(method, path)
       return Wire.error(ENTRY_API, "not_found") unless route
 
@@ -34,6 +72,35 @@ module TimekeepingContract
     end
 
     private
+
+      # The reservation routes take the generation in the body and leave every
+      # caller refusal to LocalOwner: a missing credential reaches it as a nil
+      # actor, a user token as a user actor.
+      def reservation_command(route, params, headers, body)
+        body = Wire.copy(body) || {}
+        outcome = Timekeeping::LocalOwner.call(
+          operation: route.to_sym,
+          company_id: Integer(params["company_id"], 10, exception: false),
+          generation: body.is_a?(Hash) ? body["generation"] : nil,
+          actor: reservation_actor(headers),
+          params: params.slice(*TARGET_PARAMS).merge("body" => body)
+        )
+        Response.new(status: outcome.status, body: Wire.copy(outcome.body))
+      end
+
+      def reservation_actor(headers)
+        credential = Wire.bearer(headers)
+        return if credential.nil?
+
+        LocalServiceToken.actor(credential, public_key: @public_key) || user_actor(credential)
+      end
+
+      def user_actor(credential)
+        claims = Timekeeping::UserToken.verify(credential, public_key: @public_key)
+        Timekeeping::LocalOwner::Actor.user(user_id: claims.user_id, role: claims.role)
+      rescue Timekeeping::UserToken::InvalidTokenError
+        nil
+      end
 
       def verified_claims(headers)
         token = Wire.bearer(headers)
@@ -104,14 +171,19 @@ module TimekeepingContract
              :flip_ownership, :projected_entry, to: :@monolith
 
     def initialize(private_key:)
+      @private_key = private_key
       @monolith = MonolithArrange.new(private_key:)
       TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
     end
 
-    # The local owner holds one service credential, TIMEKEEPING_SERVICE_TOKEN,
-    # and scans entry bodies for it, so that is the identity handed out.
+    # A service bound to a company gets its own signed credential, so each
+    # name, company and operation list is a separate caller. A service bound
+    # to no company is the relay's identity, the one TIMEKEEPING_SERVICE_TOKEN
+    # the local owner holds.
     def service_identity(company:, name:, operations:)
-      ENV.fetch(Internal::V1::BaseController::SERVICE_TOKEN_ENV)
+      return ENV.fetch(Internal::V1::BaseController::SERVICE_TOKEN_ENV) if company.nil?
+
+      LocalServiceToken.mint(company:, name:, operations:, private_key: @private_key)
     end
 
     # An agent row of the company that belongs to user. Validations are
@@ -128,8 +200,8 @@ module TimekeepingContract
       ).id
     end
 
-    # An entry that already holds a reservation, without the reservation
-    # routes, which this owner does not serve yet.
+    # An entry that already holds a reservation, inserted without calling the
+    # reservation routes, so the entry examples run on their own.
     def reserved_entry(company:, invoice_id:, state: "committed", disposition: "active", **attributes)
       entry_id = entry(company:, user: user(company:, role: "employee"), project: project(company:), **attributes)
       ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, company, entry_id, invoice_id, SecureRandom.uuid, state, disposition]))
