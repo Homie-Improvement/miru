@@ -6,8 +6,9 @@ require_relative "client"
 require_relative "contract"
 require_relative "idempotency_receipts"
 require_relative "reservation_rules"
-require_relative "../../../gems/timekeeping_rules/lib/timekeeping_rules/entry_rules"
-require_relative "../../../gems/timekeeping_rules/lib/timekeeping_rules/reservation_decision"
+# Required by path because the relay gem loads this fake under its own bundle,
+# which does not include timekeeping_rules.
+require_relative "../../../gems/timekeeping_rules/lib/timekeeping_rules"
 
 module TimekeepingContract
   # An in-memory Timekeeping that answers the entry API and the reservation
