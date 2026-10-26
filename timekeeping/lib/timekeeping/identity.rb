@@ -16,17 +16,24 @@ module Timekeeping
   # company_id, which stays nil for an expired token.
   #
   # purpose is the token's signed purpose claim ("read" or "write"), or nil for
-  # a token signed without one. Only WriteAccess reads it: a read token may
-  # carry a raised role, so it must never authorize a write.
+  # a token signed without one. Only WriteAccess reads it: a read token must
+  # never authorize a write.
+  #
+  # primary_role is the token's signed primary_role claim: the user's
+  # lowest-id role in the company, which the locked-entry and billed-change
+  # rules decide on, as the monolith's validations do. role may be a raised
+  # owner or admin role. A token signed without the claim was minted when a
+  # writing token's role was the primary role, so primary_role falls back to
+  # role there.
   #
   # A service caller is either the raw shared TIMEKEEPING_SERVICE_TOKEN, which
   # acts for no company and holds no operations, or a signed service token
   # (Timekeeping::ServiceTokenVerifier), whose verified claims give its
   # service_name, its one company_id and the operations it may run.
-  Identity = Data.define(:kind, :status, :user_id, :company_id, :role, :signed_company_id, :purpose,
+  Identity = Data.define(:kind, :status, :user_id, :company_id, :role, :primary_role, :signed_company_id, :purpose,
                          :service_name, :operations) do
-    def initialize(signed_company_id: nil, purpose: nil, service_name: nil, operations: [], **fields)
-      super(signed_company_id:, purpose:, service_name:, operations: operations.freeze, **fields)
+    def initialize(primary_role: nil, signed_company_id: nil, purpose: nil, service_name: nil, operations: [], **fields)
+      super(primary_role:, signed_company_id:, purpose:, service_name:, operations: operations.freeze, **fields)
     end
 
     def self.anonymous(status, signed_company_id: nil)
@@ -56,6 +63,7 @@ module Timekeeping
         user_id: claims.fetch("sub"),
         company_id: claims.fetch("company_id"),
         role: claims.fetch("role"),
+        primary_role: claims.fetch("primary_role") { claims.fetch("role") },
         signed_company_id: claims.fetch("company_id"),
         purpose: claims["purpose"]
       )

@@ -183,7 +183,8 @@ module Timekeeping
         entries = locked_entries(command, requested.filter_map { |id| entry_id(id) }.uniq, visible_only: true)
         checkpoint.call(:rows_locked)
         decision = EntryDecision.bulk(action: BULK_ACTIONS.fetch(command.route), role: command.role,
-                                      acting_user_id: command.actor_id, entries: entries.map { |entry| rule_facts(entry) },
+                                      primary_role: command.primary_role, acting_user_id: command.actor_id,
+                                      entries: entries.map { |entry| rule_facts(entry) },
                                       edit_days: command.facts.edit_days, today: command.today)
         return WriteOutcome.refusal(:forbidden) if decision == :forbidden
 
@@ -237,8 +238,9 @@ module Timekeeping
       end
 
       def change_refusal(command, entry, action:, bill_status:)
-        decision = EntryDecision.change(action:, bill_status:, role: command.role, acting_user_id: command.actor_id,
-                                        entry: rule_facts(entry), edit_days: command.facts.edit_days,
+        decision = EntryDecision.change(action:, bill_status:, role: command.role, primary_role: command.primary_role,
+                                        acting_user_id: command.actor_id, entry: rule_facts(entry),
+                                        edit_days: command.facts.edit_days,
                                         today: command.today)
         WriteOutcome.refusal(decision) unless decision == :ok
       end
