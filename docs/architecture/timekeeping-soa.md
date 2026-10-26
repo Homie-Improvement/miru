@@ -376,6 +376,8 @@ Today (observed), the role and `timesheet_edit_days` are read in `authorize`, be
 
 - **User-delegated writes.** The monolith mints the signed token per request. Its claims carry the user's current role in the company, `timesheet_edit_days`, and for each project the request touches: `company_id`, `billable` and whether the user is a member. Timekeeping takes these claims as the facts for that write.
 - **Background writes** (reservation operations, imports and agent destroy). Timekeeping calls a monolith read endpoint, `GET /internal/v1/companies/{company_id}/reference?project_ids=…`, with its own service identity, before deciding.
+- **Agents (S7).** The reference response lists every agent of the company, active or not, as `{ id, user_id }` only (`contracts/timekeeping/reference.yml`, `agent_fields`). Timekeeping checks an entry's agent against this list before the write, so a snapshot the projection would refuse is not committed. The list is read before the write's transaction opens, so an agent moved or deleted in between is still caught by the projection's own check.
+- **Deploy order for the agents list.** Deploy the monolith first: callers that do not read `agents` ignore the extra key. A Timekeeping that requires `agents` beside a monolith that does not send it refuses every write that reads the reference endpoint with `503 reference_unavailable`. To roll back, roll Timekeeping back first, then the monolith.
 - **When the facts cannot be read** (expired token, missing project claim, monolith endpoint down), the write is refused with a retryable `503 reference_unavailable`. It fails closed: Timekeeping never guesses and never falls back to an older copy.
 - There are no cross-database joins.
 

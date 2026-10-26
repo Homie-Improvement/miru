@@ -36,11 +36,6 @@ RSpec.describe Timekeeping::ReservationOperations do
     Reservation.where(entry_id:).order(:invoice_id).pluck(:invoice_id, :state)
   end
 
-  def reservation_row_counts
-    { reservations: Reservation.count, operations: InvoiceOperation.count, audit_events: AuditEvent.count,
-      outbox_snapshots: OutboxSnapshot.count, receipts: ServiceIdempotencyReceipt.count, versions: Entry.sum(:version) }
-  end
-
   it "leaves no reservation, operation, audit or outbox row when the outbox insert fails after the reservation write" do
     x
     before = reservation_row_counts
