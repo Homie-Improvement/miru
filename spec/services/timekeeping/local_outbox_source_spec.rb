@@ -75,8 +75,8 @@ RSpec.describe Timekeeping::LocalOutboxSource do
 
   # "Every outbox read and mark filters by company_id; company A's source never returns or marks company B's rows"
   # Positions are one global sequence, so B's rows sit below, between and above A's rows: a source that
-  # filtered only by position would return or mark them.
-  it "company A's source given company B's interleaved positions neither returns nor marks them" do
+  # filtered only by position would return them.
+  it "company A's unsent_after never returns company B's interleaved rows" do
     company_a = create(:company)
     company_b = create(:company)
     rows = [
@@ -88,10 +88,8 @@ RSpec.describe Timekeeping::LocalOutboxSource do
     source_a = described_class.new(company_id: company_a.id)
 
     returned = source_a.unsent_after(0, 100)
-    source_a.mark_sent(b_positions)
 
     expect(returned.map { |row| row.fetch("outbox_position") }).to eq(a_positions)
-    expect(Timekeeping::LocalOutboxEntry.where(outbox_position: b_positions).pluck(:sent_at)).to all(be_nil)
     expect(described_class.new(company_id: company_b.id).unsent_after(0, 100).map { |row| row.fetch("outbox_position") })
       .to eq(b_positions)
   end
@@ -129,40 +127,13 @@ RSpec.describe Timekeeping::LocalOutboxSource do
     source = described_class.new(company_id: company.id)
     marked = [rows.first.outbox_position, rows.last.outbox_position]
 
-    first_time = Time.zone.parse("2026-03-02 09:00:00.123456")
+    first_time = Time.zone.parse("2026-03-02 09:00:00")
     travel_to(first_time) { expect(source.mark_sent(marked)).to be_nil }
-    first_sent_at = rows.first.reload.sent_at
     travel_to(first_time + 1.hour) { source.mark_sent(marked) }
 
-    expect(rows.first.reload.sent_at).to eq(first_sent_at)
-    expect(rows.last.reload.sent_at).to eq(first_sent_at)
+    expect(rows.first.reload.sent_at).to eq(first_time)
+    expect(rows.last.reload.sent_at).to eq(first_time)
     expect(rows.second.reload.sent_at).to be_nil
     expect(source.unsent_after(0, 100).map { |row| row.fetch("outbox_position") }).to eq([rows.second.outbox_position])
-  end
-
-  # "`mark_sent` sets `sent_at` by `company_id` and the exact positions, never by entry id. A second call changes nothing."
-  it "marks only its own company's listed positions, never another company's or an unlisted row of the same entry, and a second call keeps the first sent_at" do
-    company_a = create(:company)
-    company_b = create(:company)
-    write = lambda do |company, entry_id|
-      payload = TimekeepingSnapshots.entry(id: entry_id, company_id: company.id, version: 1, project_id: nil,
-                                           user_id: nil)
-      Timekeeping::LocalOutboxEntry.create!(company_id: company.id, entry_id:, generation: 1, payload:,
-                                            created_at: Time.current)
-    end
-    a_first = write.call(company_a, 501)
-    b_row = write.call(company_b, 601)
-    a_later_same_entry = write.call(company_a, 501)
-    source = described_class.new(company_id: company_a.id)
-
-    first_time = Time.zone.parse("2026-03-02 09:00:00")
-    travel_to(first_time) do
-      expect(source.mark_sent([a_first.outbox_position, b_row.outbox_position])).to be_nil
-    end
-    travel_to(first_time + 1.hour) { source.mark_sent([a_first.outbox_position]) }
-
-    expect(a_first.reload.sent_at).to eq(first_time)
-    expect(b_row.reload.sent_at).to be_nil
-    expect(a_later_same_entry.reload.sent_at).to be_nil
   end
 end

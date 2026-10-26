@@ -47,8 +47,8 @@ module Timekeeping
       # finer than a double. Timestamps are stored as ISO 8601 strings with
       # microseconds, so they pass through as written. The entry is cut to the
       # contract fields, so a key a later writer adds is never posted. duration
-      # is a double precision column whose stored text is the shortest decimal
-      # of the written Float, so converting it back gives the same bits.
+      # is held in the payload as the jsonb number of the shortest decimal of the
+      # written Float, so converting it back to a Float gives the same bits.
       def entry(payload_text)
         payload = JSON.parse(payload_text, decimal_class: BigDecimal).slice(*SnapshotBatch::ENTRY_FIELDS)
         duration = payload["duration"]
