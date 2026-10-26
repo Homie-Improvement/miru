@@ -23,5 +23,9 @@ RSpec.describe TimekeepingRelay::IdempotencyKey do
     expect(described_class.for(batch.call(generation: 3, version: 1))).not_to eq(key)
     expect(described_class.for(batch.call(generation: 2, version: 2))).not_to eq(key)
     expect(described_class.for(batch.call(generation: 2, version: 1, entry_id: 11))).not_to eq(key)
+    # Every differing body at the same position gets its own key, not only one that differs from the first.
+    variants = [batch.call(generation: 2, version: 1), batch.call(generation: 3, version: 1),
+                batch.call(generation: 2, version: 2), batch.call(generation: 2, version: 1, entry_id: 11)]
+    expect(variants.map { |body| described_class.for(body) }.uniq.size).to eq(variants.size)
   end
 end
