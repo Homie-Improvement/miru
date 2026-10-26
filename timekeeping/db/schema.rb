@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_05_01_000000) do
+ActiveRecord::Schema[8.1].define(version: 2026_06_01_000000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -69,6 +69,21 @@ ActiveRecord::Schema[8.1].define(version: 2026_05_01_000000) do
     t.text "body", null: false
     t.datetime "created_at", null: false
     t.index ["company_id", "actor_type", "actor_id", "operation", "key"], name: "index_idempotency_receipts_on_receipt_key", unique: true
+  end
+
+  create_table "invoice_operations", force: :cascade do |t|
+    t.bigint "company_id", null: false
+    t.bigint "invoice_id", null: false
+    t.uuid "operation_id", null: false
+    t.string "state", null: false
+    t.bigint "desired_entry_ids", default: [], null: false, array: true
+    t.string "disposition", null: false
+    t.bigint "generation", null: false
+    t.datetime "created_at", null: false
+    t.datetime "finished_at"
+    t.index ["company_id", "invoice_id"], name: "index_invoice_operations_one_prepared_per_invoice", unique: true, where: "((state)::text = 'prepared'::text)"
+    t.check_constraint "disposition::text = ANY (ARRAY['active'::character varying, 'retained'::character varying]::text[])", name: "invoice_operations_disposition_check"
+    t.check_constraint "state::text = ANY (ARRAY['prepared'::character varying, 'committed'::character varying, 'aborted'::character varying]::text[])", name: "invoice_operations_state_check"
   end
 
   create_table "outbox_snapshots", primary_key: "outbox_position", force: :cascade do |t|
