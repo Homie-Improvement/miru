@@ -55,7 +55,7 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
     # composite foreign key refuses it after entries were already replaced.
     orphan_audit = {
       "id" => 1, "company_id" => 1, "entry_id" => seeded_id + 999, "actor_type" => "User", "actor_id" => 7,
-      "action" => "create", "before" => nil, "after" => { "duration" => 2.0 }, "entry_created_at" => now,
+      "actor_name" => nil, "action" => "create", "before" => nil, "after" => { "duration" => 2.0 }, "entry_created_at" => now,
       "created_at" => now
     }
     checkpoint = Timekeeping::Handoff::Checkpoint.build(

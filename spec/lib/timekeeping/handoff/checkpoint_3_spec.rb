@@ -78,7 +78,7 @@ RSpec.describe Timekeeping::Handoff::Checkpoint do
     audit = lambda do |id, company_id, entry_id|
       values = {
         "id" => id, "company_id" => company_id, "entry_id" => entry_id, "actor_type" => "User",
-        "actor_id" => 8, "action" => "create", "before" => nil, "after" => { "note" => "a" },
+        "actor_id" => 8, "actor_name" => nil, "action" => "create", "before" => nil, "after" => { "note" => "a" },
         "entry_created_at" => at, "created_at" => at
       }
       checkpoint_class::TABLES.fetch("entry_audits").index_with { |column| values.fetch(column) }
@@ -122,7 +122,7 @@ RSpec.describe Timekeeping::Handoff::Checkpoint do
     audit = lambda do |id, company_id, entry_id|
       values = {
         "id" => id, "company_id" => company_id, "entry_id" => entry_id, "actor_type" => "User",
-        "actor_id" => 8, "action" => "create", "before" => nil, "after" => { "note" => "" },
+        "actor_id" => 8, "actor_name" => nil, "action" => "create", "before" => nil, "after" => { "note" => "" },
         "entry_created_at" => at, "created_at" => at
       }
       checkpoint_class::TABLES.fetch("entry_audits").index_with { |column| values.fetch(column) }

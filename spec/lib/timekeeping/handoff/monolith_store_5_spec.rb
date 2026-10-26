@@ -30,7 +30,7 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
     # insert of entry_audits fails after entries were already replaced.
     orphan_audit = {
       "id" => 1, "company_id" => 1, "entry_id" => 999, "actor_type" => "User", "actor_id" => 7,
-      "action" => "update", "before" => nil, "after" => { "note" => "x" },
+      "actor_name" => nil, "action" => "update", "before" => nil, "after" => { "note" => "x" },
       "entry_created_at" => stamp, "created_at" => stamp
     }
     checkpoint = Timekeeping::Handoff::Checkpoint.build(
@@ -202,7 +202,8 @@ RSpec.describe Timekeeping::Handoff::MonolithStore do
       }],
       "reservations" => [{
         "company_id" => company_id, "entry_id" => 501, "invoice_id" => invoice.id, "state" => "committed",
-        "disposition" => "active", "operation_id" => "8a6f0b8e-2d4c-4f53-9a51-3f1f5d0c2b11", "created_at" => stamp
+        "disposition" => "active", "operation_id" => "8a6f0b8e-2d4c-4f53-9a51-3f1f5d0c2b11", "created_at" => stamp,
+        "invoice_operation_id" => nil
       }],
       "invoice_operations" => [{
         "id" => 7, "company_id" => company_id, "invoice_id" => invoice.id,

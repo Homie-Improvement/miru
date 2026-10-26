@@ -148,7 +148,7 @@ RSpec.describe Timekeeping::Handoff::Checkpoint, "row shapes and encoding" do
   it "reports every mismatch, including a count changed while rows and checksum stay intact" do
     audit = {
       "id" => 5, "company_id" => 2, "entry_id" => 2, "actor_type" => "User", "actor_id" => 7, "action" => "create",
-      "before" => nil, "after" => { "note" => "a" }, "entry_created_at" => Time.utc(2026, 1, 5, 9),
+      "actor_name" => nil, "before" => nil, "after" => { "note" => "a" }, "entry_created_at" => Time.utc(2026, 1, 5, 9),
       "created_at" => Time.utc(2026, 1, 5, 9)
     }
     checkpoint = described_class.build(tables: shape_case_tables(

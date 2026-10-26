@@ -61,7 +61,7 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
 
     cross_company_audit = {
       "id" => 1, "company_id" => 200, "entry_id" => 10, "actor_type" => "User", "actor_id" => 5,
-      "action" => "create", "before" => nil, "after" => { "duration" => 60.0 },
+      "actor_name" => nil, "action" => "create", "before" => nil, "after" => { "duration" => 60.0 },
       "entry_created_at" => Time.utc(2026, 10, 1, 12), "created_at" => Time.utc(2026, 10, 1, 12)
     }
     checkpoint = Timekeeping::Handoff::Checkpoint.build(

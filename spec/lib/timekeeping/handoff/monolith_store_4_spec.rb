@@ -91,7 +91,8 @@ RSpec.describe Timekeeping::Handoff::MonolithStore do
     # Points at an entry the checkpoint does not hold, so the insert fails after
     # the entries table has already been replaced.
     orphan_audit = {
-      "id" => 1, "company_id" => 1, "entry_id" => 901, "actor_type" => "User", "actor_id" => 20, "action" => "create",
+      "id" => 1, "company_id" => 1, "entry_id" => 901, "actor_type" => "User", "actor_id" => 20, "actor_name" => nil,
+      "action" => "create",
       "before" => nil, "after" => { "note" => "" }, "entry_created_at" => Time.utc(2026, 1, 9), "created_at" => Time.utc(2026, 1, 9)
     }.slice(*checkpoint_class::TABLES.fetch("entry_audits"))
     tables = checkpoint_class::TABLES.keys.index_with { [] }
