@@ -31,6 +31,10 @@ RSpec.describe Timekeeping::ReservationAccess do
       Timekeeping::Identity.resolve(authorization: "Bearer #{token}", public_key: rsa_key_pair.public_key.to_pem,
                                     service_token: secret)
     end
+    resolve_bearer = lambda do |bearer|
+      Timekeeping::Identity.resolve(authorization: bearer && "Bearer #{bearer}",
+                                    public_key: rsa_key_pair.public_key.to_pem, service_token: secret)
+    end
     decide = ->(identity, company_id, operation) { described_class.decide(identity:, company_id:, operation:) }
 
     bound = resolve.call(1, ["reservations.prepare"])
@@ -40,10 +44,18 @@ RSpec.describe Timekeeping::ReservationAccess do
     # A name outside the background allowlist grants nothing, even when the token lists it.
     wide = resolve.call(1, ["prepare", "admin.everything"])
     expect(decide.call(wide, 1, "prepare")).not_to eq(:allowed)
+    # Listing a non-background operation beside an allowed one neither grants it nor cancels the allowed one.
+    mixed = resolve.call(1, ["reservations.prepare", "entries.delete"])
+    expect(decide.call(mixed, 1, "reservations.prepare")).to eq(:allowed)
+    expect(decide.call(mixed, 2, "reservations.prepare")).to eq(:not_found)
+    expect(decide.call(mixed, 1, "reservations.commit")).to eq(:forbidden)
+    expect(decide.call(mixed, 1, "entries.delete")).to eq(:forbidden)
+    # "An anonymous or user-delegated request never gets it."
+    owner = resolve_bearer.call(mint_token({ sub: 7, company_id: 1, role: "owner" }))
+    expect(decide.call(owner, 1, "reservations.prepare")).to eq(:forbidden)
+    expect(decide.call(resolve_bearer.call(nil), 1, "reservations.prepare")).to eq(:unauthorized)
     # The shared token itself carries no company, so it never reaches these routes.
-    raw = Timekeeping::Identity.resolve(authorization: "Bearer #{secret}", public_key: rsa_key_pair.public_key.to_pem,
-                                        service_token: secret)
-    expect(decide.call(raw, 1, "reservations.prepare")).not_to eq(:allowed)
+    expect(decide.call(resolve_bearer.call(secret), 1, "reservations.prepare")).to eq(:forbidden)
   end
 end
 
