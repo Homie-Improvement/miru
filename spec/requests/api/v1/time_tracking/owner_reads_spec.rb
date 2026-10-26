@@ -4,76 +4,6 @@
 
 require "rails_helper"
 
-RSpec.describe "Owner-aware time-tracking reads", type: :request do
-  it "entry list in the prepared state shows only the current workspace's entries for a user of two companies" do
-    company_a = create(:company)
-    company_b = create(:company)
-    user = create(:user, current_workspace_id: company_a.id)
-    create(:employment, company: company_a, user:)
-    create(:employment, company: company_b, user:)
-    user.add_role :admin, company_a
-    user.add_role :admin, company_b
-    project_a = create(:project, client: create(:client, company: company_a))
-    project_b = create(:project, client: create(:client, company: company_b))
-    TimekeepingOwnership.current.update!(owner: "monolith", generation: 3, monolith_store: "prepared")
-
-    insert_prepared = lambda do |company, project, note|
-      ActiveRecord::Base.connection.select_value(ActiveRecord::Base.sanitize_sql_array([
-        "INSERT INTO entries (company_id, user_id, project_id, work_date, duration, note, bill_status, created_at, updated_at) " \
-        "VALUES (?, ?, ?, ?, 60.0, ?, 'unbilled', NOW(), NOW()) RETURNING id",
-        company.id, user.id, project.id, Date.current, note
-      ]))
-    end
-    entry_a = insert_prepared.call(company_a, project_a, "Company A work")
-    entry_b = insert_prepared.call(company_b, project_b, "Company B private work")
-
-    sign_in user
-    send_request :get, api_v1_timesheet_entry_index_path, params: {
-      from: (Date.current - 7.days).iso8601, to: (Date.current + 7.days).iso8601
-    }, headers: auth_headers(user)
-
-    expect(response).to have_http_status(:ok)
-    listed = json_response["entries"].values.flatten
-    expect(listed.pluck("id")).to include(entry_a)
-    expect(listed.pluck("id")).not_to include(entry_b)
-    expect(response.body).not_to include("Company B private work")
-  end
-end
-
-RSpec.describe "Owner-aware time-tracking reads", type: :request do
-  it "time-tracking index in the prepared state shows only the current workspace's entries for a user of two companies" do
-    company_a = create(:company)
-    company_b = create(:company)
-    user = create(:user, current_workspace_id: company_a.id)
-    create(:employment, company: company_a, user:)
-    create(:employment, company: company_b, user:)
-    user.add_role :admin, company_a
-    user.add_role :admin, company_b
-    project_a = create(:project, client: create(:client, company: company_a))
-    project_b = create(:project, client: create(:client, company: company_b))
-    TimekeepingOwnership.current.update!(owner: "monolith", generation: 3, monolith_store: "prepared")
-
-    insert_prepared = lambda do |company, project, note|
-      ActiveRecord::Base.connection.select_value(ActiveRecord::Base.sanitize_sql_array([
-        "INSERT INTO entries (company_id, user_id, project_id, work_date, duration, note, bill_status, created_at, updated_at) " \
-        "VALUES (?, ?, ?, ?, 60.0, ?, 'unbilled', NOW(), NOW()) RETURNING id",
-        company.id, user.id, project.id, Date.current, note
-      ]))
-    end
-    entry_a = insert_prepared.call(company_a, project_a, "Company A tracked work")
-    entry_b = insert_prepared.call(company_b, project_b, "Company B tracked secret")
-
-    sign_in user
-    send_request :get, api_v1_time_tracking_index_path, headers: auth_headers(user)
-
-    expect(response).to have_http_status(:ok)
-    listed = json_response["entries"].values.flatten
-    expect(listed.pluck("id")).to include(entry_a)
-    expect(listed.pluck("id")).not_to include(entry_b)
-    expect(response.body).not_to include("Company B tracked secret")
-  end
-end
-
 RSpec.describe "Owner-aware reads across owner states", type: :request do
   include_context "timekeeping contract fakes"
 
@@ -107,18 +37,18 @@ RSpec.describe "Owner-aware reads across owner states", type: :request do
     json_response.fetch("entry").fetch("id")
   end
 
-  def owner_reads_create_timekeeping_entry
+  def owner_reads_create_timekeeping_entry(note: "Timekeeping entry", **attributes)
     TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
     fake_timekeeping.add_entry(company_id: company.id, user_id: user.id, project_id: project.id,
-                               work_date:, duration: 45.0, note: "Timekeeping entry").fetch("id")
+                               work_date:, duration: 45.0, note:, **attributes).fetch("id")
   end
 
-  def owner_reads_create_prepared_entry
+  def owner_reads_create_prepared_entry(entry_company: company, entry_project: project, note: "Prepared entry")
     TimekeepingOwnership.current.update!(owner: "monolith", generation: 3, monolith_store: "prepared", handoff_step: nil)
     ActiveRecord::Base.connection.select_value(ActiveRecord::Base.sanitize_sql_array([
       "INSERT INTO entries (company_id, user_id, project_id, work_date, duration, note, bill_status, created_at, updated_at) " \
-      "VALUES (?, ?, ?, ?, 60.0, 'Prepared entry', 'unbilled', NOW(), NOW()) RETURNING id",
-      company.id, user.id, project.id, work_date
+      "VALUES (?, ?, ?, ?, 60.0, ?, 'unbilled', NOW(), NOW()) RETURNING id",
+      entry_company.id, user.id, entry_project.id, work_date, note
     ]))
   end
 
@@ -144,6 +74,24 @@ RSpec.describe "Owner-aware reads across owner states", type: :request do
     expect(TimesheetEntry.unscoped.where(id: entry_id)).not_to exist
   end
 
+  it "shows only the current workspace's prepared entries in both reads for a user of two companies" do
+    other_company = create(:company)
+    other_project = create(:project, client: create(:client, company: other_company))
+    create(:employment, company: other_company, user:)
+    user.add_role :admin, other_company
+
+    own_entry_id = owner_reads_create_prepared_entry(note: "Company A work")
+    other_entry_id = owner_reads_create_prepared_entry(entry_company: other_company, entry_project: other_project,
+                                                       note: "Company B private work")
+
+    read_paths.each do |path|
+      expect([path, owner_reads_listed_entry(path, own_entry_id)&.fetch("note")]).to eq([path, "Company A work"])
+      listed_ids = json_response.fetch("entries").values.flatten.pluck("id")
+      expect([path, listed_ids.include?(other_entry_id)]).to eq([path, false])
+      expect([path, response.body.include?("Company B private work")]).to eq([path, false])
+    end
+  end
+
   it "renders the same entry keys and value types in the legacy, prepared and Timekeeping states" do
     legacy_id = owner_reads_create_legacy_entry
     legacy = owner_reads_listed_entry(api_v1_timesheet_entry_index_path, legacy_id)
@@ -157,5 +105,76 @@ RSpec.describe "Owner-aware reads across owner states", type: :request do
     expect(legacy).to be_present
     expect(owner_reads_shape(prepared)).to eq(owner_reads_shape(legacy))
     expect(owner_reads_shape(timekeeping)).to eq(owner_reads_shape(legacy))
+  end
+
+  # "The entry list and read-after-write reads go to the current owner: Timekeeping, or the prepared
+  # monolith's local tables, or `timesheet_entries` in the legacy state."
+  # "Include a case where delivery is paused and a newly created entry still shows at once in the
+  # time-tracking index and entry list."
+  # Delivery is paused: fake_relay.deliver_pending is never called, so timesheet_entries has no row for
+  # the owner's entry. The projection row has no counterpart at the owner, as after an undelivered
+  # discard; a reader that merges sources or falls back to timesheet_entries would show it.
+  it "shows the owner's undelivered entry once, with its review status, and never a projection-only row" do
+    projection_only = create(:timesheet_entry, user:, project:, work_date:, note: "projection only")
+    projection_only.update_columns(company_id: company.id)
+    entry_id = owner_reads_create_timekeeping_entry(note: "Logged while the relay is paused",
+                                                    review_status: "pending_review")
+
+    read_paths.each do |path|
+      send_request :get, path, params: { from: work_date, to: work_date }, headers: auth_headers(user)
+
+      expect([path, response.status]).to eq([path, 200])
+      listed = json_response.fetch("entries").fetch(work_date, [])
+      expect([path, listed.pluck("note")]).to eq([path, ["Logged while the relay is paused"]])
+      shown = listed.select { |entry| entry["id"] == entry_id }
+      expect([path, shown.size]).to eq([path, 1])
+      # Neither index view renders review_status, and the response shapes must not change, so the owner's
+      # review status is checked on the records the reader returns instead.
+      expect(shown.first).to include("note" => "Logged while the relay is paused",
+                                     "project_id" => project.id, "type" => "timesheet")
+    end
+    expect(TimesheetEntry.unscoped.where(id: entry_id)).not_to exist
+
+    read = Timekeeping::EntryReader.list(company_id: company.id, user_id: user.id, from: work_date, to: work_date)
+    expect(read.find { |entry| entry.id == entry_id }.review_status).to eq("pending_review")
+  end
+
+  it "answers both reads with a JSON 503 when Timekeeping owns entries and cannot be read" do
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    # The group stubs EntryApiClient.new with the fake client, so the real constructor is restored
+    # before building the client that has no base URL.
+    allow(Timekeeping::EntryApiClient).to receive(:new).and_call_original
+    missing_url_client = Timekeeping::EntryApiClient.new(base_url: nil)
+    expect(missing_url_client).to be_an_instance_of(Timekeeping::EntryApiClient)
+    allow(Timekeeping::EntryApiClient).to receive(:new).and_return(missing_url_client)
+
+    read_paths.each do |path|
+      send_request :get, path, params: { from: work_date, to: work_date }, headers: auth_headers(user)
+
+      expect([path, response.status]).to eq([path, 503])
+      expect(json_response).to eq("errors" => "TIMEKEEPING_BASE_URL is not set")
+    end
+  end
+
+  context "when the company is on the paid plan" do
+    # The time entry report is a paid-plan feature, so a free company gets 403 before the report runs.
+    let(:company) { create(:company, plan_tier: "paid") }
+
+    it "reads the Timekeeping owner for the time-tracking index while the time entry report still reads timesheet_entries" do
+      projected = create(:timesheet_entry, user:, project:, work_date:, note: "projection only")
+      owner_entry_id = owner_reads_create_timekeeping_entry(note: "owner only")
+
+      send_request :get, api_v1_time_tracking_index_path, headers: auth_headers(user)
+      expect(response).to have_http_status(:ok)
+      index_notes = json_response["entries"].values.flatten.select { |entry| entry["type"] == "timesheet" }.pluck("note")
+      expect(index_notes).to eq(["owner only"])
+      expect(owner_entry_id).not_to eq(projected.id)
+
+      # "Aggregate reports keep reading `timesheet_entries`."
+      send_request :get, api_v1_reports_time_entries_path, headers: auth_headers(user)
+      expect(response).to have_http_status(:ok)
+      report_ids = json_response["reports"].flat_map { |group| group["entries"].pluck("id") }
+      expect(report_ids).to eq([projected.id])
+    end
   end
 end

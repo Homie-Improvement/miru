@@ -10,9 +10,12 @@ RSpec.describe Timekeeping::EntryOwner do
 
     expect(described_class.for(ownership)).to eq(:legacy)
 
-    # Two aborted first cutovers leave the legacy monolith owning the data at generation 3.
-    ownership.update_columns(generation: 3, owner: "monolith", handoff_step: nil)
-    expect(described_class.for(ownership.reload)).to eq(:legacy)
+    # Two aborted first cutovers leave the legacy monolith owning the data at generation 3. Every
+    # handoff raises the generation and an abort keeps it, so generation 3 alone does not mean a
+    # rollback ever completed: the store stays at its column default.
+    ownership.update!(generation: 3, owner: "monolith", handoff_step: nil)
+    expect(ownership.reload.monolith_store).to eq("legacy")
+    expect(described_class.for(ownership)).to eq(:legacy)
 
     ownership.update_columns(generation: 3, owner: "monolith", handoff_step: nil, monolith_store: "prepared")
     expect(described_class.for(ownership.reload)).to eq(:prepared)
@@ -27,7 +30,8 @@ RSpec.describe Timekeeping::EntryOwner, "owner table" do
     [{ owner: "monolith", monolith_store: "legacy", generation: 1, handoff_step: nil }, :legacy],
     [{ owner: "monolith", monolith_store: "legacy", generation: 2, handoff_step: "freeze" }, :legacy],
     [{ owner: "monolith", monolith_store: "prepared", generation: 3, handoff_step: nil }, :prepared],
-    [{ owner: "timekeeping", monolith_store: "legacy", generation: 2, handoff_step: nil }, :timekeeping]
+    [{ owner: "timekeeping", monolith_store: "legacy", generation: 2, handoff_step: nil }, :timekeeping],
+    [{ owner: "monolith", monolith_store: "legacy", generation: 4, handoff_step: "close_admission" }, :legacy]
   ].each do |state, expected|
     it "maps #{state} to #{expected}" do
       expect(described_class.for(TimekeepingOwnership.new(**state))).to eq(expected)
