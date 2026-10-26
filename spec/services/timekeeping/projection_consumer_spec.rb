@@ -203,6 +203,8 @@ RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
   # These examples need the consumer's transaction to really commit, so they run
   # outside the per-example cleaner transaction.
   context "with committed transactions", :without_transaction do
+    include CommittedDataMode::Helpers
+
     it "does not leave miru.writer set on the connection after the batch commits" do
       rules_deliver(rules_entry(id: 91_005, version: 1))
 
@@ -222,10 +224,10 @@ RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
       end
     end
 
-    def rules_thread(pause: false, &block)
-      Thread.new do
+    def rules_thread(backend_pids = nil, pause: false, &block)
+      committed_data_thread(backend_pids) do
         Thread.current[:rules_pause] = pause
-        ActiveRecord::Base.connection_pool.with_connection(&block)
+        block.call
       end
     end
 
@@ -254,12 +256,20 @@ RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
                              idempotency_key: nil)
       end
 
-      delivery = rules_thread(pause: true) { previous.call(91_009) }
-      paused.pop
-      flip = rules_thread { TimekeepingOwnership.current.update!(handoff_step: nil) }
+      delivery_pids = Queue.new
+      flip_pids = Queue.new
 
-      expect(flip.join(0.5)).to be_nil
-      release << true
+      delivery = rules_thread(delivery_pids, pause: true) { previous.call(91_009) }
+      paused.pop
+      flip = rules_thread(flip_pids) { TimekeepingOwnership.current.update!(handoff_step: nil) }
+
+      begin
+        blocked = blocked_by?(flip_pids.pop(timeout: 5), delivery_pids.pop(timeout: 5))
+      ensure
+        release << true
+      end
+
+      expect(blocked).to be(true), "the ownership flip never waited on the paused delivery's lock"
       expect(delivery.value.status).to eq(200)
       flip.join
 
