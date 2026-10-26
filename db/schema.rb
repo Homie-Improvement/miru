@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_10_25_120100) do
+ActiveRecord::Schema[8.1].define(version: 2026_10_26_120100) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pg_stat_statements"
@@ -456,6 +456,19 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_25_120100) do
     t.jsonb "payload", null: false
     t.datetime "sent_at"
     t.index ["company_id", "entry_id"], name: "index_entry_outbox_items_on_company_id_and_entry_id"
+  end
+
+  create_table "entry_snapshot_receipts", force: :cascade do |t|
+    t.string "actor", null: false
+    t.bigint "company_ids", null: false, array: true
+    t.datetime "created_at", null: false
+    t.datetime "expires_at", null: false
+    t.string "key", null: false
+    t.string "request_digest", null: false
+    t.jsonb "response_body", default: {}, null: false
+    t.integer "response_status", null: false
+    t.index ["company_ids", "actor", "key"], name: "index_entry_snapshot_receipts_on_scope_and_key", unique: true
+    t.index ["expires_at"], name: "index_entry_snapshot_receipts_on_expires_at"
   end
 
   create_table "exchange_rate_usages", force: :cascade do |t|
@@ -1192,11 +1205,14 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_25_120100) do
   create_table "timekeeping_ownership", force: :cascade do |t|
     t.datetime "changed_at", default: -> { "CURRENT_TIMESTAMP" }, null: false
     t.string "changed_by", default: "system", null: false
+    t.bigint "final_outbox_position"
     t.bigint "generation", default: 1, null: false
     t.string "handoff_step"
+    t.string "monolith_store", default: "legacy", null: false
     t.string "owner", default: "monolith", null: false
     t.check_constraint "handoff_step IS NULL OR (handoff_step::text = ANY (ARRAY['close_admission'::character varying, 'settle'::character varying, 'freeze'::character varying, 'checkpoint'::character varying, 'sequence'::character varying, 'reconcile'::character varying]::text[]))", name: "timekeeping_ownership_handoff_step_check"
     t.check_constraint "id = 1", name: "timekeeping_ownership_single_row_check"
+    t.check_constraint "monolith_store::text = ANY (ARRAY['legacy'::character varying, 'prepared'::character varying]::text[])", name: "timekeeping_ownership_monolith_store_check"
     t.check_constraint "owner::text = ANY (ARRAY['monolith'::character varying, 'timekeeping'::character varying]::text[])", name: "timekeeping_ownership_owner_check"
   end
 
