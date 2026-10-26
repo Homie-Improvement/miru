@@ -44,6 +44,9 @@ RSpec.describe "Prepared service idempotency receipts" do
       .to raise_error(ActiveRecord::RecordNotUnique)
     expect(connection.columns("service_idempotency_receipts").reject(&:null).map(&:name))
       .to include("company_id", "actor_name", "operation", "key", "fingerprint", "status", "body", "created_at")
+    # Service receipts deliberately live in their own table instead of a nullable actor_id and a new actor_name
+    # on idempotency_records: the cutover checkpoint loads idempotency_records into Timekeeping's
+    # idempotency_receipts, whose actor_id is NOT NULL and which has no actor_name column.
     expect(connection.columns("idempotency_records").find { |column| column.name == "actor_id" }.null).to be(false)
     expect(connection.columns("idempotency_records").map(&:name)).not_to include("actor_name")
   end
