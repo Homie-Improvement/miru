@@ -17,10 +17,15 @@ RSpec.describe TimekeepingRules::ReservationDecision, ".call" do
     # The same drop on a draft does release, so the empty release above comes from the status.
     draft = described_class.call(current:, desired: [10], disposition: "active", invoice_status: "draft")
     expect(draft[:release]).to contain_exactly(11, 12)
+
+    # A caller that wrongly sends an empty set for a sent invoice must not unlock the entries it holds.
+    emptied = described_class.call(current:, desired: [], disposition: "active", invoice_status: "sent")
+    expect(emptied[:release]).to eq([])
+    expect(emptied[:reserve]).to eq([])
+    expect(emptied[:conflicts]).to eq([])
   end
 end
 
-# frozen_string_literal: true
 RSpec.describe TimekeepingRules::ReservationDecision, ".call" do
   it "releases on a draft only the entries no remaining direct or grouped line references" do
     held = [{ invoice: :this, state: "committed", disposition: "active" }]
@@ -38,7 +43,6 @@ RSpec.describe TimekeepingRules::ReservationDecision, ".call" do
   end
 end
 
-# frozen_string_literal: true
 RSpec.describe TimekeepingRules::ReservationDecision, ".call" do
   it "refuses an entry another kept invoice holds and decides every row of the prepare table" do
     current = {
@@ -62,7 +66,6 @@ RSpec.describe TimekeepingRules::ReservationDecision, ".call" do
   end
 end
 
-# frozen_string_literal: true
 RSpec.describe TimekeepingRules::ReservationDecision, ".call" do
   it "keeps every reservation when the disposition is retained" do
     held = [{ invoice: :this, state: "committed", disposition: "active" }]
@@ -73,6 +76,12 @@ RSpec.describe TimekeepingRules::ReservationDecision, ".call" do
 
     expect(decision[:release]).to eq([])
     expect(decision[:conflicts]).to eq([])
+
+    # Rows that are themselves marked retained stay held too.
+    retained_row = [{ invoice: :this, state: "committed", disposition: "retained" }]
+    kept = described_class.call(current: { 3 => retained_row }, desired: [], disposition: "retained",
+                                invoice_status: "draft")
+    expect(kept[:release]).to eq([])
   end
 end
 
