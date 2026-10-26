@@ -84,6 +84,30 @@ RSpec.describe Timekeeping::EntryReader do
   end
 end
 
+RSpec.describe Timekeeping::EntryReader, "prepared branch through Timekeeping::LocalEntry" do
+  it "reads prepared entries written through Timekeeping::LocalEntry for the reader's company only, with PreparedEntry gone" do
+    company_a = create(:company)
+    company_b = create(:company)
+    user = create(:user)
+    create(:employment, company: company_a, user:)
+    create(:employment, company: company_b, user:)
+    project_a = create(:project, client: create(:client, company: company_a))
+    project_b = create(:project, client: create(:client, company: company_b))
+    ownership = TimekeepingOwnership.current
+    ownership.update!(owner: "monolith", generation: 4, monolith_store: "prepared", handoff_step: nil)
+    fields = { user_id: user.id, work_date: Date.new(2026, 3, 2), duration: 60.0, bill_status: "unbilled" }
+    own = Timekeeping::LocalEntry.create!(fields.merge(company_id: company_a.id, project_id: project_a.id))
+    Timekeeping::LocalEntry.create!(fields.merge(company_id: company_b.id, project_id: project_b.id))
+
+    entries = described_class.list(company_id: company_a.id, user_id: user.id, from: Date.new(2026, 3, 1),
+                                   to: Date.new(2026, 3, 31), ownership:)
+
+    # "PreparedEntry is removed and EntryReader's prepared branch reads Timekeeping::LocalEntry"
+    expect(entries.map(&:id)).to eq([own.id])
+    expect(Object.const_defined?(:PreparedEntry)).to be(false)
+  end
+end
+
 RSpec.describe Timekeeping::EntryReader, "reading the owner's own rows" do
   include_context "timekeeping contract fakes"
 

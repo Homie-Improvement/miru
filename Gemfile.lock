@@ -3,6 +3,16 @@ PATH
   specs:
     timekeeping_handoff (0.1.0)
 
+PATH
+  remote: gems/timekeeping_relay
+  specs:
+    timekeeping_relay (0.1.0)
+
+PATH
+  remote: gems/timekeeping_rules
+  specs:
+    timekeeping_rules (0.1.0)
+
 GEM
   remote: https://rubygems.org/
   specs:
@@ -1090,6 +1100,8 @@ DEPENDENCIES
   tapioca
   test-prof (~> 1.3)
   timekeeping_handoff!
+  timekeeping_relay!
+  timekeeping_rules!
   tsort
   tzinfo-data
   vcr (~> 6.4.0)

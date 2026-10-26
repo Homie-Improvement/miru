@@ -28,7 +28,7 @@ module Timekeeping
       when :legacy
         legacy_entries(company:, user_id:, from:, to:)
       when :prepared
-        rows = PreparedEntry.where(company_id:, user_id:, discarded_at: nil, work_date: from..to).map(&:attributes)
+        rows = LocalEntry.where(company_id:, user_id:, discarded_at: nil, work_date: from..to).map(&:attributes)
         hydrate(rows, company:, user_id:)
       when :timekeeping
         hydrate(timekeeping_client.list_entries(company_id:, user_id:, from:, to:, acting_user_id:), company:, user_id:)

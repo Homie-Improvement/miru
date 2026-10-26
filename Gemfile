@@ -20,6 +20,11 @@ gem "falcon-rails"
 gem "bootsnap", ">= 1.18.0", require: false
 gem "json", ">= 2.19.2"
 
+# The entry rules and the snapshot outbox relay shared with the Timekeeping
+# service (timekeeping/Gemfile), so the prepared monolith's local entry path
+# decides and publishes exactly as the service does.
+gem "timekeeping_relay", path: "gems/timekeeping_relay"
+gem "timekeeping_rules", path: "gems/timekeeping_rules"
 
 # Build JSON APIs with ease [https://github.com/rails/jbuilder]
 gem "jbuilder", "~> 2.11"
