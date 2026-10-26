@@ -10,9 +10,14 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_04_02_000200) do
+ActiveRecord::Schema[8.1].define(version: 2026_05_01_000000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
+
+  create_table "admission", force: :cascade do |t|
+    t.bigint "generation", default: 1
+    t.check_constraint "id = 1", name: "admission_single_row_check"
+  end
 
   create_table "audit_events", force: :cascade do |t|
     t.bigint "company_id", null: false
@@ -94,10 +99,6 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_02_000200) do
     t.index ["company_id", "enqueued_at"], name: "index_outbox_snapshots_unsent_by_company", where: "(sent_at IS NULL)"
     t.index ["company_id", "id"], name: "index_outbox_snapshots_on_company_id_and_id"
     t.index ["outbox_position"], name: "index_outbox_snapshots_unsent_by_position", where: "(sent_at IS NULL)"
-  end
-
-  create_table "ownership_generations", primary_key: "company_id", id: :bigint, default: nil, force: :cascade do |t|
-    t.bigint "generation", null: false
   end
 
   create_table "reservations", id: false, force: :cascade do |t|

@@ -51,10 +51,11 @@ class TimeTrackingIndexService
       entries
     end
 
+    # Reads the current owner of entries, so an entry shows right after it is
+    # written even while the timesheet_entries projection lags behind.
     def fetch_timesheet_entries
-      user.timesheet_entries.kept.includes(:user, project: :client)
-        .in_workspace(current_company)
-        .during(from, to)
+      Timekeeping::EntryReader.list(company_id: current_company.id, user_id: user.id, from:, to:,
+                                    acting_user_id: current_user.id)
     end
 
     def formatted_timesheet_entries

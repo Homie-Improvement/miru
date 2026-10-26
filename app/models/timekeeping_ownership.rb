@@ -4,17 +4,20 @@
 # generation, and which handoff step is in progress, if any
 # (docs/architecture/timekeeping-soa.md section 10.1). It is global, not per
 # company. The database allows only the row with id 1, and its column defaults
-# hold the initial state: generation 1, owned by the monolith, no handoff step.
+# hold the initial state: generation 1, owned by the monolith from its legacy
+# timesheet_entries table, no handoff step.
 class TimekeepingOwnership < ApplicationRecord
   self.table_name = "timekeeping_ownership"
 
   SINGLETON_ID = 1
   OWNERS = %w[monolith timekeeping].freeze
   HANDOFF_STEPS = %w[close_admission settle freeze checkpoint sequence reconcile].freeze
+  MONOLITH_STORES = %w[legacy prepared].freeze
 
   validates :generation, presence: true
   validates :owner, inclusion: { in: OWNERS }
   validates :handoff_step, inclusion: { in: HANDOFF_STEPS }, allow_nil: true
+  validates :monolith_store, inclusion: { in: MONOLITH_STORES }
 
   # Raises ActiveRecord::RecordNotFound when the row is missing, so a caller
   # never mistakes lost ownership state for a fresh monolith-owned start.
@@ -29,4 +32,27 @@ class TimekeepingOwnership < ApplicationRecord
   def self.ensure_initial!
     insert_all([{ id: SINGLETON_ID }], unique_by: :id)
   end
+
+  # Whether the projection consumer may apply a snapshot of this generation
+  # (section 5.4). The current generation is always accepted. The previous
+  # one is accepted only during a handoff, and only up to the final outbox
+  # position captured at the freeze. Before this handoff reaches the freeze
+  # step, a position left from an earlier handoff is not this handoff's P, so
+  # nothing of the previous generation is accepted; nor is it without a
+  # captured position. The flip, which clears handoff_step, ends the permission.
+  def snapshot_generation_accepted?(generation:, outbox_position:)
+    return true if generation == self.generation
+    return false unless generation == self.generation - 1
+    return false unless frozen_for_handoff? && !final_outbox_position.nil?
+
+    outbox_position.is_a?(Integer) && outbox_position <= final_outbox_position
+  end
+
+  private
+
+    # Whether the current handoff has reached the freeze step or a later one.
+    def frozen_for_handoff?
+      step_index = HANDOFF_STEPS.index(handoff_step)
+      !step_index.nil? && step_index >= HANDOFF_STEPS.index("freeze")
+    end
 end

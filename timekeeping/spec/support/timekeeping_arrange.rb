@@ -1,9 +1,10 @@
 # frozen_string_literal: true
 
 # The timekeeping_arrange the shared contract examples call, for the real
-# provider. Entries, reservations and generation rows are seeded through the
-# models. Users and projects live in the monolith, so they are kept in an
-# in-memory catalogue that a WebMock stub of the reference endpoint serves.
+# provider. Entries and reservations are seeded through the models, and the
+# admitted generation through Timekeeping::Admission. Users and projects live
+# in the monolith, so they are kept in an in-memory catalogue that a WebMock
+# stub of the reference endpoint serves.
 # Tokens are RS256, signed with a key generated once per run.
 class TimekeepingProviderArrange
   REFERENCE_URL = "http://reference.test"
@@ -33,7 +34,6 @@ class TimekeepingProviderArrange
     company_id = next_id
     @company_users[company_id] = []
     @company_projects[company_id] = []
-    Timekeeping::OwnershipGeneration.advance(company_id:, generation: current_generation)
     company_id
   end
 
@@ -79,10 +79,11 @@ class TimekeepingProviderArrange
     entry_id
   end
 
-  # Moves every arranged company to the new generation, one row at a time.
+  # Admits writes at the new generation only. The generation is global, so
+  # this covers every company, arranged or not.
   def set_generation(generation)
+    Timekeeping::Admission.admit!(generation:)
     @current_generation = generation
-    @company_users.each_key { |company_id| Timekeeping::OwnershipGeneration.advance(company_id:, generation:) }
   end
 
   # Serves the reference endpoint from the catalogue, answering only the

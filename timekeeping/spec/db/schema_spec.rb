@@ -5,8 +5,10 @@ require "rails_helper"
 # Every table carries a non-null company_id, so every query can start with
 # WHERE company_id = :company_id. The tables are read from the live database,
 # so a table a later migration adds is checked without editing this spec.
+# admission is skipped: it holds the one generation admitted for all
+# companies, not tenant data.
 RSpec.describe "Timekeeping database schema" do
-  rails_tables = %w[schema_migrations ar_internal_metadata].freeze
+  skipped_tables = %w[schema_migrations ar_internal_metadata admission].freeze
 
   # Solid Queue's own job tables hold RelayJob runs, which belong to no
   # company, so like the Rails tables they are not tenant tables.
@@ -24,11 +26,11 @@ RSpec.describe "Timekeeping database schema" do
   let(:connection) { ActiveRecord::Base.connection }
 
   it "walks the entries and reservations tables" do
-    expect(tenant_tables(connection, rails_tables)).to include("entries", "reservations")
+    expect(tenant_tables(connection, skipped_tables)).to include("entries", "reservations")
   end
 
   it "gives every table a NOT NULL company_id" do
-    expect(tables_without_required_company_id(connection, rails_tables)).to eq([])
+    expect(tables_without_required_company_id(connection, skipped_tables)).to eq([])
   end
 
   it "reports a table that has no company_id" do
@@ -36,7 +38,7 @@ RSpec.describe "Timekeeping database schema" do
     connection.create_table(:schema_spec_untenanted_rows) { |t| t.string :name }
     connection.create_table(:schema_spec_nullable_tenant_rows) { |t| t.bigint :company_id }
 
-    expect(tables_without_required_company_id(connection, rails_tables))
+    expect(tables_without_required_company_id(connection, skipped_tables))
       .to contain_exactly("schema_spec_untenanted_rows", "schema_spec_nullable_tenant_rows")
   end
 
