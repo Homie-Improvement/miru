@@ -11,17 +11,18 @@ RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots credential table", typ
     contract = TimekeepingContract.load(:entry_snapshots)
     company = create(:company)
     project = create(:project, client: create(:client, company:), billable: false)
-    employee = create(:user)
-    create(:employment, company:, user: employee)
-    owner = create(:user)
-    create(:employment, company:, user: owner)
-    owner.add_role(:owner, company)
+    # One user holds both user tokens and owns every entry in the batch, so the table covers a user
+    # writing their own entry both as an employee and, after gaining the owner role, as an owner.
+    user = create(:user)
+    create(:employment, company:, user:)
+    employee_token = Timekeeping::UserToken.mint(user:, company:, private_key: timekeeping_key_pair)
+    user.add_role(:owner, company)
+    owner_token = Timekeeping::UserToken.mint(user:, company:, private_key: timekeeping_key_pair)
 
-    stored = create(:timesheet_entry, project:, user: employee, note: "stored v1")
+    stored = create(:timesheet_entry, project:, user:, note: "stored v1")
     stored.update_columns(version: 1, company_id: company.id)
-    watched = %w[version note updated_at company_id discarded_at]
     new_id = 90_401
-    fields_before = stored.reload.attributes.slice(*watched)
+    fields_before = stored.reload.attributes
     # The baseline must hold the seeded values, or "unchanged" would compare two failed reads.
     expect(fields_before).to include("version" => 1, "note" => "stored v1", "company_id" => company.id)
     expect(TimesheetEntry.unscoped.where(id: new_id)).not_to exist
@@ -29,7 +30,7 @@ RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots credential table", typ
     item = lambda do |id, version, position|
       entry = contract.fetch("entry_fields").index_with(nil).merge(
         "id" => id, "company_id" => company.id, "version" => version, "project_id" => project.id,
-        "user_id" => employee.id, "work_date" => "2026-03-02", "duration" => 90.0, "note" => "v#{version}",
+        "user_id" => user.id, "work_date" => "2026-03-02", "duration" => 90.0, "note" => "v#{version}",
         "bill_status" => "unbilled", "review_status" => "not_required", "locked" => false, "source" => "manual",
         "source_metadata" => {}, "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z",
         "updated_at" => "2026-03-02T09:00:00Z"
@@ -38,8 +39,6 @@ RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots credential table", typ
     end
     body = { "schema_version" => contract.fetch("schema_version"),
              "snapshots" => [item.call(stored.id, 2, 1), item.call(new_id, 1, 2)] }.to_json
-    employee_token = Timekeeping::UserToken.mint(user: employee, company:, private_key: timekeeping_key_pair)
-    owner_token = Timekeeping::UserToken.mint(user: owner, company:, private_key: timekeeping_key_pair)
     deliver = lambda do |credential|
       headers = { "CONTENT_TYPE" => "application/json", "Idempotency-Key" => SecureRandom.uuid }
       headers["Authorization"] = "Bearer #{credential}" if credential
@@ -54,7 +53,7 @@ RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots credential table", typ
         expect([label, response.status]).to eq([label, 401])
         expect([label, response.parsed_body]).to eq([label, { "reason" => "unauthorized" }])
         expect(response.body).not_to include(service_token)
-        expect([label, stored.reload.attributes.slice(*watched)]).to eq([label, fields_before])
+        expect([label, stored.reload.attributes]).to eq([label, fields_before])
         expect([label, TimesheetEntry.unscoped.where(id: new_id).exists?]).to eq([label, false])
       end
 
