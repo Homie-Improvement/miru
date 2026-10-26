@@ -187,3 +187,23 @@ RSpec.describe Timekeeping::EntryReader, "reading the owner's own rows" do
     expect(TimesheetEntry).not_to have_received(:kept)
   end
 end
+
+RSpec.describe Timekeeping::EntryReader, "prepared branch with a named reader" do
+  it "lists only the reader's company entries through Timekeeping::LocalEntry when acting_user_id is passed" do
+    prepare_local_ownership!
+    company = create(:company)
+    other_company = create(:company)
+    user = timekeeping_member(company, "employee")
+    project = create(:project, client: create(:client, company:))
+    other_project = create(:project, client: create(:client, company: other_company))
+    own = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: user.id, project_id: project.id,
+                                          work_date: Date.current, duration: 25.0, bill_status: "unbilled")
+    Timekeeping::LocalEntry.create!(company_id: other_company.id, user_id: user.id, project_id: other_project.id,
+                                    work_date: Date.current, duration: 35.0, bill_status: "unbilled")
+
+    entries = described_class.list(company_id: company.id, user_id: user.id, from: Date.current - 1, to: Date.current + 1,
+                                   acting_user_id: user.id, ownership: TimekeepingOwnership.current)
+
+    expect(entries.map(&:id)).to eq([own.id])
+  end
+end
