@@ -153,6 +153,18 @@ RSpec.describe Timekeeping::LegacyAuditConversion do
     expect(result[:refusals].fetch(1).join("\n")).to include("910", "Agent")
   end
 
+  it "writes Date and Time change values in the JSON form the jsonb columns hold" do
+    discarded_at = Time.utc(2026, 3, 4, 5, 6, 7)
+    audit = legacy_audit(
+      audited_changes: { "work_date" => [Date.new(2026, 1, 2), Date.new(2026, 1, 3)], "discarded_at" => [nil, discarded_at] }
+    )
+
+    row = described_class.convert(audits: [audit], entries_by_id: { 5 => legacy_audit_entry_row })[:rows].sole
+
+    expect(row["before"]).to eq("work_date" => "2026-01-02", "discarded_at" => nil)
+    expect(row["after"]).to eq("work_date" => "2026-01-03", "discarded_at" => discarded_at.as_json)
+  end
+
   it "builds rows that fit the checkpoint's entry_audits shape" do
     audits = [
       legacy_audit(id: 1, action: "create", audited_changes: { "note" => "first" }),

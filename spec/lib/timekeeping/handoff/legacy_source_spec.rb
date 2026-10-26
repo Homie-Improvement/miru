@@ -207,6 +207,87 @@ RSpec.describe Timekeeping::Handoff::LegacySource, :two_tenant_seed, :seeded_wit
     end
     expect(source.export(generation: 7, captured_at: Time.utc(2026, 10, 25, 12))).to include(:checkpoint, :corrections)
   end
+
+  it "reads every legacy row inside a repeatable read, read only transaction" do
+    connection = ActiveRecord::Base.connection
+    settings_seen = []
+    # Asks the session directly, beneath Active Record, so the probe adds no query of its own to the wrapped method.
+    allow(connection).to receive(:select_all).and_wrap_original do |original, *args, **kwargs|
+      raw = connection.raw_connection
+      settings_seen << [
+        raw.exec("SHOW transaction_isolation").getvalue(0, 0),
+        raw.exec("SHOW transaction_read_only").getvalue(0, 0)
+      ]
+      original.call(*args, **kwargs)
+    end
+
+    described_class.new(connection:, recorded_disposition: recorded)
+      .export(generation: 7, captured_at: Time.utc(2026, 10, 25, 12))
+
+    expect(settings_seen).not_to be_empty
+    expect(settings_seen.uniq).to eq([["repeatable read", "on"]])
+  end
+end
+
+# Discarding the seeded draft FL-0056 turns the locked entries it holds into the
+# legacy states the issue names; each case writes rows, so each has its own seed.
+module LegacySourceDiscardedInvoiceHelpers
+  def entries_only_on(invoice)
+    links = Timekeeping::SeedDispositionRecorder.snapshot(fork_and_leaf)[:links]
+    on_invoice = links.select { |link| link[:invoice_id] == invoice.id }.pluck(:entry_id).uniq
+    elsewhere = links.reject { |link| link[:invoice_id] == invoice.id }.pluck(:entry_id)
+    (on_invoice - elsewhere).sort
+  end
+
+  def recorded_reserved_entry_ids(recorded)
+    recorded.fetch("companies").values.flat_map { |invoices| invoices.values.flat_map { |listing| listing["entry_ids"] } }
+  end
+end
+
+RSpec.describe Timekeeping::Handoff::LegacySource, :two_tenant_seed, :seeded_without_transaction do
+  include LegacySourceDiscardedInvoiceHelpers
+
+  # "A locked entry held only by a discarded non-draft gives a committed retained reservation"
+  it "gives the locked entries of a discarded non-draft invoice retained reservations by that invoice and no correction" do
+    invoice = Invoice.find_by!(company_id: fork_and_leaf.id, invoice_number: "FL-0056")
+    held_ids = entries_only_on(invoice)
+    expect(held_ids).not_to be_empty
+    expect(TimesheetEntry.where(id: held_ids).pluck(:locked)).to all(be(true))
+    invoice.update_columns(status: "sent", discarded_at: Time.utc(2026, 10, 20))
+    recorded = YAML.load_file(Timekeeping::SeedDispositionRecorder::DEFAULT_PATH)
+
+    result = described_class.new(connection: ActiveRecord::Base.connection, recorded_disposition: recorded)
+      .export(generation: 7, captured_at: Time.utc(2026, 10, 25, 12))
+
+    owners = result.fetch(:checkpoint).rows.fetch("reservations").select { |row| held_ids.include?(row["entry_id"]) }
+    expect(owners.map { |row| row.values_at("entry_id", "invoice_id", "state", "disposition") })
+      .to eq(held_ids.map { |id| [id, invoice.id, "committed", "retained"] })
+    expect(result.fetch(:corrections).pluck("entry_id")).to match_array(recorded_reserved_entry_ids(recorded))
+  end
+end
+
+RSpec.describe Timekeeping::Handoff::LegacySource, :two_tenant_seed, :seeded_without_transaction do
+  include LegacySourceDiscardedInvoiceHelpers
+
+  # "A draft-discard re-lock is released and appears as a listed correction"
+  it "releases the locked entries of a discarded draft and lists each once as a correction with locked false" do
+    invoice = Invoice.find_by!(company_id: fork_and_leaf.id, invoice_number: "FL-0056")
+    released_ids = entries_only_on(invoice)
+    expect(released_ids).not_to be_empty
+    invoice.update_columns(discarded_at: Time.utc(2026, 10, 20))
+    recorded = YAML.load_file(Timekeeping::SeedDispositionRecorder::DEFAULT_PATH)
+
+    result = described_class.new(connection: ActiveRecord::Base.connection, recorded_disposition: recorded)
+      .export(generation: 7, captured_at: Time.utc(2026, 10, 25, 12))
+
+    reserved_ids = result.fetch(:checkpoint).rows.fetch("reservations").pluck("entry_id")
+    expect(reserved_ids & released_ids).to be_empty
+    corrections = result.fetch(:corrections)
+    expect(corrections.pluck("entry_id")).to match_array(recorded_reserved_entry_ids(recorded) + released_ids)
+    released = corrections.select { |item| released_ids.include?(item["entry_id"]) }
+    expect(released.map { |item| [item["entry_id"], item["generation"], item["snapshot"]["locked"], item["snapshot"]["version"]] })
+      .to eq(released_ids.map { |id| [id, 7, false, 1] })
+  end
 end
 
 # The examples below write rows, so each sits in a group of its own and gets a fresh seed.
@@ -399,5 +480,26 @@ RSpec.describe Timekeeping::Handoff::LegacySource, :without_transaction do
         expect(error.refusals.fetch(shared_name).join("\n")).to include("matches 2 companies")
         expect(error.refusals.fetch("Nobody Here").join("\n")).to include("matches 0 companies")
       }
+  end
+
+  # "Entry rows are copied as stored"
+  it "copies every column of an entry with a non-default version and review status as stored" do
+    company = create(:company)
+    project = create(:project, client: create(:client, company:), billable: true)
+    entry = create(:timesheet_entry, user: create(:user, current_workspace_id: company.id), project:, bill_status: "unbilled")
+    entry.update_columns(
+      company_id: company.id, version: 4, review_status: TimesheetEntry.review_statuses["approved"],
+      bill_status: TimesheetEntry.bill_statuses["non_billable"], note: "kept as stored", locked: false
+    )
+    # Read independently through the model; its enum attributes give the names the checkpoint stores.
+    stored = TimesheetEntry.unscoped.find(entry.id).attributes
+
+    copied = described_class.new(connection: ActiveRecord::Base.connection, recorded_disposition: { "as_of" => "2026-10-23", "companies" => {} })
+      .export(generation: 7, captured_at: Time.utc(2026, 10, 25, 12))
+      .fetch(:checkpoint).rows.fetch("entries").find { |row| row["id"] == entry.id }
+
+    expect(copied.keys).to match_array(stored.keys)
+    expect(copied).to eq(stored)
+    expect(copied).to include("version" => 4, "review_status" => "approved", "bill_status" => "non_billable")
   end
 end

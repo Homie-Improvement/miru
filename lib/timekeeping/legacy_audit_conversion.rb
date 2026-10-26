@@ -87,7 +87,7 @@ module Timekeeping
     end
 
     def row_for(audit, entry)
-      before, after = CHANGE_SHAPES.fetch(audit[:action]).call(audit[:audited_changes].to_h)
+      before, after = CHANGE_SHAPES.fetch(audit[:action]).call(json_values(audit[:audited_changes].to_h))
 
       {
         "id" => audit[:id],
@@ -100,6 +100,14 @@ module Timekeeping
         "entry_created_at" => entry["created_at"],
         "created_at" => audit[:created_at]
       }
+    end
+
+    # before and after load into jsonb columns, which hold no Date or Time:
+    # such a value comes back as a string, and the checkpoint checksum,
+    # which tells a Date from a string, would no longer match. Converting
+    # the changes to their JSON form here gives the values the loaded rows hold.
+    def json_values(changes)
+      JSON.parse(changes.to_json)
     end
 
     def actor(audit)
