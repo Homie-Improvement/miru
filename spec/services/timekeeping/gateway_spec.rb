@@ -42,7 +42,7 @@ RSpec.describe Timekeeping::Gateway do
     expect(local_owner.calls.size).to eq(1)
     expect(local_owner.calls.first[:method].to_s).to eq("create_entry")
     expect(fake.requests).to be_empty
-    expect(PreparedEntry.count).to eq(0)
+    expect(Timekeeping::LocalEntry.count).to eq(0)
   end
 end
 
@@ -99,7 +99,7 @@ RSpec.describe Timekeeping::Gateway do
       )
     end.not_to change(TimesheetEntry, :count)
 
-    expect(PreparedEntry.where(company_id: company.id)).not_to exist
+    expect(Timekeeping::LocalEntry.where(company_id: company.id)).not_to exist
     expect(local_owner.calls.map { |call| call[:method].to_s }).to eq(["create_entry"])
   end
 end
@@ -372,7 +372,7 @@ RSpec.describe Timekeeping::Gateway do
     expect(local_owner.calls.pluck(:method)).to eq(%i[find_entry update_entry find_entry destroy_entry])
     expect(authorized).to eq([stored, stored])
     expect(gw_fake.requests).to be_empty
-    expect(PreparedEntry.count).to eq(0)
+    expect(Timekeeping::LocalEntry.count).to eq(0)
   end
 end
 
