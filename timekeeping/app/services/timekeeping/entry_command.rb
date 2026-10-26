@@ -91,6 +91,8 @@ module Timekeeping
       body["bill_status"] || UNBILLED
     end
 
+    # The body as a Hash. Timekeeping::ReservationRequest reads its bodies
+    # the same way.
     def self.parse_body(raw_body)
       return {} if raw_body.to_s.strip.empty?
 
@@ -134,6 +136,6 @@ module Timekeeping
       raise ActionController::BadRequest, "invalid work_date"
     end
 
-    private_class_method :parse_body, :parse_entry_id, :parse_project_id, :check_fields!
+    private_class_method :parse_entry_id, :parse_project_id, :check_fields!
   end
 end
