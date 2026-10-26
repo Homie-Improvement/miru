@@ -404,3 +404,138 @@ RSpec.describe Timekeeping::ProjectionConsumer, "delivery keys and receipts" do
     expect(TimesheetEntry.find(92_004).attributes).to eq(before)
   end
 end
+
+# "any `409 stale_generation` outside a handoff;" needs a lasting record of each refusal, because the refused
+# batch's transaction rolls back and would otherwise leave no trace for timekeeping:alerts.
+RSpec.describe Timekeeping::ProjectionConsumer, "stale-generation refusal records" do
+  let(:refusal_stale_answer) { [409, { "reason" => "stale_generation" }] }
+
+  # The suite starts at generation 1, and the contract refuses a generation below 1 as invalid_snapshot,
+  # so these examples raise ownership to generation 2 and send generation 1 as the stale one.
+  def refusal_item(company, project, id:, generation: 1, outbox_position: 1, **fields)
+    entry = TimekeepingSnapshots.entry(id:, company_id: company.id, version: 1, project_id: project.id,
+                                       user_id: create(:user).id, **fields)
+    TimekeepingSnapshots.item(entry, generation:, outbox_position:)
+  end
+
+  def refusal_project(company)
+    create(:project, client: create(:client, company:))
+  end
+
+  def refusal_answer(result)
+    [result.status, result.body.to_h.stringify_keys]
+  end
+
+  it "records one row per company in a refused batch, none for a bystander, after the batch rolls back" do
+    company_a = create(:company)
+    company_b = create(:company)
+    bystander = create(:company)
+    project_a = refusal_project(company_a)
+    project_b = refusal_project(company_b)
+    TimekeepingOwnership.current.update!(generation: 2, handoff_step: nil)
+
+    # Two snapshots of company A in one batch still leave one row for A.
+    batch = TimekeepingSnapshots.batch(
+      refusal_item(company_a, project_a, id: 93_401, outbox_position: 1),
+      refusal_item(company_a, project_a, id: 93_402, outbox_position: 2),
+      refusal_item(company_b, project_b, id: 93_403, outbox_position: 3)
+    )
+
+    result = described_class.call(batch:, idempotency_key: SecureRandom.uuid)
+
+    expect(refusal_answer(result)).to eq(refusal_stale_answer)
+    expect(TimesheetEntry.where(id: [93_401, 93_402, 93_403])).to be_empty
+    expect(TimekeepingStaleGenerationRefusal.order(:company_id).pluck(:company_id, :handoff_step))
+      .to eq([[company_a.id, nil], [company_b.id, nil]].sort_by(&:first))
+    expect(TimekeepingStaleGenerationRefusal.where(company_id: bystander.id)).to be_empty
+    expect(TimekeepingStaleGenerationRefusal.pluck(:created_at)).to all(be_within(1.minute).of(Time.current))
+  end
+
+  it "records every retry of a refused batch, since the relay re-sends a batch that did not get a 200" do
+    company = create(:company)
+    TimekeepingOwnership.current.update!(generation: 2, handoff_step: nil)
+    stale_batch = TimekeepingSnapshots.batch(refusal_item(company, refusal_project(company), id: 93_001))
+
+    2.times do
+      expect(refusal_answer(described_class.call(batch: stale_batch, idempotency_key: SecureRandom.uuid)))
+        .to eq(refusal_stale_answer)
+    end
+
+    expect(TimekeepingStaleGenerationRefusal.where(company_id: company.id).pluck(:handoff_step)).to eq([nil, nil])
+    expect(TimesheetEntry.where(id: 93_001)).to be_empty
+  end
+
+  it "records the handoff step in progress when the refusal happens during a handoff" do
+    company = create(:company)
+    TimekeepingOwnership.current.update_columns(generation: 2, handoff_step: "close_admission")
+
+    result = described_class.call(batch: TimekeepingSnapshots.batch(refusal_item(company, refusal_project(company),
+                                                                                 id: 92_201)),
+                                  idempotency_key: SecureRandom.uuid)
+
+    # The alert fires only "outside a handoff", so the row must say a handoff was under way.
+    expect(result.status).to eq(409)
+    expect(TimekeepingStaleGenerationRefusal.pluck(:company_id, :handoff_step)).to eq([[company.id, "close_admission"]])
+  end
+
+  it "still answers 409 stale_generation when the refusal record cannot be written" do
+    company = create(:company)
+    TimekeepingOwnership.current.update!(generation: 2, handoff_step: nil)
+    batch = TimekeepingSnapshots.batch(refusal_item(company, refusal_project(company), id: 93_301))
+    allow(TimekeepingStaleGenerationRefusal).to receive(:insert_all!).and_raise(ActiveRecord::StatementInvalid)
+
+    expect(refusal_answer(described_class.call(batch:, idempotency_key: SecureRandom.uuid))).to eq(refusal_stale_answer)
+    expect(TimekeepingStaleGenerationRefusal.count).to eq(0)
+  end
+
+  it "records nothing for an applied batch, its retry under the same key, or an invalid_snapshot refusal" do
+    company = create(:company)
+    project = refusal_project(company)
+    current = TimekeepingOwnership.current.generation
+    applied = TimekeepingSnapshots.batch(refusal_item(company, project, id: 93_101, generation: current))
+    key = SecureRandom.uuid
+
+    first = described_class.call(batch: applied, idempotency_key: key)
+    retried = described_class.call(batch: applied, idempotency_key: key)
+    invalid = described_class.call(batch: TimekeepingSnapshots.batch(refusal_item(company, project, id: 93_201,
+                                                                                  generation: current,
+                                                                                  bill_status: "paid")),
+                                   idempotency_key: SecureRandom.uuid)
+
+    expect([first.status, retried.status, invalid.status]).to eq([200, 200, 422])
+    expect(TimesheetEntry.where(id: 93_101).count).to eq(1)
+    expect(TimekeepingStaleGenerationRefusal.count).to eq(0)
+  end
+
+  context "when ownership changes after the refused batch rolled back" do
+    # Changes ownership once the batch has rolled back and its ownership lock is released, before the recorder
+    # starts. A recorder that re-read ownership here would record the new step instead of the decided one.
+    def change_ownership_before_refusal_recording(**changes)
+      allow_any_instance_of(described_class).to receive(:record_stale_generation).and_wrap_original do |method, *args|
+        TimekeepingOwnership.current.update_columns(**changes)
+        method.call(*args)
+      end
+    end
+
+    it "records no handoff step when a handoff starts after a refusal decided outside one" do
+      company = create(:company)
+      TimekeepingOwnership.current.update!(generation: 2, handoff_step: nil)
+      batch = TimekeepingSnapshots.batch(refusal_item(company, refusal_project(company), id: 93_502))
+      change_ownership_before_refusal_recording(handoff_step: "close_admission")
+
+      expect(described_class.call(batch:, idempotency_key: SecureRandom.uuid).status).to eq(409)
+      expect(TimekeepingStaleGenerationRefusal.pluck(:company_id, :handoff_step)).to eq([[company.id, nil]])
+    end
+
+    it "records the freeze step when the flip clears it after a refusal decided during the handoff" do
+      company = create(:company)
+      TimekeepingOwnership.current.update!(generation: 2, handoff_step: "freeze", final_outbox_position: 10)
+      batch = TimekeepingSnapshots.batch(refusal_item(company, refusal_project(company), id: 93_512,
+                                                      outbox_position: 11))
+      change_ownership_before_refusal_recording(handoff_step: nil)
+
+      expect(described_class.call(batch:, idempotency_key: SecureRandom.uuid).status).to eq(409)
+      expect(TimekeepingStaleGenerationRefusal.pluck(:company_id, :handoff_step)).to eq([[company.id, "freeze"]])
+    end
+  end
+end
