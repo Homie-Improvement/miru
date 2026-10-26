@@ -51,7 +51,13 @@ module Timekeeping
     end
 
     # Emits one signal per difference and returns the differences unchanged.
+    # A list that mixes companies is refused before any signal is emitted, so
+    # no report covers more than one company.
     def self.report(differences)
+      if differences.map(&:company_id).uniq.size > 1
+        raise ArgumentError, "cannot report differences of different companies together"
+      end
+
       differences.each { |difference| Rails.event.notify(FinancialSnapshotChanged.new(difference)) }
     end
 

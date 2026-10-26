@@ -219,9 +219,11 @@ RSpec.describe Timekeeping::FinancialSnapshot do
         [line_item, :quantity, [[:line_item, l, :quantity], [:pdf_total, i, :sub_total], [:pdf_total, i, :total]]],
         [invoice_tax, :amount, [[:invoice_tax, t, :amount], [:pdf_invoice_tax, t, :amount]]],
         [invoice_tax, :value, [[:invoice_tax, t, :value]]],
-        # amount_paid is not a compared stored value, so this change moves only a printed PDF amount.
-        [invoice, :amount_paid, [[:pdf_total, i, :invoice_amount_paid]]]
+        # amount_paid and amount_due are not compared stored values, so these changes move only a printed PDF amount.
+        [invoice, :amount_paid, [[:pdf_total, i, :invoice_amount_paid]]],
+        [invoice, :amount_due, [[:pdf_total, i, :invoice_amount_due]]]
       ]
+      printed_only_fields = %i[amount_paid amount_due]
 
       baseline = described_class.take(company_id:)
 
@@ -230,16 +232,24 @@ RSpec.describe Timekeeping::FinancialSnapshot do
         changed = (original || 0) + 10
         record.update_column(field, changed)
 
-        differences = described_class.compare(baseline, described_class.take(company_id:))
+        after = described_class.take(company_id:)
+        differences = nil
+        # "A pure function compares a before snapshot and an after snapshot": comparing emits no signal.
+        expect do
+          assert_no_event_reported("Timekeeping::FinancialSnapshotChanged") do
+            differences = described_class.compare(baseline, after)
+          end
+        end.not_to change { stored_snapshot_events.count }
 
         expect(differences.map { |d| [d.kind, d.record_id, d.field] }).to match_array(expected_keys), "after changing #{record.class.name}##{field}"
         expect(differences.map(&:company_id).uniq).to eq([company_id])
 
         own = differences.find { |d| [d.kind, d.record_id, d.field] == expected_keys.first }
-        if field == :amount_paid
+        if printed_only_fields.include?(field)
           # "The stored `amount` can differ from the printed total, so the PDF totals must be part of the snapshot."
-          expect(own.old_value).to be_a(String)
-          expect(own.new_value).to eq(PdfGeneration::InvoiceService.printed_totals(invoice.reload)[:invoice_amount_paid])
+          expect(own.company_id).to eq(company_id)
+          expect(own.old_value).to eq(FormatAmountService.new(invoice.currency, original).process)
+          expect(own.new_value).to eq(PdfGeneration::InvoiceService.printed_totals(invoice.reload)[:"invoice_#{field}"])
           expect(own.new_value).not_to eq(own.old_value)
         else
           expect(own.old_value).to eq(original)
@@ -279,7 +289,8 @@ RSpec.describe Timekeeping::FinancialSnapshot do
         .to match_array(differences.map { |d| [d.kind.to_s, d.record_id, d.field.to_s] })
     end
 
-    it "emits one signal per difference with each difference's own company_id when one list holds two companies' changes" do
+    # "Every check is keyed by `company_id`. No report or result mixes companies."
+    it "refuses to report one list holding two companies' changes and emits no signal" do
       fork_invoice = fork_and_leaf.invoices.order(:id).first
       copper_invoice = copper_kettle.invoices.order(:id).first
 
@@ -293,22 +304,11 @@ RSpec.describe Timekeeping::FinancialSnapshot do
         described_class.compare(copper_before, described_class.take(company_id: copper_kettle.id))
       expect(differences.map(&:company_id)).to contain_exactly(fork_and_leaf.id, copper_kettle.id)
 
-      recorded = []
-      recorder = Object.new
-      recorder.define_singleton_method(:emit) { |event| recorded << event }
-      Rails.event.subscribe(recorder)
-      begin
-        described_class.report(differences)
-      ensure
-        Rails.event.unsubscribe(recorder)
-      end
-
-      signals = recorded.select { |event| event[:name] == "Timekeeping::FinancialSnapshotChanged" }
-      expect(signals.size).to eq(differences.size)
-      expect(signals.map { |event| event[:payload].to_h[:data] }).to contain_exactly(
-        { company_id: fork_and_leaf.id, kind: :invoice, record_id: fork_invoice.id, field: :outstanding_amount },
-        { company_id: copper_kettle.id, kind: :invoice, record_id: copper_invoice.id, field: :outstanding_amount }
-      )
+      expect do
+        assert_no_event_reported("Timekeeping::FinancialSnapshotChanged") do
+          expect { described_class.report(differences) }.to raise_error(ArgumentError)
+        end
+      end.not_to change { stored_snapshot_events.count }
     end
   end
 

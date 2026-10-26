@@ -14,10 +14,13 @@ module PdfGeneration
     # Formatted strings exactly as the PDF prints them. Each invoice tax also
     # carries its id so callers can key it; the PDF itself shows name and amount.
     def printed
+      # Read the subtotal once so the printed total is always derived from the
+      # printed subtotal, even if line items change between two reads.
+      printed_subtotal = subtotal
       {
         **formatted_invoice_amounts,
-        sub_total: format_currency(subtotal),
-        total: format_currency(total),
+        sub_total: format_currency(printed_subtotal),
+        total: format_currency(total(printed_subtotal)),
         invoice_taxes: printed_invoice_taxes
       }
     end

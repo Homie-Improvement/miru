@@ -404,6 +404,16 @@ RSpec.describe PdfGeneration::InvoiceService do
       expect(totals[:invoice_taxes]).to eq([])
     end
 
+    it "derives the printed total from the printed subtotal even when a second subtotal read would differ" do
+      allow_any_instance_of(PdfGeneration::InvoiceTotals).to receive(:subtotal)
+        .and_return(BigDecimal("100"), BigDecimal("200"))
+
+      totals = described_class.printed_totals(invoice.reload)
+
+      expect(totals[:sub_total]).to eq(format_usd.call(BigDecimal("100")))
+      expect(totals[:total]).to eq(format_usd.call(BigDecimal("100") + invoice.tax - invoice.discount))
+    end
+
     # "The stored `amount` can differ from the printed total, so the PDF totals must be part of the snapshot."
     it "returns the new totals after a line item rate change instead of values kept from an earlier call" do
       first = described_class.printed_totals(invoice.reload)
