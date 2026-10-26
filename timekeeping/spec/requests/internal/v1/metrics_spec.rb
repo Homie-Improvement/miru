@@ -159,13 +159,9 @@ RSpec.describe "Timekeeping internal outbox lag metrics" do
   it "reports each company's own outbox lag only to the service token" do
     service_token = "service-#{SecureRandom.hex(24)}"
     now = Time.utc(2026, 3, 3, 12)
-    outbox_row = lambda do |company_id, entry_id, enqueued_at, sent_at = nil|
-      {
-        id: entry_id, project_id: 1, user_id: 1, work_date: "2026-03-02", duration: 60.0,
-        bill_status: "unbilled", review_status: "not_required", locked: false, source: "manual",
-        source_metadata: {}, proof_metadata: {}, created_at: now - 1.year, updated_at: now - 1.year,
-        company_id:, version: 1, generation: 1, enqueued_at:, sent_at:
-      }
+    # Each entry was created a year ago; only the outbox row's own wait counts.
+    lag_row = lambda do |company_id, entry_id, enqueued_at, sent_at = nil|
+      outbox_row(id: entry_id, company_id:, enqueued_at:, sent_at:, created_at: now - 1.year, updated_at: now - 1.year)
     end
 
     with_timekeeping_env(
@@ -173,12 +169,14 @@ RSpec.describe "Timekeeping internal outbox lag metrics" do
       Timekeeping::Environment::SERVICE_TOKEN => service_token
     ) do
       travel_to(now) do
-        OutboxSnapshot.insert_all!([
-          outbox_row.call(1, 11, now - 120),
-          outbox_row.call(1, 12, now - 30),
-          outbox_row.call(2, 21, now - 10),
-          outbox_row.call(3, 31, now - 500, now - 400)
-        ])
+        insert_outbox_rows(
+          lag_row.call(1, 11, now - 120),
+          lag_row.call(1, 12, now - 30),
+          lag_row.call(2, 21, now - 10),
+          # Company 3's only row is older than every other row but already sent:
+          # it must not appear, and its age must not be reported under another company.
+          lag_row.call(3, 31, now - 500, now - 400)
+        )
 
         get "/internal/v1/metrics"
         expect(response.status).to eq(401)
@@ -192,80 +190,6 @@ RSpec.describe "Timekeeping internal outbox lag metrics" do
         ])
       end
     end
-  end
-end
-
-
-RSpec.describe "Timekeeping internal outbox lag per company" do
-  it "reports each company's own oldest unsent outbox age and leaves out a company whose rows are all sent" do
-    lag_service_token = "service-#{SecureRandom.hex(24)}"
-    write_lag_row = lambda do |company_id:, entry_id:, enqueued_at:, sent_at: nil|
-      OutboxSnapshot.create!(
-        id: entry_id, project_id: 50, user_id: 60, work_date: Date.new(2026, 3, 2), duration: 90.0,
-        bill_status: "unbilled", review_status: "not_required", locked: false, source: "manual",
-        source_metadata: {}, proof_metadata: {}, created_at: 1.year.ago, updated_at: 1.year.ago,
-        company_id:, version: 1, generation: 1, enqueued_at:, sent_at:
-      )
-    end
-
-    write_lag_row.call(company_id: 101, entry_id: 1, enqueued_at: 120.seconds.ago)
-    write_lag_row.call(company_id: 101, entry_id: 2, enqueued_at: 30.seconds.ago)
-    write_lag_row.call(company_id: 202, entry_id: 3, enqueued_at: 10.seconds.ago)
-    # Company 303's only row is older than every other row but already sent:
-    # it must not appear, and its age must not be reported under another company.
-    write_lag_row.call(company_id: 303, entry_id: 4, enqueued_at: 600.seconds.ago, sent_at: 500.seconds.ago)
-
-    with_timekeeping_env(
-      Timekeeping::Environment::TOKEN_PUBLIC_KEY => rsa_key_pair.public_key.to_pem,
-      Timekeeping::Environment::SERVICE_TOKEN => lag_service_token
-    ) do
-      get "/internal/v1/metrics", headers: { "Authorization" => "Bearer #{lag_service_token}" }
-    end
-
-    expect(response.status).to eq(200)
-    lag = response.parsed_body.fetch("outbox_lag")
-    expect(lag.map { |item| item.fetch("company_id") }).to eq([101, 202])
-    expect(lag[0].fetch("oldest_unsent_age_seconds")).to be_within(5).of(120)
-    expect(lag[1].fetch("oldest_unsent_age_seconds")).to be_within(5).of(10)
-  end
-end
-
-RSpec.describe "Timekeeping internal outbox lag metrics" do
-  include ActiveSupport::Testing::TimeHelpers
-
-  it "reports each company's oldest unsent outbox row age under its own company_id" do
-    lag_service_token = "service-#{SecureRandom.hex(24)}"
-    now = Time.utc(2026, 4, 1, 12)
-    insert_row = lambda do |company_id, enqueued_at, sent_at: nil|
-      OutboxSnapshot.insert_all!([{
-        "id" => 90 + company_id, "project_id" => 5, "user_id" => 6, "work_date" => Date.new(2026, 3, 2),
-        "duration" => 60.0, "bill_status" => "unbilled", "review_status" => "not_required", "locked" => false,
-        "source" => "manual", "source_metadata" => {}, "proof_metadata" => {}, "created_at" => now - 1.year,
-        "updated_at" => now - 1.year, "company_id" => company_id, "version" => 1, "generation" => 1,
-        "enqueued_at" => enqueued_at, "sent_at" => sent_at
-      }])
-    end
-    insert_row.call(1, now - 120)
-    insert_row.call(1, now - 30)
-    # The entry was created a year ago, but its outbox row waits only 10 seconds.
-    insert_row.call(2, now - 10)
-    insert_row.call(3, now - 500, sent_at: now - 490)
-
-    travel_to(now) do
-      with_timekeeping_env(
-        Timekeeping::Environment::TOKEN_PUBLIC_KEY => rsa_key_pair.public_key.to_pem,
-        Timekeeping::Environment::SERVICE_TOKEN => lag_service_token
-      ) do
-        get "/internal/v1/metrics", headers: { "Authorization" => "Bearer #{lag_service_token}" }
-      end
-    end
-
-    # "Expose outbox lag (age of the oldest unsent row) with `company_id` on the Timekeeping metrics endpoint."
-    expect(response.status).to eq(200)
-    expect(response.parsed_body.fetch("outbox_lag")).to eq([
-      { "company_id" => 1, "oldest_unsent_age_seconds" => 120 },
-      { "company_id" => 2, "oldest_unsent_age_seconds" => 10 }
-    ])
   end
 
   it "reports an empty outbox_lag list when no outbox row is unsent" do
