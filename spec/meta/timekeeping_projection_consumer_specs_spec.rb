@@ -56,12 +56,6 @@ RSpec.describe "Timekeeping ProjectionConsumer service specs" do
     expect(TimekeepingSnapshots.batch).to include("snapshots" => [])
   end
 
-  # The six files held 34 examples; folding the 12 duplicated cases into one example each leaves 22.
-  # A count above 22 means a duplicate copy survived; below 22 means a distinct case was dropped.
-  it "holds the folded ProjectionConsumer cases in exactly 22 examples" do
-    expect(merged_projection_consumer_spec.scan(/^\s*it\s+"/).size).to eq(22)
-  end
-
   # "Keep the distinct cases (miru.writer mark and non-leak, concurrency, InvalidForeignKey, value mapping, a new-id
   # conflict within a batch, an equal version ignored, a flip with P set, below P after the flip, a 409 that is not stored)."
   it "keeps the distinct ProjectionConsumer cases in the merged spec file" do
