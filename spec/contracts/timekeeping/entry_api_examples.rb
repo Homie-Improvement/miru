@@ -119,6 +119,47 @@ RSpec.shared_examples "timekeeping entry API contract" do
     end
   end
 
+  describe "the entry's agent" do
+    it "creates an entry with an agent of the entry's user" do
+      own_agent = timekeeping_arrange.agent(company:, user: colleague)
+
+      response = create_entry(company, owner_token, entry_body(project:, user_id: colleague, agent_id: own_agent))
+
+      expect(response.status).to eq(201)
+      expect(response.body).to include("user_id" => colleague, "agent_id" => own_agent)
+    end
+
+    it "answers another company's agent exactly as an agent that does not exist, and creates nothing" do
+      foreign_agent = timekeeping_arrange.agent(company: other_company, user: foreign_owner)
+
+      foreign = create_entry(company, owner_token, entry_body(project:, agent_id: foreign_agent))
+      missing = create_entry(company, owner_token, entry_body(project:, agent_id: TimekeepingContractExampleHelpers::MISSING_ID))
+
+      expect([foreign.status, foreign.body]).to eq([not_found.fetch("status"), not_found.fetch("body")])
+      expect([missing.status, missing.body]).to eq([foreign.status, foreign.body])
+      expect(list_entries(company, owner_token).body.fetch("entries")).to be_empty
+    end
+
+    it "refuses a create with a colleague's agent" do
+      colleague_agent = timekeeping_arrange.agent(company:, user: colleague)
+
+      response = create_entry(company, owner_token, entry_body(project:, agent_id: colleague_agent))
+
+      expect([response.status, response.body]).to eq([not_found.fetch("status"), not_found.fetch("body")])
+      expect(list_entries(company, owner_token).body.fetch("entries")).to be_empty
+    end
+
+    it "refuses an update that moves an agent entry to another user and changes nothing" do
+      colleague_agent = timekeeping_arrange.agent(company:, user: colleague)
+      created = create_entry(company, owner_token, entry_body(project:, user_id: colleague, agent_id: colleague_agent)).body
+
+      response = write("PATCH", entry_path(:update, created.fetch("id")), owner_token, { "user_id" => owner })
+
+      expect([response.status, response.body]).to eq([not_found.fetch("status"), not_found.fetch("body")])
+      expect(show_entry(company, owner_token, created.fetch("id")).body).to eq(created)
+    end
+  end
+
   describe "request and response shapes" do
     it "answers a create with id, company_id, version and the entry fields" do
       body = entry_body(project:, note: "Sprint planning", proof_url: "https://example.test/run/1",
