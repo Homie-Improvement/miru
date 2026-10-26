@@ -200,3 +200,141 @@ RSpec.describe "Stripe payment webhook refused during a handoff through the endp
     expect(invoice.amount_due).to eq(100)
   end
 end
+
+RSpec.describe "Stripe webhook replay after a handoff", type: :request do
+  # "Verify valid events return ownership_moving without writes, invalid signatures retain their existing response, and replay succeeds after handoff."
+  it "records a signed Stripe payment_intent.succeeded event refused during a handoff exactly once when redelivered after it" do
+    secret = "whsec_replay_test"
+    allow(ENV).to receive(:[]).and_call_original
+    allow(ENV).to receive(:[]).with("STRIPE_WEBHOOK_ENDPOINT_SECRET").and_return(secret)
+    allow(PaymentMailer).to receive_message_chain(:with, :payment, :deliver_later)
+    allow_any_instance_of(Invoice).to receive(:send_to_client_email)
+    company = create(:company, base_currency: "USD")
+    client = create(:client, company:, currency: "USD")
+    invoice = create(
+      :invoice, company:, client:, currency: "USD", status: "sent", amount: 100, amount_due: 100, amount_paid: 0,
+      payment_infos: { "stripe_payment_intent" => "pi_replay_123" }
+    )
+    payload = {
+      id: "evt_replay_123",
+      object: "event",
+      type: "payment_intent.succeeded",
+      created: Time.current.to_i,
+      data: { object: { id: "pi_replay_123", object: "payment_intent", amount_received: 10_000, amount: 10_000, currency: "usd" } }
+    }.to_json
+    signed_at = Time.current
+    signature = Stripe::Webhook::Signature.compute_signature(signed_at, payload, secret)
+    headers = { "CONTENT_TYPE" => "application/json", "HTTP_STRIPE_SIGNATURE" => "t=#{signed_at.to_i},v1=#{signature}" }
+
+    TimekeepingOwnership.current.update!(handoff_step: "close_admission")
+    expect(Payment.where(invoice_id: invoice.id).count).to eq(0)
+    expect(invoice.reload).to have_attributes(status: "sent", amount_due: 100)
+
+    post "/webhooks/stripe/checkout/fulfillment", params: payload, headers: headers
+
+    expect(response).to have_http_status(:service_unavailable)
+    expect(response.headers["Retry-After"]).to eq("5")
+    expect(response.parsed_body["reason"]).to eq("ownership_moving")
+    expect(Payment.where(invoice_id: invoice.id).count).to eq(0)
+    expect(invoice.reload).to have_attributes(status: "sent", amount_due: 100)
+
+    TimekeepingOwnership.current.update!(handoff_step: nil)
+
+    post "/webhooks/stripe/checkout/fulfillment", params: payload, headers: headers
+
+    expect(response).to have_http_status(:ok)
+    expect(Payment.where(invoice_id: invoice.id).count).to eq(1)
+    expect(Payment.find_by(invoice_id: invoice.id).provider_event_id).to eq("evt_replay_123")
+    expect(invoice.reload).to be_paid
+
+    # Stripe can deliver the same event again; the second delivery must not pay twice.
+    post "/webhooks/stripe/checkout/fulfillment", params: payload, headers: headers
+
+    expect(response).to have_http_status(:ok)
+    expect(Payment.where(invoice_id: invoice.id).count).to eq(1)
+  end
+end
+
+RSpec.describe "Stripe checkout completion refused during a handoff", type: :request do
+  it "answers a signed Stripe payment-mode checkout completion during a handoff with ownership_moving and leaves the invoice unpaid" do
+    company = create(:company, base_currency: "USD")
+    client = create(:client, company:, currency: "USD")
+    invoice = create(:invoice, company:, client:, currency: "USD", status: "sent", amount: 100, amount_due: 100, amount_paid: 0)
+    allow(PaymentMailer).to receive_message_chain(:with, :payment, :deliver_later)
+    allow(ENV).to receive(:[]).and_call_original
+    allow(ENV).to receive(:[]).with("STRIPE_WEBHOOK_ENDPOINT_SECRET").and_return("whsec_fence_test")
+    payload = {
+      id: "evt_checkout_fence", object: "event", type: "checkout.session.completed", created: Time.current.to_i,
+      data: {
+        object: {
+          id: "cs_checkout_fence", object: "checkout.session", mode: "payment", status: "complete", payment_status: "paid",
+          payment_intent: nil, amount_total: 10_000, currency: "usd", metadata: { invoice_id: invoice.id.to_s }
+        }
+      }
+    }.to_json
+    timestamp = Time.now
+    signature = Stripe::Webhook::Signature.compute_signature(timestamp, payload, "whsec_fence_test")
+    TimekeepingOwnership.current.update!(handoff_step: "close_admission")
+    expect(Payment.where(invoice_id: invoice.id).count).to eq(0)
+    expect(invoice.reload).to have_attributes(status: "sent", amount_due: 100)
+
+    post "/webhooks/stripe/checkout/fulfillment", params: payload, headers: {
+      "CONTENT_TYPE" => "application/json",
+      "HTTP_STRIPE_SIGNATURE" => "t=#{timestamp.to_i},v1=#{signature}"
+    }
+
+    # This dispatch branch has its own catch-all rescue, so another event type passing proves nothing about it.
+    expect(response).to have_http_status(:service_unavailable)
+    expect(response.headers["Retry-After"]).to eq("5")
+    expect(response.parsed_body["reason"]).to eq("ownership_moving")
+    expect(PaymentMailer).not_to have_received(:with)
+    expect(Payment.where(invoice_id: invoice.id).count).to eq(0)
+    expect(invoice.reload).to have_attributes(status: "sent", amount_due: 100)
+  end
+end
+
+RSpec.describe "Signed Stripe failure events during a handoff", type: :request do
+  it "refuses signed Stripe payment_intent.payment_failed and checkout.session.expired events during a handoff without a failed payment row" do
+    allow(ENV).to receive(:[]).and_call_original
+    allow(ENV).to receive(:[]).with("STRIPE_WEBHOOK_ENDPOINT_SECRET").and_return("whsec_fence_test")
+    company = create(:company, base_currency: "USD")
+    client = create(:client, company:, currency: "USD")
+    invoice = create(
+      :invoice, company:, client:, currency: "USD", status: "sent", amount: 100, amount_due: 100, amount_paid: 0,
+      payment_infos: { "stripe_payment_intent" => "pi_http_failed" }
+    )
+    failed_payload = {
+      id: "evt_http_failed_fence",
+      object: "event",
+      type: "payment_intent.payment_failed",
+      created: Time.current.to_i,
+      data: { object: { id: "pi_http_failed", object: "payment_intent", amount: 10_000, currency: "usd", last_payment_error: nil } }
+    }.to_json
+    expired_payload = {
+      id: "evt_http_expired_fence",
+      object: "event",
+      type: "checkout.session.expired",
+      created: Time.current.to_i,
+      data: { object: { id: "cs_http_expired", object: "checkout.session", amount_total: 10_000, currency: "usd", metadata: { invoice_id: invoice.id.to_s } } }
+    }.to_json
+    TimekeepingOwnership.current.update!(handoff_step: "close_admission")
+    expect(Payment.where(invoice_id: invoice.id).count).to eq(0)
+
+    # payment_intent.payment_failed writes through Payment.create_or_find_by!, whose savepoint must not hide the refusal.
+    [failed_payload, expired_payload].each do |payload|
+      signed_at = Time.now
+      signature = Stripe::Webhook::Signature.compute_signature(signed_at, payload, "whsec_fence_test")
+
+      post "/webhooks/stripe/checkout/fulfillment", params: payload, headers: {
+        "CONTENT_TYPE" => "application/json",
+        "HTTP_STRIPE_SIGNATURE" => "t=#{signed_at.to_i},v1=#{signature}"
+      }
+
+      expect(response).to have_http_status(:service_unavailable)
+      expect(response.headers["Retry-After"]).to eq("5")
+      expect(response.parsed_body["reason"]).to eq("ownership_moving")
+      expect(Payment.where(invoice_id: invoice.id).count).to eq(0)
+    end
+    expect(Payment.where(provider_event_id: "evt_http_failed_fence")).not_to exist
+  end
+end
