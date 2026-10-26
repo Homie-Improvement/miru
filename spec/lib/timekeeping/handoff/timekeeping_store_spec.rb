@@ -106,3 +106,35 @@ RSpec.describe Timekeeping::Handoff::TimekeepingStore do
       .with(headers: { "Authorization" => "Bearer #{token}" })).to have_been_made.once
   end
 end
+
+# A real socket, because WebMock answers before Net::HTTP's own retry runs.
+RSpec.describe Timekeeping::Handoff::TimekeepingStore, "on a read timeout" do
+  it "sends a timed-out checkpoint load once and raises Store::Error" do
+    server = TCPServer.new("127.0.0.1", 0)
+    connections = Queue.new
+    acceptor = Thread.new do
+      loop do
+        client = server.accept
+        connections << true
+        Thread.new(client) do |socket|
+          socket.gets
+          sleep 2
+          socket.close
+        end
+      end
+    end
+    WebMock.disable_net_connect!(allow_localhost: true)
+    stub_const("#{described_class}::READ_TIMEOUT_SECONDS", 0.5)
+    store = described_class.new(base_url: "http://127.0.0.1:#{server.addr[1]}", token: "svc-token")
+    checkpoint = Timekeeping::Handoff::Checkpoint.build(tables: Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] })
+
+    expect { store.load_checkpoint(checkpoint) }
+      .to raise_error(Timekeeping::Handoff::Store::Error, /Net::ReadTimeout/)
+    sleep 1
+    expect(connections.size).to eq(1)
+  ensure
+    acceptor&.kill
+    server&.close
+    WebMock.disable_net_connect!
+  end
+end

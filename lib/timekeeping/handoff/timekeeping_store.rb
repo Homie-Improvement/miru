@@ -86,9 +86,12 @@ module Timekeeping
           raise Store::Error, "#{::Internal::V1::BaseController::SERVICE_TOKEN_ENV} is not set" if @token.blank?
 
           uri = URI.join(@base_url, path)
+          # Net::HTTP re-sends a GET or PUT once after a read timeout by
+          # default; max_retries: 0 keeps a slow load from being sent twice.
           response = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == "https",
                                                          open_timeout: OPEN_TIMEOUT_SECONDS,
-                                                         read_timeout: READ_TIMEOUT_SECONDS) do |http|
+                                                         read_timeout: READ_TIMEOUT_SECONDS,
+                                                         max_retries: 0) do |http|
             http.request(build_request(method, uri, body))
           end
           refuse_answer!(method, path, response) unless response.is_a?(Net::HTTPOK)
