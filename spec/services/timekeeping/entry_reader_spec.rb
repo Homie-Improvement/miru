@@ -107,6 +107,26 @@ RSpec.describe Timekeeping::EntryReader, "reading the owner's own rows" do
     SQL
   end
 
+  it "reads the prepared entries table when the monolith store is prepared and timesheet_entries when it is legacy" do
+    create(:timesheet_entry, user:, project:, work_date: Date.new(2026, 3, 2), note: "from projection")
+    insert_prepared_entry(id: 93_101, work_date: "2026-03-03")
+    # The monolith owns the data in both states, so Timekeeping must never be asked.
+    untouchable_client = Object.new
+    def untouchable_client.list_entries(**)
+      raise "Timekeeping must not be read while the monolith owns entries"
+    end
+
+    # "The entry list and read-after-write reads go to the current owner: Timekeeping, or the prepared
+    # monolith's local tables, or `timesheet_entries` in the legacy state."
+    expect(list_from_owner(timekeeping_client: untouchable_client).map(&:note)).to eq(["from projection"])
+
+    TimekeepingOwnership.current.update!(generation: 3, monolith_store: "prepared")
+    prepared = list_from_owner(timekeeping_client: untouchable_client)
+    expect(prepared.map(&:id)).to eq([93_101])
+    expect(prepared.first.snippet).to include(id: 93_101, note: "prepared 93101", project: project.name)
+    expect(prepared.first).to be_readonly
+  end
+
   it "hides a discarded prepared entry" do
     TimekeepingOwnership.current.update!(generation: 3, monolith_store: "prepared")
     insert_prepared_entry(id: 93_001, work_date: "2026-03-02")
