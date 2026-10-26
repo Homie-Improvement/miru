@@ -89,7 +89,11 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_01_000000) do
     t.bigint "company_id", null: false
     t.integer "version", null: false
     t.bigint "generation", null: false
+    t.datetime "enqueued_at", default: -> { "CURRENT_TIMESTAMP" }, null: false
+    t.datetime "sent_at"
+    t.index ["company_id", "enqueued_at"], name: "index_outbox_snapshots_unsent_by_company", where: "(sent_at IS NULL)"
     t.index ["company_id", "id"], name: "index_outbox_snapshots_on_company_id_and_id"
+    t.index ["outbox_position"], name: "index_outbox_snapshots_unsent_by_position", where: "(sent_at IS NULL)"
   end
 
   create_table "ownership_generations", primary_key: "company_id", id: :bigint, default: nil, force: :cascade do |t|

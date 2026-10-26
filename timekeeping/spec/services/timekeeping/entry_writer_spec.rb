@@ -91,7 +91,10 @@ RSpec.describe Timekeeping::EntryWriter do
 
       outbox = OutboxSnapshot.sole.attributes
       contract_fields = YAML.safe_load_file(Rails.root.join("../contracts/timekeeping/entry_snapshots.yml")).fetch("entry_fields")
-      expect(outbox.keys).to match_array(contract_fields + %w[generation outbox_position])
+      expect(outbox.keys).to match_array(contract_fields + %w[generation outbox_position enqueued_at sent_at])
+      # The database clock fills enqueued_at, so the frozen spec clock cannot pin its value.
+      expect(outbox["enqueued_at"]).to be_a(Time)
+      expect(outbox["sent_at"]).to be_nil
       expect(outbox).to include("id" => entry_id, "company_id" => company, "version" => 2, "note" => "Edited",
                                 "generation" => timekeeping_arrange.current_generation, "locked" => false)
       expect(outbox.values.map(&:to_s)).to all(satisfy { |value| !value.include?(owner_token) })
