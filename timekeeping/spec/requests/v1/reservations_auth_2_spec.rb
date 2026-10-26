@@ -78,41 +78,41 @@ RSpec.describe "Timekeeping reservations tenant isolation: credential bound to a
   end
 end
 
-RSpec.describe "Timekeeping reservations tenant isolation: operation ids per company" do
+RSpec.describe "Reservation operation ids per company through reservation_post" do
   include_context "timekeeping entry writes"
 
-  it "never commits or aborts another company's operation that carries the same operation id" do
-    client = TimekeepingRackClient.new(Rails.application)
-    operations = %w[prepare commit abort mark_billed detach_entries]
+  it "reservation_post keeps a company's operation id from another company, then the owner commits or aborts it" do
     company = timekeeping_arrange.company
     other_company = timekeeping_arrange.company
+    service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: reservation_routes)
+    other_service = timekeeping_arrange.service_identity(company: other_company, name: "invoice-boundary", operations: reservation_routes)
     user = timekeeping_arrange.user(company:, role: "employee")
-    entry = timekeeping_arrange.entry(company:, user:, project: timekeeping_arrange.project(company:))
-    service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations:)
-    other_service = timekeeping_arrange.service_identity(company: other_company, name: "invoice-boundary", operations:)
-    operation_id = SecureRandom.uuid
-    post = lambda do |company_id, credential, route, body|
-      client.call("POST", "/v1/companies/#{company_id}/reservations/#{route}",
-                  headers: { "Authorization" => "Bearer #{credential}" },
-                  body: body.merge("generation" => timekeeping_arrange.current_generation))
+    project = timekeeping_arrange.project(company:)
+
+    { "commit" => { "reserved" => 1, "released" => 0 }, "abort" => { "dropped" => 1 } }.each do |finish, owner_answer|
+      entry = timekeeping_arrange.entry(company:, user:, project:)
+      operation_id = SecureRandom.uuid
+      finish_body = { "invoice_id" => 501, "operation_id" => operation_id }
+      expect(reservation_post("prepare", company:, credential: service,
+                              body: finish_body.merge("disposition" => "active", "entries" => [entry])).status).to eq(200)
+      before = [reservation_row_counts, Entry.find(entry).version,
+                InvoiceOperation.where(company_id: company, operation_id:).pluck(:state)]
+
+      %w[commit abort].each do |route|
+        foreign = reservation_post(route, company: other_company, credential: other_service, body: finish_body)
+        expect([finish, route, foreign.status, foreign.parsed_body]).to eq([finish, route, 404, { "reason" => "not_found" }])
+      end
+      expect(timekeeping_arrange.reservations_for(entry)).to eq([{ "invoice_id" => 501, "state" => "provisional" }])
+      expect(timekeeping_arrange.entry_locked(entry)).to be(true)
+      expect([reservation_row_counts, Entry.find(entry).version,
+              InvoiceOperation.where(company_id: company, operation_id:).pluck(:state)]).to eq(before)
+      expect(before.last).to eq(["prepared"])
+
+      own = reservation_post(finish, company:, credential: service, body: finish_body)
+      expect([finish, own.status, own.parsed_body]).to eq([finish, 200, owner_answer])
+      expected_held = finish == "commit" ? [{ "invoice_id" => 501, "state" => "committed" }] : []
+      expect(timekeeping_arrange.reservations_for(entry)).to eq(expected_held)
     end
-
-    prepared = post.call(company, service, "prepare",
-                         { "invoice_id" => 501, "operation_id" => operation_id, "disposition" => "active", "entries" => [entry] })
-    expect(prepared.status).to eq(200)
-
-    # "Operation ids are unique only within a company." and "A replayed or guessed id from another company never matches."
-    foreign_commit = post.call(other_company, other_service, "commit", { "invoice_id" => 501, "operation_id" => operation_id })
-    foreign_abort = post.call(other_company, other_service, "abort", { "invoice_id" => 501, "operation_id" => operation_id })
-
-    expect([foreign_commit.status, foreign_commit.body]).to eq([404, { "reason" => "not_found" }])
-    expect([foreign_abort.status, foreign_abort.body]).to eq([404, { "reason" => "not_found" }])
-    expect(timekeeping_arrange.reservations_for(entry)).to eq([{ "invoice_id" => 501, "state" => "provisional" }])
-
-    own_commit = post.call(company, service, "commit", { "invoice_id" => 501, "operation_id" => operation_id })
-
-    expect(own_commit.body).to eq("reserved" => 1, "released" => 0)
-    expect(timekeeping_arrange.reservations_for(entry)).to eq([{ "invoice_id" => 501, "state" => "committed" }])
   end
 end
 
