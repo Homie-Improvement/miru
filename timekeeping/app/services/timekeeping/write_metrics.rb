@@ -109,11 +109,20 @@ module Timekeeping
     end
 
     # requires_new makes this a savepoint inside an open transaction, so a
-    # timeout rolls back only this company. SET LOCAL ends with it.
+    # timeout rolls back only this company, and that rollback also undoes the
+    # SET LOCAL. Releasing a savepoint does not undo a SET LOCAL: it would
+    # last until the caller's transaction ends, so a successful fold puts the
+    # caller's lock_timeout back before it returns.
     def self.fold_company(company_id)
+      connection = ApplicationRecord.connection
       ApplicationRecord.transaction(requires_new: true) do
-        ApplicationRecord.connection.execute("SET LOCAL lock_timeout = #{Integer(LOCK_TIMEOUT_MS)}")
-        ApplicationRecord.connection.select_value(ApplicationRecord.sanitize_sql_array([FOLD_COMPANY_SQL, company_id]))
+        caller_lock_timeout = connection.select_value("SELECT current_setting('lock_timeout')")
+        connection.execute("SET LOCAL lock_timeout = #{Integer(LOCK_TIMEOUT_MS)}")
+        folded = connection.select_value(ApplicationRecord.sanitize_sql_array([FOLD_COMPANY_SQL, company_id]))
+        connection.select_value(
+          ApplicationRecord.sanitize_sql_array(["SELECT set_config('lock_timeout', ?, true)", caller_lock_timeout])
+        )
+        folded
       end
     rescue ActiveRecord::LockWaitTimeout
       0

@@ -110,24 +110,6 @@ RSpec.describe "Timekeeping internal write metrics" do
       end]
     end
 
-    # Polls, on its own connection, until some session reports waiting on
-    # holding_pid's locks; answers whether one did within five seconds.
-    def watch_for_session_blocked_by(holding_pid)
-      Thread.new do
-        ApplicationRecord.connection_pool.with_connection do |connection|
-          deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
-          seen = false
-          until seen || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-            seen = connection.select_value(ApplicationRecord.sanitize_sql_array(
-              ["SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE ? = ANY(pg_blocking_pids(pid)))", holding_pid]
-            ))
-            sleep 0.02 unless seen
-          end
-          seen
-        end
-      end
-    end
-
     # "treat response delivery independently from metric persistence as follow-up
     # work that preserves counts rather than discarding timed-out events."
     it "answers metrics while one company's window row is held, keeps that company's pending write, and counts it once on the next read" do
@@ -138,21 +120,11 @@ RSpec.describe "Timekeeping internal write metrics" do
       record_metric_for_spec(1, at)
       record_metric_for_spec(2, at)
 
-      held = Queue.new
-      release = Queue.new
-      holder_pid = Queue.new
-      holder = Thread.new do
-        ApplicationRecord.connection_pool.with_connection do |connection|
-          holder_pid << connection.select_value("SELECT pg_backend_pid()")
-          connection.transaction do
-            connection.execute("SELECT 1 FROM write_metric_windows WHERE company_id = 1 FOR UPDATE")
-            held << true
-            release.pop(timeout: 10)
-          end
-        end
+      holder, release, holding_pid = hold_metric_window_row(1)
+      # The read runs on this thread, so the wait is watched from another one.
+      watcher = Thread.new do
+        ApplicationRecord.connection_pool.with_connection { metric_lock_waiter_seen?(holding_pid) }
       end
-      expect(held.pop(timeout: 10)).to be(true)
-      watcher = watch_for_session_blocked_by(holder_pid.pop(timeout: 10))
 
       answer_while_held = held_row_metric_writes
       blocked = watcher.join(10)&.value

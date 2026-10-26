@@ -2,8 +2,10 @@
 
 # Per-company entry write metrics for the alert evaluator. The body holds
 # every company's counts, so only the service identity may read it. Entry
-# writes only leave pending metric events; each read adds them into the
-# windows first, so a write is counted on the first read after it.
+# writes only leave pending metric events; each read first adds the pending
+# events it can into the windows. A company whose window row is held, or
+# whose events another read is already adding, keeps them pending, and a
+# later read counts them.
 class Timekeeping::Internal::V1::MetricsController < ApplicationController
   skip_before_action :authorize_read!
   before_action :authorize_service!

@@ -207,44 +207,20 @@ RSpec.describe Timekeeping::WriteMetrics do
       expect(WriteMetricWindow.where(company_id: company_a).pluck(:window_start, :writes)).to eq([[window_noon, 1]])
     end
 
+    # Transactional fixtures keep a transaction open here, so the fold runs in
+    # a savepoint; releasing a savepoint does not undo a SET LOCAL, and the
+    # fold's lock timeout must not reach the caller's later statements.
+    it "leaves the caller's lock_timeout as it was after a fold inside an open transaction" do
+      before = ApplicationRecord.connection.select_value("SHOW lock_timeout")
+
+      record_write_metric_at(window_noon)
+      expect(described_class.fold_pending).to eq(1)
+
+      expect(ApplicationRecord.connection.select_value("SHOW lock_timeout")).to eq(before)
+    end
+
     describe "around a held window row" do
       include_context "timekeeping entry writes without transactional fixtures"
-
-      # Holds company_id's window row FOR UPDATE on its own connection until
-      # the returned release queue is pushed. Returns the holder thread, the
-      # release queue and the holder's server process id.
-      def hold_pending_window_row(company_id)
-        held = Queue.new
-        release = Queue.new
-        holder_pid = Queue.new
-        holder = Thread.new do
-          ApplicationRecord.connection_pool.with_connection do |connection|
-            holder_pid << connection.select_value("SELECT pg_backend_pid()")
-            connection.transaction do
-              connection.execute(ApplicationRecord.sanitize_sql_array(
-                ["SELECT 1 FROM write_metric_windows WHERE company_id = ? FOR UPDATE", company_id]
-              ))
-              held << true
-              release.pop(timeout: 10)
-            end
-          end
-        end
-        expect(held.pop(timeout: 10)).to be(true)
-        [holder, release, holder_pid.pop(timeout: 10)]
-      end
-
-      def pending_fold_blocked_by?(waiting_pid, holding_pid)
-        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 3
-        while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
-          blocked = ApplicationRecord.connection.select_value(
-            ApplicationRecord.sanitize_sql_array(["SELECT ? = ANY(pg_blocking_pids(?))", holding_pid, waiting_pid])
-          )
-          return true if blocked
-
-          sleep 0.02
-        end
-        false
-      end
 
       # Does a locked metric row delay an entry response after the entry
       # transaction commits? record runs on the entry response path, so it must
@@ -253,7 +229,7 @@ RSpec.describe Timekeeping::WriteMetrics do
         record_write_metric_at(window_noon + 30, company_id: 303)
         described_class.fold_pending
 
-        holder, release, = hold_pending_window_row(303)
+        holder, release, = hold_metric_window_row(303)
         recorder = Thread.new do
           ApplicationRecord.connection_pool.with_connection do
             record_write_metric_at(window_noon + 30, company_id: 303, outcome: :reference_unavailable, latency_ms: 20)
@@ -280,15 +256,9 @@ RSpec.describe Timekeeping::WriteMetrics do
         record_write_metric_at(window_noon + 30, company_id: 404, latency_ms: 40)
         record_write_metric_at(window_noon + 30, company_id: 505, outcome: :reference_unavailable, latency_ms: 40)
 
-        holder, release, holding_pid = hold_pending_window_row(404)
-        folder_pid = Queue.new
-        folder = Thread.new do
-          ApplicationRecord.connection_pool.with_connection do |connection|
-            folder_pid << connection.select_value("SELECT pg_backend_pid()")
-            described_class.fold_pending
-          end
-        end
-        blocked = pending_fold_blocked_by?(folder_pid.pop(timeout: 10), holding_pid)
+        holder, release, holding_pid = hold_metric_window_row(404)
+        folder = Thread.new { ApplicationRecord.connection_pool.with_connection { described_class.fold_pending } }
+        blocked = metric_lock_waiter_seen?(holding_pid)
         folded_while_held = folder.join(10)&.value
         pending_while_held = WriteMetricEvent.where(company_id: 404).count
         writes_while_held = WriteMetricWindow.find_by!(company_id: 404).writes
@@ -305,27 +275,6 @@ RSpec.describe Timekeeping::WriteMetrics do
         expect(WriteMetricEvent.count).to eq(0)
         expect(described_class.fold_pending).to eq(0)
         expect(WriteMetricWindow.find_by!(company_id: 404).writes).to eq(2)
-      end
-
-      it "answers folded_windows while one company's row is held and includes that company's kept event once the lock clears" do
-        record_write_metric_at(window_noon + 60, company_id: 404)
-        described_class.folded_windows.to_a
-
-        holder, release, = hold_pending_window_row(404)
-        record_write_metric_at(window_noon + 60, company_id: 404)
-        record_write_metric_at(window_noon + 60, company_id: 505)
-        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        during = described_class.folded_windows.to_a.to_h { |row| [row.company_id, row.writes] }
-        elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
-        release << true
-        holder.join(10)
-
-        expect(elapsed).to be < 5
-        expect(during).to eq(404 => 1, 505 => 1)
-        after = described_class.folded_windows.to_a.to_h { |row| [row.company_id, row.writes] }
-        expect(after).to eq(404 => 2, 505 => 1)
-        expect(described_class.folded_windows.to_a.to_h { |row| [row.company_id, row.writes] }).to eq(after)
-        expect(WriteMetricEvent.count).to eq(0)
       end
     end
 

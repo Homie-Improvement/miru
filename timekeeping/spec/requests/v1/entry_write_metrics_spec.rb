@@ -163,26 +163,6 @@ RSpec.describe "Entry write routes: write metrics" do
       end
     end
 
-    # Holds the company's window row FOR UPDATE on its own connection until
-    # the returned release queue is pushed.
-    def hold_company_window_row
-      held = Queue.new
-      release = Queue.new
-      holder = Thread.new do
-        ApplicationRecord.connection_pool.with_connection do |connection|
-          connection.transaction do
-            connection.execute(ApplicationRecord.sanitize_sql_array(
-              ["SELECT 1 FROM write_metric_windows WHERE company_id = ? FOR UPDATE", company]
-            ))
-            held << true
-            release.pop(timeout: 10)
-          end
-        end
-      end
-      expect(held.pop(timeout: 10)).to be(true)
-      [holder, release]
-    end
-
     it "stores the pending event of a write to another company's path under the token's company until a metrics read folds it" do
       send_metric_write(:post, other_entries_path, owner_token, metric_entry_body)
 
@@ -199,7 +179,7 @@ RSpec.describe "Entry write routes: write metrics" do
       expect(send_metric_write(:post, entries_path, owner_token, metric_entry_body).status).to eq(201)
       expect(pending_metric_read_writes).to eq(company => 1)
 
-      holder, release = hold_company_window_row
+      holder, release, = hold_metric_window_row(company)
       started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       send_metric_write(:post, entries_path, owner_token, metric_entry_body)
       elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
