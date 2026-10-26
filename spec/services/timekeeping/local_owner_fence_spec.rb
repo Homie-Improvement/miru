@@ -41,4 +41,32 @@ RSpec.describe Timekeeping::LocalOwner do
     expect(%w[reservations invoice_operations entry_audits entry_outbox_items].index_with { |table| count.call(table) })
       .to eq(before)
   end
+
+  # The entry path checks the generation through the same shared steps the reservation writers use, so
+  # a malformed or wrong generation is refused there too while the monolith is the prepared owner.
+  it "an entry create with a malformed or wrong generation answers stale_generation while ownership is prepared" do
+    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
+    generation = TimekeepingOwnership.current.generation
+    company = create(:company)
+    user = create(:user)
+    create(:employment, company:, user:)
+    user.add_role("owner", company)
+    project = create(:project, client: create(:client, company:))
+    actor = described_class::Actor.user(user_id: user.id, role: "owner")
+    body = { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 10.0, "note" => "fenced",
+             "source" => TimesheetEntry::SOURCES.first, "source_metadata" => {} }
+    count = ->(table) { ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM #{table}").to_i }
+    before = %w[entries entry_audits idempotency_records entry_outbox_items].index_with { |table| count.call(table) }
+
+    [nil, "", "abc", "#{generation}.0", " #{generation}", (generation + 1).to_s, (generation - 1).to_s]
+      .each_with_index do |sent_generation, index|
+        outcome = described_class.call(operation: :create, company_id: company.id, generation: sent_generation, actor:,
+                                       params: { "idempotency_key" => "entry-fence-#{index}", "body" => body })
+
+        expect([sent_generation, outcome.status, outcome.body.with_indifferent_access[:reason].to_s])
+          .to eq([sent_generation, 409, "stale_generation"])
+      end
+    expect(%w[entries entry_audits idempotency_records entry_outbox_items].index_with { |table| count.call(table) })
+      .to eq(before)
+  end
 end
