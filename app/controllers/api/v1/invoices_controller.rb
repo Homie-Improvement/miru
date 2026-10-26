@@ -87,19 +87,22 @@ class Api::V1::InvoicesController < Api::V1::ApplicationController
       return render json: { error: I18n.t("invoices_controller.send_invoice.pdf_failed") }, status: 500
     end
 
-    # Recorded before the mail is queued, so a write refused during a
-    # Timekeeping handoff answers 503 without having sent the client an email.
-    invoice.record_send!(recipients_count: recipients.size)
+    # The send is recorded before the mail is queued, so a write refused during
+    # a Timekeeping handoff answers 503 without emailing the client. Both run in
+    # one transaction, so a failure to queue the mail leaves the invoice unsent.
+    Invoice.transaction do
+      invoice.record_send!(recipients_count: recipients.size)
 
-    # Encode PDF data as base64 to avoid encoding issues in job queue
-    InvoiceMailer.with(
-      invoice: invoice,
-      pdf_data: Base64.strict_encode64(pdf_data),
-      pdf_encoded: true,
-      subject: invoice_email_params[:subject],
-      recipients: recipients,
-      message: invoice_email_params[:message]
-    ).send_invoice.deliver_later
+      # Encode PDF data as base64 to avoid encoding issues in job queue
+      InvoiceMailer.with(
+        invoice: invoice,
+        pdf_data: Base64.strict_encode64(pdf_data),
+        pdf_encoded: true,
+        subject: invoice_email_params[:subject],
+        recipients: recipients,
+        message: invoice_email_params[:message]
+      ).send_invoice.deliver_later
+    end
 
     render json: { message: I18n.t("invoices_controller.send_invoice.success") }, status: 200
   end

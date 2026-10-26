@@ -30,8 +30,8 @@ class InvoicePayment::StripeCheckoutFulfillment < ApplicationService
 
   private
 
-    # The ownership lock comes before the invoice lock, the same order every
-    # other billing write takes them in.
+    # The ownership lock is taken before the invoice lock, the order the other
+    # fenced payment paths use.
     def settle_payment
       Timekeeping::BillingFence.transaction do
         invoice.with_lock do

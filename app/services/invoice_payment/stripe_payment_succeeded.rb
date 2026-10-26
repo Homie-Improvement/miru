@@ -14,8 +14,8 @@ class InvoicePayment::StripePaymentSucceeded < ApplicationService
     @invoice = Invoice.where("payment_infos ->> 'stripe_payment_intent' = ?", data_object.id).first
     return false if invoice.blank?
 
-    # The ownership lock comes before the invoice lock, the same order every
-    # other billing write takes them in, so this path cannot deadlock with them.
+    # The ownership lock is taken before the invoice lock, the order the other
+    # fenced payment paths use, so this path cannot deadlock with them.
     Timekeeping::BillingFence.transaction do
       invoice.with_lock do
         next true if invoice.paid? || Payment.exists?(provider_event_id: event.id)
