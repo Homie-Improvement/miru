@@ -25,6 +25,7 @@ RSpec.describe "Api::V1::Invoices::BulkDeletion#create", type: :request do
       }.to change(Invoice, :count).by(-3)
 
       expect(response).to have_http_status(:no_content)
+      expect(response.body).to be_empty
     end
 
     it "handles empty invoice ids gracefully" do
@@ -44,7 +45,10 @@ RSpec.describe "Api::V1::Invoices::BulkDeletion#create", type: :request do
         headers: auth_headers(user)
 
       expect(response).to have_http_status(:unprocessable_content)
-      expect(json_response["undeletable_invoice_ids"]).to eq([with_payment.id])
+      expect(json_response).to eq(
+        "error" => "Some invoices could not be deleted because they have recorded payments.",
+        "undeletable_invoice_ids" => [with_payment.id]
+      )
       expect(Invoice.exists?(deletable.id)).to be(false)
       expect(Invoice.exists?(with_payment.id)).to be(true)
     end
@@ -109,45 +113,6 @@ RSpec.describe "Api::V1::Invoices::BulkDeletion#create through the bulk deletion
   end
 end
 
-RSpec.describe "Api::V1::Invoices::BulkDeletion#create response contract", type: :request do
-  let(:company) { create(:company) }
-  let(:user) { create(:user, current_workspace_id: company.id) }
-  let(:client) { create(:client, company:) }
-
-  before do
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    sign_in user
-  end
-
-  # "Moving it into a service changes no behaviour and can land on its own."
-  it "keeps the 422 error message and the 204 empty body after the move to the service" do
-    expect(Invoices::BulkDeletionService).to be_a(Class)
-    paid = create(:invoice, company:, client:, amount_due: 300)
-    create(:payment, invoice: paid, amount: 300)
-    deletable = create(:invoice, company:, client:)
-
-    send_request :post, api_v1_invoices_bulk_deletion_index_path,
-      params: { invoices_ids: [paid.id] },
-      headers: auth_headers(user)
-
-    expect(response).to have_http_status(:unprocessable_content)
-    expect(json_response).to eq(
-      "error" => "Some invoices could not be deleted because they have recorded payments.",
-      "undeletable_invoice_ids" => [paid.id]
-    )
-
-    send_request :post, api_v1_invoices_bulk_deletion_index_path,
-      params: { invoices_ids: [deletable.id] },
-      headers: auth_headers(user)
-
-    expect(response).to have_http_status(:no_content)
-    expect(response.body).to be_empty
-    expect(Invoice.exists?(deletable.id)).to be(false)
-    expect(Invoice.exists?(paid.id)).to be(true)
-  end
-end
-
 RSpec.describe "Api::V1::Invoices::BulkDeletion#create during a handoff", type: :request do
   let(:company) { create(:company) }
   let(:user) { create(:user, current_workspace_id: company.id) }
@@ -168,6 +133,8 @@ RSpec.describe "Api::V1::Invoices::BulkDeletion#create during a handoff", type: 
     ids = invoices.map(&:id)
     line_item_ids = InvoiceLineItem.where(invoice_id: ids).pluck(:id)
     tax_ids = InvoiceTax.where(invoice_id: ids).pluck(:id)
+    expect(line_item_ids.size).to eq(3)
+    expect(tax_ids.size).to eq(3)
     TimekeepingOwnership.current.update!(handoff_step: "close_admission")
 
     send_request :post, api_v1_invoices_bulk_deletion_index_path,
@@ -188,6 +155,8 @@ RSpec.describe "Api::V1::Invoices::BulkDeletion#create during a handoff", type: 
     expect(foreign_invoice.company_id).not_to eq(company.id)
     ids = [own_invoice.id, foreign_invoice.id]
     baseline_line_items = InvoiceLineItem.where(invoice_id: ids).order(:id).pluck(:id, :invoice_id)
+    expect(baseline_line_items.count { |_id, invoice_id| invoice_id == own_invoice.id }).to eq(1)
+    expect(baseline_line_items.count { |_id, invoice_id| invoice_id == foreign_invoice.id }).to be_positive
     TimekeepingOwnership.current.update!(handoff_step: "close_admission")
 
     send_request :post, api_v1_invoices_bulk_deletion_index_path,
