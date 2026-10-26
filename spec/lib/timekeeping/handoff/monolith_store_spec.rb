@@ -201,8 +201,9 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
       VALUES (1, #{entry_id}, 'User', 7, 'create', NULL, '{"duration": 60}', now() - interval '1 day', now() - interval '1 day'),
              (1, #{entry_id}, 'User', 8, 'update', '{"duration": 60}', '{"duration": 0.30000000000000004}', now() - interval '1 day', now())
     SQL
-    # Spacing and key order that a jsonb column would rewrite.
-    connection.execute(<<~SQL.squish)
+    # Spacing and key order that a jsonb column would rewrite. No squish here:
+    # it would collapse the spacing inside the body literal.
+    connection.execute(<<~SQL)
       INSERT INTO idempotency_records (company_id, actor_type, actor_id, operation, key, fingerprint, status, body, created_at)
       VALUES (1, 'User', 7, 'create_entry', 'k-1', 'fp-1', 201, '{"b": 1,   "a":[2, 1]}', now())
     SQL
@@ -278,5 +279,123 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
     checkpoint = described_class.new(connection: connection).export_checkpoint
     expect(checkpoint.digest.fetch("entries").keys).to eq([1])
     expect(billing_rows.call).to eq(baseline)
+  end
+end
+
+RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
+  let(:load_case_connection) { ActiveRecord::Base.connection }
+  let(:load_case_store) { described_class.new(connection: load_case_connection) }
+  let(:load_case_stamp) { Time.utc(2026, 4, 2, 10, 15, 30, 654_321) }
+
+  def load_case_entry(id:, company_id:, **overrides)
+    {
+      "id" => id, "company_id" => company_id, "version" => 1, "project_id" => 1, "user_id" => 1,
+      "agent_id" => nil, "work_date" => Date.new(2026, 4, 2), "duration" => 60.0, "note" => "",
+      "bill_status" => "unbilled", "review_status" => "not_required", "locked" => false,
+      "source" => "manual", "source_metadata" => {}, "external_run_id" => nil,
+      "external_session_id" => nil, "proof_url" => nil, "proof_metadata" => {}, "discarded_at" => nil,
+      "created_at" => load_case_stamp, "updated_at" => load_case_stamp
+    }.merge(overrides.transform_keys(&:to_s))
+  end
+
+  def load_case_prepared_rows
+    %w[entries reservations invoice_operations entry_audits idempotency_records].index_with do |table|
+      load_case_connection.select_all("SELECT * FROM #{table} ORDER BY 1, 2").to_a
+    end
+  end
+
+  # Every value a lossy copy would change: a discarded entry, non-default
+  # statuses, a version above 1, a float with no short decimal form, a
+  # reservation whose invoice no longer exists, committed and aborted
+  # operations, audits with and without a before value, and a receipt body
+  # whose spacing and key order jsonb would rewrite.
+  def load_case_hard_checkpoint
+    Timekeeping::Handoff::Checkpoint.build(tables: {
+      "entries" => [
+        load_case_entry(
+          id: 11, company_id: 1, version: 4, duration: 0.1 + 0.2, bill_status: "billed",
+          review_status: "approved", locked: true, note: "first", discarded_at: load_case_stamp,
+          source_metadata: { "b" => 1, "a" => [1, 2.5] }
+        ),
+        load_case_entry(id: 12, company_id: 2, version: 2, duration: (0.1 + 0.2).next_float)
+      ],
+      "reservations" => [{
+        "company_id" => 1, "entry_id" => 11, "invoice_id" => 987_654, "state" => "committed",
+        "disposition" => "retained", "operation_id" => "0b1f8a4c-9d2e-4f7a-8c3b-5e6d7f8a9b0c",
+        "created_at" => load_case_stamp
+      }],
+      "invoice_operations" => [
+        {
+          "id" => 3, "company_id" => 1, "invoice_id" => 987_654, "operation_id" => "0b1f8a4c-9d2e-4f7a-8c3b-5e6d7f8a9b0c",
+          "state" => "committed", "desired_entry_ids" => [11], "disposition" => "retained", "generation" => 2,
+          "created_at" => load_case_stamp, "finished_at" => load_case_stamp
+        },
+        {
+          "id" => 4, "company_id" => 2, "invoice_id" => 55, "operation_id" => "1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f",
+          "state" => "aborted", "desired_entry_ids" => [], "disposition" => "active", "generation" => 1,
+          "created_at" => load_case_stamp, "finished_at" => nil
+        }
+      ],
+      "entry_audits" => [
+        {
+          "id" => 1, "company_id" => 1, "entry_id" => 11, "actor_type" => "User", "actor_id" => 7,
+          "action" => "create", "before" => nil, "after" => { "duration" => 60 },
+          "entry_created_at" => load_case_stamp, "created_at" => load_case_stamp
+        },
+        {
+          "id" => 2, "company_id" => 1, "entry_id" => 11, "actor_type" => "Agent", "actor_id" => 8,
+          "action" => "update", "before" => { "duration" => 60 }, "after" => { "duration" => 0.1 + 0.2 },
+          "entry_created_at" => load_case_stamp, "created_at" => load_case_stamp + 1
+        }
+      ],
+      "idempotency_records" => [{
+        "id" => 1, "company_id" => 2, "actor_type" => "User", "actor_id" => 7, "operation" => "create_entry",
+        "key" => "k-1", "fingerprint" => "fp", "status" => 201, "body" => "{ \"z\":1,   \"a\": [2, 1] }",
+        "created_at" => load_case_stamp
+      }]
+    })
+  end
+
+  it "round-trips a two-company checkpoint holding every hard case through load and export" do
+    checkpoint = load_case_hard_checkpoint
+
+    loaded = load_case_store.load_checkpoint(checkpoint)
+    exported = load_case_store.export_checkpoint
+
+    expect(loaded.digest).to eq(checkpoint.digest)
+    expect(exported.digest).to eq(checkpoint.digest)
+    expect(exported.digest.fetch("entries").keys).to contain_exactly(1, 2)
+    expect(exported.to_json).to eq(checkpoint.to_json)
+  end
+
+  it "rolls the load back when the rows read back differ from the checkpoint" do
+    load_case_connection.execute(<<~SQL.squish)
+      INSERT INTO entries (id, company_id, project_id, user_id, work_date, duration, note, bill_status, created_at, updated_at)
+      VALUES (40, 3, 1, 1, '2026-04-01', 5, 'kept', 'unbilled', now(), now())
+    SQL
+    baseline = load_case_prepared_rows
+    expect(baseline["entries"].map { |row| row["note"] }).to eq(["kept"])
+    allow(load_case_store).to receive(:read_rows).and_wrap_original do |original, table|
+      rows = original.call(table)
+      table == "entries" ? rows.map { |row| row.merge("note" => "changed on the way back") } : rows
+    end
+
+    expect { load_case_store.load_checkpoint(load_case_hard_checkpoint) }
+      .to raise_error(Timekeeping::Handoff::Store::Error, /entries company_id 1/)
+    expect(load_case_prepared_rows).to eq(baseline)
+  end
+
+  it "leaves the outbox untouched when a checkpoint is loaded" do
+    load_case_connection.execute(<<~SQL.squish)
+      INSERT INTO entry_outbox_items (company_id, generation, entry_id, payload, created_at)
+      VALUES (1, 1, 11, '{"id": 11}', now())
+    SQL
+    outbox = -> { load_case_connection.select_all("SELECT * FROM entry_outbox_items ORDER BY 1").to_a }
+    before = outbox.call
+    expect(before.size).to eq(1)
+
+    load_case_store.load_checkpoint(load_case_hard_checkpoint)
+
+    expect(outbox.call).to eq(before)
   end
 end
