@@ -60,7 +60,6 @@ RSpec.describe Analytics::DemoSeeder do
     rollback_company
     TimekeepingOwnership.current.update_columns(generation: 2, handoff_step: nil, owner: "monolith", monolith_store: "prepared")
     baseline = { users: User.count, clients: Client.count, projects: Project.count }
-    expect(baseline).to eq({ users: User.count, clients: Client.count, projects: Project.count })
 
     expect { described_class.new(company: rollback_company).process }
       .to raise_error(TimekeepingOwnership::HandoffBegun)
@@ -78,7 +77,6 @@ RSpec.describe Analytics::DemoSeeder do
     user_count = User.count
     client_count = Client.count
     project_count = Project.count
-    expect(user_count).to eq(User.count)
 
     # "The ownership record is one global row, so this refusal applies to every company at once."
     [first_company, second_company].each do |company|

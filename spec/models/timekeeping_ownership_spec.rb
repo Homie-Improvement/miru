@@ -100,12 +100,21 @@ RSpec.describe TimekeepingOwnership, type: :model do
     it "accepts the previous generation during a handoff only up to the final outbox position, and not after the flip" do
       ownership.update_columns(generation: 2, handoff_step: "freeze", final_outbox_position: 10)
 
-      expect(ownership.snapshot_generation_accepted?(generation: 1, outbox_position: 9)).to be(true)
+      # "It accepts a snapshot whose `generation` is the current owner's. During a handoff, between closing
+      # admission and the ownership flip, it also accepts the outgoing owner's previous-generation snapshots,
+      # but only up to the final outbox position captured when that owner was frozen. The flip removes that permission."
+      expect(ownership.snapshot_generation_accepted?(generation: 2, outbox_position: 99)).to be(true)
       expect(ownership.snapshot_generation_accepted?(generation: 1, outbox_position: 10)).to be(true)
       expect(ownership.snapshot_generation_accepted?(generation: 1, outbox_position: 11)).to be(false)
+      expect(ownership.snapshot_generation_accepted?(generation: 0, outbox_position: 1)).to be(false)
+      expect(ownership.snapshot_generation_accepted?(generation: 3, outbox_position: 1)).to be(false)
 
-      ownership.update_columns(handoff_step: nil)
-      expect(ownership.snapshot_generation_accepted?(generation: 1, outbox_position: 9)).to be(false)
+      ownership.update_columns(final_outbox_position: nil)
+      expect(ownership.snapshot_generation_accepted?(generation: 1, outbox_position: 1)).to be(false)
+
+      ownership.update_columns(handoff_step: nil, final_outbox_position: 10)
+      expect(ownership.snapshot_generation_accepted?(generation: 1, outbox_position: 5)).to be(false)
+      expect(ownership.snapshot_generation_accepted?(generation: 2, outbox_position: 5)).to be(true)
     end
 
     it "refuses a previous-generation snapshot whose outbox position is not an integer" do

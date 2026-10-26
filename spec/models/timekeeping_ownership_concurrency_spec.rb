@@ -12,26 +12,29 @@ RSpec.describe TimekeepingOwnership, committed_data: true do
   it "refuses a guarded block that queued behind an uncommitted handoff update once that update commits" do
     updated = Queue.new
     commit = Queue.new
+    handoff_pids = Queue.new
+    guarded_pids = Queue.new
     ran = false
-    handoff = Thread.new do
-      ActiveRecord::Base.connection_pool.with_connection do
-        ActiveRecord::Base.transaction do
-          described_class.where(id: described_class::SINGLETON_ID).update_all(handoff_step: "close_admission")
-          updated << true
-          commit.pop
-        end
+    handoff = committed_data_thread(handoff_pids) do
+      ActiveRecord::Base.transaction do
+        described_class.where(id: described_class::SINGLETON_ID).update_all(handoff_step: "close_admission")
+        updated << true
+        commit.pop
       end
     end
     updated.pop
 
-    guarded = Thread.new do
-      ActiveRecord::Base.connection_pool.with_connection do
-        described_class.unless_handoff_begun { ran = true }
-      end
+    guarded = committed_data_thread(guarded_pids) do
+      described_class.unless_handoff_begun { ran = true }
     end
 
-    expect(guarded.join(0.5)).to be_nil
-    commit << true
+    begin
+      blocked = blocked_by?(guarded_pids.pop(timeout: 5), handoff_pids.pop(timeout: 5))
+    ensure
+      commit << true
+    end
+
+    expect(blocked).to be(true), "the guarded block never waited on the uncommitted handoff update"
     handoff.join(5)
     expect(guarded.join(5)&.value).to be(false)
     expect(ran).to be(false)
@@ -46,24 +49,27 @@ RSpec.describe TimekeepingOwnership, committed_data: true do
   it "makes a handoff update of the ownership row wait until an open unless_handoff_begun block commits" do
     entered = Queue.new
     release = Queue.new
-    guarded = Thread.new do
-      ActiveRecord::Base.connection_pool.with_connection do
-        described_class.unless_handoff_begun do
-          entered << true
-          release.pop
-        end
+    guarded_pids = Queue.new
+    handoff_pids = Queue.new
+    guarded = committed_data_thread(guarded_pids) do
+      described_class.unless_handoff_begun do
+        entered << true
+        release.pop
       end
     end
     entered.pop
 
-    handoff = Thread.new do
-      ActiveRecord::Base.connection_pool.with_connection do
-        described_class.where(id: described_class::SINGLETON_ID).update_all(handoff_step: "close_admission")
-      end
+    handoff = committed_data_thread(handoff_pids) do
+      described_class.where(id: described_class::SINGLETON_ID).update_all(handoff_step: "close_admission")
     end
 
-    expect(handoff.join(0.5)).to be_nil
-    release << true
+    begin
+      blocked = blocked_by?(handoff_pids.pop(timeout: 5), guarded_pids.pop(timeout: 5))
+    ensure
+      release << true
+    end
+
+    expect(blocked).to be(true), "the handoff update never waited on the guarded block's share lock"
     expect(guarded.join(5)&.value).to be(true)
     expect(handoff.join(5)).not_to be_nil
     expect(described_class.find(described_class::SINGLETON_ID).handoff_step).to eq("close_admission")

@@ -26,7 +26,7 @@ RSpec.describe "Seed refusal once a Timekeeping handoff has begun" do
     company = create(:company, name: "Fork & Leaf Salads", business_phone: "+1 2025550123")
     TimekeepingOwnership.current.update_columns(generation: 1, handoff_step: "close_admission", owner: "monolith", monolith_store: "legacy")
     baseline = company.reload.attributes
-    expect(company.reload.attributes).to eq(baseline)
+    expect(baseline["business_phone"]).to eq("+1 2025550123")
 
     expect { load Rails.root.join("db/seeds.rb") }
       .to raise_error(TimekeepingOwnership::HandoffBegun)
