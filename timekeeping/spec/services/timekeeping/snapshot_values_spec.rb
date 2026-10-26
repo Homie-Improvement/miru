@@ -41,7 +41,9 @@ RSpec.describe Timekeeping::SnapshotValues do
       ["work_date", "2026-02-30"], ["work_date", "not a date"], ["created_at", "yesterday"], ["updated_at", nil],
       ["discarded_at", "x"], ["id", 0], ["id", "11"], ["company_id", -1], ["project_id", 0], ["user_id", "5"],
       ["agent_id", -3], ["agent_id", 0], ["note", 4], ["external_run_id", 7], ["external_session_id", []],
-      ["proof_url", 1], ["source_metadata", []], ["source_metadata", nil], ["proof_metadata", "{}"]
+      ["proof_url", 1], ["source_metadata", []], ["source_metadata", nil], ["proof_metadata", "{}"],
+      ["duration", Float::INFINITY], ["duration", Float::NAN], ["duration", BigDecimal("Infinity")],
+      ["duration", BigDecimal("NaN")]
     ]
 
     refused.each do |field, value|
@@ -71,6 +73,17 @@ RSpec.describe Timekeeping::SnapshotValues do
         .to eq([])
       expect(described_class.invalid_fields(snapshot_values_valid_snapshot.merge(field => snapshot_values_nested(97))))
         .to eq([field])
+    end
+  end
+
+  it "refuses very deep and cyclic metadata without exhausting the stack" do
+    very_deep = 10_000.times.reduce("leaf") { |value, _| { "child" => [value] } }
+    cyclic = {}
+    cyclic["child"] = cyclic
+
+    [very_deep, cyclic].each do |metadata|
+      expect(described_class.invalid_fields(snapshot_values_valid_snapshot.merge("source_metadata" => metadata)))
+        .to eq(["source_metadata"])
     end
   end
 

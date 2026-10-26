@@ -4,9 +4,10 @@ module Timekeeping
   # The values an entry snapshot may carry, field by field. The projection
   # (the monolith's Timekeeping::SnapshotBatch) refuses a whole batch when one
   # snapshot holds a value it cannot store, and the relay delivers in outbox
-  # order, so one refused snapshot holds back every later one. Every producer
-  # checks its values against these rules before it writes; each rule is at
-  # least as strict as the projection's check on the same field.
+  # order, so one refused snapshot holds back every later one. EntryCommand and
+  # Handoff::CorrectionSnapshots check their values against these rules before
+  # they write; each rule is at least as strict as the projection's check on the
+  # same field. WriteSteps.write_outbox republishes stored rows without them.
   #
   # The lists are written out here because the app deploys without the
   # contracts directory; spec/services/timekeeping/snapshot_values_spec.rb
@@ -24,22 +25,25 @@ module Timekeeping
     METADATA_MAX_NESTING = 96
     ISO_DATE = /\A[0-9]{4}-[0-9]{2}-[0-9]{2}\z/
 
-    def self.json_depth(value)
+    # Whether value nests at most levels Hashes and Arrays deep. The walk stops
+    # at the limit, so very deep or cyclic metadata is refused instead of
+    # exhausting the stack.
+    def self.nested_within?(value, levels)
       children =
         case value
         when Hash then value.values
         when Array then value
-        else return 0
+        else return true
         end
-      1 + (children.map { |child| json_depth(child) }.max || 0)
+      levels.positive? && children.all? { |child| nested_within?(child, levels - 1) }
     end
-    private_class_method :json_depth
+    private_class_method :nested_within?
 
     id = ->(value) { value.is_a?(Integer) && value.positive? }
     optional = ->(rule) { ->(value) { value.nil? || rule.call(value) } }
     text = ->(value) { value.is_a?(String) }
     one_of = ->(list) { ->(value) { list.include?(value) } }
-    metadata = ->(value) { value.is_a?(Hash) && json_depth(value) <= METADATA_MAX_NESTING }
+    metadata = ->(value) { value.is_a?(Hash) && nested_within?(value, METADATA_MAX_NESTING) }
     # In-process callers build snapshots from model attributes, so a Date or
     # Time is accepted beside the ISO text a parsed JSON body holds. Both
     # serialize to the ISO text the projection parses.
@@ -66,7 +70,8 @@ module Timekeeping
       "user_id" => id,
       "agent_id" => optional.call(id),
       "work_date" => date,
-      "duration" => ->(value) { value.is_a?(Numeric) && !value.negative? },
+      # JSON has no Infinity or NaN, so the relay could not send such a row.
+      "duration" => ->(value) { value.is_a?(Numeric) && value.finite? && !value.negative? },
       "note" => optional.call(text),
       "bill_status" => one_of.call(BILL_STATUSES),
       "review_status" => one_of.call(REVIEW_STATUSES),
