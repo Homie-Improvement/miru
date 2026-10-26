@@ -51,6 +51,13 @@ RSpec.describe "Timekeeping contract examples against fakes with one rule broken
   stale_generation_accepted = ->(**) { true }
   duration_in_hours = ->(stored) { stored / 60.0 }
   foreign_entries_visible = ->(entry:, **) { !entry.nil? && entry["discarded_at"].nil? }
+  # A copy of the shared prepare table with one row's outcome replaced; the
+  # shared frozen table itself is never changed.
+  prepare_table_answering = lambda do |replaced, outcome|
+    Timekeeping::ReservationRules::PREPARE_TABLE.map do |condition, original|
+      [condition, original == replaced ? outcome : original].freeze
+    end.freeze
+  end
 
   mutants = [
     ["keeps locked after its reservation is gone", :reservations,
@@ -104,7 +111,11 @@ RSpec.describe "Timekeeping contract examples against fakes with one rule broken
     ["counts entries to bill but writes no bill_status", :reservations,
      { timekeeping: { service_command_writes: ->(route:) { route != "mark_billed" } } }],
     ["counts entries to detach but writes no agent_id", :reservations,
-     { timekeeping: { service_command_writes: ->(route:) { route != "detach_entries" } } }]
+     { timekeeping: { service_command_writes: ->(route:) { route != "detach_entries" } } }],
+    ["reserves an entry committed to another active invoice", :reservations,
+     { timekeeping: { prepare_table: prepare_table_answering.call(:on_another_invoice, :add_provisional) } }],
+    ["reserves an entry held provisionally by another operation", :reservations,
+     { timekeeping: { prepare_table: prepare_table_answering.call(:provisional_elsewhere, :add_provisional) } }]
   ]
 
   it "passes every group with the unbroken fakes" do

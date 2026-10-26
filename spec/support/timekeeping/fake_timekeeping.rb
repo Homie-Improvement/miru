@@ -58,6 +58,8 @@ module TimekeepingContract
       # it counts: always.
       service_command_writes: ->(route:) { true },
       replay_terminal_prepare: true,
+      # The section 7.2 prepare decision table the fake answers from.
+      prepare_table: ReservationRules::PREPARE_TABLE,
       snapshot_entry: ->(entry, credentials:) { entry },
       # Whether an entry write carries a credential Timekeeping holds anywhere
       # in its body. Such a write is refused, so the snapshot it would publish
@@ -429,12 +431,13 @@ module TimekeepingContract
 
       def prepare_outcome(entry_id, company_id, invoice_id)
         current = @reservations.select { |reservation| reservation[:entry_id] == entry_id }
-        ReservationRules.prepare_outcome(
+        facts = {
           in_company: !visible_entry(entry_id, company_id).nil?,
           committed: current.find { |reservation| reservation[:state] == "committed" },
           provisional: current.find { |reservation| reservation[:state] == "provisional" },
           invoice_id:
-        )
+        }
+        ReservationRules.prepare_outcome(facts, table: @policies[:prepare_table])
       end
 
       def prepare_answer(operation)
