@@ -67,6 +67,9 @@ RSpec.describe Invoices::BulkDeletionService do
     ids = [deletable.id, paid.id]
     line_item_ids = InvoiceLineItem.where(invoice_id: ids).pluck(:id)
     tax_ids = InvoiceTax.where(invoice_id: ids).pluck(:id)
+    # One line item and one tax were created for each of the two invoices.
+    expect(line_item_ids.size).to eq(2)
+    expect(tax_ids.size).to eq(2)
     TimekeepingOwnership.current.update!(handoff_step: "close_admission")
 
     expect {
