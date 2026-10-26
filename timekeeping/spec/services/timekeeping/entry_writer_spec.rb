@@ -138,6 +138,75 @@ RSpec.describe Timekeeping::EntryWriter do
     expect(IdempotencyReceipt.count).to eq(1)
   end
 
+  # The monolith refuses a locked edit while the user's lowest-id role in the
+  # company is employee, even when they also hold admin there, so a token's
+  # raised admin role must not let the writer change a reserved entry.
+  describe "an admin token whose signed primary role is employee" do
+    let(:raised_admin) { timekeeping_arrange.user(company:, role: "admin") }
+    let(:colleague) { timekeeping_arrange.user(company:, role: "employee") }
+
+    def raised_admin_token(primary_role:)
+      now = Time.now.to_i
+      JWT.encode({ sub: raised_admin, company_id: company, role: "admin", primary_role:, purpose: "write", iat: now,
+                   exp: now + 300, jti: SecureRandom.uuid }, TimekeepingProviderArrange.signing_key, "RS256")
+    end
+
+    def colleague_entry(reserved:)
+      timekeeping_arrange.entry(company:, user: colleague, project:).tap do |id|
+        next unless reserved
+
+        Reservation.create!(company_id: company, entry_id: id, invoice_id: 701, state: "committed",
+                            disposition: "active", operation_id: SecureRandom.uuid, created_at: Time.current)
+      end
+    end
+
+    def raised_admin_call(route, primary_role:, **options)
+      described_class.new.call(build_entry_command(route, token: raised_admin_token(primary_role:), **options))
+    end
+
+    it "refuses an update of a colleague's reserved entry and leaves it unchanged" do
+      reserved = colleague_entry(reserved: true)
+      before = entry_write_counts
+
+      outcome = raised_admin_call(:update, primary_role: "employee", entry_id: reserved, body: { "duration" => 5.0 })
+
+      expect([outcome.status, JSON.parse(outcome.body)]).to eq([403, { "reason" => "forbidden" }])
+      expect(entry_write_counts).to eq(before)
+      expect(Entry.find(reserved).attributes).to include("duration" => 90.0, "version" => 1)
+    end
+
+    it "updates a colleague's unreserved entry" do
+      free = colleague_entry(reserved: false)
+
+      outcome = raised_admin_call(:update, primary_role: "employee", entry_id: free, body: { "note" => "Edited" })
+
+      expect(outcome.status).to eq(200)
+      expect(Entry.find(free).note).to eq("Edited")
+    end
+
+    it "updates a colleague's reserved entry when the primary role is admin too" do
+      reserved = colleague_entry(reserved: true)
+
+      outcome = raised_admin_call(:update, primary_role: "admin", entry_id: reserved, body: { "note" => "Edited" })
+
+      expect(outcome.status).to eq(200)
+      expect(Entry.find(reserved).note).to eq("Edited")
+    end
+
+    it "skips a colleague's reserved entry on a bulk move and moves the unreserved one" do
+      reserved = colleague_entry(reserved: true)
+      free = colleague_entry(reserved: false)
+      target_project = timekeeping_arrange.project(company:)
+
+      outcome = raised_admin_call(:bulk_move, primary_role: "employee",
+                                              body: { "entry_ids" => [reserved, free], "project_id" => target_project })
+
+      expect(outcome.status).to eq(200)
+      expect(Entry.find(reserved).project_id).to eq(project)
+      expect(Entry.find(free).project_id).to eq(target_project)
+    end
+  end
+
   it "discards on DELETE and carries discarded_at in the outbox row" do
     outcome = described_class.new.call(command(:destroy, entry_id:))
 

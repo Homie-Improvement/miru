@@ -19,8 +19,10 @@ module Timekeeping
 
     # Claims a token may leave out, but must type correctly when it carries
     # them. A purpose of the wrong type is refused here, so it can never be
-    # read as a token signed without a purpose, which may write.
-    OPTIONAL_CLAIM_TYPES = { "purpose" => String }.freeze
+    # read as a token signed without a purpose, which may write. A
+    # primary_role of the wrong type is refused for the same reason: read as
+    # absent, it would fall back to the token's role, which may be raised.
+    OPTIONAL_CLAIM_TYPES = { "purpose" => String, "primary_role" => String }.freeze
 
     class InvalidToken < StandardError; end
 

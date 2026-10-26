@@ -15,7 +15,9 @@ module TimekeepingRules
     # other role, an unknown one included, is non-privileged.
     PRIVILEGED_ROLES = %w[owner admin].freeze
 
-    # A6 and A7 bind only this role, as the model's validations do today.
+    # A6 and A7 bind only this primary role, as the model's validations do
+    # today: they compare the user's lowest-id role in the company
+    # (User#primary_role), not the owner or admin role a token may carry.
     EMPLOYEE_ROLE = "employee"
     BILLED = "billed"
 
@@ -112,19 +114,21 @@ module TimekeepingRules
     # The ids of every rule in CHANGE_RULES that refuses this change of one
     # entry, in table order. change: is { action: :update | :delete | :move,
     # bill_status: new status or nil }; entry: is { id:, user_id:, work_date:,
-    # bill_status:, locked: }.
-    def refusing_rules(caller:, change:, role:, acting_user_id:, entry:, edit_days:, today:)
+    # bill_status:, locked: }. role decides A3 and A4; primary_role, the
+    # user's lowest-id role in the company, decides A6 and A7. primary_role
+    # has no default, so no caller can fall back to a raised role for them.
+    def refusing_rules(caller:, change:, role:, primary_role:, acting_user_id:, entry:, edit_days:, today:)
       check_caller!(caller)
       check_action!(change, ACTIONS)
-      facts = change_facts(caller:, change:, role:, acting_user_id:, entry:, edit_days:, today:)
+      facts = change_facts(caller:, change:, role:, primary_role:, acting_user_id:, entry:, edit_days:, today:)
       CHANGE_RULES.filter_map { |rule_id, binds, refuses| rule_id if binds.call(facts) && refuses.call(facts) }
     end
 
     # A2 to A4, A6, A7, A10, A11 for an update or delete of one entry.
-    def change_decision(caller:, change:, role:, acting_user_id:, entry:, edit_days:, today:)
+    def change_decision(caller:, change:, role:, primary_role:, acting_user_id:, entry:, edit_days:, today:)
       check_caller!(caller)
       check_action!(change, CHANGE_ACTIONS)
-      refusals = refusing_rules(caller:, change:, role:, acting_user_id:, entry:, edit_days:, today:)
+      refusals = refusing_rules(caller:, change:, role:, primary_role:, acting_user_id:, entry:, edit_days:, today:)
       refusals.empty? ? :ok : :forbidden
     end
 
@@ -132,11 +136,11 @@ module TimekeepingRules
     # returned, so one refused entry refuses the whole request wherever it
     # sits in the list. Entries are judged before they are keyed by id, so an
     # id listed twice cannot hide a refusal; it is skipped if either copy is.
-    def bulk_decision(caller:, change:, role:, acting_user_id:, entries:, edit_days:, today:)
+    def bulk_decision(caller:, change:, role:, primary_role:, acting_user_id:, entries:, edit_days:, today:)
       check_caller!(caller)
       check_action!(change, BULK_ACTIONS)
       refusals = entries.map do |entry|
-        [entry[:id], refusing_rules(caller:, change:, role:, acting_user_id:, entry:, edit_days:, today:)]
+        [entry[:id], refusing_rules(caller:, change:, role:, primary_role:, acting_user_id:, entry:, edit_days:, today:)]
       end
       return :forbidden if refusals.any? { |_id, rules| rules.intersect?(WHOLE_REQUEST_RULES) }
 
@@ -145,7 +149,7 @@ module TimekeepingRules
       end
     end
 
-    def change_facts(caller:, change:, role:, acting_user_id:, entry:, edit_days:, today:)
+    def change_facts(caller:, change:, role:, primary_role:, acting_user_id:, entry:, edit_days:, today:)
       user_delegated = caller == USER_DELEGATED
       # A background caller carries no role, so its role is never read.
       privileged = user_delegated && privileged?(role)
@@ -154,7 +158,7 @@ module TimekeepingRules
         action: change[:action],
         user_delegated:,
         privileged:,
-        employee: user_delegated && role == EMPLOYEE_ROLE,
+        employee: user_delegated && primary_role == EMPLOYEE_ROLE,
         own: entry[:user_id] == acting_user_id,
         billed: entry[:bill_status] == BILLED,
         locked: entry[:locked] == true,

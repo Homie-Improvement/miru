@@ -44,23 +44,25 @@ module Timekeeping
     end
 
     # A2 to A4, A6, A7 for an update or delete of one locked entry. entry: is
-    # { id:, user_id:, work_date:, bill_status:, locked: }.
-    def change(action:, bill_status:, role:, acting_user_id:, entry:, edit_days:, today:)
+    # { id:, user_id:, work_date:, bill_status:, locked: }. primary_role is
+    # the token's primary role, which decides A6 and A7.
+    def change(action:, bill_status:, role:, primary_role:, acting_user_id:, entry:, edit_days:, today:)
       TimekeepingRules::EntryRules.change_decision(
         caller: TimekeepingRules::EntryRules::USER_DELEGATED,
         change: { action:, bill_status: },
-        role:, acting_user_id:, entry:, edit_days:, today:
+        role:, primary_role:, acting_user_id:, entry:, edit_days:, today:
       )
     end
 
     # A9 for a bulk move or delete: :forbidden refuses the whole request,
-    # otherwise each entry id maps to :apply or :skip (an employee's move of a
-    # reserved entry). Only entries the caller may see are passed in.
-    def bulk(action:, role:, acting_user_id:, entries:, edit_days:, today:)
+    # otherwise each entry id maps to :apply or :skip (a move of a reserved
+    # entry by a user whose primary role is employee). Only entries the caller
+    # may see are passed in.
+    def bulk(action:, role:, primary_role:, acting_user_id:, entries:, edit_days:, today:)
       TimekeepingRules::EntryRules.bulk_decision(
         caller: TimekeepingRules::EntryRules::USER_DELEGATED,
         change: { action: },
-        role:, acting_user_id:, entries:, edit_days:, today:
+        role:, primary_role:, acting_user_id:, entries:, edit_days:, today:
       )
     end
 
