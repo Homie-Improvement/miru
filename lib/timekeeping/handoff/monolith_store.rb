@@ -106,24 +106,7 @@ module Timekeeping
         def read_rows(table)
           check_columns!(table)
           order = READ_ORDER.fetch(table).map { |column| connection.quote_column_name(column) }.join(", ")
-          result = connection.select_all("SELECT * FROM #{connection.quote_table_name(table)} ORDER BY #{order}")
-          jsonb_columns = result.columns.select { |column| result.column_types[column]&.type == :jsonb }
-
-          result.cast_values.zip(result.rows).map do |values, raw_values|
-            row = result.columns.zip(values).to_h
-            jsonb_columns.each { |column| row[column] = parse_jsonb(raw_values[result.columns.index(column)]) }
-            row
-          end
-        end
-
-        # Active Record's jsonb cast turns every decimal into a Float, which
-        # rounds a number finer than a double. BigDecimal keeps it as stored.
-        # The cast also reads JSON null as nil, the same as SQL NULL.
-        def parse_jsonb(text)
-          return if text.nil?
-
-          value = JSON.parse(text, decimal_class: BigDecimal)
-          value.nil? ? Checkpoint::JSON_NULL : value
+          RowReader.select_rows(connection, "SELECT * FROM #{connection.quote_table_name(table)} ORDER BY #{order}")
         end
 
         # JSON text with each BigDecimal written as a bare number. The default

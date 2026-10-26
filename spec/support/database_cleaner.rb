@@ -5,8 +5,15 @@ RSpec.configure do |config|
   # transaction, so a transaction, isolation level or lock the code under test
   # opens is real rather than a savepoint. They start and end with every table
   # truncated and every id sequence restarted.
+  #
+  # Examples tagged :seeded_without_transaction, used with :two_tenant_seed,
+  # also run outside that transaction but are not truncated, so the seed the
+  # group loaded once survives between its examples. The group's own
+  # truncation cleans up when it finishes; an example that writes rows needs
+  # a group of its own.
   outside_transaction = ->(example) {
-    example.metadata[:type] == :system || example.metadata[:without_transaction]
+    example.metadata[:type] == :system || example.metadata[:without_transaction] ||
+      example.metadata[:seeded_without_transaction]
   }
 
   config.before(:suite) do
