@@ -6,10 +6,18 @@ RSpec.describe Analytics::DemoSeeder do
   describe "#process" do
     let(:company) { create(:company, base_currency: "USD", standard_price: 120) }
 
-    it "creates linked analytics demo data" do
+    # "The initial legacy state still seeds and destroys as today"
+    it "creates linked analytics demo data in the initial legacy ownership state without touching the ownership row" do
+      company
+      TimekeepingOwnership.current.update_columns(generation: 1, handoff_step: nil, owner: "monolith", monolith_store: "legacy")
+      user_count = User.count
+
       result = described_class.new(company: company).process
 
       expect(result[:company]).to eq(company)
+      expect(User.count).to be > user_count
+      expect(TimekeepingOwnership.pluck(:generation, :handoff_step, :owner, :monolith_store))
+        .to eq([[1, nil, "monolith", "legacy"]])
       expect(company.clients.where("name LIKE ?", "Analytics Demo%").count).to be >= 3
       expect(company.projects.count).to be >= 5
       expect(company.timesheet_entries.count).to be >= 15
@@ -88,23 +96,6 @@ RSpec.describe Analytics::DemoSeeder do
     expect(Project.count).to eq(project_count)
     expect(first_company.clients.count).to eq(0)
     expect(second_company.clients.count).to eq(0)
-  end
-end
-
-RSpec.describe Analytics::DemoSeeder do
-  it "seeds users and clients in the initial legacy ownership state without touching the ownership row" do
-    legacy_company = create(:company, base_currency: "USD", standard_price: 120)
-    TimekeepingOwnership.current.update_columns(generation: 1, handoff_step: nil, owner: "monolith", monolith_store: "legacy")
-    user_count = User.count
-
-    # "The initial legacy state still seeds and destroys as today"
-    result = described_class.new(company: legacy_company).process
-
-    expect(result[:company]).to eq(legacy_company)
-    expect(User.count).to be > user_count
-    expect(legacy_company.clients.where("name LIKE ?", "Analytics Demo%").count).to be >= 3
-    expect(TimekeepingOwnership.pluck(:generation, :handoff_step, :owner, :monolith_store))
-      .to eq([[1, nil, "monolith", "legacy"]])
   end
 end
 
