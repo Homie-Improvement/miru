@@ -50,6 +50,11 @@ module Timekeeping
       end
     end
 
+    # Emits one signal per difference and returns the differences unchanged.
+    def self.report(differences)
+      differences.each { |difference| Rails.event.notify(FinancialSnapshotChanged.new(difference)) }
+    end
+
     def initialize(company:)
       @company = company
     end
