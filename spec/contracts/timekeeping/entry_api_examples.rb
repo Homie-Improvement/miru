@@ -130,7 +130,8 @@ RSpec.shared_examples "timekeeping entry API contract" do
     end
 
     it "answers another company's agent exactly as an agent that does not exist, and creates nothing" do
-      foreign_agent = timekeeping_arrange.agent(company: other_company, user: foreign_owner)
+      # The agent belongs to the entry's own user, so only its company is wrong.
+      foreign_agent = timekeeping_arrange.agent(company: other_company, user: owner)
 
       foreign = create_entry(company, owner_token, entry_body(project:, agent_id: foreign_agent))
       missing = create_entry(company, owner_token, entry_body(project:, agent_id: TimekeepingContractExampleHelpers::MISSING_ID))

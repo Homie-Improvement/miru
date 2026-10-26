@@ -229,15 +229,34 @@ RSpec.describe Timekeeping::EntryWriter, "agent ownership" do
       .to include("id" => entry.id, "agent_id" => owners_agent, "user_id" => agent_owner_user)
   end
 
-  it "clears an entry's agent with a null agent_id update" do
+  it "commits an update that keeps the stored agent, checked against the stored user" do
     entry_id = timekeeping_arrange.entry(company: agent_company, user: agent_owner_user, project: agent_project,
                                          agent_id: owners_agent)
-    patch = build_entry_command(:update, token: agent_owner_token, entry_id:, body: { "agent_id" => nil })
+    patch = build_entry_command(:update, token: agent_owner_token, entry_id:, body: { "note" => "Edited" })
 
     outcome = described_class.new.call(patch)
 
     expect(outcome.status).to eq(200)
-    expect(Entry.find(entry_id).agent_id).to be_nil
+    entry = Entry.find(entry_id)
+    expect([entry.agent_id, entry.user_id, entry.note]).to eq([owners_agent, agent_owner_user, "Edited"])
+    expect(OutboxSnapshot.sole.attributes)
+      .to include("id" => entry_id, "agent_id" => owners_agent, "user_id" => agent_owner_user)
+  end
+
+  it "commits an update that changes user_id and agent_id together to another valid pair" do
+    entry_id = timekeeping_arrange.entry(company: agent_company, user: agent_owner_user, project: agent_project,
+                                         agent_id: owners_agent)
+    other_users_agent = timekeeping_arrange.agent(company: agent_company, user: agent_other_user)
+    patch = build_entry_command(:update, token: agent_owner_token, entry_id:,
+                                         body: { "user_id" => agent_other_user, "agent_id" => other_users_agent })
+
+    outcome = described_class.new.call(patch)
+
+    expect(outcome.status).to eq(200)
+    entry = Entry.find(entry_id)
+    expect([entry.agent_id, entry.user_id]).to eq([other_users_agent, agent_other_user])
+    expect(OutboxSnapshot.sole.attributes)
+      .to include("id" => entry_id, "agent_id" => other_users_agent, "user_id" => agent_other_user)
   end
 
   it "replays a committed agent create after its agent leaves the reference facts and writes no second row" do

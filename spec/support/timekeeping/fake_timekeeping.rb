@@ -41,7 +41,7 @@ module TimekeepingContract
       [->(pair) { pair[:agent]&.fetch("company_id") != pair[:company_id] }, :not_found],
       [->(pair) { pair[:agent].fetch("user_id") != pair[:user_id] }, :not_found],
       [->(_pair) { true }, :ok]
-    ].freeze
+    ].map(&:freeze).freeze
 
     # Whether a credential may call a reservation route, in order.
     SERVICE_ACCESS_TABLE = [
