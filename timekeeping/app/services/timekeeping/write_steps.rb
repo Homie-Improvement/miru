@@ -12,6 +12,28 @@ module Timekeeping
     # The one key every writer takes just before its outbox inserts and holds
     # until commit, so outbox positions commit in the order they were drawn.
     OUTBOX_LOCK_KEY = 2_026_034_001
+    UNPUBLISHABLE_REASON = :unpublishable_entry
+
+    # Raised by write_outbox when a stored row breaks a SnapshotValues rule.
+    # entries maps each such entry id to its failing field names. The message
+    # and the answer name fields only, never a stored value, so nothing a row
+    # holds leaves in a response or a log line.
+    class UnpublishableRows < StandardError
+      attr_reader :entries
+
+      def initialize(entries)
+        @entries = entries
+        super("stored entries hold values a snapshot may not carry: " \
+              "#{entries.map { |id, fields| "entry #{id} (#{fields.join(', ')})" }.join('; ')}")
+      end
+
+      # The refusal a writer answers with once its transaction has rolled back.
+      def outcome
+        listed = entries.map { |id, fields| { "entry_id" => id, "fields" => fields } }
+        WriteOutcome.success(Reasons.status(UNPUBLISHABLE_REASON),
+                             "reason" => UNPUBLISHABLE_REASON.to_s, "entries" => listed)
+      end
+    end
 
     module_function
 
@@ -45,11 +67,20 @@ module Timekeeping
     end
 
     # One outbox snapshot per row, each read with EntriesQuery::RESERVED.
+    # Stored rows can hold values that never passed SnapshotValues, such as
+    # ones a checkpoint load copied in, and the projection would refuse such
+    # a snapshot and hold back every later delivery. So every row is checked
+    # first, and one bad row raises UnpublishableRows with nothing inserted;
+    # the caller's transaction then rolls the whole write back.
     def write_outbox(rows, generation)
       return if rows.empty?
 
+      snapshots = rows.map { |row| OutboxFields.row(row, generation:) }
+      invalid = SnapshotValues.invalid_snapshots(snapshots)
+      raise UnpublishableRows, invalid if invalid.any?
+
       connection.execute(ApplicationRecord.sanitize_sql_array(["SELECT pg_advisory_xact_lock(?)", OUTBOX_LOCK_KEY]))
-      OutboxSnapshot.insert_all!(rows.map { |row| OutboxFields.row(row, generation:) })
+      OutboxSnapshot.insert_all!(snapshots)
     end
 
     def connection

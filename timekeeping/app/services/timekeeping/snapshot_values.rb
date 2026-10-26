@@ -7,7 +7,8 @@ module Timekeeping
   # order, so one refused snapshot holds back every later one. EntryCommand and
   # Handoff::CorrectionSnapshots check their values against these rules before
   # they write; each rule is at least as strict as the projection's check on the
-  # same field. WriteSteps.write_outbox republishes stored rows without them.
+  # same field. WriteSteps.write_outbox checks every stored row it republishes
+  # against them too, since a stored value may never have passed these checks.
   #
   # The lists are written out here because the app deploys without the
   # contracts directory; spec/services/timekeeping/snapshot_values_spec.rb
@@ -92,6 +93,12 @@ module Timekeeping
     # RULES order; [] when every value is valid.
     def self.invalid_fields(snapshot)
       RULES.reject { |field, valid| valid.call(snapshot[field]) }.keys
+    end
+
+    # Each snapshot that breaks a rule, as its entry id mapped to the fields
+    # invalid_fields names; {} when every snapshot is valid.
+    def self.invalid_snapshots(snapshots)
+      snapshots.to_h { |snapshot| [snapshot["id"], invalid_fields(snapshot)] }.reject { |_, fields| fields.empty? }
     end
   end
 end
