@@ -149,6 +149,56 @@ RSpec.describe "Company-scope params builder report with stray requests" do
     expect(report[:builders]).to eq(["post_company_scope_invoice"])
     expect(report[:stray_requests]).to eq(2)
   end
+
+  # "The issue asks for \"one params helper\"" - lifting the lambda ban must not let a lambda send requests around the builder.
+  it "reports a lambda inside an example that sends the request as a stray request beside the one builder" do
+    section = <<~RUBY
+      RSpec.describe "Api::V1::Invoices#update timesheet entry company scope", type: :request do
+        def patch_company_scope_line(line, entry_ref)
+          send_request :patch, api_v1_invoice_path(scope_invoice), params: { invoice: {} }
+          [response.status, response.body]
+        end
+
+        it "refuses" do
+          sneaky = -> { send_request :patch, api_v1_invoice_path(scope_invoice), params: { invoice: {} } }
+          sneaky.call
+        end
+      end
+    RUBY
+
+    report = params_builder_report(section)
+
+    expect(report[:builders]).to eq(["patch_company_scope_line"])
+    expect(report[:stray_requests]).to eq(1)
+  end
+end
+
+RSpec.describe "Company-scope params builder report with a nested second builder" do
+  # "Limit the check to parameter builders, or remove the blanket method and lambda counts."
+  # Narrowing the count must still see a second method that sends a request, even one nested deeper than the first.
+  it "reports both builders when a second method inside a context also sends a company-scope request" do
+    section = <<~RUBY
+      RSpec.describe "Api::V1::Invoices#create timesheet entry company scope", type: :request do
+        def post_company_scope_invoice(*entry_refs)
+          send_request :post, api_v1_invoices_path, params: { invoice: {} }
+          [response.status, response.body]
+        end
+
+        context "with a nested helper" do
+          def post_again(entry_ref)
+            [1].each do
+              send_request :post, api_v1_invoices_path, params: { invoice: entry_ref }
+            end
+          end
+        end
+      end
+    RUBY
+
+    report = params_builder_report(section)
+
+    expect(report[:builders]).to contain_exactly("post_company_scope_invoice", "post_again")
+    expect(report[:stray_requests]).to eq(0)
+  end
 end
 
 RSpec.describe "Company-scope params builder report with comments" do
