@@ -4,32 +4,7 @@
 
 require "rails_helper"
 
-RSpec.describe Timekeeping::ProjectionConsumer do
-  it "consumer refuses a higher-version snapshot whose company_id differs from the stored row and leaves the row unchanged" do
-    company_a = create(:company)
-    company_b = create(:company)
-    project_a = create(:project, client: create(:client, company: company_a))
-    project_b = create(:project, client: create(:client, company: company_b))
-    stored = create(:timesheet_entry, project: project_a, user: create(:user), note: "Company A private note")
-    stored.update_columns(company_id: company_a.id, version: 1)
-    before = stored.reload.attributes
-    expect(before).to include("company_id" => company_a.id, "version" => 1, "note" => "Company A private note")
-
-    entry = TimekeepingSnapshots.entry(id: stored.id, company_id: company_b.id, version: 5, project_id: project_b.id,
-                                       user_id: create(:user).id, note: "Company B overwrite")
-    batch = TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation: TimekeepingOwnership.current.generation))
-
-    # "A snapshot whose `company_id` differs from the row's is refused."
-    # The version is higher on purpose, so only the company check can refuse it.
-    result = described_class.call(batch:, idempotency_key: SecureRandom.uuid)
-
-    expect(result.status).to eq(409)
-    expect(result.body.to_h.stringify_keys).to eq("reason" => "stale_generation")
-    expect(result.body.to_s).not_to include(company_a.id.to_s)
-    expect(stored.reload.attributes).to eq(before)
-  end
-end
-
+# Every ProjectionConsumer rule is asserted by one example in this file, so a rule change is one spec edit.
 RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
   let(:rules_company) { create(:company) }
   let(:rules_project) { create(:project, client: create(:client, company: rules_company)) }
@@ -40,12 +15,16 @@ RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
     TimekeepingSnapshots.entry(id:, company_id:, version:, project_id:, user_id:, **fields)
   end
 
-  def rules_batch(entry, generation: TimekeepingOwnership.current.generation, outbox_position: 1)
-    TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation:, outbox_position:))
+  def rules_item(entry, generation: TimekeepingOwnership.current.generation, outbox_position: 1)
+    TimekeepingSnapshots.item(entry, generation:, outbox_position:)
   end
 
-  def rules_deliver(entry)
-    result = described_class.call(batch: rules_batch(entry), idempotency_key: nil)
+  def rules_batch(entry, **item)
+    TimekeepingSnapshots.batch(rules_item(entry, **item))
+  end
+
+  def rules_deliver(entry, **item)
+    result = described_class.call(batch: rules_batch(entry, **item), idempotency_key: nil)
     [result.status, result.body]
   end
 
@@ -53,13 +32,111 @@ RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
     ActiveRecord::Base.connection.select_one("SELECT * FROM timesheet_entries WHERE id = #{Integer(id)}")
   end
 
+  let(:rules_applied) { [200, { "applied" => 1, "ignored" => 0 }] }
+  let(:rules_ignored) { [200, { "applied" => 0, "ignored" => 1 }] }
+  let(:rules_stale) { [409, { "reason" => "stale_generation" }] }
+  let(:rules_invalid) { [422, { "reason" => "invalid_snapshot" }] }
+
   it "applies v2, ignores a later v1 and an equal v2, and keeps v2's data" do
-    expect(rules_deliver(rules_entry(id: 91_001, version: 2))).to eq([200, { "applied" => 1, "ignored" => 0 }])
-    expect(rules_deliver(rules_entry(id: 91_001, version: 1))).to eq([200, { "applied" => 0, "ignored" => 1 }])
-    expect(rules_deliver(rules_entry(id: 91_001, version: 2, note: "same version, other note")))
-      .to eq([200, { "applied" => 0, "ignored" => 1 }])
+    expect(rules_deliver(rules_entry(id: 91_001, version: 2))).to eq(rules_applied)
+    expect(rules_deliver(rules_entry(id: 91_001, version: 1))).to eq(rules_ignored)
+    expect(rules_deliver(rules_entry(id: 91_001, version: 2, note: "same version, other note"))).to eq(rules_ignored)
 
     expect(rules_row(91_001)).to include("version" => 2, "note" => "v2")
+  end
+
+  it "applies a create and an update of one entry delivered in the same batch, in outbox order" do
+    # A paused relay sends every unsent snapshot at once, so one batch can hold several versions of one entry.
+    # Listed out of order on purpose: the consumer applies snapshots in outbox_position order.
+    # "It upserts by entry `id` and applies a snapshot only when its `version` is higher than the row's."
+    batch = TimekeepingSnapshots.batch(rules_item(rules_entry(id: 91_011, version: 2), outbox_position: 2),
+                                       rules_item(rules_entry(id: 91_011, version: 1), outbox_position: 1))
+
+    result = described_class.call(batch:, idempotency_key: nil)
+
+    expect([result.status, result.body]).to eq([200, { "applied" => 2, "ignored" => 0 }])
+    expect(rules_row(91_011)).to include("version" => 2, "note" => "v2", "company_id" => rules_company.id)
+  end
+
+  it "consumer refuses a higher-version snapshot whose company_id differs from the stored row and leaves the row unchanged" do
+    other_company = create(:company)
+    other_project = create(:project, client: create(:client, company: other_company))
+    stored = create(:timesheet_entry, project: rules_project, user: rules_user, note: "Company A private note")
+    stored.update_columns(company_id: rules_company.id, version: 1)
+    before = stored.reload.attributes
+    expect(before).to include("company_id" => rules_company.id, "version" => 1, "note" => "Company A private note")
+
+    entry = rules_entry(id: stored.id, version: 5, company_id: other_company.id, project_id: other_project.id,
+                        user_id: create(:user).id, note: "Company B overwrite")
+
+    # "A snapshot whose `company_id` differs from the row's is refused."
+    # The version is higher on purpose, so only the company check can refuse it.
+    result = described_class.call(batch: rules_batch(entry), idempotency_key: SecureRandom.uuid)
+
+    expect([result.status, result.body.to_h.deep_stringify_keys]).to eq(rules_stale)
+    expect(result.body.to_s).not_to include(rules_company.id.to_s)
+    expect(stored.reload.attributes).to eq(before)
+  end
+
+  it "keeps a tombstone row and does not let a later lower version bring the entry back" do
+    # "A discard arrives as a snapshot with `discarded_at` set (a 'tombstone'), never as a row delete."
+    discard = rules_deliver(rules_entry(id: 91_012, version: 3, discarded_at: "2026-03-03T10:00:00Z"))
+    late = rules_deliver(rules_entry(id: 91_012, version: 2))
+
+    expect(discard).to eq(rules_applied)
+    expect(late).to eq(rules_ignored)
+    rows = TimesheetEntry.with_discarded.where(id: 91_012).to_a
+    expect(rows.map { |row| [row.version, row.discarded_at] }).to eq([[3, Time.utc(2026, 3, 3, 10)]])
+    expect(TimesheetEntry.kept.where(id: 91_012)).to be_empty
+  end
+
+  it "writes nothing from a batch whose valid snapshots come before a stale one" do
+    TimekeepingOwnership.current.update!(generation: 2)
+    batch = TimekeepingSnapshots.batch(
+      rules_item(rules_entry(id: 91_013, version: 1), generation: 2, outbox_position: 1),
+      rules_item(rules_entry(id: 91_014, version: 1), generation: 2, outbox_position: 2),
+      rules_item(rules_entry(id: 91_015, version: 1), generation: 1, outbox_position: 3)
+    )
+
+    # A write loop that stops at the first refusal must not leave the earlier items behind.
+    result = described_class.call(batch:, idempotency_key: SecureRandom.uuid)
+
+    expect([result.status, result.body.to_h.deep_stringify_keys]).to eq(rules_stale)
+    expect(TimesheetEntry.with_discarded.where(id: [91_013, 91_014, 91_015])).to be_empty
+  end
+
+  it "refuses a new entry whose project belongs to another company so it never reaches that company's reports" do
+    other_company = create(:company)
+    other_project = create(:project, client: create(:client, company: other_company))
+
+    # Company#timesheet_entries joins through clients and projects, so a row
+    # filed under another company's project would show in that company's reports.
+    expect(rules_deliver(rules_entry(id: 91_016, version: 1, project_id: other_project.id,
+                                     note: "company A private note"))).to eq(rules_invalid)
+    expect(TimesheetEntry.unscoped.where(id: 91_016)).to be_empty
+    expect(other_company.timesheet_entries.where(id: 91_016)).to be_empty
+    expect(other_company.timesheet_entries.where(note: "company A private note")).to be_empty
+  end
+
+  it "accepts the previous generation through position P during a handoff and refuses it past P and after the flip" do
+    TimekeepingOwnership.current.update!(generation: 2, handoff_step: "freeze", final_outbox_position: 10)
+
+    # "During a handoff, between closing admission and the ownership flip, it also accepts the outgoing owner's
+    # previous-generation snapshots, but only up to the final outbox position captured when that owner was frozen.
+    # The flip removes that permission."
+    expect(rules_deliver(rules_entry(id: 91_017, version: 1), generation: 1, outbox_position: 10)).to eq(rules_applied)
+    expect(rules_deliver(rules_entry(id: 91_017, version: 2), generation: 1, outbox_position: 11)).to eq(rules_stale)
+    expect(rules_row(91_017)).to include("version" => 1)
+
+    # The flip clears handoff_step; P is left set on purpose, so the refusal
+    # below P must come from the flip and not from a cleared position.
+    TimekeepingOwnership.current.update!(owner: "timekeeping", handoff_step: nil)
+    expect(TimekeepingOwnership.current.final_outbox_position).to eq(10)
+    expect(rules_deliver(rules_entry(id: 91_017, version: 3), generation: 1, outbox_position: 5)).to eq(rules_stale)
+    expect(rules_row(91_017)).to include("version" => 1)
+
+    expect(rules_deliver(rules_entry(id: 91_017, version: 4), generation: 2, outbox_position: 12)).to eq(rules_applied)
+    expect(rules_row(91_017)).to include("version" => 4)
   end
 
   it "stores the snapshot's values as sent, with its company and enums mapped to their stored integers" do
@@ -73,11 +150,9 @@ RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
   end
 
   it "answers invalid_snapshot and writes nothing for an unknown key, a string id or an unknown bill_status" do
-    invalid = { "reason" => "invalid_snapshot" }
-
-    expect(rules_deliver(rules_entry(id: 91_003, version: 1).merge("hours" => 1.5))).to eq([422, invalid])
-    expect(rules_deliver(rules_entry(id: 91_003, version: 1).merge("id" => "91003"))).to eq([422, invalid])
-    expect(rules_deliver(rules_entry(id: 91_003, version: 1, bill_status: "paid"))).to eq([422, invalid])
+    expect(rules_deliver(rules_entry(id: 91_003, version: 1).merge("hours" => 1.5))).to eq(rules_invalid)
+    expect(rules_deliver(rules_entry(id: 91_003, version: 1).merge("id" => "91003"))).to eq(rules_invalid)
+    expect(rules_deliver(rules_entry(id: 91_003, version: 1, bill_status: "paid"))).to eq(rules_invalid)
     expect(rules_row(91_003)).to be_nil
   end
 
@@ -85,28 +160,49 @@ RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
     other_company = create(:company)
     other_project = create(:project, client: create(:client, company: other_company))
     batch = TimekeepingSnapshots.batch(
-      TimekeepingSnapshots.item(rules_entry(id: 91_007, version: 1), generation: 1, outbox_position: 1),
-      TimekeepingSnapshots.item(
-        rules_entry(id: 91_007, version: 2, company_id: other_company.id, project_id: other_project.id),
-        generation: 1, outbox_position: 2
-      )
+      rules_item(rules_entry(id: 91_007, version: 1), generation: 1, outbox_position: 1),
+      rules_item(rules_entry(id: 91_007, version: 2, company_id: other_company.id, project_id: other_project.id),
+                 generation: 1, outbox_position: 2)
     )
 
     result = described_class.call(batch:, idempotency_key: nil)
 
-    expect([result.status, result.body]).to eq([409, { "reason" => "stale_generation" }])
+    expect([result.status, result.body]).to eq(rules_stale)
     expect(rules_row(91_007)).to be_nil
   end
 
   it "answers invalid_snapshot and writes nothing when the user does not exist" do
     expect(rules_deliver(rules_entry(id: 91_004, version: 1, user_id: User.maximum(:id).to_i + 1000)))
-      .to eq([422, { "reason" => "invalid_snapshot" }])
+      .to eq(rules_invalid)
     expect(rules_row(91_004)).to be_nil
   end
 
-  # These examples need the consumer's transaction to really commit, so they
-  # run in the committed-data mode of spec/support/committed_data.rb.
-  context "with committed transactions", committed_data: true do
+  it "writes projection rows with miru.writer set to projection while ordinary model saves carry no writer" do
+    connection = ActiveRecord::Base.connection
+    connection.execute(<<~SQL)
+      CREATE TEMP TABLE projection_writer_spec_log (entry_id bigint, writer text);
+      CREATE FUNCTION pg_temp.projection_writer_spec_record() RETURNS trigger AS $$
+      BEGIN
+        INSERT INTO projection_writer_spec_log VALUES (NEW.id, current_setting('miru.writer', true));
+        RETURN NEW;
+      END $$ LANGUAGE plpgsql;
+      CREATE TRIGGER projection_writer_spec_trigger AFTER INSERT OR UPDATE ON timesheet_entries
+        FOR EACH ROW EXECUTE FUNCTION pg_temp.projection_writer_spec_record();
+    SQL
+    ordinary = create(:timesheet_entry, user: rules_user, project: rules_project)
+    entry = rules_entry(id: ordinary.id + 1000, version: 1)
+
+    # "The consumer sets `SET LOCAL miru.writer = 'projection'` so a database-level guard can recognize it as
+    # the projection writer."
+    expect(rules_deliver(entry)).to eq(rules_applied)
+    log = connection.select_rows("SELECT entry_id, writer FROM projection_writer_spec_log ORDER BY entry_id").to_h
+    expect(log.fetch(entry["id"])).to eq("projection")
+    expect(log.fetch(ordinary.id).to_s).to eq("")
+  end
+
+  # These examples need the consumer's transaction to really commit, so they run
+  # outside the per-example cleaner transaction.
+  context "with committed transactions", :without_transaction do
     it "does not leave miru.writer set on the connection after the batch commits" do
       rules_deliver(rules_entry(id: 91_005, version: 1))
 
@@ -143,8 +239,8 @@ RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
       newer = rules_thread { rules_deliver(rules_entry(id: 91_006, version: 3)) }.value
       release << true
 
-      expect(newer).to eq([200, { "applied" => 1, "ignored" => 0 }])
-      expect(older.value).to eq([200, { "applied" => 0, "ignored" => 1 }])
+      expect(newer).to eq(rules_applied)
+      expect(older.value).to eq(rules_ignored)
       expect(rules_row(91_006)).to include("version" => 3, "note" => "v3")
     end
 
@@ -158,7 +254,7 @@ RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
                              idempotency_key: nil)
       end
 
-      delivery = rules_thread(pause: true) { previous.call(91_007) }
+      delivery = rules_thread(pause: true) { previous.call(91_009) }
       paused.pop
       flip = rules_thread { TimekeepingOwnership.current.update!(handoff_step: nil) }
 
@@ -167,9 +263,9 @@ RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
       expect(delivery.value.status).to eq(200)
       flip.join
 
-      expect(rules_row(91_007)).to include("version" => 1)
-      expect(previous.call(91_008).status).to eq(409)
-      expect(rules_row(91_008)).to be_nil
+      expect(rules_row(91_009)).to include("version" => 1)
+      expect(previous.call(91_010).status).to eq(409)
+      expect(rules_row(91_010)).to be_nil
     end
   end
 end
@@ -221,5 +317,80 @@ RSpec.describe Timekeeping::ProjectionConsumer, "references of applying snapshot
 
     expect(reference_deliver(stale)).to eq([200, { "applied" => 0, "ignored" => 1 }])
     expect(reference_row(94_021)).to include("version" => 2, "project_id" => reference_project.id)
+  end
+end
+
+RSpec.describe Timekeeping::ProjectionConsumer, "delivery keys and receipts" do
+  let(:delivery_company) { create(:company) }
+  let(:delivery_project) { create(:project, client: create(:client, company: delivery_company)) }
+  let(:delivery_user) { create(:user).tap { |user| create(:employment, company: delivery_company, user:) } }
+
+  def delivery_batch(id:, version:, generation: 1, outbox_position: version)
+    entry = TimekeepingSnapshots.entry(id:, company_id: delivery_company.id, version:,
+                                       project_id: delivery_project.id, user_id: delivery_user.id)
+    TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation:, outbox_position:))
+  end
+
+  def delivery_answer(result)
+    [result.status, result.body.to_h.deep_stringify_keys]
+  end
+
+  it "replays the first answer for the same key and batch after the flip and rejects a changed batch under that key" do
+    key = SecureRandom.uuid
+    TimekeepingOwnership.current.update!(generation: 2, handoff_step: "freeze", final_outbox_position: 10)
+    first = described_class.call(batch: delivery_batch(id: 92_001, version: 1, outbox_position: 5), idempotency_key: key)
+    expect(delivery_answer(first)).to eq([200, { "applied" => 1, "ignored" => 0 }])
+
+    # The relay lost the 200 and retries after the flip. The receipt is read
+    # before the generation check, so it gets its first answer, not 409.
+    TimekeepingOwnership.current.update!(owner: "timekeeping", handoff_step: nil, final_outbox_position: nil)
+    replay = described_class.call(batch: delivery_batch(id: 92_001, version: 1, outbox_position: 5), idempotency_key: key)
+    reused = described_class.call(batch: delivery_batch(id: 92_001, version: 2, outbox_position: 5), idempotency_key: key)
+
+    expect(delivery_answer(replay)).to eq([200, { "applied" => 1, "ignored" => 0 }])
+    expect(delivery_answer(reused)).to eq([422, { "reason" => "idempotency_key_reused" }])
+    expect(TimesheetEntry.find(92_001).version).to eq(1)
+  end
+
+  it "does not store a 409 so a retry under the same key is evaluated again and applies" do
+    key = SecureRandom.uuid
+    TimekeepingOwnership.current.update!(generation: 2)
+
+    refused = described_class.call(batch: delivery_batch(id: 92_002, version: 1, generation: 1), idempotency_key: key)
+    expect(delivery_answer(refused)).to eq([409, { "reason" => "stale_generation" }])
+    expect(TimesheetEntry.with_discarded.where(id: 92_002)).to be_empty
+
+    retried = described_class.call(batch: delivery_batch(id: 92_002, version: 1, generation: 2), idempotency_key: key)
+
+    expect(delivery_answer(retried)).to eq([200, { "applied" => 1, "ignored" => 0 }])
+    expect(TimesheetEntry.find(92_002).version).to eq(1)
+  end
+
+  it "prunes expired receipts stored under other keys and keeps live ones on a keyed delivery" do
+    receipt_attributes = { company_ids: [delivery_company.id], actor: "timekeeping", request_digest: "digest",
+                           response_status: 200, response_body: { "applied" => 1, "ignored" => 0 } }
+    expired = EntrySnapshotReceipt.create!(**receipt_attributes, key: "expired-key", created_at: 2.days.ago,
+                                           expires_at: 1.day.ago)
+    live = EntrySnapshotReceipt.create!(**receipt_attributes, key: "live-key", created_at: 1.hour.ago,
+                                        expires_at: 23.hours.from_now)
+
+    result = described_class.call(batch: delivery_batch(id: 92_003, version: 1), idempotency_key: SecureRandom.uuid)
+
+    expect(result.status).to eq(200)
+    expect(EntrySnapshotReceipt.where(id: expired.id)).not_to exist
+    expect(EntrySnapshotReceipt.where(id: live.id)).to exist
+  end
+
+  it "re-sending an applied batch under a new key changes no row and counts it ignored" do
+    batch = delivery_batch(id: 92_004, version: 2)
+    described_class.call(batch:, idempotency_key: SecureRandom.uuid)
+    before = TimesheetEntry.find(92_004).attributes
+    expect(before["version"]).to eq(2)
+
+    resent = described_class.call(batch:, idempotency_key: SecureRandom.uuid)
+
+    expect(delivery_answer(resent)).to eq([200, { "applied" => 0, "ignored" => 1 }])
+    expect(TimesheetEntry.where(id: 92_004).count).to eq(1)
+    expect(TimesheetEntry.find(92_004).attributes).to eq(before)
   end
 end

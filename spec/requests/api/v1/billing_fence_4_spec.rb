@@ -61,9 +61,18 @@ RSpec.describe "Billing fence on invoice update", type: :request do
     sign_in user
     invoice = create(:invoice, company:, client:, invoice_number: "INV-FENCE-1")
     line_item = create(:invoice_line_item, invoice:, timesheet_entry: nil, name: "Work", description: "Work", rate: 100, quantity: 60)
+    gst = create(:tax_configuration, company:, name: "GST", calculation_method: "percentage", value: 10)
+    service = create(:tax_configuration, company:, name: "Service", calculation_method: "percentage", value: 5)
+    # Amounts are passed explicitly because the invoice_tax factory otherwise derives them from the line items.
+    gst_row = create(:invoice_tax, invoice:, tax_configuration: gst, name: "GST", calculation_method: "percentage", value: 10, amount: 10)
+    service_row = create(:invoice_tax, invoice:, tax_configuration: service, name: "Service", calculation_method: "percentage", value: 5, amount: 5)
     invoice.reload
     money_before = [invoice.amount, invoice.tax, invoice.discount, invoice.outstanding_amount, line_item.reload.rate, line_item.quantity]
     expect(money_before[4]).to eq(100)
+    tax_rows_before = stored_invoice_tax_rows(invoice.id)
+    expect(tax_rows_before.map { |row| [row["id"], row["name"], row["value"].to_f, row["amount"].to_f] }).to eq(
+      [[gst_row.id, "GST", 10.0, 10.0], [service_row.id, "Service", 5.0, 5.0]]
+    )
 
     TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(handoff_step: "close_admission")
 
@@ -74,6 +83,13 @@ RSpec.describe "Billing fence on invoice update", type: :request do
         issue_date: invoice.issue_date.iso8601,
         due_date: invoice.due_date.iso8601,
         currency: invoice.currency,
+        # Indexed keys keep each row's fields together; a form-encoded array would fold the
+        # id-less new row and the destroy row into one hash.
+        invoice_taxes_attributes: {
+          "0" => { id: gst_row.id, tax_configuration_id: gst.id, name: "GST", calculation_method: "percentage", value: 18, amount: 99 },
+          "1" => { tax_configuration_id: service.id, name: "Added", calculation_method: "percentage", value: 3, amount: 3 },
+          "2" => { id: service_row.id, _destroy: "1" }
+        },
         invoice_line_items_attributes: [
           { id: line_item.id, name: "Work", description: "Work", date: line_item.date.iso8601, rate: 500, quantity: 120 },
           { name: "Extra", description: "Extra", date: Date.current.iso8601, rate: 50, quantity: 60 }
@@ -87,5 +103,7 @@ RSpec.describe "Billing fence on invoice update", type: :request do
     invoice.reload
     expect([invoice.amount, invoice.tax, invoice.discount, invoice.outstanding_amount, line_item.reload.rate, line_item.quantity]).to eq(money_before)
     expect(invoice.invoice_line_items.count).to eq(1)
+    expect(invoice.invoice_taxes.count).to eq(2)
+    expect(stored_invoice_tax_rows(invoice.id)).to eq(tax_rows_before)
   end
 end
