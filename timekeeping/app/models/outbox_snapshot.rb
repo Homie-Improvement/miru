@@ -4,13 +4,12 @@
 class OutboxSnapshot < ApplicationRecord
   self.primary_key = "outbox_position"
 
-  # The one key every writer takes just before its outbox inserts and holds
-  # until commit, so outbox positions commit in the order they were drawn.
-  INSERT_LOCK_KEY = 2_026_034_001
-
-  # Takes INSERT_LOCK_KEY for the rest of the calling transaction.
+  # Takes the outbox insert lock (Timekeeping::WriteSteps::OUTBOX_LOCK_KEY)
+  # for the rest of the calling transaction, so a writer that inserts outbox
+  # rows outside WriteSteps.write_outbox still commits positions in the order
+  # they were drawn.
   def self.lock_for_insert!
-    connection.execute(sanitize_sql_array(["SELECT pg_advisory_xact_lock(?)", INSERT_LOCK_KEY]))
+    connection.execute(sanitize_sql_array(["SELECT pg_advisory_xact_lock(?)", Timekeeping::WriteSteps::OUTBOX_LOCK_KEY]))
   end
 
   # Rails sends id= to the primary key, which would put the entry's id into

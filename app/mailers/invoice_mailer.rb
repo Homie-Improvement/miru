@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 class InvoiceMailer < ApplicationMailer
+  self.delivery_job = BillingFencedMailDeliveryJob
   after_action :update_status, only: [:invoice]
 
   def invoice
@@ -16,7 +17,7 @@ class InvoiceMailer < ApplicationMailer
         subject: params[:subject].presence || I18n.t("mailers.invoice_mailer.invoice.subject", invoice_number: @invoice.invoice_number)
       )
 
-      @invoice.update_columns(sent_at: DateTime.current)
+      @invoice_mail_built = true
     end
   end
 
@@ -66,10 +67,21 @@ class InvoiceMailer < ApplicationMailer
       @invoice.sending? && @invoice.recently_sent_mail?
     end
 
+    # Records sent_at and the sent status in one billing transaction, so a
+    # refusal during a Timekeeping handoff leaves neither written. Both run
+    # before delivery, so a refused mail is not sent.
     def update_status
-      return unless @invoice.draft? || @invoice.viewed? || @invoice.declined? || @invoice.sending?
+      record_sent_at = @invoice_mail_built
+      mark_sent = @invoice.draft? || @invoice.viewed? || @invoice.declined? || @invoice.sending?
+      return unless record_sent_at || mark_sent
 
-      @invoice.sent!
-      @invoice.update_timesheet_entry_status!
+      Timekeeping::BillingFence.transaction do
+        # update_columns skips the model's billing guard; the fence above covers it.
+        @invoice.update_columns(sent_at: DateTime.current) if record_sent_at
+        next unless mark_sent
+
+        @invoice.sent!
+        @invoice.update_timesheet_entry_status!
+      end
     end
 end

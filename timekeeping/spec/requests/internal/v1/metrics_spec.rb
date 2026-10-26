@@ -50,6 +50,15 @@ RSpec.describe "Timekeeping internal write metrics" do
       expect(get_metrics("Bearer #{metrics_service_token}x")).to eq([401, unauthorized_body])
     end
 
+    it "refuses a signed service token, which is bound to one company" do
+      now = Time.now.to_i
+      token = JWT.encode({ typ: "timekeeping_service", sub: "invoice-boundary", company_id: 1,
+                           operations: Timekeeping::ReservationAccess::ROUTE_OPERATIONS.values, iat: now,
+                           exp: now + 60, jti: SecureRandom.uuid }, rsa_key_pair, "RS256")
+
+      expect(get_metrics("Bearer #{token}")).to eq([401, unauthorized_body])
+    end
+
     it "refuses a request with no Authorization header" do
       expect(get_metrics(nil)).to eq([401, unauthorized_body])
     end

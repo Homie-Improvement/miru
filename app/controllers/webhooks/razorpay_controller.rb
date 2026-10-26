@@ -24,6 +24,10 @@ class Webhooks::RazorpayController < ApplicationController
     )
 
     render_fulfillment_result(fulfillment)
+  rescue Timekeeping::BillingFence::OwnershipMoving
+    # ErrorHandler answers a retryable 503, so Razorpay redelivers the event
+    # after the handoff instead of the payment being lost behind a 500.
+    raise
   rescue StandardError => exception
     log_processing_error(exception, PAYMENT_LINKS_WEBHOOK)
     render json: { error: "Unable to process Razorpay webhook" }, status: 500
@@ -39,6 +43,8 @@ class Webhooks::RazorpayController < ApplicationController
     )
 
     render_fulfillment_result(fulfillment)
+  rescue Timekeeping::BillingFence::OwnershipMoving
+    raise
   rescue StandardError => exception
     log_processing_error(exception, PAYOUTS_WEBHOOK)
     render json: { error: "Unable to process Razorpay webhook" }, status: 500

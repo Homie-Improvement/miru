@@ -116,11 +116,15 @@ class InvoicePayment::RazorpayPaymentLinkWebhookFulfillment
 
     def settle_new_payment
       invoice.reload
-      invoice.with_lock do
-        return if invoice.paid? || duplicate_payment?
+      # The ownership lock is taken before the invoice lock, the order the other
+      # fenced payment paths use, so this path cannot deadlock with them.
+      Timekeeping::BillingFence.transaction do
+        invoice.with_lock do
+          next if invoice.paid? || duplicate_payment?
 
-        InvoicePayment::Settle.process(payment_params, invoice).tap do
-          invoice.update!(payment_infos: processed_payment_infos)
+          InvoicePayment::Settle.process(payment_params, invoice).tap do
+            invoice.update!(payment_infos: processed_payment_infos)
+          end
         end
       end
     end

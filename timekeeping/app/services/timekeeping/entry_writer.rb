@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-require "digest"
-
 module Timekeeping
   # Carries out one Timekeeping::EntryCommand in a single transaction, so the
   # entry change, its audit rows, its outbox snapshots and its idempotency
@@ -24,8 +22,9 @@ module Timekeeping
   #
   # checkpoint is called with the name of each step as it finishes, so a spec
   # can hold a transaction at a known point or fail it after a given insert.
+  # The generation is read from Timekeeping::Admission; the locks, audit and
+  # outbox steps are Timekeeping::WriteSteps.
   class EntryWriter
-    KEY_SEPARATOR = "\u001F"
     BULK_RESULTS = { bulk_move: "moved", bulk_delete: "deleted" }.freeze
     BULK_ACTIONS = { bulk_move: :move, bulk_delete: :delete }.freeze
     NOT_FOUND_RESULT = "not_found"
@@ -65,10 +64,6 @@ module Timekeeping
 
       attr_reader :checkpoint
 
-      def connection
-        ApplicationRecord.connection
-      end
-
       def write(command)
         lock_receipt_key(command)
         receipt = find_receipt(command)
@@ -77,7 +72,9 @@ module Timekeeping
 
         generation = locked_generation
         checkpoint.call(:generation_checked)
-        return WriteOutcome.refusal(:stale_generation) unless generation_matches?(command.generation, generation)
+        unless WriteSteps.generation_matches?(command.generation, generation)
+          return WriteOutcome.refusal(:stale_generation)
+        end
         return WriteOutcome.refusal(:not_found) unless project_known?(command)
 
         written = send(ROUTE_WRITERS.fetch(command.route), command)
@@ -88,10 +85,10 @@ module Timekeeping
 
       def commit_change(command, written, generation)
         checkpoint.call(:entry_written)
-        rows = changed_rows(command.company_id, written.changes.map(&:entry_id))
+        rows = WriteSteps.reserved_rows(command.company_id, written.changes.map(&:entry_id))
         write_audit(command, written.changes, rows)
         checkpoint.call(:audit_written)
-        write_outbox(written.changes, rows, generation)
+        WriteSteps.write_outbox(written.changes.map { |change| rows.fetch(change.entry_id) }, generation)
         checkpoint.call(:outbox_written)
         outcome = WriteOutcome.success(written.status, written.payload.call(rows))
         store_receipt(command, outcome)
@@ -99,14 +96,10 @@ module Timekeeping
         outcome
       end
 
-      # Two signed 32-bit keys from a digest of the whole receipt key, so only
-      # writers with the same company, actor, operation and key wait on each
-      # other. The receipt itself is always read by every column, never by
-      # this digest.
+      # Only writers with the same company, actor, operation and key wait on
+      # each other.
       def lock_receipt_key(command)
-        parts = [command.company_id, EntryCommand::ACTOR_TYPE, command.actor_id, command.operation, command.key]
-        high, low = Digest::SHA256.digest(parts.join(KEY_SEPARATOR)).unpack("l>l>")
-        connection.execute(ApplicationRecord.sanitize_sql_array(["SELECT pg_advisory_xact_lock(?, ?)", high, low]))
+        WriteSteps.lock_key(command.company_id, EntryCommand::ACTOR_TYPE, command.actor_id, command.operation, command.key)
       end
 
       def find_receipt(command)
@@ -131,11 +124,6 @@ module Timekeeping
       # one listed in missing_project_ids, or absent, is answered as not found.
       def project_known?(command)
         command.project_id.nil? || command.facts.projects.any? { |project| project.id == command.project_id }
-      end
-
-      # A missing header, or one that is not a plain integer, is never current.
-      def generation_matches?(header, generation)
-        EntryCommand::ID.match?(header.to_s) && Integer(header.to_s, 10) == generation
       end
 
       def create_entry(command)
@@ -231,13 +219,12 @@ module Timekeeping
           scope = TimekeepingRules::EntryRules.visible_scope(role: command.role, acting_user_id: command.actor_id)
           relation = relation.where(user_id: scope) unless scope == :company
         end
-        relation.select("entries.*", EntriesQuery::RESERVED).order(:id).lock("FOR UPDATE OF entries").to_a
-      end
-
-      # The changed entries as written, with the reservation flag, discarded
-      # ones included.
-      def changed_rows(company_id, entry_ids)
-        Entry.where(company_id:, id: entry_ids).select("entries.*", EntriesQuery::RESERVED).index_by(&:id)
+        # The reservation flag is read in a second statement once the locks
+        # are held: a statement that waited on a lock still evaluates its
+        # reservation subquery against the snapshot taken before the wait, so
+        # it would miss a reservation the lock holder just committed.
+        ids = relation.order(:id).lock("FOR UPDATE").pluck(:id)
+        WriteSteps.reserved_rows(command.company_id, ids).values_at(*ids)
       end
 
       def version_matches?(command, entry)
@@ -274,22 +261,12 @@ module Timekeeping
       end
 
       def write_audit(command, changes, rows)
-        now = Time.current
-        changes.each do |change|
+        events = changes.map do |change|
           row = rows.fetch(change.entry_id)
-          AuditEvent.create!(
-            company_id: command.company_id, entry_id: change.entry_id, actor_type: EntryCommand::ACTOR_TYPE,
-            actor_id: command.actor_id, action: command.route.to_s, before: change.before,
-            after: stored_values(row), entry_created_at: row.created_at, created_at: now
-          )
+          { entry_id: change.entry_id, before: change.before, after: stored_values(row), entry_created_at: row.created_at }
         end
-      end
-
-      def write_outbox(changes, rows, generation)
-        return if changes.empty?
-
-        OutboxSnapshot.lock_for_insert!
-        OutboxSnapshot.insert_all!(changes.map { |change| OutboxFields.row(rows.fetch(change.entry_id), generation:) })
+        WriteSteps.write_audit(company_id: command.company_id, action: command.route.to_s, events:,
+                               actor: { actor_type: EntryCommand::ACTOR_TYPE, actor_id: command.actor_id })
       end
 
       def store_receipt(command, outcome)

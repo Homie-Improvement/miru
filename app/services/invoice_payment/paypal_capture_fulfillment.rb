@@ -45,15 +45,20 @@ class InvoicePayment::PaypalCaptureFulfillment
       true
     end
 
+    # The fence comes first, so a handoff refuses the return before PayPal
+    # captures the payer's money, and the ownership lock precedes the invoice
+    # lock as on the other payment paths. A handoff may wait for one PayPal call.
     def settle_under_lock
-      invoice.with_lock do
-        already_paid = invoice.paid?
+      Timekeeping::BillingFence.transaction do
+        invoice.with_lock do
+          already_paid = invoice.paid?
 
-        captured = fetch_capture(capture_if_approved: !already_paid)
-        return nil if error.present?
-        return nil if already_paid && captured[:owned] && !completed?(captured[:capture])
+          captured = fetch_capture(capture_if_approved: !already_paid)
+          return nil if error.present?
+          return nil if already_paid && captured[:owned] && !completed?(captured[:capture])
 
-        settle_captured(captured, reconcile: already_paid)
+          settle_captured(captured, reconcile: already_paid)
+        end
       end
     end
 
