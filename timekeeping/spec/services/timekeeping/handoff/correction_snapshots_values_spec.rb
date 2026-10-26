@@ -4,140 +4,99 @@
 
 require "rails_helper"
 
-RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "source values" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  # "Check whether a complete correction with source "agent" reaches the outbox despite the consumer rejecting that value."
-  it "refuses a complete correction whose source is agent and leaves the seeded correction and entry unchanged" do
-    now = Time.utc(2026, 3, 2, 9)
-    entry = Entry.create!(company_id: 41, project_id: 5, user_id: 6, work_date: Date.new(2026, 3, 2), duration: 30.0,
-                          bill_status: "unbilled", version: 0, created_at: now, updated_at: now)
-    Timekeeping::Admission.ensure_initial!
-    Timekeeping::Admission.fence!
-    snapshot = entry.attributes.slice(*described_class::SNAPSHOT_FIELDS).merge("locked" => true)
-    described_class.write!(snapshots: [snapshot], version: 1, generation: 2)
-    Entry.where(id: entry.id).update_all(version: 0)
-    before = { entries: Entry.order(:id).map(&:attributes), outbox: OutboxSnapshot.order(:outbox_position).map(&:attributes) }
-    expect(before[:outbox].pluck("source")).to eq(["manual"])
-    expect(before[:entries].pluck("version")).to eq([0])
-
-    expect do
-      described_class.write!(snapshots: [snapshot.merge("source" => "agent")], version: 3, generation: 2)
-    end.to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError, /source/)
-
-    after = { entries: Entry.order(:id).map(&:attributes), outbox: OutboxSnapshot.order(:outbox_position).map(&:attributes) }
-    expect(after).to eq(before)
-    expect(OutboxSnapshot.where(source: "agent")).to be_empty
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "mixed batches" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  # "docs/solutions/design-patterns/a-refused-snapshot-stalls-the-relay-so-align-producer-and-skip-ignored-checks.md records why producers must reject values that stop delivery for everyone."
-  it "refuses a whole correction batch when one snapshot holds a status the projection refuses" do
-    now = Time.utc(2026, 3, 2, 9)
-    entries = [51, 52].map do |company_id|
-      Entry.create!(company_id:, project_id: 5, user_id: 6, work_date: Date.new(2026, 3, 2), duration: 30.0,
-                    bill_status: "unbilled", version: 0, created_at: now, updated_at: now)
-    end
-    Timekeeping::Admission.ensure_initial!
-    Timekeeping::Admission.fence!
-    valid = entries.map { |entry| entry.attributes.slice(*described_class::SNAPSHOT_FIELDS).merge("locked" => true) }
-    bad_values = [{ "bill_status" => "paid" }, { "review_status" => "done" }, { "locked" => "true" },
-                  { "duration" => -1 }, { "source_metadata" => [] }]
-
-    bad_values.each do |bad|
-      [[valid.first.merge(bad), valid.last], [valid.first, valid.last.merge(bad)]].each do |batch|
-        expect { described_class.write!(snapshots: batch, version: 1, generation: 2) }
-          .to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError)
-      end
-    end
-
-    expect(OutboxSnapshot.count).to eq(0)
-    expect(entries.map { |entry| entry.reload.version }).to eq([0, 0])
-    expect(described_class.write!(snapshots: valid, version: 1, generation: 2)).to eq(2)
-    expect(OutboxSnapshot.where(generation: 2).count).to eq(2)
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "refused source value" do
+RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "values" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
 
+  let(:company) { timekeeping_arrange.company }
+  let(:owner) { timekeeping_arrange.user(company:, role: "owner") }
+  let(:project) { timekeeping_arrange.project(company:) }
+
+  def correction_values_snapshot_for(entry_id)
+    Entry.find(entry_id).attributes.slice(*described_class::SNAPSHOT_FIELDS).merge("locked" => true)
+  end
+
+  def correction_values_table_state
+    { entries: Entry.order(:id).map(&:attributes), outbox: OutboxSnapshot.order(:outbox_position).map(&:attributes) }
+  end
+
+  def correction_values_nested(levels)
+    levels.times.reduce("leaf") { |value, _| { "child" => value } }
+  end
+
+  # Parses the posted text the way the monolith's receiver does, with JSON's
+  # default nesting limit.
+  def correction_parsing_endpoint(parsed)
+    endpoint = Object.new
+    endpoint.define_singleton_method(:deliver) do |batch, idempotency_key:|
+      parsed << JSON.parse(TimekeepingRelay::BatchJson.generate(batch))
+      TimekeepingRelay::Response.new(status: 200, body: { "applied" => batch.fetch("snapshots").size, "ignored" => 0 })
+    end
+    endpoint
+  end
+
   # "Check whether a complete correction with source "agent" reaches the outbox despite the consumer rejecting that value."
   it "refuses a complete correction with source agent and leaves the seeded correction and entry unchanged" do
-    company = timekeeping_arrange.company
-    owner = timekeeping_arrange.user(company:, role: "owner")
-    project = timekeeping_arrange.project(company:)
     entry_id = timekeeping_arrange.entry(company:, user: owner, project:, version: 0)
-    snapshot = Entry.find(entry_id).attributes.slice(*described_class::SNAPSHOT_FIELDS).merge("locked" => true)
+    snapshot = correction_values_snapshot_for(entry_id)
     Timekeeping::Admission.fence!
     described_class.write!(snapshots: [snapshot.merge("note" => "Seeded")], version: 1, generation: 2)
+    # An entry stored below the version, so a write that got through would raise it.
+    Entry.where(id: entry_id).update_all(version: 0)
 
-    state = -> { { entries: Entry.order(:id).map(&:attributes), outbox: OutboxSnapshot.order(:outbox_position).map(&:attributes) } }
-    before = state.call
+    before = correction_values_table_state
     expect(OutboxSnapshot.where(id: entry_id, generation: 2).pluck(:version, :source, :note)).to eq([[1, "manual", "Seeded"]])
-    expect(Entry.find(entry_id).version).to eq(1)
+    expect(Entry.find(entry_id).version).to eq(0)
 
     expect { described_class.write!(snapshots: [snapshot.merge("source" => "agent")], version: 3, generation: 2) }
       .to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError, /source/)
 
-    expect(state.call).to eq(before)
+    expect(correction_values_table_state).to eq(before)
     expect(OutboxSnapshot.where(source: "agent")).to be_empty
   end
-end
-
-RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "mixed batch with a refused value" do
-  include_context "timekeeping entry writes"
-  include_context "timekeeping entry writes without transactional fixtures"
 
   # "producers must reject values that stop delivery for everyone": the consumer refuses a
-  # whole batch for one bad snapshot, so none of this batch may reach the outbox.
-  it "refuses a whole batch when one snapshot holds a refused value, first or last, and writes none of the valid ones" do
-    company = timekeeping_arrange.company
-    owner = timekeeping_arrange.user(company:, role: "owner")
-    project = timekeeping_arrange.project(company:)
+  # whole batch for one bad snapshot, so none of this batch may reach the outbox. A check
+  # that ran per row inside the insert would leave the valid snapshots written.
+  it "refuses a whole batch when one snapshot, first or last, holds a refused value, then writes the corrected batch once" do
     ids = Array.new(3) { timekeeping_arrange.entry(company:, user: owner, project:, version: 0) }
-    snapshots = ids.map { |id| Entry.find(id).attributes.slice(*described_class::SNAPSHOT_FIELDS).merge("locked" => true) }
+    snapshots = ids.map { |id| correction_values_snapshot_for(id) }
     Timekeeping::Admission.fence!
-    described_class.write!(snapshots: [snapshots.first], version: 1, generation: 2)
+    described_class.write!(snapshots: [snapshots.first.merge("note" => "Seeded")], version: 1, generation: 2)
 
-    state = -> { { entries: Entry.order(:id).map(&:attributes), outbox: OutboxSnapshot.order(:outbox_position).map(&:attributes) } }
-    before = state.call
-    expect(OutboxSnapshot.where(generation: 2).count).to eq(1)
+    before = correction_values_table_state
+    expect(OutboxSnapshot.where(generation: 2).pluck(:id, :note)).to eq([[ids.first, "Seeded"]])
+    expect(Entry.where(id: ids).order(:id).pluck(:version)).to eq([1, 0, 0])
 
-    [
-      [snapshots[0].merge("bill_status" => "paid"), snapshots[1], snapshots[2]],
-      [snapshots[0], snapshots[1], snapshots[2].merge("review_status" => "done")]
-    ].each do |batch|
-      expect { described_class.write!(snapshots: batch, version: 5, generation: 2) }
-        .to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError)
+    batch = [snapshots[0].merge("note" => "Replaced"), snapshots[1], snapshots[2]]
+    bad_values = [{ "source" => "agent" }, { "bill_status" => "paid" }, { "review_status" => "done" },
+                  { "locked" => "true" }, { "duration" => -1 }, { "source_metadata" => [] }, { "source_metadata" => nil }]
+    bad_values.each do |bad|
+      [0, 2].each do |position|
+        refused = batch.each_with_index.map { |snapshot, index| index == position ? snapshot.merge(bad) : snapshot }
+        expect { described_class.write!(snapshots: refused, version: 3, generation: 2) }
+          .to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError)
+      end
     end
+    expect(correction_values_table_state).to eq(before)
 
-    expect(state.call).to eq(before)
-    expect(Entry.where(id: ids[1..]).pluck(:version)).to all(eq(0))
+    expect(described_class.write!(snapshots:, version: 1, generation: 2)).to eq(3)
+    ids.each do |id|
+      expect(OutboxSnapshot.where(id:, generation: 2).pluck(:version)).to eq([1])
+    end
   end
-end
-
-RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "retry after a refused value" do
-  include_context "timekeeping entry writes"
-  include_context "timekeeping entry writes without transactional fixtures"
 
   # "write given entry snapshots to outbox_snapshots at the given version and generation":
   # a refusal leaves nothing behind, so the corrected retry writes each entry once.
   it "writes the corrected batch exactly once per entry after a refused value, and repeating it adds no row" do
-    company = timekeeping_arrange.company
-    owner = timekeeping_arrange.user(company:, role: "owner")
-    project = timekeeping_arrange.project(company:)
     ids = Array.new(2) { timekeeping_arrange.entry(company:, user: owner, project:, version: 0) }
-    snapshots = ids.map { |id| Entry.find(id).attributes.slice(*described_class::SNAPSHOT_FIELDS).merge("locked" => true) }
+    snapshots = ids.map { |id| correction_values_snapshot_for(id) }
     Timekeeping::Admission.fence!
 
     expect do
       described_class.write!(snapshots: [snapshots[0], snapshots[1].merge("source" => "agent")], version: 1, generation: 2)
     end.to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError)
-    expect(OutboxSnapshot.where(generation: 2)).to be_empty
+    expect(OutboxSnapshot.count).to eq(0)
 
     expect(described_class.write!(snapshots:, version: 1, generation: 2)).to eq(2)
     described_class.write!(snapshots:, version: 1, generation: 2)
@@ -147,78 +106,6 @@ RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "retry after a refused
     end
     expect(Entry.where(id: ids).pluck(:version)).to all(eq(1))
   end
-end
-
-RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "values" do
-  include_context "timekeeping entry writes"
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  let(:company) { timekeeping_arrange.company }
-  let(:owner) { timekeeping_arrange.user(company:, role: "owner") }
-  let(:project) { timekeeping_arrange.project(company:) }
-
-  # "Check whether a complete correction with source "agent" reaches the outbox despite the consumer rejecting that value."
-  it "refuses a complete correction with source agent and leaves the earlier correction and entry version unchanged" do
-    entry_id = timekeeping_arrange.entry(company:, user: owner, project:, version: 0)
-    Timekeeping::Admission.fence!
-    snapshot = Entry.find(entry_id).attributes.slice(*described_class::SNAPSHOT_FIELDS).merge("locked" => true)
-    described_class.write!(snapshots: [snapshot], version: 1, generation: 2)
-    state = -> { { entries: Entry.order(:id).map(&:attributes), outbox: OutboxSnapshot.order(:outbox_position).map(&:attributes) } }
-    before = state.call
-    expect(before[:outbox].map { |row| row.values_at("id", "version", "generation", "source") })
-      .to eq([[entry_id, 1, 2, snapshot.fetch("source")]])
-    expect(Entry.find(entry_id).version).to eq(1)
-
-    expect { described_class.write!(snapshots: [snapshot.merge("source" => "agent")], version: 3, generation: 2) }
-      .to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError, /source/)
-
-    expect(state.call).to eq(before)
-    expect(OutboxSnapshot.where(source: "agent")).to be_empty
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "values" do
-  include_context "timekeeping entry writes"
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  let(:company) { timekeeping_arrange.company }
-  let(:owner) { timekeeping_arrange.user(company:, role: "owner") }
-  let(:project) { timekeeping_arrange.project(company:) }
-
-  # "producers must reject values that stop delivery for everyone"
-  it "refuses a whole batch when any one snapshot holds a refused value, then writes the corrected batch once" do
-    ids = Array.new(3) { timekeeping_arrange.entry(company:, user: owner, project:, version: 0) }
-    Timekeeping::Admission.fence!
-    snapshots = ids.map { |id| Entry.find(id).attributes.slice(*described_class::SNAPSHOT_FIELDS).merge("locked" => true) }
-    state = -> { { entries: Entry.order(:id).map(&:attributes), outbox: OutboxSnapshot.order(:outbox_position).map(&:attributes) } }
-    before = state.call
-    expect(before[:entries].pluck("version")).to eq([0, 0, 0])
-
-    bad_values = [{ "source" => "agent" }, { "bill_status" => "paid" }, { "review_status" => "done" },
-                  { "source_metadata" => nil }]
-    bad_values.each do |bad|
-      [0, 2].each do |position|
-        batch = snapshots.each_with_index.map { |snapshot, index| index == position ? snapshot.merge(bad) : snapshot }
-        expect { described_class.write!(snapshots: batch, version: 1, generation: 2) }
-          .to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError)
-      end
-    end
-    expect(state.call).to eq(before)
-
-    expect(described_class.write!(snapshots:, version: 1, generation: 2)).to eq(3)
-    ids.each do |id|
-      expect(OutboxSnapshot.where(id:, generation: 2).pluck(:version)).to eq([1])
-    end
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "values" do
-  include_context "timekeeping entry writes"
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  let(:company) { timekeeping_arrange.company }
-  let(:owner) { timekeeping_arrange.user(company:, role: "owner") }
-  let(:project) { timekeeping_arrange.project(company:) }
 
   # "write given entry snapshots to outbox_snapshots at the given version and generation"
   it "writes a correction with each allowed source exactly as sent" do
@@ -226,8 +113,7 @@ RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "values" do
     ids = sources.map { timekeeping_arrange.entry(company:, user: owner, project:, version: 0) }
     Timekeeping::Admission.fence!
     snapshots = ids.zip(sources).map do |id, source|
-      Entry.find(id).attributes.slice(*described_class::SNAPSHOT_FIELDS)
-        .merge("locked" => true, "source" => source, "duration" => BigDecimal("30.5"))
+      correction_values_snapshot_for(id).merge("source" => source, "duration" => BigDecimal("30.5"))
     end
 
     expect(described_class.write!(snapshots:, version: 1, generation: 2)).to eq(sources.size)
@@ -235,114 +121,13 @@ RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "values" do
     expect(OutboxSnapshot.where(id: ids).order(:id).pluck(:id, :source, :duration, :version, :generation))
       .to eq(ids.zip(sources).map { |id, source| [id, source, 30.5, 1, 2] })
   end
-end
-
-RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "metadata nesting the relay can parse" do
-  include_context "timekeeping entry writes"
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  # The issue: "docs/solutions/design-patterns/a-refused-snapshot-stalls-the-relay-so-align-producer-and-skip-ignored-checks.md
-  # records why producers must reject values that stop delivery for everyone."
-  # The relay parses stored metadata with JSON's default nesting limit, so metadata
-  # deeper than 96 levels would commit here and then block every later snapshot.
-  it "refuses a correction whose source_metadata is nested 97 levels and changes nothing" do
-    company = timekeeping_arrange.company
-    owner = timekeeping_arrange.user(company:, role: "owner")
-    project = timekeeping_arrange.project(company:)
-    entry_id = timekeeping_arrange.entry(company:, user: owner, project:, version: 0)
-    Timekeeping::Admission.fence!
-    snapshot = Entry.find(entry_id).attributes.slice(*described_class::SNAPSHOT_FIELDS).merge("locked" => true)
-    described_class.write!(snapshots: [snapshot], version: 1, generation: 2)
-
-    state = -> { { entries: Entry.order(:id).map(&:attributes), outbox: OutboxSnapshot.order(:outbox_position).map(&:attributes) } }
-    before = state.call
-    expect(before[:outbox].size).to eq(1)
-    expect(Entry.find(entry_id).version).to eq(1)
-
-    too_deep = 97.times.reduce("leaf") { |value, _| { "child" => value } }
-    expect do
-      described_class.write!(snapshots: [snapshot.merge("source_metadata" => too_deep)], version: 3, generation: 2)
-    end.to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError, /source_metadata/)
-    expect(state.call).to eq(before)
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "a mixed batch with one bad source" do
-  include_context "timekeeping entry writes"
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  # "Check whether a complete correction with source "agent" reaches the outbox despite the consumer rejecting that value."
-  # A check that ran per row inside the insert would leave the valid first snapshot written.
-  it "refuses a whole batch when only its last snapshot carries source agent and leaves the seeded correction in place" do
-    company = timekeeping_arrange.company
-    owner = timekeeping_arrange.user(company:, role: "owner")
-    project = timekeeping_arrange.project(company:)
-    good_id = timekeeping_arrange.entry(company:, user: owner, project:, version: 0)
-    bad_id = timekeeping_arrange.entry(company:, user: owner, project:, version: 0)
-    snapshot_for = lambda do |id|
-      Entry.find(id).attributes.slice(*described_class::SNAPSHOT_FIELDS).merge("locked" => true)
-    end
-    table_state = lambda do
-      { entries: Entry.order(:id).map(&:attributes), outbox: OutboxSnapshot.order(:outbox_position).map(&:attributes) }
-    end
-    Timekeeping::Admission.fence!
-    described_class.write!(snapshots: [snapshot_for.call(good_id).merge("note" => "Seeded")], version: 1, generation: 2)
-
-    expect(OutboxSnapshot.where(id: good_id, generation: 2).pluck(:note)).to eq(["Seeded"])
-    expect(Entry.find(good_id).version).to eq(1)
-    expect(Entry.find(bad_id).version).to eq(0)
-    before = table_state.call
-
-    batch = [snapshot_for.call(good_id).merge("note" => "Replaced"), snapshot_for.call(bad_id).merge("source" => "agent")]
-    expect { described_class.write!(snapshots: batch, version: 3, generation: 2) }
-      .to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError)
-
-    expect(table_state.call).to eq(before)
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "a retry after a refused value" do
-  include_context "timekeeping entry writes"
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  # "producers must reject values that stop delivery for everyone"
-  # The refusal must leave nothing that blocks or duplicates the corrected retry.
-  it "writes each entry exactly once when the corrected batch is resent after a refused one" do
-    company = timekeeping_arrange.company
-    owner = timekeeping_arrange.user(company:, role: "owner")
-    project = timekeeping_arrange.project(company:)
-    ids = 2.times.map { timekeeping_arrange.entry(company:, user: owner, project:, version: 0) }
-    snapshots = ids.map do |id|
-      Entry.find(id).attributes.slice(*described_class::SNAPSHOT_FIELDS).merge("locked" => true)
-    end
-    Timekeeping::Admission.fence!
-
-    refused = [snapshots.first.merge("source" => "agent"), snapshots.last]
-    expect { described_class.write!(snapshots: refused, version: 1, generation: 2) }
-      .to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError)
-    expect(OutboxSnapshot.count).to eq(0)
-
-    expect(described_class.write!(snapshots:, version: 1, generation: 2)).to eq(2)
-
-    ids.each do |id|
-      expect(OutboxSnapshot.where(id:, generation: 2).pluck(:version, :source)).to eq([[1, "manual"]])
-    end
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "values that only a cast would accept" do
-  include_context "timekeeping entry writes"
-  include_context "timekeeping entry writes without transactional fixtures"
 
   # "These checks validate field names and entry identifiers, but not source values."
   # Each value is checked as sent: a cast that made it match would publish a row
   # that differs from what the caller stored.
   it "refuses look-alike values that only a cast would make valid and writes nothing" do
-    company = timekeeping_arrange.company
-    owner = timekeeping_arrange.user(company:, role: "owner")
-    project = timekeeping_arrange.project(company:)
     entry_id = timekeeping_arrange.entry(company:, user: owner, project:, version: 0)
-    snapshot = Entry.find(entry_id).attributes.slice(*described_class::SNAPSHOT_FIELDS).merge("locked" => true)
+    snapshot = correction_values_snapshot_for(entry_id)
     Timekeeping::Admission.fence!
 
     look_alikes = [
@@ -357,58 +142,33 @@ RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "values that only a ca
     expect(OutboxSnapshot.count).to eq(0)
     expect(Entry.find(entry_id).version).to eq(0)
   end
-end
-
-RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "deeply nested metadata" do
-  include_context "timekeeping entry writes"
-  include_context "timekeeping entry writes without transactional fixtures"
 
   # "producers must reject values that stop delivery for everyone"
-  # The relay parses stored metadata with JSON's default nesting limit, so a deeper
-  # object would commit here and then block every later snapshot.
-  it "refuses correction metadata nested deeper than the relay can parse and writes nothing" do
-    company = timekeeping_arrange.company
-    owner = timekeeping_arrange.user(company:, role: "owner")
-    project = timekeeping_arrange.project(company:)
+  # The relay parses stored metadata with JSON's default nesting limit, so metadata
+  # deeper than 96 levels would commit here and then block every later snapshot.
+  it "refuses correction metadata nested 97 levels and changes nothing" do
     entry_id = timekeeping_arrange.entry(company:, user: owner, project:, version: 0)
-    snapshot = Entry.find(entry_id).attributes.slice(*described_class::SNAPSHOT_FIELDS).merge("locked" => true)
-    too_deep = 97.times.reduce("leaf") { |value, _| { "child" => value } }
+    snapshot = correction_values_snapshot_for(entry_id)
     Timekeeping::Admission.fence!
+    described_class.write!(snapshots: [snapshot], version: 1, generation: 2)
+
+    before = correction_values_table_state
+    expect(before[:outbox].size).to eq(1)
+    expect(Entry.find(entry_id).version).to eq(1)
 
     %w[source_metadata proof_metadata].each do |field|
-      expect { described_class.write!(snapshots: [snapshot.merge(field => too_deep)], version: 1, generation: 2) }
-        .to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError)
+      expect do
+        described_class.write!(snapshots: [snapshot.merge(field => correction_values_nested(97))], version: 3, generation: 2)
+      end.to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError, /#{field}/)
     end
-
-    expect(OutboxSnapshot.count).to eq(0)
-    expect(Entry.find(entry_id).version).to eq(0)
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "metadata at the deepest accepted nesting" do
-  include_context "timekeeping entry writes"
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  # Parses the posted text the way the monolith's receiver does, with JSON's
-  # default nesting limit.
-  def correction_parsing_endpoint(parsed)
-    endpoint = Object.new
-    endpoint.define_singleton_method(:deliver) do |batch, idempotency_key:|
-      parsed << JSON.parse(TimekeepingRelay::BatchJson.generate(batch))
-      TimekeepingRelay::Response.new(status: 200, body: { "applied" => batch.fetch("snapshots").size, "ignored" => 0 })
-    end
-    endpoint
+    expect(correction_values_table_state).to eq(before)
   end
 
   it "writes source_metadata nested 96 levels and the relay delivers it to a receiver with JSON's default limit" do
-    company = timekeeping_arrange.company
-    owner = timekeeping_arrange.user(company:, role: "owner")
-    project = timekeeping_arrange.project(company:)
     entry_id = timekeeping_arrange.entry(company:, user: owner, project:, version: 0)
     Timekeeping::Admission.fence!
-    deepest = 96.times.reduce("leaf") { |value, _| { "child" => value } }
-    snapshot = Entry.find(entry_id).attributes.slice(*described_class::SNAPSHOT_FIELDS)
-      .merge("locked" => true, "source_metadata" => deepest)
+    deepest = correction_values_nested(96)
+    snapshot = correction_values_snapshot_for(entry_id).merge("source_metadata" => deepest)
 
     expect(described_class.write!(snapshots: [snapshot], version: 1, generation: 2)).to eq(1)
 
