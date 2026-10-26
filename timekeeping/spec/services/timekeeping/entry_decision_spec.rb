@@ -118,14 +118,13 @@ end
 RSpec.describe Timekeeping::EntryDecision, ".agent_owner" do
   # The issue asks for "Timekeeping::EntryCommand or EntryDecision to refuse an
   # unknown or foreign agent before the write".
-  it "answers an unknown agent, another user's agent or an empty agents list as not_found, and the entry user's agent or none as ok" do
+  # The full rule table is covered by
+  # gems/timekeeping_rules/spec/timekeeping_rules/entry_rules/agent_owner_spec.rb;
+  # this only shows the wrapper passes its arguments through unchanged.
+  it "answers the entry user's agent as ok and another user's agent as not_found" do
     company_agents = { 40 => 7, 41 => 8 }
 
-    expect(described_class.agent_owner(agent_id: 99, user_id: 7, company_agents:)).to eq(:not_found)
-    expect(described_class.agent_owner(agent_id: 41, user_id: 7, company_agents:)).to eq(:not_found)
-    expect(described_class.agent_owner(agent_id: 40, user_id: 7, company_agents: {})).to eq(:not_found)
     expect(described_class.agent_owner(agent_id: 40, user_id: 7, company_agents:)).to eq(:ok)
-    expect(described_class.agent_owner(agent_id: 41, user_id: 8, company_agents:)).to eq(:ok)
-    expect(described_class.agent_owner(agent_id: nil, user_id: 7, company_agents:)).to eq(:ok)
+    expect(described_class.agent_owner(agent_id: 41, user_id: 7, company_agents:)).to eq(:not_found)
   end
 end

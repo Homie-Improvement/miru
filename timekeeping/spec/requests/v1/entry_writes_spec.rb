@@ -385,38 +385,10 @@ RSpec.describe "Entry write routes", "agent ownership" do
     expect([response.status, response.parsed_body]).to eq([404, { "reason" => "not_found" }])
   end
 
-  # entry_api.yml's company_mismatch rule: "An entry or user of another company answers not_found, exactly
-  # as a missing id does." A different answer would let a caller probe which agent ids exist elsewhere.
-  it "answers a create naming another company's agent exactly as one naming no agent, and writes nothing" do
-    other_company = timekeeping_arrange.company
-    foreign_agent = timekeeping_arrange.agent(company: other_company,
-                                              user: timekeeping_arrange.user(company: other_company, role: "owner"))
-    before = entry_write_counts
-
-    answers = [foreign_agent, foreign_agent + 100_000].map do |agent_id|
-      post agent_entries_path, params: JSON.generate(agent_entry_body(agent_id:)), headers: agent_write_headers(agent_employee)
-      [response.status, response.body]
-    end
-
-    expect_agent_not_found
-    expect(answers.first).to eq(answers.last)
-    expect(entry_write_counts).to eq(before)
-  end
-
-  it "refuses a create naming a colleague's agent, writing nothing, and accepts the user's own agent" do
-    own_agent = timekeeping_arrange.agent(company: agent_company, user: agent_employee)
-    before = entry_write_counts
-
-    post agent_entries_path, params: JSON.generate(agent_entry_body(agent_id: colleague_agent)),
-                             headers: agent_write_headers(agent_employee)
-    expect_agent_not_found
-    expect(entry_write_counts).to eq(before)
-
-    post agent_entries_path, params: JSON.generate(agent_entry_body(agent_id: own_agent)),
-                             headers: agent_write_headers(agent_employee)
-    expect(response).to have_http_status(201)
-    expect(response.parsed_body.fetch("agent_id")).to eq(own_agent)
-  end
+  # The shared entry API contract examples, run against this provider by
+  # timekeeping/spec/contracts/entry_provider_spec.rb, own the foreign-versus-missing,
+  # colleague-agent and user-only-update refusals; the writer spec owns their
+  # row counts. These cases cover what those do not.
 
   # The agent must belong to the entry's user, which is the user the body names, not the acting owner.
   it "refuses an owner's create for an employee that carries the owner's own agent, and accepts the employee's agent" do
@@ -433,22 +405,6 @@ RSpec.describe "Entry write routes", "agent ownership" do
                              headers: agent_write_headers(agent_owner)
     expect(response.status).to eq(201)
     expect(response.parsed_body.values_at("user_id", "agent_id")).to eq([agent_employee, employee_agent])
-  end
-
-  # A body that changes only user_id leaves the stored agent beside a user it does not belong to,
-  # so the check must use the pair the write commits.
-  it "refuses an update that moves an agent entry to another user without naming the agent, and writes nothing" do
-    employee_agent = timekeeping_arrange.agent(company: agent_company, user: agent_employee)
-    entry_id = timekeeping_arrange.entry(company: agent_company, user: agent_employee, project: agent_project,
-                                         agent_id: employee_agent)
-    before = entry_write_counts
-
-    patch "#{agent_entries_path}/#{entry_id}", params: JSON.generate("user_id" => agent_colleague),
-                                               headers: agent_write_headers(agent_owner)
-
-    expect_agent_not_found
-    expect(entry_write_counts).to eq(before)
-    expect(Entry.find(entry_id).user_id).to eq(agent_employee)
   end
 
   # The body names no user_id, so the check must use the entry's stored user.
