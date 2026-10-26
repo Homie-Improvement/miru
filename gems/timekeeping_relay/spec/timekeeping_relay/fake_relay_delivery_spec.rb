@@ -47,6 +47,8 @@ RSpec.describe TimekeepingRelay::Relay, "delivery to the fake projection" do
     expect { relay.deliver(limit: 10) }.to raise_error(IOError)
     expect(source.lost_marks).to eq([[1]])
     expect(source.sent_positions).to be_empty
+    projected = projection.projected_entry(10)
+    expect(projected).to include("id" => 10, "version" => 1)
 
     source.add(outbox_row(2, id: 11))
     expect(relay.deliver(limit: 10)).to eq(sent: 2, last_position: 2)
@@ -58,7 +60,8 @@ RSpec.describe TimekeepingRelay::Relay, "delivery to the fake projection" do
     expect(endpoint.posts[1][:answer].status).to eq(200)
     expect(endpoint.posts[1][:answer].body).to eq("applied" => 1, "ignored" => 1)
     expect(source.sent_positions).to contain_exactly(1, 2)
-    expect(projection.projected_entry(10)).to include("id" => 10, "version" => 1)
+    # The ignored row leaves the entry exactly as the first delivery projected it.
+    expect(projection.projected_entry(10)).to eq(projected)
     expect(projection.projected_entry(11)).to include("id" => 11, "version" => 1)
   end
 
