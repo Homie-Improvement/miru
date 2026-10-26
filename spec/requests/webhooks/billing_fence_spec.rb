@@ -158,7 +158,8 @@ RSpec.describe "Stripe webhook replay after a handoff", type: :request do
     allow(ENV).to receive(:[]).and_call_original
     allow(ENV).to receive(:[]).with("STRIPE_WEBHOOK_ENDPOINT_SECRET").and_return(secret)
     allow(PaymentMailer).to receive_message_chain(:with, :payment, :deliver_later)
-    allow_any_instance_of(Invoice).to receive(:send_to_client_email)
+    client_emails_sent_during_replay_spec = []
+    allow_any_instance_of(Invoice).to receive(:send_to_client_email) { |sent_invoice, **| client_emails_sent_during_replay_spec << sent_invoice.id }
     company = create(:company, base_currency: "USD")
     client = create(:client, company:, currency: "USD")
     invoice = create(
@@ -188,6 +189,8 @@ RSpec.describe "Stripe webhook replay after a handoff", type: :request do
     expect(response.body).not_to include("close_admission")
     expect(Payment.where(invoice_id: invoice.id).count).to eq(0)
     expect(invoice.reload).to have_attributes(status: "sent", amount_due: 100)
+    expect(PaymentMailer).not_to have_received(:with)
+    expect(client_emails_sent_during_replay_spec).to be_empty
 
     TimekeepingOwnership.current.update!(handoff_step: nil)
 
@@ -197,6 +200,9 @@ RSpec.describe "Stripe webhook replay after a handoff", type: :request do
     expect(Payment.where(invoice_id: invoice.id).count).to eq(1)
     expect(Payment.find_by(invoice_id: invoice.id).provider_event_id).to eq("evt_replay_123")
     expect(invoice.reload).to be_paid
+    # The replay sends the confirmations the refusal held back, which also shows the email recorders above are live.
+    expect(PaymentMailer).to have_received(:with).once
+    expect(client_emails_sent_during_replay_spec).to eq([invoice.id])
 
     # Stripe can deliver the same event again; the second delivery must not pay twice.
     post "/webhooks/stripe/checkout/fulfillment", params: payload, headers: headers
@@ -270,6 +276,7 @@ RSpec.describe "Signed Stripe failure events during a handoff", type: :request d
     }.to_json
     TimekeepingOwnership.current.update!(handoff_step: "close_admission")
     expect(Payment.where(invoice_id: invoice.id).count).to eq(0)
+    expect(invoice.reload).to have_attributes(status: "sent", amount_due: 100)
 
     # payment_intent.payment_failed writes through Payment.create_or_find_by!, whose savepoint must not hide the refusal.
     [failed_payload, expired_payload].each do |payload|
@@ -285,6 +292,7 @@ RSpec.describe "Signed Stripe failure events during a handoff", type: :request d
       expect(response.headers["Retry-After"]).to eq("5")
       expect(response.parsed_body["reason"]).to eq("ownership_moving")
       expect(Payment.where(invoice_id: invoice.id).count).to eq(0)
+      expect(invoice.reload).to have_attributes(status: "sent", amount_due: 100)
     end
     expect(Payment.where(provider_event_id: "evt_http_failed_fence")).not_to exist
   end
