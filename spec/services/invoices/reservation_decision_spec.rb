@@ -23,4 +23,15 @@ RSpec.describe Invoices::ReservationDecision do
 
     expect(result).to eq(entries: [], disposition: "active")
   end
+
+  # "The entries the removed line referenced are released at commit when no remaining direct or grouped line
+  # of the draft references them; a destroyed draft releases its whole set."
+  it "sends exactly a live draft's remaining lines and an empty active set for a destroyed draft" do
+    held = { entries: [1, 2, 3], disposition: "active" }
+    live = described_class.call(status: "draft", discarded: false, destroyed: false, held:, lines: [1, 3])
+    destroyed = described_class.call(status: "draft", discarded: false, destroyed: true, held:, lines: [])
+
+    expect(live).to eq(entries: [1, 3], disposition: "active")
+    expect(destroyed).to eq(entries: [], disposition: "active")
+  end
 end

@@ -103,8 +103,8 @@ RSpec.describe "Characterization: invoice timesheet entry locking", type: :reque
     end
   end
 
-  describe "L4: aggregate line removed from a draft (deliberate fix pending: may change)" do
-    it "leaves the linked entries locked when the line item is loaded fresh before destroy" do
+  describe "L4: aggregate line removed from a draft (deliberate fix: entries no remaining line references are released)" do
+    it "unlocks the linked entries when the line item is loaded fresh before destroy" do
       invoice = create(:invoice, company:, client:)
       linked_entries = [locking_spec_entry, locking_spec_entry]
       line = locking_spec_aggregate_line(invoice, linked_entries)
@@ -113,7 +113,7 @@ RSpec.describe "Characterization: invoice timesheet entry locking", type: :reque
       InvoiceLineItem.find(line.id).destroy!
 
       expect(InvoiceLineItem.exists?(line.id)).to be(false)
-      expect_entries_state(linked_entries, locked: true)
+      expect_entries_state(linked_entries, locked: false)
     end
 
     it "unlocks the linked entries when linked_timesheet_entries is already loaded before destroy" do
@@ -130,7 +130,7 @@ RSpec.describe "Characterization: invoice timesheet entry locking", type: :reque
       expect_entries_state(linked_entries, locked: false)
     end
 
-    it "leaves the linked entries locked when the line is removed with nested _destroy through the invoice update" do
+    it "unlocks the linked entries when the line is removed with nested _destroy through the invoice update" do
       invoice = create(:invoice, company:, client:)
       linked_entries = [locking_spec_entry, locking_spec_entry]
       line = locking_spec_aggregate_line(invoice, linked_entries)
@@ -142,10 +142,10 @@ RSpec.describe "Characterization: invoice timesheet entry locking", type: :reque
 
       expect(response).to have_http_status(:ok)
       expect(InvoiceLineItem.exists?(line.id)).to be(false)
-      expect_entries_state(linked_entries, locked: true)
+      expect_entries_state(linked_entries, locked: false)
     end
 
-    it "leaves the linked entries locked when the draft is bulk deleted" do
+    it "unlocks the linked entries when the draft is bulk deleted" do
       invoice = create(:invoice, company:, client:)
       linked_entries = [locking_spec_entry, locking_spec_entry]
       locking_spec_aggregate_line(invoice, linked_entries)
@@ -157,7 +157,7 @@ RSpec.describe "Characterization: invoice timesheet entry locking", type: :reque
 
       expect(response).to have_http_status(:no_content)
       expect(Invoice.exists?(invoice.id)).to be(false)
-      expect_entries_state(linked_entries, locked: true)
+      expect_entries_state(linked_entries, locked: false)
     end
   end
 

@@ -492,3 +492,25 @@ RSpec.describe Invoices::ReservationBoundary, committed_data: true do
     expect(entry.reload.locked).to be(true)
   end
 end
+
+RSpec.describe Invoices::ReservationBoundary do
+  # "a destroyed draft releases its whole set."
+  it "unlocks every direct and grouped entry of a destroyed draft with one intent" do
+    company = create(:company)
+    client = create(:client, company:)
+    project = create(:project, client:, billable: true)
+    owner = create(:user, current_workspace_id: company.id)
+    direct_entry = create(:timesheet_entry, user: owner, project:, bill_status: "unbilled")
+    grouped_entry = create(:timesheet_entry, user: owner, project:, bill_status: "unbilled")
+    invoice = create(:invoice, company:, client:)
+    create(:invoice_line_item, invoice:, timesheet_entry: direct_entry, rate: 100, quantity: 60)
+    grouped_line = create(:invoice_line_item, invoice:, timesheet_entry: nil, rate: 100, quantity: 120)
+    create(:invoice_line_item_time_entry, invoice_line_item: grouped_line, timesheet_entry: grouped_entry)
+    expect([direct_entry.reload.locked, grouped_entry.reload.locked]).to eq([true, true])
+
+    expect { Invoice.find(invoice.id).destroy! }
+      .to change { InvoiceOperationIntent.where(invoice_id: invoice.id).count }.by(1)
+
+    expect([direct_entry.reload.locked, grouped_entry.reload.locked]).to eq([false, false])
+  end
+end

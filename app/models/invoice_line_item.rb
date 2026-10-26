@@ -15,7 +15,6 @@ class InvoiceLineItem < ApplicationRecord
   before_destroy :register_reservation_change, prepend: true
   before_save :link_pending_linked_timesheet_entries
   before_update :capture_previous_invoice_id, if: :will_save_change_to_invoice_id?
-  before_destroy :unlock_timesheet_entries
   after_save :sync_invoice_totals
   after_destroy :sync_invoice_totals
 
@@ -135,12 +134,6 @@ class InvoiceLineItem < ApplicationRecord
       end
 
       errors.add(:linked_timesheet_entries, :not_found) unless found
-    end
-
-    def unlock_timesheet_entries
-      return unless invoice.draft?
-
-      TimesheetEntry.where(id: associated_timesheet_entry_ids).update!(locked: false)
     end
 
     def associated_timesheet_entry_ids

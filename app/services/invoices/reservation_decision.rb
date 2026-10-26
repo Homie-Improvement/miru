@@ -4,10 +4,8 @@ module Invoices
   # Decides what an invoice save sends to the reservation port: nil when
   # nothing changes, or the entry set and disposition the invoice should hold.
   #
-  # A draft holds what it held plus its lines, and a discarded draft holds
-  # nothing, so its entries are released; a destroyed draft sends nothing, so
-  # its entries stay locked as they do today. A live
-  # non-draft sends nothing either: only draft saves lock entries, so a sent
+  # A draft holds exactly its lines, and a discarded or destroyed draft holds
+  # nothing. A live non-draft sends nothing: only draft saves lock entries, so a sent
   # invoice saved directly keeps its entries' lock state as it is, and
   # removing its line never releases one. A discarded or destroyed non-draft
   # keeps what it held as retained. A result equal to what is already held
@@ -24,13 +22,14 @@ module Invoices
     # what a discarded draft sends stays a one-row change.
     DISCARDED_DRAFT = ->(held:, lines:) { { entries: [], disposition: ACTIVE } }.freeze
 
+    RELEASE_ALL = ->(held:, lines:) { { entries: [], disposition: ACTIVE } }
     RETAIN_HELD = ->(held:, lines:) { { entries: held[:entries], disposition: RETAINED } }
 
     # Keyed by [draft?, lifecycle]; destroyed takes precedence over discarded.
     TABLE = {
-      [true, :live] => ->(held:, lines:) { { entries: held[:entries] | lines, disposition: ACTIVE } },
+      [true, :live] => ->(held:, lines:) { { entries: lines, disposition: ACTIVE } },
       [true, :discarded] => DISCARDED_DRAFT,
-      [true, :destroyed] => SEND_NOTHING,
+      [true, :destroyed] => RELEASE_ALL,
       [false, :live] => SEND_NOTHING,
       [false, :discarded] => RETAIN_HELD,
       [false, :destroyed] => RETAIN_HELD
