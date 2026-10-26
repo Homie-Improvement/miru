@@ -16,11 +16,13 @@ module PaymentProviders
     # billing transaction. Razorpay can text the link to the customer as it is
     # created, so a handoff that refused only the storage would leave a payable
     # link the payment webhook ignores as superseded once a retry stores a new
-    # one. The cost is that a handoff waits for one Razorpay call.
+    # one. The cost is that a handoff waits for one Razorpay call. Reusing an
+    # already-stored link creates nothing, so it stays outside the fence; its
+    # own invoice writes are still refused by the model's billing guard.
     def process
-      Timekeeping::BillingFence.transaction do
-        next existing_payment_link if existing_payment_link?
+      return existing_payment_link if existing_payment_link?
 
+      Timekeeping::BillingFence.transaction do
         response = create_payment_link_with_fallback
         invoice.update!(
           razorpay_payment_link_id: response.fetch("id"),
