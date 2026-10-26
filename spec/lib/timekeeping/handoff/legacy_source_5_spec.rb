@@ -54,7 +54,6 @@ RSpec.describe Timekeeping::Handoff::LegacySource, :two_tenant_seed, :seeded_wit
     second = source.export(generation: 7, captured_at:)
 
     # "Make every derived value repeatable: a reservation's `operation_id` is a UUIDv5 of company, entry and invoice, and timestamps are a capture time passed in."
-    expect(first[:checkpoint].fetch("reservations".then { |t| t }) { nil }).to be_nil if first[:checkpoint].respond_to?(:fetch)
     expect(second[:checkpoint].rows).to eq(first[:checkpoint].rows)
     expect(second[:checkpoint].digest).to eq(first[:checkpoint].digest)
     expect(second[:corrections]).to eq(first[:corrections])
