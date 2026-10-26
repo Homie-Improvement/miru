@@ -376,6 +376,8 @@ Today (observed), the role and `timesheet_edit_days` are read in `authorize`, be
 
 - **User-delegated writes.** The monolith mints the signed token per request. Its claims carry the user's current role in the company, `timesheet_edit_days`, and for each project the request touches: `company_id`, `billable` and whether the user is a member. Timekeeping takes these claims as the facts for that write.
 - **Background writes** (reservation operations, imports and agent destroy). Timekeeping calls a monolith read endpoint, `GET /internal/v1/companies/{company_id}/reference?project_ids=…`, with its own service identity, before deciding.
+- **Agents (S7).** The reference response lists every agent of the company, active or not, as `{ id, user_id }` only (`contracts/timekeeping/reference.yml`, `agent_fields`). Timekeeping checks an entry's agent against this list before the write, so a snapshot the projection would refuse is not committed. The list is read before the write's transaction opens, so an agent moved or deleted in between is still caught by the projection's own check.
+- **Deploy order for the agents list.** Deploy the monolith first: callers that do not read `agents` ignore the extra key. A Timekeeping that requires `agents` beside a monolith that does not send it refuses every write that reads the reference endpoint with `503 reference_unavailable`. To roll back, roll Timekeeping back first, then the monolith.
 - **When the facts cannot be read** (expired token, missing project claim, monolith endpoint down), the write is refused with a retryable `503 reference_unavailable`. It fails closed: Timekeeping never guesses and never falls back to an older copy.
 - There are no cross-database joins.
 
@@ -701,8 +703,14 @@ Every invoice change that alters which entries the invoice holds goes through th
 
 ```text
 invoice_operation_intents(company_id, invoice_id, operation_id, state: 'pending' | 'committed' | 'failed',
-                          generation, created_at, finished_at)
+                          generation, desired_entry_ids, disposition: 'active' | 'retained',
+                          created_at, finished_at)
+invoice_entry_holdings(company_id, invoice_id, entry_ids, disposition: 'active' | 'retained', updated_at)
+invoice_operation_outbox_items(company_id, invoice_id, operation_id, kind: 'commit' | 'abort', payload,
+                               attempts, delivered_at, created_at)
 ```
+
+The intent stores the whole request (entry set and disposition), so a retry or recovery resends the stored request and never recomputes it. `invoice_entry_holdings` records what each invoice holds, one row per (company_id, invoice_id), with no foreign key to `invoices`. `invoice_operation_outbox_items` holds the commit and abort messages waiting for delivery, unique per (company_id, operation_id, kind).
 
 Timekeeping keeps its own terminal record of the same operations (`invoice_operations`, section 7.2).
 

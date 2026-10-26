@@ -78,6 +78,12 @@ rules:
     company answers not_found. An employee may name only themselves; any other
     user answers forbidden. A missing user_id means the acting user.
   company_mismatch: An entry or user of another company answers not_found, exactly as a missing id does.
+  agent_owner: >-
+    A create or update must leave the entry with no agent, or with an agent of
+    the entry's company whose user is the entry's user, checked on the agent
+    and user the entry holds after the write. Any other agent_id (one that
+    does not exist, another company's agent, or a colleague's agent) answers
+    not_found, exactly as a missing id does, and changes nothing.
   stale_generation: A stale Ownership-Generation answers stale_generation and changes nothing; on a bulk route it fails the whole request.
   destroy: DELETE discards the entry and returns it; a later GET answers not_found.
   credential_in_body: >-

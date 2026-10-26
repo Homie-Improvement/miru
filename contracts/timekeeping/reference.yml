@@ -17,13 +17,18 @@ headers:
 
 max_project_ids: 200
 
-response_fields: [company_id, edit_days, users, projects, missing_project_ids]
+response_fields: [company_id, edit_days, users, projects, missing_project_ids, agents]
 user_fields: [id, role]
 project_fields: [id, company_id, billable, member_user_ids]
+agent_fields: [id, user_id]
 
 rules:
   service_identity: Only the Timekeeping service token is accepted. A missing or wrong credential, or a user token, gets 401 and no data, whether or not the company exists.
-  company_scope: Every fact belongs to the company in the path. Users are the company's employed users, with their role in that company.
+  company_scope: >-
+    Every fact belongs to the company in the path. Users are the company's
+    employed users, with their role in that company. Agents are every agent of
+    the company, active or not, each with only its id and the user it belongs
+    to, so Timekeeping can check design rule S7 before an entry write.
   missing_project: A requested project the company does not own is listed in missing_project_ids exactly like an id that does not exist, with none of its facts.
 
 errors:

@@ -151,13 +151,19 @@ RSpec.describe InvoiceMailer, type: :mailer do
     client = create(:client, company:)
     invoice = create(:invoice, client:, company:, status: :sending)
     allow(InvoicePayment::PdfGeneration).to receive(:process).and_return("%PDF-1.4 invoice")
-    TimekeepingOwnership.current.update!(handoff_step: "close_admission")
-
-    mail = InvoiceMailer.with(invoice_id: invoice.id, subject: "Invoice", recipients: [client.email]).invoice
-
-    expect { mail.message }.to raise_error(Timekeeping::BillingFence::OwnershipMoving)
     invoice.reload
     expect(invoice.sent_at).to be_nil
     expect(invoice.status).to eq("sending")
+    TimekeepingOwnership.current.update!(handoff_step: "close_admission")
+    ActionMailer::Base.deliveries.clear
+
+    expect do
+      InvoiceMailer.with(invoice_id: invoice.id, subject: "Invoice", recipients: [client.email]).invoice.deliver_now
+    end.to raise_error(Timekeeping::BillingFence::OwnershipMoving)
+
+    invoice.reload
+    expect(invoice.sent_at).to be_nil
+    expect(invoice.status).to eq("sending")
+    expect(ActionMailer::Base.deliveries).to be_empty
   end
 end

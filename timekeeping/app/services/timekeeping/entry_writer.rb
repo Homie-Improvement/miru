@@ -15,7 +15,8 @@ module Timekeeping
   # 3. Lock the target entries FOR UPDATE, by company (and the A1 scope on
   #    bulk routes), in id order, so two writers over the same entries wait in
   #    turn and never deadlock.
-  # 4. Check If-Match and the entry rules on the locked rows.
+  # 4. Check If-Match and the entry rules on the locked rows, and that the
+  #    agent the write commits is one of the company's agents for its user.
   # 5. Write the entries with version + 1 and one audit row per change.
   # 6. Under the outbox lock, insert one outbox snapshot per change.
   # 7. Insert the receipt.
@@ -130,6 +131,7 @@ module Timekeeping
         checkpoint.call(:rows_locked)
         user_id = target_user_id(command)
         return user_id if user_id.is_a?(WriteOutcome)
+        return WriteOutcome.refusal(:not_found) unless agent_owned?(command, command.body["agent_id"], user_id)
 
         entry = Entry.create!(command.entry_fields.merge(
           "company_id" => command.company_id, "user_id" => user_id, "bill_status" => command.bill_status_default
@@ -154,6 +156,9 @@ module Timekeeping
 
           fields["user_id"] = user_id
         end
+        committed = stored_values(entry).merge(fields)
+        return WriteOutcome.refusal(:not_found) unless agent_owned?(command, committed["agent_id"], committed["user_id"])
+
         single_change(entry, fields)
       end
 
@@ -254,6 +259,18 @@ module Timekeeping
         when :requested then Integer(requested.to_s, 10)
         else WriteOutcome.refusal(decision)
         end
+      end
+
+      # S7: the agent and user the write commits must be an agent of this
+      # company and its own user, or the monolith projection refuses the
+      # snapshot and every later delivery waits behind it. Checked on the
+      # committed pair, so an update that changes only user_id under a stored
+      # agent is refused too. An unknown agent, another company's agent and a
+      # colleague's agent all answer not_found, so the answer reveals nothing
+      # about other companies. The facts are read before the transaction, so
+      # the projection's own agent checks stay as the backstop.
+      def agent_owned?(command, agent_id, user_id)
+        EntryDecision.agent_owner(agent_id:, user_id:, company_agents: command.facts.agent_owners) == :ok
       end
 
       def stored_values(entry)

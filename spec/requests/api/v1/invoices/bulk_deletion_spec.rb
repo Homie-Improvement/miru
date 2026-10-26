@@ -92,8 +92,8 @@ RSpec.describe "Api::V1::Invoices::BulkDeletion#create inside the billing fence"
   it "keeps a refused paid invoice whole when a bulk deletion with no handoff runs in one fenced transaction" do
     deletable = create(:invoice, company:, client:)
     paid = create(:invoice, company:, client:, amount_due: 300)
-    create(:invoice_line_item, invoice: paid)
-    create(:invoice_tax, invoice: paid)
+    line_item = create(:invoice_line_item, invoice: paid)
+    tax_row = create(:invoice_tax, invoice: paid)
     create(:payment, invoice: paid, amount: 300)
     paid.reload
     baseline = {
@@ -101,6 +101,7 @@ RSpec.describe "Api::V1::Invoices::BulkDeletion#create inside the billing fence"
       taxes: paid.invoice_taxes.count,
       amount: paid.amount,
       tax: paid.tax,
+      discount: paid.discount,
       outstanding_amount: paid.outstanding_amount
     }
     expect(baseline[:line_items]).to eq(1)
@@ -113,12 +114,16 @@ RSpec.describe "Api::V1::Invoices::BulkDeletion#create inside the billing fence"
     expect(response).to have_http_status(:unprocessable_content)
     expect(json_response["undeletable_invoice_ids"]).to eq([paid.id])
     expect(Invoice.exists?(deletable.id)).to be(false)
+    # Matching counts alone would also pass if the original rows were replaced by new ones.
+    expect(InvoiceLineItem.exists?(line_item.id)).to be(true)
+    expect(InvoiceTax.exists?(tax_row.id)).to be(true)
     paid.reload
     expect(
       line_items: paid.invoice_line_items.count,
       taxes: paid.invoice_taxes.count,
       amount: paid.amount,
       tax: paid.tax,
+      discount: paid.discount,
       outstanding_amount: paid.outstanding_amount
     ).to eq(baseline)
   end
@@ -143,8 +148,10 @@ RSpec.describe "Api::V1::Invoices::BulkDeletion#create during a handoff", type: 
       create(:invoice_tax, invoice:)
     end
     ids = invoices.map(&:id)
-    expect(InvoiceLineItem.where(invoice_id: ids).count).to eq(3)
-    expect(InvoiceTax.where(invoice_id: ids).count).to eq(3)
+    line_item_ids = InvoiceLineItem.where(invoice_id: ids).pluck(:id)
+    tax_ids = InvoiceTax.where(invoice_id: ids).pluck(:id)
+    expect(line_item_ids.size).to eq(3)
+    expect(tax_ids.size).to eq(3)
     TimekeepingOwnership.current.update!(handoff_step: "close_admission")
 
     send_request :post, api_v1_invoices_bulk_deletion_index_path,
@@ -154,7 +161,29 @@ RSpec.describe "Api::V1::Invoices::BulkDeletion#create during a handoff", type: 
     expect(response).to have_http_status(:service_unavailable)
     expect(json_response["reason"]).to eq("ownership_moving")
     expect(Invoice.where(id: ids).count).to eq(3)
-    expect(InvoiceLineItem.where(invoice_id: ids).count).to eq(3)
-    expect(InvoiceTax.where(invoice_id: ids).count).to eq(3)
+    expect(InvoiceLineItem.where(invoice_id: ids).pluck(:id)).to match_array(line_item_ids)
+    expect(InvoiceTax.where(invoice_id: ids).pluck(:id)).to match_array(tax_ids)
+  end
+
+  # "Every invoice, line-item, invoice-tax and payment write, mobile-collection payments included, gets 503 ownership_moving while handoff_step is set and writes nothing"
+  it "refuses a bulk deletion that names another company's invoice during a handoff and leaves both companies' invoices in place" do
+    own_invoice = create(:invoice, company:, client:)
+    create(:invoice_line_item, invoice: own_invoice)
+    foreign_invoice = create(:invoice_with_invoice_line_items)
+    expect(foreign_invoice.company_id).not_to eq(company.id)
+    ids = [own_invoice.id, foreign_invoice.id]
+    baseline_line_items = InvoiceLineItem.where(invoice_id: ids).order(:id).pluck(:id, :invoice_id)
+    expect(baseline_line_items.count { |_id, invoice_id| invoice_id == own_invoice.id }).to eq(1)
+    expect(baseline_line_items.count { |_id, invoice_id| invoice_id == foreign_invoice.id }).to be_positive
+    TimekeepingOwnership.current.update!(handoff_step: "close_admission")
+
+    send_request :post, api_v1_invoices_bulk_deletion_index_path,
+      params: { invoices_ids: ids },
+      headers: auth_headers(user)
+
+    expect(response).to have_http_status(:service_unavailable)
+    expect(json_response["reason"]).to eq("ownership_moving")
+    expect(Invoice.where(id: ids).count).to eq(2)
+    expect(InvoiceLineItem.where(invoice_id: ids).order(:id).pluck(:id, :invoice_id)).to eq(baseline_line_items)
   end
 end

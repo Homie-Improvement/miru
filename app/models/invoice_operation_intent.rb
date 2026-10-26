@@ -9,4 +9,5 @@ class InvoiceOperationIntent < ApplicationRecord
 
   validates :company_id, :invoice_id, :operation_id, :generation, presence: true
   validates :state, inclusion: { in: STATES }
+  validates :disposition, inclusion: { in: Invoices::ReservationRequest::DISPOSITIONS }
 end

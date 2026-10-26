@@ -5,6 +5,7 @@ require "securerandom"
 require_relative "client"
 require_relative "contract"
 require_relative "idempotency_receipts"
+require_relative "reservation_rules"
 require_relative "../../../gems/timekeeping_rules/lib/timekeeping_rules/reservation_decision"
 
 module TimekeepingContract
@@ -33,6 +34,16 @@ module TimekeepingContract
       [->(_request) { true }, :requested]
     ].freeze
 
+    # Whether the agent and user an entry holds after a write may be
+    # committed, in order: no agent, or an agent of the entry's company whose
+    # user is the entry's user. Every other agent answers as a missing id.
+    AGENT_OWNER_TABLE = [
+      [->(pair) { pair[:agent_id].nil? }, :ok],
+      [->(pair) { pair[:agent]&.fetch("company_id") != pair[:company_id] }, :not_found],
+      [->(pair) { pair[:agent].fetch("user_id") != pair[:user_id] }, :not_found],
+      [->(_pair) { true }, :ok]
+    ].map(&:freeze).freeze
+
     # Whether a credential may call a reservation route, in order.
     SERVICE_ACCESS_TABLE = [
       [->(access) { access[:kind].nil? }, :unauthorized],
@@ -52,6 +63,7 @@ module TimekeepingContract
       locked: ->(reserved:, was_locked:) { reserved },
       duration: ->(stored) { stored },
       target_user: ->(**request) { first_match(TARGET_USER_TABLE, request) },
+      agent_owner: ->(**pair) { first_match(AGENT_OWNER_TABLE, pair) },
       service_access: ->(**access) { first_match(SERVICE_ACCESS_TABLE, access) },
       operation_key: ->(company_id:, actor:, operation_id:) { [company_id, actor, operation_id] },
       # Which entries a refused prepare still reserves or releases: none.
@@ -63,6 +75,8 @@ module TimekeepingContract
       # it counts: always.
       service_command_writes: ->(route:) { true },
       replay_terminal_prepare: true,
+      # The section 7.2 prepare decision table the fake answers from.
+      prepare_table: ReservationRules::PREPARE_TABLE,
       snapshot_entry: ->(entry, credentials:) { entry },
       # Whether an entry write carries a credential Timekeeping holds anywhere
       # in its body. Such a write is refused, so the snapshot it would publish
@@ -95,6 +109,7 @@ module TimekeepingContract
       @tokens = {}
       @services = {}
       @projects = {}
+      @agents = {}
       @entries = {}
       @reservations = []
       @operations = {}
@@ -143,6 +158,10 @@ module TimekeepingContract
 
     def add_project(company_id:)
       next_id.tap { |id| @projects[id] = company_id }
+    end
+
+    def add_agent(company_id:, user_id:)
+      next_id.tap { |id| @agents[id] = { "company_id" => company_id, "user_id" => user_id } }
     end
 
     def add_entry(company_id:, user_id:, project_id:, **attributes)
@@ -240,7 +259,10 @@ module TimekeepingContract
         return failure if failure
         return Wire.error(@entry_contract, "not_found") unless @projects[integer(body["project_id"])] == company_id
 
-        entry = write_entry(new_entry(company_id, entry_fields(body).merge("user_id" => user_id)))
+        fields = entry_fields(body).merge("user_id" => user_id)
+        return Wire.error(@entry_contract, "not_found") unless agent_owned?(company_id, fields)
+
+        entry = write_entry(new_entry(company_id, fields))
         respond(201, present(entry))
       end
 
@@ -262,7 +284,17 @@ module TimekeepingContract
           return Wire.error(@entry_contract, "not_found")
         end
 
-        respond(200, present(write_entry(entry.merge(changes))))
+        committed = entry.merge(changes)
+        return Wire.error(@entry_contract, "not_found") unless agent_owned?(company_id, committed)
+
+        respond(200, present(write_entry(committed)))
+      end
+
+      # S7, checked on the agent and user the entry holds after the write, so
+      # an update that changes only user_id under a stored agent is refused.
+      def agent_owned?(company_id, fields)
+        agent_id = fields["agent_id"]
+        @policies[:agent_owner].call(agent_id:, agent: @agents[agent_id], user_id: fields["user_id"], company_id:) == :ok
       end
 
       def destroy_entry(company_id, params)
@@ -405,13 +437,14 @@ module TimekeepingContract
         end
 
         entry_ids = Array(body["entries"]).map { |id| integer(id) }
-        in_company_ids = entry_ids.uniq.select { |entry_id| visible_entry(entry_id, company_id) }
-        decision = TimekeepingRules::ReservationDecision.call(
-          current: decision_reservations(in_company_ids, body["invoice_id"]), desired: entry_ids,
-          disposition: body["disposition"], invoice_status: WIRE_INVOICE_STATUS
-        )
-        conflicts = decision[:conflicts]
-        free = decision[:reserve]
+        # Prepare answers from the swappable prepare_table policy, so the
+        # mutation spec can break one row of it; commit's release still comes
+        # from TimekeepingRules::ReservationDecision.
+        outcomes = entry_ids.uniq.map { |entry_id| [entry_id, prepare_outcome(entry_id, company_id, body["invoice_id"])] }
+        conflicts = outcomes.filter_map do |entry_id, outcome|
+          { entry_id:, reason: outcome } if ReservationRules.refusal?(outcome)
+        end
+        free = outcomes.filter_map { |entry_id, outcome| entry_id if outcome == :add_provisional }
         operation_id = body["operation_id"]
         # Reservations carry the operation's full identity, so another actor's
         # operation with the same operation_id never commits or aborts them.
@@ -434,6 +467,17 @@ module TimekeepingContract
         }
         @operations[operation_key] = stored
         prepare_answer(stored)
+      end
+
+      def prepare_outcome(entry_id, company_id, invoice_id)
+        current = @reservations.select { |reservation| reservation[:entry_id] == entry_id }
+        facts = {
+          in_company: !visible_entry(entry_id, company_id).nil?,
+          committed: current.find { |reservation| reservation[:state] == "committed" },
+          provisional: current.find { |reservation| reservation[:state] == "provisional" },
+          invoice_id:
+        }
+        ReservationRules.prepare_outcome(facts, table: @policies[:prepare_table])
       end
 
       # Each entry's reservations in the form ReservationDecision reads, seen
