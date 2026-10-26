@@ -180,6 +180,20 @@ RSpec.describe Timekeeping::WriteMetrics do
         .to eq(folded_once)
     end
 
+    # The second fold meets an existing window row, so its counts go through
+    # the conflict update rather than the first insert.
+    it "adds a second fold into the same window: a shared bucket grows, other buckets stay, the sum accumulates" do
+      record_write_metric_at(window_noon + 10, latency_ms: 40)
+      record_write_metric_at(window_noon + 20, latency_ms: 400)
+      expect(described_class.fold_pending).to eq(2)
+
+      record_write_metric_at(window_noon + 30, latency_ms: 45)
+      record_write_metric_at(window_noon + 40, outcome: :reference_unavailable, latency_ms: 2000)
+      expect(described_class.fold_pending).to eq(2)
+
+      expect(pending_window_row(company_a)).to eq([3, 1, 2485, { "50" => 2, "500" => 1, "2500" => 1 }])
+    end
+
     it "folds each company's pending events only into that company's own window rows" do
       record_write_metric_at(window_noon + 10, company_id: 101, latency_ms: 20)
       record_write_metric_at(window_noon + 20, company_id: 101, outcome: :reference_unavailable, latency_ms: 40)
