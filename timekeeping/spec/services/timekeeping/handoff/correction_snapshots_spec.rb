@@ -226,11 +226,12 @@ RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "stored data" do
     described_class.write!(snapshots: [correction_snapshot_for(entry_id)], version: 1, generation: 2)
     before = correction_table_state
 
-    # source_metadata is NOT NULL, so this snapshot passes the shape check and fails at the insert.
+    # A note holding a NUL byte passes the value check, but the database driver
+    # refuses the INSERT text that carries it, after the old rows were deleted.
     expect do
-      described_class.write!(snapshots: [correction_snapshot_for(entry_id).merge("source_metadata" => nil)],
+      described_class.write!(snapshots: [correction_snapshot_for(entry_id).merge("note" => "a\u0000b")],
                              version: 3, generation: 2)
-    end.to raise_error(ActiveRecord::NotNullViolation)
+    end.to raise_error(ArgumentError, /null byte/)
     expect(correction_table_state).to eq(before)
   end
 
