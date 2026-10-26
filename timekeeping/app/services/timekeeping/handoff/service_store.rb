@@ -29,16 +29,9 @@ module Timekeeping
 
         # A load deletes every row the checkpoint lacks, so an entry written
         # after the export would be lost. The load therefore runs only while
-        # admission is fenced. Reading the row FOR SHARE makes an admit! wait
-        # until the load has committed or rolled back.
+        # admission is fenced.
         def check_load_allowed!
-          rows = connection.select_rows(ApplicationRecord.sanitize_sql_array(
-            ["SELECT generation FROM admission WHERE id = ? FOR SHARE", Admission::SINGLETON_ID]
-          ))
-          raise Store::Error, "refusing to load a checkpoint: the admission row is missing" if rows.empty?
-          return if rows.first.first.nil?
-
-          raise Store::Error, "refusing to load a checkpoint while entry writes are admitted; fence admission first"
+          FenceCheck.require_fenced!(connection, "load a checkpoint")
         end
     end
   end

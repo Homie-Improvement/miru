@@ -26,9 +26,6 @@ module Timekeeping
   # can hold a transaction at a known point or fail it after a given insert.
   class EntryWriter
     KEY_SEPARATOR = "\u001F"
-    # The one key every writer takes just before its outbox inserts and holds
-    # until commit, so outbox positions commit in the order they were drawn.
-    OUTBOX_LOCK_KEY = 2_026_034_001
     BULK_RESULTS = { bulk_move: "moved", bulk_delete: "deleted" }.freeze
     BULK_ACTIONS = { bulk_move: :move, bulk_delete: :delete }.freeze
     NOT_FOUND_RESULT = "not_found"
@@ -291,7 +288,7 @@ module Timekeeping
       def write_outbox(changes, rows, generation)
         return if changes.empty?
 
-        connection.execute(ApplicationRecord.sanitize_sql_array(["SELECT pg_advisory_xact_lock(?)", OUTBOX_LOCK_KEY]))
+        OutboxSnapshot.lock_for_insert!
         OutboxSnapshot.insert_all!(changes.map { |change| OutboxFields.row(rows.fetch(change.entry_id), generation:) })
       end
 
