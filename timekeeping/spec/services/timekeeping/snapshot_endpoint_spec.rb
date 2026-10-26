@@ -6,62 +6,85 @@ require "rails_helper"
 require "webmock/rspec"
 
 RSpec.describe Timekeeping::SnapshotEndpoint do
+  let(:empty_batch) { { "schema_version" => 1, "snapshots" => [] } }
+
+  # An inner endpoint that returns the given answer for every delivery.
+  def scripted_snapshot_endpoint(answer)
+    Object.new.tap do |inner|
+      inner.define_singleton_method(:deliver) { |_batch, idempotency_key:| answer }
+    end
+  end
+
+  # Delivers the batch through an endpoint scripted to return the answer.
+  # Returns what the endpoint handed back and every line it logged.
+  def deliver_through_scripted_endpoint(answer, batch: empty_batch)
+    log = StringIO.new
+    logger = Logger.new(log).tap { |capture| capture.level = Logger::DEBUG }
+    returned = described_class.new(endpoint: scripted_snapshot_endpoint(answer), logger:)
+                              .deliver(batch, idempotency_key: SecureRandom.uuid)
+    [returned, log.string]
+  end
+
   # "No token is written to a payload or a log line."
-  it "logs only the status and a fixed reason when a refusal echoes the service token" do
+  it "logs a refusal that echoes the service token once, by status and a fixed reason, and returns it unchanged" do
     token = "service-#{SecureRandom.hex(24)}"
     refusal = TimekeepingRelay::Response.new(status: 401, body: { "reason" => "Bearer #{token}\nINFO forged" })
-    inner = Object.new
-    inner.define_singleton_method(:deliver) { |_batch, idempotency_key:| refusal }
-    output = StringIO.new
-    logger = Logger.new(output)
-    logger.level = Logger::DEBUG
 
-    answer = described_class.new(endpoint: inner, logger: logger)
-                            .deliver({ "schema_version" => 1, "snapshots" => [] }, idempotency_key: SecureRandom.uuid)
+    returned, logged = with_timekeeping_env(Timekeeping::Environment::SERVICE_TOKEN => token) do
+      deliver_through_scripted_endpoint(refusal)
+    end
 
-    expect(answer.status).to eq(401)
-    expect(output.string).to include("401")
-    expect(output.string).to include("unrecognized")
-    expect(output.string).not_to include(token)
-    expect(output.string).not_to include("forged")
+    expect([returned.status, returned.body]).to eq([refusal.status, refusal.body])
+    expect(logged.lines.size).to eq(1)
+    expect(logged).to include("401")
+    expect(logged).to include("unrecognized")
+    expect(logged).not_to include(token)
+    expect(logged).not_to include("forged")
+  end
+
+  it "logs a failed answer whose nested body echoes the bearer token by its status only, without the token" do
+    token = "snapshot-endpoint-spec-token-#{SecureRandom.hex(8)}"
+    failed = TimekeepingRelay::Response.new(
+      status: 502,
+      body: { "reason" => "Bearer #{token}\nINFO forged line", "echo" => { "Authorization" => "Bearer #{token}" } }
+    )
+
+    returned, logged = deliver_through_scripted_endpoint(failed)
+
+    expect(returned.status).to eq(502)
+    expect(logged).to include("502")
+    expect(logged).not_to include(token)
+    expect(logged).not_to include("forged line")
   end
 
   it "logs a stale_generation refusal by its contract reason and hands the answer back unchanged" do
     stale_answer = TimekeepingRelay::Response.new(status: 409, body: { "reason" => "stale_generation" })
-    stale_inner = Object.new
-    stale_inner.define_singleton_method(:deliver) { |_batch, idempotency_key:| stale_answer }
-    stale_output = StringIO.new
-    stale_logger = Logger.new(stale_output).tap { |capture| capture.level = Logger::DEBUG }
 
-    returned = described_class.new(endpoint: stale_inner, logger: stale_logger)
-                              .deliver({ "schema_version" => 1, "snapshots" => [] }, idempotency_key: SecureRandom.uuid)
+    returned, logged = deliver_through_scripted_endpoint(stale_answer)
 
     expect(returned).to eq(stale_answer)
-    expect(stale_output.string.lines.size).to eq(1)
-    expect(stale_output.string).to include("status=409", "reason=stale_generation")
+    expect(logged.lines.size).to eq(1)
+    expect(logged).to include("status=409", "reason=stale_generation")
   end
 
   # Such a 200 stops the relay's run like a refusal, so it needs a log line too.
   it "logs a 200 the relay will not count as delivered, and stays quiet for one it will" do
     one_snapshot_batch = { "schema_version" => 1, "snapshots" => [{ "generation" => 1, "outbox_position" => 1, "entry" => {} }] }
     answers = {
-      proxy_page: TimekeepingRelay::Response.new(status: 200, body: "<html>proxy</html>"),
-      count_mismatch: TimekeepingRelay::Response.new(status: 200, body: { "applied" => 0, "ignored" => 0 }),
-      delivered: TimekeepingRelay::Response.new(status: 200, body: { "applied" => 1, "ignored" => 0 })
+      proxy_page: [TimekeepingRelay::Response.new(status: 200, body: "<html>proxy</html>"), one_snapshot_batch],
+      count_mismatch: [TimekeepingRelay::Response.new(status: 200, body: { "applied" => 0, "ignored" => 0 }), one_snapshot_batch],
+      delivered: [TimekeepingRelay::Response.new(status: 200, body: { "applied" => 1, "ignored" => 0 }), one_snapshot_batch],
+      empty_batch_delivered: [TimekeepingRelay::Response.new(status: 200, body: { "applied" => 0, "ignored" => 0 }), empty_batch]
     }
-    logged = answers.transform_values do |undelivered_answer|
-      scripted = Object.new
-      scripted.define_singleton_method(:deliver) { |_batch, idempotency_key:| undelivered_answer }
-      capture = StringIO.new
-      described_class.new(endpoint: scripted, logger: Logger.new(capture).tap { |log| log.level = Logger::DEBUG })
-                     .deliver(one_snapshot_batch, idempotency_key: SecureRandom.uuid)
-      capture.string
+    logged = answers.transform_values do |(answer, batch)|
+      deliver_through_scripted_endpoint(answer, batch:).last
     end
 
     expect(logged[:proxy_page]).to include("status=200", "reason=unrecognized")
     expect(logged[:proxy_page]).not_to include("proxy")
     expect(logged[:count_mismatch]).to include("status=200", "reason=unrecognized")
     expect(logged[:delivered]).to eq("")
+    expect(logged[:empty_batch_delivered]).to eq("")
   end
 
   it "posts to the configured snapshot URL with the service token and keeps the token out of inspect" do
@@ -77,7 +100,7 @@ RSpec.describe Timekeeping::SnapshotEndpoint do
       Timekeeping::Environment::MONOLITH_SNAPSHOT_URL => "http://snapshots.test"
     ) do
       configured = described_class.configured(logger: Logger.new(StringIO.new))
-      [configured, configured.deliver({ "schema_version" => 1, "snapshots" => [] }, idempotency_key: SecureRandom.uuid)]
+      [configured, configured.deliver(empty_batch, idempotency_key: SecureRandom.uuid)]
     end
 
     expect(authorizations).to eq(["Bearer #{configured_token}"])
