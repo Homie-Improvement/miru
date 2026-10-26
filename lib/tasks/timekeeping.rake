@@ -22,4 +22,46 @@ namespace :timekeeping do
   rescue Timekeeping::SeedDispositionRecorder::Error => error
     abort error.message
   end
+
+  # Runs the handoff runner and reports a refusal as a failed task, so a
+  # stopped handoff never looks finished to the operator's shell.
+  def run_timekeeping_handoff(**arguments)
+    Timekeeping::Handoff::Runner.run(**arguments)
+    puts "Timekeeping handoff #{arguments.fetch(:direction)}#{' abort' if arguments[:abort]} finished"
+  rescue Timekeeping::Handoff::Runner::Refused, Timekeeping::Handoff::Store::Error => error
+    abort error.message
+  end
+
+  # The direction a resume or abort continues, from DIRECTION.
+  def timekeeping_handoff_direction
+    direction = ENV["DIRECTION"].to_s
+    return direction.to_sym if Timekeeping::Handoff::Steps::DIRECTIONS.key?(direction.to_sym)
+
+    abort "Set DIRECTION to one of #{Timekeeping::Handoff::Steps::DIRECTIONS.keys.join(', ')}."
+  end
+
+  desc "Hand timesheet entries from the monolith's legacy table to Timekeeping (first cutover)"
+  task handoff_cutover: :environment do
+    run_timekeeping_handoff(direction: :cutover)
+  end
+
+  desc "Hand timesheet entries from Timekeeping back to the monolith"
+  task handoff_rollback: :environment do
+    run_timekeeping_handoff(direction: :rollback)
+  end
+
+  desc "Hand timesheet entries from the monolith's prepared tables to Timekeeping again"
+  task handoff_re_cutover: :environment do
+    run_timekeeping_handoff(direction: :re_cutover)
+  end
+
+  desc "Resume the Timekeeping handoff in progress (DIRECTION=cutover|rollback|re_cutover required)"
+  task handoff_resume: :environment do
+    run_timekeeping_handoff(direction: timekeeping_handoff_direction, resume: true)
+  end
+
+  desc "Abort the Timekeeping handoff in progress (DIRECTION=cutover|rollback|re_cutover required)"
+  task handoff_abort: :environment do
+    run_timekeeping_handoff(direction: timekeeping_handoff_direction, abort: true)
+  end
 end
