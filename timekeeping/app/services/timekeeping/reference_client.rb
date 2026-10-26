@@ -6,7 +6,7 @@ require "openssl"
 
 module Timekeeping
   # Reads the facts an entry write is decided on (edit_days, the company's
-  # users and the requested projects) from the monolith's reference endpoint,
+  # users and agents, and the requested projects) from the monolith's reference endpoint,
   # whose shape is contracts/timekeeping/reference.yml. Every call makes a
   # fresh request: there is no cache, so a write never acts on an older copy.
   # Any failure to read the facts raises Unavailable, so callers refuse the
@@ -16,9 +16,15 @@ module Timekeeping
 
     User = Data.define(:id, :role)
     Project = Data.define(:id, :company_id, :billable, :member_user_ids)
-    Facts = Data.define(:company_id, :edit_days, :users, :projects, :missing_project_ids) do
+    Agent = Data.define(:id, :user_id)
+    Facts = Data.define(:company_id, :edit_days, :users, :projects, :missing_project_ids, :agents) do
       def user_ids
         users.map(&:id)
+      end
+
+      # Each of the company's agent ids mapped to the user it belongs to.
+      def agent_owners
+        agents.to_h { |agent| [agent.id, agent.user_id] }
       end
     end
 
@@ -97,7 +103,8 @@ module Timekeeping
             Project.new(id: project["id"], company_id: project["company_id"], billable: project["billable"],
                         member_user_ids: project["member_user_ids"])
           end,
-          missing_project_ids: facts["missing_project_ids"]
+          missing_project_ids: facts["missing_project_ids"],
+          agents: facts["agents"].map { |agent| Agent.new(id: agent["id"], user_id: agent["user_id"]) }
         )
       rescue JSON::ParserError
         raise Unavailable, "reference response is not JSON"
@@ -109,7 +116,12 @@ module Timekeeping
           facts["edit_days"].is_a?(Integer) &&
           list_of?(facts["users"]) { |user| valid_user?(user) } &&
           list_of?(facts["projects"]) { |project| valid_project?(project, company_id) } &&
-          list_of?(facts["missing_project_ids"]) { |id| id.is_a?(Integer) }
+          list_of?(facts["missing_project_ids"]) { |id| id.is_a?(Integer) } &&
+          list_of?(facts["agents"]) { |agent| valid_agent?(agent) }
+      end
+
+      def valid_agent?(agent)
+        agent.is_a?(Hash) && agent["id"].is_a?(Integer) && agent["user_id"].is_a?(Integer)
       end
 
       def valid_user?(user)
