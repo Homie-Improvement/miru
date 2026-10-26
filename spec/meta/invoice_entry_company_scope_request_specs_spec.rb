@@ -74,6 +74,32 @@ RSpec.describe "Company-scope params builder report with an assertion helper met
   end
 end
 
+RSpec.describe "Company-scope params builder report with one-line assertion helpers" do
+  # A one-line helper ends on its own line, so a request sent in a later example is not taken as its body.
+  it "keeps endless and semicolon one-line helpers out of the builders and counts a later request as stray" do
+    section = <<~RUBY
+      RSpec.describe "Api::V1::Invoices#create timesheet entry company scope", type: :request do
+        def post_company_scope_invoice(*entry_refs)
+          send_request :post, api_v1_invoices_path, params: { invoice: { entries: entry_refs } }
+          [response.status, response.body]
+        end
+
+        def refused?(result) = result.first == 422
+        def not_found_error; "not found"; end
+
+        it "refuses" do
+          send_request :post, api_v1_invoices_path, params: { invoice: {} }
+        end
+      end
+    RUBY
+
+    report = params_builder_report(section)
+
+    expect(report[:builders]).to eq(["post_company_scope_invoice"])
+    expect(report[:stray_requests]).to eq(1)
+  end
+end
+
 RSpec.describe "Company-scope params builder report with an assertion lambda" do
   # "It also forbids lambdas regardless of their purpose."
   it "allows an assertion-only lambda beside the one company-scope params builder" do

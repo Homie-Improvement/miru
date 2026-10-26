@@ -1,11 +1,15 @@
 # frozen_string_literal: true
 
-# Reads request spec source as text so the meta specs can check that every company-scope request
-# goes through one parameter builder: the one method that calls send_request. Other helpers,
-# methods or lambdas, are allowed as long as they send no request.
+# Reads request spec source as text so the meta specs can check that every send_request call in a
+# company-scope describe sits in one parameter builder: the one method that calls send_request.
+# Other helpers, methods or lambdas, are allowed as long as they call no send_request. Requests
+# made with the plain Rails verbs (post, patch) are not tracked; these specs send through
+# send_request.
 module CompanyScopeRequestSpecScan
   REQUEST_CALL = /\bsend_request\b/
   METHOD_START = /^(?<indent>\s*)def\s+(?<name>\w+[?!]?)/
+  # "def ok?(r) = r.first == 200" or "def x; true; end": the whole method sits on its "def" line.
+  ONE_LINE_METHOD = /^\s*def\s+\w+[?!]?(?:\([^)]*\))?\s*=(?!=)|\bend\s*$/
   # A "#" that starts a line or follows whitespace, unless it opens "#{...}" string interpolation.
   COMMENT = /(?:^|\s)#(?!\{).*$/
   TOP_LEVEL_DESCRIBE = /^RSpec\.describe\b/
@@ -37,13 +41,18 @@ module CompanyScopeRequestSpecScan
 
   private
 
-    # A method ends at the first later "end" with the same indentation as its "def".
+    # A method ends on its own line when it is a one-liner, otherwise at the first later "end"
+    # with the same indentation as its "def".
     def method_ranges(lines)
       lines.each_with_index.each_with_object({}) do |(line, start), ranges|
         match = line.match(METHOD_START)
         next unless match
-
-        method_end = (start + 1...lines.size).find { |index| lines[index].match?(/^#{match[:indent]}end\b/) }
+        method_end =
+          if line.match?(ONE_LINE_METHOD)
+            start
+          else
+            (start + 1...lines.size).find { |index| lines[index].match?(/^#{match[:indent]}end\b/) }
+          end
         ranges[match[:name]] = start..(method_end || lines.size - 1)
       end
     end
