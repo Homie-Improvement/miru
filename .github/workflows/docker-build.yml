@@ -131,3 +131,52 @@ jobs:
               -H "Content-Type: application/json" \
               "https://api.render.com/v1/services/${service_id}/deploys"
           done
+
+  # The Timekeeping service image. The demo environment is local only
+  # (docs/architecture/timekeeping-soa.md section 11.1), so this job only
+  # builds and checks the image: it never logs in to a registry, never pushes,
+  # and shares neither the monolith's image name nor its cache scopes.
+  build-timekeeping:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        with:
+          version: v0.36.0
+          driver-opts: |
+            network=host
+            image=moby/buildkit@sha256:1f8167fcb0eca5b7126353d35299386945cbb8949cc516c592a49f80cfce4fa2
+
+      # A developer checkout may hold a timekeeping/.bundle/config with
+      # registry credentials. This stand-in proves the ignore file keeps it out.
+      - name: Write a sentinel Bundler config
+        run: |
+          mkdir -p timekeeping/.bundle
+          echo 'BUNDLE_SENTINEL: "must-not-reach-the-timekeeping-image"' > timekeeping/.bundle/config
+
+      - name: Build Timekeeping image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: ./timekeeping/Dockerfile
+          push: false
+          load: true
+          tags: miru-timekeeping:ci
+          cache-from: type=gha,scope=timekeeping
+          cache-to: type=gha,mode=max,scope=timekeeping
+          platforms: linux/amd64
+
+      - name: Check the image holds no local config, key or test hook switch
+        run: |
+          docker run --rm --entrypoint sh miru-timekeeping:ci -c '
+            found=$(find /app \( -path "*/.bundle/*" -o -name master.key -o -path "*/config/credentials/*.key" \
+              -o -name ".env*" -o -name "*.pem" \) -print)
+            if [ -n "$found" ]; then echo "Files that must not be in the image:"; echo "$found"; exit 1; fi
+            if [ -n "${TIMEKEEPING_TEST_HOOKS:-}" ]; then echo "TIMEKEEPING_TEST_HOOKS is set in the image"; exit 1; fi
+          '

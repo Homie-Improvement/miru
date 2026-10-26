@@ -345,3 +345,57 @@ RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots handoff window", type:
     end
   end
 end
+
+# "any `409 stale_generation` outside a handoff;" needs a lasting record of the refusal, because the refused
+# batch's transaction rolls back and would otherwise leave no trace for timekeeping:alerts.
+RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots stale-generation refusal records", type: :request do
+  let(:refusal_company) { create(:company) }
+  let(:refusal_project) { create(:project, client: create(:client, company: refusal_company)) }
+  let(:refusal_user) { create(:user).tap { |user| create(:employment, company: refusal_company, user:) } }
+
+  def deliver_refusal_snapshot(token, entry_id:, outbox_position: 1)
+    entry = TimekeepingSnapshots.entry(id: entry_id, company_id: refusal_company.id, version: 1,
+                                       project_id: refusal_project.id, user_id: refusal_user.id)
+    post "/internal/v1/timekeeping/entry-snapshots",
+      params: TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation: 1, outbox_position:)).to_json,
+      headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json",
+                 "Idempotency-Key" => SecureRandom.uuid }
+  end
+
+  it "records a nil handoff step for a refusal outside a handoff and the freeze step for one refused during it" do
+    TimekeepingOwnership.current.update!(generation: 2, handoff_step: nil)
+
+    with_timekeeping_service_token do |token|
+      deliver_refusal_snapshot(token, entry_id: 90_701, outbox_position: 5)
+      expect([response.status, response.parsed_body]).to eq([409, { "reason" => "stale_generation" }])
+      expect(TimekeepingStaleGenerationRefusal.pluck(:company_id, :handoff_step)).to eq([[refusal_company.id, nil]])
+
+      # A refusal during a handoff is recorded with that step, so the alert can leave it out.
+      TimekeepingOwnership.current.update!(handoff_step: "freeze", final_outbox_position: 10)
+      deliver_refusal_snapshot(token, entry_id: 90_701, outbox_position: 11)
+      expect([response.status, response.parsed_body]).to eq([409, { "reason" => "stale_generation" }])
+    end
+
+    expect(TimekeepingStaleGenerationRefusal.order(:id).pluck(:company_id, :handoff_step))
+      .to eq([[refusal_company.id, nil], [refusal_company.id, "freeze"]])
+    expect(TimesheetEntry.with_discarded.find_by(id: 90_701)).to be_nil
+  end
+
+  # A refusal made during a handoff must stay marked with that step after the handoff clears, or a
+  # reader that looks at the ownership row later would count it as outside a handoff.
+  it "keeps the handoff step a refusal saw after the handoff ends, so only the later refusal counts as outside one" do
+    TimekeepingOwnership.current.update!(generation: 2, handoff_step: "close_admission")
+
+    with_timekeeping_service_token do |token|
+      deliver_refusal_snapshot(token, entry_id: 93_001)
+      expect([response.status, response.parsed_body]).to eq([409, { "reason" => "stale_generation" }])
+
+      TimekeepingOwnership.current.update!(handoff_step: nil)
+      deliver_refusal_snapshot(token, entry_id: 93_002)
+      expect([response.status, response.parsed_body]).to eq([409, { "reason" => "stale_generation" }])
+    end
+
+    rows = TimekeepingStaleGenerationRefusal.where(company_id: refusal_company.id).order(:created_at, :id)
+    expect(rows.pluck(:handoff_step)).to eq(["close_admission", nil])
+  end
+end
