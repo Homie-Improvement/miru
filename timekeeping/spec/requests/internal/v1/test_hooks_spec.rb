@@ -16,14 +16,26 @@ RSpec.describe "Timekeeping relay test hooks" do
     ) do
       user_token = mint_token({ sub: 7, company_id: 1, role: "owner" })
 
+      # A refused pause must leave a running relay running.
+      Timekeeping::TestHooks.resume_relay!
+      expect(Timekeeping::TestHooks.relay_paused?).to be(false)
+
       post "/internal/v1/test-hooks/relay/pause"
       expect([response.status, response.parsed_body]).to eq([401, { "reason" => "unauthorized" }])
 
       post "/internal/v1/test-hooks/relay/pause", headers: { "Authorization" => "Bearer #{user_token}" }
       expect([response.status, response.parsed_body]).to eq([401, { "reason" => "unauthorized" }])
+      expect(Timekeeping::TestHooks.relay_paused?).to be(false)
+
+      # A refused resume must leave a paused relay paused.
+      Timekeeping::TestHooks.pause_relay!
+      expect(Timekeeping::TestHooks.relay_paused?).to be(true)
 
       post "/internal/v1/test-hooks/relay/resume", headers: { "Authorization" => "Bearer #{service_token}x" }
       expect([response.status, response.parsed_body]).to eq([401, { "reason" => "unauthorized" }])
+      expect(Timekeeping::TestHooks.relay_paused?).to be(true)
     end
+  ensure
+    Timekeeping::TestHooks.resume_relay!
   end
 end

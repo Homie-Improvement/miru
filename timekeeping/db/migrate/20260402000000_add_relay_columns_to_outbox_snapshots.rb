@@ -13,12 +13,8 @@ class AddRelayColumnsToOutboxSnapshots < ActiveRecord::Migration[8.1]
     # that carried the row.
     add_column :outbox_snapshots, :enqueued_at, :datetime, null: false, default: -> { "CURRENT_TIMESTAMP" }
     add_column :outbox_snapshots, :sent_at, :datetime
-
-    # The relay reads unsent rows in outbox_position order, and the metrics
-    # endpoint reads each company's oldest unsent row.
-    add_index :outbox_snapshots, :outbox_position, where: "sent_at IS NULL",
-      name: "index_outbox_snapshots_unsent_by_position"
-    add_index :outbox_snapshots, %i[company_id enqueued_at], where: "sent_at IS NULL",
-      name: "index_outbox_snapshots_unsent_by_company"
+    # The indexes are built in the next migration, outside this transaction,
+    # so the lock these column changes take is released before any index scans
+    # the existing rows.
   end
 end

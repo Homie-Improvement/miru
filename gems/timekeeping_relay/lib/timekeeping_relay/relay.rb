@@ -32,7 +32,9 @@ module TimekeepingRelay
         rows = @source.unsent_after(last_position || 0, limit)
         break if rows.empty? || @paused.call
 
-        batch = batch_for(rows)
+        # Canonical, so the body posted is the text the key was taken from
+        # even when a source rebuilds a row with its keys in another order.
+        batch = BatchJson.canonical(batch_for(rows))
         response = @endpoint.deliver(batch, idempotency_key: IdempotencyKey.for(batch))
         break unless response.delivered?(rows.size)
 

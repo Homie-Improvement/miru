@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require "digest/sha1"
-require "json"
 
 module TimekeepingRelay
   # The Idempotency-Key for a batch: a name-based UUID (version 5) over the
@@ -21,7 +20,7 @@ module TimekeepingRelay
     module_function
 
     def for(batch)
-      digest = Digest::SHA1.digest(namespace_bytes + JSON.generate(canonical(batch)))
+      digest = Digest::SHA1.digest(namespace_bytes + BatchJson.generate(BatchJson.canonical(batch)))
       bytes = digest.bytes.first(16)
       bytes[6] = (bytes[6] & 0x0f) | VERSION_BITS
       bytes[8] = (bytes[8] & 0x3f) | VARIANT_BITS
@@ -31,16 +30,6 @@ module TimekeepingRelay
 
     def namespace_bytes
       [NAMESPACE.delete("-")].pack("H*")
-    end
-
-    # Hash keys sorted at every depth and turned into strings, so the same
-    # content always serializes to the same text whatever order it was built in.
-    def canonical(value)
-      case value
-      when Hash then value.map { |key, item| [key.to_s, canonical(item)] }.sort_by(&:first).to_h
-      when Array then value.map { |item| canonical(item) }
-      else value
-      end
     end
   end
 end

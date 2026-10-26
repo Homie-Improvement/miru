@@ -28,6 +28,11 @@ RSpec.describe "Timekeeping relay test hooks outside the test environment" do
       Open3.capture2e(env, RbConfig.ruby, "bin/rails", "runner", probe, chdir: app_root, unsetenv_others: true)
     end
 
+    # The enabled boot pauses the production relay through its file flag;
+    # put that flag back as it was so later production runs are not held.
+    production_flag = File.join(Timekeeping::TestHooks::RELAY_PAUSE_DIRECTORY, "relay_paused.production")
+    flag_existed = File.exist?(production_flag)
+
     unset_output, unset_status = boot.call({})
     zero_output, zero_status = boot.call("TIMEKEEPING_TEST_HOOKS" => "0")
     on_output, on_status = boot.call("TIMEKEEPING_TEST_HOOKS" => "1")
@@ -39,5 +44,7 @@ RSpec.describe "Timekeeping relay test hooks outside the test environment" do
     expect(zero_output.lines.last.split).to eq(%w[absent 404])
     expect(on_output.lines.last.split.first).to eq("loaded")
     expect(on_output.lines.last.split.last).not_to eq("404")
+  ensure
+    FileUtils.rm_f(production_flag) if production_flag && !flag_existed
   end
 end

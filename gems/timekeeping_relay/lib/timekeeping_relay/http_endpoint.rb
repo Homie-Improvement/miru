@@ -62,7 +62,7 @@ module TimekeepingRelay
         request["Idempotency-Key"] = idempotency_key
         request["Content-Type"] = "application/json"
         request["Accept"] = "application/json"
-        request.body = JSON.generate(batch)
+        request.body = BatchJson.generate(batch)
         Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == "https",
                                             open_timeout:, read_timeout:) { |http| http.request(request) }
       end
