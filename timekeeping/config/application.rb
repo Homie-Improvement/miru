@@ -10,6 +10,7 @@ Bundler.require(*Rails.groups)
 
 require_relative "../lib/timekeeping/environment"
 require_relative "../lib/timekeeping/token_verifier"
+require_relative "../lib/timekeeping/service_token_verifier"
 require_relative "../lib/timekeeping/identity"
 require_relative "../lib/timekeeping/log_safety"
 require_relative "../lib/timekeeping/request_identity"

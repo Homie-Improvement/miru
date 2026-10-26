@@ -65,6 +65,49 @@ RSpec.describe Timekeeping::Identity do
     expect(identity).to have_attributes(kind: :anonymous, status: :invalid)
   end
 
+  describe "a signed service token" do
+    def service_jwt(secret: service_token, **claims)
+      now = Time.now.to_i
+      JWT.encode({ typ: "timekeeping_service", sub: "invoice-boundary", company_id: 9,
+                   operations: ["reservations.prepare"], iat: now, exp: now + 60, jti: SecureRandom.uuid }.merge(claims),
+                 secret, "HS256")
+    end
+
+    it "takes the service name, company and operations from the verified claims" do
+      expect(resolve("Bearer #{service_jwt}")).to have_attributes(
+        kind: :service, status: :verified, user_id: nil, role: nil, company_id: 9,
+        service_name: "invoice-boundary", operations: ["reservations.prepare"]
+      )
+    end
+
+    it "reports an expired service token as expired and anonymous, with no company" do
+      expect(resolve("Bearer #{service_jwt(exp: Time.now.to_i - 1)}"))
+        .to have_attributes(kind: :anonymous, status: :expired, company_id: nil, signed_company_id: nil)
+    end
+
+    it "reports a service token signed with another secret, or with a wrong claim, as invalid" do
+      [service_jwt(secret: "another-#{SecureRandom.hex(8)}"), service_jwt(typ: "user"),
+       service_jwt(company_id: "9"), service_jwt(operations: "reservations.prepare")].each do |token|
+        expect(resolve("Bearer #{token}")).to have_attributes(kind: :anonymous, status: :invalid)
+      end
+    end
+
+    it "refuses a header longer than the credential scan searches" do
+      long_header = { kid: "k" * Timekeeping::ServiceTokenVerifier::MAX_HEADER_LENGTH }
+      token = JWT.encode({ typ: "timekeeping_service", sub: "invoice-boundary", company_id: 9, operations: [],
+                           exp: Time.now.to_i + 60, jti: SecureRandom.uuid }, service_token, "HS256", long_header)
+
+      expect(resolve("Bearer #{token}")).to have_attributes(kind: :anonymous, status: :invalid)
+    end
+
+    it "gives a user token and the raw shared token no operations and no service name" do
+      expect(resolve("Bearer #{mint_token({ company_id: 9 })}"))
+        .to have_attributes(kind: :user, service_name: nil, operations: [])
+      expect(resolve("Bearer #{service_token}"))
+        .to have_attributes(kind: :service, company_id: nil, service_name: nil, operations: [])
+    end
+  end
+
   describe "the service token" do
     it "gives the service kind for an exact match" do
       expect(resolve("Bearer #{service_token}")).to have_attributes(kind: :service, status: :verified, company_id: nil)

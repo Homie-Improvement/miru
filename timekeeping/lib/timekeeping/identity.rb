@@ -14,9 +14,15 @@ module Timekeeping
   # verified, expired or not. Only write metrics read it, so an expired token
   # is counted under its own company; access decisions and log tags read
   # company_id, which stays nil for an expired token.
-  Identity = Data.define(:kind, :status, :user_id, :company_id, :role, :signed_company_id) do
-    def initialize(signed_company_id: nil, **fields)
-      super
+  #
+  # A service caller is either the raw shared TIMEKEEPING_SERVICE_TOKEN, which
+  # acts for no company and holds no operations, or a signed service token
+  # (Timekeeping::ServiceTokenVerifier), whose verified claims give its
+  # service_name, its one company_id and the operations it may run.
+  Identity = Data.define(:kind, :status, :user_id, :company_id, :role, :signed_company_id, :service_name,
+                         :operations) do
+    def initialize(signed_company_id: nil, service_name: nil, operations: [], **fields)
+      super(signed_company_id:, service_name:, operations: operations.freeze, **fields)
     end
 
     def self.anonymous(status, signed_company_id: nil)
@@ -25,6 +31,18 @@ module Timekeeping
 
     def self.service
       new(kind: :service, status: :verified, user_id: nil, company_id: nil, role: nil)
+    end
+
+    def self.bound_service(claims)
+      new(
+        kind: :service,
+        status: :verified,
+        user_id: nil,
+        company_id: claims.fetch("company_id"),
+        role: nil,
+        service_name: claims.fetch("sub"),
+        operations: claims.fetch("operations")
+      )
     end
 
     def self.user(claims)
@@ -41,8 +59,8 @@ module Timekeeping
     BEARER = /\ABearer (\S+)\z/
 
     # Pure: every input is an argument and nothing is read from ENV. An unset
-    # or empty service token matches no caller, and a missing or unreadable
-    # public key verifies no token.
+    # or empty service token matches no caller and signs no service token, and
+    # a missing or unreadable public key verifies no user token.
     def self.resolve(authorization:, public_key:, service_token:)
       return anonymous(:missing) if authorization.to_s.strip.empty?
 
@@ -50,12 +68,23 @@ module Timekeeping
       return anonymous(:invalid) unless token
       return service if service_token?(token, service_token)
 
-      user(TokenVerifier.verify(token, public_key:))
+      signed(token, public_key:, service_token:)
     rescue TokenVerifier::ExpiredToken => e
       anonymous(:expired, signed_company_id: e.company_id)
+    rescue ServiceTokenVerifier::ExpiredToken
+      anonymous(:expired)
     rescue TokenVerifier::InvalidToken
       anonymous(:invalid)
     end
+
+    # Each verifier pins its own algorithm, so a user token never verifies as
+    # a service token, nor a service token as a user token.
+    def self.signed(token, public_key:, service_token:)
+      bound_service(ServiceTokenVerifier.verify(token, secret: service_token))
+    rescue ServiceTokenVerifier::InvalidToken
+      user(TokenVerifier.verify(token, public_key:))
+    end
+    private_class_method :signed
 
     # The token of a "Bearer <token>" Authorization header, or nil. Entry
     # writes also read it, to refuse a body that carries the caller's token.
