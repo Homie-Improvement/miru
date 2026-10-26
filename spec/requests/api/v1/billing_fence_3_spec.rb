@@ -53,30 +53,6 @@ RSpec.describe "Billing fence keeps company scoping", type: :request do
   end
 end
 
-RSpec.describe "Billing fence on bulk deletion across companies", type: :request do
-  it "refuses a bulk deletion that names another company's invoice during a handoff and leaves both companies' invoices in place" do
-    own_invoice = create(:invoice_with_invoice_line_items)
-    foreign_invoice = create(:invoice_with_invoice_line_items)
-    company = own_invoice.company
-    admin = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user: admin)
-    admin.add_role :admin, company
-    sign_in admin
-
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update!(handoff_step: "close_admission")
-
-    # "Every invoice, line-item, invoice-tax and payment write, mobile-collection payments
-    # included, gets 503 ownership_moving while handoff_step is set and writes nothing"
-    send_request :post, api_v1_invoices_bulk_deletion_index_path,
-      params: { invoices_ids: [own_invoice.id, foreign_invoice.id] },
-      headers: auth_headers(admin)
-
-    expect(response).to have_http_status(503)
-    expect(Invoice.where(id: [own_invoice.id, foreign_invoice.id]).count).to eq(2)
-    expect(InvoiceLineItem.where(invoice_id: foreign_invoice.id).count).to eq(foreign_invoice.invoice_line_items.count)
-  end
-end
-
 RSpec.describe "Billing fence refusal body", type: :request do
   it "answers a refused invoice create with only errors and reason and no ownership state" do
     company = create(:company)

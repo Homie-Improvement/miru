@@ -101,6 +101,7 @@ RSpec.describe "Api::V1::Invoices::BulkDeletion#create inside the billing fence"
       taxes: paid.invoice_taxes.count,
       amount: paid.amount,
       tax: paid.tax,
+      discount: paid.discount,
       outstanding_amount: paid.outstanding_amount
     }
     expect(baseline[:line_items]).to eq(1)
@@ -119,6 +120,7 @@ RSpec.describe "Api::V1::Invoices::BulkDeletion#create inside the billing fence"
       taxes: paid.invoice_taxes.count,
       amount: paid.amount,
       tax: paid.tax,
+      discount: paid.discount,
       outstanding_amount: paid.outstanding_amount
     ).to eq(baseline)
   end
@@ -156,5 +158,27 @@ RSpec.describe "Api::V1::Invoices::BulkDeletion#create during a handoff", type: 
     expect(Invoice.where(id: ids).count).to eq(3)
     expect(InvoiceLineItem.where(invoice_id: ids).count).to eq(3)
     expect(InvoiceTax.where(invoice_id: ids).count).to eq(3)
+  end
+
+  # "Every invoice, line-item, invoice-tax and payment write, mobile-collection payments included, gets 503 ownership_moving while handoff_step is set and writes nothing"
+  it "refuses a bulk deletion that names another company's invoice during a handoff and leaves both companies' invoices in place" do
+    own_invoice = create(:invoice, company:, client:)
+    create(:invoice_line_item, invoice: own_invoice)
+    foreign_invoice = create(:invoice_with_invoice_line_items)
+    expect(foreign_invoice.company_id).not_to eq(company.id)
+    ids = [own_invoice.id, foreign_invoice.id]
+    baseline_line_items = InvoiceLineItem.where(invoice_id: ids).group(:invoice_id).count
+    expect(baseline_line_items[own_invoice.id]).to eq(1)
+    expect(baseline_line_items[foreign_invoice.id]).to be_positive
+    TimekeepingOwnership.current.update!(handoff_step: "close_admission")
+
+    send_request :post, api_v1_invoices_bulk_deletion_index_path,
+      params: { invoices_ids: ids },
+      headers: auth_headers(user)
+
+    expect(response).to have_http_status(:service_unavailable)
+    expect(json_response["reason"]).to eq("ownership_moving")
+    expect(Invoice.where(id: ids).count).to eq(2)
+    expect(InvoiceLineItem.where(invoice_id: ids).group(:invoice_id).count).to eq(baseline_line_items)
   end
 end
