@@ -363,6 +363,32 @@ RSpec.describe "Api::V1::Users#destroy in the initial legacy ownership state", t
     expect(TimekeepingOwnership.pluck(:generation, :handoff_step, :owner, :monolith_store))
       .to eq([[1, nil, "monolith", "legacy"]])
   end
+
+  # The audit row and the delete share one transaction, so a delete that fails
+  # leaves no audit row claiming the user was deleted.
+  it "rolls back the audit row when the permanent delete fails" do
+    rollback_company = create(:company, name: "Rollback Co")
+    rollback_super_admin = create(:user, email: "hello@saeloun.com", current_workspace_id: rollback_company.id)
+    rollback_target = create(:user, current_workspace_id: rollback_company.id)
+    create(:employment, company: rollback_company, user: rollback_super_admin)
+    rollback_super_admin.add_role :admin, rollback_company
+    create(:employment, company: rollback_company, user: rollback_target)
+    rollback_target.add_role :employee, rollback_company
+    sign_in rollback_super_admin
+
+    allow(User).to receive(:find).and_call_original
+    allow(User).to receive(:find).with(rollback_target.id.to_s).and_return(rollback_target)
+    allow(rollback_target).to receive(:destroy!).and_raise(ActiveRecord::RecordNotDestroyed, "delete failed")
+    audit_count = Audited::Audit.where(action: "super_admin_delete").count
+    expect(audit_count).to eq(0)
+
+    expect {
+      send_request :delete, api_v1_user_path(rollback_target), headers: auth_headers(rollback_super_admin)
+    }.to raise_error(ActiveRecord::RecordNotDestroyed, "delete failed")
+
+    expect(User.exists?(rollback_target.id)).to be(true)
+    expect(Audited::Audit.where(action: "super_admin_delete").count).to eq(audit_count)
+  end
 end
 
 RSpec.describe "Api::V1::Users#destroy refusal order during a handoff", type: :request do

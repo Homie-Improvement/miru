@@ -128,3 +128,40 @@ RSpec.describe Analytics::DemoSeeder do
     expect(TimekeepingOwnership.count).to eq(0)
   end
 end
+
+RSpec.describe Analytics::DemoSeeder do
+  # "In each refused state: ... DemoSeeder raises before writing users or clients;"
+  it "raises in each of the four begun states and leaves an existing demo account's fields unchanged" do
+    company = create(:company, base_currency: "USD", standard_price: 120)
+    other_company = create(:company, base_currency: "USD", standard_price: 120)
+    # ensure_user! would rename this account and move its workspace to the seeded company.
+    demo_owner = create(
+      :user,
+      email: "analytics.demo.owner@saeloun.test",
+      first_name: "Kept",
+      last_name: "Name",
+      current_workspace_id: other_company.id
+    )
+    baseline_fields = demo_owner.reload.attributes.slice("first_name", "last_name", "current_workspace_id")
+    expect(baseline_fields).to eq(
+      "first_name" => "Kept", "last_name" => "Name", "current_workspace_id" => other_company.id
+    )
+    baseline_counts = { users: User.count, clients: Client.count, projects: Project.count }
+
+    begun_states = {
+      "handoff_step set" => { generation: 2, handoff_step: "settle", owner: "monolith", monolith_store: "legacy" },
+      "owned by Timekeeping after the flip" => { generation: 2, handoff_step: nil, owner: "timekeeping", monolith_store: "legacy" },
+      "prepared store after a rollback" => { generation: 2, handoff_step: nil, owner: "monolith", monolith_store: "prepared" },
+      "legacy store at generation 2" => { generation: 2, handoff_step: nil, owner: "monolith", monolith_store: "legacy" }
+    }
+    begun_states.each do |label, columns|
+      TimekeepingOwnership.current.update_columns(columns)
+
+      expect { described_class.new(company:).process }.to raise_error(TimekeepingOwnership::HandoffBegun), label
+
+      expect(demo_owner.reload.attributes.slice("first_name", "last_name", "current_workspace_id"))
+        .to eq(baseline_fields), label
+      expect({ users: User.count, clients: Client.count, projects: Project.count }).to eq(baseline_counts), label
+    end
+  end
+end

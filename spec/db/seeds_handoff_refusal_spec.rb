@@ -71,16 +71,42 @@ RSpec.describe "Seed refusal once a Timekeeping handoff has begun" do
     # The script supplies only a name and phone for its company, which Company's
     # validations reject, so a valid one is created first.
     create(:company, name: "Test Company")
+    expect(TimekeepingOwnership).to receive(:refuse_if_handoff_begun!).and_call_original
 
-    raised = nil
-    begin
-      load Rails.root.join("db/seeds/timesheet_data.rb")
-    rescue StandardError => error
-      raised = error
-    end
-
-    expect(raised).not_to be_a(TimekeepingOwnership::HandoffBegun)
+    # The script already fails when it creates the company's address, because
+    # the factory company holds one. Reaching that exact failure proves the
+    # ownership check let the script through to its writes.
+    expect { load Rails.root.join("db/seeds/timesheet_data.rb") }
+      .to raise_error(ActiveRecord::RecordInvalid, /Address type has already been taken/)
     expect(TimekeepingOwnership.pluck(:generation, :handoff_step, :owner, :monolith_store))
       .to eq([[1, nil, "monolith", "legacy"]])
+  end
+
+  # "In each refused state: ... the seeds refuse before the company update."
+  it "refuses both seed files in each of the four begun states before any company write" do
+    company = create(:company, name: "Fork & Leaf Salads", business_phone: "+1 2025550123")
+    baseline = company.reload.attributes
+    expect(baseline["business_phone"]).to eq("+1 2025550123")
+    company_count = Company.count
+
+    begun_states = {
+      "handoff_step set" => { generation: 2, handoff_step: "settle", owner: "monolith", monolith_store: "legacy" },
+      "owned by Timekeeping after the flip" => { generation: 2, handoff_step: nil, owner: "timekeeping", monolith_store: "legacy" },
+      "prepared store after a rollback" => { generation: 2, handoff_step: nil, owner: "monolith", monolith_store: "prepared" },
+      "legacy store at generation 2" => { generation: 2, handoff_step: nil, owner: "monolith", monolith_store: "legacy" }
+    }
+    begun_states.each do |label, columns|
+      TimekeepingOwnership.current.update_columns(columns)
+
+      expect { load Rails.root.join("db/seeds.rb") }.to raise_error(TimekeepingOwnership::HandoffBegun), label
+      expect { load Rails.root.join("db/seeds/timesheet_data.rb") }
+        .to raise_error(TimekeepingOwnership::HandoffBegun), label
+
+      expect(company.reload.attributes).to eq(baseline), label
+      expect(Company.count).to eq(company_count), label
+      expect(Company.exists?(name: "Test Company")).to be(false), label
+      expect(TimekeepingOwnership.pluck(:generation, :handoff_step, :owner, :monolith_store))
+        .to eq([columns.values_at(:generation, :handoff_step, :owner, :monolith_store)]), label
+    end
   end
 end

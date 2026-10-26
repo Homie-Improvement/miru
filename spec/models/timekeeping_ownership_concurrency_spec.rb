@@ -22,7 +22,7 @@ RSpec.describe TimekeepingOwnership, committed_data: true do
         commit.pop
       end
     end
-    updated.pop
+    expect(updated.pop(timeout: 5)).to be(true), "the handoff update never started"
 
     guarded = committed_data_thread(guarded_pids) do
       described_class.unless_handoff_begun { ran = true }
@@ -57,7 +57,7 @@ RSpec.describe TimekeepingOwnership, committed_data: true do
         release.pop
       end
     end
-    entered.pop
+    expect(entered.pop(timeout: 5)).to be(true), "the guarded block never ran"
 
     handoff = committed_data_thread(handoff_pids) do
       described_class.where(id: described_class::SINGLETON_ID).update_all(handoff_step: "close_admission")
