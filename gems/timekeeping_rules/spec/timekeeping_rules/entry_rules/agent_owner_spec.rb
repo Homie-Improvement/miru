@@ -5,14 +5,39 @@
 RSpec.describe TimekeepingRules::EntryRules, ".agent_owner" do
   # The entry API must not commit an agent_id "without checking that the agent
   # exists and belongs to the entry's company and user (design rule S7)".
-  it "refuses an unknown agent and another user's agent as not_found, and allows only the entry user's own agent or none" do
-    company_agents = { 40 => 7, 41 => 8 }
+  # company_agents maps each agent of the entry's company to its user.
+  let(:company_agents) { { 40 => 7, 41 => 8 } }
 
+  it "answers ok for an agent of the company owned by the entry's user" do
+    expect(described_class.agent_owner(agent_id: 40, user_id: 7, company_agents:)).to eq(:ok)
+    expect(described_class.agent_owner(agent_id: 41, user_id: 8, company_agents:)).to eq(:ok)
+  end
+
+  it "answers ok for no agent, even when the company has no agents" do
+    expect(described_class.agent_owner(agent_id: nil, user_id: 7, company_agents:)).to eq(:ok)
+    expect(described_class.agent_owner(agent_id: nil, user_id: 7, company_agents: {})).to eq(:ok)
+  end
+
+  it "answers not_found for an unknown agent and for another user's agent" do
     expect(described_class.agent_owner(agent_id: 99, user_id: 7, company_agents:)).to eq(:not_found)
     expect(described_class.agent_owner(agent_id: 41, user_id: 7, company_agents:)).to eq(:not_found)
+  end
+
+  # An empty agents list must never be read as "no check needed".
+  it "answers not_found for a non-nil agent when the company has no agents" do
     expect(described_class.agent_owner(agent_id: 40, user_id: 7, company_agents: {})).to eq(:not_found)
+  end
+
+  # Ids are compared without coercion, as target_user does, so a String id never matches a company agent.
+  it "answers not_found when the agent id or user id differs only in type" do
     expect(described_class.agent_owner(agent_id: "40", user_id: 7, company_agents:)).to eq(:not_found)
-    expect(described_class.agent_owner(agent_id: 40, user_id: 7, company_agents:)).to eq(:ok)
-    expect(described_class.agent_owner(agent_id: nil, user_id: 7, company_agents:)).to eq(:ok)
+    expect(described_class.agent_owner(agent_id: 40, user_id: "7", company_agents:)).to eq(:not_found)
+  end
+
+  it "leaves the company_agents it reads unchanged" do
+    agents = { 40 => 7, 41 => 8 }
+    described_class.agent_owner(agent_id: 99, user_id: 7, company_agents: agents)
+
+    expect(agents).to eq({ 40 => 7, 41 => 8 })
   end
 end

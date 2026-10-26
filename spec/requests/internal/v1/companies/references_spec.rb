@@ -224,83 +224,36 @@ RSpec.describe "Internal::V1::Companies::References agents", type: :request do
   # The issue asks the reference endpoint "to return the company's agents with their users". reference.yml's
   # company_scope rule says every fact belongs to the company in the path, so another company's agent, or an
   # agent's name or metadata, must never cross to Timekeeping.
-  it "returns only the path company's agents, each with only an id and a user_id" do
-    contract = TimekeepingContract.load(:reference)
-    company_a = create(:company)
-    company_b = create(:company)
-    own_agent = create(:agent, company: company_a, name: "Visible Agent Name", metadata: { "secret" => "agent-meta" })
-    inactive_agent = create(:agent, company: company_a, name: "Paused Agent", active: false)
-    foreign_agent = create(:agent, company: company_b, name: "Foreign Agent Name")
-
-    with_timekeeping_service_token do |token|
-      get "/internal/v1/companies/#{company_a.id}/reference", params: { project_ids: "" },
-                                                              headers: { "Authorization" => "Bearer #{token}" }
-    end
-
-    body = response.parsed_body
-    expect(response).to have_http_status(:ok)
-    expect(contract["agent_fields"]).to eq(%w[id user_id])
-    expect(body.keys).to match_array(contract["response_fields"])
-    expect(body["agents"]).to match_array([
-      { "id" => own_agent.id, "user_id" => own_agent.user_id },
-      { "id" => inactive_agent.id, "user_id" => inactive_agent.user_id }
-    ])
-    expect(body["agents"].pluck("id")).not_to include(foreign_agent.id)
-    expect(response.body).not_to include("Visible Agent Name", "Foreign Agent Name", "agent-meta")
-  end
-end
-
-RSpec.describe "Internal::V1::Companies::References agents", type: :request do
-  # The issue asks for "the reference endpoint (contracts/timekeeping/reference.yml and the monolith's
-  # reference controller) to return the company's agents with their users".
-  it "returns the path company's agents in the contract's agent_fields and never another company's agent" do
-    contract = TimekeepingContract.load(:reference)
-    company_a = create(:company)
-    company_b = create(:company)
-    agent_a = create(:agent, company: company_a, name: "Agent A")
-    agent_b = create(:agent, company: company_b, name: "Agent B")
-
-    with_timekeeping_service_token do |token|
-      get "/internal/v1/companies/#{company_a.id}/reference", params: { project_ids: "" },
-        headers: { "Authorization" => "Bearer #{token}" }
-    end
-
-    body = response.parsed_body
-    expect(response).to have_http_status(:ok)
-    expect(body.keys).to match_array(contract["response_fields"])
-    expect(contract["agent_fields"]).to match_array(%w[id user_id])
-    body["agents"].each { |agent| expect(agent.keys).to match_array(contract["agent_fields"]) }
-    expect(body["agents"]).to eq([{ "id" => agent_a.id, "user_id" => agent_a.user_id }])
-    expect(body["agents"].pluck("id")).not_to include(agent_b.id)
-    expect(response.body).not_to include("Agent B")
-  end
-end
-
-RSpec.describe "Internal::V1::Companies::References", type: :request do
-  # "The fix needs the reference endpoint (contracts/timekeeping/reference.yml
-  # and the monolith's reference controller) to return the company's agents
-  # with their users"
-  it "returns the path company's agents with their users in the contract's agent_fields" do
+  # Covers a request with an empty project_ids and one without the parameter.
+  it "returns only the path company's agents, active or not, each with only an id and its user's id" do
     contract = TimekeepingContract.load(:reference)
     company_a = create(:company)
     company_b = create(:company)
     user_a = create(:user)
-    user_b = create(:user)
     create(:employment, company: company_a, user: user_a)
-    create(:employment, company: company_b, user: user_b)
-    agent_a = create(:agent, company: company_a, user: user_a)
-    agent_b = create(:agent, company: company_b, user: user_b)
+    own_agent = create(:agent, company: company_a, user: user_a, name: "Visible Agent Name",
+                               metadata: { "secret" => "agent-meta" })
+    inactive_agent = create(:agent, company: company_a, name: "Paused Agent", active: false)
+    foreign_agent = create(:agent, company: company_b, name: "Foreign Agent Name")
 
-    with_timekeeping_service_token do |token|
-      get "/internal/v1/companies/#{company_a.id}/reference", headers: { "Authorization" => "Bearer #{token}" }
+    [{ project_ids: "" }, {}].each do |params|
+      with_timekeeping_service_token do |token|
+        get "/internal/v1/companies/#{company_a.id}/reference", params:,
+                                                                headers: { "Authorization" => "Bearer #{token}" }
+      end
+
+      body = response.parsed_body
+      expect(response).to have_http_status(:ok)
+      expect(contract["response_fields"]).to include("agents")
+      expect(contract["agent_fields"]).to eq(%w[id user_id])
+      expect(body.keys).to match_array(contract["response_fields"])
+      body["agents"].each { |agent| expect(agent.keys).to match_array(contract["agent_fields"]) }
+      expect(body["agents"]).to match_array([
+        { "id" => own_agent.id, "user_id" => user_a.id },
+        { "id" => inactive_agent.id, "user_id" => inactive_agent.user_id }
+      ])
+      expect(body["agents"].pluck("id")).not_to include(foreign_agent.id)
+      expect(response.body).not_to include("Visible Agent Name", "Foreign Agent Name", "agent-meta")
     end
-
-    body = response.parsed_body
-    expect(response).to have_http_status(:ok)
-    expect(body.keys).to match_array(contract["response_fields"])
-    expect(contract["response_fields"]).to include("agents")
-    body["agents"].each { |agent| expect(agent.keys).to match_array(contract["agent_fields"]) }
-    expect(body["agents"]).to eq([{ "id" => agent_a.id, "user_id" => user_a.id }])
-    expect(response.body).not_to include(agent_b.name)
   end
 end

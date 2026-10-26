@@ -118,50 +118,14 @@ end
 RSpec.describe Timekeeping::EntryDecision, ".agent_owner" do
   # The issue asks for "Timekeeping::EntryCommand or EntryDecision to refuse an
   # unknown or foreign agent before the write".
-  it "agent_owner answers an unknown or foreign agent as not_found and the entry user's agent as ok" do
+  it "answers an unknown agent, another user's agent or an empty agents list as not_found, and the entry user's agent or none as ok" do
     company_agents = { 40 => 7, 41 => 8 }
 
     expect(described_class.agent_owner(agent_id: 99, user_id: 7, company_agents:)).to eq(:not_found)
     expect(described_class.agent_owner(agent_id: 41, user_id: 7, company_agents:)).to eq(:not_found)
+    expect(described_class.agent_owner(agent_id: 40, user_id: 7, company_agents: {})).to eq(:not_found)
     expect(described_class.agent_owner(agent_id: 40, user_id: 7, company_agents:)).to eq(:ok)
-  end
-end
-
-RSpec.describe Timekeeping::EntryDecision do
-  # The issue asks "Timekeeping::EntryCommand or EntryDecision to refuse an
-  # unknown or foreign agent before the write".
-  it "agent_owner refuses an unknown or foreign agent as not_found and allows the user's own agent" do
-    company_agents = { 41 => 7, 42 => 12 }
-
-    expect(described_class.agent_owner(agent_id: 500, user_id: 7, company_agents:)).to eq(:not_found)
-    expect(described_class.agent_owner(agent_id: 42, user_id: 7, company_agents:)).to eq(:not_found)
-    expect(described_class.agent_owner(agent_id: 41, user_id: 7, company_agents:)).to eq(:ok)
+    expect(described_class.agent_owner(agent_id: 41, user_id: 8, company_agents:)).to eq(:ok)
     expect(described_class.agent_owner(agent_id: nil, user_id: 7, company_agents:)).to eq(:ok)
-  end
-end
-
-RSpec.describe Timekeeping::EntryDecision do
-  # "it still commits any positive agent_id without checking that the agent
-  # exists and belongs to the entry's company and user (design rule S7)."
-  it "refuses an unknown or foreign agent and allows the entry user's own agent or none" do
-    company_agents = { 31 => 7, 32 => 8 }
-
-    expect(described_class.agent_owner(agent_id: 31, user_id: 7, company_agents:)).to eq(:ok)
-    expect(described_class.agent_owner(agent_id: nil, user_id: 7, company_agents:)).to eq(:ok)
-    expect(described_class.agent_owner(agent_id: 32, user_id: 7, company_agents:)).to eq(:not_found)
-    expect(described_class.agent_owner(agent_id: 99, user_id: 7, company_agents:)).to eq(:not_found)
-    expect(described_class.agent_owner(agent_id: 31, user_id: 7, company_agents: {})).to eq(:not_found)
-  end
-end
-
-RSpec.describe Timekeeping::EntryDecision do
-  # The issue: the entry API "still commits any positive agent_id without checking that the agent
-  # exists and belongs to the entry's company and user (design rule S7)". An agent that exists in
-  # the company but is owned by someone else must still be refused.
-  it "answers not_found for an agent that belongs to another user of the same company" do
-    company_agents = { 31 => 8 }
-
-    expect(described_class.agent_owner(agent_id: 31, user_id: 7, company_agents:)).to eq(:not_found)
-    expect(described_class.agent_owner(agent_id: 31, user_id: 8, company_agents:)).to eq(:ok)
   end
 end
