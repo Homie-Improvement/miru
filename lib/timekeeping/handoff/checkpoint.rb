@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "bigdecimal"
 require "digest"
 require "json"
 require "time"
@@ -156,7 +157,19 @@ module Timekeeping
           def encode_hash(hash)
             raise ShapeError, "a JSON object key is not a string" unless hash.keys.all?(String)
 
-            hash.sort_by(&:first).map { |key, item| [key, encode_value(item)] }
+            hash.sort_by(&:first).map { |key, item| [key, encode_json_value(item)] }
+          end
+
+          # A JSON number is a decimal, however it was read: a Float and a
+          # BigDecimal of the same decimal value encode the same, so a store
+          # that reads jsonb decimals exactly matches rows built from Floats.
+          def encode_json_value(value)
+            case value
+            when Float then ["decimal", BigDecimal(value.to_s).to_s]
+            when BigDecimal then ["decimal", value.to_s]
+            when Array then ["array", value.map { |item| encode_json_value(item) }]
+            else encode_value(value)
+            end
           end
 
           def decode_row(table, encoded_row)
@@ -172,6 +185,7 @@ module Timekeeping
             when "bool" then payload
             when "int" then Integer(payload, 10)
             when "float" then [payload].pack("H*").unpack1("G")
+            when "decimal" then BigDecimal(payload)
             when "str" then payload
             when "time" then Time.iso8601(payload).utc
             when "date" then Date.iso8601(payload)

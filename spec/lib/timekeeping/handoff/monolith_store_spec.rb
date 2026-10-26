@@ -390,4 +390,28 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
 
     expect(outbox.call).to eq(before)
   end
+
+  it "keeps JSONB decimals finer than a float exact through export, transport and load" do
+    load_case_connection.execute(<<~SQL.squish)
+      INSERT INTO entries (id, company_id, project_id, user_id, work_date, duration, bill_status, source_metadata, created_at, updated_at)
+      VALUES (50, 4, 1, 1, '2026-04-01', 5, 'unbilled', '{"rate": 1.00000000000000000001}', now(), now())
+    SQL
+    load_case_connection.execute(<<~SQL.squish)
+      INSERT INTO entry_audits (company_id, entry_id, actor_type, actor_id, action, after, entry_created_at, created_at)
+      VALUES (4, 50, 'User', 7, 'create', '{"duration": 0.12345678901234567890123}', now(), now())
+    SQL
+    stored_jsonb_text = lambda do
+      [
+        load_case_connection.select_value("SELECT source_metadata::text FROM entries WHERE id = 50"),
+        load_case_connection.select_value("SELECT after::text FROM entry_audits WHERE entry_id = 50")
+      ]
+    end
+    before = stored_jsonb_text.call
+    expect(before).to eq(['{"rate": 1.00000000000000000001}', '{"duration": 0.12345678901234567890123}'])
+
+    checkpoint = Timekeeping::Handoff::Checkpoint.from_json(load_case_store.export_checkpoint.to_json)
+    load_case_store.load_checkpoint(checkpoint)
+
+    expect(stored_jsonb_text.call).to eq(before)
+  end
 end

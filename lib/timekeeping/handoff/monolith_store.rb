@@ -107,7 +107,30 @@ module Timekeeping
           check_columns!(table)
           order = READ_ORDER.fetch(table).map { |column| connection.quote_column_name(column) }.join(", ")
           result = connection.select_all("SELECT * FROM #{connection.quote_table_name(table)} ORDER BY #{order}")
-          result.cast_values.map { |values| result.columns.zip(values).to_h }
+          jsonb_columns = result.columns.select { |column| result.column_types[column]&.type == :jsonb }
+
+          result.cast_values.zip(result.rows).map do |values, raw_values|
+            row = result.columns.zip(values).to_h
+            jsonb_columns.each { |column| row[column] = parse_jsonb(raw_values[result.columns.index(column)]) }
+            row
+          end
+        end
+
+        # Active Record's jsonb cast turns every decimal into a Float, which
+        # rounds a number finer than a double. BigDecimal keeps it as stored.
+        def parse_jsonb(text)
+          text && JSON.parse(text, decimal_class: BigDecimal)
+        end
+
+        # JSON text with each BigDecimal written as a bare number. The default
+        # encoders write a BigDecimal as a quoted string.
+        def jsonb_text(value)
+          case value
+          when Hash then "{#{value.map { |key, item| "#{JSON.generate(key)}:#{jsonb_text(item)}" }.join(',')}}"
+          when Array then "[#{value.map { |item| jsonb_text(item) }.join(',')}]"
+          when BigDecimal then value.to_s("F")
+          else JSON.generate(value)
+          end
         end
 
         # A column on only one side would be dropped or left unfilled.
@@ -167,6 +190,8 @@ module Timekeeping
           literal =
             if value.is_a?(Float)
               connection.quote(value.to_s)
+            elsif column.type == :jsonb && !value.nil?
+              connection.quote(jsonb_text(value))
             else
               connection.quote(connection.lookup_cast_type(sql_type).serialize(value))
             end
