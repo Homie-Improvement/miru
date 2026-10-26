@@ -528,6 +528,18 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
     expect_recon_checks_abort_in_a(result, :reservation_classification, reason: :changed, field: "disposition")
   end
 
+  it "refuses a classification row filed under a company other than its own" do
+    misfiled = {
+      101 => [recon_checks_reservation(202)],
+      202 => [recon_checks_reservation(202)]
+    }
+    expect { recon_checks_run(expected_reservations: misfiled) }
+      .to raise_error(ArgumentError, /filed under company 101/)
+
+    filed_right = { 101 => [recon_checks_reservation(101)], 202 => [recon_checks_reservation(202)] }
+    expect(recon_checks_run(expected_reservations: filed_right)).not_to be_abort
+  end
+
   it "reports a changed audit row and a changed idempotency receipt by count or checksum" do
     audits = recon_checks_run(checkpoint_tables: recon_checks_tables(entry_audits: [recon_checks_audit(101, action: "update")]))
     expect_recon_checks_abort_in_a(audits, :audit_rows, reason: :changed, field: "checksum")

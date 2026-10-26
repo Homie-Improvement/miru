@@ -145,7 +145,9 @@ module Timekeeping
         # cannot fully read, rather than reporting it as a pass.
         def run(source:, checkpoint:, projection:, source_intents:, intents:, next_entry_id:, money_before:,
                 money_after:, listed_corrections: {}, expected_reservations: nil)
-          check_inputs!(projection:, source_intents:, intents:, next_entry_id:, money_before:, money_after:)
+          check_inputs!(
+            projection:, source_intents:, intents:, next_entry_id:, money_before:, money_after:, expected_reservations:
+          )
           projection_by_company, unassigned = place_projection(projection, checkpoint.rows.fetch("entries"))
 
           inputs = Inputs.new(
@@ -172,9 +174,10 @@ module Timekeeping
         end
 
         # Emits one ReconciliationDifferenceFound per difference of a finished
-        # result, listed ones included, and passes each company's changed money
-        # values to FinancialSnapshot.report so the financial change signal
-        # fires as well. Returns the result unchanged. It runs after run has
+        # result, listed ones included, and passes the identifiers of each
+        # company's changed money values (kind, record id and field, without
+        # the values) to FinancialSnapshot.report so the financial change
+        # signal fires as well. Returns the result unchanged. It runs after run has
         # decided the verdict, so a signal that fails cannot alter the verdict.
         def report(result)
           result.companies.each_value do |company_report|
@@ -216,7 +219,8 @@ module Timekeeping
             CompanyReport.new(company_id:, checks:, listed: listed.freeze, unlisted: unlisted.freeze)
           end
 
-          def check_inputs!(projection:, source_intents:, intents:, next_entry_id:, money_before:, money_after:)
+          def check_inputs!(projection:, source_intents:, intents:, next_entry_id:, money_before:, money_after:,
+                            expected_reservations:)
             check_columns!("projection", projection, PROJECTION_COLUMNS)
             check_columns!("source_intents", source_intents, INTENT_COLUMNS)
             check_columns!("intents", intents, INTENT_COLUMNS)
@@ -232,6 +236,17 @@ module Timekeeping
                 next if snapshot.fetch(:company_id) == company_id
 
                 raise ArgumentError, "the financial snapshot filed under company #{company_id} is another company's"
+              end
+            end
+
+            # A classification row filed under another company would certify
+            # that company's reservations. Rows without a company_id are taken
+            # as the company they are filed under.
+            (expected_reservations || {}).each do |company_id, rows|
+              rows.each do |row|
+                next if !row.key?("company_id") || row["company_id"] == company_id
+
+                raise ArgumentError, "an expected reservation filed under company #{company_id} is another company's"
               end
             end
           end
