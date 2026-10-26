@@ -9,9 +9,15 @@ module Timekeeping
     TOKEN_PUBLIC_KEY = "TIMEKEEPING_TOKEN_PUBLIC_KEY"
     SERVICE_TOKEN = "TIMEKEEPING_SERVICE_TOKEN"
     MONOLITH_REFERENCE_URL = "MONOLITH_REFERENCE_URL"
+    # The monolith base URL the snapshot relay posts entry snapshots to.
+    MONOLITH_SNAPSHOT_URL = "MONOLITH_SNAPSHOT_URL"
     # Comma-separated credentials the service holds besides its own token.
     SERVICE_CREDENTIALS = "TIMEKEEPING_SERVICE_CREDENTIALS"
-    KEYS = [DATABASE_URL, TOKEN_PUBLIC_KEY, SERVICE_TOKEN, MONOLITH_REFERENCE_URL, SERVICE_CREDENTIALS].freeze
+    # "1" loads the relay pause control outside the test environment.
+    TEST_HOOKS = "TIMEKEEPING_TEST_HOOKS"
+    TEST_HOOKS_ENABLED = "1"
+    KEYS = [DATABASE_URL, TOKEN_PUBLIC_KEY, SERVICE_TOKEN, MONOLITH_REFERENCE_URL, MONOLITH_SNAPSHOT_URL,
+            SERVICE_CREDENTIALS, TEST_HOOKS].freeze
 
     module_function
 
@@ -32,8 +38,17 @@ module Timekeeping
       ENV.fetch(MONOLITH_REFERENCE_URL, nil)
     end
 
+    def monolith_snapshot_url
+      ENV.fetch(MONOLITH_SNAPSHOT_URL, nil)
+    end
+
     def service_credentials
       ENV.fetch(SERVICE_CREDENTIALS, nil)
+    end
+
+    # Any value but exactly "1" leaves the hooks out.
+    def test_hooks?
+      ENV.fetch(TEST_HOOKS, nil) == TEST_HOOKS_ENABLED
     end
   end
 end
