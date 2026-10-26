@@ -124,8 +124,13 @@ module Invoices
         )
       end
 
+      # Runs after the invoice transaction has ended, so an error here must not
+      # reach the caller: the save is already settled, and the row stays
+      # undelivered for the worker.
       def deliver(outbox_item_id)
         DeliverInvoiceOperationJob.perform_now(outbox_item_id, reservations:)
+      rescue StandardError => error
+        Rails.error.report(error, handled: true, context: { outbox_item_id: })
       end
   end
 end

@@ -294,7 +294,8 @@ RSpec.describe Invoices::OperationCoordinator, committed_data: true do
     commit_row = rows.first
     expect(commit_row.delivered_at).to be_nil
     expect(commit_row.attempts).to eq(1)
-    expect(adapter.requests.count { |call| call.respond_to?(:first) && call.first == :commit }).to be <= 1
+    # One prepare, then exactly one inline commit attempt.
+    expect(adapter.requests.size).to eq(2)
   end
 end
 
