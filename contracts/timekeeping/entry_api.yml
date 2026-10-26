@@ -36,7 +36,9 @@ headers:
 
 # Claims the provider reads from the signed bearer token. purpose is "read"
 # or "write"; a token signed for reads is refused on every write route.
-token_claims: [sub, company_id, role, purpose]
+# primary_role is the user's lowest-id role in the company; the locked-entry
+# and billed-change rules decide on it, and on role when a token has none.
+token_claims: [sub, company_id, role, primary_role, purpose]
 privileged_roles: [owner, admin]
 
 request:
