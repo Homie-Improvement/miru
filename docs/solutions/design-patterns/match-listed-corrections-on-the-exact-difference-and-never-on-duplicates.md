@@ -48,4 +48,5 @@ PR #92, head commit 23fd205128e594c79c537a6f660c31934c92f3e2.
 
 - `lib/timekeeping/handoff/reconciliation.rb`: `Correction#explains?` returns false when `difference.reason == :duplicate_key`, and otherwise compares `check`, `row_key` and `field`. `compare_rows` builds the `duplicate` list before it returns on a missing side. `OPERATION_KEY` and `RECEIPT_LINK_KEY` give operation and intent rows different key shapes.
 - `spec/lib/timekeeping/handoff/reconciliation_spec.rb`, "lets a listed correction pass only for its own company, row and field": a `locked` correction passes, but a `duration` change on the same row still aborts.
+- `spec/lib/timekeeping/handoff/reconciliation_spec.rb`, "does not let an entries correction for one field excuse a changed note on the same entry".
 - `spec/lib/timekeeping/handoff/reconciliation_spec.rb`, "does not let an operation row correction explain the matching intent row change" and "still aborts on a duplicate committed reservation when the added row is listed".

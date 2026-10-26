@@ -663,19 +663,21 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
     expect(unlisted_fields).not_to include("locked")
   end
 
-  it "lets a correction listed for one company pass only in that company when both share the changed entry id" do
-    changed = recon_checks_tables.merge(
-      "entries" => [recon_checks_entry(101, note: "after"), recon_checks_entry(202, note: "after")]
-    )
-    correction = described_class::Correction.new(check: :entries, row_key: [1], field: "note")
-    result = recon_checks_run(checkpoint_tables: changed, listed_corrections: { 101 => [correction] })
+  # An entries correction names one field, so a second change on the same entry row stays unlisted.
+  it "does not let an entries correction for one field excuse a changed note on the same entry" do
+    source_tables = recon_checks_tables(entries: [recon_checks_entry(101, locked: false, note: "original note")])
+    checkpoint_tables = recon_checks_tables(entries: [recon_checks_entry(101, note: "copied wrong")])
+    correction = described_class::Correction.new(check: :entries, row_key: [1], field: "locked")
+    result = recon_checks_run(source_tables:, checkpoint_tables:, listed_corrections: { 101 => [correction] })
 
-    expect(result.companies.fetch(101)).not_to be_abort
-    expect(result.companies.fetch(101).listed.map { |difference| difference.field.to_s }).to include("note")
-    expect(result.companies.fetch(202)).to be_abort
-    expect(result.companies.fetch(202).unlisted.map { |difference| [difference.company_id, difference.field.to_s] })
-      .to include([202, "note"])
-    expect(result.companies.fetch(202).unlisted.map(&:company_id).uniq).to eq([202])
+    report = result.companies.fetch(101)
+    expect(report.listed.map { |difference| [difference.check, difference.field.to_s] }).to include([:entries, "locked"])
+    unlisted_entry_fields = report.unlisted.filter_map { |difference| difference.field.to_s if difference.check == :entries }
+    expect(unlisted_entry_fields).to include("note")
+    expect(unlisted_entry_fields).not_to include("locked")
+    expect(report).to be_abort
+    expect(result.companies.fetch(202)).not_to be_abort
+    expect(result.companies.fetch(202).checks.values.flatten).to eq([])
   end
 
   it "writes no row and leaves every input unchanged while it finds a difference" do
@@ -685,16 +687,22 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
     projection = recon_checks_projection(source_tables["entries"])
     source = Timekeeping::Handoff::Checkpoint.build(tables: source_tables)
     checkpoint = Timekeeping::Handoff::Checkpoint.build(tables: checkpoint_tables)
-    inputs_before = Marshal.load(Marshal.dump([source.rows, checkpoint.rows, projection]))
+    source_intents = [recon_checks_intent(101), recon_checks_intent(202)]
+    intents = [recon_checks_intent(101), recon_checks_intent(202)]
+    discount_key = [:invoice, 1, :discount]
+    money_before = recon_checks_snapshots.merge(101 => recon_checks_snapshot(101, { discount_key => BigDecimal("5") }))
+    money_after = recon_checks_snapshots.merge(101 => recon_checks_snapshot(101, { discount_key => BigDecimal("15") }))
+    inputs = [source.rows, checkpoint.rows, projection, source_intents, intents, money_before, money_after]
+    inputs_before = Marshal.load(Marshal.dump(inputs))
 
     result = nil
     writes = recon_checks_writes_during do
-      result = recon_checks_run(source:, checkpoint:, projection:)
+      result = recon_checks_run(source:, checkpoint:, projection:, source_intents:, intents:, money_before:, money_after:)
     end
 
     expect(result.companies.fetch(101)).to be_abort
     expect(writes).to eq([])
-    expect([source.rows, checkpoint.rows, projection]).to eq(inputs_before)
+    expect(inputs).to eq(inputs_before)
   end
 
   # A second run stands in for a resumed handoff: if the first run repaired the row in place, the second would pass.
@@ -723,14 +731,19 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
     changed = recon_checks_tables.merge(
       "entries" => [recon_checks_entry(101, note: "after"), recon_checks_entry(202, note: "after")]
     )
+    checkpoint = Timekeeping::Handoff::Checkpoint.build(tables: changed)
+    projection = recon_checks_projection(changed["entries"])
     correction = described_class::Correction.new(check: :entries, row_key: [1], field: "note")
-    result = recon_checks_run(checkpoint_tables: changed, listed_corrections: { 101 => [correction] })
+    result = recon_checks_run(checkpoint:, projection:, listed_corrections: { 101 => [correction] })
     listed = result.companies.fetch(101)
     expect(listed).not_to be_abort
     expect(listed.unlisted).to eq([])
     expect(listed.listed.map { |difference| [difference.company_id, difference.check, difference.row_key, difference.field] })
       .to eq([[101, :entries, [1], "note"]])
     expect(result.companies.fetch(202)).to be_abort
+    expect(result.companies.fetch(202).unlisted.map { |difference| [difference.company_id, difference.field.to_s] })
+      .to include([202, "note"])
+    expect(result.companies.fetch(202).unlisted.map(&:company_id).uniq).to eq([202])
 
     report_before = result.to_h
     returned = nil
@@ -739,7 +752,8 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
     expect(writes.reject { |sql| sql.include?("rails_event_viewer") }).to eq([])
     expect(returned).to equal(result)
     expect(returned.to_h).to eq(report_before)
-    expect(changed["entries"].pluck("note")).to eq(%w[after after])
+    expect(checkpoint.rows["entries"].pluck("note")).to eq(%w[after after])
+    expect(projection.pluck("note")).to eq(%w[after after])
   end
 
   # Event history is readable across every workspace, so the payloads hold identifiers, not row or money values.
