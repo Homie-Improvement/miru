@@ -5,7 +5,7 @@ problem_type: convention
 component: timekeeping
 severity: high
 evidence_grounding: anchored
-grounding_evidence: "In PR #154, timekeeping/app/services/timekeeping/snapshot_values.rb requires duration to be finite, sets METADATA_MAX_NESTING = 96 with a comment that derives it from JSON's default limit of 100 and four envelope levels, and stops nested_within? at that limit. snapshot_values_spec.rb refuses Infinity, NaN, 97-level, 10_000-level and cyclic metadata. correction_snapshots_values_spec.rb delivers 96-level metadata through the relay."
+grounding_evidence: "In PR #154, timekeeping/app/services/timekeeping/snapshot_values.rb requires duration to be finite, sets METADATA_MAX_NESTING = 96 with a comment that derives it from JSON's default limit of 100 and four envelope levels, and stops nested_within? at that limit. snapshot_values_spec.rb refuses Infinity, NaN, 97-level, 10_000-level and cyclic metadata. The \"stored data\" group of correction_snapshots_spec.rb delivers 96-level metadata through the relay."
 audience: both
 related_components:
   - relay
@@ -61,5 +61,5 @@ These values fail after commit, in a different process, so the producer's own te
 
 - PR #154, `timekeeping/app/services/timekeeping/snapshot_values.rb`: the `duration` rule adds `value.finite?`, with the comment that JSON has no Infinity or NaN. `METADATA_MAX_NESTING = 96` has a comment that derives it from the relay's default limit of 100 and the four envelope levels. `nested_within?` stops at the level budget.
 - PR #154, `timekeeping/spec/services/timekeeping/snapshot_values_spec.rb`: refuses `Float::INFINITY`, `Float::NAN`, `BigDecimal("Infinity")` and `BigDecimal("NaN")` durations. It accepts 96 levels of metadata and refuses 97. It refuses 10_000-level and cyclic metadata without exhausting the stack.
-- PR #154, `timekeeping/spec/services/timekeeping/handoff/correction_snapshots_values_spec.rb`: writes 96-level `source_metadata` and delivers it through `TimekeepingRelay::Relay` to an endpoint that parses with `JSON.parse` defaults. It refuses 97 levels with the tables unchanged.
+- PR #154, the "stored data" group of `timekeeping/spec/services/timekeeping/handoff/correction_snapshots_spec.rb`: writes 96-level `source_metadata` and delivers it through `TimekeepingRelay::Relay` to an endpoint that parses with `JSON.parse` defaults. It refuses 97 levels with the tables unchanged.
 - PR #154, `timekeeping/app/services/timekeeping/entry_command.rb`: `BODY_MAX_NESTING = SnapshotValues::METADATA_MAX_NESTING + 1`.
