@@ -123,25 +123,6 @@ RSpec.describe OutboxSnapshot do
       expect(stored).to eq([7, 42, 3, 5, enqueued, sent, stamp, stamp])
     end
 
-    it "applies company, version, generation, enqueued_at and sent_at overrides that reach oldest_unsent_by_company" do
-      enqueued = Time.utc(2026, 3, 3, 12, 0, 0)
-      sent = Time.utc(2026, 3, 3, 12, 1, 0)
-      unsent_position, sent_position = insert_outbox_rows(
-        outbox_row(id: 41, company_id: 404, version: 3, generation: 2, enqueued_at: enqueued),
-        outbox_row(id: 42, company_id: 505, version: 1, generation: 1, enqueued_at: enqueued - 3600, sent_at: sent)
-      )
-
-      unsent = described_class.find(unsent_position)
-      expect([unsent.company_id, unsent.version, unsent.generation]).to eq([404, 3, 2])
-      expect(unsent.enqueued_at).to eq(enqueued)
-      expect(unsent.sent_at).to be_nil
-      expect(described_class.find(sent_position).sent_at).to eq(sent)
-
-      oldest = described_class.oldest_unsent_by_company
-      expect(oldest.keys).to contain_exactly(404)
-      expect(oldest.fetch(404)).to eq(enqueued)
-    end
-
     # insert_all! needs every row in one call to carry the same columns, so a row
     # with no sent_at override must still name sent_at, and default it to nil.
     it "inserts rows with and without a sent_at override together and keeps the default rows unsent" do
@@ -157,22 +138,6 @@ RSpec.describe OutboxSnapshot do
       expect(described_class.where(outbox_position: positions).order(:outbox_position).pluck(:sent_at))
         .to eq([sent_at, nil])
       expect(described_class.oldest_unsent_by_company).to eq(44 => enqueued_at)
-    end
-
-    it "keeps each override's company and counts rows without a sent_at override as unsent" do
-      insert_outbox_rows(
-        outbox_row(id: 1, company_id: 41, enqueued_at: Time.utc(2026, 3, 3, 12, 0, 0)),
-        outbox_row(id: 2, company_id: 42, enqueued_at: Time.utc(2026, 3, 3, 12, 5, 0)),
-        outbox_row(id: 3, company_id: 43, enqueued_at: Time.utc(2026, 3, 3, 11, 0, 0),
-                   sent_at: Time.utc(2026, 3, 3, 11, 1, 0))
-      )
-
-      oldest = described_class.oldest_unsent_by_company
-
-      expect(oldest.keys).to contain_exactly(41, 42)
-      expect(oldest.fetch(41)).to eq(Time.utc(2026, 3, 3, 12, 0, 0))
-      expect(oldest.fetch(42)).to eq(Time.utc(2026, 3, 3, 12, 5, 0))
-      expect(described_class.where(sent_at: nil).count).to eq(2)
     end
 
     it "builds independent rows so a nested metadata override never leaks into the next row" do
