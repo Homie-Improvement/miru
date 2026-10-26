@@ -40,19 +40,22 @@ namespace :timekeeping do
     abort "Set DIRECTION to one of #{Timekeeping::Handoff::Steps::DIRECTIONS.keys.join(', ')}."
   end
 
+  # The forward tasks only start a handoff. Continuing one, or re-sending the
+  # admit call after a flip, is what handoff_resume is for, so a repeated
+  # forward task is refused instead of reporting a handoff it did not run.
   desc "Hand timesheet entries from the monolith's legacy table to Timekeeping (first cutover)"
   task handoff_cutover: :environment do
-    run_timekeeping_handoff(direction: :cutover)
+    run_timekeeping_handoff(direction: :cutover, resume: false)
   end
 
   desc "Hand timesheet entries from Timekeeping back to the monolith"
   task handoff_rollback: :environment do
-    run_timekeeping_handoff(direction: :rollback)
+    run_timekeeping_handoff(direction: :rollback, resume: false)
   end
 
   desc "Hand timesheet entries from the monolith's prepared tables to Timekeeping again"
   task handoff_re_cutover: :environment do
-    run_timekeeping_handoff(direction: :re_cutover)
+    run_timekeeping_handoff(direction: :re_cutover, resume: false)
   end
 
   desc "Resume the Timekeeping handoff in progress (DIRECTION=cutover|rollback|re_cutover required)"
