@@ -79,39 +79,72 @@ RSpec.describe Timekeeping::Handoff::ServiceStore do
       entry
     end
 
-    it "refuses a load while entry writes are admitted and leaves every table as it was" do
-      service_store_seed_prior_rows
-      before = service_store_snapshot
-
-      expect { store.load_checkpoint(service_store_checkpoint) }
-        .to raise_error(Timekeeping::Handoff::Store::Error, /fence admission first/)
-      expect(service_store_snapshot).to eq(before)
-    end
-
-    it "refuses a body whose rows were edited after its digest was written and leaves every table as it was" do
-      service_store_seed_prior_rows
-      Timekeeping::Admission.fence!
-      before = service_store_snapshot
-      document = JSON.parse(service_store_checkpoint.to_json)
-      note = document.fetch("tables").fetch("entries").first.find { |column, _| column == "note" }
-      note[1] = ["str", "Tampered"]
-      tampered = Timekeeping::Handoff::Checkpoint.from_json(JSON.generate(document))
-
-      expect { store.load_checkpoint(tampered) }.to raise_error(Timekeeping::Handoff::Store::Error, /digest/)
-      expect(service_store_snapshot).to eq(before)
-    end
-
-    it "refuses an entry stored at a higher version than the checkpoint's and changes nothing" do
+    # Each refused load is compared to the one baseline taken before the table,
+    # so a refusal that changed rows and a later one that put them back cannot
+    # pass together.
+    it "refuses a load while admitted, with an edited body or with an older entry version, and changes nothing" do
       stored = service_store_seed_prior_rows
-      Timekeeping::Admission.fence!
       before = service_store_snapshot
-      checkpoint = Timekeeping::Handoff::Checkpoint.build(tables: service_store_tables.merge(
+      expect(before.slice(:entries, :reservations, :invoice_operations, :idempotency_receipts))
+        .to eq(entries: [[7, stored.id, 3, "Kept"]], reservations: 0, invoice_operations: [], idempotency_receipts: [])
+      expect(before.fetch(:audit_events).size).to eq(1)
+
+      tampered_document = JSON.parse(service_store_checkpoint.to_json)
+      note = tampered_document.fetch("tables").fetch("entries").first.find { |column, _| column == "note" }
+      note[1] = ["str", "Tampered"]
+      older_checkpoint = Timekeeping::Handoff::Checkpoint.build(tables: service_store_tables.merge(
         "entries" => [service_store_entry_row(id: stored.id, company_id: 7, version: 2)],
         "reservations" => [], "entry_audits" => []
       ))
+      # Rows run in order: the first needs writes admitted, the rest a fence.
+      refusals = [
+        ["writes admitted", service_store_checkpoint, /fence admission first/],
+        ["edited after its digest", Timekeeping::Handoff::Checkpoint.from_json(JSON.generate(tampered_document)), /digest/],
+        ["older entry version", older_checkpoint, /newer entry versions/]
+      ]
 
-      expect { store.load_checkpoint(checkpoint) }.to raise_error(Timekeeping::Handoff::Store::Error, /newer entry versions/)
-      expect(service_store_snapshot).to eq(before)
+      refusals.each do |name, checkpoint, reason|
+        Timekeeping::Admission.fence! unless name == "writes admitted"
+
+        expect { store.load_checkpoint(checkpoint) }.to raise_error(Timekeeping::Handoff::Store::Error, reason)
+        expect([name, service_store_snapshot]).to eq([name, before])
+      end
+    end
+
+    # "Load: "replaces the incoming owner's tables in one transaction", so loading
+    # the same checkpoint twice gives equal counts and checksums."
+    # Two committed reservations for one entry break a unique index only after the
+    # entries were deleted and re-inserted, so a load that is not one transaction
+    # would leave the stored entry gone.
+    it "rolls the whole load back when an insert fails after entries were already replaced" do
+      kept = service_store_seed_prior_rows
+      Timekeeping::Admission.fence!
+      tables = handoff_checkpoint_tables(company_id: 8, id: 500)
+      tables["reservations"] << tables.fetch("reservations").first.merge("invoice_id" => 42,
+                                                                         "operation_id" => SecureRandom.uuid)
+
+      expect { store.load_checkpoint(Timekeeping::Handoff::Checkpoint.build(tables:)) }
+        .to raise_error(Timekeeping::Handoff::Store::Error)
+      expect(Entry.pluck(:id, :company_id, :note)).to eq([[kept.id, 7, "Kept"]])
+      expect(AuditEvent.where(entry_id: kept.id).count).to eq(1)
+      expect([Reservation.count, InvoiceOperation.count, IdempotencyReceipt.count]).to eq([0, 0, 0])
+    end
+
+    # "Every row carries `company_id`."
+    it "exports all five checkpoint tables including invoice_operations, every row with its company_id" do
+      now = Time.utc(2026, 3, 2, 9)
+      Entry.create!(id: 71, company_id: 8, version: 1, project_id: 5, user_id: 7, work_date: Date.new(2026, 3, 2),
+                    duration: 15.0, note: "", bill_status: "unbilled", created_at: now, updated_at: now)
+      InvoiceOperation.create!(company_id: 8, invoice_id: 3, operation_id: SecureRandom.uuid,
+                               actor_name: "invoice-service", state: "committed", desired_entry_ids: [71],
+                               disposition: "active", generation: 2, created_at: now, finished_at: now)
+
+      checkpoint = store.export_checkpoint
+
+      expect(checkpoint.rows.keys).to match_array(Timekeeping::Handoff::Checkpoint::TABLES.keys)
+      expect(checkpoint.rows.fetch("invoice_operations").map { |row| [row["company_id"], row["desired_entry_ids"]] })
+        .to eq([[8, [71]]])
+      expect(checkpoint.rows.values.flatten.pluck("company_id")).to all(eq(8))
     end
 
     it "loads two companies' rows and exports them unchanged, and a second load gives the same result" do
