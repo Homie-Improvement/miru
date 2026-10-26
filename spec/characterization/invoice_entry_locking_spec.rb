@@ -275,4 +275,34 @@ RSpec.describe "Characterization: invoice timesheet entry locking", type: :reque
       expect_entries_state(entries, locked: true)
     end
   end
+
+  describe "an entry already on a kept invoice put on a second one (deliberate fix)" do
+    it "refuses the second invoice with entry is on another invoice and leaves the entry on the first" do
+      holder = create(:invoice, company:, client:)
+      line = locking_spec_direct_line(holder)
+      entry = line.timesheet_entry
+      expect_entries_state([entry], locked: true)
+
+      expect {
+        send_request :post, api_v1_invoices_path, params: {
+          invoice: {
+            client_id: client.id,
+            invoice_number: "LOCK-SECOND-1",
+            issue_date: Date.current.iso8601,
+            due_date: (Date.current + 30).iso8601,
+            status: "draft",
+            currency: company.base_currency,
+            invoice_line_items_attributes: [
+              { name: "Second", date: entry.work_date.iso8601, rate: 100, quantity: 60, timesheet_entry_id: entry.id }
+            ]
+          }
+        }, headers: auth_headers(admin)
+      }.not_to change(Invoice, :count)
+
+      expect(response).to have_http_status(:unprocessable_entity)
+      expect(response.parsed_body["errors"]).to eq("entry is on another invoice")
+      expect(InvoiceLineItem.where(timesheet_entry_id: entry.id).pluck(:invoice_id)).to eq([holder.id])
+      expect_entries_state([entry], locked: true)
+    end
+  end
 end

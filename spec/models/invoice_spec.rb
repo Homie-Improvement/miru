@@ -304,7 +304,12 @@ RSpec.describe Invoice, type: :model do
     it "recalculates both invoices when a line item moves between invoices" do
       original_invoice = create(:invoice, company:, client:)
       destination_invoice = create(:invoice, company:, client:)
-      line_item = create_invoice_line_item_for(original_invoice)
+      # A manual line with no entry: moving an entry-bearing line onto another
+      # kept invoice is refused, since the entry is still on the original one.
+      line_item = original_invoice.invoice_line_items.create!(
+        timesheet_entry: nil, name: "Worked hours", description: "Tracked work",
+        date: Date.current, rate: 120, quantity: 60
+      )
 
       line_item.update!(invoice: destination_invoice)
       original_invoice.reload

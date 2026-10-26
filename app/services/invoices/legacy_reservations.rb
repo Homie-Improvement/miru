@@ -23,11 +23,6 @@ module Invoices
 
     ACTIVE, RETAINED = ReservationRequest::DISPOSITIONS
 
-    # The prepare outcomes this adapter refuses. Only an entry outside the
-    # request's company is refused for now; the other refusals the rules name
-    # are not enforced yet, so saves keep today's outcomes.
-    REFUSED_OUTCOMES = %i[not_found].freeze
-
     def prepare(request)
       ApplicationRecord.transaction do
         entry_ids = lock_entries(request.company_id, request.entries)
@@ -101,7 +96,7 @@ module Invoices
             provisional: false,
             invoice_id: request.invoice_id
           })
-          { entry_id:, reason: result.to_s } if REFUSED_OUTCOMES.include?(result)
+          { entry_id:, reason: result.to_s } if Timekeeping::ReservationRules.refusal?(result)
         end
       end
 

@@ -304,7 +304,9 @@ RSpec.describe Invoices::ReservationBoundary, committed_data: true do
     end
     expect(payloads.size).to eq(1)
     expect(payloads.first).to include(company_id: company.id, invoice_id: second.id)
-    expect(payloads.first.values).not_to include(kept.id)
+    # company_id is left out: on a fresh database the company and the kept
+    # invoice can share an id, which says nothing about the holder leaking.
+    expect(payloads.first.except(:company_id).values).not_to include(kept.id)
   end
 end
 
@@ -412,5 +414,50 @@ RSpec.describe Invoices::ReservationBoundary do
     described_class.mark_billed(invoice)
 
     expect([held_only_entry, line_entry].map { |entry| entry.reload.bill_status }).to eq(%w[billed billed])
+  end
+end
+
+RSpec.describe Invoices::ReservationBoundary, committed_data: true do
+  let(:validated_race_company) { create(:company) }
+  let(:validated_race_client) { create(:client, company: validated_race_company) }
+  let(:validated_race_project) { create(:project, client: validated_race_client, billable: true) }
+  let(:validated_race_user) { create(:user, current_workspace_id: validated_race_company.id) }
+
+  # "a second kept invoice on the same entry fails with \"entry is on another invoice\""
+  # Both saves have validated their line, which holds FOR KEY SHARE on the
+  # entry row, before either commits. The adapter's row lock must not conflict
+  # with that share lock, or the two saves would deadlock instead of one of
+  # them being refused.
+  it "gives one success and one refusal, not a deadlock, when two saves validated the same entry" do
+    entry = create(:timesheet_entry, user: validated_race_user, project: validated_race_project, bill_status: "unbilled")
+    invoices = Array.new(2) { create(:invoice, company: validated_race_company, client: validated_race_client) }
+    validated = Queue.new
+    release = invoices.map { Queue.new }
+
+    saves = invoices.each_with_index.map do |invoice, index|
+      Thread.new do
+        ActiveRecord::Base.connection_pool.with_connection do
+          ActiveRecord::Base.transaction do
+            create(:invoice_line_item, invoice:, timesheet_entry: entry, rate: 100, quantity: 60)
+            validated << index
+            release[index].pop
+          end
+          :saved
+        rescue StandardError => error
+          error
+        end
+      end
+    end
+
+    2.times { validated.pop }
+    release.each { |queue| queue << true }
+    results = saves.map(&:value)
+
+    expect(results.count(:saved)).to eq(1)
+    refusals = results.grep(Invoices::OperationErrors::Refused)
+    expect(refusals.size).to eq(1)
+    expect(refusals.first.outcome.conflicts).to include(a_hash_including(entry_id: entry.id, reason: "on_another_invoice"))
+    expect(InvoiceLineItem.where(timesheet_entry_id: entry.id).count).to eq(1)
+    expect(entry.reload.locked).to be(true)
   end
 end

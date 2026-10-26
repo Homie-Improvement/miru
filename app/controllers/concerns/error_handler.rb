@@ -16,12 +16,32 @@ module ErrorHandler
     rescue_from Timekeeping::EntryWriteClient::Forbidden, with: :render_timekeeping_forbidden
     rescue_from Timekeeping::EntryWriteClient::Conflict, with: :render_entry_version_conflict
     rescue_from Timekeeping::EntryWriteClient::Rejected, with: :render_entry_write_rejected
+    rescue_from Invoices::OperationErrors::Refused, with: :reservation_refused
   end
 
   STALE_GENERATION_REASON = "stale_generation"
   VERSION_CONFLICT_REASON = "version_conflict"
 
+  # What a caller is told for each reason an invoice save was refused. The
+  # text never names the invoice that holds the entry.
+  RESERVATION_REFUSAL_MESSAGES = {
+    "on_another_invoice" => "entry is on another invoice",
+    "provisional_elsewhere" => "entry is being added to another invoice",
+    "not_found" => "entry not found"
+  }.freeze
+  DEFAULT_RESERVATION_REFUSAL_MESSAGE = "entry cannot be added to this invoice"
+
   private
+
+    def reservation_refused(exception)
+      reason = exception.outcome&.conflicts&.first&.fetch(:reason)
+      message = RESERVATION_REFUSAL_MESSAGES.fetch(reason, DEFAULT_RESERVATION_REFUSAL_MESSAGE)
+
+      respond_to do |format|
+        format.json { render json: { errors: message }, status: 422 }
+        format.html { render file: "public/422.html", status: 422, layout: false, alert: message }
+      end
+    end
 
     def handle_not_found_error(exception)
       message = exception.message || I18n.t("errors.not_found")

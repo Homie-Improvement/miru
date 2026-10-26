@@ -134,12 +134,14 @@ RSpec.describe Timekeeping::SeedDispositionRecorder do
 
     it "writes nothing when an entry has two discarded non-draft owners" do
       contested_entry = recorder_spec_entry(locked: true)
-      invoices = %w[RC-0005 RC-0006].map do |number|
+      # Each invoice is discarded before the next links the entry: a second kept
+      # invoice on the same entry is refused, and this legacy state has both
+      # owners discarded.
+      %w[RC-0005 RC-0006].each do |number|
         invoice = recorder_spec_sent_invoice(number)
         recorder_spec_aggregate_line(invoice, [contested_entry])
-        invoice
+        invoice.update_columns(discarded_at: Time.current)
       end
-      invoices.each { |invoice| invoice.update_columns(discarded_at: Time.current) }
 
       expect { described_class.write!(path: @recorder_spec_path, as_of: "2026-10-23") }
         .to raise_error(described_class::Error, /Recorder Co has conflicts: entries #{contested_entry.id}/)

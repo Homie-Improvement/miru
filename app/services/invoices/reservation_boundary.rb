@@ -187,6 +187,9 @@ module Invoices
         admit if admitted_entries.any?
         seed_holding if seed_holding?
         send_operation if @decision
+      rescue OperationErrors::Refused => refusal
+        report_refusal(refusal)
+        raise
       end
 
       private
@@ -235,6 +238,17 @@ module Invoices
           operation = request(entries: @decision.fetch(:entries), disposition: @decision.fetch(:disposition))
           OperationCoordinator.new(reservations: adapter)
             .call(operation, holding: { entry_ids: operation.entries, disposition: operation.disposition })
+        end
+
+        # Reported here, in the save that was refused, and not by the adapter,
+        # whose abort the outbox worker and the recovery sweep can deliver
+        # again.
+        def report_refusal(refusal)
+          ReservationRefused.notify(
+            company_id: registration.company_id,
+            invoice_id: registration.invoice_id,
+            reason: refusal.outcome&.conflicts&.first&.fetch(:reason)
+          )
         end
 
         def request(entries:, disposition:)
