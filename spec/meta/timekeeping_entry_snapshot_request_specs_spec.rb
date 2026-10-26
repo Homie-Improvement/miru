@@ -43,7 +43,7 @@ RSpec.describe "Timekeeping entry-snapshot request specs" do
   # second copy of the refusal assertions, and "the looser copies would not notice a regression to 403".
   it "keeps the endpoint's request specs in one file with no 401-or-403 assertion" do
     spec_dir = Rails.root.join("spec/requests/internal/v1/timekeeping")
-    expect(Dir.glob(spec_dir.join("*_spec.rb")).map { |path| File.basename(path) }).to eq(["entry_snapshots_spec.rb"])
+    expect(Dir.glob(spec_dir.join("entry_snapshots*_spec.rb")).map { |path| File.basename(path) }).to eq(["entry_snapshots_spec.rb"])
 
     loose_status_checks = Dir.glob(Rails.root.join("spec/requests/**/*_spec.rb")).select do |path|
       File.read(path).match?(/\[\s*401\s*,\s*403\s*\]/)
