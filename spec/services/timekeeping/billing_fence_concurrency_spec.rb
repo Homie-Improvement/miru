@@ -7,26 +7,29 @@ require "rails_helper"
 RSpec.describe Timekeeping::BillingFence, committed_data: true do
   # "Each billing write transaction holds FOR SHARE on the timekeeping_ownership row, so a handoff's row update waits for it"
   it "makes an update of the ownership row wait until an open billing transaction commits" do
+    billing_pids = Queue.new
+    handoff_pids = Queue.new
     locked = Queue.new
     release = Queue.new
-    billing = Thread.new do
-      ActiveRecord::Base.connection_pool.with_connection do
-        described_class.transaction do
-          locked << true
-          release.pop
-        end
+    billing = committed_data_thread(billing_pids) do
+      described_class.transaction do
+        locked << true
+        release.pop(timeout: 10)
       end
     end
-    locked.pop
+    expect(locked.pop(timeout: 5)).to be(true)
 
-    handoff = Thread.new do
-      ActiveRecord::Base.connection_pool.with_connection do
-        TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(handoff_step: "close_admission")
-      end
+    handoff = committed_data_thread(handoff_pids) do
+      TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(handoff_step: "close_admission")
     end
 
-    expect(handoff.join(0.5)).to be_nil
-    release << true
+    begin
+      blocked = blocked_by?(handoff_pids.pop(timeout: 5), billing_pids.pop(timeout: 5))
+    ensure
+      release << true
+    end
+
+    expect(blocked).to be(true), "the handoff update never waited on the billing transaction's lock"
     billing.join(5)
     expect(handoff.join(5)).not_to be_nil
     expect(TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).handoff_step).to eq("close_admission")
@@ -39,31 +42,34 @@ end
 RSpec.describe Timekeeping::BillingFence, committed_data: true do
   # "A billing write that starts after the handoff's row update is refused"
   it "refuses a billing transaction that queued behind an uncommitted handoff update once that update commits" do
+    handoff_pids = Queue.new
+    billing_pids = Queue.new
     updated = Queue.new
     commit = Queue.new
     ran = false
-    handoff = Thread.new do
-      ActiveRecord::Base.connection_pool.with_connection do
-        ActiveRecord::Base.transaction do
-          TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(handoff_step: "close_admission")
-          updated << true
-          commit.pop
-        end
+    handoff = committed_data_thread(handoff_pids) do
+      ActiveRecord::Base.transaction do
+        TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(handoff_step: "close_admission")
+        updated << true
+        commit.pop(timeout: 10)
       end
     end
-    updated.pop
+    expect(updated.pop(timeout: 5)).to be(true)
 
-    billing = Thread.new do
-      ActiveRecord::Base.connection_pool.with_connection do
-        described_class.transaction { ran = true }
-        :admitted
-      rescue Timekeeping::BillingFence::OwnershipMoving
-        :refused
-      end
+    billing = committed_data_thread(billing_pids) do
+      described_class.transaction { ran = true }
+      :admitted
+    rescue Timekeeping::BillingFence::OwnershipMoving
+      :refused
     end
 
-    expect(billing.join(0.5)).to be_nil
-    commit << true
+    begin
+      blocked = blocked_by?(billing_pids.pop(timeout: 5), handoff_pids.pop(timeout: 5))
+    ensure
+      commit << true
+    end
+
+    expect(blocked).to be(true), "the billing transaction never waited on the handoff update's lock"
     handoff.join(5)
     expect(billing.join(5)&.value).to eq(:refused)
     expect(ran).to be(false)
