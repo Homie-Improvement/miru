@@ -11,19 +11,12 @@
 # "Keep every distinct check: lost-mark replay, larger-batch resend counted ignored, outage then recovery,
 # stale_generation then accepted, the 403 case, and equal positions from two sources."
 RSpec.describe TimekeepingRelay::Relay, "delivery to the fake projection" do
-  def delivering_projection(operations: ["deliver"], name: "timekeeping")
-    timekeeping = TimekeepingContract::FakeTimekeeping.new
-    credential = timekeeping.add_service(company_id: nil, name:, operations:)
-    [TimekeepingContract::FakeRelay.new(source: timekeeping), credential]
-  end
-
   def outbox_row(position, **options)
     TimekeepingRelaySpec::MemoryOutboxSource.row(position, **options)
   end
 
   it "resends the same batch under the same key after a lost mark and leaves the projection unchanged" do
-    projection, credential = delivering_projection
-    endpoint = TimekeepingRelaySpec::FakeRelayEndpoint.new(projection:, credential:)
+    endpoint, projection = TimekeepingRelaySpec::FakeRelayEndpoint.over_projection
     source = TimekeepingRelaySpec::MemoryOutboxSource.new([outbox_row(3, id: 77)])
     relay = described_class.new(source:, endpoint:)
 
@@ -46,8 +39,7 @@ RSpec.describe TimekeepingRelay::Relay, "delivery to the fake projection" do
   end
 
   it "counts a row resent inside a larger batch after a lost mark as ignored" do
-    projection, credential = delivering_projection
-    endpoint = TimekeepingRelaySpec::FakeRelayEndpoint.new(projection:, credential:)
+    endpoint, projection = TimekeepingRelaySpec::FakeRelayEndpoint.over_projection
     source = TimekeepingRelaySpec::MemoryOutboxSource.new([outbox_row(1, id: 10)])
     relay = described_class.new(source:, endpoint:)
 
@@ -71,9 +63,8 @@ RSpec.describe TimekeepingRelay::Relay, "delivery to the fake projection" do
   end
 
   it "marks and projects nothing during an outage, then delivers the same batch under the same key" do
-    projection, credential = delivering_projection
-    endpoint = TimekeepingRelaySpec::FakeRelayEndpoint.new(
-      projection:, credential:, answers: [TimekeepingRelay::Response.new(status: 503, body: {})]
+    endpoint, projection = TimekeepingRelaySpec::FakeRelayEndpoint.over_projection(
+      answers: [TimekeepingRelay::Response.new(status: 503, body: {})]
     )
     source = TimekeepingRelaySpec::MemoryOutboxSource.new([outbox_row(1, id: 10), outbox_row(2, id: 11)])
     relay = described_class.new(source:, endpoint:)
@@ -93,9 +84,8 @@ RSpec.describe TimekeepingRelay::Relay, "delivery to the fake projection" do
   end
 
   it "marks nothing after the consumer's stale_generation refusal until the same batch is accepted" do
-    projection, credential = delivering_projection
+    endpoint, projection = TimekeepingRelaySpec::FakeRelayEndpoint.over_projection
     generation = TimekeepingContract::FakeTimekeeping::INITIAL_GENERATION
-    endpoint = TimekeepingRelaySpec::FakeRelayEndpoint.new(projection:, credential:)
     source = TimekeepingRelaySpec::MemoryOutboxSource.new(
       [outbox_row(5, id: 105, generation:), outbox_row(9, id: 109, generation:)]
     )
@@ -119,8 +109,7 @@ RSpec.describe TimekeepingRelay::Relay, "delivery to the fake projection" do
   end
 
   it "gets the consumer's 403 for a credential without deliver and marks or projects nothing" do
-    projection, credential = delivering_projection(name: "reporting", operations: ["read"])
-    endpoint = TimekeepingRelaySpec::FakeRelayEndpoint.new(projection:, credential:)
+    endpoint, projection = TimekeepingRelaySpec::FakeRelayEndpoint.over_projection(name: "reporting", operations: ["read"])
     source = TimekeepingRelaySpec::MemoryOutboxSource.new([outbox_row(4), outbox_row(6)])
 
     result = described_class.new(source:, endpoint:).deliver(limit: 1)
@@ -128,14 +117,14 @@ RSpec.describe TimekeepingRelay::Relay, "delivery to the fake projection" do
     expect(result).to eq(sent: 0, last_position: nil)
     expect(endpoint.posts.size).to eq(1)
     expect(endpoint.posts[0][:answer].status).to eq(403)
+    expect(endpoint.posts[0][:answer].delivered?(1)).to be(false)
     expect(source.mark_calls).to be_empty
     expect(source.sent_positions).to be_empty
     expect(projection.projected_entry(4)).to be_nil
   end
 
   it "projects both entries from two sources with equal positions" do
-    projection, credential = delivering_projection
-    endpoint = TimekeepingRelaySpec::FakeRelayEndpoint.new(projection:, credential:)
+    endpoint, projection = TimekeepingRelaySpec::FakeRelayEndpoint.over_projection
     first = TimekeepingRelaySpec::MemoryOutboxSource.new([outbox_row(1, id: 301)])
     second = TimekeepingRelaySpec::MemoryOutboxSource.new([outbox_row(1, id: 302)])
 

@@ -15,6 +15,16 @@ module TimekeepingRelaySpec
   class FakeRelayEndpoint
     attr_reader :posts
 
+    # An endpoint over a fresh projection, with a service credential that holds
+    # the given operations. Returns the endpoint and the projection, so every
+    # spec builds the consumer fake the same way.
+    def self.over_projection(name: "timekeeping", operations: ["deliver"], answers: [])
+      timekeeping = TimekeepingContract::FakeTimekeeping.new
+      credential = timekeeping.add_service(company_id: nil, name:, operations:)
+      projection = TimekeepingContract::FakeRelay.new(source: timekeeping)
+      [new(projection:, credential:, answers:), projection]
+    end
+
     def initialize(projection: nil, credential: nil, answers: [])
       @projection = projection
       @credential = credential

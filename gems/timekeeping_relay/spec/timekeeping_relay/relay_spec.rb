@@ -16,10 +16,7 @@ RSpec.describe TimekeepingRelay::Relay do
   # An endpoint over the fake projection with a credential that may deliver,
   # so every batch gets the consumer's real 200.
   def relay_spec_projection_endpoint
-    timekeeping = TimekeepingContract::FakeTimekeeping.new
-    credential = timekeeping.add_service(company_id: nil, name: "timekeeping", operations: ["deliver"])
-    projection = TimekeepingContract::FakeRelay.new(source: timekeeping)
-    TimekeepingRelaySpec::FakeRelayEndpoint.new(projection:, credential:)
+    TimekeepingRelaySpec::FakeRelayEndpoint.over_projection.first
   end
 
   def relay_spec_posted_positions(endpoint)

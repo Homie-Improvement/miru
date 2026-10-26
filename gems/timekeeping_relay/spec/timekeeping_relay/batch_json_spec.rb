@@ -8,10 +8,7 @@ RSpec.describe TimekeepingRelay::BatchJson do
   # rebuilds the same row with its keys in another order must still post the
   # text the key was taken from.
   it "lets a lost-mark retry of a reordered row replay the stored answer and mark it sent" do
-    timekeeping = TimekeepingContract::FakeTimekeeping.new
-    credential = timekeeping.add_service(company_id: nil, name: "timekeeping", operations: ["deliver"])
-    projection = TimekeepingContract::FakeRelay.new(source: timekeeping)
-    endpoint = TimekeepingRelaySpec::FakeRelayEndpoint.new(projection:, credential:)
+    endpoint, _projection = TimekeepingRelaySpec::FakeRelayEndpoint.over_projection
     row = TimekeepingRelaySpec::MemoryOutboxSource.row(1, id: 77,
                                                           generation: TimekeepingContract::FakeTimekeeping::INITIAL_GENERATION)
     source = TimekeepingRelaySpec::MemoryOutboxSource.new([row])

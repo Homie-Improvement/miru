@@ -47,12 +47,6 @@ RSpec.describe TimekeepingRelaySpec::MemoryOutboxSource do
 end
 
 RSpec.describe TimekeepingRelaySpec::FakeRelayEndpoint do
-  def delivering_projection(operations: ["deliver"], name: "timekeeping")
-    timekeeping = TimekeepingContract::FakeTimekeeping.new
-    credential = timekeeping.add_service(company_id: nil, name:, operations:)
-    [TimekeepingContract::FakeRelay.new(source: timekeeping), credential]
-  end
-
   def batch_of(*rows)
     { "schema_version" => 1, "snapshots" => rows }
   end
@@ -61,23 +55,20 @@ RSpec.describe TimekeepingRelaySpec::FakeRelayEndpoint do
     # "Make MemoryOutboxSource (with a fail-next-mark switch) and FakeRelayEndpoint (with scripted statuses, using TimekeepingRelay::HttpEndpoint::DELIVER_PATH) the only test doubles."
     expect(described_class.const_defined?(:DELIVER_PATH, false)).to be(false)
 
-    projection, credential = delivering_projection
+    endpoint, projection = described_class.over_projection
     paths = []
     call = projection.method(:call)
     projection.define_singleton_method(:call) do |method, path, **options|
       paths << path
       call.call(method, path, **options)
     end
-    endpoint = described_class.new(projection:, credential:)
 
     expect(endpoint.deliver(batch_of(TimekeepingRelaySpec::MemoryOutboxSource.row(2)), idempotency_key: "key-1").status).to eq(200)
     expect(paths).to eq([TimekeepingRelay::HttpEndpoint::DELIVER_PATH])
   end
 
   it "answers a scripted 503 without reaching the projection, then the next post reaches it" do
-    projection, credential = delivering_projection
-    endpoint = described_class.new(projection:, credential:,
-                                   answers: [TimekeepingRelay::Response.new(status: 503, body: {})])
+    endpoint, projection = described_class.over_projection(answers: [TimekeepingRelay::Response.new(status: 503, body: {})])
     batch = batch_of(TimekeepingRelaySpec::MemoryOutboxSource.row(1, id: 10))
 
     expect(endpoint.deliver(batch, idempotency_key: "key-1").status).to eq(503)
@@ -90,9 +81,7 @@ RSpec.describe TimekeepingRelaySpec::FakeRelayEndpoint do
   end
 
   it "records each batch, key and answer once, scripted and projected alike" do
-    projection, credential = delivering_projection
-    endpoint = described_class.new(projection:, credential:,
-                                   answers: [TimekeepingRelay::Response.new(status: 503, body: {})])
+    endpoint, _projection = described_class.over_projection(answers: [TimekeepingRelay::Response.new(status: 503, body: {})])
     batch = batch_of(TimekeepingRelaySpec::MemoryOutboxSource.row(3))
 
     endpoint.deliver(batch, idempotency_key: "key-a")
@@ -102,19 +91,6 @@ RSpec.describe TimekeepingRelaySpec::FakeRelayEndpoint do
     expect(endpoint.posts.map { |post| post[:batch] }).to eq([batch, batch])
     expect(endpoint.posts.map { |post| post[:answer].status }).to eq([503, 200])
     expect(endpoint.idempotency_keys).to eq(%w[key-a key-b])
-  end
-
-  # The 403 must come from the real consumer fake's credential check, not from a script.
-  it "passes on the consumer's 403 for a credential without the deliver operation and projects nothing" do
-    projection, credential = delivering_projection(name: "reporting", operations: ["read"])
-    endpoint = described_class.new(projection:, credential:)
-
-    response = endpoint.deliver(batch_of(TimekeepingRelaySpec::MemoryOutboxSource.row(4)), idempotency_key: "key-403")
-
-    expect(response.status).to eq(403)
-    expect(response.delivered?(1)).to be(false)
-    expect(endpoint.posts.map { |post| [post[:key], post[:answer].status] }).to eq([["key-403", 403]])
-    expect(projection.projected_entry(4)).to be_nil
   end
 
   # A missing script must fail loudly, never answer as if it were delivered.
