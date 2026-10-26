@@ -13,7 +13,6 @@ module Timekeeping
   class EntryCommand < Data.define(:route, :company_id, :actor_id, :role, :primary_role, :entry_id, :operation, :key,
                                    :fingerprint, :body, :project_id, :generation, :if_match, :facts, :today)
     ID = /\A[0-9]{1,19}\z/
-    DATE = /\A[0-9]{4}-[0-9]{2}-[0-9]{2}\z/
     ACTOR_TYPE = "user"
     UNBILLED = "unbilled"
 
@@ -23,37 +22,19 @@ module Timekeeping
     WRITABLE_FIELDS = %w[project_id work_date duration note source source_metadata bill_status agent_id proof_url
                          proof_metadata].freeze
 
-    # The values the monolith's timesheet_entries accepts (TimesheetEntry::SOURCES
-    # and its bill_status enum). Every write here is projected there, and the
-    # projection refuses a batch holding any other value, so accepting one
-    # would stop snapshot delivery for every later entry.
-    SOURCES = %w[manual cli mcp automation import].freeze
-    BILL_STATUSES = %w[non_billable unbilled billed].freeze
-
-    # The shape each writable field must have when the body sends it, so a
-    # value the entries table cannot store is refused as a bad request rather
-    # than failing inside the transaction. Each shape is also at least as strict
-    # as the projection's check on the same field (the monolith's
-    # Timekeeping::SnapshotBatch): a committed snapshot the projection refuses
-    # would hold back every later snapshot, because the relay delivers in order.
-    FIELD_SHAPES = {
-      "work_date" => ->(value) { value.is_a?(String) && DATE.match?(value) && Date.iso8601(value) },
-      "duration" => ->(value) { value.is_a?(Numeric) && !value.negative? },
-      "note" => ->(value) { value.nil? || value.is_a?(String) },
-      "source" => ->(value) { SOURCES.include?(value) },
-      "source_metadata" => ->(value) { value.is_a?(Hash) },
-      "bill_status" => ->(value) { BILL_STATUSES.include?(value) },
-      "agent_id" => ->(value) { value.nil? || (value.is_a?(Integer) && value.positive?) },
-      "proof_url" => ->(value) { value.nil? || value.is_a?(String) },
-      "proof_metadata" => ->(value) { value.is_a?(Hash) }
-    }.freeze
+    # The shape each field must have when the body sends it, so a value the
+    # entries table or the projection cannot store is refused as a bad request
+    # rather than failing inside the transaction or holding back snapshot
+    # delivery. project_id is not here: parse_project_id reads it, and accepts
+    # a decimal string the snapshot rule would refuse.
+    FIELD_SHAPES = SnapshotValues::RULES.slice(
+      *%w[work_date duration note source source_metadata bill_status agent_id proof_url proof_metadata]
+    ).freeze
     CREATE_REQUIRED_FIELDS = %w[work_date duration].freeze
 
-    # The deepest body accepted. A snapshot carries the entry three levels
-    # down (batch, snapshots list, item), and the projection endpoint parses a
-    # batch with JSON's default limit of 100 levels, so a deeper body could be
-    # stored but never delivered.
-    BODY_MAX_NESTING = 97
+    # The deepest body accepted: the body object itself plus metadata as deep
+    # as a snapshot may carry it.
+    BODY_MAX_NESTING = SnapshotValues::METADATA_MAX_NESTING + 1
 
     # The routes whose body names a project, and whether it must.
     PROJECT_ROUTES = { create: :required, update: :optional, bulk_move: :required }.freeze
@@ -150,8 +131,6 @@ module Timekeeping
 
       invalid = FIELD_SHAPES.select { |field, valid| body.key?(field) && !valid.call(body[field]) }.keys
       raise ActionController::BadRequest, "invalid #{invalid.join(", ")}" unless invalid.empty?
-    rescue Date::Error
-      raise ActionController::BadRequest, "invalid work_date"
     end
 
     private_class_method :parse_entry_id, :parse_project_id, :check_fields!
