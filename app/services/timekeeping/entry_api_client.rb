@@ -14,6 +14,14 @@ module Timekeeping
   # failure raises, so a caller cannot mistake a stale copy for the owner.
   class EntryApiClient
     BASE_URL_ENV = "TIMEKEEPING_BASE_URL"
+    # Set to "true" only once the running Timekeeping refuses read tokens on
+    # write routes. An older Timekeeping takes a token's role for writes too,
+    # so a read token's raised role would let its holder write as an admin.
+    # Before rolling Timekeeping back to such a version, clear it on every
+    # process and restart them, then wait at least UserToken::TTL so every read
+    # token already issued has expired (docs/architecture/timekeeping-soa.md,
+    # section 11.2).
+    READ_TOKENS_ENV = "TIMEKEEPING_READ_TOKENS_ENABLED"
     INDEX_PATH = "/v1/companies/%<company_id>d/entries"
     TIMEOUT_SECONDS = 5
 
@@ -26,12 +34,16 @@ module Timekeeping
     # Returns the entry Hashes of the list route's "entries" answer.
     # The token speaks for the acting user, whose employment the token
     # requires, while user_id only filters the list: the user being read may
-    # have left the company.
+    # have left the company. With READ_TOKENS_ENV on, it is a read token, so it
+    # carries any owner or admin role the acting user holds in the company, the
+    # same roles that let the index controllers read a colleague; Timekeeping
+    # refuses it for writes. With it off, the token is the default one, which
+    # carries the user's primary role.
     def list_entries(company_id:, user_id:, from:, to:, acting_user_id: user_id)
       raise Error, "#{BASE_URL_ENV} is not set" if @base_url.blank?
 
       company = Company.find(company_id)
-      token = UserToken.mint(user: company.users.find(acting_user_id), company:)
+      token = UserToken.mint(user: company.users.find(acting_user_id), company:, purpose: token_purpose)
       response = get(list_uri(company_id:, user_id:, from:, to:), token)
       raise Error, "Timekeeping entry list answered #{response.code}" unless response.is_a?(Net::HTTPOK)
 
@@ -42,6 +54,10 @@ module Timekeeping
     end
 
     private
+
+      def token_purpose
+        ENV[READ_TOKENS_ENV] == "true" ? :read : :write
+      end
 
       def list_uri(company_id:, user_id:, from:, to:)
         uri = URI.join(@base_url, format(INDEX_PATH, company_id:))
