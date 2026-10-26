@@ -22,13 +22,16 @@ module Timekeeping
         "reservations" => %w[company_id entry_id created_at operation_id state],
         "invoice_operations" => %w[id],
         "entry_audits" => %w[id],
-        "idempotency_records" => %w[id]
+        "idempotency_records" => %w[id],
+        "service_idempotency_receipts" => %w[id]
       }.freeze
 
       # A table goes in after, and comes out before, every table it holds a
       # foreign key to: reservations to entries, and in Timekeeping also to the
       # invoice_operations row named by invoice_operation_id.
-      LOAD_ORDER = %w[entries invoice_operations reservations entry_audits idempotency_records].freeze
+      LOAD_ORDER = %w[
+        entries invoice_operations reservations entry_audits idempotency_records service_idempotency_receipts
+      ].freeze
       INSERT_BATCH_SIZE = 500
 
       # The tables whose rows go in with the ids the checkpoint carries. Each
@@ -37,7 +40,9 @@ module Timekeeping
       # The entries sequence is left to advance_entry_id_sequence, which the
       # handoff runs as a step of its own (docs/architecture/timekeeping-soa.md
       # section 10.5).
-      LOADED_ID_SEQUENCE_TABLES = %w[invoice_operations entry_audits idempotency_records].freeze
+      LOADED_ID_SEQUENCE_TABLES = %w[
+        invoice_operations entry_audits idempotency_records service_idempotency_receipts
+      ].freeze
 
       # tables: { checkpoint table => this database's table name }, naming a
       # table for every table in Checkpoint::TABLES.

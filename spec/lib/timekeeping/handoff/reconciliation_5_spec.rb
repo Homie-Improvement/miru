@@ -447,7 +447,8 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     end
     tables = lambda do |reservations|
       { "entries" => [entry.call(101), entry.call(202)], "reservations" => reservations,
-        "invoice_operations" => [], "entry_audits" => [], "idempotency_records" => [] }
+        "invoice_operations" => [], "entry_audits" => [], "idempotency_records" => [],
+        "service_idempotency_receipts" => [] }
     end
     source = Timekeeping::Handoff::Checkpoint.build(tables: tables.call([reservation.call(101), reservation.call(202)]))
     checkpoint = Timekeeping::Handoff::Checkpoint.build(
@@ -489,7 +490,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     end
     tables = lambda do |entries|
       { "entries" => entries, "reservations" => [], "invoice_operations" => [], "entry_audits" => [],
-        "idempotency_records" => [] }
+        "idempotency_records" => [], "service_idempotency_receipts" => [] }
     end
     source = Timekeeping::Handoff::Checkpoint.build(tables: tables.call([entry.call(101, "a"), entry.call(202, "b")]))
     checkpoint = Timekeeping::Handoff::Checkpoint.build(
@@ -532,7 +533,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
       }
     end
     rows = { "entries" => [entry.call(101), entry.call(202)], "reservations" => [], "invoice_operations" => [],
-             "entry_audits" => [], "idempotency_records" => [] }
+             "entry_audits" => [], "idempotency_records" => [], "service_idempotency_receipts" => [] }
     projection = [101, 202].map do |company_id|
       entry.call(company_id).merge("bill_status" => bill_number, "review_status" => review_number)
     end
@@ -569,7 +570,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
       "discarded_at" => nil, "created_at" => at, "updated_at" => at
     }
     rows = { "entries" => [entry], "reservations" => [], "invoice_operations" => [], "entry_audits" => [],
-             "idempotency_records" => [] }
+             "idempotency_records" => [], "service_idempotency_receipts" => [] }
     projection = [entry.merge("bill_status" => bill_number, "review_status" => review_number, "version" => 0)]
     projection_before = Marshal.load(Marshal.dump(projection))
     money = { 101 => { company_id: 101, values: {} } }

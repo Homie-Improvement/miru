@@ -47,7 +47,8 @@ RSpec.describe "Timekeeping internal handoff checkpoint" do
     expect(exported.rows.keys).to match_array(Timekeeping::Handoff::Checkpoint::TABLES.keys)
     expect(Timekeeping::Handoff::Checkpoint.verify(exported)).to eq([])
     expect(exported.rows.transform_values(&:size)).to eq(
-      "entries" => 2, "reservations" => 0, "invoice_operations" => 0, "entry_audits" => 2, "idempotency_records" => 2
+      "entries" => 2, "reservations" => 0, "invoice_operations" => 0, "entry_audits" => 2, "idempotency_records" => 2,
+      "service_idempotency_receipts" => 0
     )
     %w[entries entry_audits idempotency_records].each do |table|
       expect(exported.rows.fetch(table).map { |row| row["company_id"] }).to contain_exactly(11, 22), table
@@ -264,7 +265,7 @@ RSpec.describe "Timekeeping internal handoff checkpoint" do
       expect(Entry.order(:id).pluck(:note, :version)).to eq([["Design review", 3], ["Written after export", 1]])
       expect(before.transform_values(&:size)).to eq(
         "entries" => 2, "reservations" => 1, "invoice_operations" => 0, "audit_events" => 1,
-        "idempotency_receipts" => 1, "outbox_snapshots" => 0
+        "idempotency_receipts" => 1, "service_idempotency_receipts" => 0, "outbox_snapshots" => 0
       )
       handoff_request(:checkpoint_export)
       digest_before = checkpoint_from(response).digest

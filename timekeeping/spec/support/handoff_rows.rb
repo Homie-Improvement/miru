@@ -77,6 +77,11 @@ module HandoffRows
         "idempotency_records" => {
           "id" => id, "company_id" => company_id, "actor_type" => "user", "actor_id" => 20, "operation" => "create",
           "key" => "key-#{id}", "fingerprint" => "fp-#{id}", "status" => 201, "body" => "{}", "created_at" => at
+        },
+        "service_idempotency_receipts" => {
+          "id" => id, "company_id" => company_id, "actor_name" => "invoice-service", "operation" => "commit",
+          "key" => operation_id, "fingerprint" => "fp-#{id}", "status" => 200,
+          "body" => '{"reserved":1,"released":0}', "created_at" => at
         }
       }
     end
@@ -87,7 +92,7 @@ end
 module HandoffStoredState
   # Every table a handoff load or correction can write.
   HANDOFF_STORED_TABLES = %w[entries reservations invoice_operations audit_events idempotency_receipts
-                             outbox_snapshots].freeze
+                             service_idempotency_receipts outbox_snapshots].freeze
 
   # Every row of every stored table, read as Postgres returns it, so a change
   # to any value shows up.
