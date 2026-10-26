@@ -28,6 +28,12 @@ module Timekeeping
       )
     end
 
+    # S7 for the agent and user a write will commit. EntryCommand has already
+    # checked agent_id is nil or a positive Integer, so it passes unchanged.
+    def agent_owner(agent_id:, user_id:, company_agents:)
+      TimekeepingRules::EntryRules.agent_owner(agent_id:, user_id:, company_agents:)
+    end
+
     # A missing If-Match leaves the version unchecked, as the contract fake
     # does. A value that is not a plain integer never matches a version.
     def version(if_match:, current_version:)
