@@ -4,206 +4,205 @@
 
 require "rails_helper"
 
-RSpec.describe Timekeeping::LocalOwner do
+RSpec.describe Timekeeping::LocalOwner, "entry_written rollback, merged" do
   # "A failure injected after the entry write and before commit leaves no entry change, audit row, receipt or outbox row"
-  it "a failure raised at entry_written during an update leaves the entry, audits, outbox and receipts unchanged" do
-    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
-    generation = TimekeepingOwnership.current.generation.to_s
+  it "an update failing at entry_written keeps the entry's attributes, note and version and every written table at its seeded count" do
+    generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
-    user = create(:user)
-    create(:employment, company:, user:)
-    user.add_role("employee", company)
+    owner = timekeeping_member(company, "owner")
     project = create(:project, client: create(:client, company:))
-    entry = Timekeeping::LocalEntry.create!(
-      company_id: company.id, user_id: user.id, project_id: project.id, work_date: Date.current, duration: 30.0,
-      note: "before", bill_status: TimesheetEntry.bill_statuses.keys.reject { |status| status == "billed" }.first
+    actor = described_class::Actor.user(user_id: owner.id, role: "owner")
+    created = described_class.call(
+      operation: :create, company_id: company.id, generation:, actor:,
+      params: { "idempotency_key" => "rollback-seed",
+                "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 60.0,
+                            "note" => "before", "source" => "manual", "source_metadata" => {} } }
     )
-    count = ->(table) { ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM #{table}").to_i }
+    expect(created.status).to eq(201)
+    entry = Timekeeping::LocalEntry.find_by!(company_id: company.id, note: "before")
+    baseline = timekeeping_row_counts
+    expect(baseline).to eq("entries" => 1, "entry_audits" => 1, "idempotency_records" => 1, "entry_outbox_items" => 1)
+    attributes_before = entry.reload.attributes
     injected = Class.new(StandardError)
-    fail_after_write = ->(step) { raise injected if step.to_s == "entry_written" }
+    expect(described_class::STEPS).to include(:entry_written)
 
     expect {
       described_class.call(
-        operation: :update, company_id: company.id, generation:,
-        actor: described_class::Actor.user(user_id: user.id, role: "employee"),
-        params: { "idempotency_key" => "crash", "entry_id" => entry.id, "body" => { "note" => "after" } },
-        checkpoint: fail_after_write
+        operation: :update, company_id: company.id, generation:, actor:,
+        params: { "idempotency_key" => "rollback-update", "entry_id" => entry.id, "body" => { "note" => "after" } },
+        checkpoint: ->(step) { raise injected if step == :entry_written }
       )
     }.to raise_error(injected)
 
     entry.reload
+    expect(entry.attributes).to eq(attributes_before)
     expect(entry.note).to eq("before")
     expect(entry.version).to eq(1)
-    expect(count.call("entry_audits")).to eq(0)
-    expect(count.call("entry_outbox_items")).to eq(0)
-    expect(count.call("idempotency_records")).to eq(0)
+    expect(timekeeping_row_counts).to eq(baseline)
+  end
+end
+
+RSpec.describe Timekeeping::LocalOwner, "bulk_move rollback, merged" do
+  it "a bulk_move failing at entry_written leaves every moved entry and every written table as seeded" do
+    generation = prepare_local_ownership!.generation.to_s
+    company = create(:company)
+    owner = timekeeping_member(company, "owner")
+    project = create(:project, client: create(:client, company:))
+    other_project = create(:project, client: create(:client, company:))
+    entries = %w[first second].map do |note|
+      Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
+                                      work_date: Date.current, duration: 30.0, note:, bill_status: "unbilled")
+    end
+    before = entries.map { |entry| entry.reload.attributes }
+    baseline = timekeeping_row_counts
+    expect(baseline["entries"]).to eq(2)
+    injected = Class.new(StandardError)
+
+    expect {
+      described_class.call(
+        operation: :bulk_move, company_id: company.id, generation:,
+        actor: described_class::Actor.user(user_id: owner.id, role: "owner"),
+        params: { "idempotency_key" => "merged-bulk-rollback",
+                  "body" => { "entry_ids" => entries.map(&:id), "project_id" => other_project.id } },
+        checkpoint: ->(step) { raise injected if step == :entry_written }
+      )
+    }.to raise_error(injected)
+
+    expect(entries.map { |entry| entry.reload.attributes }).to eq(before)
+    expect(entries.map(&:project_id).uniq).to eq([project.id])
+    expect(timekeeping_row_counts).to eq(baseline)
+  end
+end
+
+RSpec.describe Timekeeping::LocalOwner, "outbox_written rollback, merged" do
+  it "an update failing at outbox_written rolls back the entry change and its audit row" do
+    generation = prepare_local_ownership!.generation.to_s
+    company = create(:company)
+    owner = timekeeping_member(company, "owner")
+    project = create(:project, client: create(:client, company:))
+    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
+                                            work_date: Date.current, duration: 30.0, note: "before", bill_status: "unbilled")
+    before = entry.reload.attributes
+    baseline = timekeeping_row_counts
+    expect(baseline["entries"]).to eq(1)
+    injected = Class.new(StandardError)
+
+    expect {
+      described_class.call(
+        operation: :update, company_id: company.id, generation:,
+        actor: described_class::Actor.user(user_id: owner.id, role: "owner"),
+        params: { "idempotency_key" => "merged-outbox-rollback", "entry_id" => entry.id, "body" => { "note" => "after" } },
+        checkpoint: ->(step) { raise injected if step == :outbox_written }
+      )
+    }.to raise_error(injected)
+
+    expect(entry.reload.attributes).to eq(before)
+    expect(timekeeping_row_counts).to eq(baseline)
   end
 end
 
 RSpec.describe Timekeeping::LocalOwner, "when a failure is injected before commit" do
   let(:company) { create(:company) }
-  let(:owner) { create(:user) }
+  let(:employee) { timekeeping_member(company, "employee") }
   let(:project) { create(:project, client: create(:client, company:)) }
-  let(:other_project) { create(:project, client: create(:client, company:)) }
-  let(:generation) { TimekeepingOwnership.current.generation.to_s }
-  let(:injected_failure) { Class.new(StandardError) }
-  let(:written_tables) { %w[entries entry_audits entry_outbox_items idempotency_records] }
 
-  before do
-    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
-    create(:employment, company:, user: owner)
-    owner.add_role("owner", company)
+  # Refuses a step name LocalOwner never reports, so a renamed step cannot
+  # leave a checkpoint that never fires and a rollback example that proves nothing.
+  def failing_at(step_name, error)
+    raise ArgumentError, "unknown step #{step_name}" unless described_class::STEPS.include?(step_name)
+
+    ->(step) { raise error if step == step_name }
   end
 
-  def row_counts
-    written_tables.index_with do |table|
-      ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM #{table}").to_i
-    end
-  end
-
-  def stored_entry(note)
-    Timekeeping::LocalEntry.create!(
-      company_id: company.id, user_id: owner.id, project_id: project.id, work_date: Date.current,
-      duration: 30.0, note:, bill_status: "unbilled"
-    )
-  end
-
-  # The step is taken from LocalOwner::STEPS, so renaming a step fails here
-  # rather than leaving a checkpoint that never fires.
-  def failing_at(step_name)
-    step = described_class::STEPS.find { |candidate| candidate == step_name }
-    raise ArgumentError, "#{step_name} is not a LocalOwner step" if step.nil?
-
-    ->(reached) { raise injected_failure if reached == step }
-  end
-
-  def call_owner(operation, params, checkpoint:)
+  def create_as_employee(key, checkpoint:)
     described_class.call(
-      operation:, company_id: company.id, generation:,
-      actor: described_class::Actor.user(user_id: owner.id, role: "owner"), params:, checkpoint:
+      operation: :create, company_id: company.id, generation: prepare_local_ownership!.generation.to_s,
+      actor: described_class::Actor.user(user_id: employee.id, role: "employee"),
+      params: { "idempotency_key" => key,
+                "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 30.0,
+                            "note" => "injected", "source" => "manual", "source_metadata" => {} } },
+      checkpoint:
     )
   end
 
-  it "leaves no entry, audit, outbox row or receipt when a create fails at entry_written" do
-    before_counts = row_counts
-    body = { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 20.0,
-             "note" => "never committed", "source" => "manual", "source_metadata" => {} }
-
-    expect {
-      call_owner(:create, { "idempotency_key" => "atomic-create", "body" => body },
-                 checkpoint: failing_at(:entry_written))
-    }.to raise_error(injected_failure)
-
-    expect(row_counts).to eq(before_counts)
+  # A stored entry, so the counts compared before and after the call are not all zero.
+  def seed_entry
+    Timekeeping::LocalEntry.create!(company_id: company.id, user_id: employee.id, project_id: project.id,
+                                    work_date: Date.current, duration: 5.0, note: "seeded", bill_status: "unbilled")
   end
 
-  it "leaves every moved entry unchanged and writes no audit, outbox row or receipt when a bulk_move fails at entry_written" do
-    entries = [stored_entry("first"), stored_entry("second")]
-    before = entries.map { |entry| entry.reload.attributes }
-    before_counts = row_counts
+  # "A failure injected after the entry write and before commit leaves no entry change, audit row, receipt or outbox row"
+  it "an employee create failing at entry_written leaves no entry, audit, receipt or outbox row" do
+    seed_entry
+    baseline = timekeeping_row_counts
+    expect(baseline).to eq("entries" => 1, "entry_audits" => 0, "idempotency_records" => 0, "entry_outbox_items" => 0)
+    injected = Class.new(StandardError)
 
-    expect {
-      call_owner(:bulk_move,
-                 { "idempotency_key" => "atomic-bulk",
-                   "body" => { "entry_ids" => entries.map(&:id), "project_id" => other_project.id } },
-                 checkpoint: failing_at(:entry_written))
-    }.to raise_error(injected_failure)
+    expect { create_as_employee("injected-create", checkpoint: failing_at(:entry_written, injected)) }
+      .to raise_error(injected)
 
-    expect(entries.map { |entry| entry.reload.attributes }).to eq(before)
-    expect(row_counts).to eq(before_counts)
+    expect(timekeeping_row_counts).to eq(baseline)
+    expect(Timekeeping::LocalEntry.where(note: "injected")).to be_empty
   end
 
-  it "rolls back the entry change and audit row when an update fails at outbox_written" do
-    entry = stored_entry("before")
-    before = entry.reload.attributes
-    before_counts = row_counts
-
-    expect {
-      call_owner(:update, { "idempotency_key" => "atomic-outbox", "entry_id" => entry.id, "body" => { "note" => "after" } },
-                 checkpoint: failing_at(:outbox_written))
-    }.to raise_error(injected_failure)
-
-    expect(entry.reload.attributes).to eq(before)
-    expect(row_counts).to eq(before_counts)
-  end
-
-  it "rolls back its own write when the caller's open transaction rescues the failure" do
-    entry = stored_entry("before")
-    before = entry.reload.attributes
-    before_counts = row_counts
-
-    ApplicationRecord.transaction do
-      call_owner(:update, { "idempotency_key" => "atomic-nested", "entry_id" => entry.id, "body" => { "note" => "after" } },
-                 checkpoint: failing_at(:entry_written))
-    rescue injected_failure
-      nil
-    end
-
-    expect(entry.reload.attributes).to eq(before)
-    expect(row_counts).to eq(before_counts)
-  end
-
+  # Only a collision on the receipt insert is retried; a uniqueness error from
+  # anywhere else must escape, or an injected failure would end in a commit.
   it "lets a uniqueness error raised by a checkpoint escape instead of retrying the write" do
-    before_counts = row_counts
-    raised = false
-    unique_once = lambda do |step|
-      next unless step == :entry_written && !raised
-
-      raised = true
-      raise ActiveRecord::RecordNotUnique, "injected at entry_written"
+    seed_entry
+    baseline = timekeeping_row_counts
+    expect(baseline["entries"]).to eq(1)
+    fail_once = failing_at(:entry_written, ActiveRecord::RecordNotUnique.new("injected"))
+    calls = 0
+    # Raises on the first attempt only, so a retry of the whole write would
+    # succeed and commit; the example fails if any retry happens.
+    checkpoint = lambda do |step|
+      calls += 1 if step == :entry_written
+      fail_once.call(step) if calls == 1
     end
-    body = { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 20.0,
-             "note" => "never committed", "source" => "manual", "source_metadata" => {} }
 
-    expect {
-      call_owner(:create, { "idempotency_key" => "atomic-unique", "body" => body }, checkpoint: unique_once)
-    }.to raise_error(ActiveRecord::RecordNotUnique, "injected at entry_written")
+    expect { create_as_employee("checkpoint-not-unique", checkpoint:) }.to raise_error(ActiveRecord::RecordNotUnique)
 
-    expect(row_counts).to eq(before_counts)
+    expect(calls).to eq(1)
+    expect(timekeeping_row_counts).to eq(baseline)
   end
 end
 
 RSpec.describe Timekeeping::LocalOwner, "receipt backstop", committed_data: true do
-  # "A `RecordNotUnique` error replays the stored receipt as a backstop."
-  # A second connection commits the receipt after this call has checked for
-  # one, so the receipt insert at the end of the call hits the unique index.
-  it "answers from a receipt another connection committed mid-write and keeps no second entry" do
-    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
-    generation = TimekeepingOwnership.current.generation.to_s
+  # Another writer commits the same receipt between this writer's receipt
+  # lookup and its receipt insert. The insert then collides on the unique
+  # index, and the writer must replay the committed answer, not its own rows.
+  it "answers the receipt another connection committed mid-write and keeps no entry, audit or outbox row" do
+    generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
-    user = create(:user)
-    create(:employment, company:, user:)
-    user.add_role("employee", company)
+    employee = timekeeping_member(company, "employee")
     project = create(:project, client: create(:client, company:))
-    body = { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 25.0,
+    body = { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 30.0,
              "note" => "raced", "source" => "manual", "source_metadata" => {} }
-    stored_body = { "reason" => "stored by the other writer" }
-    receipt_step = described_class::STEPS.find { |step| step == :receipt_checked }
-    raced = false
-    commit_competing_receipt = lambda do |step|
-      next unless step == receipt_step && !raced
+    stored_answer = { "stored" => "by the other writer" }
+    other_writer_committed = false
+    commit_receipt_elsewhere = lambda do |step|
+      next unless step == :receipt_checked && !other_writer_committed
 
-      raced = true
+      other_writer_committed = true
       committed_data_thread do
         described_class::Receipt.create!(
-          company_id: company.id, actor_type: described_class::ACTOR_TYPE, actor_id: user.id, operation: "create ",
-          key: "raced-key", fingerprint: Digest::SHA256.hexdigest(JSON.generate(body)), status: 201,
-          body: JSON.generate(stored_body), created_at: Time.current
+          company_id: company.id, actor_type: described_class::ACTOR_TYPE, actor_id: employee.id,
+          operation: "create ", key: "raced-key", fingerprint: Digest::SHA256.hexdigest(JSON.generate(body)),
+          status: 201, body: JSON.generate(stored_answer), created_at: Time.current
         )
-      end.join(5)
+      end.join
     end
 
     outcome = described_class.call(
       operation: :create, company_id: company.id, generation:,
-      actor: described_class::Actor.user(user_id: user.id, role: "employee"),
-      params: { "idempotency_key" => "raced-key", "body" => body }, checkpoint: commit_competing_receipt
+      actor: described_class::Actor.user(user_id: employee.id, role: "employee"),
+      params: { "idempotency_key" => "raced-key", "body" => body }, checkpoint: commit_receipt_elsewhere
     )
 
-    expect(raced).to be(true)
-    expect([outcome.status, outcome.body]).to eq([201, stored_body])
-    expect(Timekeeping::LocalEntry.where(company_id: company.id).count).to eq(0)
-    expect(ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM entry_audits").to_i).to eq(0)
-    expect(ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM entry_outbox_items").to_i).to eq(0)
-    expect(described_class::Receipt.where(company_id: company.id).count).to eq(1)
+    expect(other_writer_committed).to be(true)
+    expect(outcome.status).to eq(201)
+    expect(outcome.body).to eq(stored_answer)
+    expect(timekeeping_row_counts)
+      .to eq("entries" => 0, "entry_audits" => 0, "idempotency_records" => 1, "entry_outbox_items" => 0)
   end
 end
