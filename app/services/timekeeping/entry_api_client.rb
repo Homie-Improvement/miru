@@ -61,7 +61,9 @@ module Timekeeping
       raise Error, "#{BASE_URL_ENV} is not set" if @base_url.blank?
 
       company = Company.find(company_id)
-      token = UserToken.mint(user: company.users.find(acting_user_id), company:)
+      # Any user, so an actor outside the company reaches mint's
+      # NotInCompanyError (403) rather than a 404 for the entry.
+      token = UserToken.mint(user: User.find(acting_user_id), company:)
       uri = URI.join(@base_url, format(SHOW_PATH, company_id:, entry_id:))
       response = get(uri, token, request_id:)
       raise show_refusal(response) unless response.is_a?(Net::HTTPOK)

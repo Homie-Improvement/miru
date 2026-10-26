@@ -189,13 +189,33 @@ module Timekeeping
       # SET LOCAL lasts until the outermost transaction ends. When the gateway
       # joins a caller's transaction, the previous value is put back after the
       # write, so the caller's later statements are not marked as the gateway's.
+      # That holds when the write raises too, since the caller may rescue and
+      # go on in the same transaction.
       def as_legacy_writer
         connection = ActiveRecord::Base.connection
         previous = connection.select_value(READ_WRITER_SQL)
         connection.execute(MARK_LEGACY_WRITER_SQL)
-        result = yield
-        connection.select_value(ActiveRecord::Base.sanitize_sql_array([RESTORE_WRITER_SQL, previous.to_s]))
+        begin
+          result = yield
+        rescue StandardError
+          restore_writer_after_failure(connection, previous)
+          raise
+        end
+        restore_writer(connection, previous)
         result
+      end
+
+      def restore_writer(connection, previous)
+        connection.select_value(ActiveRecord::Base.sanitize_sql_array([RESTORE_WRITER_SQL, previous.to_s]))
+      end
+
+      # A failed SQL statement aborts the whole transaction, which can then only
+      # roll back, and the rollback clears the setting. The restore cannot run
+      # then, and its own error must not hide the write's.
+      def restore_writer_after_failure(connection, previous)
+        restore_writer(connection, previous)
+      rescue ActiveRecord::StatementInvalid
+        nil
       end
 
       # A forwarded answer outside the company or for another user is never
