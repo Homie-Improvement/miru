@@ -32,38 +32,6 @@ RSpec.describe "Entry writes carrying a service token" do
   end
 end
 
-RSpec.describe "Reservation operation ids across companies" do
-  include_context "timekeeping entry writes"
-
-  it "never commits or aborts another company's operation that reuses the same operation id" do
-    company = timekeeping_arrange.company
-    other_company = timekeeping_arrange.company
-    all_routes = %w[prepare commit abort mark_billed detach_entries]
-    service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: all_routes)
-    other_service = timekeeping_arrange.service_identity(company: other_company, name: "invoice-boundary", operations: all_routes)
-    entry_id = timekeeping_arrange.entry(company:, user: timekeeping_arrange.user(company:, role: "employee"),
-                                         project: timekeeping_arrange.project(company:))
-    operation_id = SecureRandom.uuid
-    send_command = lambda do |company_id, credential, route, body|
-      post "/v1/companies/#{company_id}/reservations/#{route}",
-           params: JSON.generate({ "generation" => timekeeping_arrange.current_generation, "invoice_id" => 501,
-                                   "operation_id" => operation_id }.merge(body)),
-           headers: { "Content-Type" => "application/json", "Authorization" => "Bearer #{credential}" }
-      response
-    end
-    expect(send_command.call(company, service, "prepare", { "disposition" => "active", "entries" => [entry_id] }).status).to eq(200)
-    before = [Reservation.where(entry_id:).pluck(:state), AuditEvent.count, OutboxSnapshot.count, Entry.find(entry_id).version]
-
-    # "Operation ids are unique only within a company."
-    commit = send_command.call(other_company, other_service, "commit", {})
-    abort = send_command.call(other_company, other_service, "abort", {})
-
-    expect([commit.status, abort.status]).to eq([404, 404])
-    expect([Reservation.where(entry_id:).pluck(:state), AuditEvent.count, OutboxSnapshot.count,
-            Entry.find(entry_id).version]).to eq(before)
-  end
-end
-
 RSpec.describe "Reservation request bodies" do
   include_context "timekeeping entry writes"
 

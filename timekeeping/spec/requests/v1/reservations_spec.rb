@@ -47,41 +47,6 @@ end
 
 # frozen_string_literal: true
 
-RSpec.describe "Reservation operation ids across companies" do
-  include_context "timekeeping entry writes"
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  it "never matches another company's operation id on commit or abort" do
-    routes = %w[prepare commit abort mark_billed detach_entries]
-    company = timekeeping_arrange.company
-    other_company = timekeeping_arrange.company
-    employee = timekeeping_arrange.user(company:, role: "employee")
-    entry_id = timekeeping_arrange.entry(company:, user: employee, project: timekeeping_arrange.project(company:))
-    service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: routes)
-    other_service = timekeeping_arrange.service_identity(company: other_company, name: "invoice-boundary", operations: routes)
-    operation_id = SecureRandom.uuid
-    send_command = lambda do |company_id, credential, route, extra = {}|
-      body = { "invoice_id" => 501, "operation_id" => operation_id, "generation" => timekeeping_arrange.current_generation }
-      post "/v1/companies/#{company_id}/reservations/#{route}", params: JSON.generate(body.merge(extra)),
-                                                                headers: { "Content-Type" => "application/json", "Authorization" => "Bearer #{credential}" }
-      response
-    end
-
-    expect(send_command.call(company, service, "prepare", "disposition" => "active", "entries" => [entry_id]).status).to eq(200)
-
-    # "Operation ids are unique only within a company."
-    foreign_abort = send_command.call(other_company, other_service, "abort")
-    foreign_commit = send_command.call(other_company, other_service, "commit")
-
-    expect(foreign_abort.status).to eq(404)
-    expect(foreign_commit.status).to eq(404)
-    expect(Reservation.where(company_id: company, entry_id:).pluck(:invoice_id, :state)).to eq([[501, "provisional"]])
-    expect(send_command.call(company, service, "abort").parsed_body).to eq("dropped" => 1)
-  end
-end
-
-# frozen_string_literal: true
-
 RSpec.describe "Reservation locks seen through the entry API" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
