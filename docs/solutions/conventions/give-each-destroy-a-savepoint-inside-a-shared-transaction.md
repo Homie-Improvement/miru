@@ -5,7 +5,7 @@ problem_type: convention
 component: api_layer
 severity: high
 evidence_grounding: speculative
-grounding_evidence: "app/controllers/api/v1/invoices/bulk_deletion_controller.rb adds destroy_in_savepoint with Invoice.transaction(requires_new: true) and a comment saying Rails does not roll back a failed destroy's child deletions inside the shared transaction; spec/requests/api/v1/invoices/bulk_deletion_spec.rb checks that a paid invoice keeps its line items, taxes and totals in a mixed batch"
+grounding_evidence: "app/services/invoices/bulk_deletion_service.rb holds destroy_in_savepoint with Invoice.transaction(requires_new: true) and a comment saying Rails does not roll back a failed destroy's child deletions inside the shared transaction; spec/services/invoices/bulk_deletion_service_spec.rb checks that a paid invoice keeps its line items, taxes and totals in a mixed batch"
 audience: both
 related_components:
   - Timekeeping::BillingFence
@@ -64,3 +64,5 @@ PR #86, head commit `5b757b144b064084341ef0a7543debbe92f7abbd`:
 - `spec/requests/api/v1/invoices/bulk_deletion_spec.rb` adds a mixed-batch example with no handoff. It expects 422 naming only the paid invoice, and it expects the paid invoice's line-item count, tax count, `amount`, `tax` and `outstanding_amount` to equal the baseline.
 - That PR also added a duplicate of this check in `bulk_deletion_fence_spec.rb`. The duplicate has since been folded into `spec/requests/api/v1/invoices/bulk_deletion_spec.rb`, whose mixed-batch baseline now also compares `discount`.
 - The plan review raised this as a blocker before the savepoint existed.
+
+The rule now lives in `Invoices::BulkDeletionService` (`app/services/invoices/bulk_deletion_service.rb`), which the controller calls. `spec/services/invoices/bulk_deletion_service_spec.rb` holds the mixed-batch baseline check and the handoff refusal, without going through HTTP.
