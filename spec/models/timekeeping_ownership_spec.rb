@@ -267,3 +267,106 @@ RSpec.describe TimekeepingOwnership, type: :model do
     expect(ownership.snapshot_generation_accepted?(generation: 2, outbox_position: 1)).to be(false)
   end
 end
+
+RSpec.describe TimekeepingOwnership, type: :model do
+  # "An aborted handoff, which leaves the legacy store at a raised generation, counts as begun; disclose this choice in the pull request."
+  it "unless_handoff_begun skips the block and persists nothing at legacy generation 2 but runs and persists it in the initial state" do
+    company_baseline = Company.count
+
+    described_class.current.update_columns(generation: 2, handoff_step: nil, owner: "monolith", monolith_store: "legacy")
+    refused = described_class.unless_handoff_begun { create(:company) }
+
+    expect(refused).to be(false)
+    expect(Company.count).to eq(company_baseline)
+
+    described_class.current.update_columns(generation: 1)
+    admitted = described_class.unless_handoff_begun { create(:company) }
+
+    expect(admitted).to be(true)
+    expect(Company.count).to eq(company_baseline + 1)
+  end
+
+  # "It is true when any of these holds: `generation > 1`, `handoff_step` is set,
+  # `owner` is not `monolith`, `monolith_store` is not `legacy`"
+  it "handoff_begun? is false only for the initial row and true when any single column leaves it" do
+    ownership = described_class.current
+    expect([ownership.generation, ownership.handoff_step, ownership.owner, ownership.monolith_store])
+      .to eq([1, nil, "monolith", "legacy"])
+    expect(ownership.handoff_begun?).to be(false)
+
+    {
+      generation: 2,
+      handoff_step: "settle",
+      owner: "timekeeping",
+      monolith_store: "prepared"
+    }.each do |column, value|
+      ownership.update_columns(generation: 1, handoff_step: nil, owner: "monolith", monolith_store: "legacy")
+      ownership.update_columns(column => value)
+
+      expect(ownership.reload.handoff_begun?).to be(true), "expected #{column}=#{value.inspect} to count as begun"
+    end
+  end
+
+  # "A missing ownership row counts as begun."
+  it "the class-level handoff_begun? treats a missing row as begun without creating it" do
+    expect(described_class.handoff_begun?).to be(false)
+
+    described_class.delete_all
+
+    expect(described_class.handoff_begun?).to be(true)
+    expect(described_class.count).to eq(0)
+  end
+
+  # "A refused run or request writes nothing."
+  it "unless_handoff_begun runs its block only in the initial legacy state" do
+    runs = 0
+
+    expect(described_class.unless_handoff_begun { runs += 1 }).to be(true)
+    expect(runs).to eq(1)
+
+    described_class.current.update_columns(owner: "timekeeping")
+    expect(described_class.unless_handoff_begun { runs += 1 }).to be(false)
+
+    described_class.delete_all
+    expect(described_class.unless_handoff_begun { runs += 1 }).to be(false)
+
+    expect(runs).to eq(1)
+    expect(described_class.count).to eq(0)
+  end
+
+  it "refuse_if_handoff_begun! raises in each begun state, after the flip and after a rollback, and returns nil in the initial row" do
+    ownership = described_class.current
+    initial = { generation: 1, handoff_step: nil, owner: "monolith", monolith_store: "legacy" }
+    ownership.update_columns(initial)
+
+    # "Seed and demo builders are refused before their first write once a handoff has begun, including after a flip and after a rollback"
+    expect(described_class.refuse_if_handoff_begun!).to be_nil
+
+    begun_states = [
+      { handoff_step: "settle" },
+      { generation: 2, owner: "timekeeping" },
+      { generation: 2, monolith_store: "prepared" },
+      { generation: 2 }
+    ]
+    begun_states.each do |changes|
+      ownership.update_columns(initial.merge(changes))
+      expect { described_class.refuse_if_handoff_begun! }
+        .to raise_error(TimekeepingOwnership::HandoffBegun), "expected #{changes} to refuse"
+    end
+  end
+
+  # "`handoff_step` alone is not enough, because the flip clears it. An aborted handoff, which leaves
+  # the legacy store at a raised generation, counts as begun; disclose this choice in the pull request."
+  it "still counts as begun after the flip or an abort has cleared handoff_step" do
+    ownership = described_class.current
+
+    ownership.update_columns(generation: 2, handoff_step: nil, owner: "timekeeping", monolith_store: "legacy")
+    expect(ownership.reload.handoff_begun?).to be(true)
+
+    ownership.update_columns(generation: 3, handoff_step: nil, owner: "monolith", monolith_store: "legacy")
+    expect(ownership.reload.handoff_begun?).to be(true)
+
+    ownership.update_columns(generation: 1, handoff_step: nil, owner: "monolith", monolith_store: "legacy")
+    expect(ownership.reload.handoff_begun?).to be(false)
+  end
+end

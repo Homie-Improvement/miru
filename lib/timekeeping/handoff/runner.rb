@@ -31,6 +31,10 @@ module Timekeeping
       LOCK_SQL = "SELECT pg_try_advisory_lock(hashtextextended('timekeeping_handoff', 0))"
       UNLOCK_SQL = "SELECT pg_advisory_unlock(hashtextextended('timekeeping_handoff', 0))"
       CHANGED_BY = "timekeeping_handoff"
+      # A resume reads the step 2 money snapshot and the checkpoint files a
+      # previous run wrote, so they live under storage/, the directory that
+      # persists between containers, not under log/.
+      DEFAULT_REPORT_ROOT = Rails.root.join("storage", "timekeeping_handoff")
       PREPARED_MONOLITH_STORE = "prepared"
       PROJECTION_SQL = "SELECT * FROM timesheet_entries ORDER BY id"
       INTENTS_SQL = <<~SQL.squish
@@ -38,7 +42,7 @@ module Timekeeping
       SQL
 
       def self.run(direction:, resume: true, abort: false, owners: configured_owners, observer: NullObserver.new,
-                   report_root: Rails.root.join("log", "timekeeping_handoff"), clock: Time,
+                   report_root: DEFAULT_REPORT_ROOT, clock: Time,
                    close_admission_lock_timeout: CLOSE_ADMISSION_LOCK_TIMEOUT)
         new(owners:, observer:, report_root:, clock:, close_admission_lock_timeout:)
           .run(direction: direction.to_sym, resume:, abort:)

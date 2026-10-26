@@ -166,4 +166,19 @@ RSpec.describe "timekeeping handoff tasks" do
     ENV["DIRECTION"] = "sideways"
     expect { invoke_handoff_task("timekeeping:handoff_resume") }.to raise_error(SystemExit).and output(/DIRECTION|sideways/).to_stderr
   end
+
+  # Only handoff_resume continues a handoff or re-sends the admit call after a flip; the forward tasks start one.
+  it "forward handoff tasks pass resume: false and handoff_resume passes resume: true" do
+    runner = Timekeeping::Handoff::Runner
+    expect(runner).to receive(:run).with(direction: :cutover, resume: false).ordered
+    expect(runner).to receive(:run).with(direction: :rollback, resume: false).ordered
+    expect(runner).to receive(:run).with(direction: :re_cutover, resume: false).ordered
+    expect(runner).to receive(:run).with(direction: :rollback, resume: true).ordered
+
+    invoke_handoff_task("timekeeping:handoff_cutover")
+    invoke_handoff_task("timekeeping:handoff_rollback")
+    invoke_handoff_task("timekeeping:handoff_re_cutover")
+    ENV["DIRECTION"] = "rollback"
+    expect { invoke_handoff_task("timekeeping:handoff_resume") }.to output(/rollback finished/).to_stdout
+  end
 end

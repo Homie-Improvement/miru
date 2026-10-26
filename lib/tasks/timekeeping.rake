@@ -58,7 +58,8 @@ namespace :timekeeping do
     run_timekeeping_handoff(direction: :re_cutover, resume: false)
   end
 
-  desc "Resume the Timekeeping handoff in progress (DIRECTION=cutover|rollback|re_cutover required)"
+  desc "Resume the Timekeeping handoff in progress (DIRECTION=cutover|rollback|re_cutover required; " \
+       "needs the storage/timekeeping_handoff files the earlier run wrote)"
   task handoff_resume: :environment do
     run_timekeeping_handoff(direction: timekeeping_handoff_direction, resume: true)
   end
