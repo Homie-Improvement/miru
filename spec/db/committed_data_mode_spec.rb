@@ -119,17 +119,18 @@ RSpec.describe "Committed-data lock-wait helpers", committed_data: true do
   it "counts a lock wait only when the named holder is the one blocking the named waiter" do
     holder_pids = Queue.new
     waiter_pids = Queue.new
-    bystander_pids = Queue.new
     release = Queue.new
-    bystander_go = Queue.new
 
     holder = hold_ownership_row_for_lock_wait_spec(holder_pids, release)
     waiter = update_ownership_row_for_lock_wait_spec(waiter_pids)
-    bystander = committed_data_thread(bystander_pids) { bystander_go.pop(timeout: 10) }
+    # Opened outside the pool: the holder, the waiter and the main thread
+    # already lease every connection the test pool has.
+    bystander = ActiveRecord::Base.connection_pool.db_config.new_connection
 
     holder_pid = holder_pids.pop(timeout: 5)
     waiter_pid = waiter_pids.pop(timeout: 5)
-    bystander_pid = bystander_pids.pop(timeout: 5)
+    bystander_pid = bystander.select_value("SELECT pg_backend_pid()")
+    expect([holder_pid, waiter_pid, bystander_pid]).to all(be_a(Integer))
 
     begin
       really_blocked = blocked_by?(waiter_pid, holder_pid, within: 3)
@@ -144,8 +145,8 @@ RSpec.describe "Committed-data lock-wait helpers", committed_data: true do
     expect(bystander_blocked).to be(false)
   ensure
     release&.push(true)
-    bystander_go&.push(true)
-    [holder, waiter, bystander].compact.each { |thread| thread.join(5) }
+    [holder, waiter].compact.each { |thread| thread.join(5) }
+    bystander&.disconnect!
   end
 
   # "These checks do not distinguish a database lock wait from a thread that has not reached its query."
