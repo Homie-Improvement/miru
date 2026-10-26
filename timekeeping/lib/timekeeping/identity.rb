@@ -16,8 +16,8 @@ module Timekeeping
   # company_id, which stays nil for an expired token.
   #
   # purpose is the token's signed purpose claim ("read" or "write"), or nil for
-  # a token signed without one. Only WriteAccess reads it: a read token may
-  # carry a raised role, so it must never authorize a write.
+  # a token signed without one. Only WriteAccess reads it: a read token must
+  # never authorize a write.
   #
   # primary_role is the token's signed primary_role claim: the user's
   # lowest-id role in the company, which the locked-entry and billed-change
