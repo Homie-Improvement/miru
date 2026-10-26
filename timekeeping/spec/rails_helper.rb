@@ -18,4 +18,8 @@ RSpec.configure do |config|
   config.use_transactional_fixtures = true
   config.infer_spec_type_from_file_location!
   config.filter_rails_from_backtrace!
+
+  # The test database is loaded from db/schema.rb, which holds no rows, and
+  # every entry write needs the admission row.
+  config.before(:suite) { Timekeeping::Admission.ensure_initial! }
 end

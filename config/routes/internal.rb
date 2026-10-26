@@ -7,5 +7,8 @@ namespace :internal, defaults: { format: "json" } do
     resources :companies, only: [] do
       resource :reference, only: :show, controller: "companies/references"
     end
+    namespace :timekeeping do
+      resources :entry_snapshots, only: :create, path: "entry-snapshots"
+    end
   end
 end

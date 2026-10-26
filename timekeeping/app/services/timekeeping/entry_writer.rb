@@ -7,10 +7,11 @@ module Timekeeping
   #
   # 1. Lock the receipt key and re-read the receipt: a stored answer for the
   #    same body is replayed, and a different body is idempotency_key_reused.
-  # 2. Seed and read the company's generation row FOR SHARE; a header that is
-  #    not that generation is stale_generation. A project the reference facts
-  #    do not hold for the company is not_found. Both come after the receipt,
-  #    so a retry of a committed write replays even if they have changed.
+  # 2. Read the admitted generation FOR SHARE; a header that is not that
+  #    generation, or any header while fenced, is stale_generation. A project
+  #    the reference facts do not hold for the company is not_found. Both come
+  #    after the receipt, so a retry of a committed write replays even if they
+  #    have changed, or Timekeeping has been fenced since.
   # 3. Lock the target entries FOR UPDATE, by company (and the A1 scope on
   #    bulk routes), in id order, so two writers over the same entries wait in
   #    turn and never deadlock.
@@ -21,7 +22,8 @@ module Timekeeping
   #
   # checkpoint is called with the name of each step as it finishes, so a spec
   # can hold a transaction at a known point or fail it after a given insert.
-  # The locks, generation, audit and outbox steps are Timekeeping::WriteSteps.
+  # The generation is read from Timekeeping::Admission; the locks, audit and
+  # outbox steps are Timekeeping::WriteSteps.
   class EntryWriter
     BULK_RESULTS = { bulk_move: "moved", bulk_delete: "deleted" }.freeze
     BULK_ACTIONS = { bulk_move: :move, bulk_delete: :delete }.freeze
@@ -68,7 +70,7 @@ module Timekeeping
         checkpoint.call(:receipt_checked)
         return answer_from(receipt, command) if receipt
 
-        generation = WriteSteps.locked_generation(command.company_id)
+        generation = locked_generation
         checkpoint.call(:generation_checked)
         unless WriteSteps.generation_matches?(command.generation, generation)
           return WriteOutcome.refusal(:stale_generation)
@@ -109,6 +111,13 @@ module Timekeeping
         return WriteOutcome.refusal(:idempotency_key_reused) unless receipt.fingerprint == command.fingerprint
 
         WriteOutcome.new(status: receipt.status, body: receipt.body)
+      end
+
+      # The one generation Timekeeping admits, read FOR SHARE so a fence waits
+      # for this write to commit. nil while fenced or when the row is missing;
+      # the write never creates the row, so nil refuses it.
+      def locked_generation
+        Admission.locked_generation
       end
 
       # The project a body names must be one the facts hold for this company;
