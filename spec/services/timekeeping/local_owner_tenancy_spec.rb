@@ -215,3 +215,164 @@ RSpec.describe Timekeeping::LocalOwner, "cross-company references" do
     end
   end
 end
+
+RSpec.describe Timekeeping::LocalOwner, "colleague access" do
+  let(:company) { create(:company) }
+  let(:other_company) { create(:company) }
+  let(:employee) { timekeeping_member(company, "employee") }
+  let(:colleague) { timekeeping_member(company, "employee") }
+  let(:admin) { timekeeping_member(company, "admin") }
+  let(:outsider) { timekeeping_member(other_company, "employee") }
+  let(:project) { create(:project, client: create(:client, company:)) }
+  let(:other_project) { create(:project, client: create(:client, company:)) }
+  let(:generation) { prepare_local_ownership!.generation.to_s }
+
+  def entry_of(user, note)
+    Timekeeping::LocalEntry.create!(
+      company_id: company.id, user_id: user.id, project_id: project.id, work_date: Date.current,
+      duration: 30.0, note:, bill_status: "unbilled"
+    )
+  end
+
+  def write_as(user, role, operation, params)
+    described_class.call(
+      operation:, company_id: company.id, generation:,
+      actor: described_class::Actor.user(user_id: user.id, role:), params:
+    )
+  end
+
+  def create_body(overrides = {})
+    { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 30.0, "note" => "n",
+      "source" => "manual", "source_metadata" => {} }.merge(overrides)
+  end
+
+  it "refuses an employee who moves their own entry to a colleague by integer or string user_id" do
+    entry = entry_of(employee, "mine")
+    before = entry.reload.attributes
+    before_counts = timekeeping_row_counts
+
+    outcomes = [colleague.id, colleague.id.to_s].each_with_index.map do |user_id, index|
+      write_as(employee, "employee", :update,
+               { "idempotency_key" => "colleague-update-#{index}", "entry_id" => entry.id,
+                 "body" => { "user_id" => user_id } })
+    end
+
+    expect(outcomes.map(&:status)).to eq([403, 403])
+    expect(entry.reload.attributes).to eq(before)
+    expect(timekeeping_row_counts).to eq(before_counts)
+  end
+
+  it "refuses an employee who edits a colleague's entry and leaves it unchanged" do
+    entry = entry_of(colleague, "theirs")
+    before = entry.reload.attributes
+    before_counts = timekeeping_row_counts
+
+    outcome = write_as(employee, "employee", :update,
+                       { "idempotency_key" => "colleague-edit", "entry_id" => entry.id,
+                         "body" => { "note" => "taken over" } })
+
+    expect(outcome.status).to eq(403)
+    expect(entry.reload.attributes).to eq(before)
+    expect(timekeeping_row_counts).to eq(before_counts)
+  end
+
+  it "leaves a colleague's entry unchanged when an employee's bulk_move and bulk_delete list it" do
+    theirs = entry_of(colleague, "theirs")
+    before = theirs.reload.attributes
+
+    [[:bulk_move, { "project_id" => other_project.id }], [:bulk_delete, {}]].each do |operation, extra|
+      outcome = write_as(employee, "employee", operation,
+                         { "idempotency_key" => "colleague-#{operation}",
+                           "body" => { "entry_ids" => [theirs.id] }.merge(extra) })
+
+      results = outcome.body.fetch("results", []).to_h { |result| [result.fetch("entry_id"), result.fetch("result")] }
+      expect(results.fetch(theirs.id, "not_found")).to eq("not_found")
+    end
+
+    expect(theirs.reload.attributes).to eq(before)
+    expect(ActiveRecord::Base.connection.select_values("SELECT entry_id FROM entry_audits").map(&:to_i))
+      .not_to include(theirs.id)
+    expect(ActiveRecord::Base.connection.select_values("SELECT entry_id FROM entry_outbox_items").map(&:to_i))
+      .not_to include(theirs.id)
+  end
+
+  it "scopes a bulk_delete by the company's role for the user, not the role the actor claims" do
+    theirs = entry_of(colleague, "theirs")
+    before = theirs.reload.attributes
+
+    outcome = write_as(employee, "admin", :bulk_delete,
+                       { "idempotency_key" => "claimed-admin-bulk", "body" => { "entry_ids" => [theirs.id] } })
+
+    expect(outcome.body.fetch("results")).to eq([{ "entry_id" => theirs.id, "result" => "not_found" }])
+    expect(theirs.reload.attributes).to eq(before)
+  end
+
+  it "answers not_found when an admin names another company's user and stores nothing" do
+    before_counts = timekeeping_row_counts
+
+    outcome = write_as(admin, "admin", :create,
+                       { "idempotency_key" => "admin-for-outsider", "body" => create_body("user_id" => outsider.id) })
+
+    expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
+    expect(timekeeping_row_counts).to eq(before_counts)
+  end
+
+  # The projection refuses an agent of another company or user, so such a
+  # snapshot must never be committed.
+  it "answers not_found to a create naming another company's agent or a colleague's agent and stores nothing" do
+    # Only the company is wrong: the agent belongs to the entry's own user.
+    # Validations are skipped because employee is not a member of other_company.
+    foreign_agent = build(:agent, company: other_company, user: employee).tap { |agent| agent.save!(validate: false) }
+    colleague_agent = create(:agent, company:, user: colleague)
+    before_counts = timekeeping_row_counts
+
+    outcomes = [foreign_agent, colleague_agent].map do |agent|
+      write_as(employee, "employee", :create,
+               { "idempotency_key" => "agent-#{agent.id}", "body" => create_body("agent_id" => agent.id) })
+    end
+
+    expect(outcomes.map { |outcome| [outcome.status, outcome.body] }).to eq([[404, { "reason" => "not_found" }]] * 2)
+    expect(timekeeping_row_counts).to eq(before_counts)
+  end
+
+  it "creates an entry with the acting user's own agent" do
+    own_agent = create(:agent, company:, user: employee)
+
+    outcome = write_as(employee, "employee", :create,
+                       { "idempotency_key" => "own-agent", "body" => create_body("agent_id" => own_agent.id) })
+
+    expect(outcome.status).to eq(201)
+    expect(outcome.body.fetch("agent_id")).to eq(own_agent.id)
+  end
+
+  it "refuses a note-only update of an entry whose stored agent now belongs to another user" do
+    agent = create(:agent, company:, user: colleague)
+    entry = entry_of(colleague, "agent entry")
+    entry.update!(agent_id: agent.id)
+    agent.update_columns(user_id: employee.id)
+    before = entry.reload.attributes
+    before_counts = timekeeping_row_counts
+
+    outcome = write_as(admin, "admin", :update,
+                       { "idempotency_key" => "agent-moved", "entry_id" => entry.id, "body" => { "note" => "edited" } })
+
+    expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
+    expect(entry.reload.attributes).to eq(before)
+    expect(timekeeping_row_counts).to eq(before_counts)
+  end
+
+  it "refuses moving an agent-backed entry to a user the agent does not belong to" do
+    entry = entry_of(colleague, "agent entry")
+    entry.update!(agent_id: create(:agent, company:, user: colleague).id)
+    before = entry.reload.attributes
+    before_counts = timekeeping_row_counts
+
+    outcome = write_as(admin, "admin", :update,
+                       { "idempotency_key" => "agent-reassign", "entry_id" => entry.id,
+                         "body" => { "user_id" => employee.id } })
+
+    expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
+    expect(entry.reload.attributes).to eq(before)
+    expect(timekeeping_row_counts).to eq(before_counts)
+  end
+end

@@ -4,36 +4,6 @@
 
 require "rails_helper"
 
-RSpec.describe Timekeeping::LocalOwner do
-  it "answers credential_in_body for a service token nested in an array on create, stores nothing and never echoes the token" do
-    ownership = prepare_local_ownership!
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company_id: company.id))
-    held_token = "local-owner-array-token-#{SecureRandom.hex(16)}"
-    counts_before = timekeeping_row_counts
-    expect(counts_before.keys).to contain_exactly("entries", "entry_audits", "idempotency_records", "entry_outbox_items")
-
-    outcome = with_timekeeping_env("TIMEKEEPING_SERVICE_TOKEN", held_token) do
-      described_class.call(
-        operation: :create, company_id: company.id, generation: ownership.generation.to_s,
-        actor: described_class::Actor.user(user_id: owner.id, role: "owner"),
-        params: {
-          "idempotency_key" => SecureRandom.uuid,
-          "body" => {
-            "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 60.0, "note" => "",
-            "source" => "manual", "source_metadata" => { "list" => ["x", held_token] }
-          }
-        }
-      )
-    end
-
-    expect(outcome.body.to_h.transform_keys(&:to_s)["reason"].to_s).to eq("credential_in_body")
-    expect(outcome.body.to_json).not_to include(held_token)
-    expect(timekeeping_row_counts).to eq(counts_before)
-  end
-end
-
 RSpec.describe Timekeeping::LocalOwner, "credential in body" do
   # "A credential nested in an entry body answers credential_in_body and nothing is stored"
   # "`LocalOwner` runs it on the parsed body before any write, with held credentials `TIMEKEEPING_SERVICE_TOKEN` and the public half of `TIMEKEEPING_TOKEN_PRIVATE_KEY`, and answers `credential_in_body`."
@@ -54,7 +24,9 @@ RSpec.describe Timekeeping::LocalOwner, "credential in body" do
     "a hash three levels deep in an owner's update" =>
       { operation: :update, role: "owner", metadata: ->(token) { { "outer" => { "inner" => { "token" => token } } } } },
     "an array in an employee's update" =>
-      { operation: :update, role: "employee", metadata: ->(token) { { "list" => ["x", token] } } }
+      { operation: :update, role: "employee", metadata: ->(token) { { "list" => ["x", token] } } },
+    "an array in an owner's create" =>
+      { operation: :create, role: "owner", metadata: ->(token) { { "list" => ["x", token] } } }
   }
 
   def write_with_credential(user, row, token, entry)
@@ -300,17 +272,23 @@ RSpec.describe Timekeeping::LocalOwner, "request checks" do
   end
 
   # The entry API takes only YYYY-MM-DD, although the snapshot cast reads any ISO 8601 date.
-  %w[20260302 2026-03-02T00:00:00Z].each do |work_date|
-    it "refuses work_date #{work_date} with 400 invalid_request and writes nothing" do
-      seed_entry
+  %w[20260302 2026-03-02T00:00:00Z 2026-03-02T10:00:00 2026-W10-1 2026-061].each do |work_date|
+    it "refuses work_date #{work_date} on a create and an update with 400 invalid_request and writes nothing" do
+      entry = seed_entry
+      attributes_before = entry.reload.attributes
       before = timekeeping_row_counts
       expect(before["entries"]).to eq(1)
 
-      outcome = call_as_owner(:create, { "idempotency_key" => "date-#{work_date}",
-                                         "body" => entry_body.merge("work_date" => work_date) })
+      outcomes = [
+        call_as_owner(:create, { "idempotency_key" => "date-create-#{work_date}",
+                                 "body" => entry_body.merge("work_date" => work_date) }),
+        call_as_owner(:update, { "idempotency_key" => "date-update-#{work_date}", "entry_id" => entry.id,
+                                 "body" => { "work_date" => work_date } })
+      ]
 
-      expect(outcome.status).to eq(400)
-      expect(outcome.body["reason"]).to eq("invalid_request")
+      expect(outcomes.map { |outcome| [outcome.status, outcome.body] })
+        .to eq([[400, { "reason" => "invalid_request" }]] * 2)
+      expect(entry.reload.attributes).to eq(attributes_before)
       expect(timekeeping_row_counts).to eq(before)
     end
   end
@@ -372,22 +350,25 @@ RSpec.describe Timekeeping::LocalOwner, "who may act" do
     expect(timekeeping_row_counts).to eq(before)
   end
 
-  it "takes the acting user from the actor keyword, not from actor or company fields in params and the body" do
-    owner = timekeeping_member(company, "owner")
+  it "takes the acting user from the actor keyword, not from actor, role or company fields in params and the body" do
+    employee = timekeeping_member(company, "employee")
     other = timekeeping_member(company, "owner")
     other_company = create(:company)
 
     outcome = described_class.call(
       operation: :create, company_id: company.id, generation: TimekeepingOwnership.current.generation.to_s,
-      actor: described_class::Actor.user(user_id: owner.id, role: "owner"),
+      actor: described_class::Actor.user(user_id: employee.id, role: "employee"),
       params: { "idempotency_key" => "body-actor", "actor_id" => other.id, "company_id" => other_company.id,
-                "body" => entry_body.merge("actor_id" => other.id, "company_id" => other_company.id) }
+                "body" => entry_body.merge("actor_id" => other.id, "company_id" => other_company.id,
+                                           "role" => "owner", "acting_user_id" => employee.id + 1000) }
     )
 
     expect(outcome.status).to eq(201)
+    expect(Timekeeping::LocalEntry.where(company_id: other_company.id)).to be_empty
     entry = Timekeeping::LocalEntry.find(outcome.body["id"])
-    expect([entry.company_id, entry.user_id]).to eq([company.id, owner.id])
-    expect(described_class::Receipt.sole.actor_id).to eq(owner.id)
+    expect([entry.company_id, entry.user_id]).to eq([company.id, employee.id])
+    expect(described_class::Receipt.sole.actor_id).to eq(employee.id)
+    expect(described_class::AuditRow.where(company_id: company.id, entry_id: entry.id).sole.actor_id).to eq(employee.id)
   end
 end
 
@@ -425,17 +406,26 @@ RSpec.describe Timekeeping::LocalOwner, "answers and snapshots" do
     expect(outcome.body).to include("version" => 1, "duration" => 1.5, "work_date" => Date.current.iso8601,
                                     "locked" => false, "user_id" => owner.id, "company_id" => company.id)
     payload = Timekeeping::LocalOutboxEntry.where(company_id: company.id).sole.payload
-    expect(payload["updated_at"]).to match(/\.\d{6}Z\z/)
+    microsecond_utc = /\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z\z/
+    expect(payload["created_at"]).to match(microsecond_utc)
+    expect(payload["updated_at"]).to match(microsecond_utc)
   end
 
-  it "replays a retry right after receipt_checked, before any later step runs" do
+  it "answers a replay and a reused key right after receipt_checked, before any later step runs" do
     expect(call_as_owner(:create, create_params("replay-steps")).status).to eq(201)
-    steps = []
+    steps_until_receipt = %i[receipt_key_locked generation_checked request_checked receipt_checked]
+    record_steps = lambda do |params|
+      steps = []
+      outcome = call_as_owner(:create, params, checkpoint: ->(step) { steps << step })
+      [outcome.status, steps]
+    end
 
-    replay = call_as_owner(:create, create_params("replay-steps"), checkpoint: ->(step) { steps << step })
+    replay = record_steps.call(create_params("replay-steps"))
+    reused_params = create_params("replay-steps")
+    reused = record_steps.call(reused_params.merge("body" => reused_params["body"].merge("note" => "other")))
 
-    expect(replay.status).to eq(201)
-    expect(steps).to eq(%i[receipt_key_locked generation_checked request_checked receipt_checked])
+    expect(replay).to eq([201, steps_until_receipt])
+    expect(reused).to eq([422, steps_until_receipt])
   end
 
   it "moves entries to another project with version + 1 and draws outbox positions in entry id order" do
@@ -450,8 +440,15 @@ RSpec.describe Timekeeping::LocalOwner, "answers and snapshots" do
     entries.each(&:reload)
     expect(entries.map(&:project_id)).to eq([target.id, target.id])
     expect(entries.map(&:version)).to eq([2, 2])
-    expect(Timekeeping::LocalOutboxEntry.where(company_id: company.id).order(:id).pluck(:entry_id))
+    # The projection reads snapshots in outbox_position order, so positions must
+    # rise, without repeats, in the order the entries were locked: by id.
+    outbox = Timekeeping::LocalOutboxEntry.where(company_id: company.id).order(:outbox_position)
+    expect(outbox.pluck(:entry_id)).to eq(entries.map(&:id).sort)
+    positions = outbox.pluck(:outbox_position)
+    expect(positions).to eq(positions.uniq.sort)
+    expect(described_class::AuditRow.where(company_id: company.id).order(:entry_id).pluck(:entry_id))
       .to eq(entries.map(&:id).sort)
+    expect(timekeeping_row_counts["idempotency_records"]).to eq(1)
   end
 
   it "deletes the listed entries on a bulk_delete body that holds only entry_ids" do

@@ -35,61 +35,35 @@ end
 
 RSpec.describe Timekeeping::LocalOwner do
   # "The generation check runs before receipt replay, so a retry at an old generation gets 409 even when its earlier answer is stored."
-  it "merged stale retry for an employee answers 409 stale_generation and leaves every write table as the first write left it" do
-    old_generation = prepare_local_ownership!.generation
-    company = create(:company)
-    user = timekeeping_member(company, "employee")
-    project = create(:project, client: create(:client, company:))
-    params = { "idempotency_key" => "merged-stale-retry-employee",
-               "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 1.5,
-                           "note" => "retry", "source" => TimesheetEntry::SOURCES.first, "source_metadata" => {} } }
-    request = lambda do
-      described_class.call(operation: :create, company_id: company.id, generation: old_generation.to_s,
-                           actor: described_class::Actor.user(user_id: user.id, role: "employee"), params:)
+  %w[employee owner].each do |role|
+    it "a stale retry for an #{role} answers 409 stale_generation instead of the stored receipt and leaves every write table as the first write left it" do
+      old_generation = prepare_local_ownership!.generation
+      company = create(:company)
+      user = timekeeping_member(company, role)
+      project = create(:project, client: create(:client, company:))
+      params = { "idempotency_key" => "merged-stale-retry-#{role}",
+                 "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 1.5,
+                             "note" => "retry", "source" => TimesheetEntry::SOURCES.first, "source_metadata" => {} } }
+      request = lambda do
+        described_class.call(operation: :create, company_id: company.id, generation: old_generation.to_s,
+                             actor: described_class::Actor.user(user_id: user.id, role:), params:)
+      end
+
+      first = request.call
+      expect(first.status).to eq(201)
+      TimekeepingOwnership.current.update!(generation: old_generation + 1)
+      before_retry = timekeeping_row_counts
+      # The baseline must hold the first write, or an unchanged count proves nothing.
+      expect(before_retry).to eq("entries" => 1, "entry_audits" => 1, "idempotency_records" => 1, "entry_outbox_items" => 1)
+
+      retried = request.call
+
+      expect(retried.status).to eq(409)
+      expect(retried.status).not_to eq(first.status)
+      expect(retried.body.to_h.stringify_keys["reason"].to_s).to eq("stale_generation")
+      expect(timekeeping_row_counts).to eq(before_retry)
+      expect(Timekeeping::LocalEntry.where(company_id: company.id).count).to eq(1)
     end
-
-    expect(request.call.status).to eq(201)
-    TimekeepingOwnership.current.update!(generation: old_generation + 1)
-    before_retry = timekeeping_row_counts
-    # The baseline must hold the first write, or an unchanged count proves nothing.
-    expect(before_retry).to eq("entries" => 1, "entry_audits" => 1, "idempotency_records" => 1, "entry_outbox_items" => 1)
-
-    retried = request.call
-
-    expect(retried.status).to eq(409)
-    expect(retried.body.to_h.stringify_keys["reason"].to_s).to eq("stale_generation")
-    expect(timekeeping_row_counts).to eq(before_retry)
-    expect(Timekeeping::LocalEntry.where(company_id: company.id).count).to eq(1)
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner do
-  # "The generation check runs before receipt replay, so a retry at an old generation gets 409 even when its earlier answer is stored."
-  it "merged stale retry for an owner answers 409 stale_generation instead of the stored receipt and writes nothing more" do
-    old_generation = prepare_local_ownership!.generation
-    company = create(:company)
-    user = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    params = { "idempotency_key" => "merged-stale-retry-owner",
-               "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 15.0,
-                           "note" => "retry", "source" => TimesheetEntry::SOURCES.first, "source_metadata" => {} } }
-    request = lambda do
-      described_class.call(operation: :create, company_id: company.id, generation: old_generation.to_s,
-                           actor: described_class::Actor.user(user_id: user.id, role: "owner"), params:)
-    end
-
-    first = request.call
-    expect(first.status).to eq(201)
-    TimekeepingOwnership.current.update!(generation: old_generation + 1)
-    before_retry = timekeeping_row_counts
-    expect(before_retry.values).to all(eq(1))
-
-    retried = request.call
-
-    expect(retried.status).to eq(409)
-    expect(retried.status).not_to eq(first.status)
-    expect(retried.body.to_h.stringify_keys["reason"].to_s).to eq("stale_generation")
-    expect(timekeeping_row_counts).to eq(before_retry)
   end
 end
 
