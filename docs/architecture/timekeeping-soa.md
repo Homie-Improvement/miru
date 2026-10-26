@@ -986,7 +986,7 @@ handoff(outgoing, incoming):
 | `TIMEKEEPING_TOKEN_PRIVATE_KEY` | Monolith | Signs user tokens |
 | `TIMEKEEPING_SERVICE_TOKEN` (or mutual TLS certificates) | Both | Background service identity |
 | `TIMEKEEPING_BASE_URL` | Monolith | Where to forward entry requests |
-| `TIMEKEEPING_READ_TOKENS_ENABLED` | Monolith | When on, signs delegated entry reads as read tokens that carry an owner or admin role the user holds. Set it only once the running Timekeeping refuses read tokens on write routes, and clear it before rolling Timekeeping back past that |
+| `TIMEKEEPING_READ_TOKENS_ENABLED` | Monolith | When on, signs delegated entry reads as read tokens that carry an owner or admin role the user holds. Set it only once every running Timekeeping refuses read tokens on write routes. To roll Timekeeping back past that version: clear it on every monolith process and restart them, so none is still minting a read token; then wait at least the token lifetime (`Timekeeping::UserToken::TTL`, 60 seconds) after the last restart, so every issued read token has expired; only then deploy the older Timekeeping, which would accept a live read token's raised role for writes |
 | `MONOLITH_REFERENCE_URL` | Timekeeping | Reference-data read endpoint (section 3.4) |
 | `MONOLITH_SNAPSHOT_URL` | Timekeeping | The projection endpoint the relay delivers to (section 5.4) |
 

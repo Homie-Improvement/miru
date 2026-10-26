@@ -17,7 +17,10 @@ module Timekeeping
     # Set to "true" only once the running Timekeeping refuses read tokens on
     # write routes. An older Timekeeping takes a token's role for writes too,
     # so a read token's raised role would let its holder write as an admin.
-    # Clear it before rolling Timekeeping back to such a version.
+    # Before rolling Timekeeping back to such a version, clear it on every
+    # process and restart them, then wait at least UserToken::TTL so every read
+    # token already issued has expired (docs/architecture/timekeeping-soa.md,
+    # section 11.2).
     READ_TOKENS_ENV = "TIMEKEEPING_READ_TOKENS_ENABLED"
     INDEX_PATH = "/v1/companies/%<company_id>d/entries"
     TIMEOUT_SECONDS = 5
