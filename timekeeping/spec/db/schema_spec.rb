@@ -46,11 +46,11 @@ RSpec.describe "Timekeeping database schema" do
     expect(connection.columns(:entries).map(&:name)).to match_array(contract.fetch("entry_fields"))
   end
 
-  it "gives outbox_snapshots exactly the snapshot entry_fields plus generation and outbox_position" do
+  it "gives outbox_snapshots exactly the snapshot entry_fields plus generation, outbox_position and the relay columns" do
     contract = YAML.safe_load_file(Rails.root.join("../contracts/timekeeping/entry_snapshots.yml"))
 
     expect(connection.columns(:outbox_snapshots).map(&:name))
-      .to match_array(contract.fetch("entry_fields") + %w[generation outbox_position])
+      .to match_array(contract.fetch("entry_fields") + %w[generation outbox_position] + Timekeeping::OutboxFields::RELAY_FIELDS)
   end
 
   it "takes outbox positions from a sequence" do

@@ -16,11 +16,4 @@ class Timekeeping::Internal::V1::MetricsController < ApplicationController
       oldest_unsent: OutboxSnapshot.oldest_unsent_by_company, now: Time.current
     )
   end
-
-  private
-
-    def authorize_service!
-      decision = Timekeeping::ServiceAccess.decide(identity)
-      render_reason(decision) unless decision == :allowed
-    end
 end

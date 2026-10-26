@@ -17,11 +17,4 @@ class Timekeeping::Internal::V1::TestHooksController < ApplicationController
     Timekeeping::TestHooks.resume_relay!
     head :no_content
   end
-
-  private
-
-    def authorize_service!
-      decision = Timekeeping::ServiceAccess.decide(identity)
-      render_reason(decision) unless decision == :allowed
-    end
 end
