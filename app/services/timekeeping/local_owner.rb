@@ -351,11 +351,16 @@ module Timekeeping
 
       # Reference facts
 
+      # The reference facts, plus the acting user's primary role: their
+      # lowest-id role in the company, which decides A6 and A7 as the
+      # monolith's own locked and billed checks do. The role in the facts may
+      # be a raised owner or admin role, so it never unlocks those rules.
       def reference_facts
         company = Company.find_by(id: company_id)
         return if company.nil?
 
         ReferenceFacts.call(company:, project_ids: [project_id].grep(Integer))
+          .merge(primary_role: User.primary_roles_for(company, [actor.user_id]).fetch(actor.user_id))
       end
 
       def project_known?(facts)
@@ -435,7 +440,7 @@ module Timekeeping
                                  visible_only: true)
         checkpoint.call(:rows_locked)
         decision = TimekeepingRules::EntryDecision.bulk(
-          action: BULK_ACTIONS.fetch(operation), role:, acting_user_id: actor.user_id,
+          action: BULK_ACTIONS.fetch(operation), role:, primary_role: facts[:primary_role], acting_user_id: actor.user_id,
           entries: entries.map { |entry| rule_facts(entry) }, edit_days: facts[:edit_days], today:
         )
         return Outcome.refusal(:forbidden) if decision == :forbidden
@@ -500,8 +505,8 @@ module Timekeeping
 
       def change_refusal(entry, facts, role, action:, bill_status:)
         decision = TimekeepingRules::EntryDecision.change(
-          action:, bill_status:, role:, acting_user_id: actor.user_id, entry: rule_facts(entry),
-          edit_days: facts[:edit_days], today:
+          action:, bill_status:, role:, primary_role: facts[:primary_role], acting_user_id: actor.user_id,
+          entry: rule_facts(entry), edit_days: facts[:edit_days], today:
         )
         Outcome.refusal(decision) unless decision == :ok
       end
