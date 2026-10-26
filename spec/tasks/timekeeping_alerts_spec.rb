@@ -6,9 +6,13 @@ require "rails_helper"
 require "rake"
 require "webmock/rspec"
 
-RSpec.describe "timekeeping:alerts" do
+RSpec.describe "timekeeping:alerts", "shared task runner" do
+  include ActiveSupport::Testing::TimeHelpers
+
   # A leaked service token grants every service-only Timekeeping endpoint, so
-  # the task must keep it out of its output and logs even on a failed read.
+  # the task must keep it out of its output and logs even on a failed read. The
+  # pending intent alert comes from the monolith's own records, so a failed
+  # Timekeeping read must not hide it or put it under another company.
   it "shared runner keeps the service token out of stdout, stderr and logs on a 401 or 500 metrics read and still reports the pending intent" do
     TimekeepingOwnership.ensure_initial!
     late_company = create(:company)
@@ -29,76 +33,74 @@ RSpec.describe "timekeeping:alerts" do
 
       expect(run.exit_status).not_to be_nil
       expect(run.exit_status).not_to eq(0)
-      intent_lines = run.stdout.lines.grep(/\Atimekeeping alert name=pending_invoice_operation_intent company_id=/)
-      expect(intent_lines.grep(/company_id=#{late_company.id} /).size).to eq(1)
-      expect(intent_lines.grep(/company_id=#{quiet_company.id} /)).to be_empty
+      alert_companies = run.stdout.lines.filter_map do |line|
+        line[/\Atimekeeping alert name=pending_invoice_operation_intent company_id=(\S+) /, 1]
+      end
+      expect(alert_companies).to eq([late_company.id.to_s])
+      expect(run.stdout).not_to include("company_id=#{quiet_company.id} ")
       expect(run.log).to include("name=pending_invoice_operation_intent company_id=#{late_company.id} ")
       expect(run.stdout).not_to include(token)
       expect(run.stderr).not_to include(token)
       expect(run.log).not_to include(token)
     end
   end
-end
 
-RSpec.describe "timekeeping:alerts" do
-  # The token set for one run must not stay in the process environment, and an
-  # aborted run must not leave later examples writing into captured streams.
-  it "shared runner leaves no service token in ENV and puts streams and loggers back after the task aborts" do
+  # The task aborts with SystemExit when the metrics read fails. If the shared
+  # runner swallowed that status, or left ENV, $stdout, $stderr or the loggers
+  # swapped after the abort, every later example would pass or fail by run order.
+  it "shared runner reports the non-zero exit and stderr of a failed metrics read and restores ENV, streams and loggers" do
     TimekeepingOwnership.ensure_initial!
-    base_url = "http://timekeeping.test"
+    base_url = "http://timekeeping.runner.test"
     token = "service-#{SecureRandom.hex(24)}"
-    WebMock.stub_request(:get, "#{base_url}/internal/v1/metrics").to_return(status: 500, body: "boom")
-    env_before = [Timekeeping::EntryApiClient::BASE_URL_ENV, Internal::V1::BaseController::SERVICE_TOKEN_ENV]
-                 .index_with { |name| ENV.fetch(name, nil) }
+    stub_request(:get, "#{base_url}/internal/v1/metrics").to_return(status: 500, body: "boom")
+    env_names = [Timekeeping::EntryApiClient::BASE_URL_ENV, Internal::V1::BaseController::SERVICE_TOKEN_ENV]
+    env_before = env_names.index_with { |name| ENV.fetch(name, nil) }
     stdout_before = $stdout
     stderr_before = $stderr
     loggers_before = [Rails.logger, ActionController::Base.logger, ActionController::API.logger]
 
     run = run_timekeeping_alerts_task(base_url:, token:)
 
+    expect(run.exit_status).not_to be_nil
     expect(run.exit_status).not_to eq(0)
-    expect(env_before.keys.index_with { |name| ENV.fetch(name, nil) }).to eq(env_before)
+    expect(run.stderr).to include("timekeeping alerts: the Timekeeping metrics read failed")
+    expect(run.stdout + run.stderr + run.log).not_to include(token)
+    expect(env_names.index_with { |name| ENV.fetch(name, nil) }).to eq(env_before)
     expect(ENV.to_h.values).not_to include(token)
     expect($stdout).to equal(stdout_before)
     expect($stderr).to equal(stderr_before)
     expect([Rails.logger, ActionController::Base.logger, ActionController::API.logger]).to eq(loggers_before)
   end
-end
 
-RSpec.describe "timekeeping:alerts" do
-  include ActiveSupport::Testing::TimeHelpers
-
-  it "shared task runner keeps one company's pending intent alert off every other company and hides the token on a failed read" do
+  # Rake runs an invoked task only once unless it is reenabled. A runner that
+  # skipped reenable, or kept output or the exit status from an earlier run,
+  # would let a second run report nothing or a stale failure. No code records
+  # ownership pauses yet, so a successful run reports that signal as unavailable.
+  it "runs the alerts task again on a second call and reports only that run's own output and exit status" do
     TimekeepingOwnership.ensure_initial!
-    now = Time.utc(2026, 3, 3, 12, 30)
-    stuck_company = create(:company)
-    quiet_company = create(:company)
-    InvoiceOperationIntent.create!(company_id: stuck_company.id, invoice_id: 1, operation_id: SecureRandom.uuid,
-                                   generation: 1, state: "pending", created_at: now - 11.minutes)
-    InvoiceOperationIntent.create!(company_id: quiet_company.id, invoice_id: 2, operation_id: SecureRandom.uuid,
-                                   generation: 1, state: "pending", created_at: now - 9.minutes)
-    base_url = "http://timekeeping.tenant-isolation.test"
+    base_url = "http://timekeeping.rerun.test"
     token = "service-#{SecureRandom.hex(24)}"
+    stub_request(:get, "#{base_url}/internal/v1/metrics").to_return(status: 500, body: "boom")
 
-    [401, 500].each do |status|
-      WebMock.stub_request(:get, "#{base_url}/internal/v1/metrics").to_return(status:, body: "")
+    failed = run_timekeeping_alerts_task(base_url:, token:)
 
-      run = travel_to(now) { run_timekeeping_alerts_task(base_url:, token:) }
+    stub_request(:get, "#{base_url}/internal/v1/metrics")
+      .with(headers: { "Authorization" => "Bearer #{token}" })
+      .to_return(status: 200, headers: { "Content-Type" => "application/json" }, body: JSON.generate(
+        "window_seconds" => 300, "latency_bucket_bounds_ms" => [25, 50, 100, 200, 300, 500, 1000, 2500, 5000],
+        "overflow_bucket" => "inf", "total_field" => "writes + reference_unavailable",
+        "companies" => [], "outbox_lag" => []
+      ))
 
-      alert_companies = run.stdout.lines.filter_map do |line|
-        line[/\Atimekeeping alert name=pending_invoice_operation_intent company_id=(\S+) /, 1]
-      end
-      expect(alert_companies).to eq([stuck_company.id.to_s])
-      expect(run.stdout).not_to include("company_id=#{quiet_company.id} ")
-      expect(run.exit_status).not_to be_nil
-      expect(run.exit_status).not_to eq(0)
-      expect([run.stdout, run.stderr, run.log].none? { |stream| stream.include?(token) }).to be(true)
-    end
+    succeeded = run_timekeeping_alerts_task(base_url:, token:)
+
+    expect(failed.exit_status).not_to be_nil
+    expect(failed.exit_status).not_to eq(0)
+    expect(succeeded.exit_status).to be_nil
+    unavailable = Timekeeping::AlertLog.unavailable_line("ownership_moving")
+    expect(succeeded.stdout.lines.map(&:chomp).count(unavailable)).to eq(1)
+    expect(succeeded.stdout + succeeded.stderr).not_to include("metrics read failed")
   end
-end
-
-RSpec.describe "timekeeping:alerts" do
-  include ActiveSupport::Testing::TimeHelpers
 
   it "shared task runner judges reference_unavailable per company so a healthy company never borrows a failing one's alert" do
     TimekeepingOwnership.ensure_initial!
@@ -132,114 +134,6 @@ RSpec.describe "timekeeping:alerts" do
     expect(alert_companies).to eq(["101"])
     expect(run.stdout.lines.grep(/company_id=10[23] /)).to be_empty
     expect(run.exit_status).to be_nil
-  end
-end
-
-RSpec.describe "timekeeping:alerts" do
-  it "shared alerts task runner reports the non-zero exit and stderr of a failed metrics read and restores ENV and stdout" do
-    TimekeepingOwnership.ensure_initial!
-    base_url = "http://timekeeping.runner.test"
-    token = "service-#{SecureRandom.hex(24)}"
-    stub_request(:get, "#{base_url}/internal/v1/metrics").to_return(status: 500, body: "boom")
-    base_url_key = Timekeeping::EntryApiClient::BASE_URL_ENV
-    token_key = Internal::V1::BaseController::SERVICE_TOKEN_ENV
-    env_before = [ENV.fetch(base_url_key, nil), ENV.fetch(token_key, nil)]
-    stdout_before = $stdout
-    stderr_before = $stderr
-
-    run = run_timekeeping_alerts_task(base_url:, token:)
-
-    # The task aborts on a failed read, so the runner must hand back the exit
-    # status instead of swallowing it.
-    expect(run.exit_status).not_to be_nil
-    expect(run.exit_status).not_to eq(0)
-    expect(run.stderr).to include("timekeeping alerts: the Timekeeping metrics read failed")
-    expect(run.stdout + run.stderr + run.log).not_to include(token)
-    expect([ENV.fetch(base_url_key, nil), ENV.fetch(token_key, nil)]).to eq(env_before)
-    expect($stdout).to equal(stdout_before)
-    expect($stderr).to equal(stderr_before)
-  end
-end
-
-RSpec.describe "timekeeping:alerts" do
-  it "shared alerts task runner returns a nil exit status and the printed lines when the task finishes, and can run twice" do
-    TimekeepingOwnership.ensure_initial!
-    base_url = "http://timekeeping.runner.test"
-    token = "service-#{SecureRandom.hex(24)}"
-    body = {
-      "window_seconds" => 300, "latency_bucket_bounds_ms" => [25, 50, 100, 200, 300, 500, 1000, 2500, 5000],
-      "overflow_bucket" => "inf", "total_field" => "writes + reference_unavailable", "companies" => [], "outbox_lag" => []
-    }
-    stub_request(:get, "#{base_url}/internal/v1/metrics")
-      .with(headers: { "Authorization" => "Bearer #{token}" })
-      .to_return(status: 200, body: JSON.generate(body), headers: { "Content-Type" => "application/json" })
-
-    first = run_timekeeping_alerts_task(base_url:, token:)
-    # The runner reenables the task, so a second run prints again rather than doing nothing.
-    second = run_timekeeping_alerts_task(base_url:, token:)
-
-    unavailable = Timekeeping::AlertLog.unavailable_line("ownership_moving")
-    [first, second].each do |run|
-      expect(run.exit_status).to be_nil
-      expect(run.stdout.lines.map(&:chomp).count(unavailable)).to eq(1)
-    end
-  end
-end
-
-RSpec.describe "timekeeping:alerts" do
-  # The task aborts with SystemExit when the metrics read fails. If the shared
-  # runner left ENV, $stdout, $stderr or the loggers swapped after that abort,
-  # every later example in the merged file would pass or fail by run order.
-  it "restores ENV, output streams and loggers after the alerts task aborts on a failed metrics read" do
-    TimekeepingOwnership.ensure_initial!
-    base_url = "http://timekeeping.abort.test"
-    token = "service-#{SecureRandom.hex(24)}"
-    stub_request(:get, "#{base_url}/internal/v1/metrics").to_return(status: 500, body: "boom")
-    env_names = [Timekeeping::EntryApiClient::BASE_URL_ENV, Internal::V1::BaseController::SERVICE_TOKEN_ENV]
-    env_before = env_names.index_with { |name| ENV.fetch(name, nil) }
-    stdout_before = $stdout
-    stderr_before = $stderr
-    loggers_before = [Rails.logger, ActionController::Base.logger, ActionController::API.logger]
-
-    run = run_timekeeping_alerts_task(base_url:, token:)
-
-    expect(run.exit_status).not_to be_nil
-    expect(run.exit_status).not_to eq(0)
-    expect(env_names.index_with { |name| ENV.fetch(name, nil) }).to eq(env_before)
-    expect($stdout).to equal(stdout_before)
-    expect($stderr).to equal(stderr_before)
-    expect([Rails.logger, ActionController::Base.logger, ActionController::API.logger]).to eq(loggers_before)
-    expect(run.stdout + run.stderr + run.log).not_to include(token)
-  end
-end
-
-RSpec.describe "timekeeping:alerts" do
-  # Rake runs an invoked task only once unless it is reenabled. A runner that
-  # skipped reenable, or kept output or the exit status from an earlier run,
-  # would let a second run in the same example report nothing or a stale failure.
-  it "runs the alerts task again on a second call and reports only that run's own output and exit status" do
-    TimekeepingOwnership.ensure_initial!
-    base_url = "http://timekeeping.rerun.test"
-    token = "service-#{SecureRandom.hex(24)}"
-    stub_request(:get, "#{base_url}/internal/v1/metrics").to_return(status: 500, body: "boom")
-
-    failed = run_timekeeping_alerts_task(base_url:, token:)
-
-    stub_request(:get, "#{base_url}/internal/v1/metrics")
-      .with(headers: { "Authorization" => "Bearer #{token}" })
-      .to_return(status: 200, headers: { "Content-Type" => "application/json" }, body: JSON.generate(
-        "window_seconds" => 300, "latency_bucket_bounds_ms" => [25, 50, 100, 200, 300, 500, 1000, 2500, 5000],
-        "overflow_bucket" => "inf", "total_field" => "writes + reference_unavailable",
-        "companies" => [], "outbox_lag" => []
-      ))
-
-    succeeded = run_timekeeping_alerts_task(base_url:, token:)
-
-    expect(failed.exit_status).not_to be_nil
-    expect(failed.exit_status).not_to eq(0)
-    expect(succeeded.exit_status).to be_nil
-    expect(succeeded.stdout.lines.map(&:chomp)).to include(Timekeeping::AlertLog.unavailable_line("ownership_moving"))
-    expect(succeeded.stdout + succeeded.stderr).not_to include("metrics read failed")
   end
 end
 
