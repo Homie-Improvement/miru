@@ -408,13 +408,35 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
   let(:recon_checks_operation_id) { "11111111-1111-1111-1111-111111111111" }
 
   def recon_checks_entry(company_id, **overrides)
+    # locked is true because recon_checks_tables gives every entry a committed
+    # reservation; an unreserved entry must override locked to false as well.
     {
-      "id" => 1, "company_id" => company_id, "version" => 1, "project_id" => 1, "user_id" => 1, "agent_id" => nil,
+      "id" => 1, "company_id" => company_id, "version" => 1, "project_id" => 1, "user_id" => 1,
       "work_date" => Date.new(2026, 1, 5), "duration" => 60.0, "note" => "", "bill_status" => "unbilled",
       "review_status" => "not_required", "locked" => true, "source" => "manual", "source_metadata" => {},
-      "external_run_id" => nil, "external_session_id" => nil, "proof_url" => nil, "proof_metadata" => {},
-      "discarded_at" => nil, "created_at" => recon_checks_time, "updated_at" => recon_checks_time
-    }.merge(overrides.transform_keys(&:to_s))
+      "proof_metadata" => {}, "created_at" => recon_checks_time, "updated_at" => recon_checks_time
+    }
+      .reverse_merge(Timekeeping::Handoff::Checkpoint::TABLES.fetch("entries").index_with { nil })
+      .merge(overrides.transform_keys(&:to_s))
+  end
+
+  # The projection stores bill_status and review_status as integer enums,
+  # where the checkpoint keeps their names.
+  def recon_checks_projection(entry_rows)
+    entry_rows.map do |row|
+      row.merge(
+        "bill_status" => TimesheetEntry.bill_statuses.fetch(row["bill_status"]),
+        "review_status" => TimesheetEntry.review_statuses.fetch(row["review_status"])
+      )
+    end
+  end
+
+  def recon_checks_snapshot(company_id, values = {})
+    { company_id:, values: }
+  end
+
+  def recon_checks_snapshots
+    [101, 202].index_with { |company_id| recon_checks_snapshot(company_id) }
   end
 
   def recon_checks_reservation(company_id, **overrides)
@@ -475,21 +497,16 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
 
   def recon_checks_run(checkpoint_tables: recon_checks_tables, projection: nil, source_tables: recon_checks_tables,
                        intents: [recon_checks_intent(101), recon_checks_intent(202)],
-                       source_intents: [recon_checks_intent(101), recon_checks_intent(202)], **options)
+                       source_intents: [recon_checks_intent(101), recon_checks_intent(202)],
+                       next_entry_id: 2, money_before: recon_checks_snapshots, money_after: recon_checks_snapshots,
+                       **options)
     source_tables = recon_checks_canonical(source_tables)
     checkpoint_tables = recon_checks_canonical(checkpoint_tables)
-    projection ||= checkpoint_tables["entries"].map do |row|
-      row.merge(
-        "bill_status" => TimesheetEntry.bill_statuses.fetch(row["bill_status"]),
-        "review_status" => TimesheetEntry.review_statuses.fetch(row["review_status"])
-      )
-    end
-    money = [101, 202].index_with { |company_id| { company_id:, values: {} } }
+    projection ||= recon_checks_projection(checkpoint_tables["entries"])
     described_class.run(
       source: Timekeeping::Handoff::Checkpoint.build(tables: source_tables),
       checkpoint: Timekeeping::Handoff::Checkpoint.build(tables: checkpoint_tables),
-      projection:, source_intents:, intents:,
-      next_entry_id: 2, money_before: money, money_after: money, **options
+      projection:, source_intents:, intents:, next_entry_id:, money_before:, money_after:, **options
     )
   end
 
@@ -605,20 +622,8 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
   end
 
   it "signals a missing money snapshot only as a reconciliation difference" do
-    money = { 202 => { company_id: 202, values: {} } }
-    result = described_class.run(
-      source: Timekeeping::Handoff::Checkpoint.build(tables: recon_checks_tables),
-      checkpoint: Timekeeping::Handoff::Checkpoint.build(tables: recon_checks_tables),
-      projection: recon_checks_tables["entries"].map do |row|
-        row.merge(
-          "bill_status" => TimesheetEntry.bill_statuses.fetch(row["bill_status"]),
-          "review_status" => TimesheetEntry.review_statuses.fetch(row["review_status"])
-        )
-      end,
-      source_intents: [recon_checks_intent(101), recon_checks_intent(202)],
-      intents: [recon_checks_intent(101), recon_checks_intent(202)],
-      next_entry_id: 2, money_before: money, money_after: money
-    )
+    money = { 202 => recon_checks_snapshot(202) }
+    result = recon_checks_run(money_before: money, money_after: money)
     expect(result.companies.fetch(101).unlisted.map(&:reason)).to eq(%i[snapshot_missing snapshot_missing])
 
     stored = RailsEventViewer::Entry.where(name: "Timekeeping::ReconciliationDifferenceFound")
@@ -736,12 +741,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
       "entries" => [recon_checks_entry(101, id: 7, locked: false), recon_checks_entry(202, id: 8, locked: false)],
       "reservations" => []
     )
-    projection = (source["entries"] + [recon_checks_entry(202, id: 7, locked: false)]).map do |row|
-      row.merge(
-        "bill_status" => TimesheetEntry.bill_statuses.fetch(row["bill_status"]),
-        "review_status" => TimesheetEntry.review_statuses.fetch(row["review_status"])
-      )
-    end
+    projection = recon_checks_projection(source["entries"] + [recon_checks_entry(202, id: 7, locked: false)])
     result = recon_checks_run(source_tables: source, checkpoint_tables: source, projection:)
 
     expect(result.companies.fetch(101).checks.fetch(:projection)).to eq([])
@@ -753,12 +753,8 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
 
   it "reports a projection that unlocked an entry the checkpoint keeps locked" do
     unreserved = recon_checks_tables(reservations: [])
-    projection = unreserved["entries"].map do |row|
-      row.merge(
-        "bill_status" => TimesheetEntry.bill_statuses.fetch(row["bill_status"]),
-        "review_status" => TimesheetEntry.review_statuses.fetch(row["review_status"]),
-        "locked" => row["company_id"] == 202
-      )
+    projection = recon_checks_projection(unreserved["entries"]).map do |row|
+      row.merge("locked" => row["company_id"] == 202)
     end
     result = recon_checks_run(
       source_tables: recon_checks_tables(reservations: []), checkpoint_tables: unreserved, projection:
@@ -787,8 +783,8 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
       [:invoice, 9, :discount] => BigDecimal("15"), [:pdf_total, 9, :invoice_discount] => "$15.00",
       [:pdf_total, 9, :total] => "$85.00"
     }
-    money_before = { 101 => { company_id: 101, values: before_values }, 202 => { company_id: 202, values: {} } }
-    money_after = { 101 => { company_id: 101, values: after_values }, 202 => { company_id: 202, values: {} } }
+    money_before = { 101 => recon_checks_snapshot(101, before_values), 202 => recon_checks_snapshot(202) }
+    money_after = { 101 => recon_checks_snapshot(101, after_values), 202 => recon_checks_snapshot(202) }
     result = recon_checks_run(money_before:, money_after:)
 
     money = result.companies.fetch(101).checks.fetch(:money)
