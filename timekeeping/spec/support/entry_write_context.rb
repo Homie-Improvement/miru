@@ -42,15 +42,23 @@ end
 # For specs that need commits other connections can see: races, and failures
 # that must roll a real transaction back. Each example empties the tables it
 # may have written, and puts the admission row back to generation 1, so a
-# fence or a deleted row never leaks into a later example.
+# fence or a deleted row never leaks into a later example. Each example also
+# starts with those tables' id sequences restarted, because examples that
+# roll back still draw ids, and a handoff example asserts exact sequence values.
 RSpec.shared_context "timekeeping entry writes without transactional fixtures" do
   self.use_transactional_tests = false
 
-  after do
+  truncate_entry_write_tables = lambda do
     ApplicationRecord.connection.execute(<<~SQL.squish)
       TRUNCATE entries, reservations, audit_events, outbox_snapshots, idempotency_receipts, write_metric_windows,
-        write_metric_events
+        write_metric_events, invoice_operations RESTART IDENTITY
     SQL
+  end
+
+  before { truncate_entry_write_tables.call }
+
+  after do
+    truncate_entry_write_tables.call
     Timekeeping::Admission.ensure_initial!
     Timekeeping::Admission.admit!(generation: 1)
   end
