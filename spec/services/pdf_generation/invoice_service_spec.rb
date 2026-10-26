@@ -370,8 +370,6 @@ RSpec.describe PdfGeneration::InvoiceService do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe PdfGeneration::InvoiceService do
   it "returns printed totals without rendering the invoice template" do
     company = create(:company)
@@ -387,8 +385,6 @@ RSpec.describe PdfGeneration::InvoiceService do
     expect(totals[:total]).to be_a(String)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe PdfGeneration::InvoiceService do
   it "returns from printed_totals the same totals the PDF template receives" do
@@ -412,13 +408,11 @@ RSpec.describe PdfGeneration::InvoiceService do
       expect(totals[key]).to eq(captured_locals[key]), "printed #{key} differs"
     end
     expect(totals[:invoice_taxes].map { |tax| tax.slice(:name, :amount) }).to eq(captured_locals[:invoice_taxes])
-    expect(totals[:invoice_taxes].map { |tax| tax[:id] }).to eq([invoice_tax.id])
+    expect(totals[:invoice_taxes].pluck(:id)).to eq([invoice_tax.id])
     # The template itself still receives only name and amount for each tax.
     expect(captured_locals[:invoice_taxes].map(&:keys)).to all(match_array(%i[name amount]))
   end
 end
-
-require "rails_helper"
 
 RSpec.describe PdfGeneration::InvoiceService do
   # "The method must not render a PDF or change what the PDF prints."
@@ -454,8 +448,6 @@ RSpec.describe PdfGeneration::InvoiceService do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe PdfGeneration::InvoiceService do
   it "printed_totals for an invoice with no line items renders nothing and returns strings rather than a float subtotal" do
     company = create(:company)
@@ -474,8 +466,6 @@ RSpec.describe PdfGeneration::InvoiceService do
     expect(totals[:invoice_taxes]).to eq([])
   end
 end
-
-require "rails_helper"
 
 RSpec.describe PdfGeneration::InvoiceService do
   it "printed_totals called again after a line item rate change returns the new totals instead of values kept from the first call" do
