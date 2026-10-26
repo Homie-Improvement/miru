@@ -34,8 +34,9 @@ headers:
   ownership_generation: "Ownership-Generation: <n>"
   if_match: "If-Match: <version>"
 
-# Claims the provider reads from the signed bearer token.
-token_claims: [sub, company_id, role]
+# Claims the provider reads from the signed bearer token. purpose is "read"
+# or "write"; a token signed for reads is refused on every write route.
+token_claims: [sub, company_id, role, purpose]
 privileged_roles: [owner, admin]
 
 request:
