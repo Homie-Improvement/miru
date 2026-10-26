@@ -25,39 +25,46 @@ RSpec.describe Timekeeping::Handoff::ServiceStore do
     let(:store) { described_class.new(connection: ApplicationRecord.connection) }
     let(:service_store_at) { Time.utc(2026, 3, 1, 12, 30, 15.123456r) }
 
-    def service_store_entry_row(id:, company_id:, version: 2)
-      { "id" => id, "company_id" => company_id, "version" => version, "project_id" => 11, "user_id" => 12,
-        "agent_id" => nil, "work_date" => Date.new(2026, 3, 2), "duration" => 90.25, "note" => "Loaded",
-        "bill_status" => "unbilled", "review_status" => "not_required", "locked" => true, "source" => "manual",
-        "source_metadata" => { "amount" => BigDecimal("1.00000000000000000001"), "nested" => { "a" => [1, nil] } },
-        "external_run_id" => nil, "external_session_id" => nil, "proof_url" => nil, "proof_metadata" => {},
-        "discarded_at" => nil, "created_at" => service_store_at, "updated_at" => service_store_at }
+    # The values this spec's examples depend on, laid over the shared builder:
+    # jsonb decimals finer than a Float, a JSON null, a fractional timestamp,
+    # and audit, receipt and operation ids (400, 500, 300) the sequence
+    # examples compare against.
+    def service_store_overrides(version: 2)
+      at = service_store_at
+      {
+        "entries" => { "version" => version, "project_id" => 11, "user_id" => 12, "duration" => 90.25,
+                       "note" => "Loaded", "created_at" => at, "updated_at" => at,
+                       "source_metadata" => { "amount" => BigDecimal("1.00000000000000000001"),
+                                              "nested" => { "a" => [1, nil] } } },
+        "reservations" => { "invoice_id" => 41, "operation_id" => "11111111-1111-4111-8111-111111111111",
+                            "created_at" => at, "invoice_operation_id" => nil },
+        "invoice_operations" => { "id" => 300, "invoice_id" => 41,
+                                  "operation_id" => "22222222-2222-4222-8222-222222222222", "state" => "aborted",
+                                  "desired_entry_ids" => [900, 901], "disposition" => "retained",
+                                  "generation" => 2, "created_at" => at, "finished_at" => nil },
+        "entry_audits" => { "id" => 400, "actor_id" => 12, "action" => "update", "entry_created_at" => at,
+                            "created_at" => at,
+                            "after" => { "duration" => BigDecimal("0.1000000000000000000001") } },
+        "idempotency_records" => { "id" => 500, "actor_id" => 12, "key" => "key-1", "fingerprint" => "abc",
+                                   "body" => "{\"id\":900}", "created_at" => at }
+      }
     end
 
+    def service_store_entry_row(id:, company_id:, version: 2)
+      handoff_checkpoint_tables(company_id:, id:, overrides: service_store_overrides(version:)).fetch("entries").first
+    end
+
+    # Two companies: both own an entry; company 8 holds the reservation and
+    # audit, company 9 the invoice operation and receipt.
     def service_store_tables
+      eight = handoff_checkpoint_tables(company_id: 8, id: 900, overrides: service_store_overrides)
+      nine = handoff_checkpoint_tables(company_id: 9, id: 901, overrides: service_store_overrides)
       {
-        "entries" => [service_store_entry_row(id: 900, company_id: 8), service_store_entry_row(id: 901, company_id: 9)],
-        "reservations" => [
-          { "company_id" => 8, "entry_id" => 900, "invoice_id" => 41, "state" => "committed", "disposition" => "active",
-            "operation_id" => "11111111-1111-4111-8111-111111111111", "created_at" => service_store_at,
-            "invoice_operation_id" => nil }
-        ],
-        "invoice_operations" => [
-          { "id" => 300, "company_id" => 9, "invoice_id" => 41, "operation_id" => "22222222-2222-4222-8222-222222222222",
-            "actor_name" => "invoice-service", "state" => "aborted", "desired_entry_ids" => [900, 901], "disposition" => "retained", "generation" => 2,
-            "created_at" => service_store_at, "finished_at" => nil }
-        ],
-        "entry_audits" => [
-          { "id" => 400, "company_id" => 8, "entry_id" => 900, "actor_type" => "user", "actor_id" => 12,
-            "actor_name" => nil, "action" => "update", "before" => Timekeeping::Handoff::Checkpoint::JSON_NULL,
-            "after" => { "duration" => BigDecimal("0.1000000000000000000001") }, "entry_created_at" => service_store_at,
-            "created_at" => service_store_at }
-        ],
-        "idempotency_records" => [
-          { "id" => 500, "company_id" => 9, "actor_type" => "user", "actor_id" => 12, "operation" => "create",
-            "key" => "key-1", "fingerprint" => "abc", "status" => 201, "body" => "{\"id\":900}",
-            "created_at" => service_store_at }
-        ]
+        "entries" => eight.fetch("entries") + nine.fetch("entries"),
+        "reservations" => eight.fetch("reservations"),
+        "invoice_operations" => nine.fetch("invoice_operations"),
+        "entry_audits" => eight.fetch("entry_audits"),
+        "idempotency_records" => nine.fetch("idempotency_records")
       }
     end
 
@@ -79,39 +86,72 @@ RSpec.describe Timekeeping::Handoff::ServiceStore do
       entry
     end
 
-    it "refuses a load while entry writes are admitted and leaves every table as it was" do
-      service_store_seed_prior_rows
-      before = service_store_snapshot
-
-      expect { store.load_checkpoint(service_store_checkpoint) }
-        .to raise_error(Timekeeping::Handoff::Store::Error, /fence admission first/)
-      expect(service_store_snapshot).to eq(before)
-    end
-
-    it "refuses a body whose rows were edited after its digest was written and leaves every table as it was" do
-      service_store_seed_prior_rows
-      Timekeeping::Admission.fence!
-      before = service_store_snapshot
-      document = JSON.parse(service_store_checkpoint.to_json)
-      note = document.fetch("tables").fetch("entries").first.find { |column, _| column == "note" }
-      note[1] = ["str", "Tampered"]
-      tampered = Timekeeping::Handoff::Checkpoint.from_json(JSON.generate(document))
-
-      expect { store.load_checkpoint(tampered) }.to raise_error(Timekeeping::Handoff::Store::Error, /digest/)
-      expect(service_store_snapshot).to eq(before)
-    end
-
-    it "refuses an entry stored at a higher version than the checkpoint's and changes nothing" do
+    # Each refused load is compared to the one baseline taken before the table,
+    # so a refusal that changed rows and a later one that put them back cannot
+    # pass together.
+    it "refuses a load while admitted, with an edited body or with an older entry version, and changes nothing" do
       stored = service_store_seed_prior_rows
-      Timekeeping::Admission.fence!
       before = service_store_snapshot
-      checkpoint = Timekeeping::Handoff::Checkpoint.build(tables: service_store_tables.merge(
+      expect(before.slice(:entries, :reservations, :invoice_operations, :idempotency_receipts))
+        .to eq(entries: [[7, stored.id, 3, "Kept"]], reservations: 0, invoice_operations: [], idempotency_receipts: [])
+      expect(before.fetch(:audit_events).size).to eq(1)
+
+      tampered_document = JSON.parse(service_store_checkpoint.to_json)
+      note = tampered_document.fetch("tables").fetch("entries").first.find { |column, _| column == "note" }
+      note[1] = ["str", "Tampered"]
+      older_checkpoint = Timekeeping::Handoff::Checkpoint.build(tables: service_store_tables.merge(
         "entries" => [service_store_entry_row(id: stored.id, company_id: 7, version: 2)],
         "reservations" => [], "entry_audits" => []
       ))
+      # Rows run in order: the first needs writes admitted, the rest a fence.
+      refusals = [
+        ["writes admitted", service_store_checkpoint, /fence admission first/],
+        ["edited after its digest", Timekeeping::Handoff::Checkpoint.from_json(JSON.generate(tampered_document)), /digest/],
+        ["older entry version", older_checkpoint, /newer entry versions/]
+      ]
 
-      expect { store.load_checkpoint(checkpoint) }.to raise_error(Timekeeping::Handoff::Store::Error, /newer entry versions/)
-      expect(service_store_snapshot).to eq(before)
+      refusals.each do |name, checkpoint, reason|
+        Timekeeping::Admission.fence! unless name == "writes admitted"
+
+        expect { store.load_checkpoint(checkpoint) }.to raise_error(Timekeeping::Handoff::Store::Error, reason)
+        expect([name, service_store_snapshot]).to eq([name, before])
+      end
+    end
+
+    # "Load: "replaces the incoming owner's tables in one transaction", so loading
+    # the same checkpoint twice gives equal counts and checksums."
+    # Two committed reservations for one entry break a unique index only after the
+    # entries were deleted and re-inserted, so a load that is not one transaction
+    # would leave the stored entry gone.
+    it "rolls the whole load back when an insert fails after entries were already replaced" do
+      kept = service_store_seed_prior_rows
+      Timekeeping::Admission.fence!
+      tables = handoff_checkpoint_tables(company_id: 8, id: 500)
+      tables["reservations"] << tables.fetch("reservations").first.merge("invoice_id" => 42,
+                                                                         "operation_id" => SecureRandom.uuid)
+
+      expect { store.load_checkpoint(Timekeeping::Handoff::Checkpoint.build(tables:)) }
+        .to raise_error(Timekeeping::Handoff::Store::Error)
+      expect(Entry.pluck(:id, :company_id, :note)).to eq([[kept.id, 7, "Kept"]])
+      expect(AuditEvent.where(entry_id: kept.id).count).to eq(1)
+      expect([Reservation.count, InvoiceOperation.count, IdempotencyReceipt.count]).to eq([0, 0, 0])
+    end
+
+    # "Every row carries `company_id`."
+    it "exports all five checkpoint tables including invoice_operations, every row with its company_id" do
+      now = Time.utc(2026, 3, 2, 9)
+      Entry.create!(id: 71, company_id: 8, version: 1, project_id: 5, user_id: 7, work_date: Date.new(2026, 3, 2),
+                    duration: 15.0, note: "", bill_status: "unbilled", created_at: now, updated_at: now)
+      InvoiceOperation.create!(company_id: 8, invoice_id: 3, operation_id: SecureRandom.uuid,
+                               actor_name: "invoice-service", state: "committed", desired_entry_ids: [71],
+                               disposition: "active", generation: 2, created_at: now, finished_at: now)
+
+      checkpoint = store.export_checkpoint
+
+      expect(checkpoint.rows.keys).to match_array(Timekeeping::Handoff::Checkpoint::TABLES.keys)
+      expect(checkpoint.rows.fetch("invoice_operations").map { |row| [row["company_id"], row["desired_entry_ids"]] })
+        .to eq([[8, [71]]])
+      expect(checkpoint.rows.values.flatten.pluck("company_id")).to all(eq(8))
     end
 
     it "loads two companies' rows and exports them unchanged, and a second load gives the same result" do
@@ -171,11 +211,7 @@ RSpec.describe Timekeeping::Handoff::ServiceStore do
       lower.fetch("idempotency_records").first["id"] = 5
       store.load_checkpoint(Timekeeping::Handoff::Checkpoint.build(tables: lower))
 
-      next_ids = %w[invoice_operations audit_events idempotency_receipts].index_with do |table|
-        ApplicationRecord.connection.select_value(
-          "SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END FROM #{table}_id_seq"
-        ).to_i
-      end
+      next_ids = %w[invoice_operations audit_events idempotency_receipts].index_with { |table| handoff_next_id(table) }
       expect(next_ids).to eq("invoice_operations" => 301, "audit_events" => 401, "idempotency_receipts" => 501)
     end
 
