@@ -18,21 +18,24 @@ module PdfGeneration
       )
     end
 
+    # The totals the PDF prints, without rendering it. Building an instance
+    # renders the template, so this is a class method.
+    def self.printed_totals(invoice)
+      InvoiceTotals.new(invoice).printed
+    end
+
     private
 
       def build_invoice_locals
-        subtotal = calculate_subtotal
-        total = calculate_total(subtotal)
+        totals = self.class.printed_totals(invoice)
 
         {
           invoice: invoice,
-          **formatted_invoice_amounts,
+          **totals.except(:invoice_taxes),
           company_logo: company_logo_url || "",
           client: invoice.client,
           invoice_line_items: build_line_items,
-          invoice_taxes: build_invoice_taxes,
-          sub_total: format_currency(subtotal),
-          total: format_currency(total),
+          invoice_taxes: totals[:invoice_taxes].map { |invoice_tax| invoice_tax.slice(:name, :amount) },
           signature_url: resolve_signature_url
         }
       end
@@ -44,36 +47,15 @@ module PdfGeneration
       end
 
       def calculate_subtotal
-        invoice.invoice_line_items.total_cost_of_all_line_items
+        invoice_totals.subtotal
       end
 
       def calculate_total(subtotal = calculate_subtotal)
-        tax = invoice.tax || 0
-        discount = invoice.discount || 0
-        subtotal + tax - discount
+        invoice_totals.total(subtotal)
       end
 
-      def build_invoice_taxes
-        invoice.invoice_taxes.map do |invoice_tax|
-          {
-            name: invoice_tax.name,
-            amount: format_currency(invoice_tax.amount)
-          }
-        end
-      end
-
-      def formatted_invoice_amounts
-        {
-          invoice_amount: format_currency(invoice.amount),
-          invoice_tax: format_currency(invoice.tax),
-          invoice_amount_due: format_currency(invoice.amount_due),
-          invoice_amount_paid: format_currency(invoice.amount_paid),
-          invoice_discount: format_currency(invoice.discount)
-        }
-      end
-
-      def format_currency(amount)
-        FormatAmountService.new(invoice.currency, amount).process
+      def invoice_totals
+        InvoiceTotals.new(invoice)
       end
 
       def resolve_signature_url
