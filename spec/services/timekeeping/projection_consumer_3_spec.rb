@@ -17,16 +17,11 @@ RSpec.describe Timekeeping::ProjectionConsumer do
     user_b = create(:user)
     create(:employment, company: company_b, user: user_b)
     project_b = create(:project, client: create(:client, company: company_b))
-    snapshot_entry = TimekeepingContract.load(:entry_snapshots).fetch("entry_fields").index_with(nil).merge(
-      "id" => entry.id, "company_id" => company_b.id, "version" => 5, "project_id" => project_b.id,
-      "user_id" => user_b.id, "work_date" => "2026-03-02", "duration" => 90.0, "note" => "moved",
-      "bill_status" => "unbilled", "review_status" => "not_required", "locked" => false, "source" => "manual",
-      "source_metadata" => {}, "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z",
-      "updated_at" => "2026-03-02T09:00:00Z"
+    snapshot_entry = TimekeepingSnapshots.entry(id: entry.id, company_id: company_b.id, version: 5,
+                                                project_id: project_b.id, user_id: user_b.id, note: "moved")
+    batch = TimekeepingSnapshots.batch(
+      TimekeepingSnapshots.item(snapshot_entry, generation: TimekeepingOwnership.current.generation, outbox_position: 1)
     )
-    batch = { "schema_version" => 1,
-              "snapshots" => [{ "generation" => TimekeepingOwnership.current.generation, "outbox_position" => 1,
-                                "entry" => snapshot_entry }] }
 
     result = described_class.call(batch:, idempotency_key: nil)
 
@@ -45,16 +40,12 @@ RSpec.describe Timekeeping::ProjectionConsumer do
     create(:employment, company: company_a, user: user_a)
     project_b = create(:project, client: create(:client, company: company_b))
     entry_id = 70_501
-    snapshot_entry = TimekeepingContract.load(:entry_snapshots).fetch("entry_fields").index_with(nil).merge(
-      "id" => entry_id, "company_id" => company_a.id, "version" => 1, "project_id" => project_b.id,
-      "user_id" => user_a.id, "work_date" => "2026-03-02", "duration" => 90.0, "note" => "company A private note",
-      "bill_status" => "unbilled", "review_status" => "not_required", "locked" => false, "source" => "manual",
-      "source_metadata" => {}, "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z",
-      "updated_at" => "2026-03-02T09:00:00Z"
+    snapshot_entry = TimekeepingSnapshots.entry(id: entry_id, company_id: company_a.id, version: 1,
+                                                project_id: project_b.id, user_id: user_a.id,
+                                                note: "company A private note")
+    batch = TimekeepingSnapshots.batch(
+      TimekeepingSnapshots.item(snapshot_entry, generation: TimekeepingOwnership.current.generation, outbox_position: 1)
     )
-    batch = { "schema_version" => 1,
-              "snapshots" => [{ "generation" => TimekeepingOwnership.current.generation, "outbox_position" => 1,
-                                "entry" => snapshot_entry }] }
 
     result = described_class.call(batch:, idempotency_key: nil)
 

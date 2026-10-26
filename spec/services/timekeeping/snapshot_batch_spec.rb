@@ -4,17 +4,14 @@ require "rails_helper"
 
 RSpec.describe Timekeeping::SnapshotBatch do
   def batch_spec_entry(**fields)
-    TimekeepingContract.load(:entry_snapshots).fetch("entry_fields").index_with(nil).merge(
-      "id" => 11, "company_id" => 3, "version" => 2, "project_id" => 5, "user_id" => 7,
-      "work_date" => "2026-03-02", "duration" => 90.0, "note" => "Review", "bill_status" => "unbilled",
-      "review_status" => "approved", "locked" => false, "source" => "cli", "source_metadata" => { "tool" => "codex" },
-      "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z", "updated_at" => "2026-03-02T10:00:00+01:00"
-    ).merge(fields.transform_keys(&:to_s))
+    TimekeepingSnapshots.entry(
+      id: 11, company_id: 3, version: 2, project_id: 5, user_id: 7, note: "Review", review_status: "approved",
+      source: "cli", source_metadata: { "tool" => "codex" }, updated_at: "2026-03-02T10:00:00+01:00", **fields
+    )
   end
 
   def batch_spec_batch(*entries, positions: (1..entries.size).to_a)
-    { "schema_version" => 1,
-      "snapshots" => entries.zip(positions).map { |entry, position| { "generation" => 1, "outbox_position" => position, "entry" => entry } } }
+    TimekeepingSnapshots.batch(*entries.zip(positions).map { |entry, position| TimekeepingSnapshots.item(entry, generation: 1, outbox_position: position) })
   end
 
   it "maps a snapshot to timesheet_entries column values" do
