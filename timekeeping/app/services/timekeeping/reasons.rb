@@ -3,9 +3,9 @@
 module Timekeeping
   # The HTTP status for every reason a route can answer with. The service
   # deploys without the contracts directory, so the statuses from
-  # contracts/timekeeping/entry_api.yml and idempotency.yml are written out
-  # here; spec/services/timekeeping/reasons_spec.rb compares them with the
-  # YAML. reference_unavailable, idempotency_key_required and invalid_request
+  # contracts/timekeeping/entry_api.yml, idempotency.yml and reservations.yml
+  # are written out here; spec/services/timekeeping/reasons_spec.rb compares
+  # them with the YAML. reference_unavailable, idempotency_key_required and invalid_request
   # (a write body that is not JSON or holds a value of the wrong shape) are
   # this service's own answers, not yet listed in the contract.
   module Reasons
@@ -19,7 +19,9 @@ module Timekeeping
       idempotency_key_reused: 422,
       idempotency_key_required: 422,
       reference_unavailable: 503,
-      invalid_request: 400
+      invalid_request: 400,
+      conflict: 409,
+      unresolved_operation: 409
     }.freeze
 
     module_function

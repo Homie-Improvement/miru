@@ -19,7 +19,7 @@ RSpec.describe Timekeeping::Handoff::Checkpoint do
       "operation_id" => "8f1c7d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e", "desired_entry_ids" => [1], "generation" => 1,
       "finished_at" => nil, "actor_type" => "User", "actor_id" => 20, "action" => "create", "before" => nil,
       "after" => { "note" => "a" }, "entry_created_at" => at, "operation" => "create_entry", "key" => "k-1",
-      "fingerprint" => "f", "status" => 201, "body" => "{}"
+      "fingerprint" => "f", "status" => 201, "body" => "{}", "actor_name" => nil, "invoice_operation_id" => nil
     }
   end
 
