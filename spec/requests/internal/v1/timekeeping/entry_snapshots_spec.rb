@@ -245,6 +245,26 @@ RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots nesting", type: :reque
     expect(response).not_to have_http_status(:ok)
     expect(TimesheetEntry.where(id: 90_402)).to be_empty
   end
+
+  it "stores decimals finer than a Float in both metadata fields exactly, nested objects and arrays included" do
+    batch = nesting_batch(90_403, { "rates" => [1, "1.00000000000000000002"] })
+    entry = batch.dig("snapshots", 0, "entry")
+    entry["source_metadata"] = { "rate" => "1.00000000000000000001" }
+    body = JSON.generate(batch).sub('"1.00000000000000000001"', "1.00000000000000000001")
+                               .sub('"1.00000000000000000002"', "1.00000000000000000002")
+
+    with_timekeeping_service_token do |token|
+      post "/internal/v1/timekeeping/entry-snapshots", params: body,
+        headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json",
+                   "Idempotency-Key" => SecureRandom.uuid }
+    end
+
+    expect(response).to have_http_status(:ok)
+    stored = ActiveRecord::Base.connection.select_rows(
+      "SELECT source_metadata::text, proof_metadata::text FROM timesheet_entries WHERE id = 90403"
+    )
+    expect(stored).to eq([['{"rate": 1.00000000000000000001}', '{"rates": [1, 1.00000000000000000002]}']])
+  end
 end
 
 RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots idempotency", type: :request do

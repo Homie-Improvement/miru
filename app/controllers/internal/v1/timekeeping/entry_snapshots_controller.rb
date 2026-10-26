@@ -21,8 +21,10 @@ class Internal::V1::Timekeeping::EntrySnapshotsController < Internal::V1::BaseCo
     # The raw body, not params: the consumer checks the contract's exact key
     # lists, which Rails parameter wrapping would extend with its own key.
     # A body that is not JSON reaches the consumer as nil and is refused there.
+    # Decimals are read as BigDecimal, so metadata finer than a Float reaches
+    # the projection with every digit.
     def batch
-      JSON.parse(request.raw_post, max_nesting: BATCH_MAX_NESTING)
+      JSON.parse(request.raw_post, max_nesting: BATCH_MAX_NESTING, decimal_class: BigDecimal)
     rescue JSON::ParserError
       nil
     end

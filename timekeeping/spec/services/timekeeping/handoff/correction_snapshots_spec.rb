@@ -161,4 +161,21 @@ RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "stored data" do
     )
     expect(stored).to eq('{"rate": 1.00000000000000000001}')
   end
+
+  it "keeps jsonb decimals exact through the relay source and the posted batch text" do
+    entry_id = timekeeping_arrange.entry(company:, user: owner, project:, version: 0)
+    Timekeeping::Admission.fence!
+    source_metadata = { "rate" => BigDecimal("1.00000000000000000001"), "nested" => { "list" => [BigDecimal("2.5"), 3] } }
+    proof_metadata = { "scores" => [BigDecimal("0.30000000000000000004")] }
+    snapshot = correction_snapshot_for(entry_id).merge("source_metadata" => source_metadata, "proof_metadata" => proof_metadata)
+    described_class.write!(snapshots: [snapshot], version: 1, generation: 2)
+
+    position = OutboxSnapshot.where(id: entry_id, generation: 2).sole.outbox_position
+    row = Timekeeping::RelayOutboxSource.new.unsent_after(position - 1, 1).sole
+    posted = TimekeepingRelay::BatchJson.generate(TimekeepingRelay::BatchJson.canonical("schema_version" => 1, "snapshots" => [row]))
+
+    received = JSON.parse(posted, decimal_class: BigDecimal).dig("snapshots", 0, "entry")
+    expect(received.values_at("source_metadata", "proof_metadata")).to eq([source_metadata, proof_metadata])
+    expect(posted).to include('"rate":1.00000000000000000001')
+  end
 end
