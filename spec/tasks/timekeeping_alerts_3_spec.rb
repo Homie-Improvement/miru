@@ -5,17 +5,18 @@ require "rails_helper"
 require "rake"
 
 RSpec.describe "timekeeping:alerts reference_unavailable rate" do
+  let(:alerts_task_service_token) { "service-#{SecureRandom.hex(24)}" }
   include ActiveSupport::Testing::TimeHelpers
 
   def run_alerts_task_against(metrics_body)
     Rails.application.load_tasks if Rake::Task.tasks.empty?
     Rake::Task["timekeeping:alerts"].reenable
     stub_request(:get, "http://timekeeping.alerts.test/internal/v1/metrics")
-      .with(headers: { "Authorization" => "Bearer alerts-service-token" })
+      .with(headers: { "Authorization" => "Bearer #{alerts_task_service_token}" })
       .to_return(status: 200, body: JSON.generate(metrics_body), headers: { "Content-Type" => "application/json" })
     env_before = ENV.to_h.slice("TIMEKEEPING_BASE_URL", "TIMEKEEPING_SERVICE_TOKEN")
     ENV["TIMEKEEPING_BASE_URL"] = "http://timekeeping.alerts.test"
-    ENV["TIMEKEEPING_SERVICE_TOKEN"] = "alerts-service-token"
+    ENV["TIMEKEEPING_SERVICE_TOKEN"] = alerts_task_service_token
     printed = StringIO.new
     original_stdout = $stdout
     $stdout = printed
@@ -60,6 +61,7 @@ RSpec.describe "timekeeping:alerts reference_unavailable rate" do
 end
 
 RSpec.describe "timekeeping:alerts window still in progress" do
+  let(:alerts_task_service_token) { "service-#{SecureRandom.hex(24)}" }
   include ActiveSupport::Testing::TimeHelpers
 
   def run_alerts_task_for_open_window(metrics_body)
@@ -69,7 +71,7 @@ RSpec.describe "timekeeping:alerts window still in progress" do
       .to_return(status: 200, body: JSON.generate(metrics_body), headers: { "Content-Type" => "application/json" })
     env_before = ENV.to_h.slice("TIMEKEEPING_BASE_URL", "TIMEKEEPING_SERVICE_TOKEN")
     ENV["TIMEKEEPING_BASE_URL"] = "http://timekeeping.alerts.test"
-    ENV["TIMEKEEPING_SERVICE_TOKEN"] = "alerts-service-token"
+    ENV["TIMEKEEPING_SERVICE_TOKEN"] = alerts_task_service_token
     printed = StringIO.new
     original_stdout = $stdout
     $stdout = printed
@@ -107,6 +109,7 @@ RSpec.describe "timekeeping:alerts window still in progress" do
 end
 
 RSpec.describe "timekeeping:alerts p95 latency" do
+  let(:alerts_task_service_token) { "service-#{SecureRandom.hex(24)}" }
   include ActiveSupport::Testing::TimeHelpers
 
   def run_alerts_task_for_latency(metrics_body)
@@ -116,7 +119,7 @@ RSpec.describe "timekeeping:alerts p95 latency" do
       .to_return(status: 200, body: JSON.generate(metrics_body), headers: { "Content-Type" => "application/json" })
     env_before = ENV.to_h.slice("TIMEKEEPING_BASE_URL", "TIMEKEEPING_SERVICE_TOKEN")
     ENV["TIMEKEEPING_BASE_URL"] = "http://timekeeping.alerts.test"
-    ENV["TIMEKEEPING_SERVICE_TOKEN"] = "alerts-service-token"
+    ENV["TIMEKEEPING_SERVICE_TOKEN"] = alerts_task_service_token
     printed = StringIO.new
     original_stdout = $stdout
     $stdout = printed
@@ -162,6 +165,7 @@ RSpec.describe "timekeeping:alerts p95 latency" do
 end
 
 RSpec.describe "timekeeping:alerts pending invoice operation intents" do
+  let(:alerts_task_service_token) { "service-#{SecureRandom.hex(24)}" }
   include ActiveSupport::Testing::TimeHelpers
 
   def run_alerts_task_for_intents
@@ -175,7 +179,7 @@ RSpec.describe "timekeeping:alerts pending invoice operation intents" do
       .to_return(status: 200, body: JSON.generate(empty_metrics), headers: { "Content-Type" => "application/json" })
     env_before = ENV.to_h.slice("TIMEKEEPING_BASE_URL", "TIMEKEEPING_SERVICE_TOKEN")
     ENV["TIMEKEEPING_BASE_URL"] = "http://timekeeping.alerts.test"
-    ENV["TIMEKEEPING_SERVICE_TOKEN"] = "alerts-service-token"
+    ENV["TIMEKEEPING_SERVICE_TOKEN"] = alerts_task_service_token
     printed = StringIO.new
     original_stdout = $stdout
     $stdout = printed
@@ -213,6 +217,7 @@ RSpec.describe "timekeeping:alerts pending invoice operation intents" do
 end
 
 RSpec.describe "timekeeping:alerts outbox lag of the current owner" do
+  let(:alerts_task_service_token) { "service-#{SecureRandom.hex(24)}" }
   include ActiveSupport::Testing::TimeHelpers
 
   def run_alerts_task_for_outbox_lag
@@ -230,7 +235,7 @@ RSpec.describe "timekeeping:alerts outbox lag of the current owner" do
       .to_return(status: 200, body: JSON.generate(metrics), headers: { "Content-Type" => "application/json" })
     env_before = ENV.to_h.slice("TIMEKEEPING_BASE_URL", "TIMEKEEPING_SERVICE_TOKEN")
     ENV["TIMEKEEPING_BASE_URL"] = "http://timekeeping.alerts.test"
-    ENV["TIMEKEEPING_SERVICE_TOKEN"] = "alerts-service-token"
+    ENV["TIMEKEEPING_SERVICE_TOKEN"] = alerts_task_service_token
     printed = StringIO.new
     original_stdout = $stdout
     $stdout = printed
@@ -304,6 +309,7 @@ RSpec.describe "timekeeping:alerts metrics read failure" do
 end
 
 RSpec.describe "timekeeping:alerts signals without a source" do
+  let(:alerts_task_service_token) { "service-#{SecureRandom.hex(24)}" }
   include ActiveSupport::Testing::TimeHelpers
 
   it "reports signals with no data source as unavailable and exits zero when the metrics read succeeds" do
@@ -313,14 +319,14 @@ RSpec.describe "timekeeping:alerts signals without a source" do
       "overflow_bucket" => "inf", "total_field" => "writes + reference_unavailable", "companies" => [], "outbox_lag" => []
     }
     stub_request(:get, "http://timekeeping.alerts.test/internal/v1/metrics")
-      .with(headers: { "Authorization" => "Bearer alerts-service-token" })
+      .with(headers: { "Authorization" => "Bearer #{alerts_task_service_token}" })
       .to_return(status: 200, body: JSON.generate(metrics), headers: { "Content-Type" => "application/json" })
 
     Rails.application.load_tasks if Rake::Task.tasks.empty?
     Rake::Task["timekeeping:alerts"].reenable
     env_before = ENV.to_h.slice("TIMEKEEPING_BASE_URL", "TIMEKEEPING_SERVICE_TOKEN")
     ENV["TIMEKEEPING_BASE_URL"] = "http://timekeeping.alerts.test"
-    ENV["TIMEKEEPING_SERVICE_TOKEN"] = "alerts-service-token"
+    ENV["TIMEKEEPING_SERVICE_TOKEN"] = alerts_task_service_token
     printed = StringIO.new
     original_stdout = $stdout
     $stdout = printed

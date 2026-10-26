@@ -6,6 +6,7 @@ require "rake"
 require "webmock/rspec"
 
 RSpec.describe "timekeeping:alerts reference_unavailable attribution" do
+  let(:alerts_tenant_service_token) { "service-#{SecureRandom.hex(24)}" }
   include ActiveSupport::Testing::TimeHelpers
 
   before(:all) do
@@ -15,7 +16,7 @@ RSpec.describe "timekeeping:alerts reference_unavailable attribution" do
   around do |example|
     env_before = ENV.to_h.slice("TIMEKEEPING_BASE_URL", "TIMEKEEPING_SERVICE_TOKEN")
     ENV["TIMEKEEPING_BASE_URL"] = "http://timekeeping.alerts.test"
-    ENV["TIMEKEEPING_SERVICE_TOKEN"] = "service-token-alerts-tenant"
+    ENV["TIMEKEEPING_SERVICE_TOKEN"] = alerts_tenant_service_token
     travel_to(Time.utc(2026, 3, 3, 12, 7)) { example.run }
   ensure
     %w[TIMEKEEPING_BASE_URL TIMEKEEPING_SERVICE_TOKEN].each { |key| ENV[key] = env_before[key] }
@@ -45,7 +46,7 @@ RSpec.describe "timekeeping:alerts reference_unavailable attribution" do
       "outbox_lag" => []
     }
     stub_request(:get, "http://timekeeping.alerts.test/internal/v1/metrics")
-      .with(headers: { "Authorization" => "Bearer service-token-alerts-tenant" })
+      .with(headers: { "Authorization" => "Bearer #{alerts_tenant_service_token}" })
       .to_return(status: 200, body: JSON.generate(body), headers: { "Content-Type" => "application/json" })
 
     Rake::Task["timekeeping:alerts"].reenable
@@ -68,6 +69,7 @@ RSpec.describe "timekeeping:alerts reference_unavailable attribution" do
 end
 
 RSpec.describe "timekeeping:alerts latency attribution" do
+  let(:alerts_tenant_service_token) { "service-#{SecureRandom.hex(24)}" }
   include ActiveSupport::Testing::TimeHelpers
 
   before(:all) do
@@ -77,7 +79,7 @@ RSpec.describe "timekeeping:alerts latency attribution" do
   around do |example|
     env_before = ENV.to_h.slice("TIMEKEEPING_BASE_URL", "TIMEKEEPING_SERVICE_TOKEN")
     ENV["TIMEKEEPING_BASE_URL"] = "http://timekeeping.alerts.test"
-    ENV["TIMEKEEPING_SERVICE_TOKEN"] = "service-token-alerts-tenant"
+    ENV["TIMEKEEPING_SERVICE_TOKEN"] = alerts_tenant_service_token
     travel_to(Time.utc(2026, 3, 3, 12, 7)) { example.run }
   ensure
     %w[TIMEKEEPING_BASE_URL TIMEKEEPING_SERVICE_TOKEN].each { |key| ENV[key] = env_before[key] }
@@ -105,7 +107,7 @@ RSpec.describe "timekeeping:alerts latency attribution" do
       "outbox_lag" => []
     }
     stub_request(:get, "http://timekeeping.alerts.test/internal/v1/metrics")
-      .with(headers: { "Authorization" => "Bearer service-token-alerts-tenant" })
+      .with(headers: { "Authorization" => "Bearer #{alerts_tenant_service_token}" })
       .to_return(status: 200, body: JSON.generate(body), headers: { "Content-Type" => "application/json" })
 
     Rake::Task["timekeeping:alerts"].reenable
@@ -128,6 +130,7 @@ RSpec.describe "timekeeping:alerts latency attribution" do
 end
 
 RSpec.describe "timekeeping:alerts pending intent attribution" do
+  let(:alerts_tenant_service_token) { "service-#{SecureRandom.hex(24)}" }
   include ActiveSupport::Testing::TimeHelpers
 
   before(:all) do
@@ -137,7 +140,7 @@ RSpec.describe "timekeeping:alerts pending intent attribution" do
   around do |example|
     env_before = ENV.to_h.slice("TIMEKEEPING_BASE_URL", "TIMEKEEPING_SERVICE_TOKEN")
     ENV["TIMEKEEPING_BASE_URL"] = "http://timekeeping.alerts.test"
-    ENV["TIMEKEEPING_SERVICE_TOKEN"] = "service-token-alerts-tenant"
+    ENV["TIMEKEEPING_SERVICE_TOKEN"] = alerts_tenant_service_token
     travel_to(Time.utc(2026, 3, 3, 12, 7)) { example.run }
   ensure
     %w[TIMEKEEPING_BASE_URL TIMEKEEPING_SERVICE_TOKEN].each { |key| ENV[key] = env_before[key] }
@@ -162,7 +165,7 @@ RSpec.describe "timekeeping:alerts pending intent attribution" do
       "outbox_lag" => []
     }
     stub_request(:get, "http://timekeeping.alerts.test/internal/v1/metrics")
-      .with(headers: { "Authorization" => "Bearer service-token-alerts-tenant" })
+      .with(headers: { "Authorization" => "Bearer #{alerts_tenant_service_token}" })
       .to_return(status: 200, body: JSON.generate(body), headers: { "Content-Type" => "application/json" })
 
     Rake::Task["timekeeping:alerts"].reenable
