@@ -58,6 +58,7 @@ ENV BUNDLE_DEPLOYMENT="" \
 
 # Install all gems including development
 COPY Gemfile Gemfile.lock ./
+COPY gems/timekeeping_handoff gems/timekeeping_handoff
 RUN --mount=type=cache,id=bundle-cache,target=/usr/local/bundle/cache \
     bundle install --jobs 4 --retry 3
 
@@ -88,6 +89,7 @@ ENV PATH="/usr/local/node/bin:$PATH" \
 
 # Install application gems
 COPY Gemfile Gemfile.lock ./
+COPY gems/timekeeping_handoff gems/timekeeping_handoff
 RUN --mount=type=cache,id=bundle-cache,target=/usr/local/bundle/cache \
     bundle install --jobs 4 --retry 3 && \
     rm -rf ~/.bundle/ /root/.cache/gem "${BUNDLE_PATH}"/ruby/*/cache "${BUNDLE_PATH}"/ruby/*/bundler/gems/*/.git && \
