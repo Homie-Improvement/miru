@@ -5,389 +5,6 @@
 require "rails_helper"
 
 RSpec.describe RecoverInvoiceOperationIntentsJob do
-  # "Send `Rails.event.notify` named `invoices.stale_operation_intents` per company, with company_id, count and oldest_created_at."
-  # No signal may carry another company's backlog.
-  it "sends each company's stale signal with only that company's count and oldest intent" do
-    now = Time.current.change(usec: 0)
-    company_a_oldest = now - 30.minutes
-    company_b_oldest = now - (10.minutes + 1.second)
-    [company_a_oldest, now - 20.minutes].each do |created_at|
-      InvoiceOperationIntent.create!(company_id: 101, invoice_id: 10, operation_id: SecureRandom.uuid,
-        state: "pending", generation: 1, disposition: "active", desired_entry_ids: [], created_at:)
-    end
-    InvoiceOperationIntent.create!(company_id: 202, invoice_id: 20, operation_id: SecureRandom.uuid,
-      state: "pending", generation: 1, disposition: "active", desired_entry_ids: [], created_at: company_b_oldest)
-
-    received = []
-    subscriber = Class.new do
-      define_method(:initialize) { |sink| @sink = sink }
-      define_method(:emit) { |event| @sink << event if event[:name] == "invoices.stale_operation_intents" }
-    end.new(received)
-    Rails.event.subscribe(subscriber)
-    adapter_outcome = Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
-    adapter = RecordingReservationAdapter.new(prepare: adapter_outcome, commit: adapter_outcome, abort: adapter_outcome)
-    begin
-      travel_to(now) { described_class.perform_now(reservations: adapter) }
-    ensure
-      Rails.event.unsubscribe(subscriber)
-    end
-
-    data = received.map do |event|
-      payload = event[:payload].to_h.deep_symbolize_keys
-      payload.key?(:company_id) ? payload : payload.fetch(:data).to_h.deep_symbolize_keys
-    end
-    by_company = data.index_by { |item| item[:company_id] }
-
-    expect(data.size).to eq(2)
-    expect(by_company.keys).to contain_exactly(101, 202)
-    expect(by_company[101][:count]).to eq(2)
-    expect(Time.zone.parse(by_company[101][:oldest_created_at].to_s)).to eq(company_a_oldest)
-    expect(by_company[202][:count]).to eq(1)
-    expect(Time.zone.parse(by_company[202][:oldest_created_at].to_s)).to eq(company_b_oldest)
-  end
-end
-
-RSpec.describe RecoverInvoiceOperationIntentsJob, committed_data: true do
-  # "A crash after prepare converges: recovery records the pending intent failed under the (company_id, invoice_id) advisory lock and the abort is delivered"
-  # "For each one it takes the same advisory lock, runs the guarded update to `failed`, and inserts the abort row in the same transaction only when that update wins."
-  # The invoice id names no invoice row: "A pending intent naming an invoice that never committed (a rolled-back create) is aborted the same way, never treated as an error."
-  it "converges a crashed save to failed with one delivered abort row and a second sweep adds nothing" do
-    company = create(:company)
-    operation_id = SecureRandom.uuid
-    intent = InvoiceOperationIntent.create!(
-      company_id: company.id, invoice_id: 987_654_321, operation_id:, state: "pending",
-      generation: 1, disposition: "active", desired_entry_ids: [21, 22], created_at: 61.seconds.ago
-    )
-    abort_requests = []
-    adapter = RecordingReservationAdapter.new(
-      prepare: Invoices::ReservationOutcome.new(state: "prepared", conflicts: [], counts: {}),
-      commit: Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {}),
-      abort: ->(request) { abort_requests << request; Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {}) }
-    )
-
-    expect { described_class.perform_now(reservations: adapter) }.not_to raise_error
-
-    expect(intent.reload.state).to eq("failed")
-    expect(intent.finished_at).to be_present
-    rows = InvoiceOperationOutboxItem.where(company_id: company.id, operation_id:)
-    expect(rows.pluck(:kind)).to eq(["abort"])
-    expect(rows.first.delivered_at).to be_present
-    expect(abort_requests.size).to eq(1)
-    expect(abort_requests.first).to have_attributes(company_id: company.id, invoice_id: 987_654_321, entries: [21, 22])
-
-    described_class.perform_now(reservations: adapter)
-
-    expect(InvoiceOperationOutboxItem.where(company_id: company.id, operation_id:).count).to eq(1)
-    expect(abort_requests.size).to eq(1)
-  end
-end
-
-RSpec.describe RecoverInvoiceOperationIntentsJob, committed_data: true do
-  # "The sweep also redelivers outbox rows that are still undelivered."
-  it "redelivers an undelivered abort row for an already failed intent once and a second sweep sends nothing" do
-    operation_id = SecureRandom.uuid
-    InvoiceOperationIntent.create!(
-      company_id: 1, invoice_id: 10, operation_id:, state: "failed", generation: 1,
-      disposition: "active", desired_entry_ids: [3, 5], finished_at: Time.current
-    )
-    item = InvoiceOperationOutboxItem.create!(
-      company_id: 1, invoice_id: 10, operation_id:, kind: "abort",
-      payload: { company_id: 1, invoice_id: 10, operation_id:, generation: 1, disposition: "active", desired_entry_ids: [3, 5] }
-    )
-    aborted = Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
-    adapter = RecordingReservationAdapter.new(prepare: aborted, commit: aborted, abort: aborted)
-
-    described_class.perform_now(reservations: adapter)
-
-    expect(adapter.requests.size).to eq(1)
-    expect(adapter.requests.first.operation_id).to eq(operation_id)
-    expect(adapter.requests.first.entries).to eq([3, 5])
-    expect(item.reload.delivered_at).to be_present
-    expect(InvoiceOperationOutboxItem.where(company_id: 1, operation_id:).count).to eq(1)
-
-    delivered_at = item.delivered_at
-    described_class.perform_now(reservations: adapter)
-
-    expect(adapter.requests.size).to eq(1)
-    expect(item.reload.delivered_at).to eq(delivered_at)
-  end
-end
-
-RSpec.describe RecoverInvoiceOperationIntentsJob, committed_data: true do
-  # "Send `Rails.event.notify` named `invoices.stale_operation_intents` per company, with company_id, count and oldest_created_at."
-  it "emits one stale signal per company carrying only that company's count and oldest intent" do
-    now = Time.current.change(usec: 0)
-    company_one_oldest = now - 15.minutes
-    company_two_oldest = now - (10.minutes + 1.second)
-    intent = ->(company_id, invoice_id, created_at) do
-      { company_id:, invoice_id:, operation_id: SecureRandom.uuid, state: "pending", generation: 1,
-        desired_entry_ids: [1], disposition: "active", created_at: }
-    end
-    InvoiceOperationIntent.insert_all!([
-      intent.call(1, 10, company_one_oldest),
-      intent.call(1, 11, now - (10.minutes + 1.second)),
-      intent.call(2, 20, company_two_oldest)
-    ])
-    aborted = Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
-    adapter = RecordingReservationAdapter.new(prepare: aborted, commit: aborted, abort: aborted)
-
-    events = []
-    collector = Object.new
-    collector.define_singleton_method(:emit) { |event| events << event }
-    Rails.event.subscribe(collector)
-    begin
-      travel_to(now) { described_class.perform_now(reservations: adapter) }
-    ensure
-      Rails.event.unsubscribe(collector)
-    end
-
-    payloads = events.filter_map do |event|
-      next unless event[:name] == "invoices.stale_operation_intents"
-
-      payload = event[:payload]
-      payload = payload.to_h if payload.respond_to?(:to_h)
-      payload.transform_keys(&:to_sym)
-    end
-    expect(payloads.pluck(:company_id)).to contain_exactly(1, 2)
-
-    one = payloads.find { |payload| payload[:company_id] == 1 }
-    two = payloads.find { |payload| payload[:company_id] == 2 }
-    expect(one[:count]).to eq(2)
-    expect(Time.zone.parse(one[:oldest_created_at].to_s)).to eq(company_one_oldest)
-    expect(two[:count]).to eq(1)
-    expect(Time.zone.parse(two[:oldest_created_at].to_s)).to eq(company_two_oldest)
-  end
-end
-
-RSpec.describe RecoverInvoiceOperationIntentsJob do
-  # "A crash after prepare converges: recovery records the pending intent failed under the (company_id, invoice_id) advisory lock and the abort is delivered"
-  # "an intent already committed is left alone"
-  # "A pending intent naming an invoice that never committed (a rolled-back create) is aborted the same way, never treated as an error."
-  it "converges a crash after prepare to a failed intent with its abort delivered, and leaves a committed intent alone" do
-    freeze_time do
-      invoice = create(:invoice)
-      crashed_id = SecureRandom.uuid
-      missing_invoice_id = SecureRandom.uuid
-      committed_id = SecureRandom.uuid
-      InvoiceOperationIntent.create!(company_id: invoice.company_id, invoice_id: invoice.id, operation_id: crashed_id,
-        state: "pending", generation: 1, disposition: "active", desired_entry_ids: [3], created_at: 61.seconds.ago)
-      InvoiceOperationIntent.create!(company_id: invoice.company_id, invoice_id: 987_654, operation_id: missing_invoice_id,
-        state: "pending", generation: 1, disposition: "active", desired_entry_ids: [4], created_at: 61.seconds.ago)
-      InvoiceOperationIntent.create!(company_id: invoice.company_id, invoice_id: invoice.id, operation_id: committed_id,
-        state: "committed", generation: 1, disposition: "active", desired_entry_ids: [5], created_at: 5.minutes.ago)
-      settled = Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
-      adapter = RecordingReservationAdapter.new(prepare: settled, commit: settled, abort: settled)
-
-      expect { described_class.perform_now(reservations: adapter) }.not_to raise_error
-
-      [crashed_id, missing_invoice_id].each do |operation_id|
-        expect(InvoiceOperationIntent.find_by!(company_id: invoice.company_id, operation_id:).state).to eq("failed")
-        aborts = InvoiceOperationOutboxItem.where(company_id: invoice.company_id, operation_id:, kind: "abort")
-        expect(aborts.count).to eq(1)
-        expect(aborts.first.delivered_at).to be_present
-      end
-      expect(InvoiceOperationIntent.find_by!(company_id: invoice.company_id, operation_id: committed_id).state).to eq("committed")
-      expect(InvoiceOperationOutboxItem.where(operation_id: committed_id)).to be_empty
-      expect(adapter.requests.map(&:operation_id)).to contain_exactly(crashed_id, missing_invoice_id)
-    end
-  end
-end
-
-RSpec.describe RecoverInvoiceOperationIntentsJob do
-  # "It selects intents pending longer than `pickup_age`."
-  it "leaves an intent pending for 59 seconds untouched" do
-    freeze_time do
-      operation_id = SecureRandom.uuid
-      InvoiceOperationIntent.create!(company_id: 11, invoice_id: 12, operation_id:, state: "pending",
-        generation: 1, disposition: "active", desired_entry_ids: [1], created_at: 59.seconds.ago)
-      settled = Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
-      adapter = RecordingReservationAdapter.new(prepare: settled, commit: settled, abort: settled)
-
-      described_class.perform_now(reservations: adapter)
-
-      expect(InvoiceOperationIntent.find_by!(company_id: 11, operation_id:).state).to eq("pending")
-      expect(InvoiceOperationOutboxItem.where(company_id: 11, operation_id:)).to be_empty
-      expect(adapter.requests).to be_empty
-    end
-  end
-end
-
-RSpec.describe RecoverInvoiceOperationIntentsJob do
-  # Collects every reported event so the spec can read names and payloads.
-  class StaleIntentEventCollector
-    attr_reader :events
-
-    def initialize
-      @events = []
-    end
-
-    def emit(event)
-      @events << event
-    end
-  end
-
-  def stale_intent_payload(event)
-    payload = event[:payload]
-    payload = payload.to_h if payload.respond_to?(:to_h)
-    payload.transform_keys(&:to_sym)
-  end
-
-  # "Send `Rails.event.notify` named `invoices.stale_operation_intents` per company, with company_id, count and oldest_created_at."
-  # "the stale signal fires per company at 10 min 1 s and not at 9 min 59 s"
-  it "emits one stale signal per company at 10 min 1 s and none for a company at 9 min 59 s" do
-    freeze_time do
-      oldest = (10.minutes + 1.second).ago
-      [[21, oldest], [21, (10.minutes + 30.seconds).ago.then { oldest }], [22, oldest], [23, (9.minutes + 59.seconds).ago]]
-        .each do |company_id, created_at|
-          InvoiceOperationIntent.create!(company_id:, invoice_id: 1, operation_id: SecureRandom.uuid, state: "pending",
-            generation: 1, disposition: "active", desired_entry_ids: [1], created_at:)
-        end
-      settled = Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
-      adapter = RecordingReservationAdapter.new(prepare: settled, commit: settled, abort: settled)
-      collector = StaleIntentEventCollector.new
-      Rails.event.subscribe(collector)
-
-      begin
-        described_class.perform_now(reservations: adapter)
-      ensure
-        Rails.event.unsubscribe(collector)
-      end
-
-      stale = collector.events.select { |event| event[:name] == "invoices.stale_operation_intents" }
-      payloads = stale.map { |event| stale_intent_payload(event) }
-      expect(payloads.pluck(:company_id)).to contain_exactly(21, 22)
-      expect(payloads.find { |payload| payload[:company_id] == 21 }).to include(count: 2)
-      expect(payloads.find { |payload| payload[:company_id] == 22 }).to include(count: 1)
-      payloads.each { |payload| expect(payload[:oldest_created_at].to_i).to eq(oldest.to_i) }
-    end
-  end
-end
-
-RSpec.describe RecoverInvoiceOperationIntentsJob, committed_data: true do
-  # Test list: "recovery while a save holds the advisory lock waits and changes nothing"
-  # The scenario: a slow prepare outlives the 60 s pickup; recovery must not fail an intent
-  # whose save still holds the (company_id, invoice_id) lock.
-  it "waits on a live save's advisory lock and leaves the intent that save commits alone" do
-    company_id = 7301
-    invoice_id = 9301
-    operation_id = SecureRandom.uuid
-    InvoiceOperationIntent.create!(
-      company_id:, invoice_id:, operation_id:, state: "pending", generation: 1,
-      disposition: "active", desired_entry_ids: [31], created_at: 2.minutes.ago
-    )
-    adapter = RecordingReservationAdapter.new(
-      prepare: Invoices::ReservationOutcome.new(state: "prepared", conflicts: [], counts: {}),
-      commit: Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {}),
-      abort: Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
-    )
-    holder_pids = Queue.new
-    recovery_pids = Queue.new
-    locked = Queue.new
-    release = Queue.new
-
-    holder = committed_data_thread(holder_pids) do
-      ApplicationRecord.transaction do
-        Invoices::OperationLock.acquire!(ActiveRecord::Base.connection, company_id:, invoice_id:)
-        locked << true
-        release.pop(timeout: 10)
-        InvoiceOperationIntent.where(company_id:, invoice_id:, operation_id:, state: "pending")
-          .update_all(state: "committed", finished_at: Time.current)
-      end
-    end
-    expect(locked.pop(timeout: 5)).to be(true)
-    recovery = committed_data_thread(recovery_pids) { described_class.perform_now(reservations: adapter) }
-
-    begin
-      waited = blocked_by?(recovery_pids.pop(timeout: 5), holder_pids.pop(timeout: 5))
-      state_while_blocked = InvoiceOperationIntent.find_by!(company_id:, operation_id:).state
-    ensure
-      release << true
-    end
-    holder.join(5)
-    recovery.join(10)
-
-    expect(waited).to be(true)
-    expect(state_while_blocked).to eq("pending")
-    expect(InvoiceOperationIntent.find_by!(company_id:, operation_id:).state).to eq("committed")
-    expect(InvoiceOperationOutboxItem.where(company_id:, operation_id:, kind: "abort")).not_to exist
-    expect(adapter.requests).to be_empty
-  ensure
-    release&.push(true)
-    [holder, recovery].compact.each { |thread| thread.join(5) }
-  end
-end
-
-RSpec.describe RecoverInvoiceOperationIntentsJob, committed_data: true do
-  # "A pending intent naming an invoice that never committed (a rolled-back create) is aborted the same way, never treated as an error."
-  it "aborts and delivers a pending intent whose invoice never committed without raising" do
-    company_id = 7401
-    invoice_id = 9_999_401
-    operation_id = SecureRandom.uuid
-    InvoiceOperationIntent.create!(
-      company_id:, invoice_id:, operation_id:, state: "pending", generation: 1,
-      disposition: "active", desired_entry_ids: [41, 42], created_at: 61.seconds.ago
-    )
-    adapter = RecordingReservationAdapter.new(
-      prepare: Invoices::ReservationOutcome.new(state: "prepared", conflicts: [], counts: {}),
-      commit: Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {}),
-      abort: Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
-    )
-
-    expect { described_class.perform_now(reservations: adapter) }.not_to raise_error
-
-    expect(Invoice.where(id: invoice_id)).not_to exist
-    expect(InvoiceOperationIntent.find_by!(company_id:, operation_id:).state).to eq("failed")
-    abort_rows = InvoiceOperationOutboxItem.where(company_id:, operation_id:)
-    expect(abort_rows.pluck(:kind)).to eq(["abort"])
-    expect(abort_rows.first.delivered_at).to be_present
-    expect(adapter.requests.map(&:invoice_id)).to eq([invoice_id])
-    expect(adapter.requests.first.entries).to eq([41, 42])
-  end
-end
-
-RSpec.describe RecoverInvoiceOperationIntentsJob, committed_data: true do
-  # "Send `Rails.event.notify` named `invoices.stale_operation_intents` per company, with company_id, count and oldest_created_at."
-  # "The 60-second pickup and the 10-minute signal are separate constants; the sweep never waits for the signal threshold before it resolves a crashed save."
-  # The scenario: every stale intent is also past pickup, so a sweep that resolves before it counts
-  # would never signal. Company 7503 sits at 9 min 59 s and must not signal.
-  it "signals stale intents per company even though the same sweep resolves them" do
-    oldest_a = (10.minutes + 5.seconds).ago
-    [[7501, oldest_a], [7501, (10.minutes + 1.second).ago], [7502, (10.minutes + 1.second).ago], [7503, (9.minutes + 59.seconds).ago]]
-      .each_with_index do |(company_id, created_at), index|
-        InvoiceOperationIntent.create!(
-          company_id:, invoice_id: 9500 + index, operation_id: SecureRandom.uuid, state: "pending", generation: 1,
-          disposition: "active", desired_entry_ids: [51], created_at:
-        )
-      end
-    adapter = RecordingReservationAdapter.new(
-      prepare: Invoices::ReservationOutcome.new(state: "prepared", conflicts: [], counts: {}),
-      commit: Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {}),
-      abort: Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
-    )
-    captured = []
-    subscriber = Object.new
-    subscriber.define_singleton_method(:emit) { |event| captured << event }
-    Rails.event.subscribe(subscriber)
-    begin
-      described_class.perform_now(reservations: adapter)
-    ensure
-      Rails.event.unsubscribe(subscriber)
-    end
-
-    payloads = captured
-      .filter_map { |event| event[:payload].to_h.symbolize_keys if event[:name] == "invoices.stale_operation_intents" }
-      .sort_by { |payload| payload[:company_id] }
-
-    expect(payloads.map { |payload| payload.slice(:company_id, :count) }).to eq([
-      { company_id: 7501, count: 2 },
-      { company_id: 7502, count: 1 }
-    ])
-    expect(payloads.first[:oldest_created_at].to_i).to eq(oldest_a.to_i)
-    expect(InvoiceOperationIntent.where(state: "pending").pluck(:company_id)).to eq([])
-  end
-end
-
-RSpec.describe RecoverInvoiceOperationIntentsJob do
   def recovery_test_adapter
     aborted = Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
     RecordingReservationAdapter.new(prepare: aborted, commit: aborted, abort: aborted)
@@ -398,137 +15,395 @@ RSpec.describe RecoverInvoiceOperationIntentsJob do
       generation: 1, disposition: "active", desired_entry_ids: [1], created_at:)
   end
 
-  it "recovers an intent at 61 s without sending a stale signal" do
-    freeze_time do
-      intent = recovery_test_intent(company_id: 31, created_at: 61.seconds.ago)
-      events = []
-      collector = Object.new
-      collector.define_singleton_method(:emit) { |event| events << event }
-      Rails.event.subscribe(collector)
-      begin
-        described_class.perform_now(reservations: recovery_test_adapter)
-      ensure
-        Rails.event.unsubscribe(collector)
-      end
-
-      expect(intent.reload.state).to eq("failed")
-      expect(InvoiceOperationOutboxItem.where(company_id: 31, operation_id: intent.operation_id, kind: "abort").count).to eq(1)
-      expect(events.pluck(:name)).not_to include(Invoices::StaleOperationIntents::NAME)
+  # Runs the block with an event subscriber attached and returns the payload of
+  # every stale-intent signal sent meanwhile, with symbol keys.
+  def recovery_stale_signal_payloads
+    events = []
+    subscriber = Object.new
+    subscriber.define_singleton_method(:emit) { |event| events << event }
+    Rails.event.subscribe(subscriber)
+    begin
+      yield
+    ensure
+      Rails.event.unsubscribe(subscriber)
+    end
+    events.filter_map do |event|
+      event[:payload].to_h.symbolize_keys if event[:name] == Invoices::StaleOperationIntents::NAME
     end
   end
 
-  it "still resolves another company's intent when one intent fails to resolve" do
-    freeze_time do
-      broken = recovery_test_intent(company_id: 41, created_at: 2.minutes.ago)
-      healthy = recovery_test_intent(company_id: 42, created_at: 2.minutes.ago)
-      allow(Invoices::OperationLock).to receive(:acquire!).and_call_original
-      allow(Invoices::OperationLock).to receive(:acquire!)
-        .with(anything, company_id: 41, invoice_id: 1).and_raise(ActiveRecord::StatementInvalid, "lock failed")
+  context "when intents stay pending past the stale threshold" do
+    # "Send `Rails.event.notify` named `invoices.stale_operation_intents` per company, with company_id, count and oldest_created_at."
+    # No signal may carry another company's backlog.
+    it "emits one stale signal per company carrying only that company's count and oldest intent", committed_data: true do
+      now = Time.current.change(usec: 0)
+      company_one_oldest = now - 15.minutes
+      company_two_oldest = now - (10.minutes + 1.second)
+      intent = ->(company_id, invoice_id, created_at) do
+        { company_id:, invoice_id:, operation_id: SecureRandom.uuid, state: "pending", generation: 1,
+          desired_entry_ids: [1], disposition: "active", created_at: }
+      end
+      InvoiceOperationIntent.insert_all!([
+        intent.call(1, 10, company_one_oldest),
+        intent.call(1, 11, now - (10.minutes + 1.second)),
+        intent.call(2, 20, company_two_oldest)
+      ])
+
+      payloads = recovery_stale_signal_payloads do
+        travel_to(now) { described_class.perform_now(reservations: recovery_test_adapter) }
+      end
+
+      expect(payloads.pluck(:company_id)).to contain_exactly(1, 2)
+      one = payloads.find { |payload| payload[:company_id] == 1 }
+      two = payloads.find { |payload| payload[:company_id] == 2 }
+      expect(one[:count]).to eq(2)
+      expect(Time.zone.parse(one[:oldest_created_at].to_s)).to eq(company_one_oldest)
+      expect(two[:count]).to eq(1)
+      expect(Time.zone.parse(two[:oldest_created_at].to_s)).to eq(company_two_oldest)
+    end
+
+    # "the stale signal fires per company at 10 min 1 s and not at 9 min 59 s"
+    it "emits one stale signal per company at 10 min 1 s and none for a company at 9 min 59 s" do
+      freeze_time do
+        oldest = (10.minutes + 1.second).ago
+        [[21, oldest], [21, oldest], [22, oldest], [23, (9.minutes + 59.seconds).ago]].each do |company_id, created_at|
+          recovery_test_intent(company_id:, created_at:)
+        end
+
+        payloads = recovery_stale_signal_payloads { described_class.perform_now(reservations: recovery_test_adapter) }
+
+        expect(payloads.pluck(:company_id)).to contain_exactly(21, 22)
+        expect(payloads.find { |payload| payload[:company_id] == 21 }).to include(count: 2)
+        expect(payloads.find { |payload| payload[:company_id] == 22 }).to include(count: 1)
+        payloads.each { |payload| expect(payload[:oldest_created_at].to_i).to eq(oldest.to_i) }
+      end
+    end
+
+    # "The 60-second pickup and the 10-minute signal are separate constants; the sweep never waits for the signal threshold before it resolves a crashed save."
+    # The scenario: every stale intent is also past pickup, so a sweep that resolves before it counts
+    # would never signal. Company 7503 sits at 9 min 59 s and must not signal.
+    it "signals stale intents per company even though the same sweep resolves them", committed_data: true do
+      oldest_a = (10.minutes + 5.seconds).ago
+      [[7501, oldest_a], [7501, (10.minutes + 1.second).ago], [7502, (10.minutes + 1.second).ago], [7503, (9.minutes + 59.seconds).ago]]
+        .each_with_index do |(company_id, created_at), index|
+          InvoiceOperationIntent.create!(
+            company_id:, invoice_id: 9500 + index, operation_id: SecureRandom.uuid, state: "pending", generation: 1,
+            disposition: "active", desired_entry_ids: [51], created_at:
+          )
+        end
+
+      payloads = recovery_stale_signal_payloads { described_class.perform_now(reservations: recovery_test_adapter) }
+        .sort_by { |payload| payload[:company_id] }
+
+      expect(payloads.map { |payload| payload.slice(:company_id, :count) }).to eq([
+        { company_id: 7501, count: 2 },
+        { company_id: 7502, count: 1 }
+      ])
+      expect(payloads.first[:oldest_created_at].to_i).to eq(oldest_a.to_i)
+      expect(InvoiceOperationIntent.where(state: "pending").pluck(:company_id)).to eq([])
+    end
+
+    it "recovers an intent at 61 s without sending a stale signal" do
+      freeze_time do
+        intent = recovery_test_intent(company_id: 31, created_at: 61.seconds.ago)
+
+        payloads = recovery_stale_signal_payloads { described_class.perform_now(reservations: recovery_test_adapter) }
+
+        expect(intent.reload.state).to eq("failed")
+        expect(InvoiceOperationOutboxItem.where(company_id: 31, operation_id: intent.operation_id, kind: "abort").count).to eq(1)
+        expect(payloads).to be_empty
+      end
+    end
+  end
+
+  context "when a save crashed or left its outbox row undelivered" do
+    # "A crash after prepare converges: recovery records the pending intent failed under the (company_id, invoice_id) advisory lock and the abort is delivered"
+    # "For each one it takes the same advisory lock, runs the guarded update to `failed`, and inserts the abort row in the same transaction only when that update wins."
+    # The invoice id names no invoice row: "A pending intent naming an invoice that never committed (a rolled-back create) is aborted the same way, never treated as an error."
+    it "converges a crashed save to failed with one delivered abort row and a second sweep adds nothing", committed_data: true do
+      company = create(:company)
+      operation_id = SecureRandom.uuid
+      intent = InvoiceOperationIntent.create!(
+        company_id: company.id, invoice_id: 987_654_321, operation_id:, state: "pending",
+        generation: 1, disposition: "active", desired_entry_ids: [21, 22], created_at: 61.seconds.ago
+      )
+      abort_requests = []
+      adapter = RecordingReservationAdapter.new(
+        prepare: Invoices::ReservationOutcome.new(state: "prepared", conflicts: [], counts: {}),
+        commit: Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {}),
+        abort: ->(request) { abort_requests << request; Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {}) }
+      )
+
+      expect { described_class.perform_now(reservations: adapter) }.not_to raise_error
+
+      expect(intent.reload.state).to eq("failed")
+      expect(intent.finished_at).to be_present
+      rows = InvoiceOperationOutboxItem.where(company_id: company.id, operation_id:)
+      expect(rows.pluck(:kind)).to eq(["abort"])
+      expect(rows.first.delivered_at).to be_present
+      expect(abort_requests.size).to eq(1)
+      expect(abort_requests.first).to have_attributes(company_id: company.id, invoice_id: 987_654_321, entries: [21, 22])
+
+      described_class.perform_now(reservations: adapter)
+
+      expect(InvoiceOperationOutboxItem.where(company_id: company.id, operation_id:).count).to eq(1)
+      expect(abort_requests.size).to eq(1)
+    end
+
+    # "The sweep also redelivers outbox rows that are still undelivered."
+    it "redelivers an undelivered abort row for an already failed intent once and a second sweep sends nothing", committed_data: true do
+      operation_id = SecureRandom.uuid
+      InvoiceOperationIntent.create!(
+        company_id: 1, invoice_id: 10, operation_id:, state: "failed", generation: 1,
+        disposition: "active", desired_entry_ids: [3, 5], finished_at: Time.current
+      )
+      item = InvoiceOperationOutboxItem.create!(
+        company_id: 1, invoice_id: 10, operation_id:, kind: "abort",
+        payload: { company_id: 1, invoice_id: 10, operation_id:, generation: 1, disposition: "active", desired_entry_ids: [3, 5] }
+      )
+      adapter = recovery_test_adapter
+
+      described_class.perform_now(reservations: adapter)
+
+      expect(adapter.requests.size).to eq(1)
+      expect(adapter.requests.first.operation_id).to eq(operation_id)
+      expect(adapter.requests.first.entries).to eq([3, 5])
+      expect(item.reload.delivered_at).to be_present
+      expect(InvoiceOperationOutboxItem.where(company_id: 1, operation_id:).count).to eq(1)
+
+      delivered_at = item.delivered_at
+      described_class.perform_now(reservations: adapter)
+
+      expect(adapter.requests.size).to eq(1)
+      expect(item.reload.delivered_at).to eq(delivered_at)
+    end
+
+    # "A crash after prepare converges: recovery records the pending intent failed under the (company_id, invoice_id) advisory lock and the abort is delivered"
+    # "an intent already committed is left alone"
+    # "A pending intent naming an invoice that never committed (a rolled-back create) is aborted the same way, never treated as an error."
+    it "converges a crash after prepare to a failed intent with its abort delivered, and leaves a committed intent alone" do
+      freeze_time do
+        invoice = create(:invoice)
+        crashed_id = SecureRandom.uuid
+        missing_invoice_id = SecureRandom.uuid
+        committed_id = SecureRandom.uuid
+        InvoiceOperationIntent.create!(company_id: invoice.company_id, invoice_id: invoice.id, operation_id: crashed_id,
+          state: "pending", generation: 1, disposition: "active", desired_entry_ids: [3], created_at: 61.seconds.ago)
+        InvoiceOperationIntent.create!(company_id: invoice.company_id, invoice_id: 987_654, operation_id: missing_invoice_id,
+          state: "pending", generation: 1, disposition: "active", desired_entry_ids: [4], created_at: 61.seconds.ago)
+        InvoiceOperationIntent.create!(company_id: invoice.company_id, invoice_id: invoice.id, operation_id: committed_id,
+          state: "committed", generation: 1, disposition: "active", desired_entry_ids: [5], created_at: 5.minutes.ago)
+        adapter = recovery_test_adapter
+
+        expect { described_class.perform_now(reservations: adapter) }.not_to raise_error
+
+        [crashed_id, missing_invoice_id].each do |operation_id|
+          expect(InvoiceOperationIntent.find_by!(company_id: invoice.company_id, operation_id:).state).to eq("failed")
+          aborts = InvoiceOperationOutboxItem.where(company_id: invoice.company_id, operation_id:, kind: "abort")
+          expect(aborts.count).to eq(1)
+          expect(aborts.first.delivered_at).to be_present
+        end
+        expect(InvoiceOperationIntent.find_by!(company_id: invoice.company_id, operation_id: committed_id).state).to eq("committed")
+        expect(InvoiceOperationOutboxItem.where(operation_id: committed_id)).to be_empty
+        expect(adapter.requests.map(&:operation_id)).to contain_exactly(crashed_id, missing_invoice_id)
+      end
+    end
+
+    # "It selects intents pending longer than `pickup_age`."
+    it "leaves an intent pending for 59 seconds untouched" do
+      freeze_time do
+        intent = recovery_test_intent(company_id: 11, created_at: 59.seconds.ago)
+        adapter = recovery_test_adapter
+
+        described_class.perform_now(reservations: adapter)
+
+        expect(intent.reload.state).to eq("pending")
+        expect(InvoiceOperationOutboxItem.where(company_id: 11, operation_id: intent.operation_id)).to be_empty
+        expect(adapter.requests).to be_empty
+      end
+    end
+
+    # "A pending intent naming an invoice that never committed (a rolled-back create) is aborted the same way, never treated as an error."
+    it "aborts and delivers a pending intent whose invoice never committed without raising", committed_data: true do
+      company_id = 7401
+      invoice_id = 9_999_401
+      operation_id = SecureRandom.uuid
+      InvoiceOperationIntent.create!(
+        company_id:, invoice_id:, operation_id:, state: "pending", generation: 1,
+        disposition: "active", desired_entry_ids: [41, 42], created_at: 61.seconds.ago
+      )
+      adapter = recovery_test_adapter
+
+      expect { described_class.perform_now(reservations: adapter) }.not_to raise_error
+
+      expect(Invoice.where(id: invoice_id)).not_to exist
+      expect(InvoiceOperationIntent.find_by!(company_id:, operation_id:).state).to eq("failed")
+      abort_rows = InvoiceOperationOutboxItem.where(company_id:, operation_id:)
+      expect(abort_rows.pluck(:kind)).to eq(["abort"])
+      expect(abort_rows.first.delivered_at).to be_present
+      expect(adapter.requests.map(&:invoice_id)).to eq([invoice_id])
+      expect(adapter.requests.first.entries).to eq([41, 42])
+    end
+
+    it "still resolves another company's intent when one intent fails to resolve" do
+      freeze_time do
+        broken = recovery_test_intent(company_id: 41, created_at: 2.minutes.ago)
+        healthy = recovery_test_intent(company_id: 42, created_at: 2.minutes.ago)
+        allow(Invoices::OperationLock).to receive(:acquire!).and_call_original
+        allow(Invoices::OperationLock).to receive(:acquire!)
+          .with(anything, company_id: 41, invoice_id: 1).and_raise(ActiveRecord::StatementInvalid, "lock failed")
+
+        expect { described_class.perform_now(reservations: recovery_test_adapter) }.not_to raise_error
+
+        expect(broken.reload.state).to eq("pending")
+        expect(InvoiceOperationOutboxItem.where(company_id: 41)).to be_empty
+        expect(healthy.reload.state).to eq("failed")
+        expect(InvoiceOperationOutboxItem.where(company_id: 42, kind: "abort").count).to eq(1)
+      end
+    end
+
+    it "rolls back the failed update when writing the abort row fails, and a later sweep resolves the intent" do
+      intent = recovery_test_intent(company_id: 43, created_at: 2.minutes.ago)
+      allow(InvoiceOperationOutboxItem).to receive(:record!).and_raise(ActiveRecord::StatementInvalid, "abort row write failed")
 
       expect { described_class.perform_now(reservations: recovery_test_adapter) }.not_to raise_error
 
-      expect(broken.reload.state).to eq("pending")
-      expect(InvoiceOperationOutboxItem.where(company_id: 41)).to be_empty
-      expect(healthy.reload.state).to eq("failed")
-      expect(InvoiceOperationOutboxItem.where(company_id: 42, kind: "abort").count).to eq(1)
+      expect(intent.reload.state).to eq("pending")
+      expect(InvoiceOperationOutboxItem.where(company_id: 43)).to be_empty
+
+      allow(InvoiceOperationOutboxItem).to receive(:record!).and_call_original
+      described_class.perform_now(reservations: recovery_test_adapter)
+
+      expect(intent.reload.state).to eq("failed")
+      expect(InvoiceOperationOutboxItem.where(company_id: 43, kind: "abort").count).to eq(1)
     end
   end
 
-  it "rolls back the failed update when writing the abort row fails, and a later sweep resolves the intent" do
-    intent = recovery_test_intent(company_id: 43, created_at: 2.minutes.ago)
-    allow(InvoiceOperationOutboxItem).to receive(:record!).and_raise(ActiveRecord::StatementInvalid, "abort row write failed")
+  context "when a live save holds the advisory lock", committed_data: true do
+    # Test list: "recovery while a save holds the advisory lock waits and changes nothing"
+    # The scenario: a slow prepare outlives the 60 s pickup; recovery must not fail an intent
+    # whose save still holds the (company_id, invoice_id) lock.
+    it "waits on a live save's advisory lock and leaves the intent that save commits alone" do
+      company_id = 7301
+      invoice_id = 9301
+      operation_id = SecureRandom.uuid
+      InvoiceOperationIntent.create!(
+        company_id:, invoice_id:, operation_id:, state: "pending", generation: 1,
+        disposition: "active", desired_entry_ids: [31], created_at: 2.minutes.ago
+      )
+      adapter = recovery_test_adapter
+      holder_pids = Queue.new
+      recovery_pids = Queue.new
+      locked = Queue.new
+      release = Queue.new
 
-    expect { described_class.perform_now(reservations: recovery_test_adapter) }.not_to raise_error
-
-    expect(intent.reload.state).to eq("pending")
-    expect(InvoiceOperationOutboxItem.where(company_id: 43)).to be_empty
-
-    allow(InvoiceOperationOutboxItem).to receive(:record!).and_call_original
-    described_class.perform_now(reservations: recovery_test_adapter)
-
-    expect(intent.reload.state).to eq("failed")
-    expect(InvoiceOperationOutboxItem.where(company_id: 43, kind: "abort").count).to eq(1)
-  end
-end
-
-RSpec.describe RecoverInvoiceOperationIntentsJob, committed_data: true do
-  it "waits on a coordinated save paused in prepare and writes no abort once that save commits" do
-    invoice = create(:invoice)
-    request = Invoices::ReservationRequest.new(
-      company_id: invoice.company_id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
-      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [61]
-    )
-    in_prepare = Queue.new
-    release = Queue.new
-    committed = Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {})
-    adapter = RecordingReservationAdapter.new(
-      prepare: lambda { |_received|
-        in_prepare << true
-        release.pop(timeout: 10)
-        Invoices::ReservationOutcome.new(state: "prepared", conflicts: [], counts: {})
-      },
-      commit: committed,
-      abort: Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
-    )
-    save_pids = Queue.new
-    recovery_pids = Queue.new
-
-    save = committed_data_thread(save_pids) do
-      ApplicationRecord.transaction do
-        Invoices::OperationCoordinator.new(reservations: adapter).call(request, holding: { entry_ids: [61], disposition: "active" })
+      holder = committed_data_thread(holder_pids) do
+        ApplicationRecord.transaction do
+          Invoices::OperationLock.acquire!(ActiveRecord::Base.connection, company_id:, invoice_id:)
+          locked << true
+          release.pop(timeout: 10)
+          InvoiceOperationIntent.where(company_id:, invoice_id:, operation_id:, state: "pending")
+            .update_all(state: "committed", finished_at: Time.current)
+        end
       end
-    end
-    expect(in_prepare.pop(timeout: 5)).to be(true)
-    # pickup_age: 0 makes the save's fresh intent count as crashed, as a slow prepare past 60 s would.
-    recovery = committed_data_thread(recovery_pids) { described_class.perform_now(pickup_age: 0.seconds, reservations: adapter) }
+      expect(locked.pop(timeout: 5)).to be(true)
+      recovery = committed_data_thread(recovery_pids) { described_class.perform_now(reservations: adapter) }
 
-    begin
-      waited = blocked_by?(recovery_pids.pop(timeout: 5), save_pids.pop(timeout: 5))
+      begin
+        waited = blocked_by?(recovery_pids.pop(timeout: 5), holder_pids.pop(timeout: 5))
+        state_while_blocked = InvoiceOperationIntent.find_by!(company_id:, operation_id:).state
+      ensure
+        release << true
+      end
+      holder.join(5)
+      recovery.join(10)
+
+      expect(waited).to be(true)
+      expect(state_while_blocked).to eq("pending")
+      expect(InvoiceOperationIntent.find_by!(company_id:, operation_id:).state).to eq("committed")
+      expect(InvoiceOperationOutboxItem.where(company_id:, operation_id:, kind: "abort")).not_to exist
+      expect(adapter.requests).to be_empty
     ensure
-      release << true
+      release&.push(true)
+      [holder, recovery].compact.each { |thread| thread.join(5) }
     end
-    save.join(10)
-    recovery.join(10)
 
-    intent = InvoiceOperationIntent.find_by!(company_id: request.company_id, operation_id: request.operation_id)
-    rows = InvoiceOperationOutboxItem.where(company_id: request.company_id, operation_id: request.operation_id)
-    expect(waited).to be(true)
-    expect(intent.state).to eq("committed")
-    expect(rows.pluck(:kind)).to eq(["commit"])
-    expect(rows.first.delivered_at).to be_present
-  ensure
-    release&.push(true)
-    [save, recovery].compact.each { |thread| thread.join(10) }
-  end
+    it "waits on a coordinated save paused in prepare and writes no abort once that save commits" do
+      invoice = create(:invoice)
+      request = Invoices::ReservationRequest.new(
+        company_id: invoice.company_id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
+        generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [61]
+      )
+      in_prepare = Queue.new
+      release = Queue.new
+      committed = Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {})
+      adapter = RecordingReservationAdapter.new(
+        prepare: lambda { |_received|
+          in_prepare << true
+          release.pop(timeout: 10)
+          Invoices::ReservationOutcome.new(state: "prepared", conflicts: [], counts: {})
+        },
+        commit: committed,
+        abort: Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
+      )
+      save_pids = Queue.new
+      recovery_pids = Queue.new
 
-  it "leaves an intent whose save holds the lock past the wait bound pending and still fails another company's intent" do
-    stub_const("RecoverInvoiceOperationIntentsJob::LOCK_WAIT_TIMEOUT", "200ms")
-    aborted = Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
-    adapter = RecordingReservationAdapter.new(prepare: aborted, commit: aborted, abort: aborted)
-    stuck = InvoiceOperationIntent.create!(company_id: 7701, invoice_id: 9701, operation_id: SecureRandom.uuid,
-      state: "pending", generation: 1, disposition: "active", desired_entry_ids: [1], created_at: 2.minutes.ago)
-    crashed = InvoiceOperationIntent.create!(company_id: 7702, invoice_id: 9702, operation_id: SecureRandom.uuid,
-      state: "pending", generation: 1, disposition: "active", desired_entry_ids: [2], created_at: 2.minutes.ago)
-    locked = Queue.new
-    release = Queue.new
-
-    holder = committed_data_thread do
-      ApplicationRecord.transaction do
-        Invoices::OperationLock.acquire!(ActiveRecord::Base.connection, company_id: 7701, invoice_id: 9701)
-        locked << true
-        release.pop(timeout: 10)
+      save = committed_data_thread(save_pids) do
+        ApplicationRecord.transaction do
+          Invoices::OperationCoordinator.new(reservations: adapter).call(request, holding: { entry_ids: [61], disposition: "active" })
+        end
       end
+      expect(in_prepare.pop(timeout: 5)).to be(true)
+      # pickup_age: 0 makes the save's fresh intent count as crashed, as a slow prepare past 60 s would.
+      recovery = committed_data_thread(recovery_pids) { described_class.perform_now(pickup_age: 0.seconds, reservations: adapter) }
+
+      begin
+        waited = blocked_by?(recovery_pids.pop(timeout: 5), save_pids.pop(timeout: 5))
+      ensure
+        release << true
+      end
+      save.join(10)
+      recovery.join(10)
+
+      intent = InvoiceOperationIntent.find_by!(company_id: request.company_id, operation_id: request.operation_id)
+      rows = InvoiceOperationOutboxItem.where(company_id: request.company_id, operation_id: request.operation_id)
+      expect(waited).to be(true)
+      expect(intent.state).to eq("committed")
+      expect(rows.pluck(:kind)).to eq(["commit"])
+      expect(rows.first.delivered_at).to be_present
+    ensure
+      release&.push(true)
+      [save, recovery].compact.each { |thread| thread.join(10) }
     end
-    expect(locked.pop(timeout: 5)).to be(true)
 
-    described_class.perform_now(reservations: adapter)
+    it "leaves an intent whose save holds the lock past the wait bound pending and still fails another company's intent" do
+      stub_const("RecoverInvoiceOperationIntentsJob::LOCK_WAIT_TIMEOUT", "200ms")
+      stuck = InvoiceOperationIntent.create!(company_id: 7701, invoice_id: 9701, operation_id: SecureRandom.uuid,
+        state: "pending", generation: 1, disposition: "active", desired_entry_ids: [1], created_at: 2.minutes.ago)
+      crashed = InvoiceOperationIntent.create!(company_id: 7702, invoice_id: 9702, operation_id: SecureRandom.uuid,
+        state: "pending", generation: 1, disposition: "active", desired_entry_ids: [2], created_at: 2.minutes.ago)
+      locked = Queue.new
+      release = Queue.new
 
-    expect(stuck.reload.state).to eq("pending")
-    expect(InvoiceOperationOutboxItem.where(company_id: 7701)).to be_empty
-    expect(crashed.reload.state).to eq("failed")
-    expect(InvoiceOperationOutboxItem.where(company_id: 7702, kind: "abort").count).to eq(1)
-  ensure
-    release&.push(true)
-    holder&.join(5)
+      holder = committed_data_thread do
+        ApplicationRecord.transaction do
+          Invoices::OperationLock.acquire!(ActiveRecord::Base.connection, company_id: 7701, invoice_id: 9701)
+          locked << true
+          release.pop(timeout: 10)
+        end
+      end
+      expect(locked.pop(timeout: 5)).to be(true)
+
+      described_class.perform_now(reservations: recovery_test_adapter)
+
+      expect(stuck.reload.state).to eq("pending")
+      expect(InvoiceOperationOutboxItem.where(company_id: 7701)).to be_empty
+      expect(crashed.reload.state).to eq("failed")
+      expect(InvoiceOperationOutboxItem.where(company_id: 7702, kind: "abort").count).to eq(1)
+    ensure
+      release&.push(true)
+      holder&.join(5)
+    end
   end
 end
