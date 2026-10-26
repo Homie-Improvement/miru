@@ -5,6 +5,7 @@ require "securerandom"
 require_relative "client"
 require_relative "contract"
 require_relative "idempotency_receipts"
+require_relative "reservation_rules"
 require_relative "../../../gems/timekeeping_rules/lib/timekeeping_rules/reservation_decision"
 
 module TimekeepingContract
@@ -74,6 +75,8 @@ module TimekeepingContract
       # it counts: always.
       service_command_writes: ->(route:) { true },
       replay_terminal_prepare: true,
+      # The section 7.2 prepare decision table the fake answers from.
+      prepare_table: ReservationRules::PREPARE_TABLE,
       snapshot_entry: ->(entry, credentials:) { entry },
       # Whether an entry write carries a credential Timekeeping holds anywhere
       # in its body. Such a write is refused, so the snapshot it would publish
@@ -434,13 +437,14 @@ module TimekeepingContract
         end
 
         entry_ids = Array(body["entries"]).map { |id| integer(id) }
-        in_company_ids = entry_ids.uniq.select { |entry_id| visible_entry(entry_id, company_id) }
-        decision = TimekeepingRules::ReservationDecision.call(
-          current: decision_reservations(in_company_ids, body["invoice_id"]), desired: entry_ids,
-          disposition: body["disposition"], invoice_status: WIRE_INVOICE_STATUS
-        )
-        conflicts = decision[:conflicts]
-        free = decision[:reserve]
+        # Prepare answers from the swappable prepare_table policy, so the
+        # mutation spec can break one row of it; commit's release still comes
+        # from TimekeepingRules::ReservationDecision.
+        outcomes = entry_ids.uniq.map { |entry_id| [entry_id, prepare_outcome(entry_id, company_id, body["invoice_id"])] }
+        conflicts = outcomes.filter_map do |entry_id, outcome|
+          { entry_id:, reason: outcome } if ReservationRules.refusal?(outcome)
+        end
+        free = outcomes.filter_map { |entry_id, outcome| entry_id if outcome == :add_provisional }
         operation_id = body["operation_id"]
         # Reservations carry the operation's full identity, so another actor's
         # operation with the same operation_id never commits or aborts them.
@@ -463,6 +467,17 @@ module TimekeepingContract
         }
         @operations[operation_key] = stored
         prepare_answer(stored)
+      end
+
+      def prepare_outcome(entry_id, company_id, invoice_id)
+        current = @reservations.select { |reservation| reservation[:entry_id] == entry_id }
+        facts = {
+          in_company: !visible_entry(entry_id, company_id).nil?,
+          committed: current.find { |reservation| reservation[:state] == "committed" },
+          provisional: current.find { |reservation| reservation[:state] == "provisional" },
+          invoice_id:
+        }
+        ReservationRules.prepare_outcome(facts, table: @policies[:prepare_table])
       end
 
       # Each entry's reservations in the form ReservationDecision reads, seen

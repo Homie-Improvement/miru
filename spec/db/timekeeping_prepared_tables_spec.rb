@@ -9,6 +9,7 @@ RSpec.describe "Timekeeping prepared tables" do
   tenant_tables = %w[
     invoice_operation_intents entries reservations invoice_operations
     entry_audits idempotency_records entry_outbox_items
+    invoice_entry_holdings invoice_operation_outbox_items
   ].freeze
 
   let(:connection) { ActiveRecord::Base.connection }
