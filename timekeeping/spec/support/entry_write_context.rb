@@ -48,7 +48,7 @@ RSpec.shared_context "timekeeping entry writes without transactional fixtures" d
   after do
     ApplicationRecord.connection.execute(<<~SQL.squish)
       TRUNCATE entries, reservations, audit_events, outbox_snapshots, ownership_generations, idempotency_receipts,
-        write_metric_windows
+        write_metric_windows, write_metric_events
     SQL
   end
 end
@@ -64,6 +64,50 @@ module EntryWriteCounts
   end
 end
 
+# Holds a company's write_metric_windows row on a connection of its own, so
+# metric specs can show what waits on that row and what does not. Needs the
+# non-transactional context, because the held row must be committed first.
+module MetricWindowLockHelpers
+  # Locks company_id's window row FOR UPDATE until the returned release queue
+  # is pushed (or 10 seconds pass). Returns the holder thread, the release
+  # queue and the holder's server process id.
+  def hold_metric_window_row(company_id)
+    held = Queue.new
+    release = Queue.new
+    holder_pid = Queue.new
+    holder = Thread.new do
+      ApplicationRecord.connection_pool.with_connection do |connection|
+        holder_pid << connection.select_value("SELECT pg_backend_pid()")
+        connection.transaction do
+          connection.execute(ApplicationRecord.sanitize_sql_array(
+            ["SELECT 1 FROM write_metric_windows WHERE company_id = ? FOR UPDATE", company_id]
+          ))
+          held << true
+          release.pop(timeout: 10)
+        end
+      end
+    end
+    expect(held.pop(timeout: 10)).to be(true)
+    [holder, release, holder_pid.pop(timeout: 10)]
+  end
+
+  # Polls until some session reports waiting on holding_pid's locks; answers
+  # whether one did within five seconds.
+  def metric_lock_waiter_seen?(holding_pid)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+    while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      seen = ApplicationRecord.connection.select_value(ApplicationRecord.sanitize_sql_array(
+        ["SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE ? = ANY(pg_blocking_pids(pid)))", holding_pid]
+      ))
+      return true if seen
+
+      sleep 0.02
+    end
+    false
+  end
+end
+
 RSpec.configure do |config|
   config.include EntryWriteCounts
+  config.include MetricWindowLockHelpers
 end
