@@ -202,21 +202,23 @@ RSpec.describe "Api::V1::Payments#create during a handoff", type: :request do
 
   # "Every invoice, line-item, invoice-tax and payment write, mobile-collection payments included, gets 503 ownership_moving while handoff_step is set and writes nothing"
   it "refuses a manual payment during a handoff without changing the invoice and records it once when retried after" do
-    invoice.reload
-    status_before = invoice.status
-    outstanding_before = invoice.outstanding_amount
-    expect(status_before).to eq("sent")
+    money_fields = %w[status amount_due amount_paid outstanding_amount]
+    baseline = invoice.reload.attributes.slice(*money_fields)
+    expect(baseline.slice("status", "amount_due", "amount_paid"))
+      .to eq("status" => "sent", "amount_due" => 100, "amount_paid" => 0)
     TimekeepingOwnership.current.update!(handoff_step: "close_admission")
 
-    send_request :post, api_v1_payments_path(payment:), headers: auth_headers(user)
+    expect {
+      expect {
+        send_request :post, api_v1_payments_path(payment:), headers: auth_headers(user)
+      }.not_to have_enqueued_mail
+    }.not_to change(Payment, :count)
 
     expect(response).to have_http_status(:service_unavailable)
     expect(json_response["reason"]).to eq("ownership_moving")
     expect(response.headers["Retry-After"]).to eq("5")
     expect(invoice.payments.count).to eq(0)
-    invoice.reload
-    expect(invoice.status).to eq(status_before)
-    expect(invoice.outstanding_amount).to eq(outstanding_before)
+    expect(invoice.reload.attributes.slice(*money_fields)).to eq(baseline)
 
     TimekeepingOwnership.current.update!(handoff_step: nil)
     send_request :post, api_v1_payments_path(payment:), headers: auth_headers(user)

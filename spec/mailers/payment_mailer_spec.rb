@@ -29,15 +29,19 @@ end
 RSpec.describe PaymentMailer, type: :mailer do
   # Acceptance bar: "Every invoice, line-item, invoice-tax and payment write, mobile-collection payments included,
   # gets 503 ownership_moving while handoff_step is set and writes nothing"
-  it "writes no payment_sent_at when a payment mail is processed during a handoff" do
+  it "refuses the payment mail during a handoff without setting payment_sent_at or sending mail" do
     company = create(:company)
     client = create(:client, company:)
     invoice = create(:invoice, client:, company:)
-    TimekeepingOwnership.current.update!(handoff_step: "settle")
-
-    mail = PaymentMailer.with(invoice_id: invoice.id, subject: "Payment").payment
-
-    expect { mail.message }.to raise_error(Timekeeping::BillingFence::OwnershipMoving)
     expect(invoice.reload.payment_sent_at).to be_nil
+    TimekeepingOwnership.current.update!(handoff_step: "settle")
+    ActionMailer::Base.deliveries.clear
+
+    expect do
+      PaymentMailer.with(invoice_id: invoice.id, subject: "Payment").payment.deliver_now
+    end.to raise_error(Timekeeping::BillingFence::OwnershipMoving)
+
+    expect(invoice.reload.payment_sent_at).to be_nil
+    expect(ActionMailer::Base.deliveries).to be_empty
   end
 end
