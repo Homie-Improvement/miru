@@ -5,204 +5,291 @@
 require "rails_helper"
 
 RSpec.describe Timekeeping::Handoff::Checkpoint do
-  # "A value that still has no home is refused as a backstop, naming the table; it is never dropped."
-  it "refuses an entry row carrying a key with no canonical column, naming the table" do
-    row = {
-      "id" => 1, "company_id" => 1, "version" => 1, "project_id" => 1, "user_id" => 1, "agent_id" => nil,
-      "work_date" => Date.new(2026, 1, 5), "duration" => 60.0, "note" => "", "bill_status" => "unbilled",
-      "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
-      "external_run_id" => nil, "external_session_id" => nil, "proof_url" => nil, "proof_metadata" => {},
-      "discarded_at" => nil, "created_at" => Time.utc(2026, 1, 5, 9), "updated_at" => Time.utc(2026, 1, 5, 9)
-    }
-    tables = described_class::TABLES.keys.index_with { [] }
-    tables["entries"] = [row.merge("smuggled_rate" => 150)]
-
-    expect { described_class.build(tables: tables) }
-      .to raise_error(described_class::ShapeError, /entries/)
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Checkpoint do
-  # "A checkpoint carries a row count and a checksum per table and per company, and every row carries company_id"
-  it "refuses a row whose company_id is nil, naming the table" do
-    receipt = {
-      "id" => 1, "company_id" => nil, "actor_type" => "User", "actor_id" => 7, "operation" => "create_entry",
-      "key" => "k-1", "fingerprint" => "{\"a\":1}", "status" => 201, "body" => "{\"id\":1}",
-      "created_at" => Time.utc(2026, 1, 5, 9)
-    }
-    tables = described_class::TABLES.keys.index_with { [] }
-    tables["idempotency_records"] = [receipt]
-
-    expect { described_class.build(tables: tables) }
-      .to raise_error(described_class::ShapeError, /idempotency_records/)
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Checkpoint do
-  # "A changed field, or a float differing in its last bit, fails `verify` for that table and company only."
-  it "reports a tampered row for its own company only after a transport round trip" do
-    entry = lambda do |id, company_id, note|
-      {
-        "id" => id, "company_id" => company_id, "version" => 1, "project_id" => 1, "user_id" => 1, "agent_id" => nil,
-        "work_date" => Date.new(2026, 1, 5), "duration" => 60.0, "note" => note, "bill_status" => "unbilled",
-        "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
-        "external_run_id" => nil, "external_session_id" => nil, "proof_url" => nil, "proof_metadata" => {},
-        "discarded_at" => nil, "created_at" => Time.utc(2026, 1, 5, 9), "updated_at" => Time.utc(2026, 1, 5, 9)
-      }
-    end
-    tables = described_class::TABLES.keys.index_with { [] }
-    tables["entries"] = [entry.call(1, 101, "tamperme-alpha"), entry.call(2, 202, "untouched-beta")]
-    checkpoint = described_class.build(tables: tables)
-
-    tampered = described_class.from_json(checkpoint.to_json.gsub("tamperme-alpha", "tamperme-omega"))
-    mismatches = described_class.verify(tampered)
-
-    expect(described_class.verify(checkpoint)).to eq([])
-    expect(mismatches.map { |m| [m[:table], m[:company_id]] }).to eq([["entries", 101]])
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Checkpoint, "row shapes and encoding" do
-  def shape_case_entry(id: 1, company_id: 1, **overrides)
+  # One value per canonical column name across every table in TABLES. Built on
+  # each call so no example can change a hash another example holds.
+  def checkpoint_sample_values
+    at = Time.utc(2026, 1, 5, 9)
     {
-      "id" => id, "company_id" => company_id, "version" => 1, "project_id" => 1, "user_id" => 1, "agent_id" => nil,
+      "id" => 1, "company_id" => 1, "version" => 1, "project_id" => 10, "user_id" => 20, "agent_id" => nil,
       "work_date" => Date.new(2026, 1, 5), "duration" => 60.0, "note" => "", "bill_status" => "unbilled",
       "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
       "external_run_id" => nil, "external_session_id" => nil, "proof_url" => nil, "proof_metadata" => {},
-      "discarded_at" => nil, "created_at" => Time.utc(2026, 1, 5, 9), "updated_at" => Time.utc(2026, 1, 5, 9)
-    }.merge(overrides.transform_keys(&:to_s))
+      "discarded_at" => nil, "created_at" => at, "updated_at" => at,
+      "entry_id" => 1, "invoice_id" => 9, "state" => "committed", "disposition" => "active",
+      "operation_id" => "8f1c7d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e", "desired_entry_ids" => [1], "generation" => 1,
+      "finished_at" => nil, "actor_type" => "User", "actor_id" => 20, "action" => "create", "before" => nil,
+      "after" => { "note" => "a" }, "entry_created_at" => at, "operation" => "create_entry", "key" => "k-1",
+      "fingerprint" => "f", "status" => 201, "body" => "{}"
+    }
   end
 
-  def shape_case_tables(**rows_by_table)
+  # A row with exactly the table's canonical columns. A column added to TABLES
+  # without a sample value fails here with a KeyError, the one place to edit.
+  def checkpoint_row(table, **overrides)
+    sample = checkpoint_sample_values
+    described_class::TABLES.fetch(table).index_with { |column| sample.fetch(column) }
+      .merge(overrides.transform_keys(&:to_s))
+  end
+
+  def checkpoint_entry(**overrides)
+    checkpoint_row("entries", **overrides)
+  end
+
+  # Every table in TABLES, empty unless given rows.
+  def checkpoint_tables(**rows_by_table)
     described_class::TABLES.keys.index_with { [] }.merge(rows_by_table.transform_keys(&:to_s))
   end
 
-  it "gives the entries table the snapshot contract's entry_fields" do
-    contract = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/entry_snapshots.yml"))
-
-    expect(described_class::TABLES.fetch("entries")).to match_array(contract.fetch("entry_fields"))
+  # The transport form of rows_checkpoint carrying digest_checkpoint's digest,
+  # as a checkpoint changed in transit would arrive.
+  def checkpoint_with_digest_of(rows_checkpoint, digest_checkpoint)
+    document = JSON.parse(rows_checkpoint.to_json)
+    document["digest"] = JSON.parse(digest_checkpoint.to_json).fetch("digest")
+    described_class.from_json(JSON.generate(document))
   end
 
-  it "refuses a row missing a canonical column, naming the table and the column" do
-    tables = shape_case_tables(entries: [shape_case_entry.except("proof_url")])
+  describe "row shape" do
+    # "A checkpoint carries a row count and a checksum per table and per company, and every row carries company_id"
+    it "refuses a row whose company_id is nil in every table, naming the table" do
+      described_class::TABLES.each_key do |table|
+        tables = checkpoint_tables(table => [checkpoint_row(table, company_id: nil)])
 
-    expect { described_class.build(tables:) }.to raise_error(described_class::ShapeError, /entries.*proof_url/)
-  end
-
-  it "refuses a checkpoint that leaves out a table" do
-    tables = shape_case_tables.except("reservations")
-
-    expect { described_class.build(tables:) }.to raise_error(described_class::ShapeError, /reservations/)
-  end
-
-  it "tells nil apart from an empty string, and an integer from the equal float" do
-    with_nil = described_class.build(tables: shape_case_tables(entries: [shape_case_entry(note: nil)]))
-    with_empty = described_class.build(tables: shape_case_tables(entries: [shape_case_entry(note: "")]))
-    with_float = described_class.build(tables: shape_case_tables(entries: [shape_case_entry(duration: 60.0)]))
-    with_integer = described_class.build(tables: shape_case_tables(entries: [shape_case_entry(duration: 60)]))
-
-    expect(with_nil.digest).not_to eq(with_empty.digest)
-    expect(with_float.digest).not_to eq(with_integer.digest)
-  end
-
-  it "reports rows of a company the digest does not list" do
-    original = described_class.build(tables: shape_case_tables(entries: [shape_case_entry(id: 1, company_id: 1)]))
-    added = described_class.new(
-      rows: shape_case_tables(entries: [shape_case_entry(id: 1, company_id: 1), shape_case_entry(id: 2, company_id: 2)]),
-      digest: original.digest
-    )
-
-    mismatches = described_class.verify(added)
-
-    expect(mismatches.map { |mismatch| [mismatch[:table], mismatch[:company_id], mismatch[:expected]] })
-      .to eq([["entries", 2, nil]])
-  end
-
-  it "returns equal rows, with float bits and jsonb values intact, from to_json and from_json" do
-    entry = shape_case_entry(
-      duration: (0.1 + 0.2).next_float, source_metadata: { "b" => [1, 2.5, nil], "a" => { "z" => "x" } },
-      created_at: Time.utc(2026, 1, 5, 9, 0, 0, 123_456)
-    )
-    receipt = {
-      "id" => 3, "company_id" => 1, "actor_type" => "User", "actor_id" => 7, "operation" => "create_entry",
-      "key" => "k-1", "fingerprint" => "f", "status" => 201, "body" => "{ \"b\":1,  \"a\":2 }",
-      "created_at" => Time.utc(2026, 1, 5, 9)
-    }
-    operation = {
-      "id" => 4, "company_id" => 1, "invoice_id" => 9, "operation_id" => "8f1c7d0e-1f2a-4b3c-9d4e-5f6a7b8c9d0e",
-      "state" => "committed", "desired_entry_ids" => [1, 2], "disposition" => "active", "generation" => 2,
-      "created_at" => Time.utc(2026, 1, 5, 9), "finished_at" => nil
-    }
-    checkpoint = described_class.build(
-      tables: shape_case_tables(entries: [entry], idempotency_records: [receipt], invoice_operations: [operation])
-    )
-
-    restored = described_class.from_json(checkpoint.to_json)
-
-    expect(restored.rows).to eq(checkpoint.rows)
-    restored_duration = restored.rows.fetch("entries").first.fetch("duration")
-    expect([restored_duration].pack("G")).to eq([entry.fetch("duration")].pack("G"))
-    expect(restored.digest).to eq(checkpoint.digest)
-  end
-
-  it "reports every mismatch, including a count changed while rows and checksum stay intact" do
-    audit = {
-      "id" => 5, "company_id" => 2, "entry_id" => 2, "actor_type" => "User", "actor_id" => 7, "action" => "create",
-      "before" => nil, "after" => { "note" => "a" }, "entry_created_at" => Time.utc(2026, 1, 5, 9),
-      "created_at" => Time.utc(2026, 1, 5, 9)
-    }
-    checkpoint = described_class.build(tables: shape_case_tables(
-      entries: [shape_case_entry(id: 1, company_id: 1), shape_case_entry(id: 2, company_id: 2)],
-      entry_audits: [audit]
-    ))
-    digest = checkpoint.digest.to_h do |table, companies|
-      [table, companies.to_h { |company_id, entry| [company_id, entry.dup] }]
+        expect { described_class.build(tables:) }
+          .to raise_error(described_class::ShapeError, /\A#{table}: a row has no company_id\z/)
+      end
     end
-    digest["entries"][1][:count] += 1
-    tampered = described_class.new(
-      rows: checkpoint.rows.merge("entry_audits" => [audit.merge("action" => "update")]),
-      digest: digest
-    )
 
-    mismatches = described_class.verify(tampered)
+    # "A value that still has no home is refused as a backstop, naming the table; it is never dropped."
+    it "refuses a row carrying a key with no canonical column in every table, naming the table" do
+      described_class::TABLES.each_key do |table|
+        tables = checkpoint_tables(table => [checkpoint_row(table).merge("no_home_field" => 1)])
 
-    expect(mismatches.map { |mismatch| [mismatch[:table], mismatch[:company_id]] })
-      .to eq([["entries", 1], ["entry_audits", 2]])
+        expect { described_class.build(tables:) }
+          .to raise_error(described_class::ShapeError, /\A#{table}: columns with no home in the checkpoint: no_home_field\z/)
+      end
+    end
+
+    it "gives the entries table the snapshot contract's entry_fields" do
+      contract = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/entry_snapshots.yml"))
+
+      expect(described_class::TABLES.fetch("entries")).to match_array(contract.fetch("entry_fields"))
+    end
+
+    it "refuses a row missing a canonical column, naming the table and the column" do
+      tables = checkpoint_tables(entries: [checkpoint_entry.except("proof_url")])
+
+      expect { described_class.build(tables:) }.to raise_error(described_class::ShapeError, /entries.*proof_url/)
+    end
+
+    it "refuses a checkpoint that leaves out a table" do
+      tables = checkpoint_tables.except("reservations")
+
+      expect { described_class.build(tables:) }.to raise_error(described_class::ShapeError, /reservations/)
+    end
+
+    it "refuses a field added to a row after the checkpoint was built" do
+      tables = checkpoint_tables(entries: [checkpoint_entry])
+      checkpoint = described_class.build(tables:)
+
+      tables["entries"].first["unmapped_field"] = "added later"
+      expect { checkpoint.rows.fetch("entries").first["unmapped_field"] = "added later" }.to raise_error(FrozenError)
+      expect(described_class.verify(checkpoint)).to eq([])
+      expect(checkpoint.to_json).not_to include("unmapped_field")
+    end
+
+    it "refuses rows outside the canonical shape when verifying a checkpoint built without build" do
+      original = described_class.build(tables: checkpoint_tables(entries: [checkpoint_entry]))
+      widened = described_class.new(
+        rows: checkpoint_tables(entries: [checkpoint_entry.merge("unmapped_field" => "x")]),
+        digest: original.digest
+      )
+
+      expect { described_class.verify(widened) }.to raise_error(described_class::ShapeError, /entries.*unmapped_field/)
+      expect { widened.to_json }.to raise_error(described_class::ShapeError, /entries.*unmapped_field/)
+    end
+
+    it "refuses to serialize a directly built checkpoint with a missing column, a missing or extra table, or no company_id" do
+      original = described_class.build(tables: checkpoint_tables(entries: [checkpoint_entry]))
+      broken_tables = {
+        /entries.*proof_url/ => checkpoint_tables(entries: [checkpoint_entry.except("proof_url")]),
+        /reservations/ => checkpoint_tables.except("reservations"),
+        /unknown tables: invoices/ => checkpoint_tables.merge("invoices" => []),
+        /entries: a row has no company_id/ => checkpoint_tables(entries: [checkpoint_entry(company_id: nil)])
+      }
+
+      broken_tables.each do |message, rows|
+        expect { described_class.new(rows:, digest: original.digest).to_json }
+          .to raise_error(described_class::ShapeError, message)
+      end
+    end
   end
 
-  it "refuses a field added to a row after the checkpoint was built" do
-    tables = shape_case_tables(entries: [shape_case_entry])
-    checkpoint = described_class.build(tables:)
+  describe "digest" do
+    # "A checkpoint carries a row count and a checksum per table and per company, and every row carries company_id"
+    it "carries a row count and a checksum for every company" do
+      tables = checkpoint_tables(
+        entries: [checkpoint_entry(id: 1, company_id: 7), checkpoint_entry(id: 2, company_id: 7), checkpoint_entry(id: 3, company_id: 8)]
+      )
 
-    tables["entries"].first["unmapped_field"] = "added later"
-    expect { checkpoint.rows.fetch("entries").first["unmapped_field"] = "added later" }.to raise_error(FrozenError)
-    expect(described_class.verify(checkpoint)).to eq([])
-    expect(checkpoint.to_json).not_to include("unmapped_field")
+      digest = described_class.build(tables:).digest
+
+      expect(digest.fetch("entries").keys).to contain_exactly(7, 8)
+      expect(digest.dig("entries", 7, :count)).to eq(2)
+      expect(digest.dig("entries", 8, :count)).to eq(1)
+      expect(digest.dig("entries", 7, :checksum)).to be_a(String).and(be_present)
+      expect(digest.dig("entries", 7, :checksum)).not_to eq(digest.dig("entries", 8, :checksum))
+    end
+
+    # "The checksum must tell float values apart bit for bit."
+    # "A changed field, or a float differing in its last bit, fails `verify` for that table and company only."
+    it "changes only that table and company's checksum when a duration differs in its last bit" do
+      digest_for = lambda do |company_one_duration|
+        described_class.build(tables: checkpoint_tables(
+          entries: [checkpoint_entry(id: 1, company_id: 1, duration: company_one_duration),
+                    checkpoint_entry(id: 2, company_id: 2, duration: 0.1 + 0.2)],
+          idempotency_records: [checkpoint_row("idempotency_records", company_id: 1)]
+        )).digest
+      end
+      original = digest_for.call(0.1 + 0.2)
+      changed = digest_for.call((0.1 + 0.2).next_float)
+
+      expect(changed.dig("entries", 1, :checksum)).not_to eq(original.dig("entries", 1, :checksum))
+      expect(changed.dig("entries", 1, :count)).to eq(original.dig("entries", 1, :count))
+      expect(changed.dig("entries", 2)).to eq(original.dig("entries", 2))
+      expect(changed.dig("idempotency_records", 1)).to eq(original.dig("idempotency_records", 1))
+    end
+
+    # "Export, load, export again, and get equal counts and checksums."
+    # Postgres returns rows in no fixed order, so the checksum must not depend on it.
+    it "gives the same digest for the same rows in a different order, and keeps fields from running together" do
+      rows = [checkpoint_entry(id: 1, note: "a"), checkpoint_entry(id: 2, note: "b")]
+
+      forward = described_class.build(tables: checkpoint_tables(entries: rows))
+      backward = described_class.build(tables: checkpoint_tables(entries: rows.reverse))
+      expect(backward.digest).to eq(forward.digest)
+
+      joined_left = described_class.build(tables: checkpoint_tables(entries: [checkpoint_entry(note: "a|b", source: "c")]))
+      joined_right = described_class.build(tables: checkpoint_tables(entries: [checkpoint_entry(note: "a", source: "b|c")]))
+      expect(joined_left.digest).not_to eq(joined_right.digest)
+    end
+
+    it "tells nil apart from an empty string, and an integer from the equal float" do
+      with_nil = described_class.build(tables: checkpoint_tables(entries: [checkpoint_entry(note: nil)]))
+      with_empty = described_class.build(tables: checkpoint_tables(entries: [checkpoint_entry(note: "")]))
+      with_float = described_class.build(tables: checkpoint_tables(entries: [checkpoint_entry(duration: 60.0)]))
+      with_integer = described_class.build(tables: checkpoint_tables(entries: [checkpoint_entry(duration: 60)]))
+
+      expect(with_nil.digest).not_to eq(with_empty.digest)
+      expect(with_float.digest).not_to eq(with_integer.digest)
+    end
+
+    # "Entry versions and duration floats survive export and load unchanged, bit for bit"
+    it "tells -0.0 apart from 0.0 and keeps -0.0 through to_json and from_json" do
+      tables = checkpoint_tables(entries: [checkpoint_entry(id: 1, duration: (0.1 + 0.2).next_float),
+                                           checkpoint_entry(id: 2, duration: -0.0)])
+      checkpoint = described_class.build(tables:)
+
+      restored = described_class.from_json(checkpoint.to_json)
+
+      expect(restored.digest).to eq(checkpoint.digest)
+      expect(described_class.verify(restored)).to eq([])
+      with_positive_zero = checkpoint_tables(entries: [tables.fetch("entries").first, checkpoint_entry(id: 2, duration: 0.0)])
+      expect(described_class.build(tables: with_positive_zero).digest).not_to eq(checkpoint.digest)
+    end
   end
 
-  it "refuses rows outside the canonical shape when verifying a checkpoint built without build" do
-    original = described_class.build(tables: shape_case_tables(entries: [shape_case_entry]))
-    widened = described_class.new(
-      rows: shape_case_tables(entries: [shape_case_entry.merge("unmapped_field" => "x")]),
-      digest: original.digest
-    )
+  describe "verify" do
+    # "A changed field, or a float differing in its last bit, fails `verify` for that table and company only."
+    it "reports a duration one bit apart for its table and company only" do
+      checkpoint_for = lambda do |company_one_duration|
+        described_class.build(tables: checkpoint_tables(
+          entries: [checkpoint_entry(id: 1, company_id: 1, duration: company_one_duration),
+                    checkpoint_entry(id: 2, company_id: 2, duration: 0.1 + 0.2)]
+        ))
+      end
+      original = checkpoint_for.call(0.1 + 0.2)
+      changed = checkpoint_for.call((0.1 + 0.2).next_float)
 
-    expect { described_class.verify(widened) }.to raise_error(described_class::ShapeError, /entries.*unmapped_field/)
-    expect { widened.to_json }.to raise_error(described_class::ShapeError, /entries.*unmapped_field/)
+      mismatches = described_class.verify(checkpoint_with_digest_of(changed, original))
+
+      expect(described_class.verify(described_class.from_json(original.to_json))).to eq([])
+      expect(mismatches.map { |mismatch| [mismatch[:table], mismatch[:company_id]] }).to eq([["entries", 1]])
+    end
+
+    # "A changed field, or a float differing in its last bit, fails `verify` for that table and company only."
+    it "reports a changed note for its table and company only, with audit rows present" do
+      checkpoint_for = lambda do |company_one_note|
+        described_class.build(tables: checkpoint_tables(
+          entries: [checkpoint_entry(id: 1, company_id: 1, note: company_one_note),
+                    checkpoint_entry(id: 2, company_id: 2, note: "same")],
+          entry_audits: [checkpoint_row("entry_audits", id: 1, company_id: 1, entry_id: 1),
+                         checkpoint_row("entry_audits", id: 2, company_id: 2, entry_id: 2)]
+        ))
+      end
+      original = checkpoint_for.call("before")
+      changed = checkpoint_for.call("after")
+
+      mismatches = described_class.verify(checkpoint_with_digest_of(changed, original))
+
+      expect(mismatches.map { |mismatch| [mismatch[:table], mismatch[:company_id]] }).to eq([["entries", 1]])
+    end
+
+    # "Provide a pure `verify` that recomputes counts and checksums and reports every mismatch per table and per company."
+    it "reports a company present on only one side, in either direction" do
+      one_company = described_class.build(tables: checkpoint_tables(entries: [checkpoint_entry(id: 1, company_id: 1)]))
+      two_companies = described_class.build(
+        tables: checkpoint_tables(entries: [checkpoint_entry(id: 1, company_id: 1), checkpoint_entry(id: 2, company_id: 2)])
+      )
+
+      rows_not_in_digest = described_class.verify(checkpoint_with_digest_of(two_companies, one_company))
+      digest_without_rows = described_class.verify(checkpoint_with_digest_of(one_company, two_companies))
+
+      expect(rows_not_in_digest.map { |mismatch| [mismatch[:table], mismatch[:company_id], mismatch[:expected]] })
+        .to eq([["entries", 2, nil]])
+      expect(digest_without_rows.map { |mismatch| [mismatch[:table], mismatch[:company_id], mismatch[:actual]] })
+        .to eq([["entries", 2, nil]])
+    end
+
+    it "reports every mismatch, including a count changed while rows and checksum stay intact" do
+      audit = checkpoint_row("entry_audits", id: 5, company_id: 2, entry_id: 2)
+      checkpoint = described_class.build(tables: checkpoint_tables(
+        entries: [checkpoint_entry(id: 1, company_id: 1), checkpoint_entry(id: 2, company_id: 2)],
+        entry_audits: [audit]
+      ))
+      digest = checkpoint.digest.to_h do |table, companies|
+        [table, companies.to_h { |company_id, entry| [company_id, entry.dup] }]
+      end
+      digest["entries"][1][:count] += 1
+      tampered = described_class.new(
+        rows: checkpoint.rows.merge("entry_audits" => [audit.merge("action" => "update")]),
+        digest: digest
+      )
+
+      mismatches = described_class.verify(tampered)
+
+      expect(mismatches.map { |mismatch| [mismatch[:table], mismatch[:company_id]] })
+        .to eq([["entries", 1], ["entry_audits", 2]])
+    end
   end
 
-  it "refuses to serialize a directly built checkpoint with a missing column, a missing or extra table, or no company_id" do
-    original = described_class.build(tables: shape_case_tables(entries: [shape_case_entry]))
-    broken_tables = {
-      /entries.*proof_url/ => shape_case_tables(entries: [shape_case_entry.except("proof_url")]),
-      /reservations/ => shape_case_tables.except("reservations"),
-      /unknown tables: invoices/ => shape_case_tables.merge("invoices" => []),
-      /entries: a row has no company_id/ => shape_case_tables(entries: [shape_case_entry(company_id: nil)])
-    }
+  describe "transport" do
+    it "returns equal rows, with float bits and jsonb values intact, from to_json and from_json" do
+      entry = checkpoint_entry(
+        duration: (0.1 + 0.2).next_float, source_metadata: { "b" => [1, 2.5, nil], "a" => { "z" => "x" } },
+        created_at: Time.utc(2026, 1, 5, 9, 0, 0, 123_456)
+      )
+      receipt = checkpoint_row("idempotency_records", id: 3, body: "{ \"b\":1,  \"a\":2 }")
+      operation = checkpoint_row("invoice_operations", id: 4, desired_entry_ids: [1, 2], generation: 2)
+      checkpoint = described_class.build(
+        tables: checkpoint_tables(entries: [entry], idempotency_records: [receipt], invoice_operations: [operation])
+      )
 
-    broken_tables.each do |message, rows|
-      expect { described_class.new(rows:, digest: original.digest).to_json }
-        .to raise_error(described_class::ShapeError, message)
+      restored = described_class.from_json(checkpoint.to_json)
+
+      expect(restored.rows).to eq(checkpoint.rows)
+      restored_duration = restored.rows.fetch("entries").first.fetch("duration")
+      expect([restored_duration].pack("G")).to eq([entry.fetch("duration")].pack("G"))
+      expect(restored.digest).to eq(checkpoint.digest)
     end
   end
 end
