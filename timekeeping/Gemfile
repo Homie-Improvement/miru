@@ -16,6 +16,7 @@ gem "jwt", "~> 3.2"
 gem "pg", "~> 1.4"
 gem "puma", "~> 7.2"
 
+gem "timekeeping_relay", path: "../gems/timekeeping_relay"
 gem "timekeeping_rules", path: "../gems/timekeeping_rules"
 
 group :development, :test do

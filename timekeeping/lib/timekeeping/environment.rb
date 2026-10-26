@@ -9,9 +9,12 @@ module Timekeeping
     TOKEN_PUBLIC_KEY = "TIMEKEEPING_TOKEN_PUBLIC_KEY"
     SERVICE_TOKEN = "TIMEKEEPING_SERVICE_TOKEN"
     MONOLITH_REFERENCE_URL = "MONOLITH_REFERENCE_URL"
+    # The monolith base URL the snapshot relay posts entry snapshots to.
+    MONOLITH_SNAPSHOT_URL = "MONOLITH_SNAPSHOT_URL"
     # Comma-separated credentials the service holds besides its own token.
     SERVICE_CREDENTIALS = "TIMEKEEPING_SERVICE_CREDENTIALS"
-    KEYS = [DATABASE_URL, TOKEN_PUBLIC_KEY, SERVICE_TOKEN, MONOLITH_REFERENCE_URL, SERVICE_CREDENTIALS].freeze
+    KEYS = [DATABASE_URL, TOKEN_PUBLIC_KEY, SERVICE_TOKEN, MONOLITH_REFERENCE_URL, MONOLITH_SNAPSHOT_URL,
+            SERVICE_CREDENTIALS].freeze
 
     module_function
 
@@ -30,6 +33,10 @@ module Timekeeping
 
     def monolith_reference_url
       ENV.fetch(MONOLITH_REFERENCE_URL, nil)
+    end
+
+    def monolith_snapshot_url
+      ENV.fetch(MONOLITH_SNAPSHOT_URL, nil)
     end
 
     def service_credentials
