@@ -126,6 +126,41 @@ RSpec.describe Timekeeping::LocalOwner, "when a failure is injected before commi
     expect(entry.reload.attributes).to eq(before)
     expect(row_counts).to eq(before_counts)
   end
+
+  it "rolls back its own write when the caller's open transaction rescues the failure" do
+    entry = stored_entry("before")
+    before = entry.reload.attributes
+    before_counts = row_counts
+
+    ApplicationRecord.transaction do
+      call_owner(:update, { "idempotency_key" => "atomic-nested", "entry_id" => entry.id, "body" => { "note" => "after" } },
+                 checkpoint: failing_at(:entry_written))
+    rescue injected_failure
+      nil
+    end
+
+    expect(entry.reload.attributes).to eq(before)
+    expect(row_counts).to eq(before_counts)
+  end
+
+  it "lets a uniqueness error raised by a checkpoint escape instead of retrying the write" do
+    before_counts = row_counts
+    raised = false
+    unique_once = lambda do |step|
+      next unless step == :entry_written && !raised
+
+      raised = true
+      raise ActiveRecord::RecordNotUnique, "injected at entry_written"
+    end
+    body = { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 20.0,
+             "note" => "never committed", "source" => "manual", "source_metadata" => {} }
+
+    expect {
+      call_owner(:create, { "idempotency_key" => "atomic-unique", "body" => body }, checkpoint: unique_once)
+    }.to raise_error(ActiveRecord::RecordNotUnique, "injected at entry_written")
+
+    expect(row_counts).to eq(before_counts)
+  end
 end
 
 RSpec.describe Timekeeping::LocalOwner, "receipt backstop", committed_data: true do

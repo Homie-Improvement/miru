@@ -278,7 +278,9 @@ RSpec.describe Timekeeping::LocalOwner, "colleague access" do
   # The projection refuses an agent of another company or user, so such a
   # snapshot must never be committed.
   it "answers not_found to a create naming another company's agent or a colleague's agent and stores nothing" do
-    foreign_agent = create(:agent, company: other_company, user: outsider)
+    # Only the company is wrong: the agent belongs to the entry's own user.
+    # Validations are skipped because employee is not a member of other_company.
+    foreign_agent = build(:agent, company: other_company, user: employee).tap { |agent| agent.save!(validate: false) }
     colleague_agent = create(:agent, company:, user: colleague)
     before_counts = row_counts
 
@@ -299,6 +301,22 @@ RSpec.describe Timekeeping::LocalOwner, "colleague access" do
 
     expect(outcome.status).to eq(201)
     expect(outcome.body.fetch("agent_id")).to eq(own_agent.id)
+  end
+
+  it "refuses a note-only update of an entry whose stored agent now belongs to another user" do
+    agent = create(:agent, company:, user: colleague)
+    entry = entry_of(colleague, "agent entry")
+    entry.update!(agent_id: agent.id)
+    agent.update_columns(user_id: employee.id)
+    before = entry.reload.attributes
+    before_counts = row_counts
+
+    outcome = write_as(admin, "admin", :update,
+                       { "idempotency_key" => "agent-moved", "entry_id" => entry.id, "body" => { "note" => "edited" } })
+
+    expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
+    expect(entry.reload.attributes).to eq(before)
+    expect(row_counts).to eq(before_counts)
   end
 
   it "refuses moving an agent-backed entry to a user the agent does not belong to" do

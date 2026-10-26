@@ -404,6 +404,25 @@ RSpec.describe Timekeeping::LocalOwner, "local owner write details" do
     expect(entries.map { |entry| entry.reload.discarded_at }).to all(be_present)
   end
 
+  it "calls the receipt_checked checkpoint on a replay and on a reused key" do
+    params = { "idempotency_key" => "details-replay",
+               "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 1.0,
+                           "note" => "n", "source" => "manual", "source_metadata" => {} } }
+    call_with = lambda do |request|
+      steps = []
+      outcome = described_class.call(operation: :create, company_id: company.id, generation:, actor:,
+                                     params: request, checkpoint: ->(step) { steps << step })
+      [outcome.status, steps]
+    end
+    call_with.call(params)
+
+    replay = call_with.call(params)
+    reused = call_with.call(params.merge("body" => params["body"].merge("note" => "other")))
+
+    expect(replay).to eq([201, described_class::STEPS.take(4)])
+    expect(reused).to eq([422, described_class::STEPS.take(4)])
+  end
+
   # The service answers 400 to these ISO 8601 forms, so the local owner must too.
   it "refuses a work_date that is not YYYY-MM-DD with invalid_request and stores nothing" do
     entry = stored_entry(note: "kept")

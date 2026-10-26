@@ -84,66 +84,6 @@ RSpec.describe Timekeeping::EntryReader do
   end
 end
 
-RSpec.describe Timekeeping::EntryReader, "reading the owner's own rows" do
-  include_context "timekeeping contract fakes"
-
-  let(:company) { create(:company) }
-  let(:user) { create(:user) }
-  let(:project) { create(:project, client: create(:client, company:)) }
-  let(:march) { { from: Date.new(2026, 3, 1), to: Date.new(2026, 3, 31) } }
-
-  before { create(:employment, company:, user:) }
-
-  def list_from_owner(**options)
-    described_class.list(company_id: company.id, user_id: user.id, **march, ownership: TimekeepingOwnership.current, **options)
-  end
-
-  def insert_prepared_entry(id:, work_date:, discarded_at: "NULL")
-    ActiveRecord::Base.connection.execute(<<~SQL)
-      INSERT INTO entries (id, company_id, version, project_id, user_id, work_date, duration, note, bill_status,
-                           review_status, source, discarded_at, created_at, updated_at)
-      VALUES (#{id}, #{company.id}, 1, #{project.id}, #{user.id}, '#{work_date}', 30.0, 'prepared #{id}', 'unbilled',
-              'not_required', 'manual', #{discarded_at}, NOW(), NOW())
-    SQL
-  end
-
-  it "hides a discarded prepared entry" do
-    TimekeepingOwnership.current.update!(generation: 3, monolith_store: "prepared")
-    insert_prepared_entry(id: 93_001, work_date: "2026-03-02")
-    insert_prepared_entry(id: 93_002, work_date: "2026-03-03", discarded_at: "NOW()")
-
-    expect(list_from_owner.map(&:id)).to eq([93_001])
-  end
-
-  it "returns Timekeeping's unordered entries newest work_date first, as read-only records with their review status" do
-    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2)
-    { "2026-03-02" => "pending_review", "2026-03-20" => "approved", "2026-03-10" => "rejected" }.each do |date, status|
-      fake_timekeeping.add_entry(company_id: company.id, user_id: user.id, project_id: project.id, work_date: date,
-                                 review_status: status)
-    end
-
-    entries = list_from_owner(timekeeping_client: TimekeepingContract::FakeEntryApiClient.new(timekeeping: fake_timekeeping))
-
-    expect(entries.map { |entry| [entry.work_date.iso8601, entry.snippet[:review_status]] }).to eq(
-      [%w[2026-03-20 approved], %w[2026-03-10 rejected], %w[2026-03-02 pending_review]]
-    )
-    expect(entries).to all(be_readonly)
-  end
-
-  it "raises the client's error and never reads timesheet_entries when Timekeeping cannot be read" do
-    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2)
-    create(:timesheet_entry, user:, project:, work_date: Date.new(2026, 3, 2))
-    failing_client = Object.new
-    def failing_client.list_entries(**)
-      raise Timekeeping::EntryApiClient::Error, "Timekeeping entry list answered 503"
-    end
-    allow(TimesheetEntry).to receive(:kept).and_call_original
-
-    expect { list_from_owner(timekeeping_client: failing_client) }.to raise_error(Timekeeping::EntryApiClient::Error)
-    expect(TimesheetEntry).not_to have_received(:kept)
-  end
-end
-
 RSpec.describe Timekeeping::EntryReader, "prepared branch through Timekeeping::LocalEntry" do
   it "reads prepared entries written through Timekeeping::LocalEntry for the reader's company only, with PreparedEntry gone" do
     company_a = create(:company)

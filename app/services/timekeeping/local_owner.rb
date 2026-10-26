@@ -132,19 +132,30 @@ module Timekeeping
       @today = Date.current
     end
 
+    # Raised only when the receipt insert hits the unique index, so a
+    # uniqueness error from anywhere else, a checkpoint included, is never
+    # mistaken for a receipt another writer committed.
+    class ReceiptTaken < ActiveRecord::RecordNotUnique; end
+
     def call
-      ApplicationRecord.transaction { write }
-    rescue ActiveRecord::RecordNotUnique
+      attempt
+    rescue ReceiptTaken
       # A backstop: the receipt-key lock normally stops two writers with one
-      # key from both reaching the insert. The failed transaction has rolled
-      # back every row it wrote. Running the steps again checks the generation
+      # key from both reaching the insert. The failed attempt has rolled back
+      # every row it wrote. Running the steps again checks the generation
       # first and then replays the receipt that now exists.
-      ApplicationRecord.transaction { write }
+      attempt
     end
 
     private
 
       attr_reader :operation, :company_id, :generation, :actor, :params, :checkpoint, :today
+
+      # Each attempt runs in its own savepoint, so a failure rolls back this
+      # write even when the caller has a transaction open and rescues the error.
+      def attempt
+        ApplicationRecord.transaction(requires_new: true) { write }
+      end
 
       def write
         lock_receipt_key unless key.empty?
@@ -154,9 +165,9 @@ module Timekeeping
         return refusal if refusal
 
         receipt = find_receipt
+        checkpoint.call(:receipt_checked)
         return answer_from(receipt) if receipt
 
-        checkpoint.call(:receipt_checked)
         write_change(stored_generation)
       end
 
@@ -334,6 +345,8 @@ module Timekeeping
           company_id:, actor_type: ACTOR_TYPE, actor_id: actor.user_id, operation: request_operation, key:,
           fingerprint:, status: outcome.status, body: JSON.generate(outcome.body), created_at: Time.current
         )
+      rescue ActiveRecord::RecordNotUnique => error
+        raise ReceiptTaken, error.message
       end
 
       # Reference facts
@@ -358,7 +371,7 @@ module Timekeeping
         checkpoint.call(:rows_locked)
         user_id = target_user_id(facts, role)
         return user_id if user_id.is_a?(Outcome)
-        return Outcome.refusal(:not_found) unless agent_known?(body["agent_id"], user_id)
+        return Outcome.refusal(:not_found) unless agent_owned?(facts, body["agent_id"], user_id)
 
         checkpoint.call(:rules_checked)
         entry = LocalEntry.create!(entry_fields.merge(
@@ -384,20 +397,20 @@ module Timekeeping
 
           fields["user_id"] = user_id
         end
-        if fields.key?("agent_id") || fields.key?("user_id")
-          agent_id = fields.fetch("agent_id", entry.agent_id)
-          return Outcome.refusal(:not_found) unless agent_known?(agent_id, fields.fetch("user_id", entry.user_id))
-        end
+        committed = stored_values(entry).merge(fields)
+        return Outcome.refusal(:not_found) unless agent_owned?(facts, committed["agent_id"], committed["user_id"])
+
         checkpoint.call(:rules_checked)
         single_change(entry, fields)
       end
 
-      # An entry's agent must be one of this company's agents and belong to
-      # the entry's user. The projection refuses any other pairing, and the
-      # relay delivers in order, so one refused snapshot would hold back every
-      # later one. Another company's agent answers like a missing one.
-      def agent_known?(agent_id, user_id)
-        agent_id.nil? || Agent.exists?(id: agent_id, company_id:, user_id:)
+      # S7 on the agent and user the row will hold. The projection refuses any
+      # other pairing, and the relay delivers in order, so one refused snapshot
+      # would hold back every later one. Checked on every create and update,
+      # so a stored agent that has since moved to another user is caught too.
+      def agent_owned?(facts, agent_id, user_id)
+        company_agents = facts[:agents].to_h { |agent| [agent[:id], agent[:user_id]] }
+        TimekeepingRules::EntryRules.agent_owner(agent_id:, user_id:, company_agents:) == :ok
       end
 
       def destroy_entry(facts, role)
