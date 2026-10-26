@@ -671,7 +671,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
     result = recon_checks_run(checkpoint_tables: tables)
     differences = result.companies.fetch(101).checks.fetch(:operation_receipts)
     expect(differences.map { |difference| [difference.table, difference.row_key, difference.field, difference.reason] })
-      .to eq([["invoice_operations", [recon_checks_operation_id], "desired_entry_ids", :changed]])
+      .to eq([["invoice_operations", [1], "desired_entry_ids", :changed]])
     expect_recon_checks_abort_in_a(result, :operation_receipts, reason: :changed, field: "desired_entry_ids")
   end
 
@@ -685,7 +685,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
     tables = recon_checks_tables(invoice_operations: [recon_checks_operation(101, invoice_id: 2)])
     intents = [recon_checks_intent(101, invoice_id: 2), recon_checks_intent(202)]
     correction = described_class::Correction.new(
-      check: :operation_receipts, row_key: [recon_checks_operation_id], field: "invoice_id"
+      check: :operation_receipts, row_key: [1], field: "invoice_id"
     )
     result = recon_checks_run(checkpoint_tables: tables, intents:, listed_corrections: { 101 => [correction] })
 
@@ -693,6 +693,16 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
     expect(report.listed.map(&:table)).to eq(["invoice_operations"])
     expect(report.unlisted.map(&:table).uniq).to eq(["invoice_operation_intents"])
     expect(report).to be_abort
+  end
+
+  it "passes unchanged receipts of two invoices that reuse one operation id" do
+    operations = [recon_checks_operation(101, id: 1, invoice_id: 10), recon_checks_operation(101, id: 2, invoice_id: 20)]
+    tables = recon_checks_tables(invoice_operations: operations)
+    intents = [recon_checks_intent(101, invoice_id: 10), recon_checks_intent(101, invoice_id: 20), recon_checks_intent(202)]
+    result = recon_checks_run(source_tables: tables, checkpoint_tables: tables, intents:, source_intents: intents)
+
+    expect(result.companies.fetch(101).checks.fetch(:operation_receipts)).to eq([])
+    expect(result).not_to be_abort
   end
 
   it "still aborts on a duplicate committed reservation when the added row is listed" do

@@ -120,7 +120,9 @@ module Timekeeping
 
       ENTRY_KEY = ->(row) { [row["id"]] }
       RESERVATION_KEY = ->(row) { [row["entry_id"], row["state"]] }
-      OPERATION_KEY = ->(row) { [row["operation_id"]] }
+      # An operation row is identified by its own id: one operation_id can be
+      # reused by different invoices, so it does not name a single row.
+      OPERATION_KEY = ->(row) { [row["id"]] }
       # An intent and the operation it settles share both the invoice and the
       # operation id, so an operation of another invoice never answers for it.
       RECEIPT_LINK_KEY = ->(row) { [row["invoice_id"], row["operation_id"]] }
