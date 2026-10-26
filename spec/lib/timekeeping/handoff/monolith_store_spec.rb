@@ -265,9 +265,13 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
         "created_at" => time
       }
       checkpoint = checkpoint_of("entries" => [entry], "entry_audits" => [orphan_audit])
+      # The checkpoint itself is sound, so the load gets past every check made
+      # before the transaction and fails only at the audit insert.
+      expect(Timekeeping::Handoff::Checkpoint.verify(checkpoint)).to eq([])
 
       # "A load replaces the tables in one transaction, so an interrupted load leaves them unchanged"
-      expect { store.load_checkpoint(checkpoint) }.to raise_error(StandardError)
+      expect { store.load_checkpoint(checkpoint) }
+        .to raise_error(Timekeeping::Handoff::Store::Error, /\Aentry_audits: /)
       expect(prepared_rows).to eq(baseline)
       expect(entry_id_sequence_state).to eq(sequence_before)
     end
@@ -369,8 +373,10 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
       checkpoint = checkpoint_of(
         "entries" => [entry_row(id: 10, company_id: 100)], "entry_audits" => [cross_company_audit]
       )
+      expect(Timekeeping::Handoff::Checkpoint.verify(checkpoint)).to eq([])
 
-      expect { store.load_checkpoint(checkpoint) }.to raise_error(StandardError)
+      expect { store.load_checkpoint(checkpoint) }
+        .to raise_error(Timekeeping::Handoff::Store::Error, /\Aentry_audits: /)
       expect(prepared_rows).to eq(baseline)
     end
 
