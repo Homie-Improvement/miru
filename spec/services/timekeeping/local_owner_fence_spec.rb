@@ -219,3 +219,43 @@ RSpec.describe Timekeeping::LocalOwner, "ownership states that admit no generati
     end
   end
 end
+
+RSpec.describe Timekeeping::LocalOwner, "stale generation on bulk routes" do
+  # "On bulk routes a stale generation fails the whole request."
+  let(:company) { create(:company) }
+  let(:owner) { timekeeping_member(company, "owner") }
+  let(:project) { create(:project, client: create(:client, company:)) }
+  let(:other_project) { create(:project, client: create(:client, company:)) }
+
+  # Each row sends a generation one away from the stored one, newer or older.
+  routes = {
+    bulk_delete: { offset: 1, body: ->(_spec) { {} } },
+    bulk_move: { offset: -1, body: ->(spec) { { "project_id" => spec.other_project.id } } }
+  }
+
+  routes.each do |operation, route|
+    it "fails a whole #{operation} at a stale generation and changes none of the listed entries" do
+      stored = prepare_local_ownership!.generation
+      entries = Array.new(2) do |index|
+        Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
+                                        work_date: Date.current, duration: 1.0 + index, note: "bulk", bill_status: "unbilled")
+      end
+      attributes_before = entries.map { |entry| entry.reload.attributes }
+      before = timekeeping_row_counts
+      expect(before["entries"]).to eq(2)
+
+      outcome = described_class.call(
+        operation:, company_id: company.id, generation: (stored + route[:offset]).to_s,
+        actor: described_class::Actor.user(user_id: owner.id, role: "owner"),
+        params: { "idempotency_key" => "stale-#{operation}",
+                  "body" => route[:body].call(self).merge("entry_ids" => entries.map(&:id)) }
+      )
+
+      expect(outcome.status).to eq(409)
+      expect(outcome.body.with_indifferent_access[:reason].to_s).to eq("stale_generation")
+      expect(entries.map { |entry| entry.reload.attributes }).to eq(attributes_before)
+      expect(entries.map(&:discarded_at)).to all(be_nil)
+      expect(timekeeping_row_counts).to eq(before)
+    end
+  end
+end
