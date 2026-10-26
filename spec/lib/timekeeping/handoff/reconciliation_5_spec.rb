@@ -442,6 +442,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     reservation = lambda do |company_id|
       { "company_id" => company_id, "entry_id" => 7, "invoice_id" => 9, "state" => "committed",
         "disposition" => "active", "operation_id" => nil, "created_at" => at }
+        .reverse_merge(Timekeeping::Handoff::Checkpoint::TABLES.fetch("reservations").index_with { nil })
     end
     tables = lambda do |reservations|
       { "entries" => [entry.call(101), entry.call(202)], "reservations" => reservations,

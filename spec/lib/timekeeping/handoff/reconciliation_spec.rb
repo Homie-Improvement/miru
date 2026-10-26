@@ -420,7 +420,9 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
   def recon_checks_reservation(company_id, **overrides)
     { "company_id" => company_id, "entry_id" => 1, "invoice_id" => 1, "state" => "committed",
       "disposition" => "active", "operation_id" => recon_checks_operation_id,
-      "created_at" => recon_checks_time }.merge(overrides.transform_keys(&:to_s))
+      "created_at" => recon_checks_time }
+      .reverse_merge(Timekeeping::Handoff::Checkpoint::TABLES.fetch("reservations").index_with { nil })
+      .merge(overrides.transform_keys(&:to_s))
   end
 
   def recon_checks_operation(company_id, **overrides)

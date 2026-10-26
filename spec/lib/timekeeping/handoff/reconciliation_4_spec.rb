@@ -21,7 +21,10 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     end
     reservation = lambda do |company_id, **o|
       { "company_id" => company_id, "entry_id" => 1, "invoice_id" => 1, "state" => "committed",
-        "disposition" => "active", "operation_id" => op_id, "created_at" => t0 }.merge(o.transform_keys(&:to_s))
+        "disposition" => "active", "operation_id" => op_id, "created_at" => t0 }
+        .reverse_merge(Timekeeping::Handoff::Checkpoint::TABLES.fetch("reservations").index_with { nil })
+        .reverse_merge(Timekeeping::Handoff::Checkpoint::TABLES.fetch("reservations").index_with { nil })
+        .merge(o.transform_keys(&:to_s))
     end
     operation = lambda do |company_id, **o|
       { "id" => 1, "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "state" => "committed",
@@ -96,6 +99,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     reservation = lambda do |company_id|
       { "company_id" => company_id, "entry_id" => 1, "invoice_id" => 1, "state" => "committed",
         "disposition" => "active", "operation_id" => op_id, "created_at" => t0 }
+        .reverse_merge(Timekeeping::Handoff::Checkpoint::TABLES.fetch("reservations").index_with { nil })
     end
     operation = lambda do |company_id|
       { "id" => 1, "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "state" => "committed",
@@ -163,6 +167,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     reservation = lambda do |company_id|
       { "company_id" => company_id, "entry_id" => 1, "invoice_id" => 1, "state" => "committed",
         "disposition" => "active", "operation_id" => op_id, "created_at" => t0 }
+        .reverse_merge(Timekeeping::Handoff::Checkpoint::TABLES.fetch("reservations").index_with { nil })
     end
     operation = lambda do |company_id|
       { "id" => 1, "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "state" => "committed",
@@ -239,6 +244,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     reservation = lambda do |company_id|
       { "company_id" => company_id, "entry_id" => 1, "invoice_id" => 1, "state" => "committed",
         "disposition" => "active", "operation_id" => op_id, "created_at" => t0 }
+        .reverse_merge(Timekeeping::Handoff::Checkpoint::TABLES.fetch("reservations").index_with { nil })
     end
     operation = lambda do |company_id|
       { "id" => 1, "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "state" => "committed",
@@ -314,6 +320,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     reservation = lambda do |company_id, state = "committed"|
       { "company_id" => company_id, "entry_id" => ids[company_id], "invoice_id" => 1, "state" => state,
         "disposition" => "active", "operation_id" => op_id, "created_at" => t0 }
+        .reverse_merge(Timekeeping::Handoff::Checkpoint::TABLES.fetch("reservations").index_with { nil })
     end
     operation = lambda do |company_id, state = "committed"|
       { "id" => 1, "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "state" => state,
@@ -391,6 +398,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     reservation = lambda do |company_id|
       { "company_id" => company_id, "entry_id" => 1, "invoice_id" => 1, "state" => "committed",
         "disposition" => "active", "operation_id" => op_id, "created_at" => t0 }
+        .reverse_merge(Timekeeping::Handoff::Checkpoint::TABLES.fetch("reservations").index_with { nil })
     end
     operation = lambda do |company_id|
       { "id" => 1, "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "state" => "committed",
@@ -465,6 +473,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     reservation = lambda do |company_id|
       { "company_id" => company_id, "entry_id" => 1, "invoice_id" => 1, "state" => "committed",
         "disposition" => "active", "operation_id" => op_id, "created_at" => t0 }
+        .reverse_merge(Timekeeping::Handoff::Checkpoint::TABLES.fetch("reservations").index_with { nil })
     end
     operation = lambda do |company_id|
       { "id" => 1, "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "state" => "committed",
