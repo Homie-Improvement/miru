@@ -51,10 +51,10 @@ RSpec.describe "Timekeeping internal handoff routes refuse callers without the s
 
   # Sends every route as every refused caller and compares the stored state to
   # the one baseline after each request, labelled with the route and caller.
-  def expect_every_refused_caller_to_change_nothing(entry, baseline)
+  def expect_every_refused_caller_to_change_nothing(entry, baseline, callers: refused_handoff_callers)
     bodies = refused_handoff_bodies(entry)
     HandoffRequests::HANDOFF_ROUTES.each_key do |route|
-      refused_handoff_callers.each do |caller_name, authorization|
+      callers.each do |caller_name, authorization|
         handoff_request(route, body: bodies.fetch(route, HandoffRequests::HANDOFF_ROUTES.fetch(route)[2]), authorization:)
 
         expect([route, caller_name, response.status, response.parsed_body])
@@ -89,16 +89,17 @@ RSpec.describe "Timekeeping internal handoff routes refuse callers without the s
   end
 
   # "Every handoff endpoint refuses a caller without service credentials"
-  it "refuses the service bearer on every handoff route when TIMEKEEPING_SERVICE_TOKEN is empty" do
+  # An empty configured token must never match an empty or any other bearer.
+  it "refuses every route when TIMEKEEPING_SERVICE_TOKEN is empty and changes no row" do
     with_handoff_env(public_key: true, service_token: "") do
-      HandoffRequests::HANDOFF_ROUTES.each_key do |route|
-        ["Bearer ", "Bearer anything"].each do |authorization|
-          handoff_request(route, authorization:)
+      Timekeeping::Admission.admit!(generation: 3)
+      entry = create_private_entry
+      baseline = refused_handoff_state
+      expect([baseline["entries"].size, baseline["outbox_snapshots"], baseline["admission_generation"]]).to eq([1, [], 3])
 
-          expect([route, authorization, response.status, response.parsed_body])
-            .to eq([route, authorization, 401, { "reason" => "unauthorized" }])
-        end
-      end
+      expect_every_refused_caller_to_change_nothing(
+        entry, baseline, callers: { "empty bearer" => "Bearer ", "any bearer" => "Bearer anything" }
+      )
     end
   end
 end
