@@ -102,4 +102,28 @@ RSpec.describe Timekeeping::EntryCommand do
       expect(build(:create, body: create_body(bill_status:))).to be_a(described_class)
     end
   end
+
+  it "checks the body against the shared snapshot rules for the same nine fields, leaving project_id out" do
+    expect(described_class::FIELD_SHAPES.keys).to eq(
+      %w[work_date duration note source source_metadata bill_status agent_id proof_url proof_metadata]
+    )
+    expect(described_class::FIELD_SHAPES).to all(satisfy { |field, rule| rule == Timekeeping::SnapshotValues::RULES[field] })
+  end
+
+  it "still builds a bulk_move whose project_id is a decimal string" do
+    command = build(:bulk_move, body: { "project_id" => "11", "entry_ids" => [42] })
+
+    expect(command).to have_attributes(project_id: 11)
+  end
+
+  # "The base's EntryCommand enforces the allowed sources; this new producer bypasses it."
+  # Sharing the snapshot rules must not narrow the requests the entry API accepts today.
+  it "still accepts a decimal-string project_id on create and update while refusing source agent" do
+    expect(build(:create, body: create_body(project_id: "11"))).to have_attributes(project_id: 11)
+    expect(build(:update, entry_id: "42", body: { "project_id" => "11", "note" => "x" }))
+      .to have_attributes(project_id: 11)
+
+    expect { build(:create, body: create_body(source: "agent")) }
+      .to raise_error(ActionController::BadRequest, /source/)
+  end
 end
