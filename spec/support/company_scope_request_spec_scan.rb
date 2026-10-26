@@ -9,7 +9,9 @@ module CompanyScopeRequestSpecScan
   REQUEST_CALL = /\bsend_request\b/
   METHOD_START = /^(?<indent>\s*)def\s+(?<name>\w+[?!]?)/
   # "def ok?(r) = r.first == 200" or "def x; true; end": the whole method sits on its "def" line.
-  ONE_LINE_METHOD = /^\s*def\s+\w+[?!]?(?:\([^)]*\))?\s*=(?!=)|\bend\s*$/
+  # The parameter list is matched with balanced parentheses, so a default such as "ref = x.to_s()"
+  # does not end it early.
+  ONE_LINE_METHOD = /^\s*def\s+\w+[?!]?(?<params>\((?:[^()]|\g<params>)*\))?\s*=(?!=)|\bend\s*$/
   # A "#" that starts a line or follows whitespace, unless it opens "#{...}" string interpolation.
   COMMENT = /(?:^|\s)#(?!\{).*$/
   TOP_LEVEL_DESCRIBE = /^RSpec\.describe\b/
@@ -47,13 +49,18 @@ module CompanyScopeRequestSpecScan
       lines.each_with_index.each_with_object({}) do |(line, start), ranges|
         match = line.match(METHOD_START)
         next unless match
+
         method_end =
           if line.match?(ONE_LINE_METHOD)
             start
           else
             (start + 1...lines.size).find { |index| lines[index].match?(/^#{match[:indent]}end\b/) }
           end
-        ranges[match[:name]] = start..(method_end || lines.size - 1)
+        # Guessing an end would mark the code after the method as the method's body and hide
+        # any request sent there, so a method whose end cannot be found stops the scan.
+        raise ArgumentError, "no closing end found for method #{match[:name]}" if method_end.nil?
+
+        ranges[match[:name]] = start..method_end
       end
     end
 end

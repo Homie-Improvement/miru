@@ -100,6 +100,37 @@ RSpec.describe "Company-scope params builder report with one-line assertion help
   end
 end
 
+RSpec.describe "Company-scope params builder report with an endless builder" do
+  # A nested parenthesis in a default argument must not hide that the builder ends on its def line.
+  it "ends an endless builder with a parenthesized default on its def line and counts a later request as stray" do
+    section = <<~RUBY
+      RSpec.describe "Api::V1::Invoices#create timesheet entry company scope", type: :request do
+        def post_company_scope_invoice(ref = missing_id.to_s()) = send_request(:post, api_v1_invoices_path, params: {})
+
+        it "refuses" do
+          send_request :post, api_v1_invoices_path, params: { invoice: {} }
+        end
+      end
+    RUBY
+
+    report = params_builder_report(section)
+
+    expect(report[:builders]).to eq(["post_company_scope_invoice"])
+    expect(report[:stray_requests]).to eq(1)
+  end
+
+  it "stops the scan when a multi-line method has no closing end at its own indentation" do
+    section = <<~RUBY
+      RSpec.describe "Api::V1::Invoices#create timesheet entry company scope", type: :request do
+        def post_company_scope_invoice(*entry_refs)
+          send_request :post, api_v1_invoices_path, params: {}
+    RUBY
+
+    expect { params_builder_report(section) }
+      .to raise_error(ArgumentError, "no closing end found for method post_company_scope_invoice")
+  end
+end
+
 RSpec.describe "Company-scope params builder report with an assertion lambda" do
   # "It also forbids lambdas regardless of their purpose."
   it "allows an assertion-only lambda beside the one company-scope params builder" do
