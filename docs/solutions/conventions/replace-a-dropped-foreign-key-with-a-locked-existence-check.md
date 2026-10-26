@@ -38,8 +38,15 @@ In PR #44 the keys `invoice_line_items -> timesheet_entries` and `timesheet_entr
 Guard on nil, not on truthiness. Query the parent table, not the association cache. Take a share lock on the parent row, and make the parent's destroy take a row lock first.
 
 ```ruby
-# app/models/invoice_line_item.rb
-validates :timesheet_entry, presence: { message: :required }, unless: -> { timesheet_entry_id.nil? }
+# app/models/invoice_line_item.rb (now also scoped to the invoice's company; FOR KEY SHARE
+# because the entry's locked flag is updated later in the same transaction, see
+# lock-existence-checks-for-key-share-when-the-row-is-updated-later.md)
+validate :timesheet_entry_found_in_invoice_company, unless: -> { timesheet_entry_id.nil? }
+
+def timesheet_entry_found_in_invoice_company
+  return if entries_in_invoice_company.where(id: timesheet_entry_id).lock("FOR KEY SHARE").exists?
+  errors.add(:timesheet_entry, :not_found)
+end
 
 # app/models/timesheet_entry.rb
 validate :validate_agent_exists, if: -> { !agent_id.nil? && will_save_change_to_agent_id? }
