@@ -111,8 +111,8 @@ RSpec.describe Timekeeping::LocalSnapshotEndpoint do
     logger = Logger.new(log)
     logger.level = Logger::DEBUG
 
-    answer = with_timekeeping_env_values(TIMEKEEPING_SERVICE_TOKEN: SecureRandom.hex(16),
-                                         TIMEKEEPING_PROJECTION_URL: "http://localhost:3000") do
+    answer = with_timekeeping_env("TIMEKEEPING_SERVICE_TOKEN" => SecureRandom.hex(16),
+                                  "TIMEKEEPING_PROJECTION_URL" => "http://localhost:3000") do
       described_class.configured(logger:).deliver(local_endpoint_batch, idempotency_key: SecureRandom.uuid)
     end
 
@@ -125,8 +125,8 @@ RSpec.describe Timekeeping::LocalSnapshotEndpoint do
     log = StringIO.new
     logger = Logger.new(log)
 
-    answer = with_timekeeping_env_values(TIMEKEEPING_SERVICE_TOKEN: nil,
-                                         TIMEKEEPING_PROJECTION_URL: "https://projection.example.test") do
+    answer = with_timekeeping_env("TIMEKEEPING_SERVICE_TOKEN" => nil,
+                                  "TIMEKEEPING_PROJECTION_URL" => "https://projection.example.test") do
       described_class.configured(logger:).deliver(local_endpoint_batch, idempotency_key: SecureRandom.uuid)
     end
 

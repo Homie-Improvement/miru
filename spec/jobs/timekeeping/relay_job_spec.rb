@@ -102,6 +102,38 @@ RSpec.describe Timekeeping::RelayJob do
     expect(row.reload.sent_at).to be_nil
   end
 
+  # "Hold a session advisory lock with its own key constant for the whole run."
+  # The lock must stay held while a batch is posted, and an exception during delivery must not leave it
+  # held, or every later run would return without delivering.
+  it "holds the relay lock during delivery and releases it when delivery raises" do
+    company = create(:company)
+    row = relay_job_spec_row(company.id, 78)
+    try_lock_sql = ActiveRecord::Base.sanitize_sql_array(["SELECT pg_try_advisory_lock(?)", described_class::RELAY_LOCK_KEY])
+    unlock_sql = ActiveRecord::Base.sanitize_sql_array(["SELECT pg_advisory_unlock(?)", described_class::RELAY_LOCK_KEY])
+    prober = ActiveRecord::Base.connection_pool.checkout
+    locked_during_delivery = []
+    endpoint = Object.new
+    endpoint.define_singleton_method(:deliver) do |_batch, idempotency_key:|
+      taken = prober.select_value(try_lock_sql)
+      prober.select_value(unlock_sql) if taken
+      locked_during_delivery << !taken
+      raise "relay job spec delivery failure"
+    end
+    allow(Timekeeping::LocalSnapshotEndpoint).to receive(:configured).and_return(endpoint)
+
+    begin
+      expect { described_class.perform_now }.to raise_error(RuntimeError, "relay job spec delivery failure")
+      released = prober.select_value(try_lock_sql)
+      prober.select_value(unlock_sql) if released
+    ensure
+      ActiveRecord::Base.connection_pool.checkin(prober)
+    end
+
+    expect(locked_during_delivery).to eq([true])
+    expect(released).to be(true)
+    expect(row.reload.sent_at).to be_nil
+  end
+
   it "sends one company's 150 unsent rows in batches of 100 then 50 and marks them all" do
     company = create(:company)
     rows = Array.new(150) { |index| relay_job_spec_row(company.id, 5_000 + index) }

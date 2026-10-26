@@ -42,6 +42,8 @@ RSpec.describe Timekeeping::LocalOutboxSource do
       .to eq([a_first, a_second, a_third].map(&:outbox_position))
     expect(rows.pluck("outbox_position"))
       .not_to include(*[b_low, b_mid, b_high, a_sent].map(&:outbox_position))
+    expect(described_class.new(company_id: company_b.id).unsent_after(0, 100).pluck("outbox_position"))
+      .to eq([b_low, b_mid, b_high].map(&:outbox_position))
     rows.each do |row|
       expect(row.keys).to contain_exactly("generation", "outbox_position", "entry")
       expect(row["entry"].keys).to match_array(Timekeeping::SnapshotBatch::ENTRY_FIELDS)
@@ -71,27 +73,6 @@ RSpec.describe Timekeeping::LocalOutboxSource do
 
     expect(entry.dig("source_metadata", "rate")).to eq(BigDecimal(fine_decimal))
     expect(entry.dig("source_metadata", "rate")).to be_a(BigDecimal)
-  end
-
-  # "Every outbox read and mark filters by company_id; company A's source never returns or marks company B's rows"
-  # Positions are one global sequence, so B's rows sit below, between and above A's rows: a source that
-  # filtered only by position would return them.
-  it "company A's unsent_after never returns company B's interleaved rows" do
-    company_a = create(:company)
-    company_b = create(:company)
-    rows = [
-      outbox_spec_row(company_b.id, 900), outbox_spec_row(company_a.id, 100), outbox_spec_row(company_b.id, 901),
-      outbox_spec_row(company_a.id, 101), outbox_spec_row(company_b.id, 902)
-    ]
-    a_positions = rows.filter_map { |row| row.outbox_position if row.company_id == company_a.id }
-    b_positions = rows.filter_map { |row| row.outbox_position if row.company_id == company_b.id }
-    source_a = described_class.new(company_id: company_a.id)
-
-    returned = source_a.unsent_after(0, 100)
-
-    expect(returned.map { |row| row.fetch("outbox_position") }).to eq(a_positions)
-    expect(described_class.new(company_id: company_b.id).unsent_after(0, 100).map { |row| row.fetch("outbox_position") })
-      .to eq(b_positions)
   end
 
   # "Every outbox read and mark filters by company_id; company A's source never returns or marks company B's rows"

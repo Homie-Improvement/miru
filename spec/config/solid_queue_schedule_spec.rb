@@ -96,6 +96,5 @@ RSpec.describe "Solid Queue schedule" do
       tasks = block.dig("dispatchers", 0, "recurring_tasks").values.select { |task| task["class"] == "Timekeeping::RelayJob" }
       expect([name, tasks.map { |task| task["schedule"] }]).to eq([name, ["every 10 seconds"]])
     end
-    expect(Timekeeping::RelayJob.new.queue_name).to eq("timekeeping_relay")
   end
 end

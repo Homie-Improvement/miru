@@ -18,12 +18,6 @@ module TimekeepingIdentityHelpers
     previous&.each { |name, old_value| ENV[name] = old_value }
   end
 
-  # Sets several environment keys for the duration of the block, a nil value
-  # unsetting its key, and returns the block's value.
-  def with_timekeeping_env_values(values, &block)
-    values.reduce(block) { |inner, (name, value)| -> { with_timekeeping_env(name.to_s, value) { inner.call } } }.call
-  end
-
   # Sets a random service token for the duration of the block and yields it.
   def with_timekeeping_service_token(&block)
     token = SecureRandom.hex(32)
