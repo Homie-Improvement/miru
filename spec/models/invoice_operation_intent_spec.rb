@@ -30,6 +30,27 @@ RSpec.describe InvoiceOperationIntent, type: :model do
       .to raise_error(ActiveRecord::NotNullViolation)
   end
 
+  it "defaults the stored request to no entries, active" do
+    intent = described_class.create!(intent_attributes)
+
+    expect(intent.reload.desired_entry_ids).to eq([])
+    expect(intent.disposition).to eq("active")
+  end
+
+  it "stores the request's entries and accepts active and retained" do
+    %w[active retained].each do |disposition|
+      intent = described_class.create!(intent_attributes(desired_entry_ids: [3, 7], disposition:))
+
+      expect(intent.reload.desired_entry_ids).to eq([3, 7])
+    end
+  end
+
+  it "rejects another disposition in the model and in the database" do
+    expect(described_class.new(intent_attributes(disposition: "deleted"))).not_to be_valid
+    expect { described_class.insert_all([intent_attributes(disposition: "deleted", created_at: Time.current)]) }
+      .to raise_error(ActiveRecord::StatementInvalid, /disposition_check/)
+  end
+
   it "refuses the same operation twice for one invoice" do
     attributes = intent_attributes
     described_class.create!(attributes)
