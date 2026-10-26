@@ -838,11 +838,11 @@ Writers that make many writes check the generation on each write, and a refused 
 
 **Before deploying over processes that lack the checks, on a database that already lost the keys.** An earlier version of `db/migrate/20261020120000_drop_timesheet_entry_foreign_keys.rb` dropped the keys, and Rails never re-runs a recorded migration. On such a database, if any running web or worker process lacks the validations (for example after an app-only rollback), restore the keys before a rolling deploy:
 
-1. From one container, run `bin/rails db:migrate:down VERSION=20261020120000`. Its `down` counts rows that point at a missing record before it changes anything.
+1. Run `bin/rails db:migrate:down VERSION=20261020120000` in a one-off container of the release being deployed. Do not use a running container: a release without the validations also lacks this migration file, so `down` there stops with `UnknownMigrationVersionError`. The `db-migrate` alias uses `--reuse`, so it runs in a running container too. With Kamal, push the new image first, then run `kamal app exec --version=<new version> "bin/rails db:migrate:down VERSION=20261020120000"` without `--reuse`. On Render, run it as a one-off job on the new image. Its `down` counts rows that point at a missing record before it changes anything.
 2. If no row dangles, it restores all three keys, validates them and removes the version from `schema_migrations`. The deploy's `db:prepare` then runs the migration again, and its `up` keeps the keys. Deploy as usual.
 3. If it refuses with `DanglingReferencesError`, it names each column and count and changes no data. Do not continue as a rolling deploy. Stop every old web and worker process, repair the named rows by hand, then deploy.
 
-The same steps apply before an app-only rollback to code without the validations on a database whose keys are gone. Where every running process already carries the validations, no restore is needed.
+The same steps apply before an app-only rollback to code without the validations on a database whose keys are gone. In that case a running container may run step 1, because the release still running carries this migration. Where every running process already carries the validations, no restore is needed.
 
 After S4, the acceptance journey (section 13) continues with new writes, a rollback, more new writes and a re-cutover, each with the same procedure. There are no per-company waves, no shadow reads, no per-report read flags, no multi-day soak gates and no rollback window that ends. Those are deferred as rollout notes for a production move (section 15). `timesheet_entries` is never retired: as a projection it keeps every aggregate reader working with no rewrite.
 
