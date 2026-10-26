@@ -185,7 +185,7 @@ RSpec.describe Timekeeping::Handoff::Checkpoint do
 
     # "Entry versions and duration floats survive export and load unchanged, bit for bit"
     it "tells -0.0 apart from 0.0 and keeps -0.0 through to_json and from_json" do
-      tables = checkpoint_tables(entries: [checkpoint_entry(id: 1, duration: (0.1 + 0.2).next_float),
+      tables = checkpoint_tables(entries: [checkpoint_entry(id: 1, duration: (0.1 + 0.2).next_float, locked: true),
                                            checkpoint_entry(id: 2, duration: -0.0)])
       checkpoint = described_class.build(tables:)
 
