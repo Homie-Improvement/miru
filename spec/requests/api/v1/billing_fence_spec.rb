@@ -260,6 +260,9 @@ RSpec.describe "Billing fence on invoice discard", type: :request do
     # The ownership row is global operator state shared by every company, so
     # the refusal carries only the fixed code and message, never the row.
     expect(json_response.keys).to contain_exactly("errors", "reason")
+    # Entry refusals have their own text; a billing refusal keeps the billing one.
+    expect(json_response["errors"]).to eq(I18n.t("errors.ownership_moving"))
+    expect(json_response["errors"]).to start_with("Billing is paused")
     expect(response.body).not_to include("close_admission")
     expect(response.body).not_to include("handoff_step")
     expect(response.body).not_to include("generation")
