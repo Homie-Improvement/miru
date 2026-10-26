@@ -5,7 +5,7 @@ problem_type: convention
 component: data_migration
 severity: high
 evidence_grounding: anchored
-grounding_evidence: lib/timekeeping/handoff/monolith_store.rb parse_jsonb, jsonb_text and sql_literal, with Checkpoint::JSON_NULL in lib/timekeeping/handoff/checkpoint.rb, and the jsonb decimal, JSON-null and -0.0 round-trip examples in spec/lib/timekeeping/handoff/monolith_store_spec.rb
+grounding_evidence: lib/timekeeping/handoff/row_reader.rb parse_jsonb, lib/timekeeping/handoff/monolith_store.rb jsonb_text and sql_literal, with Checkpoint::JSON_NULL in lib/timekeeping/handoff/checkpoint.rb, and the jsonb decimal, JSON-null and -0.0 round-trip examples in spec/lib/timekeeping/handoff/monolith_store_spec.rb
 audience: both
 related_components:
   - active_record
@@ -54,6 +54,7 @@ This was seen on Postgres jsonb and float8 through Active Record 8.1. Other colu
 ## Evidence
 
 - PR #65, head commit 9ada49a6ef29197de28ad119fdef20747b20fa0b.
-- `lib/timekeeping/handoff/monolith_store.rb`: `read_rows` replaces jsonb cells with `parse_jsonb` of the raw text. The comment on `parse_jsonb` says the cast turns every decimal into a Float and reads JSON null as nil. `jsonb_text` writes BigDecimal with `to_s("F")`. The comment on `sql_literal` says an unquoted -0.0 is stored as 0, so floats go in as quoted text.
+- `lib/timekeeping/handoff/row_reader.rb`: `select_rows`, which `MonolithStore#read_rows` and `LegacySource` both use, replaces jsonb cells with `parse_jsonb` of the raw text. The comment on `parse_jsonb` says the cast turns every decimal into a Float and reads JSON null as nil.
+- `lib/timekeeping/handoff/monolith_store.rb`: `jsonb_text` writes BigDecimal with `to_s("F")`. The comment on `sql_literal` says an unquoted -0.0 is stored as 0, so floats go in as quoted text.
 - `lib/timekeeping/handoff/checkpoint.rb`: `JSON_NULL`, the `json_null` and `decimal` tags, and `encode_json_value`, which maps an in-JSON Float to the same decimal encoding as a BigDecimal.
 - `spec/lib/timekeeping/handoff/monolith_store_spec.rb`: these examples check stored text after export, transport and load: "keeps JSONB decimals finer than a float exact", "keeps a JSON null apart from SQL NULL in a jsonb column" and "keeps jsonb decimals exact when the value is a root array or a bare number". The example "exports durations with the bits they are stored with" includes `-0.0` and `5e-324`.
