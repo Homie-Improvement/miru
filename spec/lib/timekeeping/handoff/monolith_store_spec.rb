@@ -354,6 +354,7 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
         expect(reexported.digest.fetch("entries").transform_values { |company| company[:count] }).to eq(1 => 1, 2 => 1)
         expect(reexported.digest.fetch("idempotency_records").transform_values { |company| company[:count] })
           .to eq(1 => 1, 2 => 1)
+        expect(reexported.digest.fetch("entry_audits").transform_values { |company| company[:count] }).to eq(1 => 2)
       end
     end
 
