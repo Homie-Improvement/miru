@@ -160,6 +160,11 @@ RSpec.describe Timekeeping::ServiceCommands do
       receipts: ServiceIdempotencyReceipt.count, versions: Entry.sum(:version) }
   end
 
+  def detach_entry_for_agent(agent_id)
+    timekeeping_arrange.entry(company:, user: timekeeping_arrange.user(company:, role: "employee"),
+                              project: timekeeping_arrange.project(company:), agent_id:)
+  end
+
   # "mark_billed, detach_entries and entry updates that omit source republish whatever is stored, so a bad
   # stored value (for example from the checkpoint load) still reaches the outbox and stops delivery."
   it "refuses a mark-billed over a stored bad source with nothing kept, then bills on a retry with the same operation id once repaired" do
@@ -180,159 +185,49 @@ RSpec.describe Timekeeping::ServiceCommands do
     expect(OutboxSnapshot.where(id: billable).pluck(:bill_status, :source)).to eq([["billed", "manual"]])
     expect(ServiceIdempotencyReceipt.count).to eq(before[:receipts] + 1)
   end
-end
-
-RSpec.describe Timekeeping::ServiceCommands do
-  include_context "timekeeping entry writes"
-
-  let(:company) { timekeeping_arrange.company }
-
-  def detach_entry_for_agent(agent_id)
-    timekeeping_arrange.entry(company:, user: timekeeping_arrange.user(company:, role: "employee"),
-                              project: timekeeping_arrange.project(company:), agent_id:)
-  end
 
   # One bad row refuses the whole batch: the valid entry beside it is not detached or published either.
   it "refuses a detach-entries batch when one entry has a stored infinite duration and detaches none of them" do
     valid = detach_entry_for_agent(77)
     bad = detach_entry_for_agent(77)
     Entry.find(bad).update_column(:duration, Float::INFINITY)
-    before = { audit_events: AuditEvent.count, outbox_snapshots: OutboxSnapshot.count,
-               receipts: ServiceIdempotencyReceipt.count, versions: Entry.sum(:version) }
-    request = described_class::Request.new(route: :detach_entries, company_id: company, actor_name: "invoice-boundary",
-                                           target_id: 77, operation_id: SecureRandom.uuid,
-                                           generation: timekeeping_arrange.current_generation)
+    before = unpublishable_row_counts
 
-    outcome = described_class.new.call(request)
-
-    expect([outcome.status, JSON.parse(outcome.body)])
+    expect(run_unpublishable_command(:detach_entries, target_id: 77))
       .to eq([409, { "reason" => "unpublishable_entry", "entries" => [{ "entry_id" => bad, "fields" => ["duration"] }] }])
     expect(Entry.where(id: [valid, bad]).order(:id).pluck(:agent_id)).to eq([77, 77])
-    expect({ audit_events: AuditEvent.count, outbox_snapshots: OutboxSnapshot.count,
-             receipts: ServiceIdempotencyReceipt.count, versions: Entry.sum(:version) }).to eq(before)
-  end
-end
-
-RSpec.describe Timekeeping::ServiceCommands do
-  include_context "timekeeping entry writes"
-
-  let(:company) { timekeeping_arrange.company }
-
-  def unpublishable_service_command(route, target_id:, operation_id:)
-    request = described_class::Request.new(route:, company_id: company, actor_name: "invoice-boundary", target_id:,
-                                           operation_id:, generation: timekeeping_arrange.current_generation)
-    outcome = described_class.new.call(request)
-    [outcome.status, JSON.parse(outcome.body)]
-  end
-
-  def unpublishable_row_counts
-    { audit_events: AuditEvent.count, outbox_snapshots: OutboxSnapshot.count,
-      receipts: ServiceIdempotencyReceipt.count, versions: Entry.sum(:version) }
-  end
-
-  # "mark_billed, detach_entries and entry updates that omit source republish whatever is stored, so a bad stored
-  # value (for example from the checkpoint load) still reaches the outbox and stops delivery."
-  it "refuses mark-billed over a stored source legacy with nothing written, then bills once the value is fixed" do
-    billable = timekeeping_arrange.reserved_entry(company:, invoice_id: 501)
-    Entry.find(billable).update_column(:source, "legacy")
-    before = unpublishable_row_counts
-    operation_id = SecureRandom.uuid
-
-    expect(unpublishable_service_command(:mark_billed, target_id: 501, operation_id:)).to eq(
-      [409, { "reason" => "unpublishable_entry", "entries" => [{ "entry_id" => billable, "fields" => ["source"] }] }]
-    )
-    expect(Entry.find(billable).bill_status).to eq("unbilled")
     expect(unpublishable_row_counts).to eq(before)
-
-    Entry.find(billable).update_column(:source, "manual")
-    expect(unpublishable_service_command(:mark_billed, target_id: 501, operation_id:)).to eq([200, { "billed" => 1 }])
-    expect(OutboxSnapshot.where(id: billable).count).to eq(1)
   end
-end
 
-RSpec.describe Timekeeping::ServiceCommands do
-  include_context "timekeeping entry writes"
-
-  let(:company) { timekeeping_arrange.company }
-
-  # "mark_billed, detach_entries and entry updates that omit source republish whatever is stored"
-  it "refuses detach-entries over a stored infinite duration and keeps the agent attached" do
-    good = timekeeping_arrange.entry(company:, user: timekeeping_arrange.user(company:, role: "employee"),
-                                     project: timekeeping_arrange.project(company:), agent_id: 77)
-    bad = timekeeping_arrange.entry(company:, user: timekeeping_arrange.user(company:, role: "employee"),
-                                    project: timekeeping_arrange.project(company:), agent_id: 77)
-    Entry.find(bad).update_column(:duration, Float::INFINITY)
-    counts = -> { [AuditEvent.count, OutboxSnapshot.count, ServiceIdempotencyReceipt.count, Entry.sum(:version)] }
-    before = counts.call
-    request = described_class::Request.new(route: :detach_entries, company_id: company, actor_name: "invoice-boundary",
-                                           target_id: 77, operation_id: SecureRandom.uuid,
-                                           generation: timekeeping_arrange.current_generation)
-
-    outcome = described_class.new.call(request)
-
-    expect([outcome.status, JSON.parse(outcome.body)]).to eq(
-      [409, { "reason" => "unpublishable_entry", "entries" => [{ "entry_id" => bad, "fields" => ["duration"] }] }]
-    )
-    expect(Entry.where(id: [good, bad]).order(:id).pluck(:agent_id)).to eq([77, 77])
-    expect(counts.call).to eq(before)
-  end
-end
-
-RSpec.describe Timekeeping::ServiceCommands do
-  include_context "timekeeping entry writes"
-
-  let(:company) { timekeeping_arrange.company }
-
-  # The issue: "mark_billed, detach_entries and entry updates that omit source republish whatever is stored,
-  # so a bad stored value (for example from the checkpoint load) still reaches the outbox and stops delivery."
   # One bad entry must refuse the whole batch: inserting the valid entry and skipping the bad one would leave
   # a partial write.
   it "refuses a mark-billed batch whole when one of its entries holds a bad stored source, billing and publishing neither" do
     valid = timekeeping_arrange.reserved_entry(company:, invoice_id: 501)
     bad = timekeeping_arrange.reserved_entry(company:, invoice_id: 501)
     Entry.find(bad).update_column(:source, "legacy")
-    before = { audit_events: AuditEvent.count, outbox_snapshots: OutboxSnapshot.count,
-               receipts: ServiceIdempotencyReceipt.count, versions: Entry.sum(:version) }
-    request = described_class::Request.new(route: :mark_billed, company_id: company, actor_name: "invoice-boundary",
-                                           target_id: 501, operation_id: SecureRandom.uuid,
-                                           generation: timekeeping_arrange.current_generation)
+    before = unpublishable_row_counts
 
-    outcome = described_class.new.call(request)
-
-    expect([outcome.status, JSON.parse(outcome.body)]).to eq(
-      [409, { "reason" => "unpublishable_entry", "entries" => [{ "entry_id" => bad, "fields" => ["source"] }] }]
-    )
+    expect(run_unpublishable_command(:mark_billed, target_id: 501))
+      .to eq([409, { "reason" => "unpublishable_entry", "entries" => [{ "entry_id" => bad, "fields" => ["source"] }] }])
     expect(Entry.where(id: [valid, bad]).order(:id).pluck(:bill_status)).to eq(%w[unbilled unbilled])
-    expect({ audit_events: AuditEvent.count, outbox_snapshots: OutboxSnapshot.count,
-             receipts: ServiceIdempotencyReceipt.count, versions: Entry.sum(:version) }).to eq(before)
+    expect(unpublishable_row_counts).to eq(before)
   end
-end
-
-RSpec.describe Timekeeping::ServiceCommands do
-  include_context "timekeeping entry writes"
-
-  let(:company) { timekeeping_arrange.company }
 
   # A refusal must keep no receipt: if it did, the retry below would replay the refusal (or a stored
   # success) and the entry would never be detached or published.
   it "runs a refused detach again as a first attempt under the same operation id once the stored value is fixed" do
-    entry = timekeeping_arrange.entry(company:, user: timekeeping_arrange.user(company:, role: "employee"),
-                                      project: timekeeping_arrange.project(company:), agent_id: 77)
+    entry = detach_entry_for_agent(77)
     Entry.find(entry).update_column(:duration, Float::INFINITY)
     operation_id = SecureRandom.uuid
-    request = described_class::Request.new(route: :detach_entries, company_id: company, actor_name: "invoice-boundary",
-                                           target_id: 77, operation_id:, generation: timekeeping_arrange.current_generation)
 
-    refused = described_class.new.call(request)
-    expect(refused.status).to eq(409)
-    expect(JSON.parse(refused.body).fetch("reason")).to eq("unpublishable_entry")
+    status, body = run_unpublishable_command(:detach_entries, target_id: 77, operation_id:)
+    expect([status, body.fetch("reason")]).to eq([409, "unpublishable_entry"])
     expect(ServiceIdempotencyReceipt.where(key: operation_id).count).to eq(0)
     expect(Entry.find(entry).agent_id).to eq(77)
 
     Entry.find(entry).update_column(:duration, 1.5)
-    retried = described_class.new.call(request)
 
-    expect([retried.status, JSON.parse(retried.body)]).to eq([200, { "detached" => 1 }])
+    expect(run_unpublishable_command(:detach_entries, target_id: 77, operation_id:)).to eq([200, { "detached" => 1 }])
     expect(Entry.find(entry).agent_id).to be_nil
     expect(OutboxSnapshot.where(id: entry).count).to eq(1)
   end

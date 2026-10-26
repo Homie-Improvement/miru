@@ -251,17 +251,6 @@ RSpec.describe Timekeeping::EntryWriter do
     expect(OutboxSnapshot.where(id: entry_id).pluck(:source, :note)).to eq([["manual", "Edited"]])
     expect(IdempotencyReceipt.count).to eq(before[:idempotency_receipts] + 1)
   end
-end
-
-RSpec.describe Timekeeping::EntryWriter do
-  include_context "timekeeping entry writes"
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  let(:company) { timekeeping_arrange.company }
-  let(:project) { timekeeping_arrange.project(company:) }
-  let(:owner) { timekeeping_arrange.user(company:, role: "owner") }
-  let(:owner_token) { timekeeping_arrange.token_for(owner) }
-  let(:entry_id) { timekeeping_arrange.entry(company:, user: owner, project:) }
 
   # The check runs on the row as it will be committed, so a write that fixes the bad field is the repair route.
   it "publishes an update that repairs a stored bad source to a valid one" do
@@ -274,54 +263,13 @@ RSpec.describe Timekeeping::EntryWriter do
     expect(Entry.find(entry_id).source).to eq("manual")
     expect(OutboxSnapshot.where(id: entry_id).pluck(:source)).to eq(["manual"])
   end
-end
 
-RSpec.describe Timekeeping::EntryWriter do
-  include_context "timekeeping entry writes"
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  let(:company) { timekeeping_arrange.company }
-  let(:project) { timekeeping_arrange.project(company:) }
-  let(:owner) { timekeeping_arrange.user(company:, role: "owner") }
-  let(:owner_token) { timekeeping_arrange.token_for(owner) }
-
-  # "mark_billed, detach_entries and entry updates that omit source republish whatever is stored, so a bad stored
-  # value (for example from the checkpoint load) still reaches the outbox and stops delivery."
-  it "refuses an update that omits source over a stored bad source, and publishes the update that fixes it" do
-    entry_id = timekeeping_arrange.entry(company:, user: owner, project:)
-    Entry.find(entry_id).update_column(:source, "legacy")
-    before = entry_write_counts
-
-    refused = described_class.new.call(build_entry_command(:update, token: owner_token, entry_id:,
-                                                                    body: { "note" => "Edited" }))
-
-    expect([refused.status, JSON.parse(refused.body)]).to eq(
-      [409, { "reason" => "unpublishable_entry", "entries" => [{ "entry_id" => entry_id, "fields" => ["source"] }] }]
-    )
-    expect(entry_write_counts).to eq(before)
-    expect(Entry.find(entry_id).note).to eq("Design review")
-
-    fixed = described_class.new.call(build_entry_command(:update, token: owner_token, entry_id:,
-                                                                  body: { "source" => "manual" }))
-
-    expect(fixed.status).to eq(200)
-    expect(OutboxSnapshot.where(id: entry_id).pluck(:source)).to eq(["manual"])
+  def metadata_nested_97_levels
+    97.times.reduce("leaf") { |value, _| { "child" => value } }
   end
-end
-
-RSpec.describe Timekeeping::EntryWriter do
-  include_context "timekeeping entry writes"
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  let(:company) { timekeeping_arrange.company }
-  let(:project) { timekeeping_arrange.project(company:) }
-  let(:owner) { timekeeping_arrange.user(company:, role: "owner") }
-  let(:owner_token) { timekeeping_arrange.token_for(owner) }
 
   it "refuses destroy and bulk delete of an entry whose stored metadata nests 97 levels, leaving it kept" do
-    entry_id = timekeeping_arrange.entry(company:, user: owner, project:)
-    nested = 97.times.reduce("leaf") { |value, _| { "child" => value } }
-    Entry.find(entry_id).update_column(:source_metadata, nested)
+    Entry.find(entry_id).update_column(:source_metadata, metadata_nested_97_levels)
     before = entry_write_counts
     refusal = [409, { "reason" => "unpublishable_entry",
                       "entries" => [{ "entry_id" => entry_id, "fields" => ["source_metadata"] }] }]
@@ -337,10 +285,8 @@ RSpec.describe Timekeeping::EntryWriter do
   end
 
   it "refuses a bulk move of an entry whose stored metadata nests 97 levels, leaving it on its project" do
-    entry_id = timekeeping_arrange.entry(company:, user: owner, project:)
     other_project = timekeeping_arrange.project(company:)
-    nested = 97.times.reduce("leaf") { |value, _| { "child" => value } }
-    Entry.find(entry_id).update_column(:proof_metadata, nested)
+    Entry.find(entry_id).update_column(:proof_metadata, metadata_nested_97_levels)
     before = entry_write_counts
 
     moved = described_class.new.call(build_entry_command(:bulk_move, token: owner_token,

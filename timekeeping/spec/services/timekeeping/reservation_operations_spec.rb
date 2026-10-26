@@ -264,36 +264,6 @@ RSpec.describe Timekeeping::ReservationOperations do
   let(:company) { timekeeping_arrange.company }
   let(:user) { timekeeping_arrange.user(company:, role: "employee") }
   let(:project) { timekeeping_arrange.project(company:) }
-
-  it "refuses a prepare that would lock an entry with a stored unknown review status and leaves no operation" do
-    bad = timekeeping_arrange.entry(company:, user:, project:)
-    Entry.find(bad).update_column(:review_status, "unknown")
-    before = reservation_row_counts
-    version = Entry.find(bad).version
-    operation_id = SecureRandom.uuid
-    request = described_class::Request.new(route: :prepare, company_id: company, actor_name: "invoice-boundary",
-                                           invoice_id: 501, operation_id:, generation: timekeeping_arrange.current_generation,
-                                           disposition: "active", entry_ids: [bad])
-
-    outcome = described_class.new.call(request)
-
-    expect([outcome.status, JSON.parse(outcome.body)]).to eq(
-      [409, { "reason" => "unpublishable_entry", "entries" => [{ "entry_id" => bad, "fields" => ["review_status"] }] }]
-    )
-    expect(reservation_row_counts).to eq(before)
-    expect(InvoiceOperation.where(operation_id:).count).to eq(0)
-    expect(Reservation.where(entry_id: bad).count).to eq(0)
-    expect(OutboxSnapshot.where(id: bad).count).to eq(0)
-    expect(Entry.find(bad).version).to eq(version)
-  end
-end
-
-RSpec.describe Timekeeping::ReservationOperations do
-  include_context "timekeeping entry writes"
-
-  let(:company) { timekeeping_arrange.company }
-  let(:user) { timekeeping_arrange.user(company:, role: "employee") }
-  let(:project) { timekeeping_arrange.project(company:) }
   let(:kept_entry) { timekeeping_arrange.entry(company:, user:, project:) }
   let(:released_entry) { timekeeping_arrange.entry(company:, user:, project:) }
 
@@ -304,6 +274,23 @@ RSpec.describe Timekeeping::ReservationOperations do
     )
     outcome = described_class.new.call(request)
     [outcome.status, JSON.parse(outcome.body)]
+  end
+
+  it "refuses a prepare that would lock an entry with a stored unknown review status and leaves no operation" do
+    bad = timekeeping_arrange.entry(company:, user:, project:)
+    Entry.find(bad).update_column(:review_status, "unknown")
+    before = reservation_row_counts
+    version = Entry.find(bad).version
+    operation_id = SecureRandom.uuid
+
+    expect(unpublishable_reservation_call(:prepare, operation_id:, entry_ids: [bad])).to eq(
+      [409, { "reason" => "unpublishable_entry", "entries" => [{ "entry_id" => bad, "fields" => ["review_status"] }] }]
+    )
+    expect(reservation_row_counts).to eq(before)
+    expect(InvoiceOperation.where(operation_id:).count).to eq(0)
+    expect(Reservation.where(entry_id: bad).count).to eq(0)
+    expect(OutboxSnapshot.where(id: bad).count).to eq(0)
+    expect(Entry.find(bad).version).to eq(version)
   end
 
   # The commit releases released_entry, which flips its locked flag and would republish its stored row.
