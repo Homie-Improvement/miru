@@ -24,6 +24,34 @@ RSpec.describe Timekeeping::MetricsClient do
   end
 end
 
+RSpec.describe Timekeeping::MetricsClient, "unusable answers" do
+  let(:unusable_metrics_url) { "http://timekeeping.test/internal/v1/metrics" }
+  let(:unusable_metrics_client) do
+    described_class.new(base_url: "http://timekeeping.test", service_token: "service-#{SecureRandom.hex(24)}")
+  end
+
+  # The alert task reports the monolith's own alerts when a read fails with
+  # this class's Error, so no other failure may escape the client.
+  it "raises its own Error for a 200 body without window_seconds, such as one from an older Timekeeping" do
+    complete = { "window_seconds" => 300, "latency_bucket_bounds_ms" => [300], "overflow_bucket" => "inf",
+                 "companies" => [], "outbox_lag" => [] }
+    WebMock.stub_request(:get, unusable_metrics_url)
+           .to_return({ status: 200, body: JSON.generate(complete.except("window_seconds")) },
+                      { status: 200, body: JSON.generate(complete) })
+
+    expect { unusable_metrics_client.fetch }
+      .to raise_error(Timekeeping::MetricsClient::Error, "Timekeeping metrics body is missing fields")
+    expect(unusable_metrics_client.fetch).to eq(complete)
+  end
+
+  it "raises its own Error for a garbled HTTP answer" do
+    WebMock.stub_request(:get, unusable_metrics_url).to_raise(Net::HTTPBadResponse)
+
+    expect { unusable_metrics_client.fetch }
+      .to raise_error(Timekeeping::MetricsClient::Error, "Timekeeping metrics read failed: Net::HTTPBadResponse")
+  end
+end
+
 RSpec.describe Timekeeping::MetricsClient do
   it "metrics client sends the service token only as a bearer header and keeps it out of a refusal error" do
     env_before = ENV.to_h.slice("TIMEKEEPING_BASE_URL", "TIMEKEEPING_SERVICE_TOKEN")

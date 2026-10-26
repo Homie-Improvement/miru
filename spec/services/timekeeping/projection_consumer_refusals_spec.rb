@@ -52,3 +52,109 @@ RSpec.describe Timekeeping::ProjectionConsumer, "stale generation refusal record
     expect(TimekeepingStaleGenerationRefusal.count).to eq(0)
   end
 end
+
+RSpec.describe Timekeeping::ProjectionConsumer, "stale-generation refusal record after rollback" do
+  # "any `409 stale_generation` outside a handoff;"
+  it "a stale-generation refusal outside a handoff persists one refusal row per company after the batch rolls back" do
+    company_a = create(:company)
+    company_b = create(:company)
+    project_a = create(:project, client: create(:client, company: company_a))
+    project_b = create(:project, client: create(:client, company: company_b))
+    TimekeepingOwnership.current.update!(generation: 2, handoff_step: nil)
+
+    batch = TimekeepingSnapshots.batch(
+      TimekeepingSnapshots.item(TimekeepingSnapshots.entry(id: 93_401, company_id: company_a.id, version: 1,
+                                                           project_id: project_a.id, user_id: create(:user).id),
+                                generation: 1, outbox_position: 1),
+      TimekeepingSnapshots.item(TimekeepingSnapshots.entry(id: 93_402, company_id: company_a.id, version: 1,
+                                                           project_id: project_a.id, user_id: create(:user).id),
+                                generation: 1, outbox_position: 2),
+      TimekeepingSnapshots.item(TimekeepingSnapshots.entry(id: 93_403, company_id: company_b.id, version: 1,
+                                                           project_id: project_b.id, user_id: create(:user).id),
+                                generation: 1, outbox_position: 3)
+    )
+
+    result = described_class.call(batch:, idempotency_key: SecureRandom.uuid)
+
+    expect(result.status).to eq(409)
+    expect(result.body.to_h.stringify_keys).to eq("reason" => "stale_generation")
+    expect(TimesheetEntry.where(id: [93_401, 93_402, 93_403])).to be_empty
+    rows = TimekeepingStaleGenerationRefusal.order(:company_id).pluck(:company_id, :handoff_step)
+    expect(rows).to eq([[company_a.id, nil], [company_b.id, nil]].sort_by(&:first))
+    expect(TimekeepingStaleGenerationRefusal.pluck(:created_at)).to all(be_present)
+  end
+end
+
+RSpec.describe Timekeeping::ProjectionConsumer, "refusal record when ownership changes after the rollback" do
+  def refusal_race_batch(company_generation:, outbox_position:)
+    company = create(:company)
+    project = create(:project, client: create(:client, company:))
+    entry = TimekeepingSnapshots.entry(id: 93_501 + outbox_position, company_id: company.id, version: 1,
+                                       project_id: project.id, user_id: create(:user).id)
+    [company, TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation: company_generation,
+                                                                          outbox_position:))]
+  end
+
+  # Changes ownership after the refused batch rolled back, just before the refusal row is written.
+  def change_ownership_before_refusal_insert(**changes)
+    allow(TimekeepingStaleGenerationRefusal).to receive(:insert_all!).and_wrap_original do |method, *args|
+      TimekeepingOwnership.current.update_columns(**changes)
+      method.call(*args)
+    end
+  end
+
+  it "records no handoff step when a handoff starts after a refusal decided outside one" do
+    TimekeepingOwnership.current.update!(generation: 2, handoff_step: nil)
+    company, batch = refusal_race_batch(company_generation: 1, outbox_position: 1)
+    change_ownership_before_refusal_insert(handoff_step: "close_admission")
+
+    expect(described_class.call(batch:, idempotency_key: SecureRandom.uuid).status).to eq(409)
+    expect(TimekeepingStaleGenerationRefusal.pluck(:company_id, :handoff_step)).to eq([[company.id, nil]])
+  end
+
+  it "records the freeze step when the flip clears it after a refusal decided during the handoff" do
+    TimekeepingOwnership.current.update!(generation: 2, handoff_step: "freeze", final_outbox_position: 10)
+    company, batch = refusal_race_batch(company_generation: 1, outbox_position: 11)
+    change_ownership_before_refusal_insert(handoff_step: nil)
+
+    expect(described_class.call(batch:, idempotency_key: SecureRandom.uuid).status).to eq(409)
+    expect(TimekeepingStaleGenerationRefusal.pluck(:company_id, :handoff_step)).to eq([[company.id, "freeze"]])
+  end
+end
+
+RSpec.describe Timekeeping::ProjectionConsumer, "refusal record on accepted batches" do
+  it "an applied batch and its retry with the same idempotency key record no stale-generation refusal" do
+    company = create(:company)
+    project = create(:project, client: create(:client, company:))
+    entry = TimekeepingSnapshots.entry(id: 93_101, company_id: company.id, version: 1, project_id: project.id,
+                                       user_id: create(:user).id)
+    batch = TimekeepingSnapshots.batch(
+      TimekeepingSnapshots.item(entry, generation: TimekeepingOwnership.current.generation, outbox_position: 1)
+    )
+    key = SecureRandom.uuid
+
+    first = described_class.call(batch:, idempotency_key: key)
+    retried = described_class.call(batch:, idempotency_key: key)
+
+    expect([first.status, retried.status]).to eq([200, 200])
+    expect(TimesheetEntry.where(id: 93_101).count).to eq(1)
+    expect(TimekeepingStaleGenerationRefusal.count).to eq(0)
+  end
+end
+
+RSpec.describe Timekeeping::ProjectionConsumer, "refusal record on invalid batches" do
+  it "an invalid_snapshot refusal records no stale-generation refusal row" do
+    company = create(:company)
+    project = create(:project, client: create(:client, company:))
+    entry = TimekeepingSnapshots.entry(id: 93_201, company_id: company.id, version: 1, project_id: project.id,
+                                       user_id: create(:user).id, bill_status: "paid")
+    batch = TimekeepingSnapshots.batch(
+      TimekeepingSnapshots.item(entry, generation: TimekeepingOwnership.current.generation, outbox_position: 1)
+    )
+
+    result = described_class.call(batch:, idempotency_key: SecureRandom.uuid)
+
+    expect(result.status).to eq(422)
+    expect(TimekeepingStaleGenerationRefusal.count).to eq(0)
+  end
+end

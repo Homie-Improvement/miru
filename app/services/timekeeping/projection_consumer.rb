@@ -63,11 +63,13 @@ module Timekeeping
 
       # Runs after the refused batch has rolled back, so the record survives
       # for the stale_generation alert (section 11.3): one row per company in
-      # the batch, with the handoff step in progress at this moment. A backstop
-      # for a database fault here: the 409 is already decided, and a lost
-      # record must not replace it.
+      # the batch, with the handoff step the generation check read under its
+      # lock. Re-reading ownership here would see a handoff that started, or a
+      # flip that happened, after the decision. A backstop for a database
+      # fault here: the 409 is already decided, and a lost record must not
+      # replace it.
       def record_stale_generation(items)
-        handoff_step = TimekeepingOwnership.current.handoff_step
+        handoff_step = @decided_handoff_step
         rows = items.map(&:company_id).uniq.map { |company_id| { company_id:, handoff_step: } }
         TimekeepingStaleGenerationRefusal.insert_all!(rows)
       rescue StandardError => error
@@ -101,6 +103,8 @@ module Timekeeping
       # previous-generation snapshot can commit after the flip has.
       def refuse_stale_generations!(items)
         ownership = TimekeepingOwnership.lock("FOR SHARE").find(TimekeepingOwnership::SINGLETON_ID)
+        # Kept for record_stale_generation, which runs after this lock is released.
+        @decided_handoff_step = ownership.handoff_step
         accepted = items.all? do |item|
           ownership.snapshot_generation_accepted?(generation: item.generation, outbox_position: item.outbox_position)
         end
