@@ -132,19 +132,71 @@ RSpec.describe Timekeeping::ReservationOperations do
     expect([snapshot.locked, snapshot.version]).to eq([false, version + 1])
   end
 
-  # An entry another kept invoice holds is refused at prepare, so a successor
-  # must not take it at commit once its retained owner has become active again.
-  it "keeps an entry for a retained owner that became active before its successor commits" do
-    commit_entries([x], invoice_id: 501, disposition: "retained")
-    owner_id = SecureRandom.uuid
-    successor_id = SecureRandom.uuid
+  describe "a retained owner and a successor preparing the same entry" do
+    # "commit makes the desired set the reservation set": whichever invoice
+    # prepares the retained entry first holds it, the other is refused, and a
+    # successful commit always leaves its whole desired set reserved.
+    let(:provisional_elsewhere) do
+      [409, { "reason" => "conflict", "conflicts" => [{ "entry_id" => x, "reason" => "provisional_elsewhere" }] }]
+    end
 
-    expect(run_operation(:prepare, operation_id: owner_id, invoice_id: 501, entry_ids: [x]).first).to eq(200)
-    expect(run_operation(:prepare, operation_id: successor_id, invoice_id: 502, entry_ids: [x]).first).to eq(200)
-    expect(run_operation(:commit, operation_id: owner_id, invoice_id: 501)).to eq([200, { "reserved" => 0, "released" => 0 }])
+    def held_with_disposition(entry_id)
+      Reservation.where(entry_id:).order(:invoice_id).pluck(:invoice_id, :state, :disposition)
+    end
 
-    expect(run_operation(:commit, operation_id: successor_id, invoice_id: 502))
-      .to eq([200, { "reserved" => 0, "released" => 0 }])
-    expect(Reservation.where(entry_id: x).pluck(:invoice_id, :state, :disposition)).to eq([[501, "committed", "active"]])
+    before { commit_entries([x], invoice_id: 501, disposition: "retained") }
+
+    it "refuses the successor while the owner's active prepare holds the entry, then commits the owner's whole set" do
+      owner_id = SecureRandom.uuid
+
+      expect(run_operation(:prepare, operation_id: owner_id, invoice_id: 501, entry_ids: [x, y]).first).to eq(200)
+      expect(run_operation(:prepare, operation_id: SecureRandom.uuid, invoice_id: 502, entry_ids: [x]))
+        .to eq(provisional_elsewhere)
+
+      expect(run_operation(:commit, operation_id: owner_id, invoice_id: 501))
+        .to eq([200, { "reserved" => 1, "released" => 0 }])
+      expect(held_with_disposition(x)).to eq([[501, "committed", "active"]])
+      expect(held_with_disposition(y)).to eq([[501, "committed", "active"]])
+    end
+
+    it "refuses the owner while the successor's prepare holds the entry, then hands the entry to the successor" do
+      successor_id = SecureRandom.uuid
+
+      expect(run_operation(:prepare, operation_id: successor_id, invoice_id: 502, entry_ids: [x, y]).first).to eq(200)
+      expect(run_operation(:prepare, operation_id: SecureRandom.uuid, invoice_id: 501, entry_ids: [x]))
+        .to eq(provisional_elsewhere)
+
+      expect(run_operation(:commit, operation_id: successor_id, invoice_id: 502))
+        .to eq([200, { "reserved" => 2, "released" => 0 }])
+      expect(held_with_disposition(x)).to eq([[502, "committed", "active"]])
+      expect(held_with_disposition(y)).to eq([[502, "committed", "active"]])
+    end
+
+    it "leaves the retained reservation as it was when the owner's prepare aborts, so a successor may then take it" do
+      owner_id = SecureRandom.uuid
+      expect(run_operation(:prepare, operation_id: owner_id, invoice_id: 501, entry_ids: [x, y]).first).to eq(200)
+
+      expect(run_operation(:abort, operation_id: owner_id, invoice_id: 501)).to eq([200, { "dropped" => 1 }])
+      expect(held_with_disposition(x)).to eq([[501, "committed", "retained"]])
+      expect(held(y)).to eq([])
+
+      successor_id = SecureRandom.uuid
+      expect(run_operation(:prepare, operation_id: successor_id, invoice_id: 502, entry_ids: [x]).first).to eq(200)
+      expect(run_operation(:commit, operation_id: successor_id, invoice_id: 502))
+        .to eq([200, { "reserved" => 1, "released" => 0 }])
+      expect(held_with_disposition(x)).to eq([[502, "committed", "active"]])
+    end
+
+    it "keeps the entry retained when the owner prepares it again as retained" do
+      owner_id = SecureRandom.uuid
+      expect(run_operation(:prepare, operation_id: owner_id, invoice_id: 501, entry_ids: [x], disposition: "retained")
+               .first).to eq(200)
+      expect(run_operation(:prepare, operation_id: SecureRandom.uuid, invoice_id: 502, entry_ids: [x]))
+        .to eq(provisional_elsewhere)
+
+      expect(run_operation(:commit, operation_id: owner_id, invoice_id: 501))
+        .to eq([200, { "reserved" => 0, "released" => 0 }])
+      expect(held_with_disposition(x)).to eq([[501, "committed", "retained"]])
+    end
   end
 end
