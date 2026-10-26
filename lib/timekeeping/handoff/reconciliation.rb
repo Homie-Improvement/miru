@@ -108,7 +108,9 @@ module Timekeeping
       # not checkpoint rows, so they have their own shape here. id is compared
       # when a caller reads it, but a row may leave it out, because the
       # table's unique key is (company_id, invoice_id, operation_id).
-      INTENT_COLUMNS = %w[id company_id invoice_id operation_id generation state created_at finished_at].freeze
+      INTENT_COLUMNS = %w[
+        id company_id invoice_id operation_id generation desired_entry_ids disposition state created_at finished_at
+      ].freeze
       OPTIONAL_INTENT_COLUMNS = %w[id].freeze
 
       # The columns of a timesheet_entries row, which are the checkpoint

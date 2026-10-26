@@ -433,7 +433,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
 
   def recon_checks_intent(company_id, **overrides)
     { "company_id" => company_id, "invoice_id" => 1, "operation_id" => recon_checks_operation_id, "generation" => 1,
-      "state" => "committed", "created_at" => recon_checks_time,
+      "desired_entry_ids" => [1], "disposition" => "active", "state" => "committed", "created_at" => recon_checks_time,
       "finished_at" => recon_checks_time }.merge(overrides.transform_keys(&:to_s))
   end
 
@@ -806,6 +806,20 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
       .to contain_exactly([101, "invoice", 9, "discount"], [101, "pdf_total", 9, "invoice_discount"],
                           [101, "pdf_total", 9, "total"])
     expect(reconciliation.order(:id).last(3).map { |row| row.payload["data"]["company_id"] }).to eq([101, 101, 101])
+  end
+
+  it "accepts every stored invoice_operation_intents column" do
+    stored = ActiveRecord::Base.connection.columns("invoice_operation_intents").map(&:name)
+    expect(stored - described_class::INTENT_COLUMNS).to eq([])
+  end
+
+  it "reports a changed desired entry set and a changed disposition on an intent" do
+    changed = recon_checks_run(
+      intents: [recon_checks_intent(101, desired_entry_ids: [2], disposition: "retained"), recon_checks_intent(202)]
+    )
+    fields = changed.companies.fetch(101).checks.fetch(:operation_receipts).map(&:field)
+    expect(fields).to contain_exactly("desired_entry_ids", "disposition")
+    expect_recon_checks_abort_in_a(changed, :operation_receipts, reason: :changed, field: "disposition")
   end
 
   it "accepts intent rows with their stored id and compares that id" do

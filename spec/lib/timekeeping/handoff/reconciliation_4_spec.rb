@@ -35,7 +35,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     end
     intent = lambda do |company_id, **o|
       { "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "generation" => 1,
-        "state" => "committed", "created_at" => t0, "finished_at" => t0 }.merge(o.transform_keys(&:to_s))
+        "desired_entry_ids" => [1], "disposition" => "active", "state" => "committed", "created_at" => t0, "finished_at" => t0 }.merge(o.transform_keys(&:to_s))
     end
     projection_row = lambda do |company_id, **o|
       entry.call(company_id, **o).merge(
@@ -110,7 +110,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     end
     intent = lambda do |company_id|
       { "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "generation" => 1,
-        "state" => "committed", "created_at" => t0, "finished_at" => t0 }
+        "desired_entry_ids" => [1], "disposition" => "active", "state" => "committed", "created_at" => t0, "finished_at" => t0 }
     end
     projection_row = lambda do |company_id, **o|
       entry.call(company_id, **o).merge(
@@ -179,7 +179,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     end
     intent = lambda do |company_id|
       { "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "generation" => 1,
-        "state" => "committed", "created_at" => t0, "finished_at" => t0 }
+        "desired_entry_ids" => [1], "disposition" => "active", "state" => "committed", "created_at" => t0, "finished_at" => t0 }
     end
     projection_row = lambda do |company_id, **o|
       entry.call(company_id, **o).merge(
@@ -257,7 +257,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     end
     intent = lambda do |company_id|
       { "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "generation" => 1,
-        "state" => "committed", "created_at" => t0, "finished_at" => t0 }
+        "desired_entry_ids" => [1], "disposition" => "active", "state" => "committed", "created_at" => t0, "finished_at" => t0 }
     end
     projection_row = lambda do |company_id|
       entry.call(company_id).merge(
@@ -335,7 +335,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     end
     intent = lambda do |company_id, state = "committed"|
       { "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "generation" => 1,
-        "state" => state, "created_at" => t0, "finished_at" => state == "pending" ? nil : t0 }
+        "desired_entry_ids" => [1], "disposition" => "active", "state" => state, "created_at" => t0, "finished_at" => state == "pending" ? nil : t0 }
     end
     projection_row = lambda do |company_id|
       entry.call(company_id, ids[company_id]).merge(
@@ -413,7 +413,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     end
     intent = lambda do |company_id|
       { "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "generation" => 1,
-        "state" => "committed", "created_at" => t0, "finished_at" => t0 }
+        "desired_entry_ids" => [1], "disposition" => "active", "state" => "committed", "created_at" => t0, "finished_at" => t0 }
     end
     checkpoint_of = lambda do |note|
       tables = Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }
@@ -489,7 +489,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     end
     intent = lambda do |company_id|
       { "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "generation" => 1,
-        "state" => "committed", "created_at" => t0, "finished_at" => t0 }
+        "desired_entry_ids" => [1], "disposition" => "active", "state" => "committed", "created_at" => t0, "finished_at" => t0 }
     end
     checkpoint_of = lambda do |note_b|
       tables = Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }

@@ -287,7 +287,8 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     intent = ->(company_id) {
       {
         "company_id" => company_id, "invoice_id" => 5, "operation_id" => operation_id, "generation" => 1,
-        "state" => "committed", "created_at" => at, "finished_at" => at
+        "desired_entry_ids" => [], "disposition" => "active", "state" => "committed", "created_at" => at,
+        "finished_at" => at
       }
     }
     tables = Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }
