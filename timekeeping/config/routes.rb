@@ -18,5 +18,11 @@ Rails.application.routes.draw do
 
   scope "internal/v1", module: "timekeeping/internal/v1" do
     get "metrics", to: "metrics#index"
+
+    # Drawn only when the test hooks are loaded, so elsewhere these paths 404.
+    if defined?(Timekeeping::TestHooks)
+      post "test-hooks/relay/pause", to: "test_hooks#pause"
+      post "test-hooks/relay/resume", to: "test_hooks#resume"
+    end
   end
 end

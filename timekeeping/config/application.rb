@@ -5,6 +5,7 @@ require_relative "boot"
 require "rails"
 require "active_record/railtie"
 require "action_controller/railtie"
+require "active_job/railtie"
 
 Bundler.require(*Rails.groups)
 
@@ -16,6 +17,7 @@ require_relative "../lib/timekeeping/log_safety"
 require_relative "../lib/timekeeping/request_identity"
 require_relative "../lib/timekeeping/request_logger"
 require_relative "../lib/timekeeping/controller_log_subscriber"
+require_relative "../lib/timekeeping/test_hooks" if Rails.env.test? || Timekeeping::Environment.test_hooks?
 
 module TimekeepingService
   class Application < Rails::Application
@@ -23,6 +25,10 @@ module TimekeepingService
 
     # A JSON API: no cookies, sessions, views or assets.
     config.api_only = true
+
+    # Jobs are stored in this service's own database (the solid_queue_* tables)
+    # and worked by the processes timekeeping/config/solid_queue.yml names.
+    config.active_job.queue_adapter = :solid_queue
 
     config.log_tags = Timekeeping::RequestIdentity::LOG_TAGS
     config.middleware.swap Rails::Rack::Logger, Timekeeping::RequestLogger, config.log_tags

@@ -1,0 +1,64 @@
+# frozen_string_literal: true
+
+require "spec_helper"
+require_relative "../../../../spec/support/timekeeping/fake_relay"
+
+RSpec.describe TimekeepingRelay::BatchJson do
+  # The consumer refuses a reused key whose body text differs, so a source that
+  # rebuilds the same row with its keys in another order must still post the
+  # text the key was taken from.
+  it "lets a lost-mark retry of a reordered row replay the stored answer and mark it sent" do
+    timekeeping = TimekeepingContract::FakeTimekeeping.new
+    credential = timekeeping.add_service(company_id: nil, name: "timekeeping", operations: ["deliver"])
+    projection = TimekeepingContract::FakeRelay.new(source: timekeeping)
+    statuses = []
+    endpoint = Object.new
+    endpoint.define_singleton_method(:deliver) do |batch, idempotency_key:|
+      answer = projection.call("POST", "/internal/v1/timekeeping/entry-snapshots",
+                               headers: { "Authorization" => "Bearer #{credential}", "Idempotency-Key" => idempotency_key },
+                               body: batch)
+      statuses << answer.status
+      TimekeepingRelay::Response.new(status: answer.status, body: answer.body)
+    end
+    row = { "generation" => TimekeepingContract::FakeTimekeeping::INITIAL_GENERATION, "outbox_position" => 1,
+            "entry" => { "id" => 77, "company_id" => 1, "version" => 1 } }
+    source = TimekeepingRelaySpec::MemoryOutboxSource.new([row])
+    mark = source.method(:mark_sent)
+    lose_mark = true
+    source.define_singleton_method(:mark_sent) do |positions|
+      if lose_mark
+        lose_mark = false
+        raise IOError, "lost sent mark"
+      end
+      mark.call(positions)
+    end
+    relay = TimekeepingRelay::Relay.new(source:, endpoint:)
+
+    expect { relay.deliver(limit: 10) }.to raise_error(IOError)
+    row["entry"] = row.fetch("entry").to_a.reverse.to_h
+
+    expect(relay.deliver(limit: 10)).to eq(sent: 1, last_position: 1)
+    expect(statuses).to eq([200, 200])
+  end
+
+  # An entry can be admitted with metadata nested close to JSON's default
+  # limit of 100; the batch envelope must not push it past what can be sent.
+  it "serializes and keys a batch whose entry metadata is nested 98 levels deep" do
+    metadata = 98.times.reduce("leaf") { |value, _| { "child" => value } }
+    row = { "generation" => 1, "outbox_position" => 1,
+            "entry" => { "id" => 5, "company_id" => 1, "version" => 1, "proof_metadata" => metadata } }
+    posted = []
+    batch_json = described_class
+    endpoint = Object.new
+    endpoint.define_singleton_method(:deliver) do |batch, idempotency_key:|
+      posted << [batch_json.generate(batch), idempotency_key]
+      TimekeepingRelay::Response.new(status: 200, body: { "applied" => 1, "ignored" => 0 })
+    end
+
+    result = TimekeepingRelay::Relay.new(source: TimekeepingRelaySpec::MemoryOutboxSource.new([row]), endpoint:)
+                                    .deliver(limit: 10)
+
+    expect(result).to eq(sent: 1, last_position: 1)
+    expect(JSON.parse(posted.first.first, max_nesting: false).dig("snapshots", 0, "entry", "proof_metadata")).to eq(metadata)
+  end
+end
