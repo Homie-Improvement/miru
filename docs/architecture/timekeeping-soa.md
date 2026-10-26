@@ -701,8 +701,14 @@ Every invoice change that alters which entries the invoice holds goes through th
 
 ```text
 invoice_operation_intents(company_id, invoice_id, operation_id, state: 'pending' | 'committed' | 'failed',
-                          generation, created_at, finished_at)
+                          generation, desired_entry_ids, disposition: 'active' | 'retained',
+                          created_at, finished_at)
+invoice_entry_holdings(company_id, invoice_id, entry_ids, disposition: 'active' | 'retained', updated_at)
+invoice_operation_outbox_items(company_id, invoice_id, operation_id, kind: 'commit' | 'abort', payload,
+                               attempts, delivered_at, created_at)
 ```
+
+The intent stores the whole request (entry set and disposition), so a retry or recovery resends the stored request and never recomputes it. `invoice_entry_holdings` records what each invoice holds, one row per (company_id, invoice_id), with no foreign key to `invoices`. `invoice_operation_outbox_items` holds the commit and abort messages waiting for delivery, unique per (company_id, operation_id, kind).
 
 Timekeeping keeps its own terminal record of the same operations (`invoice_operations`, section 7.2).
 
