@@ -7,8 +7,8 @@ module Timekeeping
   # order, so one refused snapshot holds back every later one. EntryCommand,
   # Handoff::CorrectionSnapshots and the checkpoint load (Handoff::ServiceStore,
   # through Handoff::CheckpointEntryValues) check their values against these
-  # rules before they write; each rule is at least as strict as the projection's check on the
-  # same field. WriteSteps.write_outbox republishes stored rows without them.
+  # rules before they write; each rule is at least as strict as the
+  # projection's check on the same field. WriteSteps.write_outbox republishes stored rows without them.
   #
   # The lists are written out here because the app deploys without the
   # contracts directory; spec/services/timekeeping/snapshot_values_spec.rb
