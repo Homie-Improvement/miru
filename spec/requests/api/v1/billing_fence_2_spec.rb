@@ -225,11 +225,12 @@ RSpec.describe "Billing fence on retried invoice update with nested taxes", type
         due_date: invoice.due_date.iso8601,
         status: "draft",
         currency: company.base_currency,
-        invoice_taxes_attributes: [
-          { id: gst_row.id, tax_configuration_id: gst.id, name: "GST", calculation_method: "percentage", value: 18, amount: 99 },
-          { tax_configuration_id: gst.id, name: "Added", calculation_method: "percentage", value: 3, amount: 3 },
-          { id: service_row.id, _destroy: "1" }
-        ],
+        # Indexed keys keep the id-less new row apart from the destroy row, as in the update example above.
+        invoice_taxes_attributes: {
+          "0" => { id: gst_row.id, tax_configuration_id: gst.id, name: "GST", calculation_method: "percentage", value: 18, amount: 99 },
+          "1" => { tax_configuration_id: gst.id, name: "Added", calculation_method: "percentage", value: 3, amount: 3 },
+          "2" => { id: service_row.id, _destroy: "1" }
+        },
         invoice_line_items_attributes: [
           { id: line_item.id, name: "Keep", description: "Keep", date: line_item.date.iso8601, rate: 250, quantity: 90 }
         ]
