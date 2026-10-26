@@ -51,5 +51,5 @@ Reusing a secret that is already a bearer feels like following the spec, and a r
 - `timekeeping/lib/timekeeping/service_token_verifier.rb`: `ALGORITHM = "RS256"`, `TYPE = "timekeeping_service"`, `CLAIM_RULES`, and the module comment on why the key is never a value sent as a bearer.
 - `timekeeping/lib/timekeeping/identity.rb`: `signed` tries `ServiceTokenVerifier`, then `TokenVerifier`.
 - `timekeeping/spec/lib/timekeeping/identity_spec.rb`: "refuses a service token signed with the shared service token as an HMAC secret".
-- `timekeeping/spec/services/timekeeping/credential_scan_spec.rb`: the "for signed service tokens" example finds a token whose header is `{ "alg": "RS256", "typ": "JWT" }` with spaces.
+- `timekeeping/spec/services/timekeeping/credential_scan_spec.rb`: the "finds an unregistered service token signed with the token key, however it is wrapped, and ignores other keys" example finds a token whose header is `{ "alg": "RS256", "typ": "JWT" }` with spaces.
 - `timekeeping/app/services/timekeeping/reservation_access.rb`: the raw shared token lists no operation, so it is refused.

@@ -500,6 +500,9 @@ RSpec.describe "Api::V1::Mobile::Collections#create during a handoff", type: :re
   # "Every invoice, line-item, invoice-tax and payment write, mobile-collection payments included, gets 503 ownership_moving while handoff_step is set and writes nothing"
   # The 503 is retryable, so a refused attempt must not use up the idempotency key.
   it "leaves nothing behind on a refused collection and creates exactly one on a retry with the same idempotency key" do
+    row_counts = -> { [Client.count, User.count, Invoice.count, InvoiceLineItem.count, Payment.count] }
+    baseline = row_counts.call
+    expect(baseline.last(3)).to eq([0, 0, 0])
     TimekeepingOwnership.current.update!(handoff_step: "close_admission")
 
     post "/api/v1/mobile/collections", params:, headers: auth_headers(user)
@@ -508,14 +511,16 @@ RSpec.describe "Api::V1::Mobile::Collections#create during a handoff", type: :re
     expect(json_response["reason"]).to eq("ownership_moving")
     expect(Client.where(company:, phone: "+919811122334")).to be_empty
     expect(User.where(phone: "+919811122334")).to be_empty
-    expect(company.invoices.count).to eq(0)
-    expect(Payment.count).to eq(0)
+    expect(row_counts.call).to eq(baseline)
 
     TimekeepingOwnership.current.update!(handoff_step: nil)
     post "/api/v1/mobile/collections", params:, headers: auth_headers(user)
 
     expect(response).to have_http_status(:created)
     expect(company.invoices.count).to eq(1)
+    expect(
+      company.invoices.where("payment_infos ->> 'mobile_collection_idempotency_key' = ?", "handoff-retry-1500").count
+    ).to eq(1)
     expect(Payment.where(invoice: company.invoices).count).to eq(1)
 
     post "/api/v1/mobile/collections", params:, headers: auth_headers(user)

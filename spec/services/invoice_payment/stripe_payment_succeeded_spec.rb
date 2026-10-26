@@ -118,7 +118,9 @@ RSpec.describe InvoicePayment::StripePaymentSucceeded, "during a Timekeeping han
     expect do
       expect { described_class.process(event) }.to raise_error(Timekeeping::BillingFence::OwnershipMoving)
     end.not_to change(Payment, :count)
-    expect(invoice.reload.status).to eq("sent")
+    invoice.reload
+    expect(invoice.status).to eq("sent")
+    expect(invoice).not_to be_paid
 
     ownership.update!(handoff_step: nil)
 
