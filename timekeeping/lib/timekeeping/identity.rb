@@ -14,8 +14,12 @@ module Timekeeping
   # verified, expired or not. Only write metrics read it, so an expired token
   # is counted under its own company; access decisions and log tags read
   # company_id, which stays nil for an expired token.
-  Identity = Data.define(:kind, :status, :user_id, :company_id, :role, :signed_company_id) do
-    def initialize(signed_company_id: nil, **fields)
+  #
+  # purpose is the token's signed purpose claim ("read" or "write"), or nil for
+  # a token signed without one. Only WriteAccess reads it: a read token may
+  # carry a raised role, so it must never authorize a write.
+  Identity = Data.define(:kind, :status, :user_id, :company_id, :role, :signed_company_id, :purpose) do
+    def initialize(signed_company_id: nil, purpose: nil, **fields)
       super
     end
 
@@ -34,7 +38,8 @@ module Timekeeping
         user_id: claims.fetch("sub"),
         company_id: claims.fetch("company_id"),
         role: claims.fetch("role"),
-        signed_company_id: claims.fetch("company_id")
+        signed_company_id: claims.fetch("company_id"),
+        purpose: claims["purpose"]
       )
     end
 
