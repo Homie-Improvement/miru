@@ -21,7 +21,9 @@ module Timekeeping
     ].map(&:freeze).freeze
 
     # The outcomes that refuse a prepare, as the reservations contract lists them.
-    REFUSALS = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/reservations.yml"))
+    # Read relative to this file, so the fakes the Timekeeping service and the
+    # relay gem load from spec/support find the contract without this app.
+    REFUSALS = YAML.safe_load_file(File.expand_path("../../../contracts/timekeeping/reservations.yml", __dir__))
       .fetch("conflict_reasons").map(&:to_sym).freeze
 
     module_function
