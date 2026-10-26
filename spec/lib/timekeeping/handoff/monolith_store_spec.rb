@@ -112,7 +112,7 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
       "reservations" => [{
         "company_id" => 1, "entry_id" => 11, "invoice_id" => 987_654, "state" => "committed",
         "disposition" => "retained", "operation_id" => "0b1f8a4c-9d2e-4f7a-8c3b-5e6d7f8a9b0c",
-        "created_at" => checkpoint_stamp
+        "created_at" => checkpoint_stamp, "invoice_operation_id" => 3
       }],
       "invoice_operations" => [
         {
@@ -129,12 +129,12 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
       "entry_audits" => [
         {
           "id" => 1, "company_id" => 1, "entry_id" => 11, "actor_type" => "User", "actor_id" => 7,
-          "action" => "create", "before" => nil, "after" => { "duration" => 60 },
+          "actor_name" => nil, "action" => "create", "before" => nil, "after" => { "duration" => 60 },
           "entry_created_at" => checkpoint_stamp, "created_at" => checkpoint_stamp
         },
         {
           "id" => 2, "company_id" => 1, "entry_id" => 11, "actor_type" => "Agent", "actor_id" => 8,
-          "action" => "update", "before" => { "duration" => 60 }, "after" => { "duration" => 0.1 + 0.2 },
+          "actor_name" => nil, "action" => "update", "before" => { "duration" => 60 }, "after" => { "duration" => 0.1 + 0.2 },
           "entry_created_at" => checkpoint_stamp, "created_at" => checkpoint_stamp + 1
         }
       ],
@@ -261,7 +261,7 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
       # The audit points at an entry the checkpoint does not hold, so the insert fails after entries were replaced.
       orphan_audit = {
         "id" => 1, "company_id" => 2, "entry_id" => seeded_id + 999, "actor_type" => "User", "actor_id" => 7,
-        "action" => "create", "before" => nil, "after" => { "duration" => 30.0 }, "entry_created_at" => time,
+        "actor_name" => nil, "action" => "create", "before" => nil, "after" => { "duration" => 30.0 }, "entry_created_at" => time,
         "created_at" => time
       }
       checkpoint = checkpoint_of("entries" => [entry], "entry_audits" => [orphan_audit])
@@ -368,7 +368,7 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
 
       cross_company_audit = {
         "id" => 1, "company_id" => 200, "entry_id" => 10, "actor_type" => "User", "actor_id" => 5,
-        "action" => "create", "before" => nil, "after" => { "duration" => 60.0 },
+        "actor_name" => nil, "action" => "create", "before" => nil, "after" => { "duration" => 60.0 },
         "entry_created_at" => checkpoint_stamp, "created_at" => checkpoint_stamp
       }
       checkpoint = checkpoint_of(
@@ -602,7 +602,8 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
         "entries" => [entry_row(id: 501, company_id: invoice.company_id, bill_status: "billed", locked: true)],
         "reservations" => [{
           "company_id" => invoice.company_id, "entry_id" => 501, "invoice_id" => invoice.id, "state" => "committed",
-          "disposition" => "active", "operation_id" => operation_id, "created_at" => checkpoint_stamp
+          "disposition" => "active", "operation_id" => operation_id, "created_at" => checkpoint_stamp,
+          "invoice_operation_id" => 7
         }],
         "invoice_operations" => [{
           "id" => 7, "company_id" => invoice.company_id, "invoice_id" => invoice.id, "operation_id" => operation_id,

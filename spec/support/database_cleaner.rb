@@ -11,9 +11,14 @@ RSpec.configure do |config|
   # group loaded once survives between its examples. The group's own
   # truncation cleans up when it finishes; an example that writes rows needs
   # a group of its own.
+  #
+  # System specs and committed_data examples (spec/support/committed_data.rb)
+  # also need their writes committed, so they clean up by deletion instead.
   outside_transaction = ->(example) {
-    example.metadata[:type] == :system || example.metadata[:without_transaction] ||
-      example.metadata[:seeded_without_transaction]
+    example.metadata[:type] == :system ||
+      example.metadata[:without_transaction] ||
+      example.metadata[:seeded_without_transaction] ||
+      CommittedDataMode.example?(example)
   }
 
   config.before(:suite) do
@@ -28,12 +33,12 @@ RSpec.configure do |config|
     DatabaseCleaner.strategy = :transaction
   end
 
-  config.before do
-    DatabaseCleaner.start unless outside_transaction.call(RSpec.current_example)
+  config.before do |example|
+    DatabaseCleaner.start unless outside_transaction.call(example)
   end
 
-  config.append_after do
-    DatabaseCleaner.clean unless outside_transaction.call(RSpec.current_example)
+  config.append_after do |example|
+    DatabaseCleaner.clean unless outside_transaction.call(example)
   end
 
   config.before(:each, type: :system) do

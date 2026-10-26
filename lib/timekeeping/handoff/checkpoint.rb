@@ -30,13 +30,15 @@ module Timekeeping
           review_status locked source source_metadata external_run_id external_session_id proof_url
           proof_metadata discarded_at created_at updated_at
         ],
-        "reservations" => %w[company_id entry_id invoice_id state disposition operation_id created_at],
+        "reservations" => %w[
+          company_id entry_id invoice_id state disposition operation_id created_at invoice_operation_id
+        ],
         "invoice_operations" => %w[
           id company_id invoice_id operation_id state desired_entry_ids disposition generation
           created_at finished_at
         ],
         "entry_audits" => %w[
-          id company_id entry_id actor_type actor_id action before after entry_created_at created_at
+          id company_id entry_id actor_type actor_id actor_name action before after entry_created_at created_at
         ],
         "idempotency_records" => %w[
           id company_id actor_type actor_id operation key fingerprint status body created_at

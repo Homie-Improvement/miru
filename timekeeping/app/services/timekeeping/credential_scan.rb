@@ -12,14 +12,14 @@ module Timekeeping
     # A run of base64 segments joined by dots, in base64url or standard base64,
     # padded or not: a JWT verifier decodes a signature in any of them.
     DOTTED_SEGMENTS = %r{[A-Za-z0-9_+/=-]+(?:\.[A-Za-z0-9_+/=-]+)+}
-    # A user token is a header, a payload and then its signature.
+    # A signed token is a header, a payload and then its signature.
     SEGMENTS_BEFORE_SIGNATURE = 2
     SIGNATURE_DIGEST = "SHA256"
 
     module_function
 
     # True when the body holds, anywhere, the bearer token, a held credential,
-    # or a user token signed with the given key.
+    # or a user or service token signed with the given key.
     def found?(parsed_body, bearer:, held:, public_key:)
       texts = [JSON.generate(parsed_body), *decoded_strings(parsed_body)]
       literals = [bearer, *held].map(&:to_s).reject(&:empty?)
@@ -42,11 +42,12 @@ module Timekeeping
 
     # A token is found by its signature alone: any dotted segment that follows
     # two others and opens with a valid RS256 signature made by the key. Only
-    # the key's holder can make one, and the monolith signs nothing but user
-    # tokens with it, so the token is found whatever its header or payload say,
-    # however long they are and whatever text is glued around them, and an
-    # expired token counts too. Each segment costs one RSA public-key
-    # operation, so the work grows with the body's length, not its square.
+    # the key's holder can make one, and the monolith signs only user and
+    # service tokens with it, so the token is found whatever its header or
+    # payload say, however long they are and whatever text is glued around
+    # them, and an expired token counts too. Each segment costs one RSA
+    # public-key operation, so the work grows with the body's length, not its
+    # square.
     def signed_token_in?(text, rsa)
       text.scan(DOTTED_SEGMENTS).any? do |run|
         run.split(".").drop(SEGMENTS_BEFORE_SIGNATURE).any? { |segment| key_signature?(segment, rsa) }

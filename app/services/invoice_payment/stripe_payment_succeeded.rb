@@ -14,11 +14,19 @@ class InvoicePayment::StripePaymentSucceeded < ApplicationService
     @invoice = Invoice.where("payment_infos ->> 'stripe_payment_intent' = ?", data_object.id).first
     return false if invoice.blank?
 
-    invoice.with_lock do
-      return true if invoice.paid? || Payment.exists?(provider_event_id: event.id)
+    # The ownership lock is taken before the invoice lock, the order the other
+    # fenced payment paths use, so this path cannot deadlock with them.
+    Timekeeping::BillingFence.transaction do
+      invoice.with_lock do
+        next true if invoice.paid? || Payment.exists?(provider_event_id: event.id)
 
-      InvoicePayment::Settle.process(payment_params, invoice)
+        InvoicePayment::Settle.process(payment_params, invoice)
+      end
     end
+  rescue Timekeeping::BillingFence::OwnershipMoving
+    # Answered with a retryable 503 so Stripe redelivers the event after the
+    # handoff; swallowing it here would lose the customer's payment.
+    raise
   rescue StandardError => error
     Rails.logger.error error.message
     Rails.logger.error error.backtrace.join("\n")

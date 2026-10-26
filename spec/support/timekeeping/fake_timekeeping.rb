@@ -5,7 +5,7 @@ require "securerandom"
 require_relative "client"
 require_relative "contract"
 require_relative "idempotency_receipts"
-require_relative "reservation_rules"
+require_relative "../../../gems/timekeeping_rules/lib/timekeeping_rules/reservation_decision"
 
 module TimekeepingContract
   # An in-memory Timekeeping that answers the entry API and the reservation
@@ -19,6 +19,11 @@ module TimekeepingContract
     INITIAL_GENERATION = 1
     FIRST_ID = 1000
     CLOCK_START = Time.utc(2026, 1, 1)
+
+    # The reservation wire carries no invoice status, so the fake, like the
+    # real provider, applies the desired set it is sent. Keeping a non-draft
+    # invoice's entries is the job of the boundary that builds that set.
+    WIRE_INVOICE_STATUS = TimekeepingRules::ReservationDecision::DRAFT_STATUS
 
     # Who the body's user_id names, in order: the first row that holds decides.
     TARGET_USER_TABLE = [
@@ -400,22 +405,26 @@ module TimekeepingContract
         end
 
         entry_ids = Array(body["entries"]).map { |id| integer(id) }
-        outcomes = entry_ids.index_with { |entry_id| prepare_outcome(entry_id, company_id, body["invoice_id"]) }
-        conflicts = outcomes.select { |_entry_id, outcome| ReservationRules.refusal?(outcome) }
-        free = outcomes.select { |_entry_id, outcome| outcome == :add_provisional }.keys
+        in_company_ids = entry_ids.uniq.select { |entry_id| visible_entry(entry_id, company_id) }
+        decision = TimekeepingRules::ReservationDecision.call(
+          current: decision_reservations(in_company_ids, body["invoice_id"]), desired: entry_ids,
+          disposition: body["disposition"], invoice_status: WIRE_INVOICE_STATUS
+        )
+        conflicts = decision[:conflicts]
+        free = decision[:reserve]
         operation_id = body["operation_id"]
         # Reservations carry the operation's full identity, so another actor's
         # operation with the same operation_id never commits or aborts them.
         operation_key = @policies[:operation_key].call(company_id:, actor:, operation_id:)
 
         unless conflicts.empty?
-          refused = @policies[:refused_prepare].call(free_entry_ids: free, conflicting_entry_ids: conflicts.keys)
+          refused = @policies[:refused_prepare].call(free_entry_ids: free, conflicting_entry_ids: conflicts.pluck(:entry_id))
           reserve_provisionally(refused[:reserve], company_id, body, operation_key)
           release(refused[:release])
           conflict_error = @reservation_contract.dig("errors", "conflict")
           return respond(conflict_error.fetch("status"),
                          "reason" => conflict_error.fetch("reason"),
-                         "conflicts" => conflicts.map { |entry_id, reason| { "entry_id" => entry_id, "reason" => reason.to_s } })
+                         "conflicts" => conflicts.map { |conflict| { "entry_id" => conflict[:entry_id], "reason" => conflict[:reason].to_s } })
         end
 
         reserve_provisionally(free, company_id, body, operation_key)
@@ -427,14 +436,17 @@ module TimekeepingContract
         prepare_answer(stored)
       end
 
-      def prepare_outcome(entry_id, company_id, invoice_id)
-        current = @reservations.select { |reservation| reservation[:entry_id] == entry_id }
-        ReservationRules.prepare_outcome(
-          in_company: !visible_entry(entry_id, company_id).nil?,
-          committed: current.find { |reservation| reservation[:state] == "committed" },
-          provisional: current.find { |reservation| reservation[:state] == "provisional" },
-          invoice_id:
-        )
+      # Each entry's reservations in the form ReservationDecision reads, seen
+      # from invoice_id.
+      def decision_reservations(entry_ids, invoice_id)
+        entry_ids.index_with do |entry_id|
+          @reservations.filter_map do |reservation|
+            next unless reservation[:entry_id] == entry_id
+
+            { invoice: reservation[:invoice_id] == invoice_id ? :this : :other,
+              state: reservation[:state], disposition: reservation[:disposition] }
+          end
+        end
       end
 
       def prepare_answer(operation)
@@ -474,7 +486,10 @@ module TimekeepingContract
           reservation[:company_id] == operation[:company_id] && reservation[:invoice_id] == operation[:invoice_id] &&
             reservation[:state] == "committed"
         end
-        released_ids = held.pluck(:entry_id) - operation[:desired_entry_ids]
+        released_ids = TimekeepingRules::ReservationDecision.call(
+          current: decision_reservations(held.pluck(:entry_id).uniq, operation[:invoice_id]),
+          desired: operation[:desired_entry_ids], disposition: operation[:disposition], invoice_status: WIRE_INVOICE_STATUS
+        )[:release]
 
         @reservations = @reservations.reject do |reservation|
           (reservation[:state] == "committed" && reserved_ids.include?(reservation[:entry_id])) ||
