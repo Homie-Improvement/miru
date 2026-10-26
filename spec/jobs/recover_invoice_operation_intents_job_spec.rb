@@ -60,6 +60,8 @@ RSpec.describe RecoverInvoiceOperationIntentsJob do
       expect(Time.zone.parse(one[:oldest_created_at].to_s)).to eq(company_one_oldest)
       expect(two[:count]).to eq(1)
       expect(Time.zone.parse(two[:oldest_created_at].to_s)).to eq(company_two_oldest)
+      # The payloads above are filtered on the constant, so pin the published name here.
+      expect(Invoices::StaleOperationIntents::NAME).to eq("invoices.stale_operation_intents")
     end
 
     # "the stale signal fires per company at 10 min 1 s and not at 9 min 59 s"

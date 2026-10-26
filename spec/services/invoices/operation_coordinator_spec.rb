@@ -76,27 +76,29 @@ RSpec.describe Invoices::OperationCoordinator, committed_data: true do
   # "On failure, the change to `failed` and the abort outbox row commit together."
   # "a refused outcome leaves a failed intent with one abort row and no commit row"
   # The caller does nothing after the call: the refusal itself must roll back every invoice change
-  # made in the transaction, both updates to an existing invoice and an invoice created there.
+  # made in the transaction, both updates to an existing invoice and the invoice created there,
+  # which is also the invoice the request targets.
   it "rolls back every invoice change on a refused prepare and leaves a failed intent with exactly one abort row" do
     invoice = create(:invoice)
     original_reference = invoice.reference
     original_updated_at = invoice.reload.updated_at
-    request = coordinator_request(invoice, entries: [201])
     refused = coordinator_outcome("refused", conflicts: [{ entry_id: 201, reason: "locked" }])
-    created_invoice_id = nil
+    request = nil
 
     expect do
-      coordinator_save(coordinator_adapter(prepare: refused), request) do
+      ApplicationRecord.transaction do
         invoice.update_column(:reference, "should-not-persist")
         invoice.touch(time: 3.days.from_now)
-        created_invoice_id = create(:invoice).id
+        request = coordinator_request(create(:invoice), entries: [201])
+        described_class.new(reservations: coordinator_adapter(prepare: refused))
+          .call(request, holding: coordinator_holding_for(request))
       end
     end.to raise_error(Invoices::OperationErrors::Refused)
 
     invoice.reload
     expect(invoice.reference).to eq(original_reference)
     expect(invoice.updated_at).to eq(original_updated_at)
-    expect(Invoice.where(id: created_invoice_id)).not_to exist
+    expect(Invoice.where(id: request.invoice_id)).not_to exist
     intent = coordinator_intent(request)
     expect(intent.state).to eq("failed")
     expect(intent.finished_at).to be_present
@@ -107,22 +109,21 @@ RSpec.describe Invoices::OperationCoordinator, committed_data: true do
   # "the pending intent survives a rolled-back invoice transaction"
   # "On any failure (refused, retryable, a raised error, or a rolled-back invoice transaction): once the invoice transaction has rolled back, in a new transaction, set the intent to `failed` with the same guard, and insert the abort outbox row only when that update changes one row."
   # Prepare succeeds and the commit-path writes happen, then later caller work in the same invoice
-  # transaction raises. The commit row, the holding and the caller's own writes must roll back with it.
+  # transaction raises. The commit row, the holding and the invoice the request targets, created in
+  # that transaction, must roll back with it.
   it "records failed with one abort row and discards the commit row, holding and invoice writes when the transaction rolls back after a prepared outcome" do
-    invoice = create(:invoice)
-    request = coordinator_request(invoice, entries: [301])
     adapter = coordinator_adapter(prepare: coordinator_outcome("prepared"))
-    created_invoice_id = nil
+    request = nil
 
     expect do
       ApplicationRecord.transaction do
-        created_invoice_id = create(:invoice).id
+        request = coordinator_request(create(:invoice), entries: [301])
         described_class.new(reservations: adapter).call(request, holding: coordinator_holding_for(request))
         raise ArgumentError, "later invoice step failed"
       end
     end.to raise_error(ArgumentError, "later invoice step failed")
 
-    expect(Invoice.where(id: created_invoice_id)).not_to exist
+    expect(Invoice.where(id: request.invoice_id)).not_to exist
     expect(coordinator_intent(request).state).to eq("failed")
     expect(coordinator_rows(request).pluck(:kind)).to eq(["abort"])
     expect(coordinator_holdings(request)).not_to exist
@@ -130,31 +131,33 @@ RSpec.describe Invoices::OperationCoordinator, committed_data: true do
 
   # "A guarded update that changes no row rolls back the invoice change with a retryable error and writes no outbox row"
   # Recovery fails the intent on another connection while prepare is still running, so the save's
-  # guarded update to committed finds no pending row.
+  # guarded update to committed finds no pending row. The request targets an invoice created in the
+  # same transaction.
   it "raises a retryable error, rolls back the invoice changes and writes no outbox row or holding when the guarded committed update matches no row" do
     invoice = create(:invoice)
     original_reference = invoice.reference
-    request = coordinator_request(invoice, entries: [401])
-    fail_intent_elsewhere = lambda do |_received|
+    fail_intent_elsewhere = lambda do |received|
       committed_data_thread do
         InvoiceOperationIntent
-          .where(company_id: request.company_id, invoice_id: request.invoice_id, operation_id: request.operation_id, state: "pending")
+          .where(company_id: received.company_id, invoice_id: received.invoice_id, operation_id: received.operation_id, state: "pending")
           .update_all(state: "failed", finished_at: Time.current)
       end.join
       coordinator_outcome("prepared")
     end
-    created_invoice_id = nil
+    request = nil
 
     expect do
-      coordinator_save(coordinator_adapter(prepare: fail_intent_elsewhere), request) do
+      ApplicationRecord.transaction do
         invoice.update_column(:reference, "should-not-persist")
-        created_invoice_id = create(:invoice).id
+        request = coordinator_request(create(:invoice), entries: [401])
+        described_class.new(reservations: coordinator_adapter(prepare: fail_intent_elsewhere))
+          .call(request, holding: coordinator_holding_for(request))
       end
     end.to raise_error(Invoices::OperationErrors::IntentNotPending)
 
     expect(Invoices::OperationErrors::IntentNotPending.ancestors).to include(Invoices::OperationErrors::Retryable)
     expect(invoice.reload.reference).to eq(original_reference)
-    expect(Invoice.where(id: created_invoice_id)).not_to exist
+    expect(Invoice.where(id: request.invoice_id)).not_to exist
     expect(InvoiceOperationOutboxItem.where(company_id: request.company_id).count).to eq(0)
     expect(coordinator_holdings(request)).not_to exist
   end
