@@ -253,8 +253,11 @@ module Timekeeping
           # and id match a checkpoint entry goes to that company. A row whose
           # company_id is nil or matches no such entry goes to the one company
           # whose checkpoint entry has its id, where its company_id then shows
-          # as a difference. A row that no single company claims is unassigned,
-          # so it is neither dropped nor filed under a guessed company.
+          # as a difference. A row whose id no checkpoint entry has stays under
+          # its own company_id, where it shows as missing from the checkpoint.
+          # A row that no single company claims, or that has no entry and no
+          # company_id, is unassigned, so it is neither dropped nor filed under
+          # a guessed company.
           #
           # Returns [{ company_id => [normalised rows] }, [unassigned Difference]].
           def place_projection(projection, checkpoint_entries)
@@ -266,6 +269,8 @@ module Timekeeping
               next row["company_id"] if entry_keys.include?([row["company_id"], row["id"]])
 
               candidates = companies_by_id.fetch(row["id"], [])
+              next row["company_id"] if candidates.empty?
+
               candidates.one? ? candidates.first : nil
             end
 
