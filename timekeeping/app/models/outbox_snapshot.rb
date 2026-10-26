@@ -4,6 +4,14 @@
 class OutboxSnapshot < ApplicationRecord
   self.primary_key = "outbox_position"
 
+  # Takes the outbox insert lock (Timekeeping::WriteSteps::OUTBOX_LOCK_KEY)
+  # for the rest of the calling transaction, so a writer that inserts outbox
+  # rows outside WriteSteps.write_outbox still commits positions in the order
+  # they were drawn.
+  def self.lock_for_insert!
+    connection.execute(sanitize_sql_array(["SELECT pg_advisory_xact_lock(?)", Timekeeping::WriteSteps::OUTBOX_LOCK_KEY]))
+  end
+
   # Rails sends id= to the primary key, which would put the entry's id into
   # outbox_position and leave the id column null. outbox_position comes only
   # from its sequence, so id= writes the id column. The id reader still
