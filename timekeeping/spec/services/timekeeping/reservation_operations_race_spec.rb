@@ -123,7 +123,9 @@ RSpec.describe Timekeeping::ReservationOperations, "under concurrent requests" d
 
   # Holds a reservation operation at hold_at, runs other_writer on its own
   # connection until the server reports it blocked by the held operation,
-  # then lets both finish. Returns the held operation's outcome and
+  # then lets both finish. The held operation is always released before the
+  # joins, so a failed wait check cannot leave it holding its locks while the
+  # tables are truncated. Returns the held operation's outcome and
   # other_writer's.
   def race_held_reservation_against(held_request, hold_at:, &other_writer)
     reached = Queue.new
@@ -139,8 +141,11 @@ RSpec.describe Timekeeping::ReservationOperations, "under concurrent requests" d
     held = on_own_reservation_connection(held_pid) { described_class.new(checkpoint:).call(held_request) }
     expect(reached.pop(timeout: wait_seconds)).to be(true)
     other = on_own_reservation_connection(other_pid, &other_writer)
-    blocked = reservation_blocked_by?(other_pid.pop(timeout: wait_seconds), held_pid.pop(timeout: wait_seconds))
-    release << true
+    begin
+      blocked = reservation_blocked_by?(other_pid.pop(timeout: wait_seconds), held_pid.pop(timeout: wait_seconds))
+    ensure
+      release << true
+    end
     results = [held.join(wait_seconds)&.value, other.join(wait_seconds)&.value]
     expect(blocked).to be(true), "the other writer never waited on the held operation's lock"
     results
@@ -151,14 +156,60 @@ RSpec.describe Timekeeping::ReservationOperations, "under concurrent requests" d
   it "refuses an employee update that waited on a prepare of the same entry" do
     token = timekeeping_arrange.token_for(user)
     update = build_entry_command(:update, token:, entry_id:, body: { "duration" => 91.0 })
-    duration = Entry.find(entry_id).duration
+    seeded = Entry.find(entry_id)
+    expect(seeded.duration).not_to be_nil
+    expect(seeded.version).to eq(1)
+    expect(AuditEvent.where(entry_id:).count).to eq(0)
+    expect(OutboxSnapshot.where(id: entry_id).count).to eq(0)
 
     prepared, updated = race_held_reservation_against(
       race_request(:prepare, operation_id: SecureRandom.uuid, entry_ids: [entry_id]), hold_at: :rows_locked
     ) { Timekeeping::EntryWriter.new.call(update) }
 
     expect([prepared.status, updated.status]).to eq([200, 403])
-    expect(Entry.find(entry_id).duration).to eq(duration)
+    entry = Entry.find(entry_id)
+    expect(entry.duration).to eq(seeded.duration)
+    # Only the prepare's locked flip shows: the refused update adds no
+    # version, audit row or snapshot.
+    expect(entry.version).to eq(seeded.version + 1)
+    expect(Reservation.where(entry_id:).pluck(:invoice_id, :state)).to eq([[501, "provisional"]])
+    expect(AuditEvent.where(entry_id:).order(:id).pluck(:action, :after)).to eq([["prepare", { "locked" => true }]])
+    expect(OutboxSnapshot.where(id: entry_id).order(:outbox_position).pluck(:version, :locked))
+      .to eq([[seeded.version + 1, true]])
+  end
+
+  # A6 does not bind deletes (A10), so the waiting bulk delete still discards
+  # the entry the prepare just reserved, and the reservation stays. This pins
+  # that current behaviour; it does not endorse a discarded entry holding a
+  # provisional reservation. The audit row and snapshot come from a read made
+  # after the delete, so this proves the serialized stored outcome, not which
+  # reservation flag the delete decision saw: the update example above is the
+  # check for that.
+  it "discards a reserved entry when an employee bulk delete waited on its prepare" do
+    token = timekeeping_arrange.token_for(user)
+    bulk_delete = build_entry_command(:bulk_delete, token:, body: { "entry_ids" => [entry_id] })
+    seeded_version = Entry.find(entry_id).version
+    expect(seeded_version).to eq(1)
+
+    prepared, deleted = race_held_reservation_against(
+      race_request(:prepare, operation_id: SecureRandom.uuid, entry_ids: [entry_id]), hold_at: :rows_locked
+    ) { Timekeeping::EntryWriter.new.call(bulk_delete) }
+
+    expect(prepared.status).to eq(200)
+    expect(answer(deleted)).to eq([200, { "results" => [{ "entry_id" => entry_id, "result" => "deleted" }] }])
+    entry = Entry.find(entry_id)
+    expect(entry.discarded_at).not_to be_nil
+    expect(entry.version).to eq(seeded_version + 2)
+    expect(Reservation.where(entry_id:).pluck(:invoice_id, :state)).to eq([[501, "provisional"]])
+    expect(AuditEvent.where(entry_id:).order(:id).pluck(:action)).to eq(%w[prepare bulk_delete])
+    expect(AuditEvent.where(entry_id:, action: "prepare").pluck(:after)).to eq([{ "locked" => true }])
+    deleted_before, deleted_after = AuditEvent.find_by!(entry_id:, action: "bulk_delete").values_at(:before, :after)
+    expect([deleted_before["version"], deleted_before["discarded_at"]]).to eq([seeded_version + 1, nil])
+    expect(deleted_after["version"]).to eq(seeded_version + 2)
+    expect(deleted_after["discarded_at"]).not_to be_nil
+    snapshots = OutboxSnapshot.where(id: entry_id).order(:outbox_position).pluck(:version, :discarded_at, :locked)
+    expect(snapshots.map { |version, discarded_at, locked| [version, !discarded_at.nil?, locked] })
+      .to eq([[seeded_version + 1, false, true], [seeded_version + 2, true, true]])
   end
 
   # The waiting mark-billed must see that the successor took the entry, so it
@@ -172,6 +223,16 @@ RSpec.describe Timekeeping::ReservationOperations, "under concurrent requests" d
       route: :mark_billed, company_id: company, actor_name: "invoice-boundary", target_id: 501,
       operation_id: SecureRandom.uuid, generation: timekeeping_arrange.current_generation
     )
+    # The entry stays reserved from seeding through the handoff, so neither the
+    # prepare nor the commit flips its locked flag: the baseline is the seeded
+    # entry with no audit row or snapshot, and the race must leave it that way.
+    baseline = Entry.find(retained_entry)
+    expect([baseline.version, baseline.bill_status]).to eq([1, "unbilled"])
+    expect(Reservation.where(entry_id: retained_entry).order(:invoice_id).pluck(:invoice_id, :state))
+      .to eq([[501, "committed"], [502, "provisional"]])
+    baseline_audit = AuditEvent.where(entry_id: retained_entry).order(:id).pluck(:action, :after)
+    baseline_snapshots = OutboxSnapshot.where(id: retained_entry).order(:outbox_position).pluck(:version, :locked)
+    expect([baseline_audit, baseline_snapshots]).to eq([[], []])
 
     committed, billed = race_held_reservation_against(
       race_request(:commit, operation_id: successor_id, invoice_id: 502), hold_at: :rows_locked
@@ -179,8 +240,12 @@ RSpec.describe Timekeeping::ReservationOperations, "under concurrent requests" d
 
     expect([answer(committed), answer(billed)])
       .to eq([[200, { "reserved" => 1, "released" => 0 }], [200, { "billed" => 0 }]])
-    expect(Entry.find(retained_entry).bill_status).to eq("unbilled")
+    entry = Entry.find(retained_entry)
+    expect([entry.version, entry.bill_status]).to eq([baseline.version, "unbilled"])
     expect(Reservation.where(entry_id: retained_entry).pluck(:invoice_id, :state)).to eq([[502, "committed"]])
+    expect(AuditEvent.where(entry_id: retained_entry).order(:id).pluck(:action, :after)).to eq(baseline_audit)
+    expect(OutboxSnapshot.where(id: retained_entry).order(:outbox_position).pluck(:version, :locked))
+      .to eq(baseline_snapshots)
   end
 
   # The waiting prepare must see the entry as the abort left it (unlocked), so
