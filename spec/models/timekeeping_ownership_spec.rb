@@ -105,6 +105,20 @@ RSpec.describe TimekeepingOwnership, type: :model do
       end
     end
 
+    it "refuses the previous generation before this handoff's freeze, even with a position left from an earlier handoff" do
+      ownership.update_columns(generation: 3, final_outbox_position: 10)
+
+      %w[close_admission settle].each do |step|
+        ownership.update_columns(handoff_step: step)
+        expect(ownership.snapshot_generation_accepted?(generation: 2, outbox_position: 5)).to be(false)
+      end
+
+      %w[freeze checkpoint sequence reconcile].each do |step|
+        ownership.update_columns(handoff_step: step)
+        expect(ownership.snapshot_generation_accepted?(generation: 2, outbox_position: 5)).to be(true)
+      end
+    end
+
     it "refuses an older generation at any outbox position" do
       ownership.update_columns(generation: 3, handoff_step: "freeze", final_outbox_position: 10)
 

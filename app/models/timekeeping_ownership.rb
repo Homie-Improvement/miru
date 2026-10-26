@@ -36,14 +36,23 @@ class TimekeepingOwnership < ApplicationRecord
   # Whether the projection consumer may apply a snapshot of this generation
   # (section 5.4). The current generation is always accepted. The previous
   # one is accepted only during a handoff, and only up to the final outbox
-  # position captured at the freeze. Without a captured position nothing of
-  # the previous generation is accepted, and the flip, which clears
-  # handoff_step, ends the permission.
+  # position captured at the freeze. Before this handoff reaches the freeze
+  # step, a position left from an earlier handoff is not this handoff's P, so
+  # nothing of the previous generation is accepted; nor is it without a
+  # captured position. The flip, which clears handoff_step, ends the permission.
   def snapshot_generation_accepted?(generation:, outbox_position:)
     return true if generation == self.generation
     return false unless generation == self.generation - 1
-    return false if handoff_step.nil? || final_outbox_position.nil?
+    return false unless frozen_for_handoff? && !final_outbox_position.nil?
 
     outbox_position.is_a?(Integer) && outbox_position <= final_outbox_position
   end
+
+  private
+
+    # Whether the current handoff has reached the freeze step or a later one.
+    def frozen_for_handoff?
+      step_index = HANDOFF_STEPS.index(handoff_step)
+      !step_index.nil? && step_index >= HANDOFF_STEPS.index("freeze")
+    end
 end
