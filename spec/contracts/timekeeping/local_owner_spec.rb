@@ -22,9 +22,10 @@ end
 
 require_relative "entry_api_examples"
 require_relative "idempotency_examples"
+require_relative "reservations_examples"
 require_relative "../../support/timekeeping/local_owner_arrange"
 
-# Runs the shared entry API and entry idempotency contracts against the
+# Runs the shared entry API, reservation and idempotency contracts against the
 # prepared monolith's local owner, through the spec-only gateway stand-in.
 RSpec.describe "The local owner under the Timekeeping entry contracts" do
   let(:timekeeping_client) { TimekeepingContract::LocalOwnerClient.new(public_key: timekeeping_key_pair.public_key) }
@@ -44,5 +45,48 @@ RSpec.describe "The local owner under the Timekeeping entry contracts" do
 
   describe "the idempotency contract for entries" do
     it_behaves_like "timekeeping idempotency contract", contracts: [:entry_api]
+  end
+
+  describe "the reservations contract" do
+    it_behaves_like "timekeeping reservations contract"
+  end
+
+  describe "the idempotency contract for reservations" do
+    it_behaves_like "timekeeping idempotency contract", contracts: [:reservations]
+  end
+
+  # "A nil actor answers `unauthorized`. A user actor, or a service without the operation, answers `forbidden`.
+  # A service bound to another company answers `not_found`."
+  it "local owner client gives each service identity its own company-bound actor on the reservation routes" do
+    arrange = timekeeping_arrange
+    company = arrange.company
+    other_company = arrange.company
+    operations = TimekeepingContract.load(:reservations).fetch("routes").keys
+    boundary = arrange.service_identity(company:, name: "invoice-boundary", operations:)
+    cleanup = arrange.service_identity(company:, name: "invoice-cleanup", operations:)
+    foreign = arrange.service_identity(company: other_company, name: "invoice-boundary", operations:)
+    reporting = arrange.service_identity(company:, name: "reporting", operations: [])
+    expect([boundary, cleanup, foreign, reporting].uniq.size).to eq(4)
+
+    user = arrange.user(company:, role: "employee")
+    entry = arrange.entry(company:, user:, project: arrange.project(company:))
+    user_token = arrange.token_for(arrange.user(company:, role: "owner"))
+    path = "/v1/companies/#{company}/reservations/prepare"
+    prepare = lambda do |credential|
+      headers = credential ? { "Authorization" => "Bearer #{credential}" } : {}
+      timekeeping_client.call("POST", path, headers:, body: {
+        "invoice_id" => 501, "operation_id" => SecureRandom.uuid, "generation" => arrange.current_generation,
+        "disposition" => "active", "entries" => [entry]
+      })
+    end
+
+    refusals = { nil => 401, user_token => 403, reporting => 403, foreign => 404 }
+    refusals.each { |credential, status| expect(prepare.call(credential).status).to eq(status) }
+    expect(arrange.entry_locked(entry)).to be(false)
+
+    allowed = prepare.call(boundary)
+    expect(allowed.status).to eq(200)
+    expect(allowed.body.fetch("entries")).to eq([{ "entry_id" => entry, "company_id" => company }])
+    expect(arrange.entry_locked(entry)).to be(true)
   end
 end
