@@ -21,6 +21,20 @@ module Timekeeping
         super(connection:, tables: TABLES)
       end
 
+      # Refuses the whole checkpoint, before anything is deleted, when an entry
+      # holds a value the projection would refuse: a later write would
+      # republish the stored row and hold back every snapshot after it. The
+      # message names entries and fields only, because row values can be private.
+      def load_checkpoint(checkpoint)
+        invalid = CheckpointEntryValues.invalid_entries(checkpoint.rows.fetch("entries", []))
+        if invalid.any?
+          described = invalid.map { |entry| "company_id #{entry[:company_id]} id #{entry[:id]} (#{entry[:fields].join(', ')})" }
+          raise Checkpoint::ShapeError, "checkpoint entries: invalid values in #{described.join('; ')}"
+        end
+
+        super
+      end
+
       def highest_outbox_position
         connection.select_value("SELECT COALESCE(MAX(outbox_position), 0) FROM outbox_snapshots").to_i
       end
