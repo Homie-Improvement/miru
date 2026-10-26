@@ -32,7 +32,8 @@ module Timekeeping
     id = ->(value) { value.is_a?(Integer) && value.positive? ? value : raise(InvalidValue) }
     optional = ->(cast) { ->(value) { value.nil? ? nil : cast.call(value) } }
     text = ->(value) { value.is_a?(String) ? value : raise(InvalidValue) }
-    json_object = ->(value) { value.is_a?(Hash) ? value.to_json : raise(InvalidValue) }
+    # LosslessSql writes a BigDecimal as a bare number; to_json would quote it.
+    json_object = ->(value) { value.is_a?(Hash) ? Handoff::LosslessSql.json_text(value) : raise(InvalidValue) }
     # timesheet_entries stores times without a zone, as UTC, so an offset in
     # the snapshot is converted here rather than dropped by PostgreSQL.
     time = lambda do |value|
