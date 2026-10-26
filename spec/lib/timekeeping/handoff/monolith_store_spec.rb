@@ -43,11 +43,16 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
     end
   end
 
-  # Every row of the billing tables the store must never write.
+  # Every row of the billing tables and the outbox, which the store must never write.
   def billing_rows
-    %w[invoices invoice_taxes invoice_line_items invoice_line_item_time_entries].index_with do |table|
-      connection.select_all("SELECT * FROM #{table} ORDER BY id").to_a
+    %w[invoices invoice_taxes invoice_line_items invoice_line_item_time_entries entry_outbox_items].index_with do |table|
+      connection.select_all("SELECT * FROM #{table} ORDER BY 1").to_a
     end
+  end
+
+  def entry_id_sequence_state
+    sequence = connection.select_value("SELECT pg_get_serial_sequence('entries', 'id')")
+    connection.select_all("SELECT last_value, is_called FROM #{sequence}").to_a
   end
 
   def seed_invoice_with_line_item_and_tax
@@ -142,8 +147,11 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
   end
 
   describe "#export_checkpoint" do
-    it "reads every table at repeatable read in a read only transaction" do
-      insert_stored_entry(company_id: 1, duration: 1.0)
+    # "export a checkpoint in one database snapshot (REPEATABLE READ, read only);"
+    # The settings are read while export reads a table, so a transaction that
+    # starts at repeatable read but reads under another setting still fails.
+    it "exports in one repeatable read, read only transaction and refuses to join an open one" do
+      insert_stored_entry(company_id: 32, duration: 1.0)
       settings = []
       allow(connection).to receive(:select_all).and_wrap_original do |original, sql, *rest, **options|
         if settings.empty?
@@ -154,9 +162,15 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
         original.call(sql, *rest, **options)
       end
 
-      store.export_checkpoint
+      checkpoint = store.export_checkpoint
 
       expect(settings).to eq([{ "isolation" => "repeatable read", "read_only" => "on" }])
+      expect(checkpoint.digest.fetch("entries").fetch(32).fetch(:count)).to eq(1)
+
+      ActiveRecord::Base.transaction do
+        expect { store.export_checkpoint }.to raise_error(ActiveRecord::TransactionIsolationError)
+        raise ActiveRecord::Rollback
+      end
     end
 
     it "refuses to export a prepared invoice operation and names the table and company" do
@@ -187,21 +201,6 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
 
       bits = ->(value) { [value].pack("G") }
       expect(ids.map { |id| bits.call(exported.fetch(id)) }).to eq(durations.map { |duration| bits.call(duration) })
-    end
-
-    it "leaves every billing table row unchanged when a checkpoint is exported" do
-      seed_invoice_with_line_item_and_tax
-      connection.execute(<<~SQL.squish)
-        INSERT INTO entries (company_id, version, project_id, user_id, work_date, duration, bill_status, created_at, updated_at)
-        VALUES (1, 1, 1, 1, CURRENT_DATE, 60, 'billed', now(), now())
-      SQL
-      baseline = billing_rows
-      expect(baseline.values.map(&:size)).to all(be >= 1)
-
-      # "The checkpoint copies no money, and no store method writes a billing table."
-      checkpoint = store.export_checkpoint
-      expect(checkpoint.digest.fetch("entries").keys).to eq([1])
-      expect(billing_rows).to eq(baseline)
     end
   end
 
@@ -255,6 +254,7 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
       baseline = prepared_rows
       expect(baseline["entries"].pluck("id")).to eq([seeded_id])
       expect(baseline.values.map(&:size)).to eq([1, 1, 1, 1, 1])
+      sequence_before = entry_id_sequence_state
 
       time = Time.utc(2026, 1, 1, 12)
       entry = entry_row(id: seeded_id + 100, company_id: 2, duration: 30.0, created_at: time, updated_at: time)
@@ -269,6 +269,130 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
       # "A load replaces the tables in one transaction, so an interrupted load leaves them unchanged"
       expect { store.load_checkpoint(checkpoint) }.to raise_error(StandardError)
       expect(prepared_rows).to eq(baseline)
+      expect(entry_id_sequence_state).to eq(sequence_before)
+    end
+
+    # "load a checkpoint by replacing the store's tables in one transaction, recomputing the digest inside that
+    # transaction and rolling back on a mismatch;"
+    # A load that joined the caller's transaction could have its failure rescued
+    # and its half-done replacement committed by that caller.
+    it "refuses a load inside a caller's open transaction, so committing that transaction keeps the original rows" do
+      entry_id = insert_stored_entry(company_id: 31, duration: 1.5)
+      seed_children_of_entry(company_id: 31, entry_id:)
+      checkpoint = store.export_checkpoint
+      connection.execute("UPDATE entries SET note = 'kept note' WHERE id = #{entry_id}")
+      baseline = prepared_rows
+      expect(baseline["entries"].pluck("id", "note")).to eq([[entry_id, "kept note"]])
+      expect(baseline.values.map(&:size)).to eq([1, 1, 1, 1, 1])
+
+      ActiveRecord::Base.transaction do
+        expect { store.load_checkpoint(checkpoint) }
+          .to raise_error(Timekeeping::Handoff::Store::Error, /open transaction/)
+      end
+
+      expect(prepared_rows).to eq(baseline)
+    end
+
+    # "A load refuses any entry whose current version in the store is higher than its version in the checkpoint."
+    it "refuses a lower checkpoint version and names the entries table and the company" do
+      connection.execute(<<~SQL.squish)
+        INSERT INTO entries (id, company_id, version, project_id, user_id, work_date, duration, note, bill_status, created_at, updated_at)
+        VALUES (10, 777, 5, 1, 1, '2026-10-01', 60, 'newer', 'unbilled', now(), now())
+      SQL
+      baseline = prepared_rows
+      expect(baseline["entries"].pluck("id", "company_id", "version", "note")).to eq([[10, 777, 5, "newer"]])
+
+      checkpoint = checkpoint_of("entries" => [entry_row(id: 10, company_id: 777, version: 3, note: "older")])
+
+      expect { store.load_checkpoint(checkpoint) }
+        .to raise_error(Timekeeping::Handoff::Store::Error, /entries.*777/)
+      expect(prepared_rows).to eq(baseline)
+    end
+
+    # "Loading the same checkpoint twice into the monolith's prepared tables gives equal counts and checksums, and replaces rows rather than appending"
+    it "exports, loads twice over a stray row, and leaves every prepared row exactly as exported" do
+      connection.execute(<<~SQL)
+        INSERT INTO entries (id, company_id, version, project_id, user_id, work_date, duration, note, bill_status, review_status, discarded_at, created_at, updated_at)
+        VALUES (501, 1, 3, 10, 20, '2026-01-05', 0.30000000000000004, 'first', 'billed', 'approved', NULL, '2026-01-05 10:00:00.123456', '2026-01-06 11:00:00.654321'),
+               (502, 2, 1, 11, 21, '2026-01-06', 1.5, '', 'unbilled', 'not_required', '2026-02-01 00:00:00.000001', '2026-01-06 10:00:00', '2026-01-06 10:00:00');
+        INSERT INTO reservations (company_id, entry_id, invoice_id, state, disposition, operation_id, created_at)
+        VALUES (1, 501, 999999, 'committed', 'retained', '00000000-0000-0000-0000-000000000001', '2026-01-07 09:00:00');
+        INSERT INTO invoice_operations (company_id, invoice_id, operation_id, state, desired_entry_ids, disposition, generation, created_at, finished_at)
+        VALUES (1, 999999, '00000000-0000-0000-0000-000000000001', 'committed', '{501}', 'retained', 1, '2026-01-07 09:00:00', '2026-01-07 09:00:01'),
+               (2, 888, '00000000-0000-0000-0000-000000000002', 'aborted', '{}', 'active', 1, '2026-01-07 09:00:00', '2026-01-07 09:00:02');
+        INSERT INTO entry_audits (company_id, entry_id, actor_type, actor_id, action, before, after, entry_created_at, created_at)
+        VALUES (1, 501, 'User', 20, 'create', NULL, '{"duration": 0.30000000000000004}', '2026-01-05 10:00:00.123456', '2026-01-05 10:00:00.123456'),
+               (1, 501, 'User', 20, 'update', '{"note": ""}', '{"note": "first"}', '2026-01-05 10:00:00.123456', '2026-01-05 10:05:00');
+        INSERT INTO idempotency_records (company_id, actor_type, actor_id, operation, key, fingerprint, status, body, created_at)
+        VALUES (1, 'User', 20, 'create_entry', 'k-1', 'fp-1', 201, '{"z": 1,  "a": [ 2 ]}', '2026-01-05 10:00:00'),
+               (2, 'User', 20, 'create_entry', 'k-1', 'fp-2', 201, '{"id":502}', '2026-01-06 10:00:00');
+      SQL
+      # float8send keeps the stored duration bits in the comparison.
+      rows_with_duration_bits = lambda do
+        prepared_rows.merge(
+          "entries" => connection.select_all("SELECT *, float8send(duration) AS duration_bits FROM entries ORDER BY 1, 2").to_a
+        )
+      end
+      before = rows_with_duration_bits.call
+      expect(before.values.map(&:size)).to eq([2, 1, 2, 2, 2])
+      expect(before["idempotency_records"].pluck("body")).to include('{"z": 1,  "a": [ 2 ]}')
+
+      checkpoint = store.export_checkpoint
+      stray_id = insert_stored_entry(company_id: 3, duration: 9.0)
+      expect(connection.select_values("SELECT id FROM entries")).to contain_exactly(501, 502, stray_id)
+
+      2.times do
+        store.load_checkpoint(checkpoint)
+
+        expect(rows_with_duration_bits.call).to eq(before)
+        reexported = store.export_checkpoint
+        expect(reexported.digest).to eq(checkpoint.digest)
+        expect(reexported.digest.fetch("entries").transform_values { |company| company[:count] }).to eq(1 => 1, 2 => 1)
+        expect(reexported.digest.fetch("idempotency_records").transform_values { |company| company[:count] })
+          .to eq(1 => 1, 2 => 1)
+      end
+    end
+
+    it "refuses an audit row attached to another company's entry and leaves the tables unchanged" do
+      connection.execute(<<~SQL.squish)
+        INSERT INTO entries (id, company_id, project_id, user_id, work_date, duration, bill_status, created_at, updated_at)
+        VALUES (500, 300, 1, 1, '2026-09-01', 15, 'unbilled', now(), now())
+      SQL
+      baseline = prepared_rows
+      expect(baseline["entries"].pluck("id", "company_id")).to eq([[500, 300]])
+
+      cross_company_audit = {
+        "id" => 1, "company_id" => 200, "entry_id" => 10, "actor_type" => "User", "actor_id" => 5,
+        "action" => "create", "before" => nil, "after" => { "duration" => 60.0 },
+        "entry_created_at" => checkpoint_stamp, "created_at" => checkpoint_stamp
+      }
+      checkpoint = checkpoint_of(
+        "entries" => [entry_row(id: 10, company_id: 100)], "entry_audits" => [cross_company_audit]
+      )
+
+      expect { store.load_checkpoint(checkpoint) }.to raise_error(StandardError)
+      expect(prepared_rows).to eq(baseline)
+    end
+
+    # "Entry versions and duration floats survive export and load unchanged, bit for bit"
+    it "keeps entry versions and duration bits that a rounding or decimal conversion would change through load and export" do
+      # Adjacent floats, the smallest subnormal and negative zero: a value rounded
+      # to fewer digits or passed through a decimal collapses at least one of them.
+      durations = { 601 => 0.1 + 0.2, 602 => (0.1 + 0.2).next_float, 603 => 5e-324, 604 => -0.0 }
+      versions = { 601 => 7, 602 => 1, 603 => 42, 604 => 2_147_483_647 }
+      checkpoint = checkpoint_of(
+        "entries" => durations.map { |id, duration| entry_row(id:, version: versions.fetch(id), duration:) }
+      )
+
+      store.load_checkpoint(checkpoint)
+      exported = store.export_checkpoint
+
+      bits = ->(value) { [value].pack("G").unpack1("H*") }
+      stored = connection.select_rows("SELECT id, version, float8send(duration) FROM entries ORDER BY id")
+      expect(stored.map { |id, version, raw| [id.to_i, version.to_i, raw.to_s.delete_prefix("\\x")] })
+        .to eq(durations.keys.sort.map { |id| [id, versions.fetch(id), bits.call(durations.fetch(id))] })
+      expect(exported.digest).to eq(checkpoint.digest)
+      expect(Timekeeping::Handoff::Checkpoint.verify(exported)).to eq([])
     end
 
     it "restores populated audit and receipt rows exactly through export and load" do
@@ -306,21 +430,6 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
       expect(rows.call).to eq(original)
     end
 
-    it "leaves every billing table row unchanged when a checkpoint is loaded" do
-      seed_invoice_with_line_item_and_tax
-      connection.execute(<<~SQL.squish)
-        INSERT INTO entries (company_id, version, project_id, user_id, work_date, duration, bill_status, created_at, updated_at)
-        VALUES (1, 1, 1, 1, CURRENT_DATE, 60, 'billed', now(), now())
-      SQL
-      baseline = billing_rows
-      expect(baseline.values.map(&:size)).to all(be >= 1)
-      checkpoint = store.export_checkpoint
-
-      # "The checkpoint copies no money, and no store method writes a billing table."
-      store.load_checkpoint(checkpoint)
-      expect(billing_rows).to eq(baseline)
-    end
-
     it "round-trips a two-company checkpoint holding every hard case through load and export" do
       checkpoint = hard_case_checkpoint
 
@@ -346,20 +455,6 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
       expect { store.load_checkpoint(hard_case_checkpoint) }
         .to raise_error(Timekeeping::Handoff::Store::Error, /entries company_id 1/)
       expect(prepared_rows).to eq(baseline)
-    end
-
-    it "leaves the outbox untouched when a checkpoint is loaded" do
-      connection.execute(<<~SQL.squish)
-        INSERT INTO entry_outbox_items (company_id, generation, entry_id, payload, created_at)
-        VALUES (1, 1, 11, '{"id": 11}', now())
-      SQL
-      outbox = -> { connection.select_all("SELECT * FROM entry_outbox_items ORDER BY 1").to_a }
-      before = outbox.call
-      expect(before.size).to eq(1)
-
-      store.load_checkpoint(hard_case_checkpoint)
-
-      expect(outbox.call).to eq(before)
     end
 
     it "keeps JSONB decimals finer than a float exact through export, transport and load" do
@@ -447,24 +542,74 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
   end
 
   describe "#advance_entry_id_sequence" do
-    it "returns the next id the sequence hands out after an advance" do
+    # "A sequence only advances: it is set only if the new value is higher than its current one."
+    it "advances the entry id sequence only when the target is higher and returns the next id" do
       expect(store.advance_entry_id_sequence(above: 300)).to eq(301)
       expect(store.advance_entry_id_sequence(above: 10)).to eq(301)
+      current = insert_stored_entry(company_id: 1, duration: 1.0)
+      expect(current).to eq(301)
+      state_before = entry_id_sequence_state
+
+      expect(store.advance_entry_id_sequence(above: current - 1)).to eq(current + 1)
+      expect(entry_id_sequence_state).to eq(state_before)
+      expect(store.advance_entry_id_sequence(above: current)).to eq(current + 1)
+      expect(entry_id_sequence_state).to eq(state_before)
+
+      expect(store.advance_entry_id_sequence(above: current + 1000)).to eq(current + 1001)
+      expect(insert_stored_entry(company_id: 1, duration: 1.0)).to eq(current + 1001)
+    end
+  end
+
+  describe "#highest_outbox_position" do
+    # The store interface must "report the highest outbox position".
+    it "reports the highest outbox position, or zero for an empty outbox" do
+      expect(store.highest_outbox_position).to eq(0)
+
+      connection.execute(<<~SQL.squish)
+        INSERT INTO entry_outbox_items (outbox_position, company_id, generation, entry_id, payload, created_at)
+        VALUES (40, 1, 1, 5, '{}', now()), (41, 2, 1, 6, '{}', now()), (12, 1, 1, 7, '{}', now())
+      SQL
+
+      expect(store.highest_outbox_position).to eq(41)
     end
   end
 
   describe "billing tables" do
-    it "changes no billing table on export, outbox position or sequence advance" do
-      seed_invoice_with_line_item_and_tax
+    # "The checkpoint copies no money, and no store method writes a billing table."
+    it "no store method changes the billing tables or the outbox" do
+      invoice = seed_invoice_with_line_item_and_tax
+      connection.execute(<<~SQL.squish)
+        INSERT INTO entry_outbox_items (company_id, generation, entry_id, payload, created_at)
+        VALUES (1, 1, 1, '{}', now())
+      SQL
       insert_stored_entry(company_id: 1, duration: 2.0)
       baseline = billing_rows
       expect(baseline.transform_values(&:size)).to eq(
-        "invoices" => 1, "invoice_taxes" => 1, "invoice_line_items" => 1, "invoice_line_item_time_entries" => 1
+        "invoices" => 1, "invoice_taxes" => 1, "invoice_line_items" => 1, "invoice_line_item_time_entries" => 1,
+        "entry_outbox_items" => 1
+      )
+      # The reservation and the operation point at the seeded invoice, so a load
+      # that followed them into billing would change its rows.
+      operation_id = "8a6f0b8e-2d4c-4f53-9a51-3f1f5d0c2b11"
+      reserving_checkpoint = checkpoint_of(
+        "entries" => [entry_row(id: 501, company_id: invoice.company_id, bill_status: "billed", locked: true)],
+        "reservations" => [{
+          "company_id" => invoice.company_id, "entry_id" => 501, "invoice_id" => invoice.id, "state" => "committed",
+          "disposition" => "active", "operation_id" => operation_id, "created_at" => checkpoint_stamp
+        }],
+        "invoice_operations" => [{
+          "id" => 7, "company_id" => invoice.company_id, "invoice_id" => invoice.id, "operation_id" => operation_id,
+          "state" => "committed", "desired_entry_ids" => [501], "disposition" => "active", "generation" => 1,
+          "created_at" => checkpoint_stamp, "finished_at" => checkpoint_stamp
+        }]
       )
 
       store.export_checkpoint
+      store.load_checkpoint(reserving_checkpoint)
+      store.load_checkpoint(reserving_checkpoint)
+      store.export_checkpoint
       store.highest_outbox_position
-      store.advance_entry_id_sequence(above: 5_000)
+      store.advance_entry_id_sequence(above: 1_000_000)
 
       expect(billing_rows).to eq(baseline)
     end
