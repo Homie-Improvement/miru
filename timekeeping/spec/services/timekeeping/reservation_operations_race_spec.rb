@@ -123,7 +123,9 @@ RSpec.describe Timekeeping::ReservationOperations, "under concurrent requests" d
 
   # Holds a reservation operation at hold_at, runs other_writer on its own
   # connection until the server reports it blocked by the held operation,
-  # then lets both finish. Returns the held operation's outcome and
+  # then lets both finish. The held operation is always released before the
+  # joins, so a failed wait check cannot leave it holding its locks while the
+  # tables are truncated. Returns the held operation's outcome and
   # other_writer's.
   def race_held_reservation_against(held_request, hold_at:, &other_writer)
     reached = Queue.new
@@ -139,8 +141,11 @@ RSpec.describe Timekeeping::ReservationOperations, "under concurrent requests" d
     held = on_own_reservation_connection(held_pid) { described_class.new(checkpoint:).call(held_request) }
     expect(reached.pop(timeout: wait_seconds)).to be(true)
     other = on_own_reservation_connection(other_pid, &other_writer)
-    blocked = reservation_blocked_by?(other_pid.pop(timeout: wait_seconds), held_pid.pop(timeout: wait_seconds))
-    release << true
+    begin
+      blocked = reservation_blocked_by?(other_pid.pop(timeout: wait_seconds), held_pid.pop(timeout: wait_seconds))
+    ensure
+      release << true
+    end
     results = [held.join(wait_seconds)&.value, other.join(wait_seconds)&.value]
     expect(blocked).to be(true), "the other writer never waited on the held operation's lock"
     results
