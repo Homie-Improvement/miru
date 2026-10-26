@@ -26,7 +26,20 @@ module TimekeepingRelay
     # admitted and stored, and that row would block every later delivery. The
     # depth is bounded where the entry body was first parsed.
     def generate(batch)
-      JSON.generate(batch, max_nesting: false)
+      JSON.generate(exact_numbers(batch), max_nesting: false)
     end
+
+    # A BigDecimal goes out as a bare JSON number with every digit. The default
+    # encoders write it as a quoted string, or round it through a Float. The gem
+    # does not load bigdecimal itself, so the class is looked up only when a
+    # source has loaded it.
+    def exact_numbers(value)
+      case value
+      when Hash then value.transform_values { |item| exact_numbers(item) }
+      when Array then value.map { |item| exact_numbers(item) }
+      else defined?(::BigDecimal) && value.is_a?(::BigDecimal) ? JSON::Fragment.new(value.to_s("F")) : value
+      end
+    end
+    private_class_method :exact_numbers
   end
 end
