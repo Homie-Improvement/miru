@@ -214,11 +214,14 @@ module Timekeeping
         requirement = PROJECT_ROUTES[operation]
         return if requirement.nil? || (requirement == :optional && !body.key?("project_id"))
 
-        value = body["project_id"]
-        return value if value.is_a?(Integer) && value.positive?
-        return Integer(value, 10) if value.is_a?(String) && ID.match?(value)
+        id_value(body["project_id"]) || :invalid
+      end
 
-        :invalid
+      # A positive Integer, or a string of digits read as one; nil otherwise.
+      def id_value(value)
+        return value if value.is_a?(Integer) && value.positive?
+
+        Integer(value, 10) if value.is_a?(String) && ID.match?(value)
       end
 
       # Generation
@@ -386,7 +389,7 @@ module Timekeeping
       # or one that is not an id at all, is reported as not_found and takes no
       # part in the decision. A skipped entry is reported the same way.
       def bulk_change(facts, role)
-        entries = locked_entries(body.fetch("entry_ids").filter_map { |id| bulk_entry_id(id) }.uniq, role,
+        entries = locked_entries(body.fetch("entry_ids").filter_map { |id| id_value(id) }.uniq, role,
                                  visible_only: true)
         checkpoint.call(:rows_locked)
         decision = TimekeepingRules::EntryDecision.bulk(
@@ -405,15 +408,9 @@ module Timekeeping
       def bulk_results(applied_ids)
         result = BULK_RESULTS.fetch(operation)
         results = body.fetch("entry_ids").map do |id|
-          { "entry_id" => id, "result" => applied_ids.include?(bulk_entry_id(id)) ? result : NOT_FOUND_RESULT }
+          { "entry_id" => id, "result" => applied_ids.include?(id_value(id)) ? result : NOT_FOUND_RESULT }
         end
         { "results" => results }
-      end
-
-      def bulk_entry_id(value)
-        return value if value.is_a?(Integer) && value.positive?
-
-        Integer(value, 10) if value.is_a?(String) && ID.match?(value)
       end
 
       # The body's writable fields, with project_id as the checked Integer.
@@ -518,11 +515,15 @@ module Timekeeping
       # The contract snapshot of one entry, read with the reservation flag:
       # locked is that flag, never the stored entries.locked column.
       def snapshot(row)
-        SnapshotBatch::ENTRY_FIELDS.index_with { |field| json_value(field == "locked" ? row.reserved : row[field]) }
+        json_fields(row, SnapshotBatch::ENTRY_FIELDS)
       end
 
       def response_body(row)
-        RESPONSE_FIELDS.index_with { |field| json_value(field == "locked" ? row.reserved : row[field]) }
+        json_fields(row, RESPONSE_FIELDS)
+      end
+
+      def json_fields(row, fields)
+        fields.index_with { |field| json_value(field == "locked" ? row.reserved : row[field]) }
       end
 
       # Times as UTC with microseconds, the precision the column stores, and

@@ -2,17 +2,61 @@
 
 # frozen_string_literal: true
 
+require "securerandom"
 require_relative "../spec_helper"
 
-RSpec.describe "TimekeepingRules::CredentialScan" do
+RSpec.describe TimekeepingRules::CredentialScan, ".found?" do
   # "A credential nested in an entry body answers credential_in_body and nothing is stored"
-  it "finds a held token nested deep in a body and never matches when no token is held" do
-    token = "svc-token-#{rand(1_000_000)}"
-    body = { "note" => "x", "source_metadata" => { "a" => [{ "b" => "prefix #{token}" }] } }
+  it "finds a nested held token without Rails and never matches on an unset credential" do
+    token = SecureRandom.hex(32)
+    nested = { "note" => "ok", "source_metadata" => { "run" => { "headers" => ["x", "Bearer #{token}"] } } }
+    in_array = { "note" => "x", "source_metadata" => { "a" => [{ "b" => "prefix #{token}" }] } }
+    clean = { "note" => "", "source_metadata" => { "run" => { "headers" => [""] } } }
 
-    expect(TimekeepingRules::CredentialScan.found?(body, held_token: token, public_key: nil)).to be(true)
-    # An unset or empty held token must not count as a credential that every body contains.
-    expect(TimekeepingRules::CredentialScan.found?(body, held_token: nil, public_key: nil)).to be(false)
-    expect(TimekeepingRules::CredentialScan.found?(body, held_token: "", public_key: nil)).to be(false)
+    expect(defined?(ActiveSupport)).to be_nil
+    expect(described_class.found?(nested, held_token: token, public_key: nil)).to be(true)
+    expect(described_class.found?(in_array, held_token: token, public_key: nil)).to be(true)
+    expect(described_class.found?(clean, held_token: token, public_key: nil)).to be(false)
+    # No credential held must not turn into a match on every body.
+    expect(described_class.found?(clean, held_token: "", public_key: nil)).to be(false)
+    expect(described_class.found?(in_array, held_token: "", public_key: nil)).to be(false)
+    expect(described_class.found?(nested, held_token: nil, public_key: nil)).to be(false)
+  end
+
+  context "with signed tokens" do
+    let(:key_pair) { OpenSSL::PKey::RSA.new(2048) }
+
+    # Unpadded base64url, as a JWT writes each segment. The base64 gem is not a
+    # default gem on this Ruby, so this uses Array#pack.
+    def base64url(bytes)
+      [bytes].pack("m0").tr("+/", "-_").delete("=")
+    end
+
+    def signed_token(key)
+      header = base64url('{"alg":"RS256"}')
+      payload = base64url('{"sub":7}')
+      signature = key.sign("SHA256", "#{header}.#{payload}")
+      "#{header}.#{payload}.#{base64url(signature)}"
+    end
+
+    it "finds a token signed by the held key, given the public half as a key or as PEM" do
+      body = { "proof_metadata" => { "a" => { "b" => "copied #{signed_token(key_pair)} here" } } }
+
+      expect(described_class.found?(body, held_token: nil, public_key: key_pair.public_key)).to be(true)
+      expect(described_class.found?(body, held_token: nil, public_key: key_pair.public_key.to_pem)).to be(true)
+    end
+
+    it "ignores a token signed by another key" do
+      body = { "note" => signed_token(OpenSSL::PKey::RSA.new(2048)) }
+
+      expect(described_class.found?(body, held_token: nil, public_key: key_pair.public_key)).to be(false)
+    end
+
+    it "skips the signature check without raising when no public key is held" do
+      body = { "note" => signed_token(key_pair) }
+
+      expect(described_class.found?(body, held_token: nil, public_key: nil)).to be(false)
+      expect(described_class.found?(body, held_token: nil, public_key: "")).to be(false)
+    end
   end
 end
