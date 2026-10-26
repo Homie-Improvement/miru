@@ -26,7 +26,9 @@ RSpec.describe Timekeeping::LocalOwner, "credential in body" do
     "an array in an employee's update" =>
       { operation: :update, role: "employee", metadata: ->(token) { { "list" => ["x", token] } } },
     "an array in an owner's create" =>
-      { operation: :create, role: "owner", metadata: ->(token) { { "list" => ["x", token] } } }
+      { operation: :create, role: "owner", metadata: ->(token) { { "list" => ["x", token] } } },
+    "a hash three levels deep in an employee's create" =>
+      { operation: :create, role: "employee", metadata: ->(token) { { "outer" => { "inner" => { "token" => token } } } } }
   }
 
   def write_with_credential(user, row, token, entry)
@@ -197,13 +199,15 @@ RSpec.describe Timekeeping::LocalOwner, "writing for a colleague through user_id
     end
   end
 
-  { "owner" => ->(id) { id }, "admin" => ->(id) { id.to_s } }.each do |role, as_sent|
-    it "lets an #{role} create an entry for a same-company colleague named by user_id" do
+  %w[owner admin].product({ "an integer" => ->(id) { id }, "a string" => ->(id) { id.to_s } }.to_a)
+    .each do |role, (label, as_sent)|
+    it "lets an #{role} create an entry for a same-company colleague named by #{label} user_id" do
       writer = timekeeping_member(company, role)
 
       allowed = create_for_colleague(writer, role, as_sent.call(colleague.id))
 
       expect(allowed.status).to eq(201)
+      expect(allowed.body.fetch("user_id")).to eq(colleague.id)
       expect(Timekeeping::LocalEntry.where(company_id: company.id).pluck(:user_id)).to eq([colleague.id])
     end
   end
@@ -310,7 +314,8 @@ end
 
 RSpec.describe Timekeeping::LocalOwner, "who may act" do
   # Access is decided on the role Timekeeping::ReferenceFacts reads for the company,
-  # never on the role the actor claims, and the actor comes only from the keyword.
+  # never on the role the actor claims. Fields in the body that name an actor or
+  # company are covered in local_owner_tenancy_spec.rb.
   let(:company) { create(:company) }
   let(:project) { create(:project, client: create(:client, company:)) }
   let(:entry_body) do
@@ -349,27 +354,6 @@ RSpec.describe Timekeeping::LocalOwner, "who may act" do
     expect(outcome.body["reason"]).to eq("forbidden")
     expect(timekeeping_row_counts).to eq(before)
   end
-
-  it "takes the acting user from the actor keyword, not from actor, role or company fields in params and the body" do
-    employee = timekeeping_member(company, "employee")
-    other = timekeeping_member(company, "owner")
-    other_company = create(:company)
-
-    outcome = described_class.call(
-      operation: :create, company_id: company.id, generation: TimekeepingOwnership.current.generation.to_s,
-      actor: described_class::Actor.user(user_id: employee.id, role: "employee"),
-      params: { "idempotency_key" => "body-actor", "actor_id" => other.id, "company_id" => other_company.id,
-                "body" => entry_body.merge("actor_id" => other.id, "company_id" => other_company.id,
-                                           "role" => "owner", "acting_user_id" => employee.id + 1000) }
-    )
-
-    expect(outcome.status).to eq(201)
-    expect(Timekeeping::LocalEntry.where(company_id: other_company.id)).to be_empty
-    entry = Timekeeping::LocalEntry.find(outcome.body["id"])
-    expect([entry.company_id, entry.user_id]).to eq([company.id, employee.id])
-    expect(described_class::Receipt.sole.actor_id).to eq(employee.id)
-    expect(described_class::AuditRow.where(company_id: company.id, entry_id: entry.id).sole.actor_id).to eq(employee.id)
-  end
 end
 
 RSpec.describe Timekeeping::LocalOwner, "answers and snapshots" do
@@ -384,9 +368,9 @@ RSpec.describe Timekeeping::LocalOwner, "answers and snapshots" do
                          actor: described_class::Actor.user(user_id: owner.id, role: "owner"), params:, checkpoint:)
   end
 
-  def create_params(key)
+  def create_params(key, duration: 1.5)
     { "idempotency_key" => key,
-      "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 1.5,
+      "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => duration,
                   "note" => "answer", "source" => TimesheetEntry::SOURCES.first, "source_metadata" => {} } }
   end
 
@@ -399,13 +383,17 @@ RSpec.describe Timekeeping::LocalOwner, "answers and snapshots" do
     contract_fields = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/entry_api.yml"))
       .dig("response", "entry_fields")
 
-    outcome = call_as_owner(:create, create_params("response-fields"))
+    # A float with no exact binary form, so a rounded or converted duration shows up.
+    duration = 0.1 + 0.2
+
+    outcome = call_as_owner(:create, create_params("response-fields", duration:))
 
     expect(outcome.status).to eq(201)
     expect(outcome.body.keys).to eq(contract_fields)
-    expect(outcome.body).to include("version" => 1, "duration" => 1.5, "work_date" => Date.current.iso8601,
+    expect(outcome.body).to include("version" => 1, "duration" => duration, "work_date" => Date.current.iso8601,
                                     "locked" => false, "user_id" => owner.id, "company_id" => company.id)
     payload = Timekeeping::LocalOutboxEntry.where(company_id: company.id).sole.payload
+    expect(payload["duration"]).to eq(duration)
     microsecond_utc = /\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z\z/
     expect(payload["created_at"]).to match(microsecond_utc)
     expect(payload["updated_at"]).to match(microsecond_utc)
@@ -452,12 +440,13 @@ RSpec.describe Timekeeping::LocalOwner, "answers and snapshots" do
   end
 
   it "deletes the listed entries on a bulk_delete body that holds only entry_ids" do
-    entry = seed_entry("bulk delete")
+    entries = [seed_entry("bulk delete one"), seed_entry("bulk delete two")]
 
-    outcome = call_as_owner(:bulk_delete, { "idempotency_key" => "bulk-delete", "body" => { "entry_ids" => [entry.id] } })
+    outcome = call_as_owner(:bulk_delete, { "idempotency_key" => "bulk-delete",
+                                            "body" => { "entry_ids" => entries.map(&:id) } })
 
     expect(outcome.status).to eq(200)
-    expect(outcome.body["results"]).to eq([{ "entry_id" => entry.id, "result" => "deleted" }])
-    expect(entry.reload.discarded_at).not_to be_nil
+    expect(outcome.body["results"]).to eq(entries.map { |entry| { "entry_id" => entry.id, "result" => "deleted" } })
+    expect(entries.map { |entry| entry.reload.discarded_at }).to all(be_present)
   end
 end

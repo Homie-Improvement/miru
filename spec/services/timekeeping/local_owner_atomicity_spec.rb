@@ -166,6 +166,30 @@ RSpec.describe Timekeeping::LocalOwner, "when a failure is injected before commi
     expect(Timekeeping::LocalEntry.where(note: "injected")).to be_empty
   end
 
+  it "rolls back its own update at entry_written when the caller's open transaction rescues the failure" do
+    entry = seed_entry
+    attributes_before = entry.reload.attributes
+    baseline = timekeeping_row_counts
+    expect(baseline["entries"]).to eq(1)
+    injected = Class.new(StandardError)
+    rescued = false
+
+    ApplicationRecord.transaction do
+      described_class.call(
+        operation: :update, company_id: company.id, generation: prepare_local_ownership!.generation.to_s,
+        actor: described_class::Actor.user(user_id: employee.id, role: "employee"),
+        params: { "idempotency_key" => "rescued-update", "entry_id" => entry.id, "body" => { "note" => "after" } },
+        checkpoint: failing_at(:entry_written, injected)
+      )
+    rescue injected
+      rescued = true
+    end
+
+    expect(rescued).to be(true)
+    expect(entry.reload.attributes).to eq(attributes_before)
+    expect(timekeeping_row_counts).to eq(baseline)
+  end
+
   # Only a collision on the receipt insert is retried; a uniqueness error from
   # anywhere else must escape, or an injected failure would end in a commit.
   it "lets a uniqueness error raised by a checkpoint escape instead of retrying the write" do

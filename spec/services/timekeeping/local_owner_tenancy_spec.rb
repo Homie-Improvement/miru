@@ -38,6 +38,7 @@ RSpec.describe Timekeeping::LocalOwner do
     missing = update_from_b.call(missing_id, "same-user-missing")
 
     expect(foreign.status).to eq(404)
+    expect(foreign.body).to eq("reason" => "not_found")
     expect(foreign.status).to eq(missing.status)
     expect(foreign.body).to eq(missing.body)
     expect(foreign.body.to_json.gsub(entry_a.id.to_s, "ID")).to eq(missing.body.to_json.gsub(missing_id.to_s, "ID"))
@@ -194,21 +195,27 @@ RSpec.describe Timekeeping::LocalOwner, "cross-company references" do
     expect(connection.select_values("SELECT company_id FROM entry_outbox_items").map(&:to_i)).to eq([company_b.id])
   end
 
-  it "ignores a company_id inside params and the body and writes into the keyword company" do
-    owner_b = timekeeping_member(company_b, "owner")
+  it "ignores company, actor and role fields inside params and the body and writes as the keyword company and actor" do
+    employee_b = timekeeping_member(company_b, "employee")
+    other_b = timekeeping_member(company_b, "owner")
 
     # "`company_id` and the actor come only from the keyword arguments. A `company_id` or actor field inside params is ignored."
     outcome = described_class.call(
       operation: :create, company_id: company_b.id, generation:,
-      actor: described_class::Actor.user(user_id: owner_b.id, role: "owner"),
-      params: { "idempotency_key" => "tenant-body-company", "company_id" => company_a.id,
+      actor: described_class::Actor.user(user_id: employee_b.id, role: "employee"),
+      params: { "idempotency_key" => "tenant-body-company", "company_id" => company_a.id, "actor_id" => other_b.id,
                 "body" => { "company_id" => company_a.id, "project_id" => project_b.id,
                             "work_date" => Date.current.iso8601, "duration" => 15.0, "note" => "keyword wins",
-                            "source" => "manual", "source_metadata" => {} } }
+                            "source" => "manual", "source_metadata" => {}, "actor_id" => other_b.id,
+                            "role" => "owner", "acting_user_id" => employee_b.id + 1000 } }
     )
 
     expect(outcome.status).to eq(201)
     expect(outcome.body.fetch("company_id")).to eq(company_b.id)
+    entry = Timekeeping::LocalEntry.find(outcome.body.fetch("id"))
+    expect([entry.company_id, entry.user_id]).to eq([company_b.id, employee_b.id])
+    expect(described_class::Receipt.sole.actor_id).to eq(employee_b.id)
+    expect(described_class::AuditRow.where(company_id: company_b.id, entry_id: entry.id).sole.actor_id).to eq(employee_b.id)
     TIMEKEEPING_WRITE_TABLES.each do |table|
       expect(connection.select_values("SELECT DISTINCT company_id FROM #{table}").map(&:to_i))
         .to eq([company_b.id]), "#{table} should hold only the keyword company"

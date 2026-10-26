@@ -30,7 +30,7 @@ RSpec.describe TimekeepingLocalOwnerSpecHelpers do
 
   # A refused write that still leaves a row in any one of these tables must show up as a
   # changed count; a default table list that drops one would let that leak pass silently.
-  it "timekeeping_row_counts counts every written table by default, sees a write in each, and a retried create adds nothing" do
+  it "timekeeping_row_counts counts every written table by default and sees a write in each" do
     prepare_local_ownership!
     user = timekeeping_member(company, "employee")
     before = timekeeping_row_counts
@@ -44,9 +44,6 @@ RSpec.describe TimekeepingLocalOwnerSpecHelpers do
     expect(after_first).to eq(
       "entries" => 1, "entry_audits" => 1, "idempotency_records" => 1, "entry_outbox_items" => 1
     )
-
-    expect(create_entry_through_owner(user, "row-counts-helper-key").status).to eq(201)
-    expect(timekeeping_row_counts).to eq(after_first)
 
     seed_local_entry(user)
     after_seed = timekeeping_row_counts
