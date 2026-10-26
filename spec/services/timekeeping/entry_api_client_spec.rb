@@ -68,9 +68,17 @@ RSpec.describe Timekeeping::EntryApiClient, "read token role" do
     create(:user).tap { |member| create(:employment, company: read_role_company, user: member) }
   end
 
+  def read_role_employee_first_admin
+    read_role_member.tap do |admin|
+      admin.add_role(:employee, read_role_company)
+      admin.add_role(:admin, read_role_company)
+    end
+  end
+
   # Lists the colleague's entries for each actor, and returns the entries of
-  # the last list with the verified claims of every token sent.
-  def read_role_list(actors, answer_entries: [])
+  # the last list with the verified claims of every token sent. Read tokens are
+  # on unless read_tokens_enabled says otherwise.
+  def read_role_list(actors, answer_entries: [], read_tokens_enabled: "true")
     tokens = []
     stub_request(:get, read_role_list_url).to_return do |request|
       tokens << request.headers["Authorization"].delete_prefix("Bearer ")
@@ -78,12 +86,14 @@ RSpec.describe Timekeeping::EntryApiClient, "read token role" do
     end
 
     entries = with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
-      actors.map do |actor|
-        described_class.new(base_url: "http://timekeeping.test").list_entries(
-          company_id: read_role_company.id, user_id: read_role_colleague.id, from: Date.new(2026, 3, 1),
-          to: Date.new(2026, 3, 31), acting_user_id: actor.id
-        )
-      end.last
+      with_timekeeping_env(described_class::READ_TOKENS_ENV, read_tokens_enabled) do
+        actors.map do |actor|
+          described_class.new(base_url: "http://timekeeping.test").list_entries(
+            company_id: read_role_company.id, user_id: read_role_colleague.id, from: Date.new(2026, 3, 1),
+            to: Date.new(2026, 3, 31), acting_user_id: actor.id
+          )
+        end.last
+      end
     end
     claims = tokens.map { |token| Timekeeping::UserToken.verify(token, public_key: timekeeping_key_pair.public_key) }
     [entries, claims]
@@ -93,9 +103,7 @@ RSpec.describe Timekeeping::EntryApiClient, "read token role" do
   # first: today's primary role says employee, while the index controllers
   # let this user read colleagues through has_role?(:admin, company).
   it "reads a colleague for an admin whose employee role is older with an admin read token for that company" do
-    admin = read_role_member
-    admin.add_role(:employee, read_role_company)
-    admin.add_role(:admin, read_role_company)
+    admin = read_role_employee_first_admin
     expect(admin.has_role?(:admin, read_role_company)).to be(true)
     expect(admin.primary_role(read_role_company)).to eq("employee")
 
@@ -128,5 +136,18 @@ RSpec.describe Timekeeping::EntryApiClient, "read token role" do
         [admin_elsewhere.id, read_role_company.id, "employee", "read"]
       ]
     )
+  end
+
+  # Until the running Timekeeping refuses read tokens on write routes, the read
+  # must not sign a raised role: an older Timekeeping would let it write.
+  it "signs the default token with the primary role while read tokens are not enabled" do
+    admin = read_role_employee_first_admin
+
+    [nil, "false"].each do |read_tokens_enabled|
+      _entries, claims = read_role_list([admin], read_tokens_enabled:)
+
+      expect(claims.map { |claim| [claim.user_id, claim.company_id, claim.role, claim.purpose] })
+        .to eq([[admin.id, read_role_company.id, "employee", "write"]])
+    end
   end
 end
