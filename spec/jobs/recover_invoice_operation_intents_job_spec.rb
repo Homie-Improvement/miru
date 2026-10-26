@@ -433,9 +433,74 @@ RSpec.describe RecoverInvoiceOperationIntentsJob do
       expect(InvoiceOperationOutboxItem.where(company_id: 42, kind: "abort").count).to eq(1)
     end
   end
+
+  it "rolls back the failed update when writing the abort row fails, and a later sweep resolves the intent" do
+    intent = recovery_test_intent(company_id: 43, created_at: 2.minutes.ago)
+    allow(InvoiceOperationOutboxItem).to receive(:record!).and_raise(ActiveRecord::StatementInvalid, "abort row write failed")
+
+    expect { described_class.perform_now(reservations: recovery_test_adapter) }.not_to raise_error
+
+    expect(intent.reload.state).to eq("pending")
+    expect(InvoiceOperationOutboxItem.where(company_id: 43)).to be_empty
+
+    allow(InvoiceOperationOutboxItem).to receive(:record!).and_call_original
+    described_class.perform_now(reservations: recovery_test_adapter)
+
+    expect(intent.reload.state).to eq("failed")
+    expect(InvoiceOperationOutboxItem.where(company_id: 43, kind: "abort").count).to eq(1)
+  end
 end
 
 RSpec.describe RecoverInvoiceOperationIntentsJob, committed_data: true do
+  it "waits on a coordinated save paused in prepare and writes no abort once that save commits" do
+    invoice = create(:invoice)
+    request = Invoices::ReservationRequest.new(
+      company_id: invoice.company_id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
+      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [61]
+    )
+    in_prepare = Queue.new
+    release = Queue.new
+    committed = Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {})
+    adapter = RecordingReservationAdapter.new(
+      prepare: lambda { |_received|
+        in_prepare << true
+        release.pop(timeout: 10)
+        Invoices::ReservationOutcome.new(state: "prepared", conflicts: [], counts: {})
+      },
+      commit: committed,
+      abort: Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
+    )
+    save_pids = Queue.new
+    recovery_pids = Queue.new
+
+    save = committed_data_thread(save_pids) do
+      ApplicationRecord.transaction do
+        Invoices::OperationCoordinator.new(reservations: adapter).call(request, holding: { entry_ids: [61], disposition: "active" })
+      end
+    end
+    expect(in_prepare.pop(timeout: 5)).to be(true)
+    # pickup_age: 0 makes the save's fresh intent count as crashed, as a slow prepare past 60 s would.
+    recovery = committed_data_thread(recovery_pids) { described_class.perform_now(pickup_age: 0.seconds, reservations: adapter) }
+
+    begin
+      waited = blocked_by?(recovery_pids.pop(timeout: 5), save_pids.pop(timeout: 5))
+    ensure
+      release << true
+    end
+    save.join(10)
+    recovery.join(10)
+
+    intent = InvoiceOperationIntent.find_by!(company_id: request.company_id, operation_id: request.operation_id)
+    rows = InvoiceOperationOutboxItem.where(company_id: request.company_id, operation_id: request.operation_id)
+    expect(waited).to be(true)
+    expect(intent.state).to eq("committed")
+    expect(rows.pluck(:kind)).to eq(["commit"])
+    expect(rows.first.delivered_at).to be_present
+  ensure
+    release&.push(true)
+    [save, recovery].compact.each { |thread| thread.join(10) }
+  end
+
   it "leaves an intent whose save holds the lock past the wait bound pending and still fails another company's intent" do
     stub_const("RecoverInvoiceOperationIntentsJob::LOCK_WAIT_TIMEOUT", "200ms")
     aborted = Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})

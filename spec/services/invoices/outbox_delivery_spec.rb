@@ -181,15 +181,37 @@ RSpec.describe Invoices::OutboxDelivery do
           release.pop
         end
       end
-      locked.pop
+      locked.pop(timeout: 5)
 
       result = described_class.new(adapter_source: -> { adapter }).deliver(item.id)
       release << true
-      holder.join
+      holder.join(5)
 
       expect(result).to be_nil
       expect(adapter.requests).to be_empty
       expect(item.reload.attributes.slice("delivered_at", "attempts")).to eq("delivered_at" => nil, "attempts" => 0)
+    ensure
+      release&.push(true)
+      holder&.join(5)
     end
+  end
+
+  it "reports a failed write of the delivery result instead of raising, and leaves the row undelivered" do
+    operation_id = SecureRandom.uuid
+    InvoiceOperationIntent.create!(
+      company_id: 7501, invoice_id: 9501, operation_id:, state: "failed", generation: 1,
+      disposition: "active", desired_entry_ids: [51]
+    )
+    item = InvoiceOperationOutboxItem.create!(
+      company_id: 7501, invoice_id: 9501, operation_id:, kind: "abort",
+      payload: { company_id: 7501, invoice_id: 9501, operation_id:, generation: 1, disposition: "active", desired_entry_ids: [51] }
+    )
+    aborted = Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
+    adapter = RecordingReservationAdapter.new(prepare: aborted, commit: aborted, abort: aborted)
+    delivery = described_class.new(adapter_source: -> { adapter })
+    allow(delivery).to receive(:record).and_raise(ActiveRecord::StatementInvalid, "result write failed")
+
+    expect { expect(delivery.deliver(item.id)).to be_nil }.not_to raise_error
+    expect(item.reload.delivered_at).to be_nil
   end
 end

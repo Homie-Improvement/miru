@@ -570,6 +570,23 @@ RSpec.describe Invoices::OperationCoordinator, committed_data: true do
     expect(adapter.requests.size).to eq(2)
   end
 
+  it "leaves the intent pending with no abort row, and the caller sees the prepare error, when writing the abort row fails" do
+    request = coordinator_order_request(create(:invoice))
+    adapter = coordinator_order_adapter(prepare: ->(_received) { raise IOError, "store unreachable" })
+    allow(InvoiceOperationOutboxItem).to receive(:record!).and_raise(ActiveRecord::StatementInvalid, "abort row write failed")
+
+    expect { coordinator_order_save(adapter, request) }.to raise_error(IOError, "store unreachable")
+
+    expect(coordinator_order_intent(request).state).to eq("pending")
+    expect(coordinator_order_rows(request)).to be_empty
+
+    allow(InvoiceOperationOutboxItem).to receive(:record!).and_call_original
+    travel(61.seconds) { RecoverInvoiceOperationIntentsJob.perform_now(reservations: adapter) }
+
+    expect(coordinator_order_intent(request).state).to eq("failed")
+    expect(coordinator_order_rows(request).pluck(:kind)).to eq(["abort"])
+  end
+
   it "refuses a request built for another ownership generation before writing an intent" do
     request = Invoices::ReservationRequest.new(
       company_id: 7601, invoice_id: 9601, operation_id: SecureRandom.uuid,

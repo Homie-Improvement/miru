@@ -31,6 +31,12 @@ module Invoices
         record(item, outcome)
         outcome
       end
+    rescue StandardError => error
+      # Backstop for a database failure while locking or recording the row:
+      # the row stays undelivered for the next sweep, and the caller (inline
+      # delivery or the sweep's next row) carries on.
+      Rails.error.report(error, handled: true, context: { outbox_item_id: })
+      nil
     end
 
     private
