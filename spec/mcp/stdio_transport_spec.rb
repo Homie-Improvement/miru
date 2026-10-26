@@ -27,6 +27,7 @@ RSpec.describe MCP::Server::Transports::StdioTransport do
     captured = StringIO.new
 
     begin
+      # One request then end of input, as bin/miru-mcp sees when its client closes the pipe.
       $stdin = StringIO.new("#{request.to_json}\n")
       $stdout = captured
       Timeout.timeout(5) { described_class.new(server).open }
@@ -36,46 +37,13 @@ RSpec.describe MCP::Server::Transports::StdioTransport do
     end
 
     responses = captured.string.lines.map(&:strip).reject(&:empty?).map { |line| JSON.parse(line) }
-    response = responses.find { |entry| entry["id"] == 7 }
-
-    expect(response).not_to be_nil
-    expect(response["jsonrpc"]).to eq("2.0")
-    expect(response).to have_key("result")
-    expect(response).not_to have_key("error")
-  end
-
-  it "answers an initialize request over stdio and returns at end of input" do
-    server = MCP::Miru::ServerFactory.build(server_context: { pro_access: true, authorization: "Bearer token" })
-    initialize_request = {
-      jsonrpc: "2.0",
-      id: 7,
-      method: "initialize",
-      params: {
-        protocolVersion: "2025-03-26",
-        capabilities: {},
-        clientInfo: { name: "stdio-spec", version: "1.0" }
-      }
-    }
-    original_stdin = $stdin
-    original_stdout = $stdout
-    captured_output = StringIO.new
-
-    begin
-      # One request then end of input, as bin/miru-mcp sees when its client closes the pipe.
-      $stdin = StringIO.new("#{initialize_request.to_json}\n")
-      $stdout = captured_output
-      Timeout.timeout(5) { described_class.new(server).open }
-    ensure
-      $stdin = original_stdin
-      $stdout = original_stdout
-    end
-
-    responses = captured_output.string.lines.map(&:strip).reject(&:empty?).map { |line| JSON.parse(line) }
-    initialize_responses = responses.select { |response| response["id"] == 7 }
+    initialize_responses = responses.select { |entry| entry["id"] == 7 }
 
     expect(initialize_responses.size).to eq(1)
-    expect(initialize_responses.first["result"]).to be_a(Hash)
-    expect(initialize_responses.first).not_to have_key("error")
+    response = initialize_responses.first
+    expect(response["jsonrpc"]).to eq("2.0")
+    expect(response["result"]).to be_a(Hash)
+    expect(response).not_to have_key("error")
   end
 
   # A garbage line from the client must not kill the binary or stop it

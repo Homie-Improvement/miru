@@ -223,53 +223,42 @@ RSpec.describe "Api::V1::MCP#handle", type: :request do
     user.add_role :employee, company
   end
 
-  around do |example|
-    original = ENV["MCP_ALLOWED_ORIGINS"]
-    ENV["MCP_ALLOWED_ORIGINS"] = "https://allowed.miru.test"
-    example.run
-    ENV["MCP_ALLOWED_ORIGINS"] = original
-  end
+  context "with a configured origin allowlist" do
+    around do |example|
+      original = ENV["MCP_ALLOWED_ORIGINS"]
+      ENV["MCP_ALLOWED_ORIGINS"] = "https://allowed.miru.test"
+      example.run
+      ENV["MCP_ALLOWED_ORIGINS"] = original
+    end
 
-  # The upgrade fixes a security advisory, so it must not loosen the origin
-  # check: a cross-origin tool call is refused and never runs a tool.
-  it "rejects a tools/call from a disallowed origin with 403 before any tool reaches the API proxy on the upgraded mcp gem" do
-    allow(MCP::Miru::ApiProxy).to receive(:request).and_call_original
+    # The upgrade fixes a security advisory, so it must not loosen the origin
+    # check: a cross-origin tool call is refused and never runs a tool.
+    it "rejects a tools/call from a disallowed origin with 403 before any tool reaches the API proxy on the upgraded mcp gem" do
+      allow(MCP::Miru::ApiProxy).to receive(:request).and_call_original
 
-    payload = {
-      jsonrpc: "2.0",
-      id: "tool-evil",
-      method: "tools/call",
-      params: { name: "miru.workspace.whoami", arguments: {} }
-    }
-    headers = cli_auth_headers(cli_token, {
-      "CONTENT_TYPE" => "application/json",
-      "ACCEPT" => "application/json, text/event-stream",
-      "MCP-Protocol-Version" => "2025-03-26",
-      "MCP-Method" => "tools/call",
-      "Origin" => "https://evil.example"
-    })
+      payload = {
+        jsonrpc: "2.0",
+        id: "tool-evil",
+        method: "tools/call",
+        params: { name: "miru.workspace.whoami", arguments: {} }
+      }
+      headers = cli_auth_headers(cli_token, {
+        "CONTENT_TYPE" => "application/json",
+        "ACCEPT" => "application/json, text/event-stream",
+        "MCP-Protocol-Version" => "2025-03-26",
+        "MCP-Method" => "tools/call",
+        "Origin" => "https://evil.example"
+      })
 
-    post mcp_path, params: payload.to_json, headers: headers
+      post mcp_path, params: payload.to_json, headers: headers
 
-    expect(response).to have_http_status(:forbidden)
-    body = JSON.parse(response.body)
-    expect(body.dig("error", "code")).to eq(-32001)
-    expect(body.dig("error", "data", "error")).to eq("invalid_origin")
-    expect(body["result"]).to be_nil
-    expect(MCP::Miru::ApiProxy).not_to have_received(:request)
-  end
-end
-
-require "rails_helper"
-
-RSpec.describe "Api::V1::MCP#handle", type: :request do
-  let(:company) { create(:company, plan_tier: "paid") }
-  let(:user) { create(:user, current_workspace_id: company.id) }
-  let(:cli_token) { CliSession.issue_for(user:, company:).last }
-
-  before do
-    create(:employment, company:, user:)
-    user.add_role :employee, company
+      expect(response).to have_http_status(:forbidden)
+      body = JSON.parse(response.body)
+      expect(body.dig("error", "code")).to eq(-32001)
+      expect(body.dig("error", "data", "error")).to eq("invalid_origin")
+      expect(body["result"]).to be_nil
+      expect(MCP::Miru::ApiProxy).not_to have_received(:request)
+    end
   end
 
   # The issue asks to "Adapt any app code that uses the MCP server API to the 1.x interface, then run its specs".
@@ -296,19 +285,6 @@ RSpec.describe "Api::V1::MCP#handle", type: :request do
     expect(body["error"]).to be_nil
     expect(body.dig("result", "serverInfo", "name")).to be_present
     expect(body.dig("result", "protocolVersion")).to be_a(String).and be_present
-  end
-end
-
-require "rails_helper"
-
-RSpec.describe "Api::V1::MCP#handle", type: :request do
-  let(:company) { create(:company, plan_tier: "paid") }
-  let(:user) { create(:user, current_workspace_id: company.id) }
-  let(:cli_token) { CliSession.issue_for(user:, company:).last }
-
-  before do
-    create(:employment, company:, user:)
-    user.add_role :employee, company
   end
 
   # The issue asks to "Adapt any app code that uses the MCP server API to the 1.x interface, then run its specs".
@@ -338,17 +314,6 @@ RSpec.describe "Api::V1::MCP#handle", type: :request do
     expect(MCP::Miru::ApiProxy).to have_received(:request).once.with(
       hash_including(method: :get, path: "/api/v1/users/_me", headers: hash_including("Host" => "www.example.com"))
     )
-  end
-end
-
-RSpec.describe "Api::V1::MCP#handle", type: :request do
-  let(:company) { create(:company, plan_tier: "paid") }
-  let(:user) { create(:user, current_workspace_id: company.id) }
-  let(:cli_token) { CliSession.issue_for(user:, company:).last }
-
-  before do
-    create(:employment, company:, user:)
-    user.add_role :employee, company
   end
 
   # A wrong tool identifier from the client must come back as a protocol-level

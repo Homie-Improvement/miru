@@ -17,15 +17,6 @@ RSpec.describe "config/initializers/mcp.rb" do
     expect(logged.join("\n")).not_to include("secret-mcp-token-123")
   end
 
-  it "logs the exception class and message when the configured reporter is called with an exception and a server context" do
-    allow(Rails.logger).to receive(:error)
-    reporter = MCP.configuration.exception_reporter
-
-    reporter.call(ArgumentError.new("bad tool input"), { user_id: 1 })
-
-    expect(Rails.logger).to have_received(:error).with("[MCP] ArgumentError: bad tool input")
-  end
-
   it "reports MCP exceptions to the Rails log when called with an exception and a server context" do
     allow(Rails.logger).to receive(:error)
     exception = RuntimeError.new("tool exploded")
