@@ -51,7 +51,8 @@ RSpec.describe MCP::Server::Transports::StdioTransport do
     # bin/miru-mcp calls `open` with no arguments. This swaps $stdin and $stdout
     # for StringIO objects so that end of input lets `open` return, and wraps the
     # call in a timeout so a hang fails the example instead of blocking.
-    # Returns every JSON line the transport wrote.
+    # Returns every line the transport wrote, parsed as JSON; a non-JSON line
+    # raises, because a stdio client cannot read a mixed stream.
     def run_stdio_transport(server, input)
       original_stdin = $stdin
       original_stdout = $stdout
@@ -66,10 +67,6 @@ RSpec.describe MCP::Server::Transports::StdioTransport do
         $stdout = original_stdout
       end
 
-      output.string.lines.filter_map do |line|
-        JSON.parse(line)
-      rescue JSON::ParserError
-        nil
-      end
+      output.string.lines.map(&:strip).reject(&:empty?).map { |line| JSON.parse(line) }
     end
 end
