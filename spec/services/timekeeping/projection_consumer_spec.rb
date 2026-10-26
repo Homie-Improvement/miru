@@ -104,25 +104,14 @@ RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
     expect(rules_row(91_004)).to be_nil
   end
 
-  context "with committed transactions" do
-    # These examples need the consumer's transaction to really commit, so they
-    # leave the per-example cleaner transaction and empty the tables after.
-    def rules_without_cleaner_transaction
-      DatabaseCleaner.clean
-      yield
-    ensure
-      DatabaseCleaner.clean_with(:deletion, except: %w[ar_internal_metadata schema_migrations])
-      TimekeepingOwnership.ensure_initial!
-      DatabaseCleaner.start
-    end
-
+  # These examples need the consumer's transaction to really commit, so they
+  # run in the committed-data mode of spec/support/committed_data.rb.
+  context "with committed transactions", committed_data: true do
     it "does not leave miru.writer set on the connection after the batch commits" do
-      rules_without_cleaner_transaction do
-        rules_deliver(rules_entry(id: 91_005, version: 1))
+      rules_deliver(rules_entry(id: 91_005, version: 1))
 
-        expect(rules_row(91_005)).to include("version" => 1)
-        expect(ActiveRecord::Base.connection.select_value("SELECT current_setting('miru.writer', true)").to_s).to eq("")
-      end
+      expect(rules_row(91_005)).to include("version" => 1)
+      expect(ActiveRecord::Base.connection.select_value("SELECT current_setting('miru.writer', true)").to_s).to eq("")
     end
 
     # Holds a delivery started on a thread with :rules_pause set just before
@@ -145,46 +134,42 @@ RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
     end
 
     it "keeps v3 when a v2 delivery that started first writes after v3 has committed" do
-      rules_without_cleaner_transaction do
-        paused = Queue.new
-        release = Queue.new
-        rules_pause_before_write(paused, release)
+      paused = Queue.new
+      release = Queue.new
+      rules_pause_before_write(paused, release)
 
-        older = rules_thread(pause: true) { rules_deliver(rules_entry(id: 91_006, version: 2)) }
-        paused.pop
-        newer = rules_thread { rules_deliver(rules_entry(id: 91_006, version: 3)) }.value
-        release << true
+      older = rules_thread(pause: true) { rules_deliver(rules_entry(id: 91_006, version: 2)) }
+      paused.pop
+      newer = rules_thread { rules_deliver(rules_entry(id: 91_006, version: 3)) }.value
+      release << true
 
-        expect(newer).to eq([200, { "applied" => 1, "ignored" => 0 }])
-        expect(older.value).to eq([200, { "applied" => 0, "ignored" => 1 }])
-        expect(rules_row(91_006)).to include("version" => 3, "note" => "v3")
-      end
+      expect(newer).to eq([200, { "applied" => 1, "ignored" => 0 }])
+      expect(older.value).to eq([200, { "applied" => 0, "ignored" => 1 }])
+      expect(rules_row(91_006)).to include("version" => 3, "note" => "v3")
     end
 
     it "makes the ownership flip wait for an accepted previous-generation batch, then refuses that generation" do
-      rules_without_cleaner_transaction do
-        TimekeepingOwnership.current.update!(generation: 2, handoff_step: "freeze", final_outbox_position: 10)
-        paused = Queue.new
-        release = Queue.new
-        rules_pause_before_write(paused, release)
-        previous = lambda do |id|
-          described_class.call(batch: rules_batch(rules_entry(id:, version: 1), generation: 1, outbox_position: 5),
-                               idempotency_key: nil)
-        end
-
-        delivery = rules_thread(pause: true) { previous.call(91_007) }
-        paused.pop
-        flip = rules_thread { TimekeepingOwnership.current.update!(handoff_step: nil) }
-
-        expect(flip.join(0.5)).to be_nil
-        release << true
-        expect(delivery.value.status).to eq(200)
-        flip.join
-
-        expect(rules_row(91_007)).to include("version" => 1)
-        expect(previous.call(91_008).status).to eq(409)
-        expect(rules_row(91_008)).to be_nil
+      TimekeepingOwnership.current.update!(generation: 2, handoff_step: "freeze", final_outbox_position: 10)
+      paused = Queue.new
+      release = Queue.new
+      rules_pause_before_write(paused, release)
+      previous = lambda do |id|
+        described_class.call(batch: rules_batch(rules_entry(id:, version: 1), generation: 1, outbox_position: 5),
+                             idempotency_key: nil)
       end
+
+      delivery = rules_thread(pause: true) { previous.call(91_007) }
+      paused.pop
+      flip = rules_thread { TimekeepingOwnership.current.update!(handoff_step: nil) }
+
+      expect(flip.join(0.5)).to be_nil
+      release << true
+      expect(delivery.value.status).to eq(200)
+      flip.join
+
+      expect(rules_row(91_007)).to include("version" => 1)
+      expect(previous.call(91_008).status).to eq(409)
+      expect(rules_row(91_008)).to be_nil
     end
   end
 end

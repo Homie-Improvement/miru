@@ -11,7 +11,7 @@ module InvoicePayment
     end
 
     def process
-      ActiveRecord::Base.transaction do
+      Timekeeping::BillingFence.transaction do
         @payment = Payment.create!(payment_params)
         @invoice.settle!(payment)
       end
