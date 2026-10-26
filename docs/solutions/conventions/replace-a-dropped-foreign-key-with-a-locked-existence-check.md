@@ -57,6 +57,10 @@ before_destroy :lock!, prepend: true
 
 Add specs for an id of `0` and for a cached parent whose row was deleted. These are the cases the naive check lets through.
 
+## Release the checks first
+
+Ship the validations in one release and drop the key in a later one. Deploys here migrate while processes from the previous release still write: `bin/docker-entrypoint` runs `db:prepare` in the first new container of a rolling boot, and the Solid Queue workers run old code until they are replaced. If the key and its validation change together, those old processes write with neither. An app-only rollback to that release would do the same with no time limit. PR #44 first shipped them together; `db/migrate/20261020120000_drop_timesheet_entry_foreign_keys.rb` now keeps the keys, and step S1 in `docs/architecture/timekeeping-soa.md` section 10.2 records the order and how to restore the keys on a database that already lost them.
+
 ## Why it matters
 
 Without these, a dropped key silently starts accepting dangling ids. Those rows also block the migration's rollback, because restoring the key would fail on them. The refusal still changes form, from a database error to a validation error, so callers that rescued the database error need a look too.
