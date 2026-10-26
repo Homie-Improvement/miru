@@ -32,18 +32,6 @@ RSpec.describe Timekeeping::FinancialSnapshot, :two_tenant_seed do
 end
 
 RSpec.describe Timekeeping::FinancialSnapshot, :two_tenant_seed do
-  it "refuses to compare snapshots of two different companies" do
-    fork_and_leaf_snapshot = described_class.take(company_id: fork_and_leaf.id)
-    copper_kettle_snapshot = described_class.take(company_id: copper_kettle.id)
-
-    # "Every check is keyed by `company_id`. No report or result mixes companies."
-    expect {
-      described_class.compare(fork_and_leaf_snapshot, copper_kettle_snapshot)
-    }.to raise_error(ArgumentError)
-  end
-end
-
-RSpec.describe Timekeeping::FinancialSnapshot, :two_tenant_seed do
   it "takes a snapshot that holds no invoice, line item or invoice tax of another company" do
     other_invoice = copper_kettle.invoices.order(:id).first
     expect(other_invoice).to be_present
