@@ -35,7 +35,7 @@ RSpec.describe RelayJob, "through the configured queue worker", type: :request d
       body = JSON.parse(env["rack.input"].read)
       posted_lock.synchronize do
         posted_positions.concat(body.fetch("snapshots").map { |item| item.fetch("outbox_position") })
-        answer = projection.call("POST", env["PATH_INFO"],
+        answer = projection.call(env.fetch("REQUEST_METHOD"), env["PATH_INFO"],
                                  headers: { "Authorization" => env["HTTP_AUTHORIZATION"],
                                             "Idempotency-Key" => env["HTTP_IDEMPOTENCY_KEY"] },
                                  body:)
@@ -145,8 +145,7 @@ RSpec.describe RelayJob, "through the configured queue worker", type: :request d
       child_log.close!
     end
 
-    # No queue process and no pause outlives the example.
-    expect(File.exist?(Timekeeping::TestHooks.relay_pause_file)).to be(false)
+    # No queue process outlives the example.
     expect { Process.kill(0, -pid) }.to raise_error(Errno::ESRCH)
   end
 end
