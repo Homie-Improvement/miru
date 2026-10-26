@@ -17,6 +17,11 @@ module Timekeeping
     # instead of failing later as a server error.
     CLAIM_TYPES = { "sub" => Integer, "company_id" => Integer, "role" => String }.freeze
 
+    # Claims a token may leave out, but must type correctly when it carries
+    # them. A purpose of the wrong type is refused here, so it can never be
+    # read as a token signed without a purpose, which may write.
+    OPTIONAL_CLAIM_TYPES = { "purpose" => String }.freeze
+
     class InvalidToken < StandardError; end
 
     # Raised only after the signature verified, so a forged token is never
@@ -81,7 +86,8 @@ module Timekeeping
     end
 
     def typed_claims?(payload)
-      CLAIM_TYPES.all? { |claim, type| payload[claim].is_a?(type) }
+      CLAIM_TYPES.all? { |claim, type| payload[claim].is_a?(type) } &&
+        OPTIONAL_CLAIM_TYPES.all? { |claim, type| !payload.key?(claim) || payload[claim].is_a?(type) }
     end
 
     private_class_method :decode, :expired_company_id, :rsa_public_key, :typed_claims?
