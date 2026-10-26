@@ -34,6 +34,16 @@ module TimekeepingContract
       [->(_request) { true }, :requested]
     ].freeze
 
+    # Whether the agent and user an entry holds after a write may be
+    # committed, in order: no agent, or an agent of the entry's company whose
+    # user is the entry's user. Every other agent answers as a missing id.
+    AGENT_OWNER_TABLE = [
+      [->(pair) { pair[:agent_id].nil? }, :ok],
+      [->(pair) { pair[:agent]&.fetch("company_id") != pair[:company_id] }, :not_found],
+      [->(pair) { pair[:agent].fetch("user_id") != pair[:user_id] }, :not_found],
+      [->(_pair) { true }, :ok]
+    ].map(&:freeze).freeze
+
     # Whether a credential may call a reservation route, in order.
     SERVICE_ACCESS_TABLE = [
       [->(access) { access[:kind].nil? }, :unauthorized],
@@ -53,6 +63,7 @@ module TimekeepingContract
       locked: ->(reserved:, was_locked:) { reserved },
       duration: ->(stored) { stored },
       target_user: ->(**request) { first_match(TARGET_USER_TABLE, request) },
+      agent_owner: ->(**pair) { first_match(AGENT_OWNER_TABLE, pair) },
       service_access: ->(**access) { first_match(SERVICE_ACCESS_TABLE, access) },
       operation_key: ->(company_id:, actor:, operation_id:) { [company_id, actor, operation_id] },
       # Which entries a refused prepare still reserves or releases: none.
@@ -98,6 +109,7 @@ module TimekeepingContract
       @tokens = {}
       @services = {}
       @projects = {}
+      @agents = {}
       @entries = {}
       @reservations = []
       @operations = {}
@@ -146,6 +158,10 @@ module TimekeepingContract
 
     def add_project(company_id:)
       next_id.tap { |id| @projects[id] = company_id }
+    end
+
+    def add_agent(company_id:, user_id:)
+      next_id.tap { |id| @agents[id] = { "company_id" => company_id, "user_id" => user_id } }
     end
 
     def add_entry(company_id:, user_id:, project_id:, **attributes)
@@ -243,7 +259,10 @@ module TimekeepingContract
         return failure if failure
         return Wire.error(@entry_contract, "not_found") unless @projects[integer(body["project_id"])] == company_id
 
-        entry = write_entry(new_entry(company_id, entry_fields(body).merge("user_id" => user_id)))
+        fields = entry_fields(body).merge("user_id" => user_id)
+        return Wire.error(@entry_contract, "not_found") unless agent_owned?(company_id, fields)
+
+        entry = write_entry(new_entry(company_id, fields))
         respond(201, present(entry))
       end
 
@@ -265,7 +284,17 @@ module TimekeepingContract
           return Wire.error(@entry_contract, "not_found")
         end
 
-        respond(200, present(write_entry(entry.merge(changes))))
+        committed = entry.merge(changes)
+        return Wire.error(@entry_contract, "not_found") unless agent_owned?(company_id, committed)
+
+        respond(200, present(write_entry(committed)))
+      end
+
+      # S7, checked on the agent and user the entry holds after the write, so
+      # an update that changes only user_id under a stored agent is refused.
+      def agent_owned?(company_id, fields)
+        agent_id = fields["agent_id"]
+        @policies[:agent_owner].call(agent_id:, agent: @agents[agent_id], user_id: fields["user_id"], company_id:) == :ok
       end
 
       def destroy_entry(company_id, params)

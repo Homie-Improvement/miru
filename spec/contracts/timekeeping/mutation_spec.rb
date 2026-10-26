@@ -112,6 +112,7 @@ RSpec.describe "Timekeeping contract examples against fakes with one rule broken
      { timekeeping: { service_command_writes: ->(route:) { route != "mark_billed" } } }],
     ["counts entries to detach but writes no agent_id", :reservations,
      { timekeeping: { service_command_writes: ->(route:) { route != "detach_entries" } } }],
+    ["accepts any agent on an entry", :entry_api, { timekeeping: { agent_owner: ->(**) { :ok } } }],
     ["reserves an entry committed to another active invoice", :reservations,
      { timekeeping: { prepare_table: prepare_table_answering.call(:on_another_invoice, :add_provisional) } }],
     ["reserves an entry held provisionally by another operation", :reservations,

@@ -2,9 +2,10 @@
 
 module Timekeeping
   # Reads the facts the Timekeeping service decides writes on: the company's
-  # edit window, its users' roles, and billable and membership facts for the
-  # requested projects. Every query starts from the company, so a project or
-  # user of another company can never appear. A requested project the company
+  # edit window, its users' roles, billable and membership facts for the
+  # requested projects, and its agents with their users. Every query starts
+  # from the company, so a project, user or agent of another company can never
+  # appear. A requested project the company
   # does not own is reported in missing_project_ids exactly like an id that
   # does not exist, so the result never reveals another company's records.
   class ReferenceFacts
@@ -23,7 +24,8 @@ module Timekeeping
         edit_days: company.timesheet_edit_days,
         users: User.primary_roles_for(company, user_ids).map { |id, role| { id:, role: } },
         projects: projects.map { |project| project_facts(project) },
-        missing_project_ids: requested_project_ids - projects.map(&:id)
+        missing_project_ids: requested_project_ids - projects.map(&:id),
+        agents: agents
       }
     end
 
@@ -38,6 +40,13 @@ module Timekeeping
           billable: project.billable,
           member_user_ids: member_user_ids_by_project_id.fetch(project.id, [])
         }
+      end
+
+      # Every agent of the company, active or not: design rule S7 and the
+      # projection ignore active, so an inactive agent still owns its entries.
+      # Only id and user_id leave the monolith.
+      def agents
+        company.agents.order(:id).pluck(:id, :user_id).map { |id, user_id| { id:, user_id: } }
       end
 
       def projects
