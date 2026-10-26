@@ -185,39 +185,44 @@ RSpec.describe Timekeeping::Alerts, "section 11.3 thresholds" do
   it "raises no alert for a signal that is absent" do
     expect(alerts_table_evaluate(owner: "timekeeping", ownership_moving: nil, write_metrics: nil)).to eq([])
   end
-end
 
-RSpec.describe Timekeeping::Alerts, "folded partial-window and custom overflow cases" do
-  # "Move alerts_2_spec's partial-window case into alerts_spec.rb" and "Keep every distinct case once."
-  it "evaluates a custom overflow key and a newer partial window in the single alerts spec" do
-    now = Time.utc(2026, 3, 3, 12, 7)
-    window = lambda do |start, writes, unavailable, buckets = { "25" => writes + unavailable }|
-      { "window_start" => start, "writes" => writes, "reference_unavailable" => unavailable,
-        "latency_ms_sum" => 0, "latency_ms_buckets" => buckets }
+  # A completed window for each company: [company_id, window_start, writes, unavailable, buckets].
+  def alerts_table_companies(*rows, **metrics_options)
+    body = alerts_table_metrics(**metrics_options)
+    body["companies"] = rows.group_by(&:first).map do |company_id, windows|
+      { "company_id" => company_id, "windows" => windows.map do |_id, start, writes, unavailable, buckets|
+        alerts_table_metrics(writes:, unavailable:, buckets: buckets || { "25" => writes + unavailable })
+          .dig("companies", 0, "windows", 0).merge("window_start" => start)
+      end }
     end
-    partial = {
-      "window_seconds" => 300, "latency_bucket_bounds_ms" => [25, 50, 100, 200, 300, 500, 1000, 2500, 5000],
-      "overflow_bucket" => "inf", "total_field" => "writes + reference_unavailable", "outbox_lag" => [],
-      "companies" => [
-        { "company_id" => 7, "windows" => [window.call("2026-03-03T12:00:00Z", 47, 3),
-                                           window.call("2026-03-03T12:05:00Z", 1, 0)] },
-        { "company_id" => 8, "windows" => [window.call("2026-03-03T12:05:00Z", 0, 1)] },
-        { "company_id" => 9, "windows" => [window.call("2026-03-03T12:00:00Z", 100, 1)] }
-      ]
-    }
-    overflow = {
-      "window_seconds" => 300, "latency_bucket_bounds_ms" => [100, 300, 500], "overflow_bucket" => "beyond",
-      "total_field" => "writes + reference_unavailable", "outbox_lag" => [],
-      "companies" => [
-        { "company_id" => 11, "windows" => [window.call("2026-03-03T12:00:00Z", 20, 0, { "beyond" => 20 })] },
-        { "company_id" => 12, "windows" => [window.call("2026-03-03T12:00:00Z", 20, 0, { "300" => 20 })] }
-      ]
-    }
+    body
+  end
 
-    reference = described_class.evaluate(now:, write_metrics: partial).select { |alert| alert.name == "reference_unavailable_rate" }
-    latency = described_class.evaluate(now:, write_metrics: overflow).select { |alert| alert.name == "entry_write_p95_latency" }
+  # "`503 reference_unavailable` over 1% of writes for 5 minutes;" judged on each company's latest completed window.
+  it "fires for a failed completed window that a newer partial window follows, and never on a newer partial window alone" do
+    # Company 7: 3 of 50 failed in the completed 12:00 window, then one healthy write in the 12:05 window.
+    # Company 8: one failure only in the 12:05 window, still in progress. Company 9: 1 of 101, under 1%.
+    body = alerts_table_companies(
+      [7, "2026-03-03T12:00:00Z", 47, 3], [7, "2026-03-03T12:05:00Z", 1, 0],
+      [8, "2026-03-03T12:05:00Z", 0, 1],
+      [9, "2026-03-03T12:00:00Z", 100, 1]
+    )
 
-    expect(reference.map(&:company_id)).to eq([7])
-    expect(latency.map { |alert| [alert.company_id, alert.value] }).to eq([[11, Float::INFINITY]])
+    alerts = alerts_table_evaluate(write_metrics: body).select { |alert| alert.name == "reference_unavailable_rate" }
+
+    expect(alerts.map(&:company_id)).to eq([7])
+  end
+
+  # Writes past the last bound are counted only under the body's own overflow key, here not "inf".
+  it "treats a p95 in a custom overflow bucket as over every bound, and leaves a company within the bounds quiet" do
+    body = alerts_table_companies(
+      [11, "2026-03-03T12:00:00Z", 20, 0, { "beyond" => 20 }],
+      [12, "2026-03-03T12:00:00Z", 20, 0, { "300" => 20 }],
+      bounds: [100, 300, 500], overflow: "beyond"
+    )
+
+    alerts = alerts_table_evaluate(write_metrics: body).select { |alert| alert.name == "entry_write_p95_latency" }
+
+    expect(alerts.map { |alert| [alert.company_id, alert.value] }).to eq([[11, Float::INFINITY]])
   end
 end
