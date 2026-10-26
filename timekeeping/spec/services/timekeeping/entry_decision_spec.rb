@@ -68,8 +68,9 @@ RSpec.describe Timekeeping::EntryDecision do
   end
 
   describe ".change" do
-    def change(role:, entry:, action: :update, bill_status: nil)
-      described_class.change(action:, bill_status:, role:, acting_user_id: 7, entry:, edit_days: 30, today:)
+    def change(role:, entry:, action: :update, bill_status: nil, primary_role: role)
+      described_class.change(action:, bill_status:, role:, primary_role:, acting_user_id: 7, entry:, edit_days: 30,
+                             today:)
     end
 
     it "allows an employee to update their own free entry" do
@@ -83,11 +84,19 @@ RSpec.describe Timekeeping::EntryDecision do
     it "refuses any change to a billed entry" do
       expect(change(role: "owner", entry: entry(id: 1, bill_status: "billed"), action: :delete)).to eq(:forbidden)
     end
+
+    it "decides a reserved colleague entry on the primary role, not the raised admin role" do
+      reserved = entry(id: 1, user_id: 8, locked: true)
+
+      expect(change(role: "admin", primary_role: "employee", entry: reserved)).to eq(:forbidden)
+      expect(change(role: "admin", primary_role: "employee", entry: entry(id: 1, user_id: 8))).to eq(:ok)
+      expect(change(role: "admin", primary_role: "admin", entry: reserved)).to eq(:ok)
+    end
   end
 
   describe ".bulk" do
-    def bulk(role:, entries:, action: :move)
-      described_class.bulk(action:, role:, acting_user_id: 7, entries:, edit_days: 30, today:)
+    def bulk(role:, entries:, action: :move, primary_role: role)
+      described_class.bulk(action:, role:, primary_role:, acting_user_id: 7, entries:, edit_days: 30, today:)
     end
 
     it "skips a reserved entry in an employee's bulk move and applies the free one" do
@@ -106,6 +115,12 @@ RSpec.describe Timekeeping::EntryDecision do
       entries = [entry(id: 1), entry(id: 2, work_date: today - 31)]
 
       expect(bulk(role: "employee", entries:)).to eq(:forbidden)
+    end
+
+    it "skips a reserved entry in a bulk move by an admin whose primary role is employee" do
+      entries = [entry(id: 1, user_id: 8, locked: true), entry(id: 2, user_id: 8)]
+
+      expect(bulk(role: "admin", primary_role: "employee", entries:)).to eq(1 => :skip, 2 => :apply)
     end
 
     it "applies an employee's bulk delete of a reserved entry" do

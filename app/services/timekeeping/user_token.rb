@@ -15,22 +15,10 @@ module Timekeeping
     PRIVATE_KEY_ENV = "TIMEKEEPING_TOKEN_PRIVATE_KEY"
     REQUIRED_CLAIMS = %w[exp sub company_id role jti].freeze
 
-    # The roles that read every entry of the company, as the entry API
-    # contract names them.
-    PRIVILEGED_ROLES = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/entry_api.yml"))
-      .fetch("privileged_roles").freeze
-
-    # The role each purpose signs, from the user's reference role and the role
-    # names they hold in the company, oldest first. A write keeps the reference
-    # role, so write authority never changes here. A read takes an owner or
-    # admin role the user holds in the company, matching the index
-    # authorization (has_role?(:admin, company)) that lets them read colleagues.
-    ROLE_FOR_PURPOSE = {
-      write: ->(reference_role:, **) { reference_role },
-      read: lambda do |reference_role:, held_role_names:|
-        held_role_names.find { |name| PRIVILEGED_ROLES.include?(name) } || reference_role
-      end
-    }.freeze
+    # Every purpose signs the role the reference endpoint serves, so purpose is
+    # the only claim that tells a read token from a write token, and
+    # Timekeeping refuses a read token on every write route.
+    PURPOSES = %i[write read].freeze
 
     class Error < StandardError; end
     class InvalidTokenError < Error; end
@@ -40,15 +28,19 @@ module Timekeeping
 
     # The verified facts of a token. The role is only ever read beside the
     # company it was issued for.
-    Claims = Data.define(:user_id, :company_id, :role, :purpose, :edit_days, :projects, :agent_id, :jti, :expires_at)
+    Claims = Data.define(:user_id, :company_id, :role, :primary_role, :purpose, :edit_days, :projects, :agent_id,
+                         :jti, :expires_at)
 
-    # purpose is :write (the default) or :read. A write token's role comes from
-    # the same facts the reference endpoint serves, so the two always agree on
-    # a user's role in a company. A read token may carry a higher role than
-    # the endpoint serves; Timekeeping refuses it on every write route.
+    # purpose is :write (the default) or :read. role comes from the same facts
+    # the reference endpoint serves, so the two always agree on a user's role
+    # in a company: an owner or admin role the user holds there wins.
+    # primary_role is the user's lowest-id role there (User#primary_role),
+    # which the monolith's locked and billed checks read; Timekeeping's
+    # locked and billed rules read it too, so a raised role never unlocks them.
     def self.mint(user:, company:, project_ids: [], agent: nil, purpose: :write, private_key: private_key_from_env,
                   now: Time.current)
-      role_rule = ROLE_FOR_PURPOSE.fetch(purpose) { raise ArgumentError, "unknown token purpose #{purpose.inspect}" }
+      raise ArgumentError, "unknown token purpose #{purpose.inspect}" unless PURPOSES.include?(purpose)
+
       facts = ReferenceFacts.call(company:, project_ids:)
       user_facts = facts[:users].find { |listed| listed[:id] == user.id }
       raise NotInCompanyError, "user is not employed in this company" unless user_facts
@@ -60,7 +52,8 @@ module Timekeeping
       payload = {
         sub: user.id,
         company_id: company.id,
-        role: role_rule.call(reference_role: user_facts[:role], held_role_names: held_role_names(user, company)),
+        role: user_facts[:role],
+        primary_role: user.primary_role(company),
         purpose: purpose.to_s,
         edit_days: facts[:edit_days],
         projects: facts[:projects].map do |project|
@@ -109,13 +102,6 @@ module Timekeeping
       raise MissingKeyError, "#{PRIVATE_KEY_ENV} is not an RSA private key"
     end
 
-    # Only roles whose resource is exactly this company count, so a role held
-    # in another company or a global role never reaches the token.
-    def self.held_role_names(user, company)
-      Role.where(resource: company).joins(:users).where(users: { id: user.id }).order("roles.id").pluck("roles.name")
-    end
-    private_class_method :held_role_names
-
     def self.rsa_key(key)
       rsa = key.is_a?(OpenSSL::PKey::RSA) ? key : OpenSSL::PKey::RSA.new(key.to_s)
       rsa.public_key
@@ -127,6 +113,7 @@ module Timekeeping
         user_id: payload.fetch("sub"),
         company_id: payload.fetch("company_id"),
         role: payload.fetch("role"),
+        primary_role: payload["primary_role"],
         purpose: payload["purpose"],
         edit_days: payload["edit_days"],
         projects: Array(payload["projects"]),

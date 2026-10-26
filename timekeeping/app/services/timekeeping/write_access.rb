@@ -8,11 +8,11 @@ module Timekeeping
   # write needs. The expired caller carries no verified company, so the answer
   # does not depend on the path company and reveals nothing about it.
   #
-  # A token minted for a delegated read can carry a raised role (an admin
-  # whose older role is employee), and the writer takes the role from the
-  # token, so only a write token may write. A token signed without a purpose
-  # carries the user's primary role, as every token did before purposes
-  # existed, so it may still write. Any other purpose answers :forbidden.
+  # Read and write tokens carry the same role, so the signed purpose is what
+  # keeps a token minted for a delegated read from writing: only a write
+  # token may write. A token signed without a purpose was minted before
+  # purposes existed, as a write token, so it may still write. Any other
+  # purpose answers :forbidden.
   module WriteAccess
     WRITE_PURPOSES = [nil, "write"].freeze
 

@@ -5,7 +5,7 @@ require "date"
 RSpec.describe TimekeepingRules::EntryRules, "caller handling" do
   let(:today) { Date.new(2026, 3, 10) }
   let(:entry) { { id: 1, user_id: 1, work_date: today, bill_status: "unbilled", locked: false } }
-  let(:inputs) { { change: { action: :update }, role: "employee", acting_user_id: 1, edit_days: 7, today: } }
+  let(:inputs) { { change: { action: :update }, role: "employee", primary_role: "employee", acting_user_id: 1, edit_days: 7, today: } }
 
   [nil, :agent, "user_delegated", :"reservations.commit", "reservations.comit", false].each do |unknown|
     context "with caller #{unknown.inspect}" do
