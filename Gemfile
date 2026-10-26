@@ -160,7 +160,7 @@ gem "observer"
 # Faraday HTTP client adapter for Faraday 2.0+
 gem "faraday", ">= 2.14.1"
 gem "faraday-net_http"
-gem "mcp", "~> 0.25.0"
+gem "mcp", "~> 1.2"
 
 # Country information and timezones
 gem "countries", "~> 6.0"
