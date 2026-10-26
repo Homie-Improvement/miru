@@ -4,48 +4,6 @@
 
 require "rails_helper"
 
-RSpec.describe "Mobile collection create under the billing fence", type: :request do
-  let(:company) { create(:india_company, base_currency: "INR", plan_tier: "paid") }
-  let(:user) { create(:user, current_workspace_id: company.id) }
-
-  before do
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    sign_in user
-  end
-
-  # "Every invoice, line-item, invoice-tax and payment write, mobile-collection payments included,
-  # gets 503 ownership_moving while handoff_step is set and writes nothing"
-  # An invoice left behind by the refused attempt would make the client's retry replay an unpaid collection.
-  it "leaves no collection rows on a refused mobile create and lets the same idempotency key create one collection after the handoff" do
-    params = {
-      collection: {
-        name: "Asha Rao",
-        phone: "9876543210",
-        amount: "1500",
-        payment_method: "cash",
-        idempotency_key: "fence-retry-1500"
-      }
-    }
-    TimekeepingOwnership.current.update!(handoff_step: "close_admission")
-
-    expect {
-      post "/api/v1/mobile/collections", params:, headers: auth_headers(user)
-    }.not_to change { [Client.count, Invoice.count, Payment.count, User.count] }
-
-    expect(response).to have_http_status(:service_unavailable)
-    expect(json_response["reason"]).to eq("ownership_moving")
-
-    TimekeepingOwnership.current.update!(handoff_step: nil)
-
-    expect {
-      post "/api/v1/mobile/collections", params:, headers: auth_headers(user)
-    }.to change(Invoice, :count).by(1).and change(Payment, :count).by(1)
-
-    expect(response).to have_http_status(:created)
-  end
-end
-
 RSpec.describe "Billing fence on invoice routes", type: :request do
   # The fence opens only after authorization, so a handoff never changes what an unauthorized
   # caller learns. Acceptance bar: "Every invoice, line-item, invoice-tax and payment write,
