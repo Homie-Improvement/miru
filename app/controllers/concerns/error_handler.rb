@@ -2,6 +2,7 @@
 
 module ErrorHandler
   extend ActiveSupport::Concern
+  include OwnershipMovingResponse
 
   included do
     rescue_from ActionController::RoutingError, ActiveRecord::RecordNotFound, with: :handle_not_found_error
@@ -10,6 +11,7 @@ module ErrorHandler
     rescue_from ActiveRecord::RecordInvalid, with: :record_invalid
     rescue_from Pagy::VariableError, with: :invalid_param_value
     rescue_from Timekeeping::EntryApiClient::Error, with: :timekeeping_unavailable
+    rescue_from Timekeeping::BillingFence::OwnershipMoving, with: :render_ownership_moving
   end
 
   private

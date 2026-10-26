@@ -47,7 +47,9 @@ class Api::V1::Mobile::CollectionsController < Api::V1::ApplicationController
     invoice = nil
     payment = nil
 
-    ActiveRecord::Base.transaction do
+    # One fenced transaction, so a handoff refusal leaves no client, login,
+    # invoice or payment behind and the idempotency key stays unused.
+    Timekeeping::BillingFence.transaction do
       client = find_or_create_client!
       customer_user = ensure_customer_login!(client)
       invoice = create_invoice!(client) if collection_amount.positive?

@@ -8,6 +8,11 @@ class TaxConfiguration < ApplicationRecord
   belongs_to :company
   has_many :invoice_taxes, dependent: :nullify
 
+  # Destroying a configuration clears its invoice taxes' reference with
+  # update_all, which skips the invoice-tax billing guard, so the fence runs
+  # here first. Prepended so it runs before the nullify above.
+  before_destroy -> { Timekeeping::BillingFence.admit! }, prepend: true
+
   before_validation :normalize_name
 
   validates :name, presence: true, length: { maximum: 80 }
