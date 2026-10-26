@@ -50,7 +50,14 @@ class Timekeeping::V1::EntriesController < ApplicationController
         raw_body: request.raw_post, bearer: Timekeeping::Identity.bearer(request.authorization),
         reference_client: Timekeeping::ReferenceClient.configured
       )
-      outcome = command.is_a?(Timekeeping::WriteOutcome) ? command : Timekeeping::EntryWriter.new.call(command)
+      outcome = command.is_a?(Timekeeping::WriteOutcome) ? command : entry_writer.call(command)
       render json: outcome.body, status: outcome.status
+    end
+
+    # Only the test environment sets entry_write_checkpoint; everywhere else the
+    # writer runs with its own no-op checkpoint.
+    def entry_writer
+      checkpoint = Rails.configuration.x.entry_write_checkpoint
+      checkpoint ? Timekeeping::EntryWriter.new(checkpoint:) : Timekeeping::EntryWriter.new
     end
 end
