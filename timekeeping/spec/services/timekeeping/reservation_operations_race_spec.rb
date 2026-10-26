@@ -166,6 +166,36 @@ RSpec.describe Timekeeping::ReservationOperations, "under concurrent requests" d
     expect(Entry.find(entry_id).duration).to eq(duration)
   end
 
+  # A6 does not bind deletes (A10), so the waiting bulk delete still discards
+  # the entry the prepare just reserved, and the reservation stays. This pins
+  # that current behaviour; it does not endorse a discarded entry holding a
+  # provisional reservation. The audit row and snapshot come from a read made
+  # after the delete, so this proves the serialized stored outcome, not which
+  # reservation flag the delete decision saw: the update example above is the
+  # check for that.
+  it "discards a reserved entry when an employee bulk delete waited on its prepare" do
+    token = timekeeping_arrange.token_for(user)
+    bulk_delete = build_entry_command(:bulk_delete, token:, body: { "entry_ids" => [entry_id] })
+    seeded_version = Entry.find(entry_id).version
+    expect(seeded_version).to eq(1)
+
+    prepared, deleted = race_held_reservation_against(
+      race_request(:prepare, operation_id: SecureRandom.uuid, entry_ids: [entry_id]), hold_at: :rows_locked
+    ) { Timekeeping::EntryWriter.new.call(bulk_delete) }
+
+    expect(prepared.status).to eq(200)
+    expect(answer(deleted)).to eq([200, { "results" => [{ "entry_id" => entry_id, "result" => "deleted" }] }])
+    entry = Entry.find(entry_id)
+    expect(entry.discarded_at).not_to be_nil
+    expect(entry.version).to eq(seeded_version + 2)
+    expect(Reservation.where(entry_id:).pluck(:invoice_id, :state)).to eq([[501, "provisional"]])
+    expect(AuditEvent.where(entry_id:).order(:id).pluck(:action)).to eq(%w[prepare bulk_delete])
+    expect(AuditEvent.where(entry_id:, action: "prepare").pluck(:after)).to eq([{ "locked" => true }])
+    snapshots = OutboxSnapshot.where(id: entry_id).order(:outbox_position).pluck(:version, :discarded_at, :locked)
+    expect(snapshots.map { |version, discarded_at, locked| [version, !discarded_at.nil?, locked] })
+      .to eq([[seeded_version + 1, false, true], [seeded_version + 2, true, true]])
+  end
+
   # The waiting mark-billed must see that the successor took the entry, so it
   # never bills an entry its invoice no longer holds.
   it "bills nothing for an invoice whose retained entry a successor committed while mark-billed waited" do
