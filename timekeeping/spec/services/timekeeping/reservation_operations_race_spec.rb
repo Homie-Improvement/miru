@@ -203,6 +203,10 @@ RSpec.describe Timekeeping::ReservationOperations, "under concurrent requests" d
     expect(Reservation.where(entry_id:).pluck(:invoice_id, :state)).to eq([[501, "provisional"]])
     expect(AuditEvent.where(entry_id:).order(:id).pluck(:action)).to eq(%w[prepare bulk_delete])
     expect(AuditEvent.where(entry_id:, action: "prepare").pluck(:after)).to eq([{ "locked" => true }])
+    deleted_before, deleted_after = AuditEvent.find_by!(entry_id:, action: "bulk_delete").values_at(:before, :after)
+    expect([deleted_before["version"], deleted_before["discarded_at"]]).to eq([seeded_version + 1, nil])
+    expect(deleted_after["version"]).to eq(seeded_version + 2)
+    expect(deleted_after["discarded_at"]).not_to be_nil
     snapshots = OutboxSnapshot.where(id: entry_id).order(:outbox_position).pluck(:version, :discarded_at, :locked)
     expect(snapshots.map { |version, discarded_at, locked| [version, !discarded_at.nil?, locked] })
       .to eq([[seeded_version + 1, false, true], [seeded_version + 2, true, true]])
