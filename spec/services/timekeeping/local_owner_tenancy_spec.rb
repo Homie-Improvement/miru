@@ -5,6 +5,7 @@
 require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner do
+  # "An id from another company answers `not_found`, in the same shape as a missing id."
   # The foreign entry belongs to the caller and the caller holds the same role in both companies,
   # so only the company check can refuse it: a fixture that also differed in user or role would
   # still pass if the company filter were removed.
@@ -21,7 +22,9 @@ RSpec.describe Timekeeping::LocalOwner do
     )
     attributes_before = entry_a.reload.attributes
     counts_before = timekeeping_row_counts
+    expect(counts_before.keys).to match_array(%w[entries entry_audits idempotency_records entry_outbox_items])
     expect(counts_before["entries"]).to eq(1)
+    missing_id = entry_a.id + 1_000_000
     update_from_b = lambda do |entry_id, key|
       described_class.call(
         operation: :update, company_id: company_b.id, generation: ownership.generation.to_s,
@@ -32,51 +35,11 @@ RSpec.describe Timekeeping::LocalOwner do
     end
 
     foreign = update_from_b.call(entry_a.id, "same-user-foreign")
-    missing = update_from_b.call(entry_a.id + 1_000_000, "same-user-missing")
+    missing = update_from_b.call(missing_id, "same-user-missing")
 
     expect(foreign.status).to eq(404)
     expect(foreign.status).to eq(missing.status)
     expect(foreign.body).to eq(missing.body)
-    expect(entry_a.reload.attributes).to eq(attributes_before)
-    expect(timekeeping_row_counts).to eq(counts_before)
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner, "foreign id differing only in company" do
-  # "An id from another company answers `not_found`, in the same shape as a missing id."
-  # The caller owns both companies and the entry is the caller's own, so only the
-  # company check can refuse it: a fixture that also differs in user or role would
-  # still pass with that check removed.
-  it "an owner of both companies updating an entry that differs only in company answers exactly like a missing id and writes nothing" do
-    generation = prepare_local_ownership!.generation.to_s
-    company_a = create(:company)
-    company_b = create(:company)
-    owner = timekeeping_member(company_a, "owner")
-    timekeeping_member(company_b, "owner", user: owner)
-    project_a = create(:project, client: create(:client, company: company_a))
-    entry_a = Timekeeping::LocalEntry.create!(
-      company_id: company_a.id, user_id: owner.id, project_id: project_a.id, work_date: Date.current,
-      duration: 60.0, note: "company a", bill_status: "unbilled"
-    )
-    attributes_before = entry_a.reload.attributes
-    counts_before = timekeeping_row_counts
-    expect(counts_before.keys).to match_array(%w[entries entry_audits idempotency_records entry_outbox_items])
-    expect(counts_before["entries"]).to eq(1)
-    missing_id = Timekeeping::LocalEntry.maximum(:id) + 1000
-    update_in_b = lambda do |entry_id, key|
-      described_class.call(
-        operation: :update, company_id: company_b.id, generation:,
-        actor: described_class::Actor.user(user_id: owner.id, role: "owner"),
-        params: { "idempotency_key" => key, "entry_id" => entry_id,
-                  "body" => { "note" => "taken over", "company_id" => company_a.id } }
-      )
-    end
-
-    foreign = update_in_b.call(entry_a.id, "foreign-only-company")
-    missing = update_in_b.call(missing_id, "missing-only-company")
-
-    expect(foreign.status).to eq(404)
-    expect(foreign.status).to eq(missing.status)
     expect(foreign.body.to_json.gsub(entry_a.id.to_s, "ID")).to eq(missing.body.to_json.gsub(missing_id.to_s, "ID"))
     expect(entry_a.reload.attributes).to eq(attributes_before)
     expect(timekeeping_row_counts).to eq(counts_before)
@@ -115,42 +78,6 @@ RSpec.describe Timekeeping::LocalOwner, "foreign project differing only in compa
     expect(timekeeping_row_counts).to eq(counts_before)
     expect(Timekeeping::LocalEntry.where(company_id: company_b.id).count).to eq(0)
     expect(create_in_b.call(project_b.id, "own-project-only-company").status).to eq(201)
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner do
-  # "An id from another company answers `not_found`, in the same shape as a missing id."
-  # The foreign entry belongs to the calling user, who holds the same role in both
-  # companies, so only the company check can refuse it.
-  it "an update of the same user's entry in another company answers exactly like a missing id and changes no write table" do
-    generation = prepare_local_ownership!.generation
-    company_a = create(:company)
-    company_b = create(:company)
-    owner = timekeeping_member(company_a, "owner")
-    timekeeping_member(company_b, "owner", user: owner)
-    project_a = create(:project, client: create(:client, company: company_a))
-    entry_a = Timekeeping::LocalEntry.create!(
-      company_id: company_a.id, user_id: owner.id, project_id: project_a.id, work_date: Date.current,
-      duration: 60.0, note: "company a", bill_status: TimesheetEntry.bill_statuses.keys.find { |s| s != "billed" }
-    )
-    attributes_before = entry_a.reload.attributes
-    counts_before = timekeeping_row_counts
-    expect(counts_before["entries"]).to eq(1)
-    update_from_b = lambda do |entry_id, key|
-      described_class.call(operation: :update, company_id: company_b.id, generation: generation.to_s,
-                           actor: described_class::Actor.user(user_id: owner.id, role: "owner"),
-                           params: { "idempotency_key" => key, "entry_id" => entry_id,
-                                     "body" => { "note" => "taken over", "company_id" => company_a.id } })
-    end
-
-    foreign = update_from_b.call(entry_a.id, "same-user-foreign")
-    missing = update_from_b.call(entry_a.id + 1_000_000, "same-user-missing")
-
-    expect(foreign.status).to eq(404)
-    expect(foreign.status).to eq(missing.status)
-    expect(foreign.body).to eq(missing.body)
-    expect(entry_a.reload.attributes).to eq(attributes_before)
-    expect(timekeeping_row_counts).to eq(counts_before)
   end
 end
 
