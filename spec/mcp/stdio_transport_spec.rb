@@ -6,37 +6,12 @@ require "rails_helper"
 require "stringio"
 require "timeout"
 
-# bin/miru-mcp calls `open` with no arguments. Each example swaps $stdin and
-# $stdout for StringIO objects so that end of input lets `open` return, and
-# wraps the call in a timeout so a hang fails the example instead of blocking.
 RSpec.describe MCP::Server::Transports::StdioTransport do
   it "answers an initialize request on stdout and returns at end of stdin when opened with no arguments" do
     server = MCP::Miru::ServerFactory.build(server_context: { pro_access: true, authorization: "Bearer token" })
-    request = {
-      jsonrpc: "2.0",
-      id: 7,
-      method: "initialize",
-      params: {
-        protocolVersion: "2025-03-26",
-        capabilities: {},
-        clientInfo: { name: "stdio-spec", version: "1.0" }
-      }
-    }
-    original_stdin = $stdin
-    original_stdout = $stdout
-    captured = StringIO.new
 
-    begin
-      # One request then end of input, as bin/miru-mcp sees when its client closes the pipe.
-      $stdin = StringIO.new("#{request.to_json}\n")
-      $stdout = captured
-      Timeout.timeout(5) { described_class.new(server).open }
-    ensure
-      $stdin = original_stdin
-      $stdout = original_stdout
-    end
-
-    responses = captured.string.lines.map(&:strip).reject(&:empty?).map { |line| JSON.parse(line) }
+    # One request then end of input, as bin/miru-mcp sees when its client closes the pipe.
+    responses = run_stdio_transport(server, "#{stdio_initialize_request(7).to_json}\n")
     initialize_responses = responses.select { |entry| entry["id"] == 7 }
 
     expect(initialize_responses.size).to eq(1)
@@ -50,34 +25,51 @@ RSpec.describe MCP::Server::Transports::StdioTransport do
   # answering the next valid request.
   it "keeps answering after a malformed stdin line and returns at end of input" do
     server = MCP::Miru::ServerFactory.build(server_context: { pro_access: false, authorization: "Bearer token" })
-    initialize_request = {
-      jsonrpc: "2.0",
-      id: "init-1",
-      method: "initialize",
-      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "miru-spec", version: "1.0.0" } }
-    }.to_json
-    input = StringIO.new("{not json\n#{initialize_request}\n")
-    output = StringIO.new
-    original_stdin = $stdin
-    original_stdout = $stdout
 
-    begin
-      $stdin = input
-      $stdout = output
-      Timeout.timeout(5) { described_class.new(server).open }
-    ensure
-      $stdin = original_stdin
-      $stdout = original_stdout
-    end
-
-    responses = output.string.lines.filter_map do |line|
-      JSON.parse(line)
-    rescue JSON::ParserError
-      nil
-    end
+    responses = run_stdio_transport(server, "{not json\n#{stdio_initialize_request("init-1").to_json}\n")
     init_response = responses.find { |response| response["id"] == "init-1" }
 
     expect(init_response).to be_present
     expect(init_response["result"]).to be_present
   end
+
+  private
+
+    def stdio_initialize_request(id)
+      {
+        jsonrpc: "2.0",
+        id:,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-03-26",
+          capabilities: {},
+          clientInfo: { name: "stdio-spec", version: "1.0" }
+        }
+      }
+    end
+
+    # bin/miru-mcp calls `open` with no arguments. This swaps $stdin and $stdout
+    # for StringIO objects so that end of input lets `open` return, and wraps the
+    # call in a timeout so a hang fails the example instead of blocking.
+    # Returns every JSON line the transport wrote.
+    def run_stdio_transport(server, input)
+      original_stdin = $stdin
+      original_stdout = $stdout
+      output = StringIO.new
+
+      begin
+        $stdin = StringIO.new(input)
+        $stdout = output
+        Timeout.timeout(5) { described_class.new(server).open }
+      ensure
+        $stdin = original_stdin
+        $stdout = original_stdout
+      end
+
+      output.string.lines.filter_map do |line|
+        JSON.parse(line)
+      rescue JSON::ParserError
+        nil
+      end
+    end
 end

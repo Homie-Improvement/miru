@@ -5,34 +5,25 @@
 require "rails_helper"
 
 RSpec.describe "config/initializers/mcp.rb" do
-  it "reports MCP exceptions to the Rails log without writing the caller's bearer token" do
+  # Drives a failing tool through the SDK, so the spec fails if the SDK stops
+  # calling the configured reporter or changes the arguments it passes.
+  it "reports a tool exception raised inside the SDK to the Rails log once, without the caller's bearer token" do
     logged = []
     allow(Rails.logger).to receive(:error) { |message| logged << message }
-    exception = RuntimeError.new("tool exploded")
-    server_context = { authorization: "Bearer secret-mcp-token-123", user_id: 1, company_id: 2 }
+    allow(MCP::Miru::Tools::WorkspaceWhoamiTool).to receive(:call).and_raise(RuntimeError, "tool exploded")
+    server = MCP::Miru::ServerFactory.build(
+      server_context: { pro_access: true, authorization: "Bearer secret-mcp-token-123" }
+    )
+    request = {
+      jsonrpc: "2.0",
+      id: "tool-boom",
+      method: "tools/call",
+      params: { name: MCP::Miru::Tools::WorkspaceWhoamiTool.name_value, arguments: {} }
+    }
 
-    MCP.configuration.exception_reporter.call(exception, server_context)
+    server.handle_json(request.to_json)
 
-    expect(logged).to include("[MCP] RuntimeError: tool exploded")
+    expect(logged.count("[MCP] RuntimeError: tool exploded")).to eq(1)
     expect(logged.join("\n")).not_to include("secret-mcp-token-123")
-  end
-
-  it "reports MCP exceptions to the Rails log when called with an exception and a server context" do
-    allow(Rails.logger).to receive(:error)
-    exception = RuntimeError.new("tool exploded")
-
-    MCP.configuration.exception_reporter.call(exception, { user_id: 1, company_id: 2 })
-
-    expect(Rails.logger).to have_received(:error).with("[MCP] RuntimeError: tool exploded").once
-  end
-
-  # The SDK can report a failure before any server context exists. The reporter
-  # itself must not raise then, or the original exception is lost.
-  it "reports an exception with a nil server context without raising" do
-    allow(Rails.logger).to receive(:error)
-    exception = RuntimeError.new("tool exploded")
-
-    expect { MCP.configuration.exception_reporter.call(exception, nil) }.not_to raise_error
-    expect(Rails.logger).to have_received(:error).with("[MCP] RuntimeError: tool exploded")
   end
 end
