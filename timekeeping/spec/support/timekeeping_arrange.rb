@@ -2,8 +2,9 @@
 
 # The timekeeping_arrange the shared contract examples call, for the real
 # provider. Entries and reservations are seeded through the models, and the
-# admitted generation through Timekeeping::Admission. Users and projects live in the monolith, so they are kept in an
-# in-memory catalogue that a WebMock stub of the reference endpoint serves.
+# admitted generation through Timekeeping::Admission. Users and projects live
+# in the monolith, so they are kept in an in-memory catalogue that a WebMock
+# stub of the reference endpoint serves.
 # Tokens are RS256, signed with a key generated once per run.
 class TimekeepingProviderArrange
   REFERENCE_URL = "http://reference.test"
