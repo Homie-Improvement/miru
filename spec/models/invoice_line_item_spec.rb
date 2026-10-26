@@ -126,6 +126,10 @@ RSpec.describe InvoiceLineItem, type: :model do
         expect(line).not_to be_valid
         expect(line.errors[:timesheet_entry]).to eq(["not found"])
         expect(line.errors.to_hash).to eq(missing_line.errors.to_hash)
+
+        loaded_line = build(:invoice_line_item, invoice:, timesheet_entry: entry)
+        expect(loaded_line).not_to be_valid
+        expect(loaded_line.errors.to_hash).to eq(missing_line.errors.to_hash)
       end
     end
 
