@@ -52,5 +52,5 @@ A guard on global state is easy to add at the top of an action, and the happy-pa
 ## Evidence
 
 - PR #149 changes `app/controllers/api/v1/users_controller.rb` so that the `TimekeepingOwnership.unless_handoff_begun` block and the 422 render come after the existing early return in `destroy`.
-- `spec/requests/api/v1/users/destroy_spec.rb` adds the "refusal order during a handoff" group, which checks the 403 and the sole-owner message. The "handoff refusal for unknown users" group compares the status for a missing id before and after `handoff_step` is set. The "handoff refusal body" group checks that the body omits `changed_by`, the generation and the company name.
+- `spec/requests/api/v1/users/destroy_spec.rb` adds the "refusal order during a handoff" group, which checks the 403 and the sole-owner message. The "handoff refusal for unknown users" group compares the status for a missing id before and after `handoff_step` is set. The "when a handoff has begun, the refusal body" context checks that the body omits `changed_by`, the generation and the company name.
 - `config/locales/en.yml` adds the fixed `handoff_begun` message.
