@@ -11,20 +11,15 @@ RSpec.describe Timekeeping::ProjectionConsumer do
     project = create(:project, client: create(:client, company:))
     user = create(:user)
     snapshot = lambda do |id:, version:, generation: 1, position: version|
-      entry = TimekeepingContract.load(:entry_snapshots).fetch("entry_fields").index_with(nil).merge(
-        "id" => id, "company_id" => company.id, "version" => version, "project_id" => project.id, "user_id" => user.id,
-        "work_date" => "2026-03-02", "duration" => 90.0, "note" => "v#{version}", "bill_status" => "unbilled",
-        "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
-        "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z", "updated_at" => "2026-03-02T09:00:00Z"
-      )
-      { "generation" => generation, "outbox_position" => position, "entry" => entry }
+      entry = TimekeepingSnapshots.entry(id:, company_id: company.id, version:, project_id: project.id, user_id: user.id)
+      TimekeepingSnapshots.item(entry, generation:, outbox_position: position)
     end
 
     # A paused relay sends every unsent snapshot at once, so one batch can hold
     # several versions of one entry. The batch must not fail because of that.
     # "It upserts by entry `id` and applies a snapshot only when its `version` is higher than the row's."
     result = described_class.call(
-      batch: { "schema_version" => 1, "snapshots" => [snapshot.call(id: 71_001, version: 1), snapshot.call(id: 71_001, version: 2)] },
+      batch: TimekeepingSnapshots.batch(snapshot.call(id: 71_001, version: 1), snapshot.call(id: 71_001, version: 2)),
       idempotency_key: SecureRandom.uuid
     )
 
@@ -43,24 +38,19 @@ RSpec.describe Timekeeping::ProjectionConsumer do
     project = create(:project, client: create(:client, company:))
     user = create(:user)
     snapshot = lambda do |id:, version:, generation:, position:|
-      entry = TimekeepingContract.load(:entry_snapshots).fetch("entry_fields").index_with(nil).merge(
-        "id" => id, "company_id" => company.id, "version" => version, "project_id" => project.id, "user_id" => user.id,
-        "work_date" => "2026-03-02", "duration" => 90.0, "note" => "v#{version}", "bill_status" => "unbilled",
-        "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
-        "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z", "updated_at" => "2026-03-02T09:00:00Z"
-      )
-      { "generation" => generation, "outbox_position" => position, "entry" => entry }
+      entry = TimekeepingSnapshots.entry(id:, company_id: company.id, version:, project_id: project.id, user_id: user.id)
+      TimekeepingSnapshots.item(entry, generation:, outbox_position: position)
     end
 
     # A batch holding any refused snapshot answers stale_generation and applies
     # nothing, so a write loop that stops at the first refusal must not leave
     # the earlier items behind.
     result = described_class.call(
-      batch: { "schema_version" => 1, "snapshots" => [
+      batch: TimekeepingSnapshots.batch(
         snapshot.call(id: 72_001, version: 1, generation: 2, position: 1),
         snapshot.call(id: 72_002, version: 1, generation: 2, position: 2),
         snapshot.call(id: 72_003, version: 1, generation: 1, position: 3)
-      ] },
+      ),
       idempotency_key: SecureRandom.uuid
     )
 
@@ -80,13 +70,9 @@ RSpec.describe Timekeeping::ProjectionConsumer do
     project_b = create(:project, client: create(:client, company: company_b))
     user = create(:user)
     snapshot = lambda do |company:, project:, version:|
-      entry = TimekeepingContract.load(:entry_snapshots).fetch("entry_fields").index_with(nil).merge(
-        "id" => 73_001, "company_id" => company.id, "version" => version, "project_id" => project.id, "user_id" => user.id,
-        "work_date" => "2026-03-02", "duration" => 90.0, "note" => "v#{version}", "bill_status" => "unbilled",
-        "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
-        "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z", "updated_at" => "2026-03-02T09:00:00Z"
-      )
-      { "schema_version" => 1, "snapshots" => [{ "generation" => 1, "outbox_position" => version, "entry" => entry }] }
+      entry = TimekeepingSnapshots.entry(id: 73_001, company_id: company.id, version:, project_id: project.id,
+                                         user_id: user.id)
+      TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation: 1))
     end
     described_class.call(batch: snapshot.call(company: company_a, project: project_a, version: 1), idempotency_key: SecureRandom.uuid)
     read_row = -> { ActiveRecord::Base.connection.select_one("SELECT * FROM timesheet_entries WHERE id = 73001") }
@@ -111,17 +97,13 @@ RSpec.describe Timekeeping::ProjectionConsumer do
     company_b = create(:company)
     project_b = create(:project, client: create(:client, company: company_b))
     user = create(:user)
-    entry = TimekeepingContract.load(:entry_snapshots).fetch("entry_fields").index_with(nil).merge(
-      "id" => 74_001, "company_id" => company_a.id, "version" => 1, "project_id" => project_b.id, "user_id" => user.id,
-      "work_date" => "2026-03-02", "duration" => 90.0, "note" => "company A private note", "bill_status" => "unbilled",
-      "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
-      "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z", "updated_at" => "2026-03-02T09:00:00Z"
-    )
+    entry = TimekeepingSnapshots.entry(id: 74_001, company_id: company_a.id, version: 1, project_id: project_b.id,
+                                       user_id: user.id, note: "company A private note")
 
     # Company#timesheet_entries joins through clients and projects, so a row
     # filed under company B's project would show in company B's reports.
     result = described_class.call(
-      batch: { "schema_version" => 1, "snapshots" => [{ "generation" => 1, "outbox_position" => 1, "entry" => entry }] },
+      batch: TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation: 1)),
       idempotency_key: SecureRandom.uuid
     )
 
@@ -140,13 +122,9 @@ RSpec.describe Timekeeping::ProjectionConsumer do
     project = create(:project, client: create(:client, company:))
     user = create(:user)
     snapshot = lambda do |version:, generation:, position:|
-      entry = TimekeepingContract.load(:entry_snapshots).fetch("entry_fields").index_with(nil).merge(
-        "id" => 75_001, "company_id" => company.id, "version" => version, "project_id" => project.id, "user_id" => user.id,
-        "work_date" => "2026-03-02", "duration" => 90.0, "note" => "v#{version}", "bill_status" => "unbilled",
-        "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
-        "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z", "updated_at" => "2026-03-02T09:00:00Z"
-      )
-      { "schema_version" => 1, "snapshots" => [{ "generation" => generation, "outbox_position" => position, "entry" => entry }] }
+      entry = TimekeepingSnapshots.entry(id: 75_001, company_id: company.id, version:, project_id: project.id,
+                                         user_id: user.id)
+      TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation:, outbox_position: position))
     end
 
     # "During a handoff, between closing admission and the ownership flip, it also accepts the outgoing owner's
@@ -176,13 +154,9 @@ RSpec.describe Timekeeping::ProjectionConsumer do
     project = create(:project, client: create(:client, company:))
     user = create(:user)
     snapshot = lambda do |version:|
-      entry = TimekeepingContract.load(:entry_snapshots).fetch("entry_fields").index_with(nil).merge(
-        "id" => 76_001, "company_id" => company.id, "version" => version, "project_id" => project.id, "user_id" => user.id,
-        "work_date" => "2026-03-02", "duration" => 90.0, "note" => "v#{version}", "bill_status" => "unbilled",
-        "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
-        "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z", "updated_at" => "2026-03-02T09:00:00Z"
-      )
-      { "schema_version" => 1, "snapshots" => [{ "generation" => 1, "outbox_position" => version, "entry" => entry }] }
+      entry = TimekeepingSnapshots.entry(id: 76_001, company_id: company.id, version:, project_id: project.id,
+                                         user_id: user.id)
+      TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation: 1))
     end
     key = SecureRandom.uuid
 
@@ -210,14 +184,9 @@ RSpec.describe Timekeeping::ProjectionConsumer do
     project = create(:project, client: create(:client, company:))
     user = create(:user)
     snapshot = lambda do |version:, discarded_at: nil|
-      entry = TimekeepingContract.load(:entry_snapshots).fetch("entry_fields").index_with(nil).merge(
-        "id" => 77_001, "company_id" => company.id, "version" => version, "project_id" => project.id, "user_id" => user.id,
-        "work_date" => "2026-03-02", "duration" => 90.0, "note" => "v#{version}", "bill_status" => "unbilled",
-        "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
-        "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z", "updated_at" => "2026-03-02T09:00:00Z",
-        "discarded_at" => discarded_at
-      )
-      { "schema_version" => 1, "snapshots" => [{ "generation" => 1, "outbox_position" => version, "entry" => entry }] }
+      entry = TimekeepingSnapshots.entry(id: 77_001, company_id: company.id, version:, project_id: project.id,
+                                         user_id: user.id, discarded_at:)
+      TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation: 1))
     end
 
     # "A discard arrives as a snapshot with `discarded_at` set (a 'tombstone'), never as a row delete."

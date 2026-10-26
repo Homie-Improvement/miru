@@ -5,14 +5,16 @@ class InvoiceLineItemTimeEntry < ApplicationRecord
   belongs_to :timesheet_entry
 
   validates :timesheet_entry_id, uniqueness: { scope: :invoice_line_item_id }
-  validate :timesheet_entry_belongs_to_invoice_company
+  validate :timesheet_entry_in_invoice_company
 
   private
 
-    def timesheet_entry_belongs_to_invoice_company
+    # Compares the stored company_id, so an entry with no company never matches,
+    # and reports the same not found error a line item gives for a missing id.
+    def timesheet_entry_in_invoice_company
       return if invoice_line_item&.invoice.blank? || timesheet_entry.blank?
-      return if timesheet_entry.company&.id == invoice_line_item.invoice.company_id
+      return if timesheet_entry.company_id == invoice_line_item.invoice.company_id
 
-      errors.add(:timesheet_entry, "must belong to the same company")
+      errors.add(:timesheet_entry, :not_found)
     end
 end

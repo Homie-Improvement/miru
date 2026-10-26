@@ -82,7 +82,8 @@ RSpec.describe Timekeeping::TokenVerifier do
     {
       "role given as a number" => { role: 1 },
       "sub given as a string" => { sub: "7" },
-      "company_id given as a string" => { company_id: "1" }
+      "company_id given as a string" => { company_id: "1" },
+      "purpose given as a number" => { purpose: 1 }
     }.each do |description, claims|
       it "refuses a signed token with #{description}" do
         expect { verify(mint_token(claims)) }.to raise_error(described_class::InvalidToken)
@@ -111,6 +112,10 @@ RSpec.describe Timekeeping::TokenVerifier do
 
       expect(claims).to include("sub" => 42, "company_id" => 9, "role" => "owner")
       expect(claims.keys).to include("exp", "jti")
+    end
+
+    it "returns a String purpose claim when the token carries one" do
+      expect(verify(mint_token({ purpose: "read" }))).to include("purpose" => "read")
     end
 
     it "accepts the public key as PEM text" do
