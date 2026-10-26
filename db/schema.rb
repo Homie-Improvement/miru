@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_10_26_120100) do
+ActiveRecord::Schema[8.1].define(version: 2026_10_26_130000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pg_stat_statements"
@@ -616,6 +616,16 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_26_120100) do
     t.index ["token"], name: "index_invitations_on_token", unique: true
   end
 
+  create_table "invoice_entry_holdings", force: :cascade do |t|
+    t.bigint "company_id", null: false
+    t.string "disposition", default: "active", null: false
+    t.bigint "entry_ids", default: [], null: false, array: true
+    t.bigint "invoice_id", null: false
+    t.datetime "updated_at", null: false
+    t.index ["company_id", "invoice_id"], name: "index_invoice_entry_holdings_on_company_invoice", unique: true
+    t.check_constraint "disposition::text = ANY (ARRAY['active'::character varying, 'retained'::character varying]::text[])", name: "invoice_entry_holdings_disposition_check"
+  end
+
   create_table "invoice_line_item_time_entries", force: :cascade do |t|
     t.datetime "created_at", null: false
     t.bigint "invoice_line_item_id", null: false
@@ -644,13 +654,29 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_26_120100) do
   create_table "invoice_operation_intents", force: :cascade do |t|
     t.bigint "company_id", null: false
     t.datetime "created_at", null: false
+    t.bigint "desired_entry_ids", default: [], null: false, array: true
+    t.string "disposition", default: "active", null: false
     t.datetime "finished_at"
     t.bigint "generation", null: false
     t.bigint "invoice_id", null: false
     t.uuid "operation_id", null: false
     t.string "state", null: false
     t.index ["company_id", "invoice_id", "operation_id"], name: "index_invoice_operation_intents_on_company_invoice_operation", unique: true
+    t.check_constraint "disposition::text = ANY (ARRAY['active'::character varying, 'retained'::character varying]::text[])", name: "invoice_operation_intents_disposition_check"
     t.check_constraint "state::text = ANY (ARRAY['pending'::character varying, 'committed'::character varying, 'failed'::character varying]::text[])", name: "invoice_operation_intents_state_check"
+  end
+
+  create_table "invoice_operation_outbox_items", force: :cascade do |t|
+    t.integer "attempts", default: 0, null: false
+    t.bigint "company_id", null: false
+    t.datetime "created_at", null: false
+    t.datetime "delivered_at"
+    t.bigint "invoice_id"
+    t.string "kind", null: false
+    t.uuid "operation_id", null: false
+    t.jsonb "payload", null: false
+    t.index ["company_id", "operation_id", "kind"], name: "index_invoice_operation_outbox_items_on_company_operation_kind", unique: true
+    t.check_constraint "kind::text = ANY (ARRAY['commit'::character varying, 'abort'::character varying]::text[])", name: "invoice_operation_outbox_items_kind_check"
   end
 
   create_table "invoice_operations", force: :cascade do |t|

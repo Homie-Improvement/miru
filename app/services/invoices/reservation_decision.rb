@@ -14,8 +14,8 @@ module Invoices
     DRAFT_STATUS = "draft"
     NOTHING_HELD = { entries: [].freeze, disposition: ACTIVE }.freeze
 
-    # Named on its own so that changing what a discarded draft sends stays a
-    # one-row change.
+    # Named on its own, apart from the destroyed-draft row, so that changing
+    # what a discarded draft sends stays a one-row change.
     DISCARDED_DRAFT = ->(held:, lines:) { { entries: [], disposition: ACTIVE } }.freeze
 
     RELEASE_ALL = ->(held:, lines:) { { entries: [], disposition: ACTIVE } }
