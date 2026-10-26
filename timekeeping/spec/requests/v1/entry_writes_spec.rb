@@ -237,7 +237,7 @@ RSpec.describe "Entry write routes" do
     WebMock.stub_request(:get, %r{reference\.test/internal/v1/companies/#{company}/reference}).to_return(
       status: 200, headers: { "Content-Type" => "application/json" },
       body: JSON.generate(company_id: company, edit_days: 30, users: [{ id: employee, role: "employee" }],
-                          projects: [], missing_project_ids: [project])
+                          projects: [], missing_project_ids: [project], agents: [])
     )
 
     replay = send_write(:post, entries_path, employee_token, entry_body, key:)
@@ -353,5 +353,124 @@ RSpec.describe "Entry writes carrying a service token" do
       expect([response.status, response.parsed_body]).to eq([422, { "reason" => "credential_in_body" }])
     end
     expect(entry_write_counts).to eq(before_counts)
+  end
+end
+
+# The entry API must not commit an agent_id "without checking that the agent
+# exists and belongs to the entry's company and user (design rule S7)". Every
+# refusal answers 404 not_found and writes nothing.
+RSpec.describe "Entry write routes", "agent ownership" do
+  include_context "timekeeping entry writes"
+  include_context "timekeeping entry writes without transactional fixtures"
+
+  let(:agent_company) { timekeeping_arrange.company }
+  let(:agent_project) { timekeeping_arrange.project(company: agent_company) }
+  let(:agent_owner) { timekeeping_arrange.user(company: agent_company, role: "owner") }
+  let(:agent_employee) { timekeeping_arrange.user(company: agent_company, role: "employee") }
+  let(:agent_colleague) { timekeeping_arrange.user(company: agent_company, role: "employee") }
+  let(:colleague_agent) { timekeeping_arrange.agent(company: agent_company, user: agent_colleague) }
+  let(:agent_entries_path) { "/v1/companies/#{agent_company}/entries" }
+
+  def agent_entry_body(**fields)
+    { "project_id" => agent_project, "work_date" => "2026-03-02", "duration" => 45.0, "note" => "Review",
+      "source" => "manual", "source_metadata" => {} }.merge(fields.transform_keys(&:to_s))
+  end
+
+  def agent_write_headers(user)
+    { "Content-Type" => "application/json", "Authorization" => "Bearer #{timekeeping_arrange.token_for(user)}",
+      "Ownership-Generation" => timekeeping_arrange.current_generation.to_s, "Idempotency-Key" => SecureRandom.uuid }
+  end
+
+  def expect_agent_not_found
+    expect([response.status, response.parsed_body]).to eq([404, { "reason" => "not_found" }])
+  end
+
+  # The shared entry API contract examples, run against this provider by
+  # timekeeping/spec/contracts/entry_provider_spec.rb, own the foreign-versus-missing,
+  # colleague-agent and user-only-update refusals; the writer spec owns their
+  # row counts. These cases cover what those do not.
+
+  # The agent must belong to the entry's user, which is the user the body names, not the acting owner.
+  it "refuses an owner's create for an employee that carries the owner's own agent, and accepts the employee's agent" do
+    owner_agent = timekeeping_arrange.agent(company: agent_company, user: agent_owner)
+    employee_agent = timekeeping_arrange.agent(company: agent_company, user: agent_employee)
+    before = entry_write_counts
+
+    post agent_entries_path, params: JSON.generate(agent_entry_body(user_id: agent_employee, agent_id: owner_agent)),
+                             headers: agent_write_headers(agent_owner)
+    expect_agent_not_found
+    expect(entry_write_counts).to eq(before)
+
+    post agent_entries_path, params: JSON.generate(agent_entry_body(user_id: agent_employee, agent_id: employee_agent)),
+                             headers: agent_write_headers(agent_owner)
+    expect(response.status).to eq(201)
+    expect(response.parsed_body.values_at("user_id", "agent_id")).to eq([agent_employee, employee_agent])
+  end
+
+  # The body names no user_id, so the check must use the entry's stored user.
+  it "refuses an update that sets a colleague's agent while the stored user stays, and leaves the entry unchanged" do
+    entry_id = timekeeping_arrange.entry(company: agent_company, user: agent_employee, project: agent_project)
+    version_before = Entry.find(entry_id).version
+    before = entry_write_counts
+
+    patch "#{agent_entries_path}/#{entry_id}", params: JSON.generate("agent_id" => colleague_agent),
+                                               headers: agent_write_headers(agent_owner)
+
+    expect_agent_not_found
+    expect(entry_write_counts).to eq(before)
+    stored = Entry.find(entry_id)
+    expect([stored.agent_id, stored.user_id, stored.version]).to eq([nil, agent_employee, version_before])
+  end
+
+  it "refuses an update that sets another company's agent and leaves the entry untouched" do
+    entry_id = timekeeping_arrange.entry(company: agent_company, user: agent_owner, project: agent_project)
+    other_company = timekeeping_arrange.company
+    foreign_agent = timekeeping_arrange.agent(company: other_company,
+                                              user: timekeeping_arrange.user(company: other_company, role: "owner"))
+    before = entry_write_counts
+
+    patch "#{agent_entries_path}/#{entry_id}", params: JSON.generate("agent_id" => foreign_agent),
+                                               headers: agent_write_headers(agent_owner)
+
+    expect_agent_not_found
+    expect(Entry.find(entry_id).agent_id).to be_nil
+    expect(entry_write_counts).to eq(before)
+  end
+
+  # "The entry API now refuses a zero or negative agent_id": that shape refusal must stay a 400,
+  # answered before the ownership check, not become the new 404 for unknown agents.
+  it "still refuses a zero or negative agent_id with 400 and writes nothing" do
+    before = entry_write_counts
+
+    statuses = [0, -1, -3].map do |agent_id|
+      post agent_entries_path, params: JSON.generate(agent_entry_body(agent_id:)), headers: agent_write_headers(agent_employee)
+      response.status
+    end
+
+    expect(statuses).to eq([400, 400, 400])
+    expect(entry_write_counts).to eq(before)
+  end
+
+  # Writes that keep the agent/user pair valid, or clear the agent, must not
+  # be refused by the agent ownership check.
+  it "clears the agent with a null agent_id, and moves and deletes agent entries" do
+    other_project = timekeeping_arrange.project(company: agent_company)
+    owner_agent = timekeeping_arrange.agent(company: agent_company, user: agent_owner)
+    cleared, moved, deleted = Array.new(3) do
+      timekeeping_arrange.entry(company: agent_company, user: agent_owner, project: agent_project, agent_id: owner_agent)
+    end
+
+    patch "#{agent_entries_path}/#{cleared}", params: JSON.generate("agent_id" => nil), headers: agent_write_headers(agent_owner)
+    expect(response.status).to eq(200)
+    post "#{agent_entries_path}/bulk-move", params: JSON.generate("entry_ids" => [moved], "project_id" => other_project),
+                                            headers: agent_write_headers(agent_owner)
+    expect(response.status).to eq(200)
+    expect(response.parsed_body.fetch("results")).to eq([{ "entry_id" => moved, "result" => "moved" }])
+    delete "#{agent_entries_path}/#{deleted}", headers: agent_write_headers(agent_owner)
+    expect(response.status).to eq(200)
+
+    expect(Entry.find(cleared).agent_id).to be_nil
+    expect([Entry.find(moved).project_id, Entry.find(moved).agent_id]).to eq([other_project, owner_agent])
+    expect(Entry.find(deleted).discarded_at).not_to be_nil
   end
 end

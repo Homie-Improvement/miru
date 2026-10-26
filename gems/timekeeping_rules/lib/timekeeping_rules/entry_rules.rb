@@ -64,6 +64,18 @@ module TimekeepingRules
       [->(_request) { true }, :requested]
     ].map(&:freeze).freeze
 
+    # S7: whether an entry may carry an agent, in order. company_agents maps
+    # each agent id of the entry's company to its user id. An unknown agent
+    # and another user's agent answer alike, as the contract's company
+    # mismatch rule asks, so the answer never shows whether the agent exists
+    # elsewhere. Ids are compared without coercion, so "7" never matches 7.
+    AGENT_OWNER_TABLE = [
+      [->(request) { request[:agent_id].nil? }, :ok],
+      [->(request) { !request[:company_agents].key?(request[:agent_id]) }, :not_found],
+      [->(request) { request[:company_agents].fetch(request[:agent_id]) != request[:user_id] }, :not_found],
+      [->(_request) { true }, :ok]
+    ].map(&:freeze).freeze
+
     module_function
 
     # A5: :acting records the entry for the caller, :requested for the named
@@ -76,6 +88,14 @@ module TimekeepingRules
         privileged: privileged?(role)
       }
       TARGET_USER_TABLE.find { |condition, _outcome| condition.call(request) }.last
+    end
+
+    # S7: :ok when the entry has no agent, or its agent is one of the
+    # company's and belongs to user_id, the entry's user after the write;
+    # otherwise :not_found.
+    def agent_owner(agent_id:, user_id:, company_agents:)
+      request = { agent_id:, user_id:, company_agents: }
+      AGENT_OWNER_TABLE.find { |condition, _outcome| condition.call(request) }.last
     end
 
     # A1: :company when the caller sees every kept entry of the company,
