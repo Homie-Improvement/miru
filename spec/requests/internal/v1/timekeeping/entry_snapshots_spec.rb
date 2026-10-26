@@ -8,7 +8,6 @@ RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots credential table", typ
   # "A request with no credential, a wrong one or a user token gets 401 or 403 and writes nothing."
   # The monolith answers 401 to all of them, so each row pins 401 exactly: a regression to 403 fails here.
   it "answers exactly 401 to every non-service credential, owner user tokens included, writes neither the stored nor the new entry, then applies the same batch for the service token" do
-    contract = TimekeepingContract.load(:entry_snapshots)
     company = create(:company)
     project = create(:project, client: create(:client, company:), billable: false)
     # One user holds both user tokens and owns every entry in the batch, so the table covers a user
@@ -28,17 +27,10 @@ RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots credential table", typ
     expect(TimesheetEntry.unscoped.where(id: new_id)).not_to exist
 
     item = lambda do |id, version, position|
-      entry = contract.fetch("entry_fields").index_with(nil).merge(
-        "id" => id, "company_id" => company.id, "version" => version, "project_id" => project.id,
-        "user_id" => user.id, "work_date" => "2026-03-02", "duration" => 90.0, "note" => "v#{version}",
-        "bill_status" => "unbilled", "review_status" => "not_required", "locked" => false, "source" => "manual",
-        "source_metadata" => {}, "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z",
-        "updated_at" => "2026-03-02T09:00:00Z"
-      )
-      { "generation" => TimekeepingOwnership.current.generation, "outbox_position" => position, "entry" => entry }
+      entry = TimekeepingSnapshots.entry(id:, company_id: company.id, version:, project_id: project.id, user_id: user.id)
+      TimekeepingSnapshots.item(entry, generation: TimekeepingOwnership.current.generation, outbox_position: position)
     end
-    body = { "schema_version" => contract.fetch("schema_version"),
-             "snapshots" => [item.call(stored.id, 2, 1), item.call(new_id, 1, 2)] }.to_json
+    body = TimekeepingSnapshots.batch(item.call(stored.id, 2, 1), item.call(new_id, 1, 2)).to_json
     deliver = lambda do |credential|
       headers = { "CONTENT_TYPE" => "application/json", "Idempotency-Key" => SecureRandom.uuid }
       headers["Authorization"] = "Bearer #{credential}" if credential
@@ -70,7 +62,6 @@ RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots credential table", typ
 end
 
 RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots without a configured token", type: :request do
-  let(:snapshot_contract) { TimekeepingContract.load(:entry_snapshots) }
   let(:company) { create(:company) }
   let(:project) { create(:project, client: create(:client, company:), billable: false) }
   let(:user) { create(:user) }
@@ -79,16 +70,11 @@ RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots without a configured t
   # an empty or absent credential must never match it.
   it "refuses every snapshot delivery while TIMEKEEPING_SERVICE_TOKEN is unset or blank and inserts no row" do
     entry_id = 91_001
-    entry = snapshot_contract.fetch("entry_fields").index_with(nil).merge(
-      "id" => entry_id, "company_id" => company.id, "version" => 1, "project_id" => project.id,
-      "user_id" => user.id, "work_date" => "2026-03-02", "duration" => 90.0, "note" => "v1",
-      "bill_status" => "unbilled", "review_status" => "not_required", "locked" => false, "source" => "manual",
-      "source_metadata" => {}, "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z",
-      "updated_at" => "2026-03-02T09:00:00Z"
-    )
-    body = { "schema_version" => snapshot_contract.fetch("schema_version"),
-             "snapshots" => [{ "generation" => TimekeepingOwnership.current.generation, "outbox_position" => 1,
-                               "entry" => entry }] }.to_json
+    entry = TimekeepingSnapshots.entry(id: entry_id, company_id: company.id, version: 1, project_id: project.id,
+                                       user_id: user.id)
+    body = TimekeepingSnapshots.batch(
+      TimekeepingSnapshots.item(entry, generation: TimekeepingOwnership.current.generation)
+    ).to_json
 
     [nil, ""].each do |configured|
       with_timekeeping_env("TIMEKEEPING_SERVICE_TOKEN", configured) do
@@ -107,7 +93,6 @@ RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots without a configured t
 end
 
 RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots project tenancy", type: :request do
-  let(:snapshot_contract) { TimekeepingContract.load(:entry_snapshots) }
   let(:company_a) { create(:company) }
   let(:company_b) { create(:company) }
   let(:project_a) { create(:project, client: create(:client, company: company_a), billable: false) }
@@ -115,14 +100,9 @@ RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots project tenancy", type
   let(:user) { create(:user) }
 
   def tenancy_spec_item(entry_id:, project:, version: 1)
-    entry = snapshot_contract.fetch("entry_fields").index_with(nil).merge(
-      "id" => entry_id, "company_id" => company_a.id, "version" => version, "project_id" => project.id,
-      "user_id" => user.id, "work_date" => "2026-03-02", "duration" => 90.0, "note" => "private note of A",
-      "bill_status" => "unbilled", "review_status" => "not_required", "locked" => false, "source" => "manual",
-      "source_metadata" => {}, "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z",
-      "updated_at" => "2026-03-02T09:00:00Z"
-    )
-    { "generation" => TimekeepingOwnership.current.generation, "outbox_position" => entry_id, "entry" => entry }
+    entry = TimekeepingSnapshots.entry(id: entry_id, company_id: company_a.id, version:, project_id: project.id,
+                                       user_id: user.id, note: "private note of A")
+    TimekeepingSnapshots.item(entry, generation: TimekeepingOwnership.current.generation, outbox_position: entry_id)
   end
 
   # Company#timesheet_entries joins through clients and projects, so an entry of company A filed under
@@ -130,7 +110,7 @@ RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots project tenancy", type
   it "refuses a batch whose snapshot names another company's project and writes nothing from it" do
     valid = tenancy_spec_item(entry_id: 92_001, project: project_a)
     foreign = tenancy_spec_item(entry_id: 92_002, project: project_b)
-    body = { "schema_version" => snapshot_contract.fetch("schema_version"), "snapshots" => [valid, foreign] }.to_json
+    body = TimekeepingSnapshots.batch(valid, foreign).to_json
 
     with_timekeeping_service_token do |token|
       post "/internal/v1/timekeeping/entry-snapshots", params: body,
@@ -146,7 +126,6 @@ RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots project tenancy", type
 end
 
 RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots company mismatch", type: :request do
-  let(:snapshot_contract) { TimekeepingContract.load(:entry_snapshots) }
   let(:company_a) { create(:company) }
   let(:company_b) { create(:company) }
   let(:project_a) { create(:project, client: create(:client, company: company_a), billable: false) }
@@ -164,16 +143,11 @@ RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots company mismatch", typ
     fields_before = stored.reload.attributes
     expect(fields_before).to include("version" => 1, "company_id" => company_a.id, "note" => "kept in A")
 
-    entry = snapshot_contract.fetch("entry_fields").index_with(nil).merge(
-      "id" => stored.id, "company_id" => company_b.id, "version" => 5, "project_id" => project_b.id,
-      "user_id" => user.id, "work_date" => "2026-03-02", "duration" => 90.0, "note" => "moved to B",
-      "bill_status" => "unbilled", "review_status" => "not_required", "locked" => false, "source" => "manual",
-      "source_metadata" => {}, "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z",
-      "updated_at" => "2026-03-02T09:00:00Z"
-    )
-    body = { "schema_version" => snapshot_contract.fetch("schema_version"),
-             "snapshots" => [{ "generation" => TimekeepingOwnership.current.generation, "outbox_position" => 5,
-                               "entry" => entry }] }.to_json
+    entry = TimekeepingSnapshots.entry(id: stored.id, company_id: company_b.id, version: 5, project_id: project_b.id,
+                                       user_id: user.id, note: "moved to B")
+    body = TimekeepingSnapshots.batch(
+      TimekeepingSnapshots.item(entry, generation: TimekeepingOwnership.current.generation)
+    ).to_json
 
     with_timekeeping_service_token do |token|
       post "/internal/v1/timekeeping/entry-snapshots", params: body,
@@ -190,22 +164,14 @@ RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots company mismatch", typ
 end
 
 RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots malformed input", type: :request do
-  let(:snapshot_contract) { TimekeepingContract.load(:entry_snapshots) }
   let(:company) { create(:company) }
   let(:project) { create(:project, client: create(:client, company:), billable: false) }
   let(:user) { create(:user) }
 
   def malformed_spec_body(entry_id, **overrides)
-    entry = snapshot_contract.fetch("entry_fields").index_with(nil).merge(
-      "id" => entry_id, "company_id" => company.id, "version" => 1, "project_id" => project.id,
-      "user_id" => user.id, "work_date" => "2026-03-02", "duration" => 90.0, "note" => "v1",
-      "bill_status" => "unbilled", "review_status" => "not_required", "locked" => false, "source" => "manual",
-      "source_metadata" => {}, "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z",
-      "updated_at" => "2026-03-02T09:00:00Z"
-    ).merge(overrides.transform_keys(&:to_s))
-    { "schema_version" => snapshot_contract.fetch("schema_version"),
-      "snapshots" => [{ "generation" => TimekeepingOwnership.current.generation, "outbox_position" => 1,
-                        "entry" => entry }] }.to_json
+    entry = TimekeepingSnapshots.entry(id: entry_id, company_id: company.id, version: 1, project_id: project.id,
+                                       user_id: user.id, **overrides)
+    TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation: TimekeepingOwnership.current.generation)).to_json
   end
 
   # Only the contract's entry_fields may be written; the endpoint bypasses model callbacks, so an extra
@@ -238,15 +204,9 @@ RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots idempotency", type: :r
     create(:employment, company:, user:)
     entry_id = 90_201
     batch = lambda do |version|
-      entry = TimekeepingContract.load(:entry_snapshots).fetch("entry_fields").index_with(nil).merge(
-        "id" => entry_id, "company_id" => company.id, "version" => version, "project_id" => project.id,
-        "user_id" => user.id, "work_date" => "2026-03-02", "duration" => 90.0, "note" => "v#{version}",
-        "bill_status" => "unbilled", "review_status" => "not_required", "locked" => false, "source" => "manual",
-        "source_metadata" => {}, "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z",
-        "updated_at" => "2026-03-02T09:00:00Z"
-      )
-      { "schema_version" => 1,
-        "snapshots" => [{ "generation" => TimekeepingOwnership.current.generation, "outbox_position" => version, "entry" => entry }] }
+      entry = TimekeepingSnapshots.entry(id: entry_id, company_id: company.id, version:, project_id: project.id,
+                                         user_id: user.id)
+      TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation: TimekeepingOwnership.current.generation))
     end
     key = SecureRandom.uuid
 
@@ -275,18 +235,12 @@ RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots handoff window", type:
     project = create(:project, client: create(:client, company:))
     user = create(:user)
     create(:employment, company:, user:)
-    contract = TimekeepingContract.load(:entry_snapshots)
     entry_id = 90_101
 
     item = lambda do |version:, generation:, outbox_position:|
-      entry = contract.fetch("entry_fields").index_with(nil).merge(
-        "id" => entry_id, "company_id" => company.id, "version" => version, "project_id" => project.id,
-        "user_id" => user.id, "work_date" => "2026-03-02", "duration" => 90.0, "note" => "v#{version}",
-        "bill_status" => "unbilled", "review_status" => "not_required", "locked" => false, "source" => "manual",
-        "source_metadata" => {}, "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z",
-        "updated_at" => "2026-03-02T09:00:00Z"
-      )
-      { "generation" => generation, "outbox_position" => outbox_position, "entry" => entry }
+      entry = TimekeepingSnapshots.entry(id: entry_id, company_id: company.id, version:, project_id: project.id,
+                                         user_id: user.id)
+      TimekeepingSnapshots.item(entry, generation:, outbox_position:)
     end
 
     TimekeepingOwnership.current.update!(generation: 2, handoff_step: "freeze", final_outbox_position: 10)
@@ -294,7 +248,7 @@ RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots handoff window", type:
     with_timekeeping_service_token do |token|
       deliver = lambda do |snapshot|
         post "/internal/v1/timekeeping/entry-snapshots",
-          params: { "schema_version" => contract.fetch("schema_version"), "snapshots" => [snapshot] }.to_json,
+          params: TimekeepingSnapshots.batch(snapshot).to_json,
           headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json",
                      "Idempotency-Key" => SecureRandom.uuid }
       end
