@@ -1082,6 +1082,18 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_27_120000) do
     t.index ["resource_type", "resource_id"], name: "index_roles_on_resource"
   end
 
+  create_table "service_idempotency_receipts", force: :cascade do |t|
+    t.string "actor_name", null: false
+    t.text "body", null: false
+    t.bigint "company_id", null: false
+    t.datetime "created_at", null: false
+    t.string "fingerprint", null: false
+    t.string "key", null: false
+    t.string "operation", null: false
+    t.integer "status", null: false
+    t.index ["company_id", "actor_name", "operation", "key"], name: "index_service_idempotency_receipts_on_receipt_key", unique: true
+  end
+
   create_table "solid_cable_messages", force: :cascade do |t|
     t.binary "channel", null: false
     t.bigint "channel_hash", null: false
