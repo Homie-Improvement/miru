@@ -47,6 +47,11 @@ module Timekeeping
       # microseconds, so a finer time read back from it no longer matches.
       TIME_FORMAT = "%Y-%m-%dT%H:%M:%S.%9NZ"
 
+      # A jsonb cell holding the JSON value null. Ruby nil stands for SQL NULL,
+      # so a nullable jsonb column such as entry_audits.before needs a second
+      # value to keep the two apart.
+      JSON_NULL = Object.new.tap { |value| def value.inspect = "Timekeeping::Handoff::Checkpoint::JSON_NULL" }.freeze
+
       attr_reader :rows, :digest
 
       class << self
@@ -61,7 +66,10 @@ module Timekeeping
         # is a mismatch too, so rows that vanished are reported.
         #
         # Returns [{ table:, company_id:, expected:, actual: }], empty when all match.
+        # Raises ShapeError for rows outside the canonical shape, since the
+        # checksum reads only canonical columns and would not see the rest.
         def verify(checkpoint)
+          check_shape!(checkpoint.rows)
           actual_digest = digest_of(checkpoint.rows)
 
           (TABLES.keys | checkpoint.digest.keys).flat_map do |table|
@@ -144,11 +152,13 @@ module Timekeeping
             when true, false then ["bool", value]
             when Integer then ["int", value.to_s]
             when Float then ["float", [value].pack("G").unpack1("H*")]
+            when BigDecimal then ["decimal", value.to_s]
             when String then ["str", value]
             when ActiveSupport::TimeWithZone, Time, DateTime then ["time", value.to_time.getutc.strftime(TIME_FORMAT)]
             when Date then ["date", value.iso8601]
-            when Array then ["array", value.map { |item| encode_value(item) }]
+            when Array then ["array", value.map { |item| encode_json_value(item) }]
             when Hash then ["hash", encode_hash(value)]
+            when JSON_NULL then ["json_null"]
             else raise ShapeError, "unsupported value type #{value.class}"
             end
           end
@@ -160,16 +170,14 @@ module Timekeeping
             hash.sort_by(&:first).map { |key, item| [key, encode_json_value(item)] }
           end
 
-          # A JSON number is a decimal, however it was read: a Float and a
-          # BigDecimal of the same decimal value encode the same, so a store
-          # that reads jsonb decimals exactly matches rows built from Floats.
+          # Inside a JSON object or array a number is a decimal, however it was
+          # read: a Float and a BigDecimal of the same decimal value encode the
+          # same, so a store that reads jsonb decimals exactly matches rows
+          # built from Floats. Only bigint[] and jsonb hold arrays, and bigint[]
+          # holds no Floats. A Float column value, such as duration, keeps its
+          # bit encoding in encode_value.
           def encode_json_value(value)
-            case value
-            when Float then ["decimal", BigDecimal(value.to_s).to_s]
-            when BigDecimal then ["decimal", value.to_s]
-            when Array then ["array", value.map { |item| encode_json_value(item) }]
-            else encode_value(value)
-            end
+            value.is_a?(Float) ? ["decimal", BigDecimal(value.to_s).to_s] : encode_value(value)
           end
 
           def decode_row(table, encoded_row)
@@ -182,6 +190,7 @@ module Timekeeping
             tag, payload = tagged
             case tag
             when "nil" then nil
+            when "json_null" then JSON_NULL
             when "bool" then payload
             when "int" then Integer(payload, 10)
             when "float" then [payload].pack("H*").unpack1("G")
@@ -204,8 +213,10 @@ module Timekeeping
           end
       end
 
+      # Rows are copied and frozen, so a field added after construction
+      # cannot slip past the shape checks into a load or the transport form.
       def initialize(rows:, digest:)
-        @rows = rows
+        @rows = rows.to_h { |table, table_rows| [table, table_rows.map { |row| row.dup.freeze }.freeze] }.freeze
         @digest = digest
       end
 

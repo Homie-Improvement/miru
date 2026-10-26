@@ -59,30 +59,42 @@ RSpec.describe "Timekeeping prepared tables against Timekeeping's schema" do
   # "Add a monolith migration that reshapes the prepared `entry_audits` and `idempotency_records` tables to the
   # exact columns, types and nullability of Timekeeping's `audit_events` and `idempotency_receipts`."
   it "matches the prepared audit and receipt tables and their canonical columns to Timekeeping's audit_events and idempotency_receipts" do
-    parse_schema = lambda do |path|
+    # Each column as [type, NOT NULL, precision, limit], read from Timekeeping's
+    # schema file. Rails leaves the default datetime precision of 6 out of the
+    # file, so it is filled in here; a table keeps an implicit bigint id unless
+    # it says id: false.
+    parse_timekeeping_schema = lambda do
       tables = {}
       current = nil
-      File.readlines(Rails.root.join(path)).each do |line|
-        if (start = line.match(/^\s*create_table "(\w+)"/))
+      File.readlines(Rails.root.join("timekeeping/db/schema.rb")).each do |line|
+        if (start = line.match(/^\s*create_table "(\w+)"(.*)$/))
           current = tables[start[1]] = {}
+          current["id"] = ["integer", true, nil, 8] unless start[2].include?("id: false")
         elsif current && (column = line.match(/^\s*t\.(\w+) "(\w+)"(.*)$/))
-          current[column[2]] = [column[1], column[3].include?("null: false")]
+          type, options = column[1], column[3]
+          precision = options[/precision: (\d+)/, 1]&.to_i || (type == "datetime" ? 6 : nil)
+          limit = options[/limit: (\d+)/, 1]&.to_i || { "bigint" => 8, "integer" => 4 }[type]
+          current[column[2]] = [type == "bigint" ? "integer" : type, options.include?("null: false"), precision, limit]
         elsif line.match?(/^\s*end\s*$/)
           current = nil
         end
       end
       tables
     end
-    monolith = parse_schema.call("db/schema.rb")
-    timekeeping = parse_schema.call("timekeeping/db/schema.rb")
+    live_columns = lambda do |table|
+      ActiveRecord::Base.connection.columns(table).to_h do |column|
+        [column.name, [column.type.to_s, !column.null, column.precision, column.limit]]
+      end
+    end
+    timekeeping = parse_timekeeping_schema.call
     pairs = { "entry_audits" => "audit_events", "idempotency_records" => "idempotency_receipts",
               "entries" => "entries", "reservations" => "reservations" }
 
     pairs.each do |prepared, counterpart|
-      expect([prepared, monolith.fetch(prepared)]).to eq([prepared, timekeeping.fetch(counterpart)])
+      expect([prepared, live_columns.call(prepared)]).to eq([prepared, timekeeping.fetch(counterpart)])
     end
     %w[entry_audits idempotency_records].each do |prepared|
-      canonical = Timekeeping::Handoff::Checkpoint::TABLES.fetch(prepared) - ["id"]
+      canonical = Timekeeping::Handoff::Checkpoint::TABLES.fetch(prepared)
       expect([prepared, canonical]).to match([prepared, match_array(timekeeping.fetch(pairs.fetch(prepared)).keys)])
     end
   end

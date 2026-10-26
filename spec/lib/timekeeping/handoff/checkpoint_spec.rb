@@ -144,4 +144,49 @@ RSpec.describe Timekeeping::Handoff::Checkpoint, "row shapes and encoding" do
     expect([restored_duration].pack("G")).to eq([entry.fetch("duration")].pack("G"))
     expect(restored.digest).to eq(checkpoint.digest)
   end
+
+  it "reports every mismatch, including a count changed while rows and checksum stay intact" do
+    audit = {
+      "id" => 5, "company_id" => 2, "entry_id" => 2, "actor_type" => "User", "actor_id" => 7, "action" => "create",
+      "before" => nil, "after" => { "note" => "a" }, "entry_created_at" => Time.utc(2026, 1, 5, 9),
+      "created_at" => Time.utc(2026, 1, 5, 9)
+    }
+    checkpoint = described_class.build(tables: shape_case_tables(
+      entries: [shape_case_entry(id: 1, company_id: 1), shape_case_entry(id: 2, company_id: 2)],
+      entry_audits: [audit]
+    ))
+    digest = checkpoint.digest.to_h do |table, companies|
+      [table, companies.to_h { |company_id, entry| [company_id, entry.dup] }]
+    end
+    digest["entries"][1][:count] += 1
+    tampered = described_class.new(
+      rows: checkpoint.rows.merge("entry_audits" => [audit.merge("action" => "update")]),
+      digest: digest
+    )
+
+    mismatches = described_class.verify(tampered)
+
+    expect(mismatches.map { |mismatch| [mismatch[:table], mismatch[:company_id]] })
+      .to eq([["entries", 1], ["entry_audits", 2]])
+  end
+
+  it "refuses a field added to a row after the checkpoint was built" do
+    tables = shape_case_tables(entries: [shape_case_entry])
+    checkpoint = described_class.build(tables:)
+
+    tables["entries"].first["unmapped_field"] = "added later"
+    expect { checkpoint.rows.fetch("entries").first["unmapped_field"] = "added later" }.to raise_error(FrozenError)
+    expect(described_class.verify(checkpoint)).to eq([])
+    expect(checkpoint.to_json).not_to include("unmapped_field")
+  end
+
+  it "refuses rows outside the canonical shape when verifying a checkpoint built without build" do
+    original = described_class.build(tables: shape_case_tables(entries: [shape_case_entry]))
+    widened = described_class.new(
+      rows: shape_case_tables(entries: [shape_case_entry.merge("unmapped_field" => "x")]),
+      digest: original.digest
+    )
+
+    expect { described_class.verify(widened) }.to raise_error(described_class::ShapeError, /entries.*unmapped_field/)
+  end
 end

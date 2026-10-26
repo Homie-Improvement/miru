@@ -118,8 +118,12 @@ module Timekeeping
 
         # Active Record's jsonb cast turns every decimal into a Float, which
         # rounds a number finer than a double. BigDecimal keeps it as stored.
+        # The cast also reads JSON null as nil, the same as SQL NULL.
         def parse_jsonb(text)
-          text && JSON.parse(text, decimal_class: BigDecimal)
+          return if text.nil?
+
+          value = JSON.parse(text, decimal_class: BigDecimal)
+          value.nil? ? Checkpoint::JSON_NULL : value
         end
 
         # JSON text with each BigDecimal written as a bare number. The default
@@ -129,6 +133,7 @@ module Timekeeping
           when Hash then "{#{value.map { |key, item| "#{JSON.generate(key)}:#{jsonb_text(item)}" }.join(',')}}"
           when Array then "[#{value.map { |item| jsonb_text(item) }.join(',')}]"
           when BigDecimal then value.to_s("F")
+          when Checkpoint::JSON_NULL then "null"
           else JSON.generate(value)
           end
         end
