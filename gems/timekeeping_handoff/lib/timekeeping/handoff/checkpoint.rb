@@ -34,7 +34,7 @@ module Timekeeping
           company_id entry_id invoice_id state disposition operation_id created_at invoice_operation_id
         ],
         "invoice_operations" => %w[
-          id company_id invoice_id operation_id state desired_entry_ids disposition generation
+          id company_id invoice_id operation_id actor_name state desired_entry_ids disposition generation
           created_at finished_at
         ],
         "entry_audits" => %w[
