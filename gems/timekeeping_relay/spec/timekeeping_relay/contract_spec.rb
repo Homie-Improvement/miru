@@ -20,22 +20,13 @@ RSpec.describe "TimekeepingRelay against contracts/timekeeping/entry_snapshots.y
   end
 
   it "builds batches with exactly the contract's batch and item keys" do
-    endpoint = Class.new do
-      attr_reader :batches
-
-      def initialize
-        @batches = []
-      end
-
-      def deliver(batch, idempotency_key:)
-        @batches << batch
-        TimekeepingRelay::Response.new(status: 200, body: { "applied" => batch["snapshots"].size, "ignored" => 0 })
-      end
-    end.new
+    endpoint = TimekeepingRelaySpec::FakeRelayEndpoint.new(
+      answers: [TimekeepingRelay::Response.new(status: 200, body: { "applied" => 1, "ignored" => 0 })]
+    )
     source = TimekeepingRelaySpec::MemoryOutboxSource.new([TimekeepingRelaySpec::MemoryOutboxSource.row(1)])
 
     TimekeepingRelay::Relay.new(source:, endpoint:).deliver(limit: 10)
-    batch = endpoint.batches.fetch(0)
+    batch = endpoint.posts.fetch(0)[:batch]
 
     expect(batch.keys).to match_array(contract.fetch("batch_fields"))
     expect(batch.fetch("snapshots").first.keys).to match_array(contract.fetch("item_fields"))
