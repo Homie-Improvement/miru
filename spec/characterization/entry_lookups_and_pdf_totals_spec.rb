@@ -6,7 +6,7 @@ require "rails_helper"
 # - the line-item unlock lookup (`TimesheetEntry.where(id:)` over
 #   `associated_timesheet_entry_ids`, no company filter), read while the line still exists,
 #   and the ids the new-line-items picker hides as already allocated (`filtered_ids`, built
-#   from every company's kept invoices) give the same result for one company. This is not
+#   from the client's company's kept invoices) give the same result for one company. This is not
 #   the set a destroy unlocks: on a freshly loaded aggregate line the join rows are
 #   destroyed before `unlock_timesheet_entries` runs, so destroy unlocks only the direct
 #   entry (see the L4 examples in invoice_entry_locking_spec.rb);

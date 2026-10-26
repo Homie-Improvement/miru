@@ -26,21 +26,22 @@ module GenerateInvoice
       # Sending team members list for filter dropdown options
       def team_members_of_projects
         @team_members_of_projects ||= User.where(
-          id: TimesheetEntry.kept.where(project_id: @projects).pluck(:user_id)
+          id: TimesheetEntry.kept.where(project_id: @projects, company_id: client.company_id).pluck(:user_id)
         )
       end
 
-      # merging selected_entries from params with ids already present in other invoice line items
+      # merging selected_entries from params with ids already present in this company's invoice line items
       def filtered_ids
-        discarded_invoice_ids = Invoice.kept.pluck(:id)
+        company_kept_invoice_ids = Invoice.kept.where(company_id: client.company_id).select(:id)
+        company_unbilled_entries = { company_id: client.company_id, bill_status: "unbilled", discarded_at: nil }
         direct_entry_ids = InvoiceLineItem.joins(:timesheet_entry)
-          .where(invoice_id: discarded_invoice_ids)
-          .where(timesheet_entries: { bill_status: "unbilled", discarded_at: nil })
+          .where(invoice_id: company_kept_invoice_ids)
+          .where(timesheet_entries: company_unbilled_entries)
           .pluck(:timesheet_entry_id)
         linked_entry_ids = InvoiceLineItemTimeEntry
           .joins(:timesheet_entry, :invoice_line_item)
-          .where(invoice_line_items: { invoice_id: discarded_invoice_ids })
-          .where(timesheet_entries: { bill_status: "unbilled", discarded_at: nil })
+          .where(invoice_line_items: { invoice_id: company_kept_invoice_ids })
+          .where(timesheet_entries: company_unbilled_entries)
           .pluck(:timesheet_entry_id)
 
         @filtered_ids ||= params[:selected_entries].to_a | direct_entry_ids | linked_entry_ids
@@ -53,6 +54,7 @@ module GenerateInvoice
 
         {
           project_id: allowed_project_ids,
+          company_id: client.company_id,
           id: { not: filtered_ids },
           bill_status: "unbilled",
           discarded_at: nil
