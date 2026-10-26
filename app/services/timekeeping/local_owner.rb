@@ -29,23 +29,34 @@ module Timekeeping
   # 7. Write the entries with version + 1, one audit row per change, one
   #    outbox row per change under the outbox lock, and the receipt last.
   #
+  # The reservation routes (prepare, commit, abort) and the service commands
+  # (mark_billed, detach_entries) admit only service actors. LocalOwner.call
+  # decides their access with ServiceAccess and hands an allowed call to
+  # ReservationOperations or ServiceCommands, which take their own steps.
+  #
   # A refusal at any step writes nothing. checkpoint is called with each name
   # in STEPS as that step finishes, so a spec can fail the transaction at a
   # known point; an error it raises is never rescued here.
   class LocalOwner
+    # The entry writes' steps, then those only the reservation and service
+    # command writers take.
     STEPS = %i[
       receipt_key_locked generation_checked request_checked receipt_checked project_checked
       rows_locked rules_checked entry_written audit_written outbox_written receipt_written
+      operation_key_locked operation_checked decision_made reservations_written
     ].freeze
 
     ENTRY_API = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/entry_api.yml")).freeze
     IDEMPOTENCY = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/idempotency.yml")).freeze
+    RESERVATIONS = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/reservations.yml")).freeze
 
     # Every reason this owner answers with and its status: the contracts'
     # errors, plus this owner's own answers to a request without a key and to
-    # a body value the entries table or the projection could not take.
-    STATUS = [ENTRY_API, IDEMPOTENCY].flat_map { |contract| contract.fetch("errors").values }
-      .to_h { |error| [error.dig("body", "reason").to_sym, error.fetch("status")] }
+    # a body value the entries table or the projection could not take. An
+    # error whose body the owner builds itself, such as conflict, names its
+    # reason beside the status instead of in a fixed body.
+    STATUS = [ENTRY_API, IDEMPOTENCY, RESERVATIONS].flat_map { |contract| contract.fetch("errors").values }
+      .to_h { |error| [(error.dig("body", "reason") || error.fetch("reason")).to_sym, error.fetch("status")] }
       .merge(idempotency_key_required: 422, invalid_request: 400)
       .freeze
 
@@ -110,8 +121,22 @@ module Timekeeping
       self.table_name = "entry_audits"
     end
 
+    # The reservation routes; every other route ServiceAccess knows is a
+    # service command.
+    RESERVATION_ROUTES = %i[prepare commit abort].freeze
+
+    # :reek:LongParameterList
     def self.call(operation:, company_id:, generation:, actor:, params:, checkpoint: ->(_step) { })
-      new(operation:, company_id:, generation:, actor:, params:, checkpoint:).call
+      route = operation.to_sym
+      return new(operation:, company_id:, generation:, actor:, params:, checkpoint:).call unless ServiceAccess.routes.include?(route)
+
+      # Access is decided on the actor alone, before any lock or read, so a
+      # refused caller never sees a stored answer and nothing is written.
+      access = ServiceAccess.decide(actor:, company_id:, route:)
+      return Outcome.refusal(access) unless access == :allowed
+
+      writer = RESERVATION_ROUTES.include?(route) ? ReservationOperations : ServiceCommands
+      writer.call(route:, company_id:, generation:, actor:, params:, checkpoint:)
     end
 
     # :reek:LongParameterList
