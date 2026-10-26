@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_05_01_000000) do
+ActiveRecord::Schema[8.1].define(version: 2026_06_01_000000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -23,13 +23,15 @@ ActiveRecord::Schema[8.1].define(version: 2026_05_01_000000) do
     t.bigint "company_id", null: false
     t.bigint "entry_id", null: false
     t.string "actor_type", null: false
-    t.bigint "actor_id", null: false
+    t.bigint "actor_id"
     t.string "action", null: false
     t.jsonb "before"
     t.jsonb "after", null: false
     t.datetime "entry_created_at", null: false
     t.datetime "created_at", null: false
+    t.string "actor_name"
     t.index ["company_id", "entry_id"], name: "index_audit_events_on_company_id_and_entry_id"
+    t.check_constraint "actor_type::text = 'service'::text AND actor_name IS NOT NULL OR actor_type::text <> 'service'::text AND actor_id IS NOT NULL", name: "audit_events_actor_check"
   end
 
   create_table "entries", force: :cascade do |t|
@@ -71,6 +73,24 @@ ActiveRecord::Schema[8.1].define(version: 2026_05_01_000000) do
     t.index ["company_id", "actor_type", "actor_id", "operation", "key"], name: "index_idempotency_receipts_on_receipt_key", unique: true
   end
 
+  create_table "invoice_operations", force: :cascade do |t|
+    t.bigint "company_id", null: false
+    t.bigint "invoice_id", null: false
+    t.uuid "operation_id", null: false
+    t.string "actor_name", null: false
+    t.string "state", null: false
+    t.bigint "desired_entry_ids", default: [], null: false, array: true
+    t.string "disposition", null: false
+    t.bigint "generation", null: false
+    t.datetime "created_at", null: false
+    t.datetime "finished_at"
+    t.index ["company_id", "actor_name", "operation_id"], name: "index_invoice_operations_on_operation_key", unique: true
+    t.index ["company_id", "id", "operation_id"], name: "index_invoice_operations_on_owner_key", unique: true
+    t.index ["company_id", "invoice_id"], name: "index_invoice_operations_one_prepared_per_invoice", unique: true, where: "((state)::text = 'prepared'::text)"
+    t.check_constraint "disposition::text = ANY (ARRAY['active'::character varying, 'retained'::character varying]::text[])", name: "invoice_operations_disposition_check"
+    t.check_constraint "state::text = ANY (ARRAY['prepared'::character varying, 'committed'::character varying, 'aborted'::character varying]::text[])", name: "invoice_operations_state_check"
+  end
+
   create_table "outbox_snapshots", primary_key: "outbox_position", force: :cascade do |t|
     t.bigint "id", null: false
     t.bigint "project_id", null: false
@@ -109,11 +129,25 @@ ActiveRecord::Schema[8.1].define(version: 2026_05_01_000000) do
     t.string "disposition", null: false
     t.uuid "operation_id", null: false
     t.datetime "created_at", null: false
+    t.bigint "invoice_operation_id"
     t.index ["company_id", "entry_id"], name: "index_reservations_on_company_id_and_entry_id"
     t.index ["company_id", "entry_id"], name: "index_reservations_one_committed_per_entry", unique: true, where: "((state)::text = 'committed'::text)"
     t.index ["company_id", "entry_id"], name: "index_reservations_one_provisional_per_entry", unique: true, where: "((state)::text = 'provisional'::text)"
+    t.index ["company_id", "invoice_operation_id"], name: "index_reservations_on_company_id_and_invoice_operation_id"
     t.check_constraint "disposition::text = ANY (ARRAY['active'::character varying, 'retained'::character varying]::text[])", name: "reservations_disposition_check"
     t.check_constraint "state::text = ANY (ARRAY['provisional'::character varying, 'committed'::character varying]::text[])", name: "reservations_state_check"
+  end
+
+  create_table "service_idempotency_receipts", force: :cascade do |t|
+    t.bigint "company_id", null: false
+    t.string "actor_name", null: false
+    t.string "operation", null: false
+    t.string "key", null: false
+    t.string "fingerprint", null: false
+    t.integer "status", null: false
+    t.text "body", null: false
+    t.datetime "created_at", null: false
+    t.index ["company_id", "actor_name", "operation", "key"], name: "index_service_idempotency_receipts_on_receipt_key", unique: true
   end
 
   create_table "solid_queue_blocked_executions", force: :cascade do |t|
@@ -258,6 +292,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_05_01_000000) do
   end
 
   add_foreign_key "reservations", "entries", column: ["company_id", "entry_id"], primary_key: ["company_id", "id"]
+  add_foreign_key "reservations", "invoice_operations", column: ["company_id", "invoice_operation_id", "operation_id"], primary_key: ["company_id", "id", "operation_id"], name: "fk_reservations_owning_operation"
   add_foreign_key "solid_queue_blocked_executions", "solid_queue_jobs", column: "job_id", on_delete: :cascade
   add_foreign_key "solid_queue_claimed_executions", "solid_queue_jobs", column: "job_id", on_delete: :cascade
   add_foreign_key "solid_queue_failed_executions", "solid_queue_jobs", column: "job_id", on_delete: :cascade

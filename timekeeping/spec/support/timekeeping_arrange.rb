@@ -51,8 +51,22 @@ class TimekeepingProviderArrange
                  exp: now + TOKEN_LIFETIME.to_i, jti: SecureRandom.uuid }, @signing_key, "RS256")
   end
 
-  # A held credential: the provider must refuse a body that carries it.
+  # A service caller's credential. For a company it is a signed service token
+  # bound to that company, listing the operations the examples name by route
+  # (prepare, mark_billed, ...) as Timekeeping::ReservationAccess spells them.
+  # Without a company it is a held credential. Either way the provider must
+  # refuse a body that carries it.
   def service_identity(company:, name:, operations:)
+    return held_credential(name) if company.nil?
+
+    now = Time.now.to_i
+    granted = operations.map { |operation| Timekeeping::ReservationAccess::ROUTE_OPERATIONS.fetch(operation.to_sym, operation) }
+    JWT.encode({ typ: Timekeeping::ServiceTokenVerifier::TYPE, sub: name, company_id: company, operations: granted,
+                 iat: now, exp: now + TOKEN_LIFETIME.to_i, jti: SecureRandom.uuid },
+               @signing_key, Timekeeping::ServiceTokenVerifier::ALGORITHM)
+  end
+
+  def held_credential(name)
     credential = "#{name}-#{SecureRandom.hex(24)}"
     @service_credentials << credential
     ENV[Timekeeping::Environment::SERVICE_CREDENTIALS] = @service_credentials.join(",")
@@ -77,6 +91,23 @@ class TimekeepingProviderArrange
     Reservation.create!(company_id: company, entry_id:, invoice_id:, state:, disposition:,
                         operation_id: SecureRandom.uuid, created_at: Time.current)
     entry_id
+  end
+
+  # The readers below answer from the database, so the shared examples see
+  # exactly what the provider stored. locked comes from the same reservation
+  # check the entry API uses.
+  def entry_locked(entry_id)
+    stored_entry(entry_id).fetch("locked")
+  end
+
+  def stored_entry(entry_id)
+    Timekeeping::EntryPresenter.call(Entry.select("entries.*", Timekeeping::EntriesQuery::RESERVED).find(entry_id))
+  end
+
+  def reservations_for(entry_id)
+    Reservation.where(entry_id:).order(:created_at, :invoice_id).pluck(:invoice_id, :state).map do |invoice_id, state|
+      { "invoice_id" => invoice_id, "state" => state }
+    end
   end
 
   # Admits writes at the new generation only. The generation is global, so
