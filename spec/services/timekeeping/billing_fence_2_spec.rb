@@ -27,6 +27,6 @@ RSpec.describe Timekeeping::BillingFence, "admit outside a transaction", committ
   it "refuses an admit check made outside any open transaction" do
     expect(ActiveRecord::Base.connection.transaction_open?).to be(false)
 
-    expect { described_class.admit! }.to raise_error(StandardError)
+    expect { described_class.admit! }.to raise_error(Timekeeping::BillingFence::TransactionRequired)
   end
 end

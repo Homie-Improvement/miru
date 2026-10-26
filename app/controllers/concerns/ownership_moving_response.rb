@@ -14,8 +14,15 @@ module OwnershipMovingResponse
 
   private
 
+    # A browser opening a page, such as the payer's pay and return pages, gets
+    # an error page. Every other caller gets JSON, including provider webhooks,
+    # which POST without an Accept header and so default to the HTML format.
     def render_ownership_moving(_exception = nil)
       response.headers["Retry-After"] = Timekeeping::BillingFence::RETRY_AFTER_SECONDS.to_s
-      render json: { errors: I18n.t("errors.ownership_moving"), reason: REASON }, status: 503
+      if request.get? && request.format.html?
+        render file: Rails.public_path.join("500.html"), status: 503, layout: false
+      else
+        render json: { errors: I18n.t("errors.ownership_moving"), reason: REASON }, status: 503
+      end
     end
 end

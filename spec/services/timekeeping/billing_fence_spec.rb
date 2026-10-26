@@ -61,7 +61,7 @@ RSpec.describe Timekeeping::BillingFence, committed_data: true do
   # A check outside a transaction would release the share lock at once, so it must not pass silently.
   it "admit! raises when called with no open transaction even though no handoff is in progress" do
     expect(ActiveRecord::Base.connection.transaction_open?).to be(false)
-    expect { described_class.admit! }.to raise_error(StandardError)
+    expect { described_class.admit! }.to raise_error(Timekeeping::BillingFence::TransactionRequired)
     expect { described_class.transaction { described_class.admit! } }.not_to raise_error
   end
 end
