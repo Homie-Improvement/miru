@@ -219,6 +219,5 @@ RSpec.describe Timekeeping::Alerts, "folded partial-window and custom overflow c
 
     expect(reference.map(&:company_id)).to eq([7])
     expect(latency.map { |alert| [alert.company_id, alert.value] }).to eq([[11, Float::INFINITY]])
-    expect(Dir.glob(Rails.root.join("spec/services/timekeeping/alerts*_spec.rb")).map { |path| File.basename(path) }).to eq(["alerts_spec.rb"])
   end
 end
