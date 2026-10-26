@@ -8,8 +8,10 @@ require "rails_helper"
 RSpec.describe "Timekeeping database schema" do
   rails_tables = %w[schema_migrations ar_internal_metadata].freeze
 
+  # Solid Queue's own job tables hold RelayJob runs, which belong to no
+  # company, so like the Rails tables they are not tenant tables.
   def tenant_tables(connection, skipped)
-    connection.tables - skipped
+    connection.tables - skipped - connection.tables.grep(/\Asolid_queue_/)
   end
 
   def tables_without_required_company_id(connection, skipped)

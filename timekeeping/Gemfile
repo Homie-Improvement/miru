@@ -8,6 +8,7 @@ ruby "4.0.1"
 # Rails line (root Gemfile), so the service shares no runtime with it but the
 # same framework version.
 gem "actionpack", "~> 8.1.2"
+gem "activejob", "~> 8.1.2"
 gem "activerecord", "~> 8.1.2"
 gem "activesupport", "~> 8.1.2"
 gem "railties", "~> 8.1.2"
@@ -15,6 +16,9 @@ gem "railties", "~> 8.1.2"
 gem "jwt", "~> 3.2"
 gem "pg", "~> 1.4"
 gem "puma", "~> 7.2"
+# The monolith's queue backend and pin (root Gemfile). The snapshot relay runs
+# as RelayJob on the service's own database.
+gem "solid_queue", "~> 0.6"
 
 gem "timekeeping_relay", path: "../gems/timekeeping_relay"
 gem "timekeeping_rules", path: "../gems/timekeeping_rules"

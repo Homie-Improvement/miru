@@ -27,6 +27,9 @@ GEM
       erubi (~> 1.11)
       rails-dom-testing (~> 2.2)
       rails-html-sanitizer (~> 1.6)
+    activejob (8.1.4)
+      activesupport (= 8.1.4)
+      globalid (>= 0.3.6)
     activemodel (8.1.4)
       activesupport (= 8.1.4)
     activerecord (8.1.4)
@@ -61,6 +64,13 @@ GEM
     drb (2.2.3)
     erb (6.0.7)
     erubi (1.13.1)
+    et-orbi (1.4.2)
+      tzinfo
+    fugit (1.11.2)
+      et-orbi (~> 1, >= 1.2.11)
+      raabro (~> 1.4)
+    globalid (1.4.0)
+      activesupport (>= 6.1)
     hashdiff (1.2.1)
     i18n (1.15.2)
       concurrent-ruby (~> 1.0)
@@ -111,6 +121,7 @@ GEM
     public_suffix (7.0.5)
     puma (7.2.1)
       nio4r (~> 2.0)
+    raabro (1.5.0)
     racc (1.8.1)
     rack (3.2.7)
     rack-session (2.1.2)
@@ -167,6 +178,12 @@ GEM
       rspec-support (>= 3.13.0, < 5.0.0)
     rspec-support (3.13.7)
     securerandom (0.4.1)
+    solid_queue (0.6.1)
+      activejob (>= 7.1)
+      activerecord (>= 7.1)
+      concurrent-ruby (>= 1.3.1)
+      fugit (~> 1.11.0)
+      railties (>= 7.1)
     thor (1.5.0)
     timeout (0.6.1)
     tsort (0.2.0)
@@ -193,6 +210,7 @@ PLATFORMS
 
 DEPENDENCIES
   actionpack (~> 8.1.2)
+  activejob (~> 8.1.2)
   activerecord (~> 8.1.2)
   activesupport (~> 8.1.2)
   jwt (~> 3.2)
@@ -200,6 +218,7 @@ DEPENDENCIES
   puma (~> 7.2)
   railties (~> 8.1.2)
   rspec-rails (~> 8.0)
+  solid_queue (~> 0.6)
   timekeeping_relay!
   timekeeping_rules!
   webmock (~> 3.26.2)
@@ -207,6 +226,7 @@ DEPENDENCIES
 CHECKSUMS
   actionpack (8.1.4) sha256=245493cc51be195a7645e6fc184880fa7e5b32ff1a08e053ee31f58c76e30ea4
   actionview (8.1.4) sha256=eff1efd07c4d969abad288322b423bcb67fdbab5e324c91ca37352b80f226076
+  activejob (8.1.4) sha256=4ed5b2ed8d4cc5c8f5f09becfef8346f202a4884eee0c8c73cae5ac378824099
   activemodel (8.1.4) sha256=9a0906c127bd118aa5f06157db12b8f750da83dccee72db2f658547a0ae7a0e8
   activerecord (8.1.4) sha256=3b4957ea7f246c9231bd7faa909312eac03a9101aaf87977b6c52733ff00b04f
   activesupport (8.1.4) sha256=891dd3fe43c4fc8391934b237b1189bb1f661c932a84a840043db9d46a4e80df
@@ -222,6 +242,9 @@ CHECKSUMS
   drb (2.2.3) sha256=0b00d6fdb50995fe4a45dea13663493c841112e4068656854646f418fda13373
   erb (6.0.7) sha256=c5ca6dc25b0ef974a44dc8f59fe847577122483b1968a38dec305c60bf91ee92
   erubi (1.13.1) sha256=a082103b0885dbc5ecf1172fede897f9ebdb745a4b97a5e8dc63953db1ee4ad9
+  et-orbi (1.4.2) sha256=bb555dae668419cb24caa2a293a170e58be6d4df1e017c51f5030bdc133cd20c
+  fugit (1.11.2) sha256=4c2e234f750c78d4514d0ca343a0b923847eac3846976fdb23ed4245d8fde6fe
+  globalid (1.4.0) sha256=037f12fbf1d9d7a014d501c2d5c77356fd4ddd96d7a7991d6700bba96706f427
   hashdiff (1.2.1) sha256=9c079dbc513dfc8833ab59c0c2d8f230fa28499cc5efb4b8dd276cf931457cd1
   i18n (1.15.2) sha256=00f9eb62412fe593b2a65a97daa75300d37abb8f7202ec748e94b6d46a9dd1b5
   io-console (0.9.4) sha256=a403304f32928ee85e56d457b4612ca43f2703b561a3258844992bd24085fbb1
@@ -252,6 +275,7 @@ CHECKSUMS
   prism (1.9.0) sha256=7b530c6a9f92c24300014919c9dcbc055bf4cdf51ec30aed099b06cd6674ef85
   public_suffix (7.0.5) sha256=1a8bb08f1bbea19228d3bed6e5ed908d1cb4f7c2726d18bd9cadf60bc676f623
   puma (7.2.1) sha256=d7bf0e9cabd532e0d401e142cd94e3ac531e993610e2d80e6fbf9c26961414b0
+  raabro (1.5.0) sha256=3f998a7bc84f9c84df3ab580634d2e0a5bda4f0841168d56035f529c9877440a
   racc (1.8.1) sha256=4a7f6929691dbec8b5209a0b373bc2614882b55fc5d2e447a21aaa691303d62f
   rack (3.2.7) sha256=93e13e1c24f93556671d85d2d79fa228c3485815c50d7e2f265b5330c6528fb7
   rack-session (2.1.2) sha256=595434f8c0c3473ae7d7ac56ecda6cc6dfd9d37c0b2b5255330aa1576967ffe8
@@ -271,6 +295,7 @@ CHECKSUMS
   rspec-rails (8.0.4) sha256=06235692fc0892683d3d34977e081db867434b3a24ae0dd0c6f3516bad4e22df
   rspec-support (3.13.7) sha256=0640e5570872aafefd79867901deeeeb40b0c9875a36b983d85f54fb7381c47c
   securerandom (0.4.1) sha256=cc5193d414a4341b6e225f0cb4446aceca8e50d5e1888743fac16987638ea0b1
+  solid_queue (0.6.1) sha256=f85443441fab4cb34ab173b4cdef80d9fa36d058da886d1766712e3b52057d0a
   thor (1.5.0) sha256=e3a9e55fe857e44859ce104a84675ab6e8cd59c650a49106a05f55f136425e73
   timekeeping_relay (0.1.0)
   timekeeping_rules (0.1.0)
