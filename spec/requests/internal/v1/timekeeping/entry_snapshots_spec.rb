@@ -44,3 +44,49 @@ RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots stale-generation refus
     expect(TimesheetEntry.with_discarded.find_by(id: entry_id)).to be_nil
   end
 end
+
+RSpec.describe "Internal::V1::Timekeeping::EntrySnapshots refusals before the consumer", type: :request do
+  let(:snapshot_path) { "/internal/v1/timekeeping/entry-snapshots" }
+
+  def snapshot_batch_body
+    company = create(:company)
+    project = create(:project, client: create(:client, company:))
+    entry = TimekeepingSnapshots.entry(id: 90_801, company_id: company.id, version: 1, project_id: project.id,
+                                       user_id: create(:user).id)
+    TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation: 1, outbox_position: 1)).to_json
+  end
+
+  it "answers 401 to a delivery without the Timekeeping service token and applies nothing" do
+    body = snapshot_batch_body
+
+    with_timekeeping_service_token do |token|
+      [nil, "Bearer not-#{token}", "Bearer "].each do |authorization|
+        headers = { "Content-Type" => "application/json", "Idempotency-Key" => SecureRandom.uuid,
+                    "Authorization" => authorization }.compact
+        post snapshot_path, params: body, headers: headers
+
+        expect(response).to have_http_status(401)
+        expect(response.parsed_body).to eq("reason" => "unauthorized")
+      end
+    end
+
+    expect(TimesheetEntry.with_discarded.find_by(id: 90_801)).to be_nil
+  end
+
+  it "answers 422 invalid_snapshot to a body that is not JSON or is nested past the parser limit" do
+    too_deep = ("[" * 200) + ("]" * 200)
+
+    with_timekeeping_service_token do |token|
+      ["not json", too_deep].each do |body|
+        post snapshot_path, params: body,
+                            # text/plain keeps Rails from parsing the body itself; the
+                            # controller reads the raw body either way.
+                            headers: { "Content-Type" => "text/plain", "Idempotency-Key" => SecureRandom.uuid,
+                                       "Authorization" => "Bearer #{token}" }
+
+        expect(response).to have_http_status(422)
+        expect(response.parsed_body).to eq("reason" => "invalid_snapshot")
+      end
+    end
+  end
+end
