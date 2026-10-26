@@ -340,6 +340,8 @@ jobs:
       DB_PASS: password
       CI: true
       TIMEKEEPING_LIVE: "1"
+      # The live specs render no pages, so they need no Vite build (and this job installs no Node).
+      SKIP_VITE_TEST_BUILD: "1"
       TIMEKEEPING_DATABASE_URL: postgres://root:password@localhost:5432/timekeeping_live_test
     services:
       postgres:
