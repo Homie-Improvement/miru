@@ -18,11 +18,7 @@ RSpec.describe Timekeeping::Handoff::CheckpointEntryValues do
     expect(rows.first.fetch("locked")).to be_nil
     expect(described_class.invalid_entries(rows)).to eq([])
   end
-end
 
-require "rails_helper"
-
-RSpec.describe Timekeeping::Handoff::CheckpointEntryValues do
   # "A monolith row with a source such as "agent" is therefore stored in Timekeeping's entries table, and any later write republishes it to the outbox, where the projection refuses it and delivery stops."
   it "names only the second checkpoint entry when its source is agent" do
     expect(Timekeeping::SnapshotValues::SOURCES).not_to include("agent")
@@ -32,11 +28,7 @@ RSpec.describe Timekeeping::Handoff::CheckpointEntryValues do
 
     expect(described_class.invalid_entries(rows)).to eq([{ company_id: 9, id: 901, fields: ["source"] }])
   end
-end
 
-require "rails_helper"
-
-RSpec.describe Timekeeping::Handoff::CheckpointEntryValues do
   # The projection refuses a non-positive version, an unknown status and a
   # duration JSON cannot carry; the checkpoint load is the only check before
   # write_outbox republishes them.
@@ -54,11 +46,7 @@ RSpec.describe Timekeeping::Handoff::CheckpointEntryValues do
         .to eq([{ company_id: 8, id:, fields: [field] }]), "expected #{field} = #{value.inspect} to be refused"
     end
   end
-end
 
-require "rails_helper"
-
-RSpec.describe Timekeeping::Handoff::CheckpointEntryValues do
   # Plain rows, never Checkpoint.build: the checkpoint checksum cannot encode
   # metadata this deep, so the edges are only reachable on the pure check.
   it "accepts checkpoint entry metadata nested 96 levels and names 97" do
