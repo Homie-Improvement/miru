@@ -4,281 +4,97 @@
 
 require "rails_helper"
 
-RSpec.describe "Timekeeping handoff correction snapshot value refusals for source agent" do
-  let(:agent_source_refusal_token) { "service-#{SecureRandom.hex(24)}" }
+RSpec.describe "Timekeeping handoff correction snapshot values" do
+  include_context "timekeeping entry writes without transactional fixtures"
+
+  let(:correction_value_token) { "service-#{SecureRandom.hex(24)}" }
+  let(:correction_value_headers) do
+    { "Authorization" => "Bearer #{correction_value_token}", "CONTENT_TYPE" => "application/json" }
+  end
+  let(:correction_value_at) { Time.utc(2026, 3, 2, 9) }
 
   around do |example|
     with_timekeeping_env(
       Timekeeping::Environment::TOKEN_PUBLIC_KEY => rsa_key_pair.public_key.to_pem,
-      Timekeeping::Environment::SERVICE_TOKEN => agent_source_refusal_token
+      Timekeeping::Environment::SERVICE_TOKEN => correction_value_token
     ) { example.run }
+  end
+
+  before do
+    Timekeeping::Admission.ensure_initial!
+    Timekeeping::Admission.fence!
+    Entry.insert_all!([{ id: 41, company_id: 1, version: 0, project_id: 10, user_id: 20,
+                         work_date: Date.new(2026, 3, 2), duration: 30.0, bill_status: "unbilled",
+                         created_at: correction_value_at, updated_at: correction_value_at }])
+  end
+
+  # A complete snapshot of entry 41 as the route's JSON body carries it.
+  def correction_value_snapshot(**changes)
+    (Timekeeping::OutboxFields::ENTRY_FIELDS - ["version"]).index_with { nil }.merge(
+      "id" => 41, "company_id" => 1, "project_id" => 10, "user_id" => 20, "work_date" => "2026-03-02",
+      "duration" => 30.5, "note" => "", "bill_status" => "unbilled", "review_status" => "not_required",
+      "locked" => false, "source" => "manual", "source_metadata" => {}, "proof_metadata" => {},
+      "created_at" => correction_value_at.iso8601, "updated_at" => correction_value_at.iso8601
+    ).merge(changes.transform_keys(&:to_s))
+  end
+
+  def put_correction_value(snapshot)
+    put "/internal/v1/handoff/correction_snapshots",
+        params: { generation: 2, version: 1, snapshots: [snapshot] }.to_json, headers: correction_value_headers
   end
 
   # "Check whether a complete correction with source "agent" reaches the outbox despite the consumer rejecting that value."
   # The caller holds the service token, so only the value check stands between this snapshot and the outbox.
-  it "answers invalid_request to an authorized correction whose source is agent and writes no outbox row" do
-    entry = Entry.create!(company_id: 1, user_id: 1, project_id: 2, work_date: "2026-03-02", duration: 30.0,
-                          note: "", bill_status: "unbilled", source: "manual", source_metadata: {})
-    Timekeeping::Admission.fence!
-    snapshot = entry.attributes.slice(*(Timekeeping::OutboxFields::ENTRY_FIELDS - ["version"]))
-                    .merge("locked" => true, "source" => "agent")
-    headers = { "Content-Type" => "application/json", "Authorization" => "Bearer #{agent_source_refusal_token}" }
-
-    put "/internal/v1/handoff/correction_snapshots",
-        params: { generation: 2, version: 3, snapshots: [snapshot] }.to_json, headers: headers
-
+  it "answers invalid_request for a correction with source agent and writes it once the source is valid" do
+    put_correction_value(correction_value_snapshot(source: "agent"))
     expect([response.status, response.parsed_body]).to eq([400, { "reason" => "invalid_request" }])
     expect(OutboxSnapshot.count).to eq(0)
-    expect(entry.reload.version).to eq(1)
-  end
-end
+    expect(Entry.find_by!(company_id: 1, id: 41).version).to eq(0)
 
-RSpec.describe "Timekeeping handoff correction snapshot value refusals for non-text sources" do
-  let(:typed_source_refusal_token) { "service-#{SecureRandom.hex(24)}" }
-
-  around do |example|
-    with_timekeeping_env(
-      Timekeeping::Environment::TOKEN_PUBLIC_KEY => rsa_key_pair.public_key.to_pem,
-      Timekeeping::Environment::SERVICE_TOKEN => typed_source_refusal_token
-    ) { example.run }
+    put_correction_value(correction_value_snapshot(source: "manual"))
+    expect(response.status).to eq(200)
+    expect(OutboxSnapshot.pluck(:id, :source, :duration, :version, :generation)).to eq([[41, "manual", 30.5, 1, 2]])
   end
 
   # "producers must reject values that stop delivery for everyone"
   # The consumer tests membership on the raw value, so a value that only matches after a cast must be refused, not cast.
   it "answers invalid_request to a correction whose source is a list, number or object holding an allowed value" do
-    entry = Entry.create!(company_id: 1, user_id: 1, project_id: 2, work_date: "2026-03-02", duration: 30.0,
-                          note: "", bill_status: "unbilled", source: "manual", source_metadata: {})
-    Timekeeping::Admission.fence!
-    snapshot = entry.attributes.slice(*(Timekeeping::OutboxFields::ENTRY_FIELDS - ["version"])).merge("locked" => true)
-    headers = { "Content-Type" => "application/json", "Authorization" => "Bearer #{typed_source_refusal_token}" }
-
     answers = [["manual"], 1, { "value" => "manual" }].map do |source|
-      put "/internal/v1/handoff/correction_snapshots",
-          params: { generation: 2, version: 3, snapshots: [snapshot.merge("source" => source)] }.to_json,
-          headers: headers
+      put_correction_value(correction_value_snapshot(source:))
       [response.status, response.parsed_body]
     end
 
     expect(answers).to all(eq([400, { "reason" => "invalid_request" }]))
     expect(OutboxSnapshot.count).to eq(0)
-    expect(entry.reload.version).to eq(1)
-  end
-end
-
-RSpec.describe "Timekeeping handoff correction snapshot value refusals for deep metadata" do
-  let(:deep_metadata_refusal_token) { "service-#{SecureRandom.hex(24)}" }
-
-  around do |example|
-    with_timekeeping_env(
-      Timekeeping::Environment::TOKEN_PUBLIC_KEY => rsa_key_pair.public_key.to_pem,
-      Timekeeping::Environment::SERVICE_TOKEN => deep_metadata_refusal_token
-    ) { example.run }
+    expect(Entry.find_by!(company_id: 1, id: 41).version).to eq(0)
   end
 
   # "producers must reject values that stop delivery for everyone"
   # 97 nested objects still parse in this request body, but the relay could not parse the stored metadata back,
   # so the row would block every later snapshot.
   it "answers invalid_request to a correction whose source_metadata is nested deeper than the relay can deliver" do
-    entry = Entry.create!(company_id: 1, user_id: 1, project_id: 2, work_date: "2026-03-02", duration: 30.0,
-                          note: "", bill_status: "unbilled", source: "manual", source_metadata: {})
-    Timekeeping::Admission.fence!
     deep_metadata = 97.times.reduce("leaf") { |value, _| { "child" => value } }
-    snapshot = entry.attributes.slice(*(Timekeeping::OutboxFields::ENTRY_FIELDS - ["version"]))
-                    .merge("locked" => true, "source_metadata" => deep_metadata)
-    headers = { "Content-Type" => "application/json", "Authorization" => "Bearer #{deep_metadata_refusal_token}" }
 
-    put "/internal/v1/handoff/correction_snapshots",
-        params: { generation: 2, version: 3, snapshots: [snapshot] }.to_json, headers: headers
+    put_correction_value(correction_value_snapshot(source_metadata: deep_metadata))
 
     expect([response.status, response.parsed_body]).to eq([400, { "reason" => "invalid_request" }])
     expect(OutboxSnapshot.count).to eq(0)
-    expect(entry.reload.version).to eq(1)
-  end
-end
-
-RSpec.describe "Timekeeping handoff correction snapshot values" do
-  let(:correction_value_token) { "service-#{SecureRandom.hex(24)}" }
-
-  around do |example|
-    with_timekeeping_env(
-      Timekeeping::Environment::TOKEN_PUBLIC_KEY => rsa_key_pair.public_key.to_pem,
-      Timekeeping::Environment::SERVICE_TOKEN => correction_value_token
-    ) { example.run }
+    expect(Entry.find_by!(company_id: 1, id: 41).version).to eq(0)
   end
 
   # "write given entry snapshots to outbox_snapshots at the given version and generation"
-  # The value check must not refuse the numbers and strings the route's JSON parsing produces.
-  it "writes a valid JSON correction with a decimal duration at the given version and generation" do
-    entry = Entry.create!(company_id: 1, user_id: 1, project_id: 2, work_date: "2026-03-02", duration: 30.0,
-                          note: "", bill_status: "unbilled", source: "manual", source_metadata: {})
-    Timekeeping::Admission.fence!
-    snapshot = {
-      "id" => entry.id, "project_id" => 2, "user_id" => 1, "agent_id" => nil, "work_date" => "2026-03-02",
-      "duration" => 30.5, "note" => "", "bill_status" => "unbilled", "review_status" => "not_required",
-      "locked" => true, "source" => "cli", "source_metadata" => {}, "external_run_id" => nil,
-      "external_session_id" => nil, "proof_url" => nil, "proof_metadata" => {}, "discarded_at" => nil,
-      "created_at" => "2026-03-02T09:00:00Z", "updated_at" => "2026-03-02T09:00:00Z", "company_id" => 1
-    }
-    headers = { "Content-Type" => "application/json", "Authorization" => "Bearer #{correction_value_token}" }
-
-    put "/internal/v1/handoff/correction_snapshots",
-        params: { generation: 2, version: 3, snapshots: [snapshot] }.to_json, headers: headers
-
-    expect(response.status).to eq(200)
-    expect(OutboxSnapshot.where(id: entry.id).pluck(:version, :generation, :duration, :source))
-      .to eq([[3, 2, 30.5, "cli"]])
-  end
-end
-
-RSpec.describe "Timekeeping handoff correction snapshot value refusals" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  let(:correction_value_token) { "service-#{SecureRandom.hex(24)}" }
-
-  around do |example|
-    with_timekeeping_env(
-      Timekeeping::Environment::TOKEN_PUBLIC_KEY => rsa_key_pair.public_key.to_pem,
-      Timekeeping::Environment::SERVICE_TOKEN => correction_value_token
-    ) { example.run }
-  end
-
-  before do
-    Timekeeping::Admission.ensure_initial!
-    Timekeeping::Admission.fence!
-  end
-
-  # "Check whether a complete correction with source "agent" reaches the outbox despite the consumer rejecting that value."
-  it "answers invalid_request to a JSON correction with source agent and writes no outbox row" do
-    at = Time.utc(2026, 3, 2, 9)
-    Entry.insert_all!([{ id: 31, company_id: 1, version: 0, project_id: 10, user_id: 20,
-                         work_date: Date.new(2026, 3, 2), duration: 30.0, bill_status: "unbilled",
-                         created_at: at, updated_at: at }])
-    snapshot = (Timekeeping::OutboxFields::ENTRY_FIELDS - ["version"]).index_with { nil }.merge(
-      "id" => 31, "company_id" => 1, "project_id" => 10, "user_id" => 20, "work_date" => "2026-03-02",
-      "duration" => 30.0, "note" => "", "bill_status" => "unbilled", "review_status" => "not_required",
-      "locked" => false, "source" => "agent", "source_metadata" => {}, "proof_metadata" => {},
-      "created_at" => at.iso8601, "updated_at" => at.iso8601
-    )
-
-    put "/internal/v1/handoff/correction_snapshots",
-        params: { generation: 2, version: 1, snapshots: [snapshot] }.to_json,
-        headers: { "Authorization" => "Bearer #{correction_value_token}", "CONTENT_TYPE" => "application/json" }
-
-    expect([response.status, response.parsed_body]).to eq([400, { "reason" => "invalid_request" }])
-    expect(OutboxSnapshot.count).to eq(0)
-    expect(Entry.find_by!(company_id: 1, id: 31).version).to eq(0)
-  end
-end
-
-RSpec.describe "Timekeeping handoff valid correction snapshot values" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  let(:valid_correction_token) { "service-#{SecureRandom.hex(24)}" }
-
-  around do |example|
-    with_timekeeping_env(
-      Timekeeping::Environment::TOKEN_PUBLIC_KEY => rsa_key_pair.public_key.to_pem,
-      Timekeeping::Environment::SERVICE_TOKEN => valid_correction_token
-    ) { example.run }
-  end
-
-  before do
-    Timekeeping::Admission.ensure_initial!
-    Timekeeping::Admission.fence!
-  end
-
   # The route parses numbers as BigDecimal, so a value check stricter than
   # "non-negative Numeric" would refuse every real correction.
   it "writes a valid JSON correction with a decimal duration once at the given version and generation" do
-    at = Time.utc(2026, 3, 2, 9)
-    Entry.insert_all!([{ id: 41, company_id: 1, version: 0, project_id: 10, user_id: 20,
-                         work_date: Date.new(2026, 3, 2), duration: 30.0, bill_status: "unbilled",
-                         created_at: at, updated_at: at }])
-    snapshot = (Timekeeping::OutboxFields::ENTRY_FIELDS - ["version"]).index_with { nil }.merge(
-      "id" => 41, "company_id" => 1, "project_id" => 10, "user_id" => 20, "work_date" => "2026-03-02",
-      "duration" => 30.5, "note" => "", "bill_status" => "billed", "review_status" => "approved",
-      "locked" => true, "source" => "import", "source_metadata" => { "rate" => 1.25 }, "proof_metadata" => {},
-      "created_at" => at.iso8601, "updated_at" => at.iso8601
-    )
-    body = { generation: 2, version: 1, snapshots: [snapshot] }.to_json
-    headers = { "Authorization" => "Bearer #{valid_correction_token}", "CONTENT_TYPE" => "application/json" }
+    snapshot = correction_value_snapshot(bill_status: "billed", review_status: "approved", locked: true,
+                                         source: "import", source_metadata: { "rate" => 1.25 })
 
-    # "write given entry snapshots to outbox_snapshots at the given version and generation"
     2.times do
-      put "/internal/v1/handoff/correction_snapshots", params: body, headers: headers
+      put_correction_value(snapshot)
       expect(response.status).to eq(200)
     end
 
     expect(OutboxSnapshot.pluck(:company_id, :id, :version, :generation, :duration, :source, :bill_status))
       .to eq([[1, 41, 1, 2, 30.5, "import", "billed"]])
-  end
-end
-
-RSpec.describe "Timekeeping handoff correction snapshot value refusals" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  let(:correction_value_token) { "service-#{SecureRandom.hex(24)}" }
-
-  around do |example|
-    with_timekeeping_env(
-      Timekeeping::Environment::TOKEN_PUBLIC_KEY => rsa_key_pair.public_key.to_pem,
-      Timekeeping::Environment::SERVICE_TOKEN => correction_value_token
-    ) { example.run }
-  end
-
-  # "Check whether a complete correction with source "agent" reaches the outbox despite the consumer rejecting that value."
-  it "answers invalid_request for a correction with source agent and writes it once the source is valid" do
-    Timekeeping::Admission.ensure_initial!
-    Timekeeping::Admission.fence!
-    at = Time.utc(2026, 3, 2, 9)
-    Entry.insert_all!([{ id: 41, company_id: 1, version: 0, project_id: 10, user_id: 20,
-                         work_date: Date.new(2026, 3, 2), duration: 30.0, bill_status: "unbilled",
-                         created_at: at, updated_at: at }])
-    snapshot = (Timekeeping::OutboxFields::ENTRY_FIELDS - ["version"]).index_with { nil }.merge(
-      "id" => 41, "company_id" => 1, "project_id" => 10, "user_id" => 20, "work_date" => "2026-03-02",
-      "duration" => 30.5, "note" => "", "bill_status" => "unbilled", "review_status" => "not_required",
-      "locked" => false, "source" => "agent", "source_metadata" => {}, "proof_metadata" => {},
-      "created_at" => at.iso8601, "updated_at" => at.iso8601
-    )
-    headers = { "Authorization" => "Bearer #{correction_value_token}", "CONTENT_TYPE" => "application/json" }
-
-    put "/internal/v1/handoff/correction_snapshots",
-        params: { generation: 2, version: 1, snapshots: [snapshot] }.to_json, headers: headers
-    expect([response.status, response.parsed_body]).to eq([400, { "reason" => "invalid_request" }])
-    expect(OutboxSnapshot.count).to eq(0)
-    expect(Entry.find_by(company_id: 1, id: 41).version).to eq(0)
-
-    put "/internal/v1/handoff/correction_snapshots",
-        params: { generation: 2, version: 1, snapshots: [snapshot.merge("source" => "manual")] }.to_json, headers: headers
-    expect(response.status).to eq(200)
-    expect(OutboxSnapshot.pluck(:id, :source, :duration, :version, :generation)).to eq([[41, "manual", 30.5, 1, 2]])
-  end
-end
-
-RSpec.describe "Timekeeping handoff correction snapshot value refusals" do
-  let(:correction_value_token) { "service-#{SecureRandom.hex(24)}" }
-
-  around do |example|
-    with_timekeeping_env(
-      Timekeeping::Environment::TOKEN_PUBLIC_KEY => rsa_key_pair.public_key.to_pem,
-      Timekeeping::Environment::SERVICE_TOKEN => correction_value_token
-    ) { example.run }
-  end
-
-  # "Check whether a complete correction with source "agent" reaches the outbox despite the consumer rejecting that value."
-  it "answers invalid_request to a correction with source agent from the service caller and writes no outbox row" do
-    entry = Entry.create!(company_id: 1, user_id: 1, project_id: 2, work_date: "2026-03-02", duration: 30.0,
-                          note: "", bill_status: "unbilled", source: "manual", source_metadata: {})
-    Timekeeping::Admission.fence!
-    snapshot = entry.attributes.slice(*(Timekeeping::OutboxFields::ENTRY_FIELDS - ["version"]))
-                    .merge("locked" => true, "source" => "agent")
-    body = { generation: 2, version: 3, snapshots: [snapshot] }.to_json
-    headers = { "Content-Type" => "application/json", "Authorization" => "Bearer #{correction_value_token}" }
-
-    put "/internal/v1/handoff/correction_snapshots", params: body, headers: headers
-
-    expect([response.status, response.parsed_body]).to eq([400, { "reason" => "invalid_request" }])
-    expect(OutboxSnapshot.count).to eq(0)
-    expect(entry.reload.version).to eq(1)
   end
 end
