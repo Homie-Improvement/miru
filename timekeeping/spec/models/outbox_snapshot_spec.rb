@@ -5,29 +5,152 @@
 require "rails_helper"
 
 RSpec.describe OutboxSnapshot do
-  it "groups the oldest unsent enqueued_at by each row's own company and skips companies with only sent rows" do
-    write_grouping_row = lambda do |company_id:, entry_id:, enqueued_at:, sent_at: nil|
-      described_class.create!(
-        id: entry_id, project_id: 50, user_id: 60, work_date: Date.new(2026, 3, 2), duration: 90.0,
-        bill_status: "unbilled", review_status: "not_required", locked: false, source: "manual",
-        source_metadata: {}, proof_metadata: {}, created_at: Time.utc(2025, 1, 1), updated_at: Time.utc(2025, 1, 1),
-        company_id:, version: 1, generation: 1, enqueued_at:, sent_at:
+  describe ".oldest_unsent_by_company" do
+    # Company 11's oldest row is sent, so a minimum taken over every row would
+    # report it; company 33 has nothing unsent, so it must be absent.
+    it "reports each company's oldest unsent row and skips sent rows and sent-only companies" do
+      insert_outbox_rows(
+        outbox_row(id: 1, company_id: 11, enqueued_at: Time.utc(2026, 3, 3, 9, 0, 0), sent_at: Time.utc(2026, 3, 3, 9, 1, 0)),
+        outbox_row(id: 2, company_id: 11, enqueued_at: Time.utc(2026, 3, 3, 10, 0, 0)),
+        outbox_row(id: 3, company_id: 11, enqueued_at: Time.utc(2026, 3, 3, 11, 0, 0)),
+        outbox_row(id: 4, company_id: 22, enqueued_at: Time.utc(2026, 3, 3, 10, 30, 0)),
+        outbox_row(id: 5, company_id: 33, enqueued_at: Time.utc(2026, 3, 3, 8, 0, 0), sent_at: Time.utc(2026, 3, 3, 8, 1, 0))
       )
+
+      oldest = described_class.oldest_unsent_by_company
+
+      expect(oldest.keys).to contain_exactly(11, 22)
+      expect(oldest.fetch(11)).to eq(Time.utc(2026, 3, 3, 10, 0, 0))
+      expect(oldest.fetch(22)).to eq(Time.utc(2026, 3, 3, 10, 30, 0))
+    end
+  end
+
+  describe "shared outbox row builder" do
+    it "builds a default row with every required column that inserts as one unsent row" do
+      # Every NOT NULL column without a database default must come from the builder,
+      # so a schema change is edited in one place.
+      required_columns = %w[
+        id project_id user_id work_date duration bill_status review_status locked source
+        source_metadata proof_metadata created_at updated_at company_id version generation
+      ]
+      row = outbox_row.transform_keys(&:to_s)
+
+      expect(row.keys).to include(*required_columns)
+      expect(row["sent_at"]).to be_nil
+
+      positions = insert_outbox_rows(outbox_row)
+
+      expect(positions.size).to eq(1)
+      expect(positions.first).to be_a(Integer)
+      expect(described_class.count).to eq(1)
+      stored = described_class.find(positions.first)
+      expect(stored.outbox_position).to eq(positions.first)
+      # The builder's default must leave the row unsent, so no default decides a sent/unsent outcome.
+      expect(stored.sent_at).to be_nil
+      expect(stored.enqueued_at).not_to be_nil
     end
 
-    write_grouping_row.call(company_id: 11, entry_id: 1, enqueued_at: Time.utc(2026, 3, 3, 12, 0, 0))
-    write_grouping_row.call(company_id: 11, entry_id: 2, enqueued_at: Time.utc(2026, 3, 3, 12, 5, 0))
-    # An older row of company 11 that was already sent must not count.
-    write_grouping_row.call(company_id: 11, entry_id: 3, enqueued_at: Time.utc(2026, 3, 3, 11, 0, 0),
-                            sent_at: Time.utc(2026, 3, 3, 11, 1, 0))
-    write_grouping_row.call(company_id: 22, entry_id: 4, enqueued_at: Time.utc(2026, 3, 3, 12, 9, 0))
-    write_grouping_row.call(company_id: 33, entry_id: 5, enqueued_at: Time.utc(2026, 3, 3, 10, 0, 0),
-                            sent_at: Time.utc(2026, 3, 3, 10, 0, 5))
+    it "returns explicit positions in insert order and writes the id override to the entry-id column" do
+      positions = insert_outbox_rows(
+        outbox_row(id: 7, company_id: 1, outbox_position: 30),
+        outbox_row(id: 8, company_id: 1, outbox_position: 10),
+        outbox_row(id: 9, company_id: 2, outbox_position: 20)
+      )
 
-    oldest = described_class.oldest_unsent_by_company
+      expect(positions).to eq([30, 10, 20])
+      expect(positions).to all(be_an(Integer))
+      # insert_all! writes the "id" key to the entry-id column, never to the
+      # outbox_position primary key, so position 30 holds entry 7, not entry 30.
+      entry_ids = described_class.connection.select_rows(
+        "SELECT outbox_position, id FROM outbox_snapshots ORDER BY outbox_position"
+      )
+      expect(entry_ids).to eq([[10, 8], [20, 9], [30, 7]])
+    end
 
-    expect(oldest.keys).to contain_exactly(11, 22)
-    expect(oldest.fetch(11)).to eq(Time.utc(2026, 3, 3, 12, 0, 0))
-    expect(oldest.fetch(22)).to eq(Time.utc(2026, 3, 3, 12, 9, 0))
+    # Mixing up the entry id and the position would let versioning tests pass
+    # for the wrong reason.
+    it "keeps two versions of one entry id apart by their explicit positions" do
+      positions = insert_outbox_rows(
+        outbox_row(id: 900, company_id: 1, version: 1, outbox_position: 5005),
+        outbox_row(id: 900, company_id: 1, version: 2, outbox_position: 5003)
+      )
+
+      expect(positions).to eq([5005, 5003])
+      stored = described_class.where(outbox_position: [5003, 5005])
+                              .order(:outbox_position)
+                              .pluck(:outbox_position, Arel.sql("outbox_snapshots.id"), :version)
+      expect(stored).to eq([[5003, 900, 2], [5005, 900, 1]])
+    end
+
+    # Without an explicit outbox_position the sequence assigns one per row, so a
+    # repeated row is a second outbox row, never a merge into the first.
+    it "lets the sequence assign distinct rising positions when no position is given" do
+      from_sequence = insert_outbox_rows(outbox_row(id: 4, company_id: 1), outbox_row(id: 5, company_id: 1))
+
+      expect(from_sequence.size).to eq(2)
+      expect(from_sequence).to all(be_an(Integer))
+      expect(from_sequence.uniq.size).to eq(2)
+      expect(described_class.where(outbox_position: from_sequence).pluck(Arel.sql("outbox_snapshots.id")))
+        .to contain_exactly(4, 5)
+
+      row = outbox_row(id: 77, company_id: 3, version: 1)
+      first = insert_outbox_rows(row)
+      second = insert_outbox_rows(row)
+
+      expect(first.size).to eq(1)
+      expect(second.size).to eq(1)
+      expect(second.first).to be > first.first
+      expect(described_class.where(outbox_position: first + second).count).to eq(2)
+      expect(described_class.count).to eq(4)
+    end
+
+    it "writes every override to its own column" do
+      enqueued = Time.utc(2026, 3, 3, 12, 0, 0)
+      sent = Time.utc(2026, 3, 3, 12, 1, 0)
+      stamp = Time.utc(2025, 1, 1)
+
+      positions = insert_outbox_rows(
+        outbox_row(id: 7, outbox_position: 900, company_id: 42, version: 3, generation: 5,
+                   enqueued_at: enqueued, sent_at: sent, created_at: stamp, updated_at: stamp)
+      )
+
+      expect(positions).to eq([900])
+      # The model's `id` reads outbox_position, so the entry-id column is read by its table name.
+      stored = described_class.where(outbox_position: 900).pick(
+        Arel.sql("outbox_snapshots.id"), :company_id, :version, :generation, :enqueued_at, :sent_at,
+        :created_at, :updated_at
+      )
+      expect(stored).to eq([7, 42, 3, 5, enqueued, sent, stamp, stamp])
+    end
+
+    # insert_all! needs every row in one call to carry the same columns, so a row
+    # with no sent_at override must still name sent_at, and default it to nil.
+    it "inserts rows with and without a sent_at override together and keeps the default rows unsent" do
+      sent_at = Time.utc(2026, 3, 3, 11, 1, 0)
+      enqueued_at = Time.utc(2026, 3, 3, 12, 0, 0)
+
+      positions = insert_outbox_rows(
+        outbox_row(id: 1, company_id: 44, version: 1, enqueued_at: Time.utc(2026, 3, 3, 11, 0, 0), sent_at:),
+        outbox_row(id: 2, company_id: 44, version: 1, enqueued_at:)
+      )
+
+      expect(positions.size).to eq(2)
+      expect(described_class.where(outbox_position: positions).order(:outbox_position).pluck(:sent_at))
+        .to eq([sent_at, nil])
+      expect(described_class.oldest_unsent_by_company).to eq(44 => enqueued_at)
+    end
+
+    it "builds independent rows so a nested metadata override never leaks into the next row" do
+      nested = { "kind" => "screenshot", "detail" => { "pages" => [1, 2] } }
+
+      first = outbox_row(proof_metadata: nested).transform_keys(&:to_s)
+      first["source_metadata"]["tool"] = "changed"
+      second = outbox_row.transform_keys(&:to_s)
+
+      expect(nested).to eq("kind" => "screenshot", "detail" => { "pages" => [1, 2] })
+      expect(first["proof_metadata"]).to eq(nested)
+      expect(second["source_metadata"]).not_to have_key("tool")
+      expect(second["proof_metadata"]).not_to eq(nested)
+    end
   end
 end
