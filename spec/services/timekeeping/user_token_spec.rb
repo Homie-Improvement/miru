@@ -241,24 +241,6 @@ RSpec.describe Timekeeping::UserToken, "write tokens and roles outside the compa
   end
 end
 
-RSpec.describe Timekeeping::UserToken, "primary role beside a raised write role" do
-  # "This gives no one more write authority than the monolith already grants through `has_role?`."
-  # The monolith refuses this user's locked edits through primary_role, so the
-  # token must still carry that role for Timekeeping's locked-entry rule.
-  it "keeps the lowest-id role in primary_role beside the raised write role of an employee-first admin" do
-    company = create(:company)
-    member = create(:user).tap { |user| create(:employment, company:, user:) }
-    member.add_role(:employee, company)
-    member.add_role(:admin, company)
-
-    token = described_class.mint(user: member, company:, private_key: timekeeping_key_pair)
-    claims = described_class.verify(token, public_key: timekeeping_key_pair.public_key)
-
-    expect([claims.role, claims.primary_role, claims.purpose]).to eq(%w[admin employee write])
-    expect(member.primary_role(company)).to eq("employee")
-  end
-end
-
 RSpec.describe Timekeeping::UserToken, "purpose stays a separate claim" do
   # "A read token must still never be accepted for writes. Purpose stays a separate claim."
   it "keeps read and write tokens apart by their signed purpose once both carry the raised role of an employee-first admin" do
@@ -415,77 +397,6 @@ RSpec.describe Timekeeping::UserToken, "write role per company" do
     end
 
     expect(signed).to eq([[admin_company.id, "admin", "write"], [employee_company.id, "employee", "write"]])
-  end
-end
-
-RSpec.describe Timekeeping::UserToken, "write role of an employee-first privileged user" do
-  # "A write token for a user who holds employee first and admin or owner later in a company signs the admin or owner role with purpose write"
-  it "signs the admin or owner role with purpose write on the default token of an employee-first admin or owner" do
-    company = create(:company)
-    { admin: "admin", owner: "owner" }.each do |privileged, expected_role|
-      member = create(:user)
-      create(:employment, company:, user: member)
-      # The employee role is added first, so it has the lower roles.id.
-      member.add_role(:employee, company)
-      member.add_role(privileged, company)
-
-      token = described_class.mint(user: member, company:, private_key: timekeeping_key_pair)
-      claims = described_class.verify(token, public_key: timekeeping_key_pair.public_key)
-
-      expect([claims.user_id, claims.company_id, claims.role, claims.purpose])
-        .to eq([member.id, company.id, expected_role, "write"])
-      expect(claims.primary_role).to eq("employee")
-      expect(User.primary_roles_for(company, [member.id])).to eq(member.id => "employee")
-    end
-  end
-end
-
-RSpec.describe Timekeeping::UserToken, "write role outside the company" do
-  # "Roles held in another company or globally never raise the signed role"
-  it "keeps employee on a write token for a global admin, another company's admin, a roleless member and a plain employee" do
-    company = create(:company)
-    elsewhere = create(:company)
-    member = lambda do
-      create(:user).tap { |user| create(:employment, company:, user:) }
-    end
-    global_admin = member.call
-    global_admin.add_role(:employee, company)
-    global_admin.add_role(:admin)
-    other_company_admin = member.call
-    create(:employment, company: elsewhere, user: other_company_admin)
-    other_company_admin.add_role(:employee, company)
-    other_company_admin.add_role(:admin, elsewhere)
-    roleless = member.call
-    plain_employee = member.call
-    plain_employee.add_role(:employee, company)
-
-    signed = [global_admin, other_company_admin, roleless, plain_employee].map do |user|
-      token = described_class.mint(user:, company:, purpose: :write, private_key: timekeeping_key_pair)
-      claims = described_class.verify(token, public_key: timekeeping_key_pair.public_key)
-      [claims.company_id, claims.role, claims.purpose]
-    end
-
-    expect(signed).to eq([[company.id, "employee", "write"]] * 4)
-  end
-end
-
-RSpec.describe Timekeeping::UserToken, "purpose beside a raised write role" do
-  # "A read token must still never be accepted for writes. Purpose stays a separate claim."
-  # Once both purposes sign the same role, the purpose claim is the only thing
-  # that tells a read token from a write token, so it must differ.
-  it "keeps purpose as its own claim when read and write tokens sign the same raised role" do
-    company = create(:company)
-    member = create(:user).tap { |user| create(:employment, company:, user:) }
-    member.add_role(:employee, company)
-    member.add_role(:admin, company)
-
-    claims = %i[write read].map do |purpose|
-      token = described_class.mint(user: member, company:, purpose:, private_key: timekeeping_key_pair)
-      described_class.verify(token, public_key: timekeeping_key_pair.public_key)
-    end
-
-    expect(claims.map { |claim| [claim.role, claim.purpose, claim.primary_role] })
-      .to eq([["admin", "write", "employee"], ["admin", "read", "employee"]])
   end
 end
 
