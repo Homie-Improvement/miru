@@ -4,19 +4,256 @@
 
 require "rails_helper"
 
-RSpec.describe "Billing fence refusal body", type: :request do
-  it "answers 503 ownership_moving during a handoff without exposing the handoff step" do
-    invoice = create(:invoice_with_invoice_line_items)
-    company = invoice.company
-    user = create(:user, current_workspace_id: company.id)
+RSpec.describe "Billing fence on invoice create", type: :request do
+  let(:company) { create(:company, base_currency: "USD") }
+  let(:client) { create(:client, company:) }
+  let(:user) { create(:user, current_workspace_id: company.id) }
+
+  before do
     create(:employment, company:, user:)
     user.add_role :admin, company
     sign_in user
+  end
+
+  # "Every invoice, line-item, invoice-tax and payment write, mobile-collection payments included,
+  # gets 503 ownership_moving while handoff_step is set and writes nothing"
+  it "refuses invoice create during a handoff with only the fixed refusal fields and writes no invoice, line item or tax" do
+    expect(Invoice.where(invoice_number: "FENCE-C-001")).not_to exist
+    TimekeepingOwnership.current.update!(handoff_step: "close_admission")
+    params = {
+      invoice: {
+        client_id: client.id,
+        invoice_number: "FENCE-C-001",
+        issue_date: Date.current.iso8601,
+        due_date: (Date.current + 7).iso8601,
+        status: "draft",
+        currency: "USD",
+        invoice_line_items_attributes: [
+          { name: "Work", description: "Work", date: Date.current.iso8601, rate: 100, quantity: 60 }
+        ]
+      }
+    }
+
+    expect do
+      send_request :post, api_v1_invoices_path, params:, headers: auth_headers(user)
+    end.to not_change(Invoice, :count).and not_change(InvoiceLineItem, :count).and not_change(InvoiceTax, :count)
+
+    expect(response).to have_http_status(:service_unavailable)
+    expect(response.headers["Retry-After"]).to eq("5")
+    # The ownership row is global operator state shared by every company, so
+    # the refusal carries only the fixed code and message, never the row.
+    body = response.parsed_body
+    expect(body.keys).to contain_exactly("errors", "reason")
+    expect(body["reason"]).to eq("ownership_moving")
+    expect(body["errors"]).to be_present
+    expect(response.body).not_to include("close_admission")
+    expect(response.body).not_to include("handoff")
+    expect(response.body).not_to include("generation")
+    expect(response.body).not_to include("monolith")
+    expect(Invoice.where(invoice_number: "FENCE-C-001")).not_to exist
+  end
+end
+
+RSpec.describe "Billing fence on invoice update", type: :request do
+  let(:company) { create(:company, base_currency: "USD") }
+  let(:client) { create(:client, company:) }
+  let(:user) { create(:user, current_workspace_id: company.id) }
+  let(:invoice) { create(:invoice, company:, client:, invoice_number: "FENCE-U-001", status: :draft) }
+  let!(:line_item) do
+    create(:invoice_line_item, invoice:, timesheet_entry: nil, name: "Keep", description: "Keep", rate: 100, quantity: 60)
+  end
+  let(:gst) { create(:tax_configuration, company:, name: "GST", calculation_method: "percentage", value: 10) }
+  let(:service) { create(:tax_configuration, company:, name: "Service", calculation_method: "percentage", value: 5) }
+  # Amounts are passed explicitly because the invoice_tax factory otherwise derives them from the line items.
+  let!(:gst_row) do
+    create(:invoice_tax, invoice:, tax_configuration: gst, name: "GST", calculation_method: "percentage", value: 10, amount: 10)
+  end
+  let!(:service_row) do
+    create(:invoice_tax, invoice:, tax_configuration: service, name: "Service", calculation_method: "percentage", value: 5, amount: 5)
+  end
+
+  before do
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    sign_in user
+  end
+
+  # Reads the seeded tax rows once and checks they hold the seeded values, so a failed seed or a broken
+  # read fails here instead of comparing nothing with nothing after the refusal.
+  def seeded_tax_baseline
+    rows = stored_invoice_tax_rows(invoice.id)
+    expect(rows.map { |row| [row["id"], row["name"], row["value"].to_f, row["amount"].to_f] }).to eq(
+      [[gst_row.id, "GST", 10.0, 10.0], [service_row.id, "Service", 5.0, 5.0]]
+    )
+    rows
+  end
+
+  # "Every invoice, line-item, invoice-tax and payment write, mobile-collection payments included,
+  # gets 503 ownership_moving while handoff_step is set and writes nothing"
+  it "refuses invoice update during a handoff and leaves the invoice money, its one line item and its tax rows unchanged" do
+    invoice.reload
+    money_before = invoice.attributes.slice("amount", "tax", "discount", "outstanding_amount")
+    line_before = line_item.reload.attributes.slice("rate", "quantity")
+    expect(line_before).to eq("rate" => 100, "quantity" => 60)
+    expect(invoice.invoice_line_items.count).to eq(1)
+    tax_rows_before = seeded_tax_baseline
+
+    TimekeepingOwnership.current.update!(handoff_step: "settle")
+
+    expect do
+      send_request :patch, api_v1_invoice_path(invoice), params: {
+        invoice: {
+          client_id: client.id,
+          invoice_number: "FENCE-U-001",
+          issue_date: invoice.issue_date.iso8601,
+          due_date: invoice.due_date.iso8601,
+          status: "draft",
+          currency: company.base_currency,
+          # Indexed keys keep each row's fields together; a form-encoded array would fold the
+          # id-less new row and the destroy row into one hash.
+          invoice_taxes_attributes: {
+            "0" => { id: gst_row.id, tax_configuration_id: gst.id, name: "GST", calculation_method: "percentage", value: 18, amount: 99 },
+            "1" => { tax_configuration_id: service.id, name: "Added", calculation_method: "percentage", value: 3, amount: 3 },
+            "2" => { id: service_row.id, _destroy: "1" }
+          },
+          invoice_line_items_attributes: [
+            { id: line_item.id, name: "Keep", description: "Keep", date: line_item.date.iso8601, rate: 250, quantity: 90 },
+            { name: "New", description: "New", date: Date.current.iso8601, rate: 10, quantity: 30 }
+          ]
+        }
+      }, headers: auth_headers(user)
+    end.to not_change(InvoiceLineItem, :count).and not_change(InvoiceTax, :count)
+
+    expect(response).to have_http_status(:service_unavailable)
+    expect(response.parsed_body["reason"]).to eq("ownership_moving")
+    expect(response.body).not_to include("settle")
+    expect(invoice.reload.attributes.slice("amount", "tax", "discount", "outstanding_amount")).to eq(money_before)
+    expect(line_item.reload.attributes.slice("rate", "quantity")).to eq(line_before)
+    expect(invoice.invoice_line_items.count).to eq(1)
+    expect(stored_invoice_tax_rows(invoice.id)).to eq(tax_rows_before)
+  end
+
+  # "Seed and assert a nonempty tax baseline, attempt nested tax changes during handoff, and compare the stored rows after refusal."
+  # The 503 is retryable, so a client resends the same request; neither attempt may write a tax row.
+  it "refuses a retried invoice update with nested tax update, add and destroy twice and leaves the seeded tax rows unchanged after both refusals" do
+    baseline = seeded_tax_baseline
+
+    TimekeepingOwnership.current.update!(handoff_step: "settle")
+    params = {
+      invoice: {
+        client_id: client.id,
+        invoice_number: "FENCE-U-001",
+        issue_date: invoice.issue_date.iso8601,
+        due_date: invoice.due_date.iso8601,
+        status: "draft",
+        currency: company.base_currency,
+        # Indexed keys keep the id-less new row apart from the destroy row, as in the update example above.
+        invoice_taxes_attributes: {
+          "0" => { id: gst_row.id, tax_configuration_id: gst.id, name: "GST", calculation_method: "percentage", value: 18, amount: 99 },
+          "1" => { tax_configuration_id: gst.id, name: "Added", calculation_method: "percentage", value: 3, amount: 3 },
+          "2" => { id: service_row.id, _destroy: "1" }
+        },
+        invoice_line_items_attributes: [
+          { id: line_item.id, name: "Keep", description: "Keep", date: line_item.date.iso8601, rate: 250, quantity: 90 }
+        ]
+      }
+    }
+
+    2.times do
+      send_request :patch, api_v1_invoice_path(invoice), params:, headers: auth_headers(user)
+      expect(response).to have_http_status(:service_unavailable)
+      expect(response.parsed_body["reason"]).to eq("ownership_moving")
+      # Checked after each attempt, so a write by the first attempt that the retry undoes is still caught.
+      expect(stored_invoice_tax_rows(invoice.id)).to eq(baseline)
+    end
+  end
+
+  # "Seed and assert a nonempty tax baseline, attempt nested tax changes during handoff, and compare the stored rows after refusal."
+  # A payload that only destroys rows sends no invoice scalar change, so only the stored rows can show a write.
+  it "refuses an invoice update during a handoff that destroys every seeded tax row and keeps all of them stored" do
+    baseline = seeded_tax_baseline
+
+    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(handoff_step: "close_admission")
+
+    expect do
+      send_request :patch, api_v1_invoice_path(invoice), params: {
+        invoice: {
+          client_id: client.id,
+          invoice_number: "FENCE-U-001",
+          issue_date: invoice.issue_date.iso8601,
+          due_date: invoice.due_date.iso8601,
+          status: "draft",
+          currency: company.base_currency,
+          invoice_taxes_attributes: [
+            { id: gst_row.id, _destroy: "1" },
+            { id: service_row.id, _destroy: "1" }
+          ]
+        }
+      }, headers: auth_headers(user)
+    end.to not_change(InvoiceTax, :count)
+
+    expect(response).to have_http_status(:service_unavailable)
+    expect(response.parsed_body["reason"]).to eq("ownership_moving")
+    expect(stored_invoice_tax_rows(invoice.id)).to eq(baseline)
+  end
+
+  # "Seed and assert a nonempty tax baseline, attempt nested tax changes during handoff, and compare the stored rows after refusal."
+  # A wrong tax row id must still meet the ownership_moving refusal, not a lookup error, and must touch no row.
+  it "refuses an invoice update during a handoff that names another invoice's tax row id and leaves both invoices' tax rows unchanged" do
+    other_invoice = create(:invoice, company:, client:, invoice_number: "FENCE-TAX-OTHER", status: :draft)
+    create(:invoice_line_item, invoice: other_invoice, timesheet_entry: nil, name: "Other", description: "Other", rate: 100, quantity: 60)
+    other_row = create(:invoice_tax, invoice: other_invoice, tax_configuration: gst, name: "GST", calculation_method: "percentage", value: 10, amount: 10)
+    seeded_tax_baseline
+    baseline = stored_invoice_tax_rows(invoice.id, other_invoice.id)
+    expect(baseline.map { |row| [row["id"], row["invoice_id"], row["amount"].to_f] }).to eq(
+      [[gst_row.id, invoice.id, 10.0], [service_row.id, invoice.id, 5.0], [other_row.id, other_invoice.id, 10.0]]
+    )
+
+    TimekeepingOwnership.current.update!(handoff_step: "freeze")
+
+    send_request :patch, api_v1_invoice_path(invoice), params: {
+      invoice: {
+        client_id: client.id,
+        invoice_number: "FENCE-U-001",
+        issue_date: invoice.issue_date.iso8601,
+        due_date: invoice.due_date.iso8601,
+        status: "draft",
+        currency: company.base_currency,
+        invoice_taxes_attributes: [
+          { id: other_row.id, tax_configuration_id: gst.id, name: "GST", calculation_method: "percentage", value: 18, amount: 99 },
+          { id: gst_row.id, tax_configuration_id: gst.id, name: "GST", calculation_method: "percentage", value: 18, amount: 99 }
+        ]
+      }
+    }, headers: auth_headers(user)
+
+    expect(response).to have_http_status(:service_unavailable)
+    expect(response.parsed_body["reason"]).to eq("ownership_moving")
+    expect(stored_invoice_tax_rows(invoice.id, other_invoice.id)).to eq(baseline)
+  end
+end
+
+RSpec.describe "Billing fence on invoice discard", type: :request do
+  let(:invoice) { create(:invoice_with_invoice_line_items) }
+  let(:company) { invoice.company }
+  let(:user) { create(:user, current_workspace_id: company.id) }
+
+  before do
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    sign_in user
+  end
+
+  # "The monolith also refuses every other invoice, line-item, invoice-tax and payment write with the same `503` while `handoff_step` is set."
+  it "refuses invoice discard during a handoff without exposing the handoff step and keeps the invoice and its line items" do
+    number_before = invoice.reload.invoice_number
+    expect(invoice).not_to be_discarded
+    expect(invoice.invoice_line_items).to exist
     TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update!(handoff_step: "close_admission")
 
-    send_request :delete, api_v1_invoice_path(id: invoice.id), headers: auth_headers(user)
+    expect do
+      send_request :delete, api_v1_invoice_path(id: invoice.id), headers: auth_headers(user)
+    end.not_to change(InvoiceLineItem, :count)
 
-    # "The monolith also refuses every other invoice, line-item, invoice-tax and payment write with the same `503` while `handoff_step` is set."
     expect(response).to have_http_status(:service_unavailable)
     expect(json_response["reason"]).to eq("ownership_moving")
     expect(response.headers["Retry-After"]).to eq("5")
@@ -27,26 +264,99 @@ RSpec.describe "Billing fence refusal body", type: :request do
     expect(response.body).not_to include("handoff_step")
     expect(response.body).not_to include("generation")
     expect(invoice.reload).not_to be_discarded
+    expect(invoice.invoice_number).to eq(number_before)
+  end
+end
+
+RSpec.describe "Billing fence across companies", type: :request do
+  it "refuses invoice discards for every company while a handoff is in progress" do
+    invoices = [create(:invoice_with_invoice_line_items), create(:invoice_with_invoice_line_items)]
+    expect(invoices.map(&:company_id).uniq.size).to eq(2)
+    expect(invoices.map { |invoice| invoice.reload.discarded? }).to eq([false, false])
+
+    # "Every monolith billing write transaction (invoice, line item, invoice tax, payment,
+    # mobile-collection payment included) takes FOR SHARE on the `timekeeping_ownership` row and
+    # reads `handoff_step` under that lock." The row is global, so no company is exempt.
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update!(handoff_step: "close_admission")
+
+    invoices.each do |invoice|
+      admin = create(:user, current_workspace_id: invoice.company.id)
+      create(:employment, company: invoice.company, user: admin)
+      admin.add_role :admin, invoice.company
+      sign_in admin
+
+      send_request :delete, api_v1_invoice_path(id: invoice.id), headers: auth_headers(admin)
+
+      # The company id labels which company's discard failed when this fails.
+      expect([invoice.company_id, response.status]).to eq([invoice.company_id, 503])
+      expect(json_response["reason"]).to eq("ownership_moving")
+      expect(invoice.reload).not_to be_discarded
+    end
+  end
+end
+
+RSpec.describe "Billing fence keeps company scoping", type: :request do
+  it "answers a discard of another company's invoice with 404 during a handoff while refusing its own with 503" do
+    own_invoice = create(:invoice_with_invoice_line_items)
+    foreign_invoice = create(:invoice_with_invoice_line_items)
+    company = own_invoice.company
+    admin = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    sign_in admin
+
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update!(handoff_step: "close_admission")
+
+    # Company scoping runs before the fence, so a foreign invoice is still not found, and a
+    # handoff never tells another company's caller that the invoice exists.
+    send_request :delete, api_v1_invoice_path(id: foreign_invoice.id), headers: auth_headers(admin)
+    expect(response).to have_http_status(:not_found)
+    expect(foreign_invoice.reload).not_to be_discarded
+
+    send_request :delete, api_v1_invoice_path(id: own_invoice.id), headers: auth_headers(admin)
+    expect(response).to have_http_status(:service_unavailable)
+    expect(own_invoice.reload).not_to be_discarded
   end
 end
 
 RSpec.describe "Billing fence authorization order", type: :request do
-  it "still forbids an employee during a handoff instead of answering 503" do
-    invoice = create(:invoice_with_invoice_line_items)
-    company = invoice.company
+  def sign_in_employee_of(company)
     user = create(:user, current_workspace_id: company.id)
     create(:employment, company:, user:)
     user.add_role :employee, company
     sign_in user
+    user
+  end
+
+  # Authorization runs before the fence opens, so a handoff never tells a
+  # caller without authority that a handoff is in progress.
+  it "still forbids an employee discarding an invoice during a handoff instead of answering 503" do
+    invoice = create(:invoice_with_invoice_line_items)
+    user = sign_in_employee_of(invoice.company)
     TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update!(handoff_step: "close_admission")
 
     send_request :delete, api_v1_invoice_path(id: invoice.id), headers: auth_headers(user)
 
-    # Authorization runs before the fence opens, so a handoff never tells a
-    # caller without authority that a handoff is in progress.
     expect(response).to have_http_status(:forbidden)
     expect(response.body).not_to include("ownership_moving")
+    expect(response.body).not_to include("close_admission")
     expect(invoice.reload).not_to be_discarded
+  end
+
+  it "answers 403 not 503 to an employee creating an invoice during a handoff and leaks no handoff step" do
+    company = create(:company)
+    user = sign_in_employee_of(company)
+    client = create(:client, company:)
+    TimekeepingOwnership.current.update!(handoff_step: "reconcile")
+
+    expect {
+      send_request :post, api_v1_invoices_path(invoice: { client_id: client.id, invoice_number: "FENCE-1",
+        issue_date: Date.current, due_date: Date.current }), headers: auth_headers(user)
+    }.not_to change(Invoice, :count)
+
+    expect(response).to have_http_status(:forbidden)
+    expect(response.body).not_to include("ownership_moving")
+    expect(response.body).not_to include("reconcile")
   end
 end
 
@@ -64,30 +374,45 @@ RSpec.describe "Billing fence authentication order", type: :request do
   end
 end
 
-RSpec.describe "Billing fence refusal body on invoice create", type: :request do
-  it "answers invoice create during a handoff with only the fixed refusal fields" do
-    company = create(:company, base_currency: "USD")
-    client = create(:client, company:)
-    user = create(:user, current_workspace_id: company.id)
+RSpec.describe "Billing fence on Razorpay payment links", type: :request do
+  let(:company) { create(:india_company, base_currency: "INR", plan_tier: "paid") }
+  let(:client) { create(:client, company:, currency: "INR", phone: "+919876543210") }
+  let(:invoice) { create(:invoice, company:, client:, currency: "INR", amount: 1200, amount_due: 1200, status: "sent") }
+  let(:user) { create(:user, current_workspace_id: company.id) }
+  let(:razorpay_client) { instance_double(PaymentProviders::RazorpayClient) }
+
+  before do
     create(:employment, company:, user:)
     user.add_role :admin, company
     sign_in user
-    TimekeepingOwnership.current.update_columns(handoff_step: "close_admission")
+    provider = build(
+      :payments_provider,
+      company:,
+      name: PaymentsProvider::RAZORPAY_PROVIDER,
+      connected: true,
+      enabled: true,
+      accepted_payment_methods: ["razorpay"],
+      settings: { enabled_on_invoices: true, key_id: "rzp_test_123", sms_notifications_enabled: true }
+    )
+    provider.key_secret = "secret"
+    provider.save!
+    allow(PaymentProviders::RazorpayClient).to receive(:new).and_return(razorpay_client)
+    allow(razorpay_client).to receive(:create_payment_link)
+  end
 
-    invoice = attributes_for(:invoice, invoice_number: "FENCE-SEC-1", client_id: client.id)
-    send_request :post, api_v1_invoices_path(invoice:), headers: auth_headers(user)
+  # "Every invoice, line-item, invoice-tax and payment write, mobile-collection payments included,
+  # gets 503 ownership_moving while handoff_step is set and writes nothing"
+  # A link created at the provider but never stored could be paid by the customer and then ignored
+  # by the webhook, so the refusal must come before the provider call.
+  it "refuses a Razorpay payment link during a handoff before any link is created at the provider" do
+    infos_before = invoice.reload.payment_infos
+    TimekeepingOwnership.current.update!(handoff_step: "close_admission")
 
-    # The ownership row is global, so anything the refusal exposes about the
-    # handoff is exposed to every tenant's callers.
+    post "/api/v1/invoices/#{invoice.id}/razorpay_payment_link", params: { notify_sms: true }, headers: auth_headers(user)
+
     expect(response).to have_http_status(:service_unavailable)
-    expect(response.headers["Retry-After"]).to eq("5")
-    body = JSON.parse(response.body)
-    expect(body.keys).to contain_exactly("errors", "reason")
-    expect(body["reason"]).to eq("ownership_moving")
-    expect(response.body).not_to include("close_admission")
-    expect(response.body).not_to include("handoff")
-    expect(response.body).not_to include("generation")
-    expect(response.body).not_to include("monolith")
-    expect(Invoice.where(invoice_number: "FENCE-SEC-1")).not_to exist
+    expect(response.parsed_body["reason"]).to eq("ownership_moving")
+    expect(razorpay_client).not_to have_received(:create_payment_link)
+    expect(invoice.reload.payment_infos).to eq(infos_before)
   end
 end

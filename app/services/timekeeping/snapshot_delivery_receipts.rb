@@ -73,8 +73,23 @@ module Timekeeping
         case value
         when Hash then "{#{value.sort_by { |key, _| key.to_s }.map { |key, item| "#{key.to_s.to_json}:#{canonical_json(item)}" }.join(",")}}"
         when Array then "[#{value.map { |item| canonical_json(item) }.join(",")}]"
+        when BigDecimal then number_json(value)
         else value.to_json
         end
+      end
+
+      # The batch parser reads decimals as BigDecimal, whose to_json is a
+      # quoted string: it would change the digest of every receipt stored when
+      # decimals were read as Floats, and match a JSON string of the same
+      # digits. A decimal a Float holds exactly is written as that Float was,
+      # so those receipts still replay; a finer one is written as a bare
+      # number with every digit.
+      def number_json(value)
+        float = value.to_f
+        return value.to_s("F") unless float.finite?
+
+        legacy = float.to_json
+        BigDecimal(legacy) == value ? legacy : value.to_s("F")
       end
   end
 end

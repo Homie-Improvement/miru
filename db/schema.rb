@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_10_26_130000) do
+ActiveRecord::Schema[8.1].define(version: 2026_10_26_130100) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pg_stat_statements"
@@ -656,6 +656,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_26_130000) do
   end
 
   create_table "invoice_operations", force: :cascade do |t|
+    t.string "actor_name", null: false
     t.bigint "company_id", null: false
     t.datetime "created_at", null: false
     t.bigint "desired_entry_ids", default: [], null: false, array: true
@@ -665,6 +666,8 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_26_130000) do
     t.bigint "invoice_id", null: false
     t.uuid "operation_id", null: false
     t.string "state", null: false
+    t.index ["company_id", "actor_name", "operation_id"], name: "index_invoice_operations_on_operation_key", unique: true
+    t.index ["company_id", "id", "operation_id"], name: "index_invoice_operations_on_owner_key", unique: true
     t.index ["company_id", "invoice_id"], name: "index_invoice_operations_one_prepared_per_invoice", unique: true, where: "((state)::text = 'prepared'::text)"
     t.check_constraint "disposition::text = ANY (ARRAY['active'::character varying, 'retained'::character varying]::text[])", name: "invoice_operations_disposition_check"
     t.check_constraint "state::text = ANY (ARRAY['prepared'::character varying, 'committed'::character varying, 'aborted'::character varying]::text[])", name: "invoice_operations_state_check"
