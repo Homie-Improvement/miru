@@ -200,7 +200,9 @@ RSpec.describe Timekeeping::ReferenceFacts, "role selection" do
     { case: "an admin here whose employment is discarded", role: nil,
       member: lambda {
         served_member(:admin).tap { |member| served_company.employments.find_by(user: member).discard! }
-      } }
+      } },
+    { case: "an employee who later holds owner and then admin", role: "owner",
+      member: -> { served_member(:employee, :owner, :admin) } }
   ].each do |row|
     expected = row[:role] ? "serves #{row[:role]}" : "leaves out the user"
     it "#{expected} for #{row[:case]}" do
