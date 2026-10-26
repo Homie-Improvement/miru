@@ -73,6 +73,25 @@ RSpec.describe DropTimesheetEntryForeignKeys do
     expect_every_dropped_key_present_and_validated
   end
 
+  # The old drop removed keys one at a time outside a transaction, so an
+  # interrupted run can leave a key gone with the version unrecorded. The
+  # runner skips down for an unrecorded version; the documented restore runs
+  # up first so that down then runs.
+  it "restores the keys through the migration runner when an interrupted drop left the version unrecorded" do
+    version = 20261020120000
+    connection.execute("DELETE FROM schema_migrations WHERE version = '#{version}'")
+    link_key = described_class::DROPPED_KEYS.first
+    connection.remove_foreign_key link_key[:from_table], link_key[:to_table], column: link_key[:column]
+    runner = ActiveRecord::Base.connection_pool.migration_context
+
+    ActiveRecord::Migration.suppress_messages do
+      runner.run(:up, version)
+      runner.run(:down, version)
+    end
+
+    expect_every_dropped_key_present_and_validated
+  end
+
   it "leaves the keys absent, rather than re-adding them unvalidated, when up runs on a database that lost them" do
     remove_dropped_keys
 
