@@ -8,6 +8,9 @@ module TimekeepingRules
   # types those rules compare, so every writer coerces them alike.
   module EntryDecision
     ID = /\A[0-9]{1,19}\z/
+    # The one work_date form every writer accepts. ISO 8601 also allows
+    # compact, week, ordinal and date-time forms, which the entry API refuses.
+    DATE = /\A[0-9]{4}-[0-9]{2}-[0-9]{2}\z/
 
     # Stands in for a user_id that is not an id at all. It equals no user id,
     # so EntryRules answers it as it answers a user who does not exist:

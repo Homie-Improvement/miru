@@ -13,7 +13,7 @@ module Timekeeping
   class EntryCommand < Data.define(:route, :company_id, :actor_id, :role, :entry_id, :operation, :key, :fingerprint,
                                    :body, :project_id, :generation, :if_match, :facts, :today)
     ID = /\A[0-9]{1,19}\z/
-    DATE = /\A[0-9]{4}-[0-9]{2}-[0-9]{2}\z/
+    DATE = TimekeepingRules::EntryDecision::DATE
     ACTOR_TYPE = "user"
     UNBILLED = "unbilled"
 

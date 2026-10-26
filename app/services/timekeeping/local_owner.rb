@@ -284,6 +284,8 @@ module Timekeeping
       def valid_fields?
         return false if operation == :create && !CREATE_REQUIRED_FIELDS.all? { |field| body.key?(field) }
         return false if BULK_ROUTES.include?(operation) && !body["entry_ids"].is_a?(Array)
+        # The snapshot cast reads any ISO 8601 date; the entry API takes only YYYY-MM-DD.
+        return false if body.key?("work_date") && !TimekeepingRules::EntryDecision::DATE.match?(body["work_date"].to_s)
 
         # A cast raises InvalidValue for a value it refuses; its result is not needed.
         CAST_FIELDS.each { |field| SnapshotBatch::FIELD_CASTS.fetch(field).call(body[field]) if body.key?(field) }
@@ -342,6 +344,7 @@ module Timekeeping
         checkpoint.call(:rows_locked)
         user_id = target_user_id(facts, role)
         return user_id if user_id.is_a?(Outcome)
+        return Outcome.refusal(:not_found) unless agent_known?(body["agent_id"], user_id)
 
         checkpoint.call(:rules_checked)
         entry = LocalEntry.create!(entry_fields.merge(
@@ -367,8 +370,20 @@ module Timekeeping
 
           fields["user_id"] = user_id
         end
+        if fields.key?("agent_id") || fields.key?("user_id")
+          agent_id = fields.fetch("agent_id", entry.agent_id)
+          return Outcome.refusal(:not_found) unless agent_known?(agent_id, fields.fetch("user_id", entry.user_id))
+        end
         checkpoint.call(:rules_checked)
         single_change(entry, fields)
+      end
+
+      # An entry's agent must be one of this company's agents and belong to
+      # the entry's user. The projection refuses any other pairing, and the
+      # relay delivers in order, so one refused snapshot would hold back every
+      # later one. Another company's agent answers like a missing one.
+      def agent_known?(agent_id, user_id)
+        agent_id.nil? || Agent.exists?(id: agent_id, company_id:, user_id:)
       end
 
       def destroy_entry(facts, role)

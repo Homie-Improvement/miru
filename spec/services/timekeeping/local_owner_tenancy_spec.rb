@@ -274,4 +274,45 @@ RSpec.describe Timekeeping::LocalOwner, "colleague access" do
     expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
     expect(row_counts).to eq(before_counts)
   end
+
+  # The projection refuses an agent of another company or user, so such a
+  # snapshot must never be committed.
+  it "answers not_found to a create naming another company's agent or a colleague's agent and stores nothing" do
+    foreign_agent = create(:agent, company: other_company, user: outsider)
+    colleague_agent = create(:agent, company:, user: colleague)
+    before_counts = row_counts
+
+    outcomes = [foreign_agent, colleague_agent].map do |agent|
+      write_as(employee, "employee", :create,
+               { "idempotency_key" => "agent-#{agent.id}", "body" => create_body("agent_id" => agent.id) })
+    end
+
+    expect(outcomes.map { |outcome| [outcome.status, outcome.body] }).to eq([[404, { "reason" => "not_found" }]] * 2)
+    expect(row_counts).to eq(before_counts)
+  end
+
+  it "creates an entry with the acting user's own agent" do
+    own_agent = create(:agent, company:, user: employee)
+
+    outcome = write_as(employee, "employee", :create,
+                       { "idempotency_key" => "own-agent", "body" => create_body("agent_id" => own_agent.id) })
+
+    expect(outcome.status).to eq(201)
+    expect(outcome.body.fetch("agent_id")).to eq(own_agent.id)
+  end
+
+  it "refuses moving an agent-backed entry to a user the agent does not belong to" do
+    entry = entry_of(colleague, "agent entry")
+    entry.update!(agent_id: create(:agent, company:, user: colleague).id)
+    before = entry.reload.attributes
+    before_counts = row_counts
+
+    outcome = write_as(admin, "admin", :update,
+                       { "idempotency_key" => "agent-reassign", "entry_id" => entry.id,
+                         "body" => { "user_id" => employee.id } })
+
+    expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
+    expect(entry.reload.attributes).to eq(before)
+    expect(row_counts).to eq(before_counts)
+  end
 end

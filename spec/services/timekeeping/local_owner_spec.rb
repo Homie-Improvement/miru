@@ -403,4 +403,30 @@ RSpec.describe Timekeeping::LocalOwner, "local owner write details" do
     expect(outcome.status).to eq(200)
     expect(entries.map { |entry| entry.reload.discarded_at }).to all(be_present)
   end
+
+  # The service answers 400 to these ISO 8601 forms, so the local owner must too.
+  it "refuses a work_date that is not YYYY-MM-DD with invalid_request and stores nothing" do
+    entry = stored_entry(note: "kept")
+    forms = ["20260302", "2026-03-02T10:00:00", "2026-W10-1", "2026-061"]
+
+    outcomes = forms.flat_map do |work_date|
+      [
+        described_class.call(
+          operation: :create, company_id: company.id, generation:, actor:,
+          params: { "idempotency_key" => "date-create-#{work_date}",
+                    "body" => { "project_id" => project.id, "work_date" => work_date, "duration" => 1.0,
+                                "note" => "n", "source" => "manual", "source_metadata" => {} } }
+        ),
+        described_class.call(
+          operation: :update, company_id: company.id, generation:, actor:,
+          params: { "idempotency_key" => "date-update-#{work_date}", "entry_id" => entry.id,
+                    "body" => { "work_date" => work_date } }
+        )
+      ]
+    end
+
+    expect(outcomes.map { |outcome| [outcome.status, outcome.body] }.uniq).to eq([[400, { "reason" => "invalid_request" }]])
+    expect(Timekeeping::LocalEntry.where(company_id: company.id).pluck(:id, :version)).to eq([[entry.id, 1]])
+    expect(Timekeeping::LocalOutboxEntry.count).to eq(0)
+  end
 end
