@@ -433,40 +433,46 @@ RSpec.describe "Api::V1::Invoices#update timesheet entry company scope", type: :
   it "refuses a link-only update naming a foreign entry exactly like a missing id and keeps the old links" do
     join_row_ids = InvoiceLineItemTimeEntry.where(invoice_line_item_id: aggregate_line.id).pluck(:id)
 
-    foreign_result = nil
-    missing_result = nil
-    expect do
-      foreign_result = patch_company_scope_line(aggregate_line, linked_timesheet_entry_ids: [foreign_entry.id])
-      missing_result = patch_company_scope_line(aggregate_line, linked_timesheet_entry_ids: [missing_id])
-    end.to not_change(Invoice, :count)
-      .and not_change(InvoiceLineItem, :count)
-      .and not_change(InvoiceLineItemTimeEntry, :count)
+    # Each refused call is checked against the seeded state on its own, so a write by the first
+    # cannot hide behind the second.
+    results = [[foreign_entry.id], [missing_id]].map do |entry_ids|
+      result = nil
+      expect do
+        result = patch_company_scope_line(aggregate_line, linked_timesheet_entry_ids: entry_ids)
+      end.to not_change(Invoice, :count)
+        .and not_change(InvoiceLineItem, :count)
+        .and not_change(InvoiceLineItemTimeEntry, :count)
+      expect(aggregate_line.reload.linked_timesheet_entry_ids).to eq([own_entry.id])
+      expect(InvoiceLineItemTimeEntry.where(invoice_line_item_id: aggregate_line.id).pluck(:id)).to eq(join_row_ids)
+      expect(foreign_entry.reload.locked).to be(false)
+      result
+    end
+    foreign_result, missing_result = results
 
     expect(foreign_result.first).to eq(422)
     expect(foreign_result).to eq(missing_result)
     expect(JSON.parse(foreign_result.last)["errors"]).to include("not found")
     expect(foreign_result.last).not_to include(foreign_entry.id.to_s)
-    expect(aggregate_line.reload.linked_timesheet_entry_ids).to eq([own_entry.id])
-    expect(InvoiceLineItemTimeEntry.where(invoice_line_item_id: aggregate_line.id).pluck(:id)).to eq(join_row_ids)
-    expect(foreign_entry.reload.locked).to be(false)
   end
 
   it "refuses a foreign direct timesheet_entry_id exactly like a missing one and leaves the line without an entry" do
-    foreign_result = nil
-    missing_result = nil
-    expect do
-      foreign_result = patch_company_scope_line(manual_line, timesheet_entry_id: foreign_entry.id)
-      missing_result = patch_company_scope_line(manual_line, timesheet_entry_id: missing_id)
-    end.to not_change(Invoice, :count)
-      .and not_change(InvoiceLineItem, :count)
-      .and not_change(InvoiceLineItemTimeEntry, :count)
+    results = [foreign_entry.id, missing_id].map do |entry_id|
+      result = nil
+      expect do
+        result = patch_company_scope_line(manual_line, timesheet_entry_id: entry_id)
+      end.to not_change(Invoice, :count)
+        .and not_change(InvoiceLineItem, :count)
+        .and not_change(InvoiceLineItemTimeEntry, :count)
+      expect(manual_line.reload.timesheet_entry_id).to be_nil
+      expect(foreign_entry.reload.locked).to be(false)
+      result
+    end
+    foreign_result, missing_result = results
 
     expect(foreign_result.first).to eq(422)
     expect(foreign_result).to eq(missing_result)
     expect(JSON.parse(foreign_result.last)["errors"]).to include("not found")
     expect(foreign_result.last).not_to include(foreign_entry.id.to_s)
-    expect(manual_line.reload.timesheet_entry_id).to be_nil
-    expect(foreign_entry.reload.locked).to be(false)
   end
 
   it "refuses a NULL-company entry, direct or linked, exactly like a missing id and leaves it unlocked" do
