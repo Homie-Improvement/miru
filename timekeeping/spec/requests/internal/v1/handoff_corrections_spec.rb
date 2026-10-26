@@ -45,13 +45,15 @@ RSpec.describe "Timekeeping internal handoff correction snapshots" do
     Timekeeping::Admission.fence!
     corrections = [handoff_correction_snapshot(first, locked: false), handoff_correction_snapshot(second, locked: false)]
     expect(put_handoff_corrections(corrections)).to eq([200, { "written" => 2 }])
-    before = stored_handoff_corrections
-    expect(before).to contain_exactly([1, first.id, 2, 1, false], [1, second.id, 2, 1, false])
+    expect(stored_handoff_corrections).to contain_exactly([1, first.id, 2, 1, false], [1, second.id, 2, 1, false])
+    # Every column of every stored row, outbox_position included, so a refusal
+    # that replaced a snapshot before rejecting the request is caught.
+    before = handoff_stored_rows
 
     duplicate = [handoff_correction_snapshot(first, locked: false), handoff_correction_snapshot(first, locked: true)]
 
     expect(put_handoff_corrections(duplicate)).to eq([400, { "reason" => "invalid_request" }])
-    expect(stored_handoff_corrections).to eq(before)
+    expect(handoff_stored_rows).to eq(before)
   end
 
   it "stores a decimal sent as a bare JSON number exactly" do
