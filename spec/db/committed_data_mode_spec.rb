@@ -59,19 +59,16 @@ RSpec.describe "Committed-data test mode", committed_data: true do
     expect { TimekeepingOwnership.current }.not_to raise_error
   end
 
-  # "the ownership row exists after it"
-  it "restores the ownership row after a committed_data example that emptied it" do
+  # Runs one inner example with the suite's registered hooks, in a group the
+  # surrounding run does not report, and returns its execution result.
+  def run_committed_data_inner_example(metadata, &body)
     inner_results = []
     listener = Object.new
     listener.define_singleton_method(:example_finished) { |notification| inner_results << notification.example.execution_result }
     reporter = RSpec::Core::Reporter.new(RSpec::Core::Configuration.new)
     reporter.register_listener(listener, :example_finished)
-
-    # The inner example empties the ownership table and commits that, as a
-    # deletion or a separate connection would; the tag's cleanup must put the
-    # row back once the example ends.
-    group = RSpec::Core::ExampleGroup.subclass(RSpec::Core::ExampleGroup, "tagged inner example", [{ committed_data: true }], []) do
-      it("empties the ownership table") { TimekeepingOwnership.delete_all }
+    group = RSpec::Core::ExampleGroup.subclass(RSpec::Core::ExampleGroup, "inner example", [metadata], []) do
+      it("runs the inner body", &body)
     end
 
     outer_example = RSpec.current_example
@@ -83,10 +80,39 @@ RSpec.describe "Committed-data test mode", committed_data: true do
     end
 
     expect(inner_results.size).to eq(1)
-    expect(inner_results.first.exception).to be_nil
+    inner_results.first
+  end
+
+  # "the ownership row exists after it"
+  it "restores the ownership row after a committed_data example that emptied it" do
+    # The inner example empties the ownership table and commits that, as a
+    # deletion or a separate connection would; the tag's cleanup must put the
+    # row back once the example ends.
+    result = run_committed_data_inner_example(committed_data: true) { TimekeepingOwnership.delete_all }
+
+    expect(result.exception).to be_nil
     expect(TimekeepingOwnership.count).to eq(1)
     expect { TimekeepingOwnership.current }.not_to raise_error
   ensure
     TimekeepingOwnership.ensure_initial!
+  end
+
+  # "an after-each step that runs after `DatabaseCleaner.clean`": an ordinary
+  # transactional example whose intent and outbox rows were committed on
+  # another connection leaves none of them behind.
+  it "removes ledger rows another connection committed during an ordinary transactional example" do
+    result = run_committed_data_inner_example({}) do
+      operation_id = SecureRandom.uuid
+      Thread.new do
+        ActiveRecord::Base.connection_pool.with_connection do
+          InvoiceOperationIntent.create!(company_id: 1, invoice_id: 10, operation_id:, state: "pending", generation: 1)
+          InvoiceOperationOutboxItem.create!(company_id: 1, invoice_id: 10, operation_id:, kind: "commit", payload: {})
+        end
+      end.join
+    end
+
+    expect(result.exception).to be_nil
+    expect(committed_data_count_elsewhere("SELECT count(*) FROM invoice_operation_intents")).to eq(0)
+    expect(committed_data_count_elsewhere("SELECT count(*) FROM invoice_operation_outbox_items")).to eq(0)
   end
 end

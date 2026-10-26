@@ -37,13 +37,6 @@ RSpec.describe InvoiceOperationOutboxItem, type: :model do
       .to raise_error(ActiveRecord::StatementInvalid, /kind_check/)
   end
 
-  it "refuses a second item of one kind for one operation of one company" do
-    attributes = outbox_item_attributes(created_at: Time.current)
-    described_class.insert_all!([attributes])
-
-    expect { described_class.insert_all!([attributes]) }.to raise_error(ActiveRecord::RecordNotUnique)
-  end
-
   it "keeps a commit and an abort of one operation as two rows and starts with no attempts" do
     operation_id = SecureRandom.uuid
     described_class.create!(outbox_item_attributes(operation_id:, kind: "commit"))

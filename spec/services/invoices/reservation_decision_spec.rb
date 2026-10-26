@@ -54,6 +54,17 @@ RSpec.describe Invoices::ReservationDecision do
     expect(destroyed).to eq(entries: [1, 2], disposition: "retained")
   end
 
+  # The held set is sent, not held union lines, even when the lines carry an entry not yet held.
+  it "ignores added lines when a non-draft is discarded or destroyed" do
+    held = { entries: [1, 2], disposition: "active" }
+
+    discarded = described_class.call(status: "sent", discarded: true, destroyed: false, held:, lines: [2, 5])
+    destroyed = described_class.call(status: "sent", discarded: false, destroyed: true, held:, lines: [2, 5])
+
+    expect(discarded).to eq(entries: [1, 2], disposition: "retained")
+    expect(destroyed).to eq(entries: [1, 2], disposition: "retained")
+  end
+
   # Both flags at once, with the lines already emptied, must still keep every held entry.
   it "never drops a held entry when a sent invoice loses lines and is then discarded and destroyed together" do
     result = described_class.call(
