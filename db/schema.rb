@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_10_26_120000) do
+ActiveRecord::Schema[8.1].define(version: 2026_10_26_120100) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pg_stat_statements"
@@ -456,6 +456,19 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_26_120000) do
     t.jsonb "payload", null: false
     t.datetime "sent_at"
     t.index ["company_id", "entry_id"], name: "index_entry_outbox_items_on_company_id_and_entry_id"
+  end
+
+  create_table "entry_snapshot_receipts", force: :cascade do |t|
+    t.string "actor", null: false
+    t.bigint "company_ids", null: false, array: true
+    t.datetime "created_at", null: false
+    t.datetime "expires_at", null: false
+    t.string "key", null: false
+    t.string "request_digest", null: false
+    t.jsonb "response_body", default: {}, null: false
+    t.integer "response_status", null: false
+    t.index ["company_ids", "actor", "key"], name: "index_entry_snapshot_receipts_on_scope_and_key", unique: true
+    t.index ["expires_at"], name: "index_entry_snapshot_receipts_on_expires_at"
   end
 
   create_table "exchange_rate_usages", force: :cascade do |t|

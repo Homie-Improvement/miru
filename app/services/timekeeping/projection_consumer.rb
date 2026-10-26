@@ -63,14 +63,19 @@ module Timekeeping
       def apply(items)
         TimesheetEntry.transaction(requires_new: true) do
           connection.execute(MARK_PROJECTION_WRITER_SQL)
-          refuse_stale_generations!(items)
-          stored_companies = lock_stored_rows(items.map(&:entry_id))
-          refuse_company_mismatch!(items, stored_companies)
-          refuse_foreign_projects!(items)
-
-          applied = items.count { |item| upsert(item) }
-          Result.new(status: 200, body: { "applied" => applied, "ignored" => items.size - applied })
+          receipts = SnapshotDeliveryReceipts.new(key: @idempotency_key, batch: @batch, company_ids: items.map(&:company_id))
+          receipts.stored_answer || receipts.store(write(items))
         end
+      end
+
+      def write(items)
+        refuse_stale_generations!(items)
+        stored_companies = lock_stored_rows(items.map(&:entry_id))
+        refuse_company_mismatch!(items, stored_companies)
+        refuse_foreign_projects!(items)
+
+        applied = items.count { |item| upsert(item) }
+        Result.new(status: 200, body: { "applied" => applied, "ignored" => items.size - applied })
       end
 
       # The share lock makes an ownership flip wait for this batch, so no
