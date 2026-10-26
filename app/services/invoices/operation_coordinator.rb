@@ -117,18 +117,11 @@ module Invoices
       end
 
       def insert_outbox_item(request, kind, generation)
-        InvoiceOperationOutboxItem.create!(
-          company_id: request.company_id, invoice_id: request.invoice_id,
-          operation_id: request.operation_id, kind:, payload: payload_for(request, generation)
-        ).id
-      end
-
-      def payload_for(request, generation)
-        {
-          company_id: request.company_id, invoice_id: request.invoice_id,
+        InvoiceOperationOutboxItem.record!(
+          kind:, company_id: request.company_id, invoice_id: request.invoice_id,
           operation_id: request.operation_id, generation:,
           disposition: request.disposition, desired_entry_ids: request.entries
-        }
+        )
       end
 
       def deliver(outbox_item_id)

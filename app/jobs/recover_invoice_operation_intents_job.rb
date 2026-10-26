@@ -60,14 +60,10 @@ class RecoverInvoiceOperationIntentsJob < ApplicationJob
     end
 
     def insert_abort_item(intent)
-      InvoiceOperationOutboxItem.create!(
-        company_id: intent.company_id, invoice_id: intent.invoice_id,
-        operation_id: intent.operation_id, kind: "abort",
-        payload: {
-          company_id: intent.company_id, invoice_id: intent.invoice_id,
-          operation_id: intent.operation_id, generation: intent.generation,
-          disposition: intent.disposition, desired_entry_ids: intent.desired_entry_ids
-        }
+      InvoiceOperationOutboxItem.record!(
+        kind: "abort", company_id: intent.company_id, invoice_id: intent.invoice_id,
+        operation_id: intent.operation_id, generation: intent.generation,
+        disposition: intent.disposition, desired_entry_ids: intent.desired_entry_ids
       )
     end
 
