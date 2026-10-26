@@ -23,6 +23,8 @@ Rails.application.routes.draw do
     if defined?(Timekeeping::TestHooks)
       post "test-hooks/relay/pause", to: "test_hooks#pause"
       post "test-hooks/relay/resume", to: "test_hooks#resume"
+      post "test-hooks/writes/delay", to: "test_hooks#delay_writes"
+      post "test-hooks/writes/clear", to: "test_hooks#clear_write_delay"
     end
   end
 end
