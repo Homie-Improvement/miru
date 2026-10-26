@@ -65,6 +65,7 @@ RSpec.describe "Reservation prepare outbox failure through reservation_post" do
     retried = reservation_post("prepare", company:, credential: service, body:)
 
     expect([retried.status, retried.parsed_body.fetch("state")]).to eq([200, "prepared"])
+    expect(timekeeping_arrange.reservations_for(entry)).to eq([{ "invoice_id" => 501, "state" => "provisional" }])
     expect(OutboxSnapshot.where(id: entry).count).to eq(1)
     expect(reservation_row_counts.values_at(:reservations, :operations, :outbox_snapshots))
       .to eq([before[:reservations] + 1, before[:operations] + 1, before[:outbox_snapshots] + 1])

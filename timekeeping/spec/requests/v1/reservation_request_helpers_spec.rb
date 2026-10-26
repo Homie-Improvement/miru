@@ -6,13 +6,16 @@ require "rails_helper"
 require "webmock/rspec"
 require_relative "../../../../spec/support/timekeeping/contract"
 
+# The helper's own contract: routes and paths come from
+# contracts/timekeeping/reservations.yml, a nil credential sends no header, the
+# generation is merged in, and company and credential are always named. What
+# each route answers is owned by the reservation request specs that use it.
 RSpec.describe "Shared reservation request helpers: route list" do
   include_context "timekeeping entry writes"
 
   it "reservation_routes lists the five contract routes in contract order, each once" do
     routes = reservation_routes
 
-    # The route names come from contracts/timekeeping/reservations.yml, so no spec pastes its own list.
     expect(routes).to eq(TimekeepingContract.load(:reservations).fetch("routes").keys)
     expect(routes).to eq(%w[prepare commit abort mark_billed detach_entries])
     expect(routes.uniq.size).to eq(routes.size)
@@ -20,14 +23,12 @@ RSpec.describe "Shared reservation request helpers: route list" do
 
   # A misspelt route must fail loudly instead of posting to a blank path that
   # answers 404 and passes a refusal check by accident.
-  it "refuses to post a route the contract does not name and writes nothing" do
+  it "refuses to post a route the contract does not name" do
     company = timekeeping_arrange.company
     service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: reservation_routes)
-    before = reservation_row_counts
 
     expect { reservation_post("refund", company:, credential: service, body: { "operation_id" => SecureRandom.uuid }) }
-      .to raise_error(StandardError)
-    expect(reservation_row_counts).to eq(before)
+      .to raise_error(KeyError, /refund/)
   end
 end
 
@@ -36,50 +37,36 @@ RSpec.describe "Shared reservation request helpers: no credential" do
 
   # A helper that sent "Bearer " for nil would test a malformed token, not an
   # anonymous caller, and the matrix's 401 row would prove nothing.
-  it "reservation_post with a nil credential sends no Authorization header and every route answers unauthorized without writing" do
+  it "reservation_post with a nil credential sends no Authorization header on any route" do
     company = timekeeping_arrange.company
-    entry_id = timekeeping_arrange.entry(company:, user: timekeeping_arrange.user(company:, role: "employee"),
-                                         project: timekeeping_arrange.project(company:))
     path_params = { "mark_billed" => { invoice_id: 501 }, "detach_entries" => { agent_id: 77 } }
-    before = reservation_row_counts
 
     reservation_routes.each do |route|
-      answer = reservation_post(route, company:, credential: nil,
-                                       body: { "invoice_id" => 501, "operation_id" => SecureRandom.uuid,
-                                               "disposition" => "active", "entries" => [entry_id] },
+      answer = reservation_post(route, company:, credential: nil, body: { "operation_id" => SecureRandom.uuid },
                                        **path_params.fetch(route, {}))
 
       expect([route, answer.request.headers["Authorization"]]).to eq([route, nil])
-      expect([route, answer.status, answer.parsed_body]).to eq([route, 401, { "reason" => "unauthorized" }])
     end
-    expect(reservation_row_counts).to eq(before)
-    expect(Reservation.where(entry_id:)).to be_empty
   end
 end
 
 RSpec.describe "Shared reservation request helpers: mark-billed path" do
   include_context "timekeeping entry writes"
 
-  it "reservation_post fills the invoice_id path parameter and the current generation for mark_billed, and a replay bills nothing again" do
+  it "reservation_post fills the invoice_id path parameter and the current generation for mark_billed" do
     company = timekeeping_arrange.company
     billable = timekeeping_arrange.reserved_entry(company:, invoice_id: 501, state: "committed")
     other_invoice_entry = timekeeping_arrange.reserved_entry(company:, invoice_id: 502, state: "committed")
     service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: reservation_routes)
-    body = { "operation_id" => SecureRandom.uuid }
 
     # The body carries no generation: the helper must add the current one or the route refuses the call.
-    answer = reservation_post("mark_billed", company:, credential: service, body:, invoice_id: 501)
+    answer = reservation_post("mark_billed", company:, credential: service,
+                                             body: { "operation_id" => SecureRandom.uuid }, invoice_id: 501)
 
     expect(answer.request.path).to eq("/v1/companies/#{company}/invoices/501/mark-billed")
     expect([answer.status, answer.parsed_body]).to eq([200, { "billed" => 1 }])
     expect(Entry.find(billable).bill_status).to eq("billed")
     expect(Entry.find(other_invoice_entry).bill_status).to eq("unbilled")
-    after_first = reservation_row_counts
-
-    replay = reservation_post("mark_billed", company:, credential: service, body:, invoice_id: 501)
-
-    expect([replay.status, replay.parsed_body]).to eq([200, { "billed" => 1 }])
-    expect(reservation_row_counts.except(:receipts)).to eq(after_first.except(:receipts))
   end
 end
 
@@ -109,21 +96,17 @@ RSpec.describe "Shared reservation request helpers: path company" do
 
   # A helper that quietly posted to the credential's own company would turn
   # every cross-company refusal into a passing write.
-  it "reservation_post sends to the path company it is given, so a service bound elsewhere gets not_found" do
+  it "reservation_post sends to the path company it is given, not the credential's company" do
     company = timekeeping_arrange.company
     other_company = timekeeping_arrange.company
     service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: reservation_routes)
     body = { "invoice_id" => 501, "operation_id" => SecureRandom.uuid, "disposition" => "active", "entries" => [] }
-    before = reservation_row_counts
 
     foreign = reservation_post("prepare", company: other_company, credential: service, body:)
-
     expect(foreign.request.path).to eq("/v1/companies/#{other_company}/reservations/prepare")
-    expect([foreign.status, foreign.parsed_body]).to eq([404, { "reason" => "not_found" }])
-    expect(reservation_row_counts).to eq(before)
 
     own = reservation_post("prepare", company:, credential: service, body:)
-
+    expect(own.request.path).to eq("/v1/companies/#{company}/reservations/prepare")
     expect([own.status, own.parsed_body.fetch("state")]).to eq([200, "prepared"])
   end
 end
@@ -138,35 +121,5 @@ RSpec.describe "Shared reservation request helpers: required keywords" do
     # A default company would let a cross-company case quietly call its own company and prove nothing.
     expect { reservation_post("commit", credential: service) }.to raise_error(ArgumentError, /company/)
     expect { reservation_post("commit", company:) }.to raise_error(ArgumentError, /credential/)
-  end
-end
-
-RSpec.describe "Shared reservation request helpers: row counts" do
-  include_context "timekeeping entry writes"
-
-  # The copies drifted because some counted the user receipt table and none of
-  # the operation rows; these counts must move when a service write lands.
-  it "reservation_row_counts reports every reservation table and the version sum, and sees a prepare's rows" do
-    company = timekeeping_arrange.company
-    entry_id = timekeeping_arrange.entry(company:, user: timekeeping_arrange.user(company:, role: "employee"),
-                                         project: timekeeping_arrange.project(company:))
-    service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: reservation_routes)
-    before = reservation_row_counts
-
-    expect(before.keys).to eq(%i[reservations operations audit_events outbox_snapshots receipts versions])
-    expect(before).to eq(reservations: Reservation.count, operations: InvoiceOperation.count,
-                         audit_events: AuditEvent.count, outbox_snapshots: OutboxSnapshot.count,
-                         receipts: ServiceIdempotencyReceipt.count, versions: Entry.sum(:version))
-
-    prepared = reservation_post("prepare", company:, credential: service,
-                                           body: { "invoice_id" => 501, "operation_id" => SecureRandom.uuid,
-                                                   "disposition" => "active", "entries" => [entry_id] })
-    expect(prepared.status).to eq(200)
-
-    after = reservation_row_counts
-    expect(after.slice(:reservations, :operations, :audit_events, :outbox_snapshots))
-      .to eq(reservations: before[:reservations] + 1, operations: before[:operations] + 1,
-             audit_events: before[:audit_events] + 1, outbox_snapshots: before[:outbox_snapshots] + 1)
-    expect(after[:versions]).to eq(before[:versions] + 1)
   end
 end

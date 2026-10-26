@@ -27,7 +27,7 @@ module ReservationRequests
   private
 
     def reservation_route_path(route, **params)
-      TimekeepingContract.load(:reservations).dig("routes", route.to_s, "path")
+      TimekeepingContract.load(:reservations).fetch("routes").fetch(route.to_s).fetch("path")
         .gsub(/\{(\w+)\}/) { params.fetch(Regexp.last_match(1).to_sym) }
     end
 end

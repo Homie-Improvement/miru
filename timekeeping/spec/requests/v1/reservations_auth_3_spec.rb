@@ -50,7 +50,8 @@ RSpec.describe "Reservation route access through reservation_post" do
         "all but this route" => [timekeeping_arrange.service_identity(company:, name: "invoice-boundary",
                                                                       operations: reservation_routes - [route]), 403, "forbidden"],
         "other company" => [timekeeping_arrange.service_identity(company: other_company, name: "invoice-boundary",
-                                                                 operations: reservation_routes), 404, "not_found"]
+                                                                 operations: reservation_routes), 404, "not_found"],
+        "admin user token" => [timekeeping_arrange.token_for(timekeeping_arrange.user(company:, role: "admin")), 403, "forbidden"]
       }
       credentials.each do |label, (credential, status, reason)|
         answer = reservation_post(route, company:, credential:, body:, **path_params)
