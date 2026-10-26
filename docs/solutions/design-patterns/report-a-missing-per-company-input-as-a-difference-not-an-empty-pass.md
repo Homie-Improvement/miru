@@ -5,7 +5,7 @@ problem_type: design_pattern
 component: timekeeping_handoff
 severity: high
 evidence_grounding: anchored
-grounding_evidence: lib/timekeeping/handoff/reconciliation.rb run builds company_ids from every input including money maps, corrections and expected_reservations; check_money emits :snapshot_missing per missing side; check_inputs! raises ArgumentError for a snapshot or expected reservation filed under another company; reconciliation_5_spec.rb and reconciliation_spec.rb cover both cases
+grounding_evidence: lib/timekeeping/handoff/reconciliation.rb run builds company_ids from every input including money maps, corrections and expected_reservations; check_money emits :snapshot_missing per missing side; check_inputs! raises ArgumentError for a snapshot or expected reservation filed under another company; reconciliation_spec.rb covers both cases
 audience: both
 related_components:
   - timekeeping_handoff
@@ -46,5 +46,4 @@ In a per-company verdict, "no differences" and "no data" look the same unless th
 PR #92, head commit 23fd205128e594c79c537a6f660c31934c92f3e2.
 
 - `lib/timekeeping/handoff/reconciliation.rb`: `run` builds `company_ids` from all row inputs and adds the keys of `money_before`, `money_after`, `listed_corrections` and `expected_reservations`. `check_money` returns `:snapshot_missing` differences when a side is nil. `check_inputs!` raises for a snapshot or an expected reservation filed under another company. `place_projection` sends unclaimed nil-company rows to `unassigned`, and `Result#abort?` aborts on any of them.
-- `spec/lib/timekeeping/handoff/reconciliation_5_spec.rb`, "a company with entries but no financial snapshot on either side fails its money check" and "a projection row with no company whose id two companies share is unassigned and aborts without entering either company report".
-- `spec/lib/timekeeping/handoff/reconciliation_spec.rb`, "refuses a classification row filed under a company other than its own".
+- `spec/lib/timekeeping/handoff/reconciliation_spec.rb`, "fails the money check of a company with entries but no financial snapshot on either side", "leaves a projection row with no company whose id two companies share unassigned and aborts" and "refuses a classification row filed under a company other than its own".
