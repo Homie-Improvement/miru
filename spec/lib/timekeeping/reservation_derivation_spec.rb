@@ -379,6 +379,11 @@ RSpec.describe Timekeeping::ReservationDerivation do
     expect(first["operation_id"]).not_to eq(second["operation_id"])
   end
 
+  it "freezes the owner table and each of its rows" do
+    expect(described_class::OWNER_TABLE).to be_frozen
+    expect(described_class::OWNER_TABLE.values).to all(be_frozen)
+  end
+
   it "derives operation_id as the RFC 4122 UUIDv5 of company, entry and invoice under the fixed namespace" do
     expect(described_class.operation_id(company_id: 1, entry_id: 2, invoice_id: 3))
       .to eq("d144e460-1f35-5745-b31c-a17874ecd9b3")

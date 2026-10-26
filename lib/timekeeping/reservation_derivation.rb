@@ -26,7 +26,7 @@ module Timekeeping
       # Only reached when the recorded disposition equals the live listing and
       # reserves every invoice; any other record refuses.
       unlocked_links: { owner: ->(facts) { facts[:kept].first }, disposition: "active" }
-    }.freeze
+    }.transform_values(&:freeze).freeze
 
     # Pre-flight lists that refuse the company whenever they hold an entry.
     REFUSED_LISTS = { orphans: "orphan", conflicts: "conflict" }.freeze
@@ -96,8 +96,9 @@ module Timekeeping
     def disposition_refusals(classification, invoice_numbers, recorded_invoices)
       unlocked_links = classification.fetch(:unlocked_links)
       unnumbered = unlocked_links.reject { |link| invoice_numbers[link[:invoice_id]] }
-      live_invoices = (unlocked_links - unnumbered).group_by { |link| invoice_numbers.fetch(link[:invoice_id]) }
-        .transform_values { |links| { "entry_ids" => links.pluck(:entry_id).sort, "disposition" => SeedDisposition::RESERVE } }
+      live_invoices = SeedDisposition.invoices_with_unlocked_links(
+        { classification: { unlocked_links: unlocked_links - unnumbered }, invoice_numbers: }
+      )
       unknown_numbers = recorded_invoices.keys - invoice_numbers.values
 
       label = "this company"
