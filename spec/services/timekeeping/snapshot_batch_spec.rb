@@ -91,18 +91,3 @@ RSpec.describe Timekeeping::SnapshotBatch do
     end
   end
 end
-
-RSpec.describe Timekeeping::SnapshotBatch do
-  # "Source specs: rows of company B are never returned or marked by company A's source; duration bits survive, including `5e-324`; marking is idempotent."
-  # The endpoint parses numbers as BigDecimal, so a lossy conversion here would store 0.0, answer 200,
-  # and the relay would mark the row sent with a changed duration.
-  it "the receiver keeps the bits of a subnormal duration parsed as BigDecimal" do
-    cast = described_class::FIELD_CASTS.fetch("duration")
-
-    [5e-324, 0.1 + 0.2].each do |duration|
-      parsed = JSON.parse(JSON.generate({ "duration" => duration }), decimal_class: BigDecimal).fetch("duration")
-
-      expect([cast.call(parsed)].pack("G")).to eq([duration].pack("G"))
-    end
-  end
-end

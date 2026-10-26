@@ -5,13 +5,16 @@
 require "rails_helper"
 
 RSpec.describe Timekeeping::LocalSnapshotEndpoint do
+  let(:local_endpoint_batch) do
+    { "schema_version" => 1, "snapshots" => [{ "generation" => 1, "outbox_position" => 1, "entry" => {} }] }
+  end
+
   # "Log failures without the response body or the token. Pass nothing secret as a job argument."
   it "logs a refused delivery without the response body or the service token" do
     body_marker = "body-marker-#{SecureRandom.hex(8)}"
     log = StringIO.new
     logger = Logger.new(log)
     logger.level = Logger::DEBUG
-    batch = { "schema_version" => 1, "snapshots" => [{ "generation" => 1, "outbox_position" => 1, "entry" => {} }] }
 
     with_timekeeping_service_token do |token|
       with_timekeeping_env("TIMEKEEPING_PROJECTION_URL", "https://projection.example.test") do
@@ -19,7 +22,7 @@ RSpec.describe Timekeeping::LocalSnapshotEndpoint do
           .to_return(status: 409, body: { reason: "stale_generation", echo: "#{body_marker} #{token}" }.to_json,
                      headers: { "Content-Type" => "application/json" })
 
-        answer = described_class.configured(logger:).deliver(batch, idempotency_key: SecureRandom.uuid)
+        answer = described_class.configured(logger:).deliver(local_endpoint_batch, idempotency_key: SecureRandom.uuid)
 
         expect(answer.delivered?(1)).to be(false)
         expect(log.string).to include("status=409")
@@ -28,9 +31,7 @@ RSpec.describe Timekeeping::LocalSnapshotEndpoint do
       end
     end
   end
-end
 
-RSpec.describe Timekeeping::LocalSnapshotEndpoint do
   it "keeps the service token out of the endpoint's inspect output" do
     with_timekeeping_service_token do |token|
       with_timekeeping_env("TIMEKEEPING_PROJECTION_URL", "https://projection.example.test") do
@@ -41,12 +42,9 @@ RSpec.describe Timekeeping::LocalSnapshotEndpoint do
       end
     end
   end
-end
 
-RSpec.describe Timekeeping::LocalSnapshotEndpoint do
   # "Delivery posts to POST /internal/v1/timekeeping/entry-snapshots with TIMEKEEPING_SERVICE_TOKEN, and a failed post logs neither the response body nor the token"
   it "posts with the service token to the entry-snapshots path of TIMEKEEPING_PROJECTION_URL" do
-    batch = { "schema_version" => 1, "snapshots" => [{ "generation" => 1, "outbox_position" => 1, "entry" => {} }] }
     deliver_url = "https://projection.example.test/internal/v1/timekeeping/entry-snapshots"
 
     with_timekeeping_service_token do |token|
@@ -55,25 +53,21 @@ RSpec.describe Timekeeping::LocalSnapshotEndpoint do
                                                    headers: { "Content-Type" => "application/json" })
 
         answer = described_class.configured(logger: Logger.new(StringIO.new))
-                                .deliver(batch, idempotency_key: SecureRandom.uuid)
+                                .deliver(local_endpoint_batch, idempotency_key: SecureRandom.uuid)
 
         expect(answer.delivered?(1)).to be(true)
         expect(WebMock).to have_requested(:post, deliver_url).with(headers: { "Authorization" => "Bearer #{token}" })
       end
     end
   end
-end
 
-RSpec.describe Timekeeping::LocalSnapshotEndpoint do
   # The plan refuses a plain-http URL to a non-loopback host, because the
   # bearer token and customers' entry snapshots would cross the network unencrypted.
   it "sends no token or snapshot to a remote host over plain http" do
-    batch = { "schema_version" => 1, "snapshots" => [{ "generation" => 1, "outbox_position" => 1, "entry" => {} }] }
-
     with_timekeeping_service_token do
       with_timekeeping_env("TIMEKEEPING_PROJECTION_URL", "http://monolith.example.test") do
         answer = described_class.configured(logger: Logger.new(StringIO.new))
-                                .deliver(batch, idempotency_key: SecureRandom.uuid)
+                                .deliver(local_endpoint_batch, idempotency_key: SecureRandom.uuid)
 
         expect(answer.delivered?(1)).to be(false)
         expect(answer.status).to be_nil
@@ -81,18 +75,14 @@ RSpec.describe Timekeeping::LocalSnapshotEndpoint do
       end
     end
   end
-end
 
-RSpec.describe Timekeeping::LocalSnapshotEndpoint do
   # "The URL comes from a new deploy setting, `TIMEKEEPING_PROJECTION_URL` (the monolith's own base URL). `TIMEKEEPING_BASE_URL` names the service, so it is not used."
   it "never falls back to TIMEKEEPING_BASE_URL when TIMEKEEPING_PROJECTION_URL is blank" do
-    batch = { "schema_version" => 1, "snapshots" => [{ "generation" => 1, "outbox_position" => 1, "entry" => {} }] }
-
     with_timekeeping_service_token do
       with_timekeeping_env("TIMEKEEPING_BASE_URL", "https://timekeeping.example.test") do
         with_timekeeping_env("TIMEKEEPING_PROJECTION_URL", nil) do
           answer = described_class.configured(logger: Logger.new(StringIO.new))
-                                  .deliver(batch, idempotency_key: SecureRandom.uuid)
+                                  .deliver(local_endpoint_batch, idempotency_key: SecureRandom.uuid)
 
           expect(answer.delivered?(1)).to be(false)
           expect(WebMock).not_to have_requested(:post, /timekeeping\.example\.test/)
@@ -100,9 +90,7 @@ RSpec.describe Timekeeping::LocalSnapshotEndpoint do
       end
     end
   end
-end
 
-RSpec.describe Timekeeping::LocalSnapshotEndpoint do
   it "accepts only https or loopback http projection URLs" do
     expect(described_class.protected_url("https://monolith.example.test")).to eq("https://monolith.example.test")
     expect(described_class.protected_url("http://localhost:3000")).to eq("http://localhost:3000")
@@ -113,78 +101,6 @@ RSpec.describe Timekeeping::LocalSnapshotEndpoint do
     expect(described_class.protected_url("ftp://monolith.example.test")).to be_nil
     expect(described_class.protected_url("")).to be_nil
     expect(described_class.protected_url(nil)).to be_nil
-  end
-end
-
-RSpec.describe Timekeeping::LocalSnapshotEndpoint do
-  # The bearer token and entry notes would cross the network in clear text over plain http to a remote host,
-  # so the plan only sends over https or to a loopback host; the change must disclose this narrowing of
-  # "The URL comes from a new deploy setting, `TIMEKEEPING_PROJECTION_URL` (the monolith's own base URL)."
-  it "passes https and loopback http projection URLs and refuses plain http to a remote host" do
-    expect(described_class.protected_url("https://monolith.example.test")).to eq("https://monolith.example.test")
-    expect(described_class.protected_url("http://localhost:3000")).to eq("http://localhost:3000")
-    expect(described_class.protected_url("http://127.0.0.1:3000")).to eq("http://127.0.0.1:3000")
-    expect(described_class.protected_url("http://monolith.example.test")).to be_nil
-    expect(described_class.protected_url("")).to be_nil
-    expect(described_class.protected_url(nil)).to be_nil
-  end
-end
-
-RSpec.describe Timekeeping::LocalSnapshotEndpoint do
-  # "Delivery posts to POST /internal/v1/timekeeping/entry-snapshots with TIMEKEEPING_SERVICE_TOKEN, and a failed post logs neither the response body nor the token"
-  it "a refused post whose body echoes the token logs neither the body nor the token" do
-    token = "endpoint-spec-token-#{SecureRandom.hex(8)}"
-    body_marker = "endpoint-spec-body-#{SecureRandom.hex(8)}"
-    stub_request(:post, "https://projection.example.test/internal/v1/timekeeping/entry-snapshots")
-      .with(headers: { "Authorization" => "Bearer #{token}" })
-      .to_return(status: 409, headers: { "Content-Type" => "application/json" },
-                 body: { reason: "stale_generation", echo: "#{body_marker} #{token}" }.to_json)
-    output = StringIO.new
-    logger = Logger.new(output)
-    logger.level = Logger::DEBUG
-    batch = { "schema_version" => 1, "snapshots" => [{ "generation" => 1, "outbox_position" => 1, "entry" => {} }] }
-
-    answer = with_timekeeping_env_values(TIMEKEEPING_SERVICE_TOKEN: token,
-                                         TIMEKEEPING_PROJECTION_URL: "https://projection.example.test") do
-      described_class.configured(logger:).deliver(batch, idempotency_key: SecureRandom.uuid)
-    end
-
-    expect(answer.delivered?(1)).to be(false)
-    expect(output.string).to include("status=409")
-    expect(output.string).not_to include(token)
-    expect(output.string).not_to include(body_marker)
-  end
-end
-
-RSpec.describe Timekeeping::LocalSnapshotEndpoint do
-  # "The URL comes from a new deploy setting, `TIMEKEEPING_PROJECTION_URL` (the monolith's own base URL). `TIMEKEEPING_BASE_URL` names the service, so it is not used."
-  # The plan also refuses a plain-http URL to a remote host, so the token never crosses the network unencrypted;
-  # this narrows the issue's words and the change must disclose it.
-  it "a plain http remote projection url or a base-url-only setup sends no request and no token" do
-    stub_request(:any, /.*/)
-    batch = { "schema_version" => 1, "snapshots" => [{ "generation" => 1, "outbox_position" => 1, "entry" => {} }] }
-
-    token = SecureRandom.hex(16)
-
-    remote_http = with_timekeeping_env_values(TIMEKEEPING_SERVICE_TOKEN: token,
-                                              TIMEKEEPING_PROJECTION_URL: "http://monolith.example.test") do
-      described_class.configured(logger: Logger.new(StringIO.new)).deliver(batch, idempotency_key: SecureRandom.uuid)
-    end
-    base_url_only = with_timekeeping_env_values(TIMEKEEPING_SERVICE_TOKEN: token,
-                                                TIMEKEEPING_PROJECTION_URL: nil,
-                                                TIMEKEEPING_BASE_URL: "https://timekeeping.example.test") do
-      described_class.configured(logger: Logger.new(StringIO.new)).deliver(batch, idempotency_key: SecureRandom.uuid)
-    end
-
-    expect(a_request(:any, /.*/)).not_to have_been_made
-    expect(remote_http.delivered?(1)).to be(false)
-    expect(base_url_only.delivered?(1)).to be(false)
-  end
-end
-
-RSpec.describe Timekeeping::LocalSnapshotEndpoint do
-  let(:local_endpoint_batch) do
-    { "schema_version" => 1, "snapshots" => [{ "generation" => 1, "outbox_position" => 1, "entry" => {} }] }
   end
 
   it "posts to a loopback http projection URL and logs nothing for a delivery" do

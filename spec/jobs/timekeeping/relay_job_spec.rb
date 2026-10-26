@@ -5,22 +5,33 @@
 require "rails_helper"
 
 RSpec.describe Timekeeping::RelayJob do
+  def relay_job_spec_row(company_id, entry_id)
+    payload = Timekeeping::SnapshotBatch::ENTRY_FIELDS.index_with { nil }.merge(
+      "id" => entry_id, "company_id" => company_id, "duration" => 45.0, "version" => 1
+    )
+    Timekeeping::LocalOutboxEntry.create!(company_id:, entry_id:, generation: 1, payload:, created_at: Time.current)
+  end
+
+  def relay_job_spec_accepted(batch)
+    TimekeepingRelay::Response.new(status: 200, body: { "applied" => batch.fetch("snapshots").size, "ignored" => 0 })
+  end
+
+  def relay_job_spec_refused
+    TimekeepingRelay::Response.new(status: 409, body: { "reason" => "stale_generation" })
+  end
+
   # "Log failures without the response body or the token. Pass nothing secret as a job argument."
   it "takes no job arguments so no secret is stored with the enqueued job" do
     expect(described_class.instance_method(:perform).arity).to eq(0)
     expect(described_class.queue_name).to eq("timekeeping_relay")
   end
-end
 
-RSpec.describe Timekeeping::RelayJob do
   # "A refused batch stops only its own company's delivery."
   it "a refused batch stays unsent, the next accepted run marks it, and a later run re-sends nothing" do
     company = create(:company)
-    payload = Timekeeping::SnapshotBatch::ENTRY_FIELDS.index_with { nil }.merge("id" => 9, "company_id" => company.id)
-    row = Timekeeping::LocalOutboxEntry.create!(company_id: company.id, entry_id: 9, generation: 1,
-                                                payload:, created_at: Time.current)
+    row = relay_job_spec_row(company.id, 9)
     posts = []
-    answer = TimekeepingRelay::Response.new(status: 409, body: { "reason" => "stale_generation" })
+    answer = relay_job_spec_refused
     endpoint = Object.new
     endpoint.define_singleton_method(:deliver) do |batch, idempotency_key:|
       posts << [batch, idempotency_key]
@@ -40,86 +51,37 @@ RSpec.describe Timekeeping::RelayJob do
     described_class.perform_now
     expect(posts.size).to eq(2)
   end
-end
-
-RSpec.describe Timekeeping::RelayJob do
-  # "Each entry belongs to one company, so its snapshots stay in position order. A refused batch stops only its own company's delivery."
-  it "one company's refused batch leaves its rows unsent while another company's rows are delivered and marked" do
-    refused_company = create(:company)
-    accepted_company = create(:company)
-    write = lambda do |company, entry_id|
-      payload = Timekeeping::SnapshotBatch::ENTRY_FIELDS.index_with { nil }
-                                                         .merge("id" => entry_id, "company_id" => company.id)
-      Timekeeping::LocalOutboxEntry.create!(company_id: company.id, entry_id:, generation: 1,
-                                            payload:, created_at: Time.current)
-    end
-    refused_rows = [write.call(refused_company, 1), write.call(refused_company, 3)]
-    accepted_rows = [write.call(accepted_company, 2), write.call(accepted_company, 4)]
-    endpoint = Object.new
-    endpoint.define_singleton_method(:deliver) do |batch, idempotency_key:|
-      companies = batch.fetch("snapshots").map { |snapshot| snapshot.dig("entry", "company_id") }.uniq
-      raise "a batch mixed companies" unless companies.size == 1
-
-      if companies.first == refused_company.id
-        TimekeepingRelay::Response.new(status: 409, body: { "reason" => "stale_generation" })
-      else
-        TimekeepingRelay::Response.new(status: 200, body: { "applied" => companies.size.zero? ? 0 : batch.fetch("snapshots").size, "ignored" => 0 })
-      end
-    end
-    allow(Timekeeping::LocalSnapshotEndpoint).to receive(:configured).and_return(endpoint)
-
-    described_class.perform_now
-
-    expect(refused_rows.map { |row| row.reload.sent_at }).to all(be_nil)
-    expect(accepted_rows.map { |row| row.reload.sent_at }).to all(be_present)
-  end
-end
-
-RSpec.describe Timekeeping::RelayJob do
-  def relay_job_spec_row(company_id, entry_id)
-    payload = Timekeeping::SnapshotBatch::ENTRY_FIELDS.index_with { nil }.merge(
-      "id" => entry_id, "company_id" => company_id, "duration" => 45.0, "version" => 1
-    )
-    Timekeeping::LocalOutboxEntry.create!(company_id:, entry_id:, generation: 1, payload:, created_at: Time.current)
-  end
 
   # "Each entry belongs to one company, so its snapshots stay in position order. A refused batch stops only its own company's delivery."
-  it "a refused batch for one company leaves its rows unsent while the next company is still delivered" do
-    refused_company = create(:company)
-    accepted_company = create(:company)
-    refused_rows = [relay_job_spec_row(refused_company.id, 1), relay_job_spec_row(refused_company.id, 2)]
-    accepted_rows = [relay_job_spec_row(accepted_company.id, 3), relay_job_spec_row(accepted_company.id, 4)]
-    posted_companies = []
+  it "a refused batch for company A leaves A unsent while company B is delivered and marked in the same run, and no batch mixes companies" do
+    company_a = create(:company)
+    company_b = create(:company)
+    a_rows = [relay_job_spec_row(company_a.id, 1201), relay_job_spec_row(company_a.id, 1202)]
+    b_rows = [relay_job_spec_row(company_b.id, 9201), relay_job_spec_row(company_b.id, 9202)]
+    batch_companies = []
+    refused = relay_job_spec_refused
+    accepted = method(:relay_job_spec_accepted)
     endpoint = Object.new
     endpoint.define_singleton_method(:deliver) do |batch, idempotency_key:|
       companies = batch.fetch("snapshots").map { |item| item.fetch("entry").fetch("company_id") }.uniq
-      posted_companies << companies
-      if companies.include?(refused_company.id)
-        TimekeepingRelay::Response.new(status: 409, body: { "reason" => "stale_generation" })
-      else
-        TimekeepingRelay::Response.new(status: 200, body: { "applied" => batch.fetch("snapshots").size, "ignored" => 0 })
-      end
+      batch_companies << companies
+      companies.include?(company_a.id) ? refused : accepted.call(batch)
     end
     allow(Timekeeping::LocalSnapshotEndpoint).to receive(:configured).and_return(endpoint)
 
     described_class.perform_now
 
-    expect(posted_companies).to all(satisfy { |companies| companies.size == 1 })
-    expect(refused_rows.map { |row| row.reload.sent_at }).to all(be_nil)
-    expect(accepted_rows.map { |row| row.reload.sent_at }).to all(be_present)
+    expect(a_rows.map { |row| row.reload.sent_at }).to all(be_nil)
+    expect(b_rows.map { |row| row.reload.sent_at }).to all(be_present)
+    expect(batch_companies).to include([company_a.id], [company_b.id])
+    expect(batch_companies).to all(satisfy { |companies| companies.size == 1 })
   end
-end
 
-RSpec.describe Timekeeping::RelayJob do
   # "Hold a session advisory lock with its own key constant for the whole run."
   # A second run started while the first still holds the lock would read the same unsent rows and post them twice.
   it "a run that overlaps another holding the relay lock posts nothing and marks nothing" do
     company = create(:company)
-    payload = Timekeeping::SnapshotBatch::ENTRY_FIELDS.index_with { nil }.merge(
-      "id" => 77, "company_id" => company.id, "duration" => 10.0, "version" => 1
-    )
-    row = Timekeeping::LocalOutboxEntry.create!(company_id: company.id, entry_id: 77, generation: 1, payload:,
-                                                created_at: Time.current)
+    row = relay_job_spec_row(company.id, 77)
     endpoint = double("endpoint")
     allow(Timekeeping::LocalSnapshotEndpoint).to receive(:configured).and_return(endpoint)
     allow(endpoint).to receive(:deliver)
@@ -139,23 +101,16 @@ RSpec.describe Timekeeping::RelayJob do
     expect(endpoint).not_to have_received(:deliver)
     expect(row.reload.sent_at).to be_nil
   end
-end
 
-RSpec.describe Timekeeping::RelayJob do
   it "sends one company's 150 unsent rows in batches of 100 then 50 and marks them all" do
     company = create(:company)
-    rows = Array.new(150) do |index|
-      payload = Timekeeping::SnapshotBatch::ENTRY_FIELDS.index_with { nil }.merge(
-        "id" => 5_000 + index, "company_id" => company.id, "duration" => 15.0, "version" => 1
-      )
-      Timekeeping::LocalOutboxEntry.create!(company_id: company.id, entry_id: 5_000 + index, generation: 1,
-                                            payload:, created_at: Time.current)
-    end
+    rows = Array.new(150) { |index| relay_job_spec_row(company.id, 5_000 + index) }
     batch_sizes = []
+    accepted = method(:relay_job_spec_accepted)
     endpoint = Object.new
     endpoint.define_singleton_method(:deliver) do |batch, idempotency_key:|
       batch_sizes << batch.fetch("snapshots").size
-      TimekeepingRelay::Response.new(status: 200, body: { "applied" => batch.fetch("snapshots").size, "ignored" => 0 })
+      accepted.call(batch)
     end
     allow(Timekeeping::LocalSnapshotEndpoint).to receive(:configured).and_return(endpoint)
 

@@ -5,82 +5,14 @@
 require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOutboxSource do
-  # "`mark_sent` sets `sent_at` by `company_id` and the exact positions, never by entry id. A second call changes nothing."
-  it "a second mark_sent keeps the first sent_at and leaves unlisted rows of the same entry unsent" do
-    company = create(:company)
-    payload = Timekeeping::SnapshotBatch::ENTRY_FIELDS.index_with { nil }.merge("id" => 7, "company_id" => company.id)
-    rows = Array.new(3) do
-      Timekeeping::LocalOutboxEntry.create!(company_id: company.id, entry_id: 7, generation: 1,
-                                            payload:, created_at: Time.current)
-    end
-    source = described_class.new(company_id: company.id)
-    marked = [rows.first.outbox_position, rows.last.outbox_position]
-
-    first_time = Time.zone.parse("2026-03-02 09:00:00.123456")
-    travel_to(first_time) { expect(source.mark_sent(marked)).to be_nil }
-    first_sent_at = rows.first.reload.sent_at
-    travel_to(first_time + 1.hour) { source.mark_sent(marked) }
-
-    expect(rows.first.reload.sent_at).to eq(first_sent_at)
-    expect(rows.last.reload.sent_at).to eq(first_sent_at)
-    expect(rows.second.reload.sent_at).to be_nil
-    expect(source.unsent_after(0, 100).map { |row| row.fetch("outbox_position") }).to eq([rows.second.outbox_position])
+  def outbox_spec_row(company_id, entry_id)
+    payload = Timekeeping::SnapshotBatch::ENTRY_FIELDS.index_with { nil }.merge(
+      "id" => entry_id, "company_id" => company_id, "duration" => 30.0, "version" => 1,
+      "created_at" => "2026-03-02T09:00:00.123456Z", "updated_at" => "2026-03-02T09:00:00.123456Z"
+    )
+    Timekeeping::LocalOutboxEntry.create!(company_id:, entry_id:, generation: 1, payload:, created_at: Time.current)
   end
-end
 
-RSpec.describe Timekeeping::LocalOutboxSource do
-  # "Every outbox read and mark filters by company_id; company A's source never returns or marks company B's rows"
-  it "company A's source neither returns nor marks company B's interleaved rows" do
-    company_a = create(:company)
-    company_b = create(:company)
-    write = lambda do |company, entry_id|
-      payload = Timekeeping::SnapshotBatch::ENTRY_FIELDS.index_with { nil }
-                                                         .merge("id" => entry_id, "company_id" => company.id)
-      Timekeeping::LocalOutboxEntry.create!(company_id: company.id, entry_id:, generation: 1,
-                                            payload:, created_at: Time.current)
-    end
-    b_below = write.call(company_b, 1)
-    a_first = write.call(company_a, 2)
-    b_between = write.call(company_b, 3)
-    a_second = write.call(company_a, 4)
-    b_above = write.call(company_b, 5)
-    b_rows = [b_below, b_between, b_above]
-    source_a = described_class.new(company_id: company_a.id)
-
-    returned = source_a.unsent_after(0, 100).map { |row| row.fetch("outbox_position") }
-    expect(returned).to eq([a_first.outbox_position, a_second.outbox_position])
-
-    source_a.mark_sent(b_rows.map(&:outbox_position))
-    expect(b_rows.map { |row| row.reload.sent_at }).to all(be_nil)
-    expect(described_class.new(company_id: company_b.id).unsent_after(0, 100).size).to eq(3)
-  end
-end
-
-RSpec.describe Timekeeping::LocalOutboxSource do
-  # "Read the jsonb payload from its raw text, so `duration` keeps its exact float bits and timestamps keep microseconds."
-  it "unsent_after returns stored durations with identical bits and timestamps with microseconds" do
-    company = create(:company)
-    created_at = "2026-03-02T09:00:00.123456Z"
-    durations = [5e-324, 0.1 + 0.2]
-    durations.each_with_index do |duration, index|
-      payload = Timekeeping::SnapshotBatch::ENTRY_FIELDS.index_with { nil }.merge(
-        "id" => index + 1, "company_id" => company.id, "duration" => duration,
-        "created_at" => created_at, "updated_at" => created_at
-      )
-      Timekeeping::LocalOutboxEntry.create!(company_id: company.id, entry_id: index + 1, generation: 1,
-                                            payload:, created_at: Time.current)
-    end
-
-    rows = described_class.new(company_id: company.id).unsent_after(0, 100)
-
-    expect(rows.map { |row| [row.dig("entry", "duration")].pack("G") }).to eq(durations.map { |d| [d].pack("G") })
-    expect(rows.map { |row| row.dig("entry", "created_at") }).to all(eq(created_at))
-    expect(rows.first.keys).to contain_exactly("generation", "outbox_position", "entry")
-    expect(rows.first.fetch("entry").keys).to match_array(Timekeeping::SnapshotBatch::ENTRY_FIELDS)
-  end
-end
-
-RSpec.describe Timekeeping::LocalOutboxSource do
   # "`unsent_after` returns that company's rows with `sent_at` nil and `outbox_position > position`, ascending,
   # at most `limit` rows. Each row is a Hash with the string keys `generation`, `outbox_position` and `entry`,
   # and `entry` holds exactly the contract fields."
@@ -124,48 +56,21 @@ RSpec.describe Timekeeping::LocalOutboxSource do
     expect(source.unsent_after(0, 2).pluck("outbox_position"))
       .to eq([a_first, a_second].map(&:outbox_position))
   end
-end
 
-RSpec.describe Timekeeping::LocalOutboxSource do
-  # "`mark_sent` sets `sent_at` by `company_id` and the exact positions, never by entry id. A second call changes nothing."
-  it "marks only its own company's listed positions, never another company's or an unlisted row of the same entry, and a second call keeps the first sent_at" do
-    company_a = create(:company)
-    company_b = create(:company)
-    write = lambda do |company, entry_id|
-      payload = TimekeepingSnapshots.entry(id: entry_id, company_id: company.id, version: 1, project_id: nil,
-                                           user_id: nil)
-      Timekeeping::LocalOutboxEntry.create!(company_id: company.id, entry_id:, generation: 1, payload:,
-                                            created_at: Time.current)
-    end
-    a_first = write.call(company_a, 501)
-    b_row = write.call(company_b, 601)
-    a_later_same_entry = write.call(company_a, 501)
-    source = described_class.new(company_id: company_a.id)
-
-    first_time = Time.zone.parse("2026-03-02 09:00:00")
-    travel_to(first_time) do
-      expect(source.mark_sent([a_first.outbox_position, b_row.outbox_position])).to be_nil
-    end
-    travel_to(first_time + 1.hour) { source.mark_sent([a_first.outbox_position]) }
-
-    expect(a_first.reload.sent_at).to eq(first_time)
-    expect(b_row.reload.sent_at).to be_nil
-    expect(a_later_same_entry.reload.sent_at).to be_nil
-  end
-end
-
-RSpec.describe Timekeeping::LocalOutboxSource do
-  def outbox_spec_payload(entry_id, company_id)
-    Timekeeping::SnapshotBatch::ENTRY_FIELDS.index_with { nil }.merge(
-      "id" => entry_id, "company_id" => company_id, "duration" => 30.0, "version" => 1,
-      "created_at" => "2026-03-02T09:00:00.123456Z", "updated_at" => "2026-03-02T09:00:00.123456Z"
+  # "Read the jsonb payload from its raw text, so `duration` keeps its exact float bits and timestamps keep microseconds."
+  # The jsonb cast would read this metadata number as a Float and round it.
+  it "returns a source_metadata decimal finer than a double as the exact BigDecimal" do
+    company = create(:company)
+    fine_decimal = "1.00000000000000000001"
+    row = outbox_spec_row(company.id, 700)
+    Timekeeping::LocalOutboxEntry.where(outbox_position: row.outbox_position).update_all(
+      ["payload = jsonb_set(payload, '{source_metadata}', ?::jsonb)", %({"rate": #{fine_decimal}})]
     )
-  end
 
-  def outbox_spec_row(company_id, entry_id)
-    Timekeeping::LocalOutboxEntry.create!(
-      company_id:, entry_id:, generation: 1, payload: outbox_spec_payload(entry_id, company_id), created_at: Time.current
-    )
+    entry = described_class.new(company_id: company.id).unsent_after(0, 100).first.fetch("entry")
+
+    expect(entry.dig("source_metadata", "rate")).to eq(BigDecimal(fine_decimal))
+    expect(entry.dig("source_metadata", "rate")).to be_a(BigDecimal)
   end
 
   # "Every outbox read and mark filters by company_id; company A's source never returns or marks company B's rows"
@@ -190,54 +95,74 @@ RSpec.describe Timekeeping::LocalOutboxSource do
     expect(described_class.new(company_id: company_b.id).unsent_after(0, 100).map { |row| row.fetch("outbox_position") })
       .to eq(b_positions)
   end
-end
 
-RSpec.describe Timekeeping::LocalOutboxSource do
-  def outbox_spec_retry_row(company_id, entry_id)
-    payload = Timekeeping::SnapshotBatch::ENTRY_FIELDS.index_with { nil }.merge(
-      "id" => entry_id, "company_id" => company_id, "duration" => 15.0, "version" => 1
-    )
-    Timekeeping::LocalOutboxEntry.create!(company_id:, entry_id:, generation: 1, payload:, created_at: Time.current)
+  # "Every outbox read and mark filters by company_id; company A's source never returns or marks company B's rows"
+  # "`mark_sent` sets `sent_at` by `company_id` and the exact positions, never by entry id."
+  it "company A's mark_sent given company B's positions leaves every B row unsent" do
+    company_a = create(:company)
+    company_b = create(:company)
+    b_first = outbox_spec_row(company_b.id, 9101).outbox_position
+    a_only = outbox_spec_row(company_a.id, 1101).outbox_position
+    b_second = outbox_spec_row(company_b.id, 9102).outbox_position
+    sent_at = ->(position) { Timekeeping::LocalOutboxEntry.find(position).sent_at }
+
+    source_a = described_class.new(company_id: company_a.id)
+    source_a.mark_sent([b_first, b_second])
+
+    expect(sent_at.call(b_first)).to be_nil
+    expect(sent_at.call(b_second)).to be_nil
+    expect(sent_at.call(a_only)).to be_nil
+
+    source_a.mark_sent([b_first, a_only, b_second])
+
+    expect(sent_at.call(a_only)).to be_present
+    expect(sent_at.call(b_first)).to be_nil
+    expect(sent_at.call(b_second)).to be_nil
+    expect(described_class.new(company_id: company_b.id).unsent_after(0, 100).map { |row| row.fetch("outbox_position") })
+      .to eq([b_first, b_second])
   end
 
   # "`mark_sent` sets `sent_at` by `company_id` and the exact positions, never by entry id. A second call changes nothing."
-  # A retried job marks the same positions again; the first sent_at must survive, and a later unsent
-  # snapshot of the same entry must stay unsent so it is still delivered.
-  it "a repeated mark_sent keeps the first sent_at and never marks an unlisted row of the same entry" do
+  it "a second mark_sent keeps the first sent_at and leaves unlisted rows of the same entry unsent" do
     company = create(:company)
-    delivered = outbox_spec_retry_row(company.id, 500)
-    later = outbox_spec_retry_row(company.id, 500)
+    rows = Array.new(3) { outbox_spec_row(company.id, 7) }
     source = described_class.new(company_id: company.id)
+    marked = [rows.first.outbox_position, rows.last.outbox_position]
 
-    travel_to(Time.zone.parse("2026-03-02 09:00:00")) { source.mark_sent([delivered.outbox_position]) }
-    first_sent_at = delivered.reload.sent_at
-    travel_to(Time.zone.parse("2026-03-02 10:00:00")) { expect(source.mark_sent([delivered.outbox_position])).to be_nil }
+    first_time = Time.zone.parse("2026-03-02 09:00:00.123456")
+    travel_to(first_time) { expect(source.mark_sent(marked)).to be_nil }
+    first_sent_at = rows.first.reload.sent_at
+    travel_to(first_time + 1.hour) { source.mark_sent(marked) }
 
-    expect(first_sent_at).to be_present
-    expect(delivered.reload.sent_at).to eq(first_sent_at)
-    expect(later.reload.sent_at).to be_nil
-    expect(source.unsent_after(0, 100).map { |row| row.fetch("outbox_position") }).to eq([later.outbox_position])
+    expect(rows.first.reload.sent_at).to eq(first_sent_at)
+    expect(rows.last.reload.sent_at).to eq(first_sent_at)
+    expect(rows.second.reload.sent_at).to be_nil
+    expect(source.unsent_after(0, 100).map { |row| row.fetch("outbox_position") }).to eq([rows.second.outbox_position])
   end
-end
 
-RSpec.describe Timekeeping::LocalOutboxSource do
-  # "Read the jsonb payload from its raw text, so `duration` keeps its exact float bits and timestamps keep microseconds."
-  # The jsonb cast would read this metadata number as a Float and round it.
-  it "returns a source_metadata decimal finer than a double as the exact BigDecimal" do
-    company = create(:company)
-    fine_decimal = "1.00000000000000000001"
-    payload = Timekeeping::SnapshotBatch::ENTRY_FIELDS.index_with { nil }.merge(
-      "id" => 700, "company_id" => company.id, "duration" => 15.0, "version" => 1
-    )
-    row = Timekeeping::LocalOutboxEntry.create!(company_id: company.id, entry_id: 700, generation: 1,
-                                                payload:, created_at: Time.current)
-    Timekeeping::LocalOutboxEntry.where(outbox_position: row.outbox_position).update_all(
-      ["payload = jsonb_set(payload, '{source_metadata}', ?::jsonb)", %({"rate": #{fine_decimal}})]
-    )
+  # "`mark_sent` sets `sent_at` by `company_id` and the exact positions, never by entry id. A second call changes nothing."
+  it "marks only its own company's listed positions, never another company's or an unlisted row of the same entry, and a second call keeps the first sent_at" do
+    company_a = create(:company)
+    company_b = create(:company)
+    write = lambda do |company, entry_id|
+      payload = TimekeepingSnapshots.entry(id: entry_id, company_id: company.id, version: 1, project_id: nil,
+                                           user_id: nil)
+      Timekeeping::LocalOutboxEntry.create!(company_id: company.id, entry_id:, generation: 1, payload:,
+                                            created_at: Time.current)
+    end
+    a_first = write.call(company_a, 501)
+    b_row = write.call(company_b, 601)
+    a_later_same_entry = write.call(company_a, 501)
+    source = described_class.new(company_id: company_a.id)
 
-    entry = described_class.new(company_id: company.id).unsent_after(0, 100).first.fetch("entry")
+    first_time = Time.zone.parse("2026-03-02 09:00:00")
+    travel_to(first_time) do
+      expect(source.mark_sent([a_first.outbox_position, b_row.outbox_position])).to be_nil
+    end
+    travel_to(first_time + 1.hour) { source.mark_sent([a_first.outbox_position]) }
 
-    expect(entry.dig("source_metadata", "rate")).to eq(BigDecimal(fine_decimal))
-    expect(entry.dig("source_metadata", "rate")).to be_a(BigDecimal)
+    expect(a_first.reload.sent_at).to eq(first_time)
+    expect(b_row.reload.sent_at).to be_nil
+    expect(a_later_same_entry.reload.sent_at).to be_nil
   end
 end

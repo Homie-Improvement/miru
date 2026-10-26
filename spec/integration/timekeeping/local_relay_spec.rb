@@ -78,13 +78,10 @@ RSpec.describe "Timekeeping local relay" do
   # "Test with no Timekeeping process running: an entry edit after a rollback is written locally,
   # delivered by the monolith relay, and shown in the projection and time report."
   it "delivers a post-rollback edit made through LocalOwner into timesheet_entries, the entry list and the time report, and marks the outbox sent" do
-    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
-    generation = TimekeepingOwnership.current.generation.to_s
+    prepare_local_relay_owner
     company = create(:company)
     other_company = create(:company)
-    user = create(:user)
-    create(:employment, company:, user:)
-    user.add_role("owner", company)
+    user, actor = local_relay_owner_actor(company)
     project = create(:project, client: create(:client, company:))
     other_project = create(:project, client: create(:client, company: other_company))
     other_user = create(:user)
@@ -94,25 +91,13 @@ RSpec.describe "Timekeeping local relay" do
     other_row.update_columns(company_id: other_company.id)
     other_before = other_row.reload.attributes
     advance_local_entry_ids_past_projection
-    actor = Timekeeping::LocalOwner::Actor.user(user_id: user.id, role: "owner")
 
-    created = Timekeeping::LocalOwner.call(
-      operation: :create, company_id: company.id, generation:, actor:,
-      params: { "idempotency_key" => SecureRandom.uuid,
-                "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 60.0,
-                            "note" => "before relay", "source" => "manual", "source_metadata" => {} } }
-    )
-    expect(created.status).to be_between(200, 201)
-    entry = Timekeeping::LocalEntry.where(company_id: company.id).sole
-    updated = Timekeeping::LocalOwner.call(
-      operation: :update, company_id: company.id, generation:, actor:,
-      params: { "idempotency_key" => SecureRandom.uuid, "entry_id" => entry.id,
-                "body" => { "note" => "after relay", "duration" => 135.0 } }
-    )
-    expect(updated.status).to eq(200)
+    entry = local_relay_create_entry(company:, actor:, project:, duration: 60.0, note: "before relay")
+    expect(Timekeeping::LocalEntry.where(company_id: company.id).sole).to eq(entry)
+    local_relay_update_entry(company:, actor:, entry:, body: { "note" => "after relay", "duration" => 135.0 })
 
     with_timekeeping_service_token do
-      with_timekeeping_env("TIMEKEEPING_PROJECTION_URL", "https://www.example.com") do
+      with_timekeeping_env("TIMEKEEPING_PROJECTION_URL", local_relay_projection_url) do
         route_local_relay_posts_into_app
 
         # Only the relay writes timesheet_entries in the prepared state.
@@ -144,27 +129,18 @@ RSpec.describe "Timekeeping local relay" do
   # "The token comes from the existing `TIMEKEEPING_SERVICE_TOKEN`. `Internal::V1::BaseController` accepts that token."
   # The receiver keeps the environment token; only the sender is given a different one.
   it "leaves the outbox unsent and timesheet_entries untouched when the sender's token does not match the receiver's" do
-    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
+    prepare_local_relay_owner
     company = create(:company)
-    user = create(:user)
-    create(:employment, company:, user:)
-    user.add_role("owner", company)
+    _user, actor = local_relay_owner_actor(company)
     project = create(:project, client: create(:client, company:))
-    Timekeeping::LocalOwner.call(
-      operation: :create, company_id: company.id, generation: TimekeepingOwnership.current.generation.to_s,
-      actor: Timekeeping::LocalOwner::Actor.user(user_id: user.id, role: "owner"),
-      params: { "idempotency_key" => SecureRandom.uuid,
-                "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 30.0,
-                            "note" => "refused delivery", "source" => "manual", "source_metadata" => {} } }
-    )
-    entry = Timekeeping::LocalEntry.where(company_id: company.id).sole
+    entry = local_relay_create_entry(company:, actor:, project:, duration: 30.0, note: "refused delivery")
     expect(Timekeeping::LocalOutboxEntry.where(company_id: company.id, sent_at: nil)).to exist
 
     statuses = []
     with_timekeeping_service_token do
       route_local_relay_posts_into_app
       wrong = Timekeeping::LocalSnapshotEndpoint.new(
-        endpoint: TimekeepingRelay::HttpEndpoint.new(url: "https://www.example.com", token: "wrong-token"),
+        endpoint: TimekeepingRelay::HttpEndpoint.new(url: local_relay_projection_url, token: "wrong-token"),
         logger: Logger.new(StringIO.new)
       )
       recording = Object.new
