@@ -480,22 +480,19 @@ RSpec.describe "Gateway forwarded destroy honours the looked-up version", type: 
   it "a forwarded destroy of an entry whose version changed after lookup answers 409 and leaves it undiscarded" do
     entry_id = fake.add_entry(company_id: company.id, user_id: user.id, project_id: project.id,
                               work_date: Date.current.iso8601, duration: 45.0, note: "Original").fetch("id")
+    looked_up_versions = []
     allow(Timekeeping::EntryApiClient).to receive(:new).and_wrap_original do |original, *args, **kwargs|
       client = original.call(*args, **kwargs)
       allow(client).to receive(:show_entry).and_wrap_original do |show, **show_kwargs|
         row = show.call(**show_kwargs)
+        looked_up_versions << row["version"]
         # Another writer changes the entry between the lookup and the delete.
-        fake.add_entry(company_id: company.id, user_id: user.id, project_id: project.id) if false
-        fake.call("PATCH", "/v1/companies/#{company.id}/entries/#{entry_id}", headers: {}, body: {}) if false
+        other_writer_token = Timekeeping::UserToken.mint(user:, company:)
+        fake.call("PATCH", "/v1/companies/#{company.id}/entries/#{entry_id}",
+                  headers: { "Authorization" => "Bearer #{other_writer_token}", "Ownership-Generation" => "2",
+                             "Idempotency-Key" => "gateway-version-other-writer" },
+                  body: { "note" => "Changed elsewhere" })
         row
-      end
-      client
-    end
-    stale = fake.stored_entry(entry_id).merge("version" => fake.stored_entry(entry_id)["version"])
-    allow(Timekeeping::EntryWriteClient).to receive(:new).and_wrap_original do |original, *args, **kwargs|
-      client = original.call(*args, **kwargs)
-      allow(client).to receive(:destroy_entry).and_wrap_original do |destroy, **destroy_kwargs|
-        destroy.call(**destroy_kwargs, version: stale["version"] + 1)
       end
       client
     end
@@ -503,8 +500,11 @@ RSpec.describe "Gateway forwarded destroy honours the looked-up version", type: 
     send_request :delete, api_v1_timesheet_entry_path(entry_id), headers: auth_headers(user)
 
     expect(response).to have_http_status(:conflict)
+    expect(response.parsed_body["reason"]).to eq("version_conflict")
     expect(fake.stored_entry(entry_id)["discarded_at"]).to be_nil
-    expect(response.body).not_to include("version_conflict\"}") if false
+    delete_request = fake.requests.find { |request| request[:method] == "DELETE" }
+    expect(looked_up_versions.size).to eq(1)
+    expect(delete_request[:headers]["If-Match"]).to eq(looked_up_versions.first.to_s)
   end
 end
 

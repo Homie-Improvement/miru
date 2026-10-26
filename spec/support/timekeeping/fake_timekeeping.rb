@@ -263,11 +263,19 @@ module TimekeepingContract
         return entry_route(route, company_id, acting, params, headers, body) unless ENTRY_WRITE_ROUTES.include?(route)
         return Wire.error(@entry_contract, "stale_generation") unless generation_current?(headers["Ownership-Generation"])
         return Wire.error(@entry_contract, "credential_in_body") if @policies[:credential_in_body].call(body:, credentials:)
+        return respond(400, "reason" => "bad_request") if malformed_duration?(body)
 
         @receipts.answer(company_scope: company_id, actor: ["user", acting["id"]], operation: "#{route} #{params["entry_id"]}",
                          key: headers["Idempotency-Key"], body:) do
           entry_route(route, company_id, acting, params, headers, body)
         end
+      end
+
+      # In token mode, which stands in for the real service, a duration must be
+      # a JSON number, as Timekeeping::EntryCommand requires. Opaque-token mode
+      # keeps the contract fake's looser input.
+      def malformed_duration?(body)
+        !@token_public_key.nil? && body.key?("duration") && !body["duration"].is_a?(Numeric)
       end
 
       # The acting user Hash for the request's bearer, or nil when it is not

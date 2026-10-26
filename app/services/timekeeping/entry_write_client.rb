@@ -72,9 +72,20 @@ module Timekeeping
     # The create body for a web or mobile entry. user and project are records
     # the caller already resolved inside the company, never raw params.
     def self.create_body(user:, project:, attributes:)
-      attributes.to_h.stringify_keys.slice(*EDIT_FIELDS)
+      edit_fields(attributes)
         .merge("project_id" => project.id, "user_id" => user.id)
         .merge(CREATE_SOURCE.deep_dup)
+    end
+
+    # The EDIT_FIELDS of attributes, as sent. A form post carries every value
+    # as a string, and Timekeeping takes duration only as a JSON number, so a
+    # numeric string is sent as the Float the duration column would store. Any
+    # other duration is sent unchanged, and Timekeeping refuses it.
+    def self.edit_fields(attributes)
+      fields = attributes.to_h.stringify_keys.slice(*EDIT_FIELDS)
+      duration = fields["duration"]
+      number = Float(duration, exception: false) if duration.is_a?(String)
+      number.nil? ? fields : fields.merge("duration" => number)
     end
 
     # Returns the created entry Hash.
@@ -87,7 +98,7 @@ module Timekeeping
     def update_entry(context:, generation:, entry_id:, version:, body:)
       path = format(ENTRY_PATH, company_id: context.company.id, entry_id:)
       forward(Net::HTTP::Patch, path, operation: "update", context:, generation:, entry_id:, version:,
-                                      body: body.to_h.stringify_keys.slice(*EDIT_FIELDS))
+                                      body: self.class.edit_fields(body))
     end
 
     # Returns the discarded entry Hash.

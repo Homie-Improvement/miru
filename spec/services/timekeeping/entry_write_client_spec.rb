@@ -227,3 +227,24 @@ RSpec.describe Timekeeping::EntryWriteClient, "forwarded requests" do
     expect(WebMock).not_to have_requested(:post, forwarding_entries_url)
   end
 end
+
+RSpec.describe Timekeeping::EntryWriteClient, "edit fields" do
+  # Timekeeping takes duration only as a JSON number, while a form post carries it as a string.
+  it "sends a numeric duration string as a number and leaves other durations and absent fields as given" do
+    expect(described_class.edit_fields("duration" => "30", "note" => "x")).to eq("duration" => 30.0, "note" => "x")
+    expect(described_class.edit_fields(duration: "12.5")).to eq("duration" => 12.5)
+    expect(described_class.edit_fields("duration" => "abc")).to eq("duration" => "abc")
+    expect(described_class.edit_fields("duration" => 45)).to eq("duration" => 45)
+    expect(described_class.edit_fields("note" => "only")).to eq("note" => "only")
+  end
+
+  it "builds a create body whose form-posted duration is a number" do
+    user = build_stubbed(:user)
+    project = build_stubbed(:project)
+
+    body = described_class.create_body(user:, project:, attributes: { "duration" => "30", "work_date" => "2026-03-02" })
+
+    expect(body["duration"]).to eq(30.0)
+    expect(body).to include("project_id" => project.id, "user_id" => user.id, "source" => "manual")
+  end
+end
