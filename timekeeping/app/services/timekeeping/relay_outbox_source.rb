@@ -29,8 +29,15 @@ module Timekeeping
         {
           "generation" => attributes.fetch("generation"),
           "outbox_position" => attributes.fetch("outbox_position"),
-          "entry" => attributes.slice(*OutboxFields::ENTRY_FIELDS)
+          "entry" => attributes.slice(*OutboxFields::ENTRY_FIELDS).transform_values { |value| wire_value(value) }
         }
+      end
+
+      # JSON.generate writes a timestamp as Time#to_s ("2026-03-02 09:00:00 UTC"),
+      # which drops its microseconds. ISO 8601 in UTC with microseconds keeps
+      # created_at, updated_at and discarded_at equal to the stored entry's.
+      def wire_value(value)
+        value.is_a?(Time) ? value.utc.iso8601(6) : value
       end
   end
 end

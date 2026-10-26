@@ -55,3 +55,20 @@ RSpec.describe Timekeeping::RelayOutboxSource do
     expect(serialized).not_to match(/email|name/i)
   end
 end
+
+RSpec.describe Timekeeping::RelayOutboxSource do
+  # "Payloads carry the full entry row": a timestamp keeps its microseconds on the wire.
+  it "sends entry timestamps as ISO 8601 UTC with microseconds" do
+    sub_second = Time.utc(2026, 3, 2, 9, 0, 0, 123_456)
+    OutboxSnapshot.insert_all!([{
+      id: 71, project_id: 2, user_id: 3, work_date: "2026-03-02", duration: 30.0, bill_status: "unbilled",
+      review_status: "not_required", locked: false, source: "manual", source_metadata: {}, proof_metadata: {},
+      created_at: sub_second, updated_at: sub_second, discarded_at: sub_second, company_id: 4, version: 1, generation: 1
+    }])
+
+    entry = JSON.parse(JSON.generate(described_class.new.unsent_after(0, 10))).first.fetch("entry")
+
+    expect(entry.values_at("created_at", "updated_at", "discarded_at")).to all(eq("2026-03-02T09:00:00.123456Z"))
+    expect(entry.fetch("work_date")).to eq("2026-03-02")
+  end
+end

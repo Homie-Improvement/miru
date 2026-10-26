@@ -2,7 +2,9 @@
 
 module Timekeeping
   # The endpoint the snapshot relay posts through. It passes every answer back
-  # unchanged and writes one log line for each answer that is not a 200. That
+  # unchanged and writes one log line for each answer the relay will not count
+  # as delivered (TimekeepingRelay::Response#delivered?), a malformed 200
+  # included, since that answer also stops the run. That
   # line holds only the status and a fixed reason from
   # TimekeepingRelay::FailureReason, because a response body is text the
   # consumer chose and could echo the bearer token.
@@ -22,7 +24,7 @@ module Timekeeping
 
     def deliver(batch, idempotency_key:)
       answer = endpoint.deliver(batch, idempotency_key:)
-      log_failure(answer) unless answer.status == 200
+      log_failure(answer) unless answer.delivered?(batch.fetch("snapshots").size)
       answer
     end
 
