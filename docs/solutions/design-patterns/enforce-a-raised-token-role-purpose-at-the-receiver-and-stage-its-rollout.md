@@ -38,8 +38,8 @@ PR #79 needed a higher role on read tokens. An admin whose older role is `employ
 
 Put the limit where the credential is accepted, and type it strictly:
 
-- Every token carries a signed `purpose` claim, `"read"` or `"write"`. `UserToken.mint` picks the role with a lookup, `ROLE_FOR_PURPOSE`, keyed by purpose. Any other purpose raises `ArgumentError`, so an unexpected value never falls back to the raised role.
-- The read rule counts only `owner` or `admin` roles whose resource is exactly this company: `Role.where(resource: company)`. Global roles and roles in other companies never raise the role.
+- Every token carries a signed `purpose` claim, `"read"` or `"write"`. `UserToken.mint` accepts only the purposes in `UserToken::PURPOSES`; any other purpose raises `ArgumentError`. (At PR #79 it picked the role per purpose through a lookup, `ROLE_FOR_PURPOSE`. Both purposes now sign the same role, the one `Timekeeping::ReferenceFacts` serves.)
+- The raised role counts only `owner` or `admin` roles whose resource is exactly this company: `Role.where(resource: company)`, now queried in `Timekeeping::ReferenceFacts`. Global roles and roles in other companies never raise the role.
 - Once `ReadAccess.decide` allows the request, `WriteAccess.decide` answers `:forbidden` unless the purpose is `nil` or `"write"`; an expired token still answers `:reference_unavailable`, and another company's path still answers ReadAccess's refusal (such as `:not_found`), whatever the purpose. A missing purpose is allowed only because tokens signed before this change carry the primary role, as before.
 - Because a missing purpose may write, `TokenVerifier` rejects a purpose that is present but not a String (`OPTIONAL_CLAIM_TYPES`). Otherwise a wrong-type value could be read as missing and gain write access.
 
