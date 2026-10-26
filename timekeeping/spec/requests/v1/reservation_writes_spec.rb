@@ -104,3 +104,149 @@ RSpec.describe "Reservation replay after commit through reservation_post" do
     expect(timekeeping_arrange.entry_locked(entry)).to be(true)
   end
 end
+
+RSpec.describe "Reservation operation ids across companies" do
+  include_context "timekeeping entry writes"
+
+  # "Each operation is idempotent by (company_id, operation_id). A replay after a terminal state changes nothing. Operation ids are unique only within a company."
+  it "keeps one company's provisional reservations when another company aborts the same operation id" do
+    operations = %w[prepare commit abort]
+    first_company = timekeeping_arrange.company
+    second_company = timekeeping_arrange.company
+    entry_in = lambda do |company|
+      timekeeping_arrange.entry(company:, user: timekeeping_arrange.user(company:, role: "employee"),
+                                project: timekeeping_arrange.project(company:))
+    end
+    first_entry = entry_in.call(first_company)
+    second_entry = entry_in.call(second_company)
+    services = {
+      first_company => timekeeping_arrange.service_identity(company: first_company, name: "invoice-boundary", operations:),
+      second_company => timekeeping_arrange.service_identity(company: second_company, name: "invoice-boundary", operations:)
+    }
+    command = lambda do |company, route, body|
+      process(:post, "/v1/companies/#{company}/reservations/#{route}",
+              params: JSON.generate({ "generation" => timekeeping_arrange.current_generation }.merge(body)),
+              headers: { "Content-Type" => "application/json", "Authorization" => "Bearer #{services.fetch(company)}" })
+      [response.status, response.parsed_body]
+    end
+    operation_id = SecureRandom.uuid
+    finish_body = { "invoice_id" => 501, "operation_id" => operation_id }
+
+    expect(command.call(first_company, "prepare", finish_body.merge("disposition" => "active", "entries" => [first_entry])).first).to eq(200)
+    expect(command.call(second_company, "prepare", finish_body.merge("disposition" => "active", "entries" => [second_entry])).first).to eq(200)
+
+    expect(command.call(second_company, "abort", finish_body)).to eq([200, { "dropped" => 1 }])
+
+    expect(timekeeping_arrange.reservations_for(second_entry)).to eq([])
+    expect(timekeeping_arrange.reservations_for(first_entry)).to eq([{ "invoice_id" => 501, "state" => "provisional" }])
+    expect(timekeeping_arrange.entry_locked(first_entry)).to be(true)
+    expect(command.call(first_company, "commit", finish_body)).to eq([200, { "reserved" => 1, "released" => 0 }])
+    expect(timekeeping_arrange.reservations_for(first_entry)).to eq([{ "invoice_id" => 501, "state" => "committed" }])
+  end
+end
+
+RSpec.describe "Reservation commit that releases an entry" do
+  include_context "timekeeping entry writes"
+
+  # "Every reservation change that flips `locked`, every mark-billed and every detach writes an audit row and an outbox snapshot row in the same transaction as the change."
+  it "writes one audit row and one unlocked outbox snapshot when a commit releases an entry the stored set dropped" do
+    company = timekeeping_arrange.company
+    user = timekeeping_arrange.user(company:, role: "employee")
+    project = timekeeping_arrange.project(company:)
+    kept = timekeeping_arrange.entry(company:, user:, project:)
+    dropped = timekeeping_arrange.entry(company:, user:, project:)
+    service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: %w[prepare commit abort])
+    command = lambda do |route, body|
+      process(:post, "/v1/companies/#{company}/reservations/#{route}",
+              params: JSON.generate({ "generation" => timekeeping_arrange.current_generation }.merge(body)),
+              headers: { "Content-Type" => "application/json", "Authorization" => "Bearer #{service}" })
+      [response.status, response.parsed_body]
+    end
+    save = lambda do |entries|
+      body = { "invoice_id" => 501, "operation_id" => SecureRandom.uuid }
+      expect(command.call("prepare", body.merge("disposition" => "active", "entries" => entries)).first).to eq(200)
+      command.call("commit", body)
+    end
+    save.call([kept, dropped])
+    version_before = Entry.find(dropped).version
+    audits_before = AuditEvent.where(entry_id: dropped).count
+    snapshots_before = OutboxSnapshot.where(id: dropped).count
+
+    expect(save.call([kept])).to eq([200, { "reserved" => 0, "released" => 1 }])
+
+    expect(timekeeping_arrange.entry_locked(dropped)).to be(false)
+    expect(AuditEvent.where(entry_id: dropped).count).to eq(audits_before + 1)
+    expect(OutboxSnapshot.where(id: dropped).count).to eq(snapshots_before + 1)
+    latest = OutboxSnapshot.where(id: dropped).order(:outbox_position).last
+    expect([latest.locked, latest.version, latest.company_id]).to eq([false, Entry.find(dropped).version, company])
+    expect(Entry.find(dropped).version).to be > version_before
+  end
+end
+
+RSpec.describe "Detach-entries persistence and replay" do
+  include_context "timekeeping entry writes"
+
+  # "Detach-entries nulls `agent_id` on that company's entries for the agent with one audit row per entry."
+  it "writes one audit row per detached entry once, and a replay of the same operation id writes none" do
+    company = timekeeping_arrange.company
+    other_company = timekeeping_arrange.company
+    user = timekeeping_arrange.user(company:, role: "employee")
+    project = timekeeping_arrange.project(company:)
+    own = Array.new(2) { timekeeping_arrange.entry(company:, user:, project:, agent_id: 77) }
+    foreign = timekeeping_arrange.entry(company: other_company, user: timekeeping_arrange.user(company: other_company, role: "employee"),
+                                        project: timekeeping_arrange.project(company: other_company), agent_id: 77)
+    service = timekeeping_arrange.service_identity(company:, name: "agent-destroy", operations: %w[detach_entries])
+    body = { "generation" => timekeeping_arrange.current_generation, "operation_id" => SecureRandom.uuid }
+    detach = lambda do
+      process(:post, "/v1/companies/#{company}/agents/77/detach-entries", params: JSON.generate(body),
+                                                                         headers: { "Content-Type" => "application/json", "Authorization" => "Bearer #{service}" })
+      [response.status, response.parsed_body]
+    end
+    audits = -> { own.map { |id| AuditEvent.where(company_id: company, entry_id: id).count } }
+    snapshots = -> { own.map { |id| OutboxSnapshot.where(company_id: company, id:).count } }
+    audits_before = audits.call
+    snapshots_before = snapshots.call
+
+    first = detach.call
+
+    expect(first).to eq([200, { "detached" => 2 }])
+    expect(own.map { |id| timekeeping_arrange.stored_entry(id).fetch("agent_id") }).to eq([nil, nil])
+    expect(timekeeping_arrange.stored_entry(foreign).fetch("agent_id")).to eq(77)
+    expect(audits.call).to eq(audits_before.map { |count| count + 1 })
+    expect(snapshots.call).to eq(snapshots_before.map { |count| count + 1 })
+    after_first = [audits.call, snapshots.call, Entry.sum(:version)]
+
+    expect(detach.call).to eq(first)
+    expect([audits.call, snapshots.call, Entry.sum(:version)]).to eq(after_first)
+  end
+end
+
+RSpec.describe "Mark-billed persistence and replay" do
+  include_context "timekeeping entry writes"
+
+  # "Every reservation change that flips `locked`, every mark-billed and every detach writes an audit row and an outbox snapshot row in the same transaction as the change."
+  it "bills the committed entry once with one audit and one outbox row, and a replay bills nothing again" do
+    company = timekeeping_arrange.company
+    billable = timekeeping_arrange.reserved_entry(company:, invoice_id: 501, state: "committed")
+    service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: %w[mark_billed])
+    body = { "generation" => timekeeping_arrange.current_generation, "operation_id" => SecureRandom.uuid }
+    mark_billed = lambda do
+      process(:post, "/v1/companies/#{company}/invoices/501/mark-billed", params: JSON.generate(body),
+                                                                         headers: { "Content-Type" => "application/json", "Authorization" => "Bearer #{service}" })
+      [response.status, response.parsed_body]
+    end
+    rows = -> { [AuditEvent.where(entry_id: billable).count, OutboxSnapshot.where(id: billable).count, Entry.find(billable).version] }
+    audits_before, snapshots_before, version_before = rows.call
+
+    first = mark_billed.call
+
+    expect(first).to eq([200, { "billed" => 1 }])
+    expect(timekeeping_arrange.stored_entry(billable).fetch("bill_status")).to eq("billed")
+    expect(rows.call).to eq([audits_before + 1, snapshots_before + 1, version_before + 1])
+    latest = OutboxSnapshot.where(id: billable).order(:outbox_position).last
+    expect([latest.bill_status, latest.company_id]).to eq(["billed", company])
+
+    expect(mark_billed.call).to eq(first)
+    expect(rows.call).to eq([audits_before + 1, snapshots_before + 1, version_before + 1])
+  end
+end
