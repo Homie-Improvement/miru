@@ -5,6 +5,12 @@
 require "rails_helper"
 
 RSpec.describe "Invoice entry company-scope request specs" do
+  # An `expect([... .locked ...]).to eq([false, ...])` line inside a `before do` block, reached without
+  # leaving the block, so the seeded unlocked state is asserted before any refused request.
+  let(:locked_baseline_in_before_pattern) do
+    /before do(?:\n(?!\s*end\n).*)*\n\s*expect\(\[[^\]]*\.locked[^\]]*\]\)\s*\.to eq\(\[false(?:, false)*\]\)/
+  end
+
   let(:invoice_request_spec_dir) { Rails.root.join("spec/requests/api/v1/invoices") }
 
   # "Suggested fix: Delete spec/requests/api/v1/invoices/entry_company_scope_spec.rb."
@@ -71,7 +77,8 @@ RSpec.describe "Invoice entry company-scope request specs" do
     required_assertions = {
       "no echoed id" => /not_to include\(\s*(foreign_entry|missing_id)[^)]*\.to_s\s*\)/,
       "no writes" => /InvoiceLineItemTimeEntry(, :count|\.count)/,
-      "locked unchanged with a baseline assert" => /locked\)\.to (be\(false\)|eq\(false\))/,
+      "unlocked baseline asserted in a before block" => locked_baseline_in_before_pattern,
+      "locked unchanged after the request" => /locked\)\.to (be\(false\)|eq\(false\))/,
       "repeated refusal identical" => /uniq\.size\)\.to eq\(1\)/,
       "no 'same company' wording" => /not_to include\("same company"\)/,
       "422 errors shape" => /\["errors"\]\)\.to include\("not found"\)/,
@@ -93,9 +100,10 @@ RSpec.describe "Invoice entry company-scope request specs" do
     required_assertions = {
       "no echoed id" => /not_to include\(\s*foreign_entry[^)]*\.to_s\s*\)/,
       "no writes" => /InvoiceLineItemTimeEntry(, :count|\.count)/,
-      "locked unchanged with a baseline assert" => /locked\)\.to (be\(false\)|eq\(false\))/,
+      "unlocked baseline asserted in a before block" => locked_baseline_in_before_pattern,
+      "locked unchanged after the request" => /locked\)\.to (be\(false\)|eq\(false\))/,
       "link-only refusal keeps the old links" => /linked_timesheet_entr(y_ids|ies\.ids)\)\.to (eq|match_array)/,
-      "replace idempotent on repeat" => /2\.times/,
+      "replace idempotent on repeat" => /2\.times do\s+\S.*patch_company_scope_line\(\w+, linked_timesheet_entry_ids:/,
       "then clear" => /\[""\]/,
       "422 errors shape" => /\["errors"\]\)\.to include\("not found"\)/,
       "NULL-company entry" => /company_id, nil\)/
