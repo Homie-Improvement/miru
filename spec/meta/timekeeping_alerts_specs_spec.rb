@@ -20,9 +20,7 @@ RSpec.describe "Timekeeping alerts spec layout" do
 
     expect(found).to eq(families)
   end
-end
 
-RSpec.describe "Timekeeping alerts spec layout" do
   # "The task harness (ENV swap, stdout capture, invoke) is pasted about ten times although with_timekeeping_env already exists."
   it "runs the alerts task only through the shared runner in the task spec" do
     source = File.read(Rails.root.join("spec/tasks/timekeeping_alerts_spec.rb"))
@@ -33,9 +31,7 @@ RSpec.describe "Timekeeping alerts spec layout" do
     expect(source.scan(/ENV\[["'][A-Z_]+["']\]\s*=/)).to be_empty
     expect(source.scan(/Rake::Task\[["']timekeeping:alerts["']\]\.invoke/)).to be_empty
   end
-end
 
-RSpec.describe "Timekeeping alerts spec layout" do
   # "merge the two new metrics_spec describes. Keep every distinct case once."
   it "asserts each metrics endpoint example title exactly once" do
     source = File.read(Rails.root.join("timekeeping/spec/requests/internal/v1/metrics_spec.rb"))
@@ -46,23 +42,17 @@ RSpec.describe "Timekeeping alerts spec layout" do
     expect(titles.count("reports each company's own outbox lag only to the service token")).to eq(1)
     expect(titles.count("reports an empty outbox_lag list when no outbox row is unsent")).to eq(1)
   end
-end
 
-RSpec.describe "Timekeeping alerts task spec distinct cases" do
-  # "Keep every distinct case once."
+  # "Keep every distinct case once." Each marker is text only the guarded example
+  # holds, so removing that example fails this check.
   it "keeps each distinct alerts task case exactly once in the single task spec" do
     source = File.read(Rails.root.join("spec/tasks/timekeeping_alerts_spec.rb"))
 
-    present_markers = {
-      "failed read answered 401" => "401",
-      "failed read answered 500" => "500",
-      "window still in progress" => "2026-03-03T12:05:00Z",
-      "signals without a source" => "ownership_moving",
-      "pending intent at exactly 10 minutes" => "600"
-    }
-    expect(present_markers.reject { |_case, marker| source.include?(marker) }.keys).to be_empty
-
     once_markers = {
+      "failed read answered 401 and 500" => "[401, 500].each",
+      "window still in progress" => '"window_start" => "2026-03-03T12:05:00Z"',
+      "signals without a source" => 'unavailable_line("ownership_moving")',
+      "pending intent at exactly 10 minutes" => '[on_time_company, "pending", 600]',
       "stale_generation refusal during a handoff" => 'handoff_step: "freeze"',
       "outbox lag at exactly 5 minutes" => '"oldest_unsent_age_seconds" => 300',
       "body without window_seconds" => "without window_seconds"
@@ -70,9 +60,7 @@ RSpec.describe "Timekeeping alerts task spec distinct cases" do
     counts = once_markers.transform_values { |marker| source.scan(marker).size }
     expect(counts).to eq(once_markers.transform_values { 1 })
   end
-end
 
-RSpec.describe "Timekeeping alerts rule spec distinct cases" do
   # "Move alerts_2_spec's partial-window case into alerts_spec.rb" and "Keep every distinct case once."
   # alerts_2_spec.rb also held the only p95 case whose overflow bucket uses a key other than "inf".
   it "keeps the partial-window and custom overflow key cases in the single alerts spec" do
@@ -84,9 +72,7 @@ RSpec.describe "Timekeeping alerts rule spec distinct cases" do
     }
     expect(markers.reject { |_case, marker| source.include?(marker) }.keys).to be_empty
   end
-end
 
-RSpec.describe "Timekeeping write delay hook spec distinct cases" do
   # "delete write_delay_hook_2_spec.rb" and "Keep every distinct case once."
   # The deleted file checked the delay after every refused request, so the kept file must too.
   it "checks a zero write delay after each refused delay request in the single write delay hook spec" do
