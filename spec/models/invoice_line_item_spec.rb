@@ -350,7 +350,8 @@ RSpec.describe InvoiceLineItem do
     expect(foreign_line.linked_timesheet_entries.map(&:id)).not_to include(foreign_entry.id)
 
     expect(own_line).to be_valid
-    expect(own_line.linked_timesheet_entries.map(&:id)).to eq([own_entry.id])
+    own_line.save!
+    expect(own_line.reload.linked_timesheet_entries.map(&:id)).to eq([own_entry.id])
   end
 end
 
@@ -489,5 +490,22 @@ RSpec.describe InvoiceLineItem, type: :model do
     expect(missing_line).not_to be_valid
     expect(foreign_line.errors[:timesheet_entry]).to eq(["not found"])
     expect(foreign_line.errors.to_hash).to eq(missing_line.errors.to_hash)
+  end
+end
+
+RSpec.describe InvoiceLineItem, type: :model do
+  it "writes pending linked ids of a saved line only on save, never on validation" do
+    invoice = create(:invoice)
+    project = create(:project, client: invoice.client, billable: true)
+    user = create(:user, current_workspace: invoice.company)
+    entry = create(:timesheet_entry, user:, project:, bill_status: "unbilled")
+    line = InvoiceLineItem.find(create(:invoice_line_item, invoice:, timesheet_entry: nil).id)
+    line.linked_timesheet_entry_ids = [entry.id]
+
+    expect(line).to be_valid
+    expect(InvoiceLineItemTimeEntry.where(invoice_line_item_id: line.id)).to be_empty
+
+    line.save!
+    expect(InvoiceLineItemTimeEntry.where(invoice_line_item_id: line.id).pluck(:timesheet_entry_id)).to eq([entry.id])
   end
 end

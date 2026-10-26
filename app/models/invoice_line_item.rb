@@ -6,7 +6,7 @@ class InvoiceLineItem < ApplicationRecord
   has_many :invoice_line_item_time_entries, dependent: :destroy
   has_many :linked_timesheet_entries, through: :invoice_line_item_time_entries, source: :timesheet_entry
 
-  before_validation :resolve_pending_linked_timesheet_entries
+  before_save :link_pending_linked_timesheet_entries
   before_update :capture_previous_invoice_id, if: :will_save_change_to_invoice_id?
   before_destroy :unlock_timesheet_entries
   after_save :sync_invoice_totals
@@ -56,7 +56,8 @@ class InvoiceLineItem < ApplicationRecord
   # The Rails ids writer would look the ids up in every company, and raise
   # RecordNotFound for a missing one, so a caller could tell a missing id from
   # another company's id. The ids are kept here and resolved within the
-  # invoice's company at validation, when nested attributes have set the invoice.
+  # invoice's company at validation and save, when nested attributes have set
+  # the invoice.
   def linked_timesheet_entry_ids=(ids)
     @pending_linked_timesheet_entry_ids = Array(ids).reject(&:blank?).map { |id| Integer(id.to_s, exception: false) }.uniq
   end
@@ -75,14 +76,22 @@ class InvoiceLineItem < ApplicationRecord
       TimesheetEntry.where(company_id: invoice.company_id)
     end
 
-    # Links the pending ids only when every one is an entry of the invoice's
-    # company; otherwise they stay pending and validation reports not found.
-    def resolve_pending_linked_timesheet_entries
+    # The pending ids' entries, or nil when any id is not an entry of the
+    # invoice's company.
+    def pending_linked_entries_in_invoice_company
       requested_ids = @pending_linked_timesheet_entry_ids
-      return if requested_ids.nil?
-
       entries = entries_in_invoice_company.where(id: requested_ids.compact).to_a
-      return unless entries.size == requested_ids.size
+      entries if entries.size == requested_ids.size
+    end
+
+    # Assigning links on a saved line writes join rows at once, so it waits for
+    # save and validation stays read-only. Unresolved ids stay pending, which
+    # validation reports as not found.
+    def link_pending_linked_timesheet_entries
+      return if @pending_linked_timesheet_entry_ids.nil?
+
+      entries = pending_linked_entries_in_invoice_company
+      return if entries.nil?
 
       self.linked_timesheet_entries = entries
       @pending_linked_timesheet_entry_ids = nil
@@ -99,7 +108,7 @@ class InvoiceLineItem < ApplicationRecord
     end
 
     def linked_timesheet_entries_found_in_invoice_company
-      unresolved_ids = !@pending_linked_timesheet_entry_ids.nil?
+      unresolved_ids = !@pending_linked_timesheet_entry_ids.nil? && pending_linked_entries_in_invoice_company.nil?
       foreign_entry = invoice.present? &&
         linked_timesheet_entries.any? { |entry| entry.company_id != invoice.company_id }
 
