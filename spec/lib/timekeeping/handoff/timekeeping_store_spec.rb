@@ -3,8 +3,187 @@
 
 require "rails_helper"
 
+RSpec.describe Timekeeping::Handoff::TimekeepingStore, "blank credentials on every route" do
+  # "blank token sends no request in two" - the folded failures table applies the
+  # blank token/URL rows to every method, not only export and outbox position.
+  it "sends no request from any of the seven methods when the token or base URL is blank" do
+    stub_request(:any, /timekeeping-handoff\.test/)
+    checkpoint = Timekeeping::Handoff::Checkpoint.build(
+      tables: Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }
+    )
+    calls = [
+      ->(store) { store.export_checkpoint },
+      ->(store) { store.load_checkpoint(checkpoint) },
+      ->(store) { store.highest_outbox_position },
+      ->(store) { store.advance_entry_id_sequence(above: 5) },
+      ->(store) { store.write_correction_snapshots(snapshots: [], version: 1, generation: 2) },
+      ->(store) { store.fence_admission },
+      ->(store) { store.admit(generation: 2) }
+    ]
+
+    [
+      described_class.new(base_url: "http://timekeeping-handoff.test", token: ""),
+      described_class.new(base_url: "http://timekeeping-handoff.test", token: nil),
+      described_class.new(base_url: "", token: "service-token")
+    ].each do |store|
+      calls.each do |call|
+        expect { call.call(store) }.to raise_error(Timekeeping::Handoff::Store::Error)
+      end
+    end
+
+    expect(a_request(:any, /timekeeping-handoff\.test/)).not_to have_been_made
+  end
+end
+
+RSpec.describe Timekeeping::Handoff::TimekeepingStore, "token kept out of refusals" do
+  # The old files proved the token stays out of the message only for export,
+  # outbox position, correction, fence and admit; this covers the other two routes.
+  it "keeps the bearer out of the error when the sequence and load routes refuse or fail" do
+    token = "service-#{SecureRandom.hex(24)}"
+    store = described_class.new(base_url: "http://timekeeping-handoff.test", token:)
+    sequence_url = "http://timekeeping-handoff.test/internal/v1/handoff/entry_id_sequence"
+    checkpoint_url = "http://timekeeping-handoff.test/internal/v1/handoff/checkpoint"
+    checkpoint = Timekeeping::Handoff::Checkpoint.build(
+      tables: Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }
+    )
+    failures = [
+      ->(stub) { stub.to_return(status: 401, body: JSON.generate("reason" => "unauthorized")) },
+      ->(stub) { stub.to_return(status: 409, body: JSON.generate("reason" => "handoff_refused")) },
+      ->(stub) { stub.to_return(status: 503, body: JSON.generate("reason" => "fence_timeout")) },
+      ->(stub) { stub.to_timeout },
+      ->(stub) { stub.to_raise(Errno::ECONNREFUSED) }
+    ]
+
+    failures.each do |failure|
+      WebMock.reset!
+      sequence = failure.call(stub_request(:post, sequence_url).with(headers: { "Authorization" => "Bearer #{token}" }))
+      load = failure.call(stub_request(:put, checkpoint_url).with(headers: { "Authorization" => "Bearer #{token}" }))
+
+      expect { store.advance_entry_id_sequence(above: 5) }
+        .to raise_error(Timekeeping::Handoff::Store::Error) { |error| expect(error.message).not_to include(token) }
+      expect { store.load_checkpoint(checkpoint) }
+        .to raise_error(Timekeeping::Handoff::Store::Error) { |error| expect(error.message).not_to include(token) }
+      expect(sequence).to have_been_requested.once
+      expect(load).to have_been_requested.once
+    end
+  end
+end
+
 RSpec.describe Timekeeping::Handoff::TimekeepingStore do
-  it "raises Store::Error without sending a request when the service token or base URL is blank" do
+  it "raises Store::Error without the bearer on a 401, 409 or 503, a timeout or a refused connection for export, outbox, correction, fence and admit" do
+    token = "service-#{SecureRandom.hex(24)}"
+    base_url = "http://timekeeping-handoff.test"
+    store = described_class.new(base_url:, token:)
+    routes = [
+      [:get, "/internal/v1/handoff/checkpoint", -> { store.export_checkpoint }],
+      [:get, "/internal/v1/handoff/outbox_position", -> { store.highest_outbox_position }],
+      [:put, "/internal/v1/handoff/correction_snapshots",
+       -> { store.write_correction_snapshots(snapshots: [], version: 1, generation: 2) }],
+      [:post, "/internal/v1/handoff/admission/fence", -> { store.fence_admission }],
+      [:post, "/internal/v1/handoff/admission/admit", -> { store.admit(generation: 2) }]
+    ]
+    failures = [
+      ->(stub) { stub.to_return(status: 401, body: JSON.generate("reason" => "unauthorized")) },
+      ->(stub) { stub.to_return(status: 409, body: JSON.generate("reason" => "handoff_refused")) },
+      ->(stub) { stub.to_return(status: 503, body: JSON.generate("reason" => "fence_timeout")) },
+      ->(stub) { stub.to_timeout },
+      ->(stub) { stub.to_raise(Errno::ECONNREFUSED) }
+    ]
+
+    routes.product(failures).each do |(verb, path, call), failure|
+      WebMock.reset!
+      stub = failure.call(stub_request(verb, "#{base_url}#{path}")
+        .with(headers: { "Authorization" => "Bearer #{token}" }))
+
+      expect { call.call }.to raise_error(Timekeeping::Handoff::Store::Error) { |error|
+        expect(error.message).not_to include(token)
+      }
+      expect(stub).to have_been_requested.once
+    end
+  end
+end
+
+RSpec.describe Timekeeping::Handoff::TimekeepingStore do
+  it "treats a refused fence as Store::Error and never as success" do
+    token = "service-#{SecureRandom.hex(24)}"
+    store = described_class.new(base_url: "http://timekeeping.test", token:)
+    fence = stub_request(:post, "http://timekeeping.test/internal/v1/handoff/admission/fence")
+      .with(headers: { "Authorization" => "Bearer #{token}" })
+      .to_return(status: 503, body: JSON.generate("reason" => "fence_timeout"))
+
+    result = :not_raised
+    expect { result = store.fence_admission }
+      .to raise_error(Timekeeping::Handoff::Store::Error, /503/) { |error| expect(error.message).not_to include(token) }
+    expect(result).to eq(:not_raised)
+    expect(fence).to have_been_requested.once
+  end
+end
+
+RSpec.describe Timekeeping::Handoff::TimekeepingStore do
+  it "raises Store::Error on a malformed answer from each method that reads the answer body" do
+    base_url = "http://timekeeping-handoff.test"
+    store = described_class.new(base_url:, token: "svc-token")
+    checkpoint = Timekeeping::Handoff::Checkpoint.build(tables: Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] })
+    routes = [
+      [:get, "/internal/v1/handoff/checkpoint", -> { store.export_checkpoint }],
+      [:put, "/internal/v1/handoff/checkpoint", -> { store.load_checkpoint(checkpoint) }],
+      [:get, "/internal/v1/handoff/outbox_position", -> { store.highest_outbox_position }],
+      [:post, "/internal/v1/handoff/entry_id_sequence", -> { store.advance_entry_id_sequence(above: 5) }],
+      [:put, "/internal/v1/handoff/correction_snapshots",
+       -> { store.write_correction_snapshots(snapshots: [], version: 1, generation: 2) }]
+    ]
+    malformed_bodies = ["not json", "[1]", JSON.generate("tables" => [])]
+
+    routes.product(malformed_bodies).each do |(verb, path, call), body|
+      WebMock.reset!
+      stub = stub_request(verb, "#{base_url}#{path}").to_return(status: 200, body:)
+
+      expect { call.call }.to raise_error(Timekeeping::Handoff::Store::Error)
+      expect(stub).to have_been_requested.once
+    end
+  end
+end
+
+RSpec.describe Timekeeping::Handoff::TimekeepingStore, "spec layout" do
+  # "Fold timekeeping_store_2/\_3/\_auth specs into timekeeping_store_spec.rb with a describe per method"
+  # A second spec file for this client means a change to its error contract
+  # needs edits in more than one place.
+  it "keeps every TimekeepingStore client spec in this one file" do
+    handoff_specs = Rails.root.join("spec/lib/timekeeping/handoff")
+    store_specs = Dir.children(handoff_specs).grep(/\Atimekeeping_store.*_spec\.rb\z/)
+
+    expect(store_specs).to eq(["timekeeping_store_spec.rb"])
+  end
+end
+
+RSpec.describe Timekeeping::Handoff::TimekeepingStore do
+  # "Fold timekeeping_store_2/_3/_auth specs into timekeeping_store_spec.rb with a describe per method,
+  # one route table through shared expectations and one table-driven failures block
+  # (blank token/URL, 401/409/503, timeout, ECONNREFUSED, malformed body); keep the interface-parity example."
+  it "drives every TimekeepingStore route through one shared example group with literal paths" do
+    source = Rails.root.join("spec/lib/timekeeping/handoff/timekeeping_store_spec.rb").read
+
+    expect(source.scan(/^\s*shared_examples\b/).size).to be >= 1
+    %w[
+      /internal/v1/handoff/checkpoint
+      /internal/v1/handoff/outbox_position
+      /internal/v1/handoff/entry_id_sequence
+      /internal/v1/handoff/correction_snapshots
+      /internal/v1/handoff/admission/fence
+      /internal/v1/handoff/admission/admit
+    ].each { |path| expect(source).to include(%("#{path}")) }
+    %w[export_checkpoint load_checkpoint highest_outbox_position advance_entry_id_sequence
+       write_correction_snapshots fence_admission admit].each do |name|
+      expect(source).to match(/describe "##{name}"/)
+    end
+    expect(source).to include("includes Store and gives the four store methods the same parameters as MonolithStore")
+  end
+end
+
+RSpec.describe Timekeeping::Handoff::TimekeepingStore do
+  # "one table-driven failures block (blank token/URL, 401/409/503, timeout, ECONNREFUSED, malformed body)"
+  # The old files checked a blank token only for export_checkpoint and highest_outbox_position.
+  it "refuses fence and admit with a blank token without sending a request" do
     stub_request(:any, /timekeeping-handoff\.test/)
 
     [
@@ -12,117 +191,209 @@ RSpec.describe Timekeeping::Handoff::TimekeepingStore do
       described_class.new(base_url: "http://timekeeping-handoff.test", token: nil),
       described_class.new(base_url: "", token: "service-token")
     ].each do |store|
-      expect { store.export_checkpoint }.to raise_error(Timekeeping::Handoff::Store::Error)
-      expect { store.highest_outbox_position }.to raise_error(Timekeeping::Handoff::Store::Error)
+      expect { store.fence_admission }.to raise_error(Timekeeping::Handoff::Store::Error)
+      expect { store.admit(generation: 2) }.to raise_error(Timekeeping::Handoff::Store::Error)
     end
 
     expect(a_request(:any, /timekeeping-handoff\.test/)).not_to have_been_made
   end
 end
 
-RSpec.describe Timekeeping::Handoff::TimekeepingStore, :without_transaction do
-  let(:client_case_url) { "http://timekeeping-handoff.test/internal/v1/handoff/checkpoint" }
-  let(:client_case_store) { described_class.new(base_url: "http://timekeeping-handoff.test", token: "svc-token") }
-
-  def client_case_monolith_export
-    connection = ActiveRecord::Base.connection
-    connection.execute(MonolithCheckpointFileSeed::SQL)
-    Timekeeping::Handoff::MonolithStore.new(connection:).export_checkpoint
+RSpec.describe Timekeeping::Handoff::TimekeepingStore, "per method" do
+  base_url = "http://timekeeping-handoff.test"
+  empty_checkpoint = lambda do
+    Timekeeping::Handoff::Checkpoint.build(tables: Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] })
   end
+  correction_snapshot = -> { { "id" => 61, "company_id" => 4, "locked" => false } }
 
-  it "loads a populated monolith export with a PUT of its transport form and returns the checkpoint read back" do
-    checkpoint = client_case_monolith_export
-    stub_request(:put, client_case_url).to_return { |request| { status: 200, body: request.body } }
+  # One row per public method. The paths are written out rather than read from
+  # the client's *_PATH constants, so a wrong constant fails here instead of
+  # moving the stub along with it. Bodies are built per example, so no example
+  # can change a value another one reads.
+  routes = {
+    export_checkpoint: {
+      verb: :get, path: "/internal/v1/handoff/checkpoint",
+      call: ->(store) { store.export_checkpoint.digest },
+      request_body: nil,
+      answer_body: -> { empty_checkpoint.call.to_json },
+      expected_result: -> { empty_checkpoint.call.digest }
+    },
+    load_checkpoint: {
+      verb: :put, path: "/internal/v1/handoff/checkpoint",
+      call: ->(store) { store.load_checkpoint(empty_checkpoint.call).digest },
+      request_body: -> { JSON.parse(empty_checkpoint.call.to_json) },
+      answer_body: -> { empty_checkpoint.call.to_json },
+      expected_result: -> { empty_checkpoint.call.digest }
+    },
+    highest_outbox_position: {
+      verb: :get, path: "/internal/v1/handoff/outbox_position",
+      call: ->(store) { store.highest_outbox_position },
+      request_body: nil,
+      answer_body: -> { JSON.generate("outbox_position" => 42) },
+      expected_result: -> { 42 }
+    },
+    advance_entry_id_sequence: {
+      verb: :post, path: "/internal/v1/handoff/entry_id_sequence",
+      call: ->(store) { store.advance_entry_id_sequence(above: 5) },
+      request_body: -> { { "above" => 5 } },
+      answer_body: -> { JSON.generate("next_id" => 6) },
+      expected_result: -> { 6 }
+    },
+    write_correction_snapshots: {
+      verb: :put, path: "/internal/v1/handoff/correction_snapshots",
+      call: ->(store) { store.write_correction_snapshots(snapshots: [correction_snapshot.call], version: 1, generation: 2) },
+      request_body: -> { { "snapshots" => [correction_snapshot.call], "version" => 1, "generation" => 2 } },
+      answer_body: -> { JSON.generate("written" => 1) },
+      expected_result: -> { 1 }
+    },
+    fence_admission: {
+      verb: :post, path: "/internal/v1/handoff/admission/fence",
+      call: ->(store) { store.fence_admission },
+      request_body: -> { {} },
+      answer_body: -> { JSON.generate("generation" => nil) },
+      expected_result: -> { nil }
+    },
+    admit: {
+      verb: :post, path: "/internal/v1/handoff/admission/admit",
+      call: ->(store) { store.admit(generation: 2) },
+      request_body: -> { { "generation" => 2 } },
+      answer_body: -> { JSON.generate("generation" => 2) },
+      expected_result: -> { nil }
+    }
+  }.transform_values(&:freeze).freeze
 
-    loaded = client_case_store.load_checkpoint(checkpoint)
+  shared_examples "a TimekeepingStore route" do |route|
+    it "sends #{route[:verb].upcase} #{route[:path]} once with the service bearer and returns what Timekeeping answered" do
+      token = "service-#{SecureRandom.hex(24)}"
+      body = route[:request_body]&.call
+      headers = { "Authorization" => "Bearer #{token}" }
+      headers["Content-Type"] = "application/json" if body
+      stub = stub_request(route[:verb], "#{base_url}#{route[:path]}")
+        .with(**{ headers:, body: }.compact)
+        .to_return(status: 200, body: route[:answer_body].call)
 
-    expect(WebMock).to have_requested(:put, client_case_url).with(
-      headers: { "Authorization" => "Bearer svc-token", "Content-Type" => "application/json" },
-      body: checkpoint.to_json
-    ).once
-    expect(loaded.digest).to eq(checkpoint.digest)
-    expect(loaded.rows).to eq(Timekeeping::Handoff::Checkpoint.from_json(checkpoint.to_json).rows)
-  end
+      result = route[:call].call(described_class.new(base_url:, token:))
 
-  it "raises Store::Error for a refused load, a malformed answer and an answer that fails its own digest" do
-    checkpoint = client_case_monolith_export
-    tampered = checkpoint.to_json.sub("Design review", "Design reviewed")
-
-    [
-      { status: 409, body: JSON.generate(reason: "handoff_refused") },
-      { status: 200, body: "not json" },
-      { status: 200, body: JSON.generate(tables: []) },
-      { status: 200, body: tampered }
-    ].each do |answer|
-      stub_request(:put, client_case_url).to_return(answer)
-      expect { client_case_store.load_checkpoint(checkpoint) }.to raise_error(Timekeeping::Handoff::Store::Error)
-      stub_request(:get, client_case_url).to_return(answer)
-      expect { client_case_store.export_checkpoint }.to raise_error(Timekeeping::Handoff::Store::Error)
+      expect(result).to eq(route[:expected_result].call)
+      expect(stub).to have_been_requested.once
     end
   end
 
-  it "raises Store::Error when the load answer holds rows other than the ones sent" do
-    checkpoint = client_case_monolith_export
-    other = Timekeeping::Handoff::Checkpoint.build(tables: checkpoint.rows.merge("idempotency_records" => []))
-    stub_request(:put, client_case_url).to_return(status: 200, body: other.to_json)
-
-    expect { client_case_store.load_checkpoint(checkpoint) }.to raise_error(Timekeeping::Handoff::Store::Error)
+  it "keeps the route table and each of its rows frozen" do
+    expect(routes).to be_frozen
+    expect(routes.values).to all(be_frozen)
   end
 
-  it "raises Store::Error for a timeout, a refused connection and an answer without the expected number" do
-    position_url = "http://timekeeping-handoff.test/internal/v1/handoff/outbox_position"
-
-    stub_request(:get, position_url).to_timeout
-    expect { client_case_store.highest_outbox_position }.to raise_error(Timekeeping::Handoff::Store::Error)
-    stub_request(:get, position_url).to_raise(Errno::ECONNREFUSED)
-    expect { client_case_store.highest_outbox_position }.to raise_error(Timekeeping::Handoff::Store::Error)
-    stub_request(:get, position_url).to_return(status: 200, body: "[1]")
-    expect { client_case_store.highest_outbox_position }.to raise_error(Timekeeping::Handoff::Store::Error)
-    stub_request(:get, position_url).to_return(status: 200, body: JSON.generate(outbox_position: 42))
-    expect(client_case_store.highest_outbox_position).to eq(42)
+  # "Timekeeping::Handoff::TimekeepingStore implements the same interface as Timekeeping::Handoff::MonolithStore"
+  it "includes Store and gives the four store methods the same parameters as MonolithStore" do
+    expect(described_class.ancestors).to include(Timekeeping::Handoff::Store)
+    %i[export_checkpoint load_checkpoint highest_outbox_position advance_entry_id_sequence].each do |name|
+      expect(described_class.instance_method(name).owner).not_to eq(Timekeeping::Handoff::Store)
+      expect(described_class.instance_method(name).parameters)
+        .to eq(Timekeeping::Handoff::MonolithStore.instance_method(name).parameters)
+    end
   end
-end
 
-RSpec.describe Timekeeping::Handoff::TimekeepingStore do
-  it "sends the service bearer and keeps it out of every error it raises" do
-    token = "service-#{SecureRandom.hex(24)}"
-    store = described_class.new(base_url: "http://timekeeping-handoff.test", token:)
-    stub_request(:get, "http://timekeeping-handoff.test/internal/v1/handoff/checkpoint")
-      .with(headers: { "Authorization" => "Bearer #{token}" })
-      .to_return(status: 401, body: { reason: "unauthorized" }.to_json)
-    stub_request(:get, "http://timekeeping-handoff.test/internal/v1/handoff/outbox_position")
-      .to_raise(Errno::ECONNREFUSED)
+  describe "#export_checkpoint" do
+    it_behaves_like "a TimekeepingStore route", routes.fetch(:export_checkpoint)
+  end
 
-    errors = [-> { store.export_checkpoint }, -> { store.highest_outbox_position }].map do |call|
-      call.call
-      nil
-    rescue StandardError => error
-      error
+  describe "#load_checkpoint" do
+    it_behaves_like "a TimekeepingStore route", routes.fetch(:load_checkpoint)
+
+    context "with a populated monolith export", :without_transaction do
+      let(:checkpoint_url) { "#{base_url}/internal/v1/handoff/checkpoint" }
+      let(:store) { described_class.new(base_url:, token: "svc-token") }
+
+      def populated_monolith_export
+        connection = ActiveRecord::Base.connection
+        connection.execute(MonolithCheckpointFileSeed::SQL)
+        Timekeeping::Handoff::MonolithStore.new(connection:).export_checkpoint
+      end
+
+      it "loads a populated monolith export with a PUT of its transport form and returns the checkpoint read back" do
+        checkpoint = populated_monolith_export
+        stub_request(:put, checkpoint_url).to_return { |request| { status: 200, body: request.body } }
+
+        loaded = store.load_checkpoint(checkpoint)
+
+        expect(WebMock).to have_requested(:put, checkpoint_url).with(
+          headers: { "Authorization" => "Bearer svc-token", "Content-Type" => "application/json" },
+          body: checkpoint.to_json
+        ).once
+        expect(loaded.digest).to eq(checkpoint.digest)
+        expect(loaded.rows).to eq(Timekeeping::Handoff::Checkpoint.from_json(checkpoint.to_json).rows)
+      end
+
+      it "raises Store::Error when a loaded or exported checkpoint fails its own digest" do
+        checkpoint = populated_monolith_export
+        tampered = checkpoint.to_json.sub("Design review", "Design reviewed")
+        stub_request(:put, checkpoint_url).to_return(status: 200, body: tampered)
+        stub_request(:get, checkpoint_url).to_return(status: 200, body: tampered)
+
+        expect { store.load_checkpoint(checkpoint) }.to raise_error(Timekeeping::Handoff::Store::Error)
+        expect { store.export_checkpoint }.to raise_error(Timekeeping::Handoff::Store::Error)
+      end
+
+      it "raises Store::Error when the load answer holds rows other than the ones sent" do
+        checkpoint = populated_monolith_export
+        other = Timekeeping::Handoff::Checkpoint.build(tables: checkpoint.rows.merge("idempotency_records" => []))
+        stub_request(:put, checkpoint_url).to_return(status: 200, body: other.to_json)
+
+        expect { store.load_checkpoint(checkpoint) }.to raise_error(Timekeeping::Handoff::Store::Error)
+      end
+    end
+  end
+
+  describe "#highest_outbox_position" do
+    it_behaves_like "a TimekeepingStore route", routes.fetch(:highest_outbox_position)
+  end
+
+  describe "#advance_entry_id_sequence" do
+    it_behaves_like "a TimekeepingStore route", routes.fetch(:advance_entry_id_sequence)
+  end
+
+  describe "#write_correction_snapshots" do
+    it_behaves_like "a TimekeepingStore route", routes.fetch(:write_correction_snapshots)
+
+    it "sends a jsonb decimal from the checkpoint as a bare JSON number, not a string" do
+      checkpoint = Timekeeping::Handoff::Checkpoint.from_json(
+        Rails.root.join("spec/fixtures/files/timekeeping_handoff/monolith_checkpoint.json").read
+      )
+      snapshot = checkpoint.rows.fetch("entries").first.except("version")
+      url = "#{base_url}/internal/v1/handoff/correction_snapshots"
+      stub_request(:put, url).to_return(status: 200, body: JSON.generate("written" => 1))
+
+      described_class.new(base_url:, token: "svc-token")
+        .write_correction_snapshots(snapshots: [snapshot], version: 1, generation: 2)
+
+      expect(a_request(:put, url).with do |request|
+        sent = JSON.parse(request.body, decimal_class: BigDecimal).fetch("snapshots").first.fetch("source_metadata")
+        sent == snapshot.fetch("source_metadata") && sent.fetch("rate").is_a?(BigDecimal)
+      end).to have_been_made.once
     end
 
-    expect(errors).to all(be_a(Timekeeping::Handoff::Store::Error))
-    expect(errors.map(&:message)).to all(satisfy { |message| !message.include?(token) })
-    expect(a_request(:get, "http://timekeeping-handoff.test/internal/v1/handoff/checkpoint")
-      .with(headers: { "Authorization" => "Bearer #{token}" })).to have_been_made.once
+    it "writes an empty list of snapshots with the service bearer" do
+      token = "service-#{SecureRandom.hex(24)}"
+      accepted = stub_request(:put, "#{base_url}/internal/v1/handoff/correction_snapshots")
+        .with(headers: { "Authorization" => "Bearer #{token}" },
+              body: { "snapshots" => [], "version" => 1, "generation" => 2 })
+        .to_return(status: 200, body: JSON.generate("written" => 0))
+
+      written = described_class.new(base_url:, token:)
+        .write_correction_snapshots(snapshots: [], version: 1, generation: 2)
+
+      expect(written).to eq(0)
+      expect(accepted).to have_been_requested.once
+    end
   end
-end
 
-RSpec.describe Timekeeping::Handoff::TimekeepingStore, "correction transport" do
-  it "sends a jsonb decimal from the checkpoint as a bare JSON number, not a string" do
-    checkpoint = Timekeeping::Handoff::Checkpoint.from_json(
-      Rails.root.join("spec/fixtures/files/timekeeping_handoff/monolith_checkpoint.json").read
-    )
-    snapshot = checkpoint.rows.fetch("entries").first.except("version")
-    url = "http://timekeeping-handoff.test/internal/v1/handoff/correction_snapshots"
-    stub_request(:put, url).to_return(status: 200, body: JSON.generate("written" => 1))
+  describe "#fence_admission" do
+    it_behaves_like "a TimekeepingStore route", routes.fetch(:fence_admission)
+  end
 
-    described_class.new(base_url: "http://timekeeping-handoff.test", token: "svc-token")
-      .write_correction_snapshots(snapshots: [snapshot], version: 1, generation: 2)
-
-    expect(a_request(:put, url).with do |request|
-      sent = JSON.parse(request.body, decimal_class: BigDecimal).fetch("snapshots").first.fetch("source_metadata")
-      sent == snapshot.fetch("source_metadata") && sent.fetch("rate").is_a?(BigDecimal)
-    end).to have_been_made.once
+  describe "#admit" do
+    it_behaves_like "a TimekeepingStore route", routes.fetch(:admit)
   end
 end
 
