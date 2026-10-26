@@ -2,8 +2,8 @@
 
 # The timekeeping_arrange the shared contract examples call, for the real
 # provider. Entries and reservations are seeded through the models, and the
-# admitted generation through Timekeeping::Admission. Users and projects live
-# in the monolith, so they are kept in an in-memory catalogue that a WebMock
+# admitted generation through Timekeeping::Admission. Users, projects and
+# agents live in the monolith, so they are kept in an in-memory catalogue that a WebMock
 # stub of the reference endpoint serves.
 # Tokens are RS256, signed with a key generated once per run.
 class TimekeepingProviderArrange
@@ -26,6 +26,7 @@ class TimekeepingProviderArrange
     @users = {}
     @company_users = {}
     @company_projects = {}
+    @company_agents = {}
     @service_credentials = []
     @current_generation = 1
   end
@@ -34,6 +35,7 @@ class TimekeepingProviderArrange
     company_id = next_id
     @company_users[company_id] = []
     @company_projects[company_id] = []
+    @company_agents[company_id] = []
     company_id
   end
 
@@ -77,6 +79,14 @@ class TimekeepingProviderArrange
     project_id = next_id
     @company_projects.fetch(company) << project_id
     project_id
+  end
+
+  # An agent of the company that belongs to user. Only arranged agents are
+  # listed, so the reference stub never vouches for an agent nobody set up.
+  def agent(company:, user:)
+    agent_id = next_id
+    @company_agents.fetch(company) << { id: agent_id, user_id: user }
+    agent_id
   end
 
   def entry(company:, user:, project:, **attributes)
@@ -152,7 +162,8 @@ class TimekeepingProviderArrange
         edit_days: EDIT_DAYS,
         users: @company_users.fetch(company_id, []).map { |id| { id:, role: @users.fetch(id)[:role] } },
         projects: owned.map { |id| { id:, company_id:, billable: true, member_user_ids: [] } },
-        missing_project_ids: missing
+        missing_project_ids: missing,
+        agents: @company_agents.fetch(company_id, [])
       }
     end
 end

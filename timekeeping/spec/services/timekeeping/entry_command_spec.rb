@@ -7,7 +7,7 @@ RSpec.describe Timekeeping::EntryCommand do
     Timekeeping::ReferenceClient::Facts.new(
       company_id: 3, edit_days: 30, users: [Timekeeping::ReferenceClient::User.new(id: 7, role: "owner")],
       projects: [Timekeeping::ReferenceClient::Project.new(id: 11, company_id: 3, billable: true, member_user_ids: [])],
-      missing_project_ids: []
+      missing_project_ids: [], agents: []
     )
   end
   let(:reference_client) { instance_double(Timekeeping::ReferenceClient, fetch: facts) }
