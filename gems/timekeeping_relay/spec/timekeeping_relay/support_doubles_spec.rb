@@ -126,7 +126,8 @@ RSpec.describe TimekeepingRelaySpec::FakeRelayEndpoint do
       [TimekeepingRelaySpec::MemoryOutboxSource.row(1), TimekeepingRelaySpec::MemoryOutboxSource.row(2)]
     )
 
-    expect { TimekeepingRelay::Relay.new(source:, endpoint:).deliver(limit: 1) }.to raise_error(StandardError)
+    expect { TimekeepingRelay::Relay.new(source:, endpoint:).deliver(limit: 1) }
+      .to raise_error(ArgumentError, /no scripted answer left/)
     expect(source.mark_calls).to eq([[1]])
     expect(endpoint.posts.size).to eq(2)
   end
