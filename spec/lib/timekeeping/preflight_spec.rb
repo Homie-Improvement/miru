@@ -116,9 +116,13 @@ RSpec.describe Timekeeping::Preflight do
   end
 
   it "reads no database" do
-    allow(ActiveRecord::Base).to receive(:connection).and_raise("classify must not touch the database")
+    # The stub ends with the block, so the suite's after hooks can still use
+    # the connection.
+    result = RSpec::Mocks.with_temporary_scope do
+      allow(ActiveRecord::Base).to receive(:connection).and_raise("classify must not touch the database")
 
-    result = classify_one(preflight_entry(1, locked: true), [preflight_link(1, 10)])
+      classify_one(preflight_entry(1, locked: true), [preflight_link(1, 10)])
+    end
 
     expect(result[:active]).to eq([1])
   end
