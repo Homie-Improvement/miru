@@ -893,6 +893,7 @@ en:
     super_admin_delete:
       sole_owner: "Cannot permanently delete this user because they are the only owner of: %{companies}. Transfer ownership or delete the company before deleting this user."
       success: User %{email} has been permanently deleted.
+      handoff_begun: "Users cannot be permanently deleted once a timekeeping handoff has begun."
   workspaces:
     update:
       failure: Failed to switch workspace
