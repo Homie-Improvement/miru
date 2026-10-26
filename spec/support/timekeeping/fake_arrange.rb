@@ -37,6 +37,11 @@ module TimekeepingContract
       @timekeeping.add_project(company_id: company)
     end
 
+    # An agent of the company that belongs to user.
+    def agent(company:, user:)
+      @timekeeping.add_agent(company_id: company, user_id: user)
+    end
+
     def entry(company:, user:, project:, **attributes)
       @timekeeping.add_entry(company_id: company, user_id: user, project_id: project, **attributes).fetch("id")
     end
