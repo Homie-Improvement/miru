@@ -18,12 +18,21 @@ class RelayJob < ActiveJob::Base
   def perform
     with_relay_lock do
       TimekeepingRelay::Relay.new(source: Timekeeping::RelayOutboxSource.new,
-                                  endpoint: Timekeeping::SnapshotEndpoint.configured)
+                                  endpoint: Timekeeping::SnapshotEndpoint.configured,
+                                  paused: relay_pause_check)
                              .deliver(limit: BATCH_SIZE)
     end
   end
 
   private
+
+    # The pause control exists only where the test hooks are loaded; anywhere
+    # else the relay is never paused.
+    def relay_pause_check
+      return TimekeepingRelay::Relay::NEVER_PAUSED unless defined?(Timekeeping::TestHooks)
+
+      Timekeeping::TestHooks.method(:relay_paused?)
+    end
 
     # A session lock rather than a transaction lock, so no transaction stays
     # open across the POST and each mark_sent commits on its own.

@@ -16,6 +16,7 @@ require_relative "../lib/timekeeping/log_safety"
 require_relative "../lib/timekeeping/request_identity"
 require_relative "../lib/timekeeping/request_logger"
 require_relative "../lib/timekeeping/controller_log_subscriber"
+require_relative "../lib/timekeeping/test_hooks" if Rails.env.test? || Timekeeping::Environment.test_hooks?
 
 module TimekeepingService
   class Application < Rails::Application
