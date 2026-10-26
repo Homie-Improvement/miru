@@ -194,7 +194,7 @@ RSpec.describe Timekeeping::ReservationDerivation do
     )
 
     expect(result[:refusals]).to eq([])
-    expect(result[:corrections].map { |correction| correction["entry_id"] }).to eq([2, 3])
+    expect(result[:corrections].pluck("entry_id")).to eq([2, 3])
     result[:corrections].each do |correction|
       expect(correction["company_id"]).to eq(1)
       expect(correction["generation"]).to eq(7)
@@ -346,9 +346,9 @@ RSpec.describe Timekeeping::ReservationDerivation do
     expect(first).to eq(second)
     expect(first[:refusals]).to eq([])
     expect(first[:reservations].size).to eq(2)
-    expect(first[:reservations].map { |reservation| reservation["created_at"] }).to all(eq(captured_at))
-    expect(first[:reservations].map { |reservation| reservation["operation_id"] }).to all(match(/\A\h{8}-\h{4}-5\h{3}-[89ab]\h{3}-\h{12}\z/))
-    expect(first[:reservations].map { |reservation| reservation["operation_id"] }.uniq.size).to eq(2)
+    expect(first[:reservations].pluck("created_at")).to all(eq(captured_at))
+    expect(first[:reservations].pluck("operation_id")).to all(match(/\A\h{8}-\h{4}-5\h{3}-[89ab]\h{3}-\h{12}\z/))
+    expect(first[:reservations].pluck("operation_id").uniq.size).to eq(2)
 
     other_invoice = derive.call(11)[:reservations].find { |reservation| reservation["entry_id"] == 1 }
     same_invoice = first[:reservations].find { |reservation| reservation["entry_id"] == 1 }

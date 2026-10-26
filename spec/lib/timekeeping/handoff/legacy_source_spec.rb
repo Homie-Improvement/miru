@@ -12,7 +12,7 @@ RSpec.describe Timekeeping::Handoff::LegacySource, :two_tenant_seed, :seeded_wit
   it "exports the seeded legacy entries as stored without writing audits or billing tables" do
     connection = ActiveRecord::Base.connection
     tables = %w[audits invoices invoice_line_items invoice_line_item_time_entries invoice_taxes timesheet_entries]
-    snapshot = -> { tables.to_h { |table| [table, connection.select_rows("SELECT * FROM #{table} ORDER BY id")] } }
+    snapshot = -> { tables.index_with { |table| connection.select_rows("SELECT * FROM #{table} ORDER BY id") } }
     before = snapshot.call
 
     result = described_class.new(connection:, recorded_disposition: recorded)
@@ -30,14 +30,14 @@ RSpec.describe Timekeeping::Handoff::LegacySource, :two_tenant_seed, :seeded_wit
       [row["id"], [row["company_id"], row["version"], row["duration"], row["bill_status"]]]
     end
     expect(copied).to eq(stored)
-    expect(rows.fetch("entries").map { |row| row["company_id"] }).to all(be_a(Integer))
+    expect(rows.fetch("entries").pluck("company_id")).to all(be_a(Integer))
     expect(rows.fetch("invoice_operations")).to eq([])
     expect(rows.fetch("idempotency_records")).to eq([])
 
     reserved_ids = recorded.fetch("companies").values.flat_map { |invoices| invoices.values.flat_map { |i| i["entry_ids"] } }
-    committed = rows.fetch("reservations").select { |r| r["state"] == "committed" }.map { |r| r["entry_id"] }
+    committed = rows.fetch("reservations").filter_map { |r| r["entry_id"] if r["state"] == "committed" }
     expect(committed).to include(*reserved_ids)
-    expect(result[:corrections].map { |c| c["entry_id"] }.sort).to eq(reserved_ids.sort)
+    expect(result[:corrections].pluck("entry_id").sort).to eq(reserved_ids.sort)
   end
 
   # "each unlocked link follows its recorded disposition (`reserve` becomes a committed
@@ -78,7 +78,7 @@ RSpec.describe Timekeeping::Handoff::LegacySource, :two_tenant_seed, :seeded_wit
 
     expect(expected_entry_ids).not_to be_empty
     # The seed has no re-locks, orphans or conflicts, so only reserved unlocked links are corrected.
-    expect(corrections.map { |item| item["entry_id"] }).to match_array(expected_entry_ids)
+    expect(corrections.pluck("entry_id")).to match_array(expected_entry_ids)
   end
 
   it "keeps every exported reservation, entry, audit and correction inside the company that owns it" do
@@ -121,9 +121,9 @@ RSpec.describe Timekeeping::Handoff::LegacySource, :two_tenant_seed, :seeded_wit
 
     reservations = first.fetch(:checkpoint).rows.fetch("reservations")
     expect(reservations).not_to be_empty
-    expect(reservations.map { |row| row["created_at"] }.uniq).to eq([captured_at])
+    expect(reservations.pluck("created_at").uniq).to eq([captured_at])
     expect(reservations.map { |row| [row["company_id"], row["entry_id"]] }.uniq.size).to eq(reservations.size)
-    expect(first.fetch(:corrections).map { |item| item["captured_at"] }.uniq).to eq([captured_at])
+    expect(first.fetch(:corrections).pluck("captured_at").uniq).to eq([captured_at])
   end
 
   it "refuses only the company whose record names an invoice number that only the other seeded company has" do
@@ -306,8 +306,8 @@ RSpec.describe Timekeeping::Handoff::LegacySource, :without_transaction do
   let(:stored_rows) do
     connection = ActiveRecord::Base.connection
     lambda do
-      %w[audits invoices invoice_line_items invoice_line_item_time_entries invoice_taxes timesheet_entries].to_h do |table|
-        [table, connection.select_all("SELECT * FROM #{connection.quote_table_name(table)} ORDER BY id").to_a]
+      %w[audits invoices invoice_line_items invoice_line_item_time_entries invoice_taxes timesheet_entries].index_with do |table|
+        connection.select_all("SELECT * FROM #{connection.quote_table_name(table)} ORDER BY id").to_a
       end
     end
   end
@@ -371,7 +371,7 @@ RSpec.describe Timekeeping::Handoff::LegacySource, :without_transaction do
     expect(first[:corrections].first["snapshot"]["version"]).to eq(1)
 
     expect(rows.fetch("entry_audits").size).to eq(legacy_audit_count)
-    expect(rows.fetch("entry_audits").map { |row| row["company_id"] }).to all(eq(company.id))
+    expect(rows.fetch("entry_audits").pluck("company_id")).to all(eq(company.id))
     expect(rows.fetch("invoice_operations")).to eq([])
     expect(rows.fetch("idempotency_records")).to eq([])
 
