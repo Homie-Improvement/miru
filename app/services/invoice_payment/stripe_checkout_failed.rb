@@ -13,6 +13,10 @@ class InvoicePayment::StripeCheckoutFailed < ApplicationService
   def process
     @invoice = Invoice.find(event.data.object.metadata.invoice_id)
     @payment = Payment.create!(payment_params)
+    rescue Timekeeping::BillingFence::OwnershipMoving
+      # Answered with a retryable 503 so Stripe redelivers the event after the
+      # handoff instead of the failed payment never being recorded.
+      raise
     rescue StandardError => error
       Rails.logger.error error.message
       Rails.logger.error error.backtrace.join("\n")

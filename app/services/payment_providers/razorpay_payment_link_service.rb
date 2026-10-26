@@ -12,18 +12,25 @@ module PaymentProviders
       @sms_sent = false
     end
 
+    # Creating the link at Razorpay and storing it on the invoice run in one
+    # billing transaction. Razorpay can text the link to the customer as it is
+    # created, so a handoff that refused only the storage would leave a payable
+    # link the payment webhook ignores as superseded once a retry stores a new
+    # one. The cost is that a handoff waits for one Razorpay call.
     def process
-      return existing_payment_link if existing_payment_link?
+      Timekeeping::BillingFence.transaction do
+        next existing_payment_link if existing_payment_link?
 
-      response = create_payment_link_with_fallback
-      invoice.update!(
-        razorpay_payment_link_id: response.fetch("id"),
-        razorpay_payment_link_url: response.fetch("short_url"),
-        razorpay_payment_link_status: response["status"].presence || "created"
-      )
-      @sms_sent = notify_sms?
+        response = create_payment_link_with_fallback
+        invoice.update!(
+          razorpay_payment_link_id: response.fetch("id"),
+          razorpay_payment_link_url: response.fetch("short_url"),
+          razorpay_payment_link_status: response["status"].presence || "created"
+        )
+        @sms_sent = notify_sms?
 
-      response.fetch("short_url")
+        response.fetch("short_url")
+      end
     end
 
     def sms_sent?
