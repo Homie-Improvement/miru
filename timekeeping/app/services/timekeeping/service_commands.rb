@@ -15,8 +15,9 @@ module Timekeeping
   # 2. Re-read the receipt: a stored answer is replayed. It comes before the
   #    generation check, so a retry of finished work replays even after the
   #    generation has moved.
-  # 3. Seed and read the company's generation row FOR SHARE; a body
-  #    generation that is not that generation is stale_generation.
+  # 3. Read the admitted generation (Timekeeping::Admission) FOR SHARE; a
+  #    body generation that is not that generation, or any generation while
+  #    fenced, is stale_generation.
   # 4. Lock the target entries FOR UPDATE in id order, then select them again
   #    under those locks.
   # 5. Write each entry with version + 1, one audit row holding the changed
@@ -87,7 +88,7 @@ module Timekeeping
         checkpoint.call(:receipt_checked)
         return replay(receipt) if receipt
 
-        generation = WriteSteps.locked_generation(request.company_id)
+        generation = Admission.locked_generation
         checkpoint.call(:generation_checked)
         return WriteOutcome.refusal(:stale_generation) unless WriteSteps.generation_matches?(request.generation, generation)
 

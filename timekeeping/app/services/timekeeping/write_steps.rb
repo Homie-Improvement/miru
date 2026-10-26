@@ -4,7 +4,7 @@ require "digest"
 
 module Timekeeping
   # The steps every writer takes inside its own transaction: advisory locks,
-  # the company's generation check, audit rows and outbox snapshots. Each
+  # the generation check, audit rows and outbox snapshots. Each
   # writer decides what changes; these steps record the change the same way
   # for all of them, so an entry write and a reservation change publish alike.
   module WriteSteps
@@ -21,19 +21,6 @@ module Timekeeping
     def lock_key(*parts)
       high, low = Digest::SHA256.digest(parts.join(KEY_SEPARATOR)).unpack("l>l>")
       connection.execute(ApplicationRecord.sanitize_sql_array(["SELECT pg_advisory_xact_lock(?, ?)", high, low]))
-    end
-
-    # The company's row is created at generation 1 when it has none, then
-    # read FOR SHARE, so an advance of this company's generation waits for
-    # this write to commit. Both statements name this one company only.
-    def locked_generation(company_id)
-      connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, company_id]))
-        INSERT INTO ownership_generations (company_id, generation) VALUES (?, 1)
-        ON CONFLICT (company_id) DO NOTHING
-      SQL
-      connection.select_value(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, company_id]))
-        SELECT generation FROM ownership_generations WHERE company_id = ? FOR SHARE
-      SQL
     end
 
     # A missing generation, or one that is not a plain integer, is never current.
