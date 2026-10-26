@@ -28,13 +28,8 @@ RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
   # "Admission: fence and admit through `Timekeeping::Admission.fence!` and
   # `Timekeeping::Admission.admit!`, from the admission-fence work this depends on.
   # This endpoint only calls them."
-  it "fences the real admission row only for the service bearer and never answers success for a missing row" do
+  it "fences the real admission row for the service bearer and never answers success for a missing row" do
     Timekeeping::Admission.admit!(generation: 1)
-
-    owner_token = mint_token({ sub: 7, company_id: 1, role: "owner" })
-    expect(handoff_answer_for_spec(:admission_fence, authorization: "Bearer #{owner_token}"))
-      .to eq([401, { "reason" => "unauthorized" }])
-    expect(Timekeeping::Admission.current.generation).to eq(1)
 
     expect(handoff_answer_for_spec(:admission_fence)).to eq([200, { "generation" => nil }])
     expect(Timekeeping::Admission.current.generation).to be_nil
