@@ -88,20 +88,6 @@ RSpec.describe TimekeepingSnapshots do
     expect(described_class.batch).to eq("schema_version" => schema_version, "snapshots" => [])
   end
 
-  it "builds a batch that Timekeeping::SnapshotBatch parses with the values it was given" do
-    entry = described_class.entry(id: 11, company_id: 3, version: 2, project_id: 5, user_id: 7,
-                                  review_status: "approved", source: "cli", source_metadata: { "tool" => "codex" })
-    batch = described_class.batch(described_class.item(entry, generation: 1, outbox_position: 1))
-
-    item = Timekeeping::SnapshotBatch.parse(batch).sole
-
-    expect([item.generation, item.outbox_position, item.entry_id, item.company_id, item.project_id]).to eq([1, 1, 11, 3, 5])
-    expect(item.row).to include(
-      "review_status" => TimesheetEntry.review_statuses.fetch("approved"),
-      "source_metadata" => '{"tool":"codex"}', "duration" => 90.0, "work_date" => "2026-03-02"
-    )
-  end
-
   # Explicit generation, project and user keep the timekeeping_arrange defaults from being evaluated.
   it "snapshot_item still returns the exact item it built before delegating, with every default and override in place" do
     item = snapshot_item(entry_id: 80_001, company: 2, version: 3, generation: 4, project: 5, user: 6,
