@@ -254,8 +254,6 @@ RSpec.describe "PayPal webhook replay after a handoff", type: :request do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "PayPal webhooks refused by the billing fence through the real chain", type: :request do
   it "answers a verified PayPal capture event during a handoff with 503 ownership_moving through the real chain and writes nothing" do
     company = create(:company)
@@ -308,8 +306,6 @@ RSpec.describe "PayPal webhooks refused by the billing fence through the real ch
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "PayPal webhooks with a bad signature during a handoff", type: :request do
   it "keeps the 401 for a PayPal event whose signature fails verification during a handoff" do
     company = create(:company)
@@ -350,8 +346,6 @@ RSpec.describe "PayPal webhooks with a bad signature during a handoff", type: :r
     expect(Payment.where(invoice_id: invoice.id).count).to eq(0)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "PayPal webhook replay after a handoff", type: :request do
   it "records a PayPal capture refused during a handoff exactly once when PayPal redelivers it afterwards" do
