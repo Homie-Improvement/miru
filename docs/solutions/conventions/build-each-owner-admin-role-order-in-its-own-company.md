@@ -51,6 +51,6 @@ A spec that puts both orders in one company looks correct, but one of its two ex
 
 ## Evidence
 
-- PR #151, `spec/services/timekeeping/reference_facts_spec.rb`: the "privileged-first users' roles" and "order between owner and admin" groups build the admin-first user in its own company. Their comments say Rolify shares one roles row per name and company among its holders.
+- PR #151, `spec/services/timekeeping/reference_facts_spec.rb`: the "privileged-first users' roles" and "order between owner and admin" groups build the admin-first user in its own company. Their comments say Rolify shares one roles row per name and company among its holders. Those groups are now merged into the "role selection" group. It takes fresh companies from `let` in every example, so each owner/admin order row gets a company of its own, and its comment gives the same Rolify reason.
 - PR #151, `app/services/timekeeping/reference_facts.rb`: `held_role_names_by_user_id` queries `Role.where(resource: company)` ordered by `roles.id`, and `role_from` takes the first name in `PRIVILEGED_ROLES`.
 - PR #151 description: one test file changed because two examples gave two users owner and admin in opposite orders in one company, which cannot hold under Rolify.
