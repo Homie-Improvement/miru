@@ -125,7 +125,7 @@ RSpec.describe Timekeeping::Handoff::TimekeepingStore, "per method" do
     "a refused connection" => ->(stub) { stub.to_raise(Errno::ECONNREFUSED) }
   }.freeze
 
-  malformed_answers = ["not json", "[1]", JSON.generate("tables" => [])].freeze
+  malformed_answers = ["not json", "[1]", JSON.generate("tables" => [])].map(&:freeze).freeze
 
   shared_examples "a TimekeepingStore route" do |route|
     it "sends #{route[:verb].upcase} #{route[:path]} once with the service bearer and returns the method's result" do
