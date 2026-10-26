@@ -1,10 +1,19 @@
 # frozen_string_literal: true
 
-# Drops the database references to timesheet entries from billing rows, and from
-# entries to agents, so a later ownership handoff can move entry rows without
-# these keys blocking it. Model validations now refuse the same missing
-# references: InvoiceLineItem and InvoiceLineItemTimeEntry check that their
-# entry exists, and TimesheetEntry checks that its agent exists.
+# The keys from billing rows to timesheet entries, and from entries to agents,
+# must go before a later ownership handoff can move entry rows. Model
+# validations take over their refusal: InvoiceLineItem and
+# InvoiceLineItemTimeEntry check that their entry exists, and TimesheetEntry
+# checks that its agent exists.
+#
+# This migration keeps the keys. A rolling deploy migrates while older web and
+# worker processes, which lack those validations, still write, so the keys are
+# dropped only in a release that follows one already running the validations.
+# Step S1 in docs/architecture/timekeeping-soa.md section 10.2 records that order.
+#
+# Databases that ran an earlier version of this migration have already lost the
+# keys. Its down restores them, and refuses without changing data when a row
+# points at a missing record.
 class DropTimesheetEntryForeignKeys < ActiveRecord::Migration[8.1]
   # Validating a restored key in its own step, outside one long transaction,
   # follows the repository's pattern for adding keys to existing tables.
@@ -18,11 +27,9 @@ class DropTimesheetEntryForeignKeys < ActiveRecord::Migration[8.1]
 
   class DanglingReferencesError < StandardError; end
 
-  def up
-    DROPPED_KEYS.each do |key|
-      remove_foreign_key key[:from_table], key[:to_table], column: key[:column], if_exists: true
-    end
-  end
+  # Removes nothing, and adds back nothing: re-adding a key here would fail on
+  # any row written while it was absent.
+  def up; end
 
   def down
     # A row written without the keys could point at a missing row. Restoring the
