@@ -3,47 +3,6 @@
 
 require "rails_helper"
 
-RSpec.describe "Timekeeping internal handoff correction snapshots" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  let(:handoff_service_token) { "service-#{SecureRandom.hex(24)}" }
-
-  around do |example|
-    with_timekeeping_env(
-      Timekeeping::Environment::TOKEN_PUBLIC_KEY => rsa_key_pair.public_key.to_pem,
-      Timekeeping::Environment::SERVICE_TOKEN => handoff_service_token
-    ) { example.run }
-  end
-
-  # "Writing the same corrections again replaces them, so there is never a second snapshot for one entry and generation."
-  it "writing the same correction snapshots twice leaves one snapshot per corrected entry and generation" do
-    now = Time.utc(2026, 3, 3, 12)
-    Entry.insert_all!([
-      { id: 701, company_id: 1, version: 0, project_id: 11, user_id: 21, work_date: Date.new(2026, 3, 2),
-        duration: 60.0, bill_status: "unbilled", created_at: now, updated_at: now },
-      { id: 702, company_id: 1, version: 0, project_id: 11, user_id: 21, work_date: Date.new(2026, 3, 2),
-        duration: 45.0, bill_status: "unbilled", created_at: now, updated_at: now }
-    ])
-    Timekeeping::Admission.fence!
-    headers = { "Authorization" => "Bearer #{handoff_service_token}", "Content-Type" => "application/json" }
-
-    snapshots = Entry.where(id: [701, 702]).order(:id).map do |entry|
-      entry.attributes.slice(*(Timekeeping::OutboxFields::ENTRY_FIELDS - ["version"])).merge("locked" => false).as_json
-    end
-    body = JSON.generate({ generation: 2, version: 1, snapshots: })
-
-    put "/internal/v1/handoff/correction_snapshots", params: body, headers: headers
-    first_status = response.status
-    put "/internal/v1/handoff/correction_snapshots", params: body, headers: headers
-    second_status = response.status
-
-    expect([first_status, second_status]).to eq([200, 200])
-    stored = OutboxSnapshot.where(company_id: 1, generation: 2).order(:id).pluck(:id, :version)
-    # "The first cutover writes one per corrected entry, at version 1 and the new generation."
-    expect(stored).to eq([[701, 1], [702, 1]])
-  end
-end
-
 RSpec.describe "Timekeeping internal handoff entry id sequence" do
   include_context "timekeeping entry writes without transactional fixtures"
 

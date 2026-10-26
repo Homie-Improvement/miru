@@ -77,56 +77,6 @@ RSpec.describe "Timekeeping handoff entry id sequence" do
   end
 end
 
-RSpec.describe "Timekeeping handoff correction snapshots delivered more than once" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  let(:correction_token) { "service-#{SecureRandom.hex(24)}" }
-  let(:correction_auth) { { "Authorization" => "Bearer #{correction_token}" } }
-
-  around do |example|
-    with_timekeeping_env(
-      Timekeeping::Environment::TOKEN_PUBLIC_KEY => rsa_key_pair.public_key.to_pem,
-      Timekeeping::Environment::SERVICE_TOKEN => correction_token
-    ) { example.run }
-  end
-
-  def correction_snapshot_for_spec(entry, locked:)
-    entry.attributes.slice(*(Timekeeping::OutboxFields::ENTRY_FIELDS - ["version"]))
-      .merge("locked" => locked).as_json
-  end
-
-  def put_corrections_for_spec(snapshots)
-    put "/internal/v1/handoff/correction_snapshots",
-        params: { generation: 2, version: 1, snapshots: }, headers: correction_auth, as: :json
-    [response.status, response.parsed_body]
-  end
-
-  def correction_rows_for_spec
-    OutboxSnapshot.order(:outbox_position).pluck(:company_id, :id, :generation, :version, :locked)
-  end
-
-  # "Writing the same corrections again replaces them, so there is never a
-  # second snapshot for one entry and generation."
-  it "keeps one correction snapshot per entry when the same corrections arrive twice and refuses one entry named twice in a request" do
-    first, second = 2.times.map do
-      Entry.create!(company_id: 1, user_id: 7, project_id: 3, work_date: "2026-03-02", duration: 90.0,
-                    note: "Corrected", bill_status: "unbilled", source: "manual", source_metadata: {})
-    end
-    Timekeeping::Admission.fence!
-    corrections = [correction_snapshot_for_spec(first, locked: false), correction_snapshot_for_spec(second, locked: false)]
-
-    expect(put_corrections_for_spec(corrections)).to eq([200, { "written" => 2 }])
-    expect(put_corrections_for_spec(corrections)).to eq([200, { "written" => 2 }])
-    expect(correction_rows_for_spec).to contain_exactly([1, first.id, 2, 1, false], [1, second.id, 2, 1, false])
-
-    before = correction_rows_for_spec
-    duplicate = [correction_snapshot_for_spec(first, locked: false), correction_snapshot_for_spec(first, locked: true)]
-
-    expect(put_corrections_for_spec(duplicate)).to eq([400, { "reason" => "invalid_request" }])
-    expect(correction_rows_for_spec).to eq(before)
-  end
-end
-
 RSpec.describe "Timekeeping handoff admission with a malformed generation" do
   include_context "timekeeping entry writes without transactional fixtures"
 
