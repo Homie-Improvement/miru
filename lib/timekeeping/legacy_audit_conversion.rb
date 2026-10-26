@@ -14,7 +14,7 @@ module Timekeeping
     # The actor of a change no one authored, such as a seed load: the row has
     # no user and no username. entry_audits.actor_id is NOT NULL, so the
     # absence of an author needs a value of its own.
-    SYSTEM_ACTOR = { "actor_type" => "system", "actor_id" => 0 }.freeze
+    SYSTEM_ACTOR = { "actor_type" => "system", "actor_id" => 0, "actor_name" => nil }.freeze
     LEGACY_USER_TYPE = "User"
     COMPANY_TYPE = "Company"
     # The refusal key of an audit that names no company and whose entry is gone.
@@ -113,7 +113,8 @@ module Timekeeping
     def actor(audit)
       return SYSTEM_ACTOR if audit[:user_id].nil?
 
-      { "actor_type" => USER_ACTOR_TYPE, "actor_id" => audit[:user_id] }
+      # actor_name names a service actor only; a legacy author is a user.
+      { "actor_type" => USER_ACTOR_TYPE, "actor_id" => audit[:user_id], "actor_name" => nil }
     end
 
     def audit_company_id(audit)

@@ -130,7 +130,9 @@ module Timekeeping
           "state" => COMMITTED,
           "disposition" => rule[:disposition],
           "operation_id" => operation_id(company_id:, entry_id: entry[:id], invoice_id:),
-          "created_at" => captured_at
+          "created_at" => captured_at,
+          # No invoice operation writes these rows: the first cutover registers none.
+          "invoice_operation_id" => nil
         }
       end
     end
