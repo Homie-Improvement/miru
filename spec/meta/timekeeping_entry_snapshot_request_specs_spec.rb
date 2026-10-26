@@ -15,11 +15,7 @@ RSpec.describe "Timekeeping entry-snapshot request specs" do
     expect(folded.scan("company_b.timesheet_entries.where(id: stored.id)").size).to eq(1)
     expect(folded).to include("\"company_id\\\":")
   end
-end
 
-require "rails_helper"
-
-RSpec.describe "Timekeeping entry-snapshot request specs" do
   # "Keep one example each for the company mismatch, the foreign project and a malformed body, plus the tenancy, idempotency and handoff examples."
   it "keeps the foreign-project, malformed-body, idempotency and handoff examples in entry_snapshots_spec.rb" do
     folded = File.read(Rails.root.join("spec/requests/internal/v1/timekeeping/entry_snapshots_spec.rb"))
@@ -31,11 +27,7 @@ RSpec.describe "Timekeeping entry-snapshot request specs" do
     expect(folded).to include("final_outbox_position: 10")
     expect(folded.scan("final_outbox_position: 10").size).to eq(1)
   end
-end
 
-require "rails_helper"
-
-RSpec.describe "Timekeeping entry-snapshot request specs" do
   # "Leave upsert, replay and handoff semantics to the consumer spec and the shared contract examples in monolith_projection_spec."
   it "leaves version-upsert semantics to the shared contract examples rather than the request specs" do
     request_specs = Dir[Rails.root.join("spec/requests/internal/v1/timekeeping/*_spec.rb")].map { |path| File.read(path) }
@@ -46,9 +38,7 @@ RSpec.describe "Timekeeping entry-snapshot request specs" do
     monolith = File.read(Rails.root.join("spec/contracts/timekeeping/monolith_projection_spec.rb"))
     expect(monolith).to include("it_behaves_like \"timekeeping entry snapshot endpoint\"")
   end
-end
 
-RSpec.describe "Timekeeping entry-snapshot request spec layout" do
   # "Fold entry_snapshots_{2,3,4,5}\_spec.rb into entry_snapshots_spec.rb." A second file would bring back a
   # second copy of the refusal assertions, and "the looser copies would not notice a regression to 403".
   it "keeps the endpoint's request specs in one file with no 401-or-403 assertion" do
