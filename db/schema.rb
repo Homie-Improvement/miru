@@ -439,11 +439,13 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_26_120100) do
 
   create_table "entry_audits", force: :cascade do |t|
     t.string "action", null: false
-    t.string "actor_id"
+    t.bigint "actor_id", null: false
     t.string "actor_type", null: false
-    t.jsonb "changed_fields", default: {}, null: false
+    t.jsonb "after", null: false
+    t.jsonb "before"
     t.bigint "company_id", null: false
     t.datetime "created_at", null: false
+    t.datetime "entry_created_at", null: false
     t.bigint "entry_id", null: false
     t.index ["company_id", "entry_id"], name: "index_entry_audits_on_company_id_and_entry_id"
   end
@@ -565,18 +567,16 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_26_120100) do
   end
 
   create_table "idempotency_records", force: :cascade do |t|
-    t.string "actor_id", null: false
+    t.bigint "actor_id", null: false
     t.string "actor_type", null: false
+    t.text "body", null: false
     t.bigint "company_id", null: false
     t.datetime "created_at", null: false
-    t.datetime "expires_at", null: false
+    t.string "fingerprint", null: false
     t.string "key", null: false
     t.string "operation", null: false
-    t.string "request_digest", null: false
-    t.jsonb "response_body", default: {}, null: false
-    t.integer "response_status", null: false
+    t.integer "status", null: false
     t.index ["company_id", "actor_type", "actor_id", "operation", "key"], name: "index_idempotency_records_on_scope_and_key", unique: true
-    t.index ["expires_at"], name: "index_idempotency_records_on_expires_at"
   end
 
   create_table "identities", force: :cascade do |t|
