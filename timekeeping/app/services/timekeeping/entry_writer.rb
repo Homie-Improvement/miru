@@ -9,10 +9,11 @@ module Timekeeping
   #
   # 1. Lock the receipt key and re-read the receipt: a stored answer for the
   #    same body is replayed, and a different body is idempotency_key_reused.
-  # 2. Seed and read the company's generation row FOR SHARE; a header that is
-  #    not that generation is stale_generation. A project the reference facts
-  #    do not hold for the company is not_found. Both come after the receipt,
-  #    so a retry of a committed write replays even if they have changed.
+  # 2. Read the admitted generation FOR SHARE; a header that is not that
+  #    generation, or any header while fenced, is stale_generation. A project
+  #    the reference facts do not hold for the company is not_found. Both come
+  #    after the receipt, so a retry of a committed write replays even if they
+  #    have changed, or Timekeeping has been fenced since.
   # 3. Lock the target entries FOR UPDATE, by company (and the A1 scope on
   #    bulk routes), in id order, so two writers over the same entries wait in
   #    turn and never deadlock.
@@ -77,7 +78,7 @@ module Timekeeping
         checkpoint.call(:receipt_checked)
         return answer_from(receipt, command) if receipt
 
-        generation = locked_generation(command.company_id)
+        generation = locked_generation
         checkpoint.call(:generation_checked)
         return WriteOutcome.refusal(:stale_generation) unless generation_matches?(command.generation, generation)
         return WriteOutcome.refusal(:not_found) unless project_known?(command)
@@ -122,17 +123,11 @@ module Timekeeping
         WriteOutcome.new(status: receipt.status, body: receipt.body)
       end
 
-      # The company's row is created at generation 1 when it has none, then
-      # read FOR SHARE, so an advance of this company's generation waits for
-      # this write to commit. Both statements name this one company only.
-      def locked_generation(company_id)
-        connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, company_id]))
-          INSERT INTO ownership_generations (company_id, generation) VALUES (?, 1)
-          ON CONFLICT (company_id) DO NOTHING
-        SQL
-        connection.select_value(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, company_id]))
-          SELECT generation FROM ownership_generations WHERE company_id = ? FOR SHARE
-        SQL
+      # The one generation Timekeeping admits, read FOR SHARE so a fence waits
+      # for this write to commit. nil while fenced or when the row is missing;
+      # the write never creates the row, so nil refuses it.
+      def locked_generation
+        Admission.locked_generation
       end
 
       # The project a body names must be one the facts hold for this company;
