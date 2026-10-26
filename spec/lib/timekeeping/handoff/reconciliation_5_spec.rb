@@ -282,7 +282,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
         "id" => 1, "company_id" => company_id, "invoice_id" => 5, "operation_id" => operation_id,
         "state" => "committed", "desired_entry_ids" => [], "disposition" => "active", "generation" => 1,
         "created_at" => at, "finished_at" => at
-      }
+      }.reverse_merge(Timekeeping::Handoff::Checkpoint::TABLES.fetch("invoice_operations").index_with { nil })
     }
     intent = ->(company_id) {
       {

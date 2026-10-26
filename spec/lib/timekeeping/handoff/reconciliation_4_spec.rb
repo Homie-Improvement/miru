@@ -29,7 +29,9 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     operation = lambda do |company_id, **o|
       { "id" => 1, "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "state" => "committed",
         "desired_entry_ids" => [1], "disposition" => "active", "generation" => 1, "created_at" => t0,
-        "finished_at" => t0 }.merge(o.transform_keys(&:to_s))
+        "finished_at" => t0 }
+        .reverse_merge(Timekeeping::Handoff::Checkpoint::TABLES.fetch("invoice_operations").index_with { nil })
+        .merge(o.transform_keys(&:to_s))
     end
     intent = lambda do |company_id, **o|
       { "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "generation" => 1,
@@ -104,6 +106,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     operation = lambda do |company_id|
       { "id" => 1, "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "state" => "committed",
         "desired_entry_ids" => [1], "disposition" => "active", "generation" => 1, "created_at" => t0, "finished_at" => t0 }
+        .reverse_merge(Timekeeping::Handoff::Checkpoint::TABLES.fetch("invoice_operations").index_with { nil })
     end
     intent = lambda do |company_id|
       { "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "generation" => 1,
@@ -172,6 +175,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     operation = lambda do |company_id|
       { "id" => 1, "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "state" => "committed",
         "desired_entry_ids" => [1], "disposition" => "active", "generation" => 1, "created_at" => t0, "finished_at" => t0 }
+        .reverse_merge(Timekeeping::Handoff::Checkpoint::TABLES.fetch("invoice_operations").index_with { nil })
     end
     intent = lambda do |company_id|
       { "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "generation" => 1,
@@ -249,6 +253,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     operation = lambda do |company_id|
       { "id" => 1, "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "state" => "committed",
         "desired_entry_ids" => [1], "disposition" => "active", "generation" => 1, "created_at" => t0, "finished_at" => t0 }
+        .reverse_merge(Timekeeping::Handoff::Checkpoint::TABLES.fetch("invoice_operations").index_with { nil })
     end
     intent = lambda do |company_id|
       { "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "generation" => 1,
@@ -326,6 +331,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
       { "id" => 1, "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "state" => state,
         "desired_entry_ids" => [ids[company_id]], "disposition" => "active", "generation" => 1, "created_at" => t0,
         "finished_at" => state == "committed" ? t0 : nil }
+        .reverse_merge(Timekeeping::Handoff::Checkpoint::TABLES.fetch("invoice_operations").index_with { nil })
     end
     intent = lambda do |company_id, state = "committed"|
       { "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "generation" => 1,
@@ -403,6 +409,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     operation = lambda do |company_id|
       { "id" => 1, "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "state" => "committed",
         "desired_entry_ids" => [1], "disposition" => "active", "generation" => 1, "created_at" => t0, "finished_at" => t0 }
+        .reverse_merge(Timekeeping::Handoff::Checkpoint::TABLES.fetch("invoice_operations").index_with { nil })
     end
     intent = lambda do |company_id|
       { "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "generation" => 1,
@@ -478,6 +485,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     operation = lambda do |company_id|
       { "id" => 1, "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "state" => "committed",
         "desired_entry_ids" => [1], "disposition" => "active", "generation" => 1, "created_at" => t0, "finished_at" => t0 }
+        .reverse_merge(Timekeeping::Handoff::Checkpoint::TABLES.fetch("invoice_operations").index_with { nil })
     end
     intent = lambda do |company_id|
       { "company_id" => company_id, "invoice_id" => 1, "operation_id" => op_id, "generation" => 1,
