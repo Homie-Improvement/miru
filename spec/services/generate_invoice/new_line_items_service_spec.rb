@@ -5,52 +5,6 @@
 require "rails_helper"
 
 RSpec.describe GenerateInvoice::NewLineItemsService do
-  it "keeps offering this company's free entry when another company's kept invoice references its id directly and as a linked entry" do
-    company = create(:company)
-    client = create(:client, company:)
-    project = create(:project, client:, billable: true)
-    user = create(:user, current_workspace_id: company.id)
-    free_entry = create(:timesheet_entry, user:, project:, bill_status: "unbilled")
-
-    other_company = create(:company)
-    other_client = create(:client, company: other_company)
-    other_invoice = create(:invoice, company: other_company, client: other_client)
-    # These rows break the company rule on purpose, so they skip validation: they stand for
-    # another tenant's data that names this company's entry id.
-    InvoiceLineItem.new(invoice: other_invoice, name: "Direct", date: Date.current, rate: 1, quantity: 60,
-      timesheet_entry_id: free_entry.id).save!(validate: false)
-    aggregate = InvoiceLineItem.new(invoice: other_invoice, name: "Aggregate", date: Date.current, rate: 1, quantity: 60)
-    aggregate.save!(validate: false)
-    InvoiceLineItemTimeEntry.new(invoice_line_item: aggregate, timesheet_entry_id: free_entry.id).save!(validate: false)
-
-    # "Another company's kept invoices do not change this company's candidate entries from GenerateInvoice::NewLineItemsService"
-    result = described_class.new(client, {}).process
-
-    expect(result[:new_line_item_entries].pluck(:timesheet_entry_id)).to eq([free_entry.id])
-    expect(result[:total_new_line_items]).to eq(1)
-  end
-end
-
-RSpec.describe GenerateInvoice::NewLineItemsService do
-  it "does not offer an entry in the client's project whose stored company_id is NULL" do
-    company = create(:company)
-    client = create(:client, company:)
-    project = create(:project, client:, billable: true)
-    user = create(:user, current_workspace_id: company.id)
-    scoped_entry = create(:timesheet_entry, user:, project:, bill_status: "unbilled")
-    unscoped_entry = create(:timesheet_entry, user:, project:, bill_status: "unbilled")
-    # update_column skips the callback that fills company_id from the project on save.
-    unscoped_entry.update_column(:company_id, nil)
-    expect(unscoped_entry.reload.company_id).to be_nil
-
-    # "Read only kept invoices of the client's company, and only that company's entries."
-    result = described_class.new(client, {}).process
-
-    expect(result[:new_line_item_entries].pluck(:timesheet_entry_id)).to eq([scoped_entry.id])
-  end
-end
-
-RSpec.describe GenerateInvoice::NewLineItemsService do
   def company_scope_workspace
     company = create(:company)
     client = create(:client, company:)
@@ -65,6 +19,46 @@ RSpec.describe GenerateInvoice::NewLineItemsService do
 
   def company_scope_offered_ids(workspace)
     described_class.new(workspace[:client], {}).process[:new_line_item_entries].pluck(:timesheet_entry_id)
+  end
+
+  it "keeps offering entries that another company's kept invoice references directly or through a link" do
+    workspace = company_scope_workspace
+    direct_target = company_scope_entry(workspace)
+    linked_target = company_scope_entry(workspace)
+
+    expect(company_scope_offered_ids(workspace)).to contain_exactly(direct_target.id, linked_target.id)
+
+    other_company = create(:company)
+    other_client = create(:client, company: other_company)
+    other_invoice = create(:invoice, company: other_company, client: other_client)
+    # Ids are global across companies, so another company's rows can name this
+    # company's entry ids. Validation refuses these rows, so they are written
+    # without it to stand for data that already exists.
+    build(:invoice_line_item, invoice: other_invoice, timesheet_entry: nil, timesheet_entry_id: direct_target.id)
+      .save!(validate: false)
+    other_aggregate_line = create(:invoice_line_item, invoice: other_invoice, timesheet_entry: nil)
+    InvoiceLineItemTimeEntry.new(invoice_line_item: other_aggregate_line, timesheet_entry_id: linked_target.id)
+      .save!(validate: false)
+
+    # "Another company's kept invoices do not change this company's candidate entries from GenerateInvoice::NewLineItemsService"
+    result = described_class.new(workspace[:client], {}).process
+    expect(result[:new_line_item_entries].pluck(:timesheet_entry_id)).to contain_exactly(direct_target.id, linked_target.id)
+    expect(result[:total_new_line_items]).to eq(2)
+  end
+
+  it "does not offer an entry in the client's project whose stored company_id is NULL" do
+    workspace = company_scope_workspace
+    scoped_entry = company_scope_entry(workspace)
+    unscoped_entry = company_scope_entry(workspace)
+    # update_column skips the callback that fills company_id from the project on save.
+    unscoped_entry.update_column(:company_id, nil)
+    expect(unscoped_entry.reload.company_id).to be_nil
+
+    # "Read only kept invoices of the client's company, and only that company's entries."
+    result = described_class.new(workspace[:client], {}).process
+
+    expect(result[:new_line_item_entries].pluck(:timesheet_entry_id)).to eq([scoped_entry.id])
+    expect(result[:total_new_line_items]).to eq(1)
   end
 
   it "hides an entry already on one of this company's kept invoices" do
