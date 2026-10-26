@@ -2,236 +2,205 @@
 
 # frozen_string_literal: true
 
+require "json"
 require "timekeeping_relay"
 
-RSpec.describe TimekeepingRelay::Relay, "ordered delivery" do
-  it "delivers rows with position gaps in ascending outbox_position order and marks exactly those positions after a 200" do
-    source = Class.new do
-      attr_reader :marked
+# How the relay reacts to each answer. Answers the consumer would give are
+# scripted here where only the relay's reaction is under test; the consumer's
+# own answers are proved in fake_relay_delivery_spec.rb.
+RSpec.describe TimekeepingRelay::Relay do
+  def relay_spec_rows(positions)
+    positions.map { |position| TimekeepingRelaySpec::MemoryOutboxSource.row(position) }
+  end
 
-      def initialize(rows)
-        @rows = rows
-        @marked = []
-      end
+  # An endpoint over the fake projection with a credential that may deliver,
+  # so every batch gets the consumer's real 200.
+  def relay_spec_projection_endpoint
+    timekeeping = TimekeepingContract::FakeTimekeeping.new
+    credential = timekeeping.add_service(company_id: nil, name: "timekeeping", operations: ["deliver"])
+    projection = TimekeepingContract::FakeRelay.new(source: timekeeping)
+    TimekeepingRelaySpec::FakeRelayEndpoint.new(projection:, credential:)
+  end
 
-      def unsent_after(position, limit)
-        @rows.reject { |row| @marked.include?(row["outbox_position"]) }
-             .select { |row| row["outbox_position"] > position }
-             .sort_by { |row| row["outbox_position"] }
-             .first(limit)
-      end
+  def relay_spec_posted_positions(endpoint)
+    endpoint.posts.map { |post| post[:batch]["snapshots"].map { |item| item["outbox_position"] } }
+  end
 
-      def mark_sent(positions)
-        @marked.concat(positions)
-        nil
-      end
+  [
+    [409, { "reason" => "stale_generation" }],
+    [401, { "reason" => "unauthorized" }],
+    [403, { "reason" => "forbidden" }],
+    [404, { "reason" => "not_found" }],
+    [500, "<html>Internal error</html>"],
+    [302, nil],
+    [nil, nil]
+  ].each do |status, body|
+    it "marks nothing and sends no later batch in the same run when the endpoint answers #{status.inspect}" do
+      source = TimekeepingRelaySpec::MemoryOutboxSource.new(relay_spec_rows(1..4))
+      endpoint = TimekeepingRelaySpec::FakeRelayEndpoint.new(answers: [TimekeepingRelay::Response.new(status:, body:)])
+
+      result = described_class.new(source:, endpoint:).deliver(limit: 2)
+
+      # "The relay marks a row sent only after a `200`, so delivery is at least once."
+      expect(source.mark_calls).to be_empty
+      expect(result).to eq(sent: 0, last_position: nil)
+      # "It delivers in `outbox_position` order." Moving on to rows 3 and 4 after a refused batch would break the order.
+      expect(relay_spec_posted_positions(endpoint)).to eq([[1, 2]])
     end
-    rows = [12, 3, 7].map do |position|
-      { "generation" => 1, "outbox_position" => position, "entry" => { "id" => position * 10, "company_id" => 1, "version" => 1 } }
-    end
-    outbox = source.new(rows)
-    posted = []
-    endpoint = Object.new
-    endpoint.define_singleton_method(:deliver) do |batch, idempotency_key:|
-      posted << batch
-      count = batch.fetch("snapshots", batch[:snapshots]).size
-      TimekeepingRelay::Response.new(status: 200, body: { "applied" => count, "ignored" => 0 })
-    end
+  end
 
-    result = described_class.new(source: outbox, endpoint:).deliver(limit: 10)
+  it "treats a 200 whose applied and ignored counts do not cover the batch as a failure" do
+    source = TimekeepingRelaySpec::MemoryOutboxSource.new(relay_spec_rows([1, 2, 3]))
+    # A proxy page or truncated answer: a 200 that does not account for every row.
+    bodies = [{ "applied" => 1, "ignored" => 0 }, { "applied" => "3" }, {}]
+    endpoint = TimekeepingRelaySpec::FakeRelayEndpoint.new(
+      answers: bodies.map { |body| TimekeepingRelay::Response.new(status: 200, body:) }
+    )
+    relay = described_class.new(source:, endpoint:)
 
-    # "It delivers in `outbox_position` order."
-    sent_positions = posted.flat_map { |batch| batch.fetch("snapshots", batch[:snapshots]) }
-                           .map { |item| item.fetch("outbox_position", item[:outbox_position]) }
-    expect(sent_positions).to eq([3, 7, 12])
-    expect(outbox.marked).to eq([3, 7, 12])
-    # The issue's result shape is exactly {sent:, last_position:}.
+    results = bodies.map { relay.deliver(limit: 10) }
+
+    expect(results).to all(eq(sent: 0, last_position: nil))
+    expect(source.mark_calls).to be_empty
+    expect(relay_spec_posted_positions(endpoint)).to eq([[1, 2, 3]] * 3)
+  end
+
+  it "delivers rows with position gaps in ascending order and marks their exact positions, never a range" do
+    source = TimekeepingRelaySpec::MemoryOutboxSource.new(relay_spec_rows([12, 3, 7]))
+    endpoint = relay_spec_projection_endpoint
+
+    result = described_class.new(source:, endpoint:).deliver(limit: 2)
+
+    # "It delivers in `outbox_position` order." A rolled-back write leaves gaps, so positions 4..6 and 8..11 never existed.
+    expect(relay_spec_posted_positions(endpoint).flatten).to eq([3, 7, 12])
+    expect(source.mark_calls).to eq([[3, 7], [12]])
     expect(result).to eq(sent: 3, last_position: 12)
   end
-end
 
-# frozen_string_literal: true
+  # Positions have gaps after a rolled-back write, and a row can commit after
+  # a higher one was sent. Marking a range up to last_position would lose it.
+  it "delivers a row committed later below the positions already sent" do
+    source = TimekeepingRelaySpec::MemoryOutboxSource.new(relay_spec_rows([12, 3, 7]))
+    endpoint = relay_spec_projection_endpoint
+    relay = described_class.new(source:, endpoint:)
 
-RSpec.describe TimekeepingRelay::Relay, "refused batch" do
-  it "marks nothing and stops after a 409 stale_generation answer" do
-    marked = []
-    rows = (1..4).map do |position|
-      { "generation" => 1, "outbox_position" => position, "entry" => { "id" => position, "company_id" => 1, "version" => 1 } }
-    end
-    outbox = Object.new
-    outbox.define_singleton_method(:unsent_after) do |position, limit|
-      rows.select { |row| row["outbox_position"] > position && !marked.include?(row["outbox_position"]) }.first(limit)
-    end
-    outbox.define_singleton_method(:mark_sent) { |positions| marked.concat(positions) && nil }
-    posts = 0
-    endpoint = Object.new
-    endpoint.define_singleton_method(:deliver) do |_batch, idempotency_key:|
-      posts += 1
-      TimekeepingRelay::Response.new(status: 409, body: { "reason" => "stale_generation" })
-    end
+    expect(relay.deliver(limit: 10)).to eq(sent: 3, last_position: 12)
+    expect(source.mark_calls).to eq([[3, 7, 12]])
 
-    result = described_class.new(source: outbox, endpoint:).deliver(limit: 2)
+    source.add(TimekeepingRelaySpec::MemoryOutboxSource.row(5))
 
-    # "The relay marks a row sent only after a `200`, so delivery is at least once."
-    expect(marked).to be_empty
-    # A later batch after a refused one would reach the consumer out of order.
-    expect(posts).to eq(1)
-    expect(result).to eq(sent: 0, last_position: nil)
+    expect(relay.deliver(limit: 10)).to eq(sent: 1, last_position: 5)
+    expect(relay_spec_posted_positions(endpoint)).to eq([[3, 7, 12], [5]])
+    expect(source.sent_positions).to contain_exactly(3, 5, 7, 12)
   end
-end
 
-# frozen_string_literal: true
+  it "posts nothing on a later deliver once every row was marked sent" do
+    source = TimekeepingRelaySpec::MemoryOutboxSource.new(relay_spec_rows([1, 2, 3]))
+    endpoint = relay_spec_projection_endpoint
+    relay = described_class.new(source:, endpoint:)
 
-RSpec.describe TimekeepingRelay::Relay, "outage recovery" do
-  it "resends the same batch with the same Idempotency-Key after an outage and marks it once recovered" do
-    marked = []
-    rows = [5, 9].map do |position|
-      { "generation" => 2, "outbox_position" => position, "entry" => { "id" => position, "company_id" => 3, "version" => 1 } }
-    end
-    outbox = Object.new
-    outbox.define_singleton_method(:unsent_after) do |position, limit|
-      rows.select { |row| row["outbox_position"] > position && !marked.include?(row["outbox_position"]) }.first(limit)
-    end
-    outbox.define_singleton_method(:mark_sent) { |positions| marked.concat(positions) && nil }
-    calls = []
-    answers = [503, 200]
-    endpoint = Object.new
-    endpoint.define_singleton_method(:deliver) do |batch, idempotency_key:|
-      calls << [batch, idempotency_key]
-      status = answers.shift || 200
-      body = status == 200 ? { "applied" => 2, "ignored" => 0 } : {}
-      TimekeepingRelay::Response.new(status:, body:)
-    end
-    relay = described_class.new(source: outbox, endpoint:)
+    expect(relay.deliver(limit: 2)).to eq(sent: 3, last_position: 3)
+    posts_after_first_run = endpoint.posts.size
 
-    first = relay.deliver(limit: 10)
-    expect(first).to eq(sent: 0, last_position: nil)
-    expect(marked).to be_empty
-
-    second = relay.deliver(limit: 10)
-
-    # "resends after an outage, and survives duplicates"
-    expect(calls.size).to eq(2)
-    expect(calls[1][0]).to eq(calls[0][0])
-    expect(calls[1][1]).to eq(calls[0][1])
-    expect(marked).to eq([5, 9])
-    expect(second).to eq(sent: 2, last_position: 9)
+    expect(relay.deliver(limit: 2)).to eq(sent: 0, last_position: nil)
+    expect(endpoint.posts.size).to eq(posts_after_first_run)
   end
-end
 
-# frozen_string_literal: true
+  it "sends five rows as three ordered batches when the limit is two" do
+    source = TimekeepingRelaySpec::MemoryOutboxSource.new(relay_spec_rows([5, 1, 4, 2, 3]))
+    endpoint = relay_spec_projection_endpoint
 
-RSpec.describe TimekeepingRelay::Relay, "malformed success" do
-  it "treats a 200 whose applied and ignored counts do not cover the batch as a failure" do
-    marked = []
-    rows = [1, 2, 3].map do |position|
-      { "generation" => 1, "outbox_position" => position, "entry" => { "id" => position, "company_id" => 1, "version" => 1 } }
-    end
-    outbox = Object.new
-    outbox.define_singleton_method(:unsent_after) do |position, limit|
-      rows.select { |row| row["outbox_position"] > position && !marked.include?(row["outbox_position"]) }.first(limit)
-    end
-    outbox.define_singleton_method(:mark_sent) { |positions| marked.concat(positions) && nil }
-    bodies = [{ "applied" => 1, "ignored" => 0 }, { "applied" => "3" }, {}]
-    bodies.each do |body|
-      endpoint = Object.new
-      endpoint.define_singleton_method(:deliver) do |_batch, idempotency_key:|
-        TimekeepingRelay::Response.new(status: 200, body:)
-      end
+    result = described_class.new(source:, endpoint:).deliver(limit: 2)
 
-      result = described_class.new(source: outbox, endpoint:).deliver(limit: 10)
-
-      expect(result).to eq(sent: 0, last_position: nil)
-    end
-    expect(marked).to be_empty
+    expect(relay_spec_posted_positions(endpoint)).to eq([[1, 2], [3, 4], [5]])
+    expect(source.mark_calls).to eq([[1, 2], [3, 4], [5]])
+    # The result shape is exactly {sent:, last_position:}.
+    expect(result).to eq(sent: 5, last_position: 5)
+    expect(result.keys).to eq(%i[sent last_position])
   end
-end
 
-# frozen_string_literal: true
+  it "counts a 200 that reports every row ignored as delivered" do
+    source = TimekeepingRelaySpec::MemoryOutboxSource.new(relay_spec_rows([8]))
+    endpoint = TimekeepingRelaySpec::FakeRelayEndpoint.new(
+      answers: [TimekeepingRelay::Response.new(status: 200, body: { "applied" => 0, "ignored" => 1 })]
+    )
 
-RSpec.describe TimekeepingRelay::Relay, "pause" do
+    expect(described_class.new(source:, endpoint:).deliver(limit: 10)).to eq(sent: 1, last_position: 8)
+    expect(source.mark_calls).to eq([[8]])
+    expect(endpoint.posts.size).to eq(1)
+  end
+
+  it "posts nothing for an empty outbox" do
+    source = TimekeepingRelaySpec::MemoryOutboxSource.new([])
+    endpoint = TimekeepingRelaySpec::FakeRelayEndpoint.new
+
+    expect(described_class.new(source:, endpoint:).deliver(limit: 10)).to eq(sent: 0, last_position: nil)
+    expect(endpoint.posts).to be_empty
+  end
+
   it "sends nothing while paused and delivers once resumed" do
-    marked = []
-    rows = [{ "generation" => 1, "outbox_position" => 1, "entry" => { "id" => 1, "company_id" => 1, "version" => 1 } }]
-    outbox = Object.new
-    outbox.define_singleton_method(:unsent_after) do |position, limit|
-      rows.select { |row| row["outbox_position"] > position && !marked.include?(row["outbox_position"]) }.first(limit)
-    end
-    outbox.define_singleton_method(:mark_sent) { |positions| marked.concat(positions) && nil }
-    posts = 0
-    endpoint = Object.new
-    endpoint.define_singleton_method(:deliver) do |_batch, idempotency_key:|
-      posts += 1
-      TimekeepingRelay::Response.new(status: 200, body: { "applied" => 1, "ignored" => 0 })
-    end
+    source = TimekeepingRelaySpec::MemoryOutboxSource.new(relay_spec_rows([1]))
+    endpoint = relay_spec_projection_endpoint
     paused = true
-    relay = described_class.new(source: outbox, endpoint:, paused: -> { paused })
+    relay = described_class.new(source:, endpoint:, paused: -> { paused })
 
     # "A paused relay sends nothing until resumed"
     expect(relay.deliver(limit: 10)).to eq(sent: 0, last_position: nil)
-    expect(posts).to eq(0)
-    expect(marked).to be_empty
+    expect(endpoint.posts).to be_empty
+    expect(source.mark_calls).to be_empty
 
     paused = false
     expect(relay.deliver(limit: 10)).to eq(sent: 1, last_position: 1)
-    expect(posts).to eq(1)
+    expect(endpoint.posts.size).to eq(1)
   end
-end
 
-# frozen_string_literal: true
+  it "stops before the second POST when a pause is set between two batches" do
+    source = TimekeepingRelaySpec::MemoryOutboxSource.new(relay_spec_rows(1..4))
+    endpoint = relay_spec_projection_endpoint
+    # Paused as soon as the first batch was posted.
+    paused = -> { endpoint.posts.any? }
 
-RSpec.describe TimekeepingRelay::Relay, "limit" do
-  it "rejects a limit that is zero, negative or not an Integer before posting anything" do
-    outbox = Object.new
-    outbox.define_singleton_method(:unsent_after) do |_position, _limit|
-      [{ "generation" => 1, "outbox_position" => 1, "entry" => { "id" => 1, "company_id" => 1, "version" => 1 } }]
-    end
-    outbox.define_singleton_method(:mark_sent) { |_positions| nil }
-    posts = 0
-    endpoint = Object.new
-    endpoint.define_singleton_method(:deliver) do |_batch, idempotency_key:|
-      posts += 1
-      TimekeepingRelay::Response.new(status: 200, body: { "applied" => 1, "ignored" => 0 })
-    end
-    relay = described_class.new(source: outbox, endpoint:)
+    result = described_class.new(source:, endpoint:, paused:).deliver(limit: 2)
 
-    [0, -1, "2", nil, 1.5].each do |limit|
-      expect { relay.deliver(limit:) }.to raise_error(ArgumentError)
-    end
-    expect(posts).to eq(0)
+    # "A paused relay sends nothing until resumed": the check runs before every POST, not only at the start of a run.
+    expect(endpoint.posts.size).to eq(1)
+    expect(source.mark_calls).to eq([[1, 2]])
+    expect(result).to eq(sent: 2, last_position: 2)
   end
-end
 
-# frozen_string_literal: true
-require "json"
+  it "refuses a limit that is zero, negative or not an Integer before any read or post" do
+    source = TimekeepingRelaySpec::MemoryOutboxSource.new(relay_spec_rows([1]))
+    allow(source).to receive(:unsent_after).and_call_original
+    endpoint = TimekeepingRelaySpec::FakeRelayEndpoint.new
+    relay = described_class.new(source:, endpoint:)
 
-RSpec.describe TimekeepingRelay::Relay, "batch shape" do
+    # A bad limit passed straight to unsent_after could read the whole outbox into one POST.
+    [0, -1, "2", nil, 1.5, 2.5].each do |limit|
+      expect { relay.deliver(limit:) }.to raise_error(ArgumentError, /limit/)
+    end
+    expect(source).not_to have_received(:unsent_after)
+    expect(endpoint.posts).to be_empty
+  end
+
   it "posts a contract-shaped batch carrying each row's entry unchanged" do
     entry = { "id" => 41, "company_id" => 7, "user_id" => 9, "version" => 3,
               "proof_metadata" => { "links" => ["a"], "nested" => { "k" => "v" } } }
     rows = [{ "generation" => 4, "outbox_position" => 2, "entry" => entry }]
     original = JSON.parse(JSON.generate(rows))
-    marked = []
-    outbox = Object.new
-    outbox.define_singleton_method(:unsent_after) do |position, limit|
-      rows.select { |row| row["outbox_position"] > position && !marked.include?(row["outbox_position"]) }.first(limit)
-    end
-    outbox.define_singleton_method(:mark_sent) { |positions| marked.concat(positions) && nil }
-    posted = []
-    endpoint = Object.new
-    endpoint.define_singleton_method(:deliver) do |batch, idempotency_key:|
-      posted << JSON.parse(JSON.generate(batch))
-      TimekeepingRelay::Response.new(status: 200, body: { "applied" => 1, "ignored" => 0 })
-    end
+    source = TimekeepingRelaySpec::MemoryOutboxSource.new(rows)
+    endpoint = TimekeepingRelaySpec::FakeRelayEndpoint.new(
+      answers: [TimekeepingRelay::Response.new(status: 200, body: { "applied" => 1, "ignored" => 0 })]
+    )
 
-    described_class.new(source: outbox, endpoint:).deliver(limit: 5)
+    described_class.new(source:, endpoint:).deliver(limit: 5)
 
     # contracts/timekeeping/entry_snapshots.yml: batch_fields [schema_version, snapshots],
     # item_fields [generation, outbox_position, entry].
-    expect(posted.size).to eq(1)
-    expect(posted[0].keys).to contain_exactly("schema_version", "snapshots")
-    expect(posted[0]["schema_version"]).to eq(1)
-    expect(posted[0]["snapshots"]).to eq([{ "generation" => 4, "outbox_position" => 2, "entry" => original[0]["entry"] }])
+    expect(endpoint.posts.size).to eq(1)
+    posted = JSON.parse(JSON.generate(endpoint.posts[0][:batch]))
+    expect(posted.keys).to contain_exactly("schema_version", "snapshots")
+    expect(posted["schema_version"]).to eq(1)
+    expect(posted["snapshots"]).to eq([{ "generation" => 4, "outbox_position" => 2, "entry" => original[0]["entry"] }])
     # The relay must not rewrite the rows it was handed, nested values included.
     expect(rows).to eq(original)
   end
