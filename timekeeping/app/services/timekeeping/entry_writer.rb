@@ -210,7 +210,12 @@ module Timekeeping
           scope = TimekeepingRules::EntryRules.visible_scope(role: command.role, acting_user_id: command.actor_id)
           relation = relation.where(user_id: scope) unless scope == :company
         end
-        relation.select("entries.*", EntriesQuery::RESERVED).order(:id).lock("FOR UPDATE OF entries").to_a
+        # The reservation flag is read in a second statement once the locks
+        # are held: a statement that waited on a lock still evaluates its
+        # reservation subquery against the snapshot taken before the wait, so
+        # it would miss a reservation the lock holder just committed.
+        ids = relation.order(:id).lock("FOR UPDATE").pluck(:id)
+        WriteSteps.reserved_rows(command.company_id, ids).values_at(*ids)
       end
 
       def version_matches?(command, entry)

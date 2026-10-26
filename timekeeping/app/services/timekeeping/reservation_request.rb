@@ -60,7 +60,7 @@ module Timekeeping
         handler: ServiceCommands,
         build: ->(values) { command_request(values) }
       }
-    }.freeze
+    }.each_value { |route| route.fetch(:fields).freeze && route.freeze }.freeze
 
     PATH_ID_ROUTES = %i[mark_billed detach_entries].freeze
 
@@ -75,8 +75,7 @@ module Timekeeping
     def self.build(route:, identity:, path_id:, raw_body:, bearer:)
       body = EntryCommand.parse_body(raw_body)
       if CredentialScan.found?(body, bearer:, held: Timekeeping.config.service_credentials,
-                                     public_key: Environment.token_public_key,
-                                     service_secret: Environment.service_token)
+                                     public_key: Environment.token_public_key)
         return WriteOutcome.refusal(:credential_in_body)
       end
 

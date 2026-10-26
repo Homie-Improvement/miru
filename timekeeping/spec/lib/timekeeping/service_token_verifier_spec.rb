@@ -5,21 +5,43 @@
 require "rails_helper"
 
 RSpec.describe Timekeeping::ServiceTokenVerifier do
-  it "refuses service tokens signed with another secret, unsigned, as RS256, or under an empty secret" do
-    secret = "verifier-secret-#{SecureRandom.hex(16)}"
+  let(:public_key) { rsa_key_pair.public_key }
+  let(:claims) do
     now = Time.now.to_i
-    claims = { typ: "timekeeping_service", sub: "invoice-boundary", company_id: 1,
-               operations: ["reservations.prepare"], iat: now, exp: now + 60, jti: SecureRandom.uuid }
+    { typ: "timekeeping_service", sub: "invoice-boundary", company_id: 1,
+      operations: ["reservations.prepare"], iat: now, exp: now + 60, jti: SecureRandom.uuid }
+  end
 
-    expect(described_class.verify(JWT.encode(claims, secret, "HS256"), secret:)).to include("company_id" => 1)
+  it "returns the claims of a service token signed with the token key" do
+    expect(described_class.verify(JWT.encode(claims, rsa_key_pair, "RS256"), public_key:)).to include("company_id" => 1)
+  end
+
+  # "An anonymous or user-delegated request never gets it." Neither a user
+  # token, nor a token signed with the public key's text as an HMAC secret,
+  # nor one signed with any other key or none may verify as a service token.
+  it "refuses a user token and a token signed with any other key or algorithm as invalid" do
     [
-      JWT.encode(claims, "another-secret-#{SecureRandom.hex(16)}", "HS256"),
-      JWT.encode(claims, nil, "none"),
-      JWT.encode(claims, rsa_key_pair, "RS256"),
-      JWT.encode(claims.merge(exp: now - 1), secret, "HS256")
+      mint_token({ sub: 7, company_id: 1, role: "owner" }),
+      JWT.encode(claims, OpenSSL::PKey::RSA.generate(2048), "RS256"),
+      JWT.encode(claims, public_key.to_pem, "HS256"),
+      JWT.encode(claims, "guessed", "HS256"),
+      JWT.encode(claims, nil, "none")
     ].each do |token|
-      expect { described_class.verify(token, secret:) }.to raise_error(StandardError)
+      expect { described_class.verify(token, public_key:) }.to raise_error(described_class::InvalidToken)
     end
-    expect { described_class.verify(JWT.encode(claims, "", "HS256"), secret: "") }.to raise_error(StandardError)
+  end
+
+  it "verifies nothing without a readable key" do
+    token = JWT.encode(claims, rsa_key_pair, "RS256")
+
+    [nil, "", "not a key"].each do |key|
+      expect { described_class.verify(token, public_key: key) }.to raise_error(described_class::InvalidToken)
+    end
+  end
+
+  it "reports a correctly signed token past its exp as expired" do
+    token = JWT.encode(claims.merge(exp: Time.now.to_i - 1), rsa_key_pair, "RS256")
+
+    expect { described_class.verify(token, public_key:) }.to raise_error(described_class::ExpiredToken)
   end
 end

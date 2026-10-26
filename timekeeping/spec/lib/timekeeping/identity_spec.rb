@@ -66,11 +66,11 @@ RSpec.describe Timekeeping::Identity do
   end
 
   describe "a signed service token" do
-    def service_jwt(secret: service_token, **claims)
+    def service_jwt(key: rsa_key_pair, algorithm: "RS256", **claims)
       now = Time.now.to_i
       JWT.encode({ typ: "timekeeping_service", sub: "invoice-boundary", company_id: 9,
                    operations: ["reservations.prepare"], iat: now, exp: now + 60, jti: SecureRandom.uuid }.merge(claims),
-                 secret, "HS256")
+                 key, algorithm)
     end
 
     it "takes the service name, company and operations from the verified claims" do
@@ -85,19 +85,18 @@ RSpec.describe Timekeeping::Identity do
         .to have_attributes(kind: :anonymous, status: :expired, company_id: nil, signed_company_id: nil)
     end
 
-    it "reports a service token signed with another secret, or with a wrong claim, as invalid" do
-      [service_jwt(secret: "another-#{SecureRandom.hex(8)}"), service_jwt(typ: "user"),
+    it "reports a service token signed with another key, or with a wrong claim, as invalid" do
+      [service_jwt(key: OpenSSL::PKey::RSA.generate(2048)), service_jwt(typ: "user"),
        service_jwt(company_id: "9"), service_jwt(operations: "reservations.prepare")].each do |token|
         expect(resolve("Bearer #{token}")).to have_attributes(kind: :anonymous, status: :invalid)
       end
     end
 
-    it "refuses a header longer than the credential scan searches" do
-      long_header = { kid: "k" * Timekeeping::ServiceTokenVerifier::MAX_HEADER_LENGTH }
-      token = JWT.encode({ typ: "timekeeping_service", sub: "invoice-boundary", company_id: 9, operations: [],
-                           exp: Time.now.to_i + 60, jti: SecureRandom.uuid }, service_token, "HS256", long_header)
-
-      expect(resolve("Bearer #{token}")).to have_attributes(kind: :anonymous, status: :invalid)
+    # The shared token is sent as a bearer on every reference read, so a
+    # token signed with it must bind no company.
+    it "refuses a service token signed with the shared service token as an HMAC secret" do
+      expect(resolve("Bearer #{service_jwt(key: service_token, algorithm: 'HS256')}"))
+        .to have_attributes(kind: :anonymous, status: :invalid)
     end
 
     it "gives a user token and the raw shared token no operations and no service name" do

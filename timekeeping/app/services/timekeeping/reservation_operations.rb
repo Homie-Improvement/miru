@@ -35,6 +35,8 @@ module Timekeeping
     INVOICE_LOCK = "invoice"
     PROVISIONAL = TimekeepingRules::ReservationDecision::PROVISIONAL
     COMMITTED = TimekeepingRules::ReservationDecision::COMMITTED
+    ACTIVE = TimekeepingRules::ReservationDecision::ACTIVE_DISPOSITION
+    RETAINED = "retained"
 
     # Operation states. COMMITTED names both a committed operation and a
     # committed reservation, as the contract does.
@@ -54,8 +56,8 @@ module Timekeeping
     # What commit and abort answer for an operation that is already terminal:
     # the first of them won, so this one changes nothing.
     TERMINAL_ANSWERS = {
-      commit: { "reserved" => 0, "released" => 0 },
-      abort: { "dropped" => 0 }
+      commit: { "reserved" => 0, "released" => 0 }.freeze,
+      abort: { "dropped" => 0 }.freeze
     }.freeze
 
     def initialize(checkpoint: ->(_step) { })
@@ -135,7 +137,7 @@ module Timekeeping
 
         entries = lock_entries(request.company_id, (own_provisional(operation) + invoice_committed(operation)).pluck(:entry_id))
         checkpoint.call(:rows_locked)
-        reserved_ids = own_provisional(operation).pluck(:entry_id)
+        reserved_ids = own_provisional(operation).pluck(:entry_id) - give_way_to_active_owners(operation)
         held_ids = invoice_committed(operation).pluck(:entry_id)
         released_ids = TimekeepingRules::ReservationDecision.call(
           current: decision_reservations(request.company_id, held_ids, operation.invoice_id),
@@ -167,10 +169,23 @@ module Timekeeping
       # rows become committed, and every row the invoice holds takes the
       # operation's disposition.
       def make_desired_set_the_reservation_set(operation, reserved_ids, released_ids)
-        Reservation.where(company_id: operation.company_id, entry_id: reserved_ids, state: COMMITTED).delete_all
+        Reservation.where(company_id: operation.company_id, entry_id: reserved_ids, state: COMMITTED,
+                          disposition: RETAINED).delete_all
         invoice_committed(operation).where(entry_id: released_ids).delete_all
         own_provisional(operation).update_all(state: COMMITTED)
         invoice_committed(operation).update_all(disposition: operation.disposition)
+      end
+
+      # A retained owner can become active again (its own commit with an
+      # active disposition) while this operation still holds the entry
+      # provisionally. An active owner keeps the entry, as at prepare, so this
+      # operation drops its provisional row there and does not count it.
+      # Returns the ids it gave up.
+      def give_way_to_active_owners(operation)
+        held = Reservation.where(company_id: operation.company_id, state: COMMITTED, disposition: ACTIVE)
+          .where.not(invoice_id: operation.invoice_id)
+        given_up = own_provisional(operation).where(entry_id: held.select(:entry_id))
+        given_up.pluck(:entry_id).tap { given_up.delete_all }
       end
 
       def reserve_provisionally(operation, entry_ids)

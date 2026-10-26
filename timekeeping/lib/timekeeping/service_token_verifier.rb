@@ -2,22 +2,20 @@
 
 module Timekeeping
   # Verifies the signed service token a background caller sends with each
-  # request: an HS256 token signed with TIMEKEEPING_SERVICE_TOKEN that binds
-  # the call to one company and to the operations it names. Every call into
-  # the jwt gem for these tokens lives here; callers see only this module's two
-  # errors, and neither error message holds any part of the token.
+  # request: an RS256 token signed with the monolith's token key that binds the
+  # call to one company and to the operations it names. The key is the one
+  # TIMEKEEPING_TOKEN_PUBLIC_KEY verifies, never a value any caller sends as a
+  # bearer, so holding the shared TIMEKEEPING_SERVICE_TOKEN does not let anyone
+  # mint a token for another company. Every call into the jwt gem for these
+  # tokens lives here; callers see only this module's two errors, and neither
+  # error message holds any part of the token.
   module ServiceTokenVerifier
     # Fixed here and never read from the token header, so a token signed with
-    # "none", or an RS256 user token, is refused.
-    ALGORITHM = "HS256"
+    # "none" or with HMAC over the public key's PEM text is refused.
+    ALGORITHM = "RS256"
+    # User tokens carry no typ claim, so one never verifies as a service token.
     TYPE = "timekeeping_service"
     REQUIRED_CLAIMS = %w[typ sub company_id operations exp jti].freeze
-
-    # Timekeeping::CredentialScan finds a service token in a body by trying
-    # header starts within this many characters before the payload. A longer
-    # header is refused here, so every token that verifies is one the scan
-    # finds.
-    MAX_HEADER_LENGTH = 256
 
     # The company and operations come only from these claims, so a token whose
     # claims have another shape grants nothing.
@@ -36,38 +34,48 @@ module Timekeeping
 
     module_function
 
-    # An empty secret verifies nothing, so an unset TIMEKEEPING_SERVICE_TOKEN
-    # admits no caller. The jwt gem checks the signature before exp, so a
-    # forged token that has also expired raises InvalidToken.
-    def verify(token, secret:)
-      raise InvalidToken, "invalid Timekeeping service token" if secret.to_s.empty? || header_too_long?(token)
-
-      payload = decode(token, secret)
+    # The key is passed in, never looked up from the token's header. A missing
+    # or unreadable key verifies nothing. The jwt gem checks the signature
+    # before exp, so a forged token that has also expired raises InvalidToken.
+    def verify(token, public_key:)
+      payload = decode(token, public_key, verify_expiration: true)
       raise InvalidToken, "invalid Timekeeping service token" unless valid_claims?(payload)
 
       payload
     rescue JWT::ExpiredSignature
-      raise ExpiredToken, "expired Timekeeping service token"
-    rescue JWT::DecodeError
+      raise ExpiredToken, "expired Timekeeping service token" if expired_service_token?(token, public_key)
+
+      raise InvalidToken, "invalid Timekeeping service token"
+    rescue JWT::DecodeError, OpenSSL::PKey::PKeyError
       raise InvalidToken, "invalid Timekeeping service token"
     end
 
-    def decode(token, secret)
+    def decode(token, public_key, verify_expiration:)
       payload, _header = JWT.decode(
-        token.to_s, secret.to_s, true,
-        algorithm: ALGORITHM, required_claims: REQUIRED_CLAIMS, verify_expiration: true, leeway: 0
+        token.to_s, rsa_public_key(public_key), true,
+        algorithm: ALGORITHM, required_claims: REQUIRED_CLAIMS, verify_expiration:, leeway: 0
       )
       payload
     end
 
-    def header_too_long?(token)
-      token.to_s.split(".", 2).first.to_s.length > MAX_HEADER_LENGTH
+    # Reached only after the signature verified and exp had passed. An
+    # expired user token, signed with the same key, is not a service token,
+    # so it is left for the user token verifier to report.
+    def expired_service_token?(token, public_key)
+      valid_claims?(decode(token, public_key, verify_expiration: false))
+    rescue JWT::DecodeError
+      false
+    end
+
+    def rsa_public_key(key)
+      rsa = key.is_a?(OpenSSL::PKey::RSA) ? key : OpenSSL::PKey::RSA.new(key.to_s)
+      rsa.public_key
     end
 
     def valid_claims?(payload)
       CLAIM_RULES.all? { |claim, valid| valid.call(payload[claim]) }
     end
 
-    private_class_method :decode, :header_too_long?, :valid_claims?
+    private_class_method :decode, :expired_service_token?, :rsa_public_key, :valid_claims?
   end
 end

@@ -131,4 +131,20 @@ RSpec.describe Timekeeping::ReservationOperations do
     snapshot = OutboxSnapshot.where(id: y).order(:outbox_position).last
     expect([snapshot.locked, snapshot.version]).to eq([false, version + 1])
   end
+
+  # An entry another kept invoice holds is refused at prepare, so a successor
+  # must not take it at commit once its retained owner has become active again.
+  it "keeps an entry for a retained owner that became active before its successor commits" do
+    commit_entries([x], invoice_id: 501, disposition: "retained")
+    owner_id = SecureRandom.uuid
+    successor_id = SecureRandom.uuid
+
+    expect(run_operation(:prepare, operation_id: owner_id, invoice_id: 501, entry_ids: [x]).first).to eq(200)
+    expect(run_operation(:prepare, operation_id: successor_id, invoice_id: 502, entry_ids: [x]).first).to eq(200)
+    expect(run_operation(:commit, operation_id: owner_id, invoice_id: 501)).to eq([200, { "reserved" => 0, "released" => 0 }])
+
+    expect(run_operation(:commit, operation_id: successor_id, invoice_id: 502))
+      .to eq([200, { "reserved" => 0, "released" => 0 }])
+    expect(Reservation.where(entry_id: x).pluck(:invoice_id, :state, :disposition)).to eq([[501, "committed", "active"]])
+  end
 end

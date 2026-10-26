@@ -17,7 +17,8 @@ module Timekeeping
   #    generation has moved.
   # 3. Seed and read the company's generation row FOR SHARE; a body
   #    generation that is not that generation is stale_generation.
-  # 4. Lock the target entries FOR UPDATE in id order.
+  # 4. Lock the target entries FOR UPDATE in id order, then select them again
+  #    under those locks.
   # 5. Write each entry with version + 1, one audit row holding the changed
   #    field before and after, and under the outbox lock one snapshot.
   # 6. Store the receipt.
@@ -44,17 +45,17 @@ module Timekeeping
           Entry.where(company_id:, discarded_at: nil, id: committed.select(:entry_id))
             .where.not(bill_status: TimekeepingRules::EntryRules::BILLED)
         end,
-        changes: { "bill_status" => TimekeepingRules::EntryRules::BILLED },
+        changes: { "bill_status" => TimekeepingRules::EntryRules::BILLED }.freeze,
         count: "billed"
-      },
+      }.freeze,
       detach_entries: {
         lock: "agent",
         # Every entry of the company that names the agent, discarded ones
         # included, so none keeps a reference to it.
         targets: ->(company_id, agent_id) { Entry.where(company_id:, agent_id:) },
-        changes: { "agent_id" => nil },
+        changes: { "agent_id" => nil }.freeze,
         count: "detached"
-      }
+      }.freeze
     }.freeze
 
     def initialize(checkpoint: ->(_step) { })
@@ -90,10 +91,20 @@ module Timekeeping
         checkpoint.call(:generation_checked)
         return WriteOutcome.refusal(:stale_generation) unless WriteSteps.generation_matches?(request.generation, generation)
 
-        entries = command.fetch(:targets).call(request.company_id, request.target_id).order(:id).lock.to_a
+        entries = locked_targets(command.fetch(:targets).call(request.company_id, request.target_id))
         checkpoint.call(:rows_locked)
         change_entries(request, command.fetch(:changes), entries, generation)
         finish(request, command.fetch(:count) => entries.size)
+      end
+
+      # Locks the targets in id order, then selects them again once the locks
+      # are held. A statement that waited on a lock still reads the
+      # reservations as they were before the wait, so without the second
+      # read a mark-billed could bill an entry whose committed reservation a
+      # successor invoice took over while it waited.
+      def locked_targets(targets)
+        ids = targets.order(:id).lock.pluck(:id)
+        targets.where(id: ids).order(:id).to_a
       end
 
       def change_entries(request, changes, entries, generation)

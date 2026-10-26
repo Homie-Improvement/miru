@@ -335,10 +335,10 @@ RSpec.describe "Entry writes carrying a service token" do
     project = timekeeping_arrange.project(company:)
     employee_token = timekeeping_arrange.token_for(timekeeping_arrange.user(company:, role: "employee"))
     now = Time.now.to_i
-    # Minted with the service secret and never registered as a held credential.
+    # Minted with the token key and never registered as a held credential.
     service_token = JWT.encode({ typ: "timekeeping_service", sub: "invoice-boundary", company_id: company,
                                  operations: %w[reservations.prepare], iat: now, exp: now + 300, jti: SecureRandom.uuid },
-                               provider_service_token, "HS256")
+                               TimekeepingProviderArrange.signing_key, "RS256")
     before_counts = entry_write_counts
 
     # "An anonymous or user-delegated request never gets it."

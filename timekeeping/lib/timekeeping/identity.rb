@@ -59,8 +59,8 @@ module Timekeeping
     BEARER = /\ABearer (\S+)\z/
 
     # Pure: every input is an argument and nothing is read from ENV. An unset
-    # or empty service token matches no caller and signs no service token, and
-    # a missing or unreadable public key verifies no user token.
+    # or empty service token matches no caller, and a missing or unreadable
+    # public key verifies no user or service token.
     def self.resolve(authorization:, public_key:, service_token:)
       return anonymous(:missing) if authorization.to_s.strip.empty?
 
@@ -68,7 +68,7 @@ module Timekeeping
       return anonymous(:invalid) unless token
       return service if service_token?(token, service_token)
 
-      signed(token, public_key:, service_token:)
+      signed(token, public_key:)
     rescue TokenVerifier::ExpiredToken => e
       anonymous(:expired, signed_company_id: e.company_id)
     rescue ServiceTokenVerifier::ExpiredToken
@@ -77,10 +77,12 @@ module Timekeeping
       anonymous(:invalid)
     end
 
-    # Each verifier pins its own algorithm, so a user token never verifies as
-    # a service token, nor a service token as a user token.
-    def self.signed(token, public_key:, service_token:)
-      bound_service(ServiceTokenVerifier.verify(token, secret: service_token))
+    # Both kinds are signed with the same key. A service token must carry
+    # typ "timekeeping_service", which no user token has, and a user token
+    # needs an integer sub and a role, which no service token has, so neither
+    # verifies as the other.
+    def self.signed(token, public_key:)
+      bound_service(ServiceTokenVerifier.verify(token, public_key:))
     rescue ServiceTokenVerifier::InvalidToken
       user(TokenVerifier.verify(token, public_key:))
     end

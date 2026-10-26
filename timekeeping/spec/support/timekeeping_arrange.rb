@@ -63,7 +63,7 @@ class TimekeepingProviderArrange
     granted = operations.map { |operation| Timekeeping::ReservationAccess::ROUTE_OPERATIONS.fetch(operation.to_sym, operation) }
     JWT.encode({ typ: Timekeeping::ServiceTokenVerifier::TYPE, sub: name, company_id: company, operations: granted,
                  iat: now, exp: now + TOKEN_LIFETIME.to_i, jti: SecureRandom.uuid },
-               @service_token, Timekeeping::ServiceTokenVerifier::ALGORITHM)
+               @signing_key, Timekeeping::ServiceTokenVerifier::ALGORITHM)
   end
 
   def held_credential(name)

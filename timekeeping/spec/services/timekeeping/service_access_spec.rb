@@ -35,10 +35,11 @@ RSpec.describe Timekeeping::ServiceAccess do
     now = Time.now.to_i
     token = JWT.encode({ typ: "timekeeping_service", sub: "invoice-boundary", company_id: 1,
                          operations: ["reservations.prepare"], iat: now, exp: now + 60, jti: SecureRandom.uuid },
-                       secret, "HS256")
+                       rsa_key_pair, "RS256")
     bound = Timekeeping::Identity.resolve(authorization: "Bearer #{token}", public_key: rsa_key_pair.public_key.to_pem,
                                           service_token: secret)
 
+    expect(bound).to have_attributes(kind: :service, company_id: 1)
     expect(described_class.decide(bound)).not_to eq(:allowed)
   end
 end

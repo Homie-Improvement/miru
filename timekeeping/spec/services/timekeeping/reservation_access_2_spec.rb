@@ -18,7 +18,7 @@ RSpec.describe Timekeeping::ReservationAccess do
     end
     service_token = lambda do |operations|
       JWT.encode({ typ: "timekeeping_service", sub: "invoice-boundary", company_id: 1, operations:,
-                   exp: Time.now.to_i + 300, jti: SecureRandom.uuid }, secret, "HS256")
+                   exp: Time.now.to_i + 300, jti: SecureRandom.uuid }, rsa_key_pair, "RS256")
     end
     bound = resolve.call(service_token.call(["reservations.prepare", "entries.delete"]))
     owner = resolve.call(mint_token({ sub: 7, company_id: 1, role: "owner" }))

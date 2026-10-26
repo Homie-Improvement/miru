@@ -56,8 +56,7 @@ module Timekeeping
 
       body = parse_body(raw_body)
       if CredentialScan.found?(body, bearer:, held: Timekeeping.config.service_credentials,
-                                     public_key: Environment.token_public_key,
-                                     service_secret: Environment.service_token)
+                                     public_key: Environment.token_public_key)
         return WriteOutcome.refusal(:credential_in_body)
       end
 

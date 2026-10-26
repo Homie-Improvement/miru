@@ -54,7 +54,7 @@ RSpec.describe "Timekeeping internal write metrics" do
       now = Time.now.to_i
       token = JWT.encode({ typ: "timekeeping_service", sub: "invoice-boundary", company_id: 1,
                            operations: Timekeeping::ReservationAccess::ROUTE_OPERATIONS.values, iat: now,
-                           exp: now + 60, jti: SecureRandom.uuid }, metrics_service_token, "HS256")
+                           exp: now + 60, jti: SecureRandom.uuid }, rsa_key_pair, "RS256")
 
       expect(get_metrics("Bearer #{token}")).to eq([401, unauthorized_body])
     end

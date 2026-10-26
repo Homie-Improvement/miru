@@ -26,7 +26,7 @@ module Timekeeping
       [->(access) { !granted_operations(access[:identity]).include?(access[:operation]) }, :forbidden],
       [->(access) { access[:identity].company_id.to_s != access[:company_id].to_s }, :not_found],
       [->(_access) { true }, :allowed]
-    ].freeze
+    ].map(&:freeze).freeze
 
     module_function
 

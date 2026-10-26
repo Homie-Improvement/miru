@@ -27,7 +27,7 @@ RSpec.describe Timekeeping::ReservationAccess do
     resolve = lambda do |company_id, operations|
       now = Time.now.to_i
       token = JWT.encode({ typ: "timekeeping_service", sub: "invoice-boundary", company_id:, operations:,
-                           iat: now, exp: now + 60, jti: SecureRandom.uuid }, secret, "HS256")
+                           iat: now, exp: now + 60, jti: SecureRandom.uuid }, rsa_key_pair, "RS256")
       Timekeeping::Identity.resolve(authorization: "Bearer #{token}", public_key: rsa_key_pair.public_key.to_pem,
                                     service_token: secret)
     end
@@ -67,6 +67,15 @@ RSpec.describe Timekeeping::ReservationAccess, "for signed service tokens" do
     identity = bound_service_for_access(operations: ["reservations.prepare"])
 
     expect(described_class.decide(identity:, company_id: 2, operation: "reservations.abort")).to eq(:forbidden)
+  end
+
+  it "freezes its rules and every rule row, and the command tables' nested rules" do
+    expect(described_class::RULES).to be_frozen.and(all(be_frozen))
+    expect(Timekeeping::ServiceCommands::COMMANDS.values).to all(be_frozen)
+    expect(Timekeeping::ServiceCommands::COMMANDS.values.map { |command| command.fetch(:changes) }).to all(be_frozen)
+    expect(Timekeeping::ReservationOperations::TERMINAL_ANSWERS.values).to all(be_frozen)
+    expect(Timekeeping::ReservationRequest::ROUTES.values).to all(be_frozen)
+    expect(Timekeeping::ReservationRequest::ROUTES.values.map { |route| route.fetch(:fields) }).to all(be_frozen)
   end
 
   it "maps every route to a background operation" do

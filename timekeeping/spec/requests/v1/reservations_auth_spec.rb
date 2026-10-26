@@ -183,11 +183,11 @@ RSpec.describe "Entry writes carrying a service token" do
     employee = timekeeping_arrange.user(company:, role: "employee")
     project = timekeeping_arrange.project(company:)
     now = Time.now.to_i
-    # Minted here with the service secret and never registered as a held
+    # Minted here with the token key and never registered as a held
     # credential, as a token the monolith minted for another request would be.
     service_token = JWT.encode({ typ: "timekeeping_service", sub: "invoice-boundary", company_id: company,
                                  operations: ["reservations.prepare", "invoices.mark_billed"], iat: now,
-                                 exp: now + 60, jti: SecureRandom.uuid }, provider_service_token, "HS256")
+                                 exp: now + 60, jti: SecureRandom.uuid }, TimekeepingProviderArrange.signing_key, "RS256")
     before = entry_write_counts
     body = { "project_id" => project, "work_date" => "2026-03-02", "duration" => 45.0,
              "note" => "see #{service_token} thanks", "source" => "manual", "source_metadata" => {} }

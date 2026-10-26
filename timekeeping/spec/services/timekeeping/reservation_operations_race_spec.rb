@@ -121,6 +121,68 @@ RSpec.describe Timekeeping::ReservationOperations, "under concurrent requests" d
     expect(Reservation.where(entry_id:).pluck(:invoice_id, :state)).to eq([[501, "committed"]])
   end
 
+  # Holds a reservation operation at hold_at, runs other_writer on its own
+  # connection until the server reports it blocked by the held operation,
+  # then lets both finish. Returns the held operation's outcome and
+  # other_writer's.
+  def race_held_reservation_against(held_request, hold_at:, &other_writer)
+    reached = Queue.new
+    release = Queue.new
+    held_pid = Queue.new
+    other_pid = Queue.new
+    checkpoint = lambda do |step|
+      next unless step == hold_at
+
+      reached << true
+      release.pop
+    end
+    held = on_own_reservation_connection(held_pid) { described_class.new(checkpoint:).call(held_request) }
+    expect(reached.pop(timeout: wait_seconds)).to be(true)
+    other = on_own_reservation_connection(other_pid, &other_writer)
+    blocked = reservation_blocked_by?(other_pid.pop(timeout: wait_seconds), held_pid.pop(timeout: wait_seconds))
+    release << true
+    results = [held.join(wait_seconds)&.value, other.join(wait_seconds)&.value]
+    expect(blocked).to be(true), "the other writer never waited on the held operation's lock"
+    results
+  end
+
+  # The waiting update must see the reservation prepare committed, so an
+  # employee cannot change an entry that is now locked.
+  it "refuses an employee update that waited on a prepare of the same entry" do
+    token = timekeeping_arrange.token_for(user)
+    update = build_entry_command(:update, token:, entry_id:, body: { "duration" => 91.0 })
+    duration = Entry.find(entry_id).duration
+
+    prepared, updated = race_held_reservation_against(
+      race_request(:prepare, operation_id: SecureRandom.uuid, entry_ids: [entry_id]), hold_at: :rows_locked
+    ) { Timekeeping::EntryWriter.new.call(update) }
+
+    expect([prepared.status, updated.status]).to eq([200, 403])
+    expect(Entry.find(entry_id).duration).to eq(duration)
+  end
+
+  # The waiting mark-billed must see that the successor took the entry, so it
+  # never bills an entry its invoice no longer holds.
+  it "bills nothing for an invoice whose retained entry a successor committed while mark-billed waited" do
+    retained_entry = timekeeping_arrange.reserved_entry(company:, invoice_id: 501, disposition: "retained")
+    successor_id = SecureRandom.uuid
+    expect(described_class.new.call(race_request(:prepare, operation_id: successor_id, invoice_id: 502,
+                                                           entry_ids: [retained_entry])).status).to eq(200)
+    mark_billed = Timekeeping::ServiceCommands::Request.new(
+      route: :mark_billed, company_id: company, actor_name: "invoice-boundary", target_id: 501,
+      operation_id: SecureRandom.uuid, generation: timekeeping_arrange.current_generation
+    )
+
+    committed, billed = race_held_reservation_against(
+      race_request(:commit, operation_id: successor_id, invoice_id: 502), hold_at: :rows_locked
+    ) { Timekeeping::ServiceCommands.new.call(mark_billed) }
+
+    expect([answer(committed), answer(billed)])
+      .to eq([[200, { "reserved" => 1, "released" => 0 }], [200, { "billed" => 0 }]])
+    expect(Entry.find(retained_entry).bill_status).to eq("unbilled")
+    expect(Reservation.where(entry_id: retained_entry).pluck(:invoice_id, :state)).to eq([[502, "committed"]])
+  end
+
   # The waiting prepare must see the entry as the abort left it (unlocked), so
   # reserving it again is a locked flip with its own version, audit and snapshot.
   it "records the relock when a prepare for another invoice waits on an abort of the same entry" do
