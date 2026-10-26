@@ -24,6 +24,10 @@ module Timekeeping
       # Each table's canonical columns, in encoding order. The columns of
       # entry_audits and idempotency_records equal Timekeeping's audit_events
       # and idempotency_receipts, so a row loads into either application.
+      # service_idempotency_receipts holds the stored answers of commit,
+      # abort, mark_billed and detach_entries under the same name in both
+      # applications. It crosses a cutover so a service command retried on
+      # the other side replays its answer instead of running again.
       TABLES = {
         "entries" => %w[
           id company_id version project_id user_id agent_id work_date duration note bill_status
@@ -42,6 +46,9 @@ module Timekeeping
         ],
         "idempotency_records" => %w[
           id company_id actor_type actor_id operation key fingerprint status body created_at
+        ],
+        "service_idempotency_receipts" => %w[
+          id company_id actor_name operation key fingerprint status body created_at
         ]
       }.transform_values(&:freeze).freeze
 

@@ -82,7 +82,9 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
       INSERT INTO entry_audits (company_id, entry_id, actor_type, actor_id, action, after, entry_created_at, created_at)
       VALUES (#{company_id}, #{entry_id}, 'User', 7, 'create', '{"duration": 5}', now(), now());
       INSERT INTO idempotency_records (company_id, actor_type, actor_id, operation, key, fingerprint, status, body, created_at)
-      VALUES (#{company_id}, 'User', 7, 'create_entry', 'k-#{entry_id}', 'fp', 201, '{}', now())
+      VALUES (#{company_id}, 'User', 7, 'create_entry', 'k-#{entry_id}', 'fp', 201, '{}', now());
+      INSERT INTO service_idempotency_receipts (company_id, actor_name, operation, key, fingerprint, status, body, created_at)
+      VALUES (#{company_id}, 'agent-destroy', 'detach_entries 77', 'k-#{entry_id}', 'fp', 200, '{"detached":1}', now())
     SQL
   end
 
@@ -253,7 +255,7 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
       seed_children_of_entry(company_id: 1, entry_id: seeded_id)
       baseline = prepared_rows
       expect(baseline["entries"].pluck("id")).to eq([seeded_id])
-      expect(baseline.values.map(&:size)).to eq([1, 1, 1, 1, 1])
+      expect(baseline.values.map(&:size)).to eq([1, 1, 1, 1, 1, 1])
       sequence_before = entry_id_sequence_state
 
       time = Time.utc(2026, 1, 1, 12)
@@ -287,7 +289,7 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
       connection.execute("UPDATE entries SET note = 'kept note' WHERE id = #{entry_id}")
       baseline = prepared_rows
       expect(baseline["entries"].pluck("id", "note")).to eq([[entry_id, "kept note"]])
-      expect(baseline.values.map(&:size)).to eq([1, 1, 1, 1, 1])
+      expect(baseline.values.map(&:size)).to eq([1, 1, 1, 1, 1, 1])
 
       ActiveRecord::Base.transaction do
         expect { store.load_checkpoint(checkpoint) }
@@ -339,7 +341,8 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
       end
       before = rows_with_duration_bits.call
       expect(before.transform_values(&:size)).to eq(
-        "entries" => 2, "reservations" => 1, "invoice_operations" => 2, "entry_audits" => 2, "idempotency_records" => 2
+        "entries" => 2, "reservations" => 1, "invoice_operations" => 2, "entry_audits" => 2, "idempotency_records" => 2,
+        "service_idempotency_receipts" => 0
       )
       expect(before["idempotency_records"].pluck("body")).to include('{"z": 1,  "a": [ 2 ]}')
 
@@ -455,7 +458,7 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
       seed_entry_40_with_children
       baseline = prepared_rows
       expect(baseline["entries"].pluck("note")).to eq(["kept"])
-      expect(baseline.values.map(&:size)).to eq([1, 1, 1, 1, 1])
+      expect(baseline.values.map(&:size)).to eq([1, 1, 1, 1, 1, 1])
       allow(store).to receive(:read_rows).and_wrap_original do |original, table|
         rows = original.call(table)
         table == "entries" ? rows.map { |row| row.merge("note" => "changed on the way back") } : rows
@@ -539,7 +542,7 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
     it "rolls the whole load back when the second insert batch fails" do
       seed_entry_40_with_children
       baseline = prepared_rows
-      expect(baseline.values.map(&:size)).to eq([1, 1, 1, 1, 1])
+      expect(baseline.values.map(&:size)).to eq([1, 1, 1, 1, 1, 1])
       # The row after the first full batch repeats id 1, so only the second INSERT fails.
       entries = (1..described_class::INSERT_BATCH_SIZE).map { |id| entry_row(id:) }
       entries << entry_row(id: 1, company_id: 2)

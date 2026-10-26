@@ -101,7 +101,8 @@ module Timekeeping
               "reservations" => derived.flat_map { |result| result[:reservations] },
               "invoice_operations" => [],
               "entry_audits" => audits[:rows],
-              "idempotency_records" => []
+              "idempotency_records" => [],
+              "service_idempotency_receipts" => []
             }),
             corrections: derived.flat_map { |result| result[:corrections] }
           }
