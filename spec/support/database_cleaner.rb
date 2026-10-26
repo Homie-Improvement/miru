@@ -33,9 +33,16 @@ module TestDatabaseCleanup
   # System, committed_data (spec/support/committed_data.rb) and
   # without_transaction examples run with no enclosing transaction, so their
   # writes really commit.
+  #
+  # Examples tagged :seeded_without_transaction, used with :two_tenant_seed,
+  # also run outside that transaction but are not truncated, so the seed the
+  # group loaded once survives between its examples. The group's own
+  # truncation cleans up when it finishes; an example that writes rows needs
+  # a group of its own.
   def committed?(example)
     example.metadata[:type] == :system ||
       example.metadata[:without_transaction] ||
+      example.metadata[:seeded_without_transaction] ||
       CommittedDataMode.example?(example)
   end
 end
