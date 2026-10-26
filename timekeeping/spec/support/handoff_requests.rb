@@ -44,17 +44,6 @@ module HandoffRequests
   end
 end
 
-# Row counts of every table a handoff route writes, to show a refused or failed
-# call left nothing behind.
-module HandoffRowCounts
-  def handoff_row_counts
-    { entries: Entry.count, reservations: Reservation.count, invoice_operations: InvoiceOperation.count,
-      audit_events: AuditEvent.count, idempotency_receipts: IdempotencyReceipt.count,
-      outbox_snapshots: OutboxSnapshot.count }
-  end
-end
-
 RSpec.configure do |config|
   config.include HandoffRequests, type: :request
-  config.include HandoffRowCounts
 end
