@@ -34,6 +34,7 @@ RSpec.describe "Reservation conflicted prepare retried through reservation_post"
               "entries" => [{ "entry_id" => free_a, "company_id" => company }, { "entry_id" => free_b, "company_id" => company }] }]
     )
     expect(Reservation.where(entry_id: [free_a, free_b]).pluck(:invoice_id, :state)).to eq([[501, "provisional"], [501, "provisional"]])
+    expect(Reservation.where(entry_id: held).pluck(:invoice_id, :state)).to eq([[777, "committed"]])
   end
 end
 
