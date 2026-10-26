@@ -5,16 +5,23 @@
 require "rails_helper"
 require "open3"
 
-RSpec.describe "Timekeeping relay test hooks outside the test environment" do
+RSpec.describe "Timekeeping test hooks outside the test environment" do
   # Add a test-only pause and resume control, loaded only in the test environment or when `TIMEKEEPING_TEST_HOOKS=1`, for the integration tests.
-  it "does not load the relay pause hook in production unless TIMEKEEPING_TEST_HOOKS is 1" do
+  # A write delay reachable in a built image would let a caller slow every company's entry writes, so the
+  # write delay route must be gated the same way, even for the service token.
+  it "does not load the relay pause or write delay hooks in production unless TIMEKEEPING_TEST_HOOKS is 1" do
     app_root = File.expand_path("../../..", __dir__)
     service_token = SecureRandom.hex(32)
     probe = <<~RUBY
-      env = Rack::MockRequest.env_for("/internal/v1/test-hooks/relay/pause", method: "POST",
-                                      "HTTP_AUTHORIZATION" => "Bearer #{service_token}")
-      status, = Rails.application.call(env)
-      puts [defined?(Timekeeping::TestHooks) ? "loaded" : "absent", status].join(" ")
+      pause = Rack::MockRequest.env_for("/internal/v1/test-hooks/relay/pause", method: "POST",
+                                        "HTTP_AUTHORIZATION" => "Bearer #{service_token}")
+      delay = Rack::MockRequest.env_for("/internal/v1/test-hooks/writes/delay", method: "POST",
+                                        "CONTENT_TYPE" => "application/json",
+                                        input: JSON.generate(milliseconds: 400),
+                                        "HTTP_AUTHORIZATION" => "Bearer #{service_token}")
+      pause_status, = Rails.application.call(pause)
+      delay_status, = Rails.application.call(delay)
+      puts [defined?(Timekeeping::TestHooks) ? "loaded" : "absent", pause_status, delay_status].join(" ")
     RUBY
 
     boot = lambda do |extra_env|
@@ -28,10 +35,13 @@ RSpec.describe "Timekeeping relay test hooks outside the test environment" do
       Open3.capture2e(env, RbConfig.ruby, "bin/rails", "runner", probe, chdir: app_root, unsetenv_others: true)
     end
 
-    # The enabled boot pauses the production relay through its file flag;
-    # put that flag back as it was so later production runs are not held.
-    production_flag = File.join(Timekeeping::TestHooks::RELAY_PAUSE_DIRECTORY, "relay_paused.production")
-    flag_existed = File.exist?(production_flag)
+    # The enabled boot pauses the production relay and sets a production write
+    # delay through their files; put both back as they were so later production
+    # runs are not held or slowed.
+    production_flags = %w[relay_paused.production write_delay_ms.production].map do |name|
+      File.join(Timekeeping::TestHooks::HOOK_DIRECTORY, name)
+    end
+    existing_flags = production_flags.select { |flag| File.exist?(flag) }
 
     unset_output, unset_status = boot.call({})
     zero_output, zero_status = boot.call("TIMEKEEPING_TEST_HOOKS" => "0")
@@ -40,11 +50,12 @@ RSpec.describe "Timekeeping relay test hooks outside the test environment" do
     expect(unset_status).to be_success, unset_output
     expect(zero_status).to be_success, zero_output
     expect(on_status).to be_success, on_output
-    expect(unset_output.lines.last.split).to eq(%w[absent 404])
-    expect(zero_output.lines.last.split).to eq(%w[absent 404])
-    expect(on_output.lines.last.split.first).to eq("loaded")
-    expect(on_output.lines.last.split.last).not_to eq("404")
+    expect(unset_output.lines.last.split).to eq(%w[absent 404 404])
+    expect(zero_output.lines.last.split).to eq(%w[absent 404 404])
+    loaded, pause_status, delay_status = on_output.lines.last.split
+    expect(loaded).to eq("loaded")
+    expect([pause_status, delay_status]).not_to include("404")
   ensure
-    FileUtils.rm_f(production_flag) if production_flag && !flag_existed
+    (production_flags - existing_flags).each { |flag| FileUtils.rm_f(flag) } if production_flags
   end
 end

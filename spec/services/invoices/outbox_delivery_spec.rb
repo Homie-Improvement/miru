@@ -5,6 +5,15 @@
 require "rails_helper"
 
 RSpec.describe Invoices::OutboxDelivery do
+  def outbox_delivery_outcome(state)
+    Invoices::ReservationOutcome.new(state:, conflicts: [], counts: {})
+  end
+
+  def outbox_delivery_settled_adapter(state)
+    outcome = outbox_delivery_outcome(state)
+    RecordingReservationAdapter.new(prepare: outcome, commit: outcome, abort: outcome)
+  end
+
   # "It builds the request from the stored outbox row and intent (company_id, invoice_id, operation_id, generation, disposition, desired_entry_ids), never from the invoice's current lines."
   # The intent is looked up under the outbox row's own company, so a row can never settle another company's reservation.
   it "sends nothing when the only intent matching the outbox row's operation belongs to another company" do
@@ -17,58 +26,74 @@ RSpec.describe Invoices::OutboxDelivery do
       company_id: 101, invoice_id: 10, operation_id:, kind: "commit",
       payload: { company_id: 202, invoice_id: 10, operation_id:, generation: 1, disposition: "active", desired_entry_ids: [1, 2] }
     )
-    settled = Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {})
-    adapter = RecordingReservationAdapter.new(prepare: settled, commit: settled, abort: settled)
+    adapter = outbox_delivery_settled_adapter("committed")
 
     described_class.new(adapter_source: -> { adapter }).deliver(item.id)
 
     expect(adapter.requests).to be_empty
     expect(item.reload.delivered_at).to be_nil
   end
-end
 
-RSpec.describe Invoices::OutboxDelivery do
   # "It builds the request from the stored outbox row and intent (company_id, invoice_id, operation_id, generation, disposition, desired_entry_ids), never from the invoice's current lines."
   # "an undelivered commit row is delivered once and a second delivery changes nothing"
-  it "delivers an undelivered commit row from the stored intent once and a second delivery changes nothing" do
+  # One row's invoice changed after the save and the other row's invoice id names
+  # no invoice at all: both requests must come from the stored row and intent,
+  # with the intent's entries sent sorted.
+  it "delivers each undelivered commit row once from its stored intent and a second delivery changes nothing" do
     invoice = create(:invoice)
-    operation_id = SecureRandom.uuid
+    missing_invoice_id = 99_999
+    changed_operation_id = SecureRandom.uuid
+    missing_operation_id = SecureRandom.uuid
     InvoiceOperationIntent.create!(
-      company_id: invoice.company_id, invoice_id: invoice.id, operation_id:, state: "committed",
-      generation: 7, disposition: "retained", desired_entry_ids: [11, 12]
+      company_id: invoice.company_id, invoice_id: invoice.id, operation_id: changed_operation_id, state: "committed",
+      generation: 7, disposition: "retained", desired_entry_ids: [12, 11]
     )
-    row = InvoiceOperationOutboxItem.create!(
-      company_id: invoice.company_id, invoice_id: invoice.id, operation_id:, kind: "commit",
-      payload: {
-        "company_id" => invoice.company_id, "invoice_id" => invoice.id, "operation_id" => operation_id,
-        "generation" => 7, "disposition" => "retained", "desired_entry_ids" => [11, 12]
-      }
+    InvoiceOperationIntent.create!(
+      company_id: invoice.company_id, invoice_id: missing_invoice_id, operation_id: missing_operation_id,
+      state: "committed", generation: 3, disposition: "active", desired_entry_ids: [5, 4]
     )
+    rows = [
+      [invoice.id, changed_operation_id, 7, "retained", [11, 12]],
+      [missing_invoice_id, missing_operation_id, 3, "active", [4, 5]]
+    ].map do |invoice_id, operation_id, generation, disposition, entry_ids|
+      InvoiceOperationOutboxItem.create!(
+        company_id: invoice.company_id, invoice_id:, operation_id:, kind: "commit",
+        payload: {
+          "company_id" => invoice.company_id, "invoice_id" => invoice_id, "operation_id" => operation_id,
+          "generation" => generation, "disposition" => disposition, "desired_entry_ids" => entry_ids
+        }
+      )
+    end
     invoice.update_column(:reference, "changed-after-save")
     received = []
     adapter = RecordingReservationAdapter.new(
-      prepare: Invoices::ReservationOutcome.new(state: "prepared", conflicts: [], counts: {}),
-      commit: ->(request) { received << request; Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {}) },
-      abort: Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
+      prepare: outbox_delivery_outcome("prepared"),
+      commit: ->(request) { received << request; outbox_delivery_outcome("committed") },
+      abort: outbox_delivery_outcome("aborted")
     )
     delivery = described_class.new(adapter_source: -> { adapter })
 
-    delivery.deliver(row.id)
-    first_state = row.reload.attributes
-    delivery.deliver(row.id)
+    rows.each { |row| delivery.deliver(row.id) }
+    first_states = rows.map { |row| row.reload.attributes }
+    rows.each { |row| delivery.deliver(row.id) }
 
-    expect(received.size).to eq(1)
+    expect(Invoice.exists?(missing_invoice_id)).to be(false)
+    expect(received.size).to eq(2)
     expect(received.first).to have_attributes(
-      company_id: invoice.company_id, invoice_id: invoice.id, operation_id:,
+      company_id: invoice.company_id, invoice_id: invoice.id, operation_id: changed_operation_id,
       generation: 7, disposition: "retained", entries: [11, 12]
     )
-    expect(first_state["delivered_at"]).to be_present
-    expect(row.reload.attributes).to eq(first_state)
-    expect(InvoiceOperationOutboxItem.where(company_id: invoice.company_id, operation_id:).count).to eq(1)
+    expect(received.second).to have_attributes(
+      company_id: invoice.company_id, invoice_id: missing_invoice_id, operation_id: missing_operation_id,
+      generation: 3, disposition: "active", entries: [4, 5]
+    )
+    expect(first_states.pluck("delivered_at")).to all(be_present)
+    expect(rows.map { |row| row.reload.attributes }).to eq(first_states)
+    [changed_operation_id, missing_operation_id].each do |operation_id|
+      expect(InvoiceOperationOutboxItem.where(company_id: invoice.company_id, operation_id:).count).to eq(1)
+    end
   end
-end
 
-RSpec.describe Invoices::OutboxDelivery do
   # "It calls the adapter's `commit` or `abort`, sets `delivered_at` only on a settled outcome, and otherwise keeps the row and increments `attempts`."
   it "keeps a row undelivered and counts an attempt when the adapter answers retryable or raises" do
     operation_id = SecureRandom.uuid
@@ -84,13 +109,13 @@ RSpec.describe Invoices::OutboxDelivery do
       }
     )
     retryable_adapter = RecordingReservationAdapter.new(
-      prepare: Invoices::ReservationOutcome.new(state: "prepared", conflicts: [], counts: {}),
-      commit: Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {}),
-      abort: Invoices::ReservationOutcome.new(state: "retryable", conflicts: [], counts: {})
+      prepare: outbox_delivery_outcome("prepared"),
+      commit: outbox_delivery_outcome("committed"),
+      abort: outbox_delivery_outcome("retryable")
     )
     raising_adapter = RecordingReservationAdapter.new(
-      prepare: Invoices::ReservationOutcome.new(state: "prepared", conflicts: [], counts: {}),
-      commit: Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {}),
+      prepare: outbox_delivery_outcome("prepared"),
+      commit: outbox_delivery_outcome("committed"),
       abort: ->(_request) { raise "reservation store unreachable" }
     )
 
@@ -102,9 +127,7 @@ RSpec.describe Invoices::OutboxDelivery do
     expect(row.reload.delivered_at).to be_nil
     expect(row.attempts).to eq(2)
   end
-end
 
-RSpec.describe Invoices::OutboxDelivery do
   # "It builds the request from the stored outbox row and intent (company_id, invoice_id, operation_id, generation, disposition, desired_entry_ids), never from the invoice's current lines."
   it "builds the request from the row's own company when two companies share an operation id" do
     operation_id = SecureRandom.uuid
@@ -118,8 +141,7 @@ RSpec.describe Invoices::OutboxDelivery do
       company_id: 2, invoice_id: 10, operation_id:, kind: "commit",
       payload: { "company_id" => 2, "invoice_id" => 10, "operation_id" => operation_id }
     )
-    committed = Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {})
-    adapter = RecordingReservationAdapter.new(prepare: committed, commit: committed, abort: committed)
+    adapter = outbox_delivery_settled_adapter("committed")
 
     described_class.new(adapter_source: -> { adapter }).deliver(item.id)
 
@@ -131,9 +153,7 @@ RSpec.describe Invoices::OutboxDelivery do
     expect(InvoiceOperationOutboxItem.where(company_id: 1).count).to eq(0)
     expect(item.reload.delivered_at).to be_present
   end
-end
 
-RSpec.describe Invoices::OutboxDelivery do
   it "delivers an abort row through abort when its invoice no longer exists" do
     operation_id = SecureRandom.uuid
     InvoiceOperationIntent.create!(
@@ -146,9 +166,9 @@ RSpec.describe Invoices::OutboxDelivery do
     )
     aborts = []
     adapter = RecordingReservationAdapter.new(
-      prepare: Invoices::ReservationOutcome.new(state: "prepared", conflicts: [], counts: {}),
-      commit: Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {}),
-      abort: ->(request) { aborts << request; Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {}) }
+      prepare: outbox_delivery_outcome("prepared"),
+      commit: outbox_delivery_outcome("committed"),
+      abort: ->(request) { aborts << request; outbox_delivery_outcome("aborted") }
     )
 
     described_class.new(adapter_source: -> { adapter }).deliver(item.id)
@@ -170,8 +190,7 @@ RSpec.describe Invoices::OutboxDelivery do
         company_id: 7401, invoice_id: 9401, operation_id:, kind: "commit",
         payload: { company_id: 7401, invoice_id: 9401, operation_id:, generation: 1, disposition: "active", desired_entry_ids: [41] }
       )
-      committed = Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {})
-      adapter = RecordingReservationAdapter.new(prepare: committed, commit: committed, abort: committed)
+      adapter = outbox_delivery_settled_adapter("committed")
       locked = Queue.new
       release = Queue.new
       holder = committed_data_thread do
@@ -206,8 +225,7 @@ RSpec.describe Invoices::OutboxDelivery do
       company_id: 7501, invoice_id: 9501, operation_id:, kind: "abort",
       payload: { company_id: 7501, invoice_id: 9501, operation_id:, generation: 1, disposition: "active", desired_entry_ids: [51] }
     )
-    aborted = Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
-    adapter = RecordingReservationAdapter.new(prepare: aborted, commit: aborted, abort: aborted)
+    adapter = outbox_delivery_settled_adapter("aborted")
     delivery = described_class.new(adapter_source: -> { adapter })
     allow(delivery).to receive(:record).and_raise(ActiveRecord::StatementInvalid, "result write failed")
 

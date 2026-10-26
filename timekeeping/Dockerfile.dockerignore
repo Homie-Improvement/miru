@@ -1,0 +1,23 @@
+# Used instead of the root .dockerignore when building timekeeping/Dockerfile
+# from the repository root. The root file anchors its key, env and Bundler
+# rules at the root (/config/master.key, /.env*, /.bundle), so it would not
+# keep timekeeping/'s own copies out of the image. This file starts from
+# nothing and lets in only the two trees the image needs.
+*
+!timekeeping
+!gems
+
+# Local Bundler config can hold private gem registry credentials.
+**/.bundle
+**/.env*
+**/config/master.key
+**/config/credentials/*.key
+**/*.pem
+
+# Specs, logs and temp files are not part of the running service.
+**/spec
+**/.rspec
+timekeeping/log
+timekeeping/tmp
+timekeeping/Dockerfile
+timekeeping/Dockerfile.dockerignore
