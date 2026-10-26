@@ -3,9 +3,9 @@
 module Timekeeping
   # The GET /internal/v1/metrics body: every stored window, grouped under its
   # own company, and each company's outbox lag. It carries counts and ages
-  # only, never a token, user or entry, and no total summed across companies. The bucket bounds come from
-  # Timekeeping::WriteMetrics, so the alert evaluator reads them here instead
-  # of keeping its own copy.
+  # only, never a token, user or entry, and no total summed across companies. The window length and
+  # bucket bounds come from Timekeeping::WriteMetrics, so the alert evaluator
+  # reads them here instead of keeping its own copy.
   module WriteMetricsPresenter
     # What the reference_unavailable rate divides by: the two counts never
     # overlap (Timekeeping::WriteMetrics).
@@ -19,6 +19,7 @@ module Timekeeping
     # at now, in whole seconds.
     def call(windows, oldest_unsent:, now:)
       {
+        "window_seconds" => WriteMetrics::WINDOW_SECONDS,
         "latency_bucket_bounds_ms" => WriteMetrics::LATENCY_BUCKET_BOUNDS_MS,
         "overflow_bucket" => WriteMetrics::OVERFLOW_BUCKET,
         "total_field" => TOTAL_FIELD,
