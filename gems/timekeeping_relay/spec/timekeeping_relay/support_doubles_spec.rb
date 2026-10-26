@@ -30,7 +30,7 @@ RSpec.describe TimekeepingRelaySpec::MemoryOutboxSource do
 
     source.add(described_class.row(5))
 
-    expect(source.unsent_after(0, 10).map { |row| row["outbox_position"] }).to eq([5])
+    expect(source.unsent_after(0, 10).map { |row| row.fetch("outbox_position") }).to eq([5])
     expect(source.sent_positions).to contain_exactly(3, 7, 12)
   end
 
@@ -87,8 +87,8 @@ RSpec.describe TimekeepingRelaySpec::FakeRelayEndpoint do
     endpoint.deliver(batch, idempotency_key: "key-a")
     endpoint.deliver(batch, idempotency_key: "key-b")
 
-    expect(endpoint.posts.map { |post| post[:key] }).to eq(%w[key-a key-b])
-    expect(endpoint.posts.map { |post| post[:batch] }).to eq([batch, batch])
+    expect(endpoint.posts.map { |post| post.fetch(:key) }).to eq(%w[key-a key-b])
+    expect(endpoint.posts.map { |post| post.fetch(:batch) }).to eq([batch, batch])
     expect(endpoint.posts.map { |post| post[:answer].status }).to eq([503, 200])
     expect(endpoint.idempotency_keys).to eq(%w[key-a key-b])
   end

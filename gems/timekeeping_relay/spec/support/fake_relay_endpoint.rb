@@ -39,7 +39,7 @@ module TimekeepingRelaySpec
     end
 
     def idempotency_keys
-      @posts.map { |post| post[:key] }
+      @posts.map { |post| post.fetch(:key) }
     end
 
     private
