@@ -622,3 +622,61 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
     end
   end
 end
+
+RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
+  let(:loaded_ids_connection) { ActiveRecord::Base.connection }
+  let(:loaded_ids_store) { described_class.new(connection: loaded_ids_connection) }
+
+  def loaded_ids_entry(id:)
+    {
+      "id" => id, "company_id" => 1, "version" => 1, "project_id" => 1, "user_id" => 1, "agent_id" => nil,
+      "work_date" => Date.new(2026, 1, 5), "duration" => 1.0, "note" => "", "bill_status" => "unbilled",
+      "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
+      "external_run_id" => nil, "external_session_id" => nil, "proof_url" => nil, "proof_metadata" => {},
+      "discarded_at" => nil, "created_at" => Time.utc(2026, 1, 5, 9), "updated_at" => Time.utc(2026, 1, 5, 9)
+    }
+  end
+
+  def loaded_ids_audit(id:, entry_id:)
+    {
+      "id" => id, "company_id" => 1, "entry_id" => entry_id, "actor_type" => "User", "actor_id" => 1,
+      "action" => "create", "before" => nil, "after" => { "note" => "" },
+      "entry_created_at" => Time.utc(2026, 1, 5, 9), "created_at" => Time.utc(2026, 1, 5, 9)
+    }
+  end
+
+  def loaded_ids_checkpoint(audit_ids:)
+    tables = Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }
+    tables["entries"] = [loaded_ids_entry(id: 1)]
+    tables["entry_audits"] = audit_ids.map { |id| loaded_ids_audit(id:, entry_id: 1) }
+    Timekeeping::Handoff::Checkpoint.build(tables:)
+  end
+
+  def loaded_ids_insert_audit
+    loaded_ids_connection.select_value(<<~SQL.squish)
+      INSERT INTO entry_audits (company_id, entry_id, actor_type, actor_id, action, after, entry_created_at, created_at)
+      VALUES (1, 1, 'User', 1, 'update', '{}', now(), now())
+      RETURNING id
+    SQL
+  end
+
+  it "moves a loaded table's id sequence above the highest loaded id, and never back" do
+    loaded_ids_store.load_checkpoint(loaded_ids_checkpoint(audit_ids: [7, 50]))
+    expect(loaded_ids_insert_audit).to eq(51)
+
+    loaded_ids_store.load_checkpoint(loaded_ids_checkpoint(audit_ids: [3]))
+    expect(loaded_ids_insert_audit).to eq(52)
+  end
+
+  it "refuses a checkpoint holding a table with no mapping and leaves every table as it was" do
+    loaded_ids_store.load_checkpoint(loaded_ids_checkpoint(audit_ids: [7]))
+    valid = loaded_ids_checkpoint(audit_ids: [9])
+    unmapped = Timekeeping::Handoff::Checkpoint.new(
+      rows: valid.rows.merge("timesheet_entries" => []), digest: valid.digest
+    )
+
+    expect { loaded_ids_store.load_checkpoint(unmapped) }
+      .to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError, /unknown tables: timesheet_entries/)
+    expect(loaded_ids_connection.select_values("SELECT id FROM entry_audits")).to eq([7])
+  end
+end
