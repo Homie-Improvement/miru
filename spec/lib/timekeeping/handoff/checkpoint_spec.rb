@@ -188,5 +188,21 @@ RSpec.describe Timekeeping::Handoff::Checkpoint, "row shapes and encoding" do
     )
 
     expect { described_class.verify(widened) }.to raise_error(described_class::ShapeError, /entries.*unmapped_field/)
+    expect { widened.to_json }.to raise_error(described_class::ShapeError, /entries.*unmapped_field/)
+  end
+
+  it "refuses to serialize a directly built checkpoint with a missing column, a missing or extra table, or no company_id" do
+    original = described_class.build(tables: shape_case_tables(entries: [shape_case_entry]))
+    broken_tables = {
+      /entries.*proof_url/ => shape_case_tables(entries: [shape_case_entry.except("proof_url")]),
+      /reservations/ => shape_case_tables.except("reservations"),
+      /unknown tables: invoices/ => shape_case_tables.merge("invoices" => []),
+      /entries: a row has no company_id/ => shape_case_tables(entries: [shape_case_entry(company_id: nil)])
+    }
+
+    broken_tables.each do |message, rows|
+      expect { described_class.new(rows:, digest: original.digest).to_json }
+        .to raise_error(described_class::ShapeError, message)
+    end
   end
 end

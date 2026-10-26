@@ -105,16 +105,20 @@ module Timekeeping
           end
         end
 
+        # Raises ShapeError, naming the table, for a missing or unknown table,
+        # a column with no home, a missing column or a row without company_id.
+        # Every path that reads rows calls it first, because encoding reads
+        # only canonical columns and would silently skip the rest.
+        def check_shape!(tables)
+          missing = TABLES.keys - tables.keys
+          unknown = tables.keys - TABLES.keys
+          raise ShapeError, "missing tables: #{missing.join(', ')}" if missing.any?
+          raise ShapeError, "unknown tables: #{unknown.join(', ')}" if unknown.any?
+
+          tables.each { |table, rows| rows.each { |row| check_row!(table, row) } }
+        end
+
         private
-
-          def check_shape!(tables)
-            missing = TABLES.keys - tables.keys
-            unknown = tables.keys - TABLES.keys
-            raise ShapeError, "missing tables: #{missing.join(', ')}" if missing.any?
-            raise ShapeError, "unknown tables: #{unknown.join(', ')}" if unknown.any?
-
-            tables.each { |table, rows| rows.each { |row| check_row!(table, row) } }
-          end
 
           def check_row!(table, row)
             columns = TABLES.fetch(table)
@@ -223,6 +227,7 @@ module Timekeeping
       # The transport form: every row as its encoded [column, tagged value]
       # pairs, and the digest with company ids as JSON object keys.
       def to_json(*)
+        self.class.check_shape!(rows)
         JSON.generate(
           "tables" => rows.to_h { |table, table_rows| [table, table_rows.map { |row| self.class.encode_row(table, row) }] },
           "digest" => digest.transform_values do |companies|
