@@ -151,6 +151,31 @@ RSpec.describe Timekeeping::Handoff::ServiceStore do
       audit = AuditEvent.create!(company_id: 8, entry_id: 900, actor_type: "user", actor_id: 1, action: "update",
                                  after: {}, entry_created_at: Time.current, created_at: Time.current)
       expect(audit.id).to be > 400
+      receipt = IdempotencyReceipt.create!(company_id: 9, actor_type: "user", actor_id: 12, operation: "create",
+                                           key: "key-after-load", fingerprint: "def", status: 201, body: "{}",
+                                           created_at: Time.current)
+      expect(receipt.id).to be > 500
+      operation = InvoiceOperation.create!(company_id: 9, invoice_id: 42, operation_id: SecureRandom.uuid,
+                                           state: "committed", disposition: "active", generation: 2,
+                                           created_at: Time.current)
+      expect(operation.id).to be > 300
+    end
+
+    it "never moves the audit, receipt and operation id sequences back when a checkpoint holds lower ids" do
+      Timekeeping::Admission.fence!
+      store.load_checkpoint(service_store_checkpoint)
+      lower = service_store_tables
+      lower.fetch("invoice_operations").first["id"] = 3
+      lower.fetch("entry_audits").first["id"] = 4
+      lower.fetch("idempotency_records").first["id"] = 5
+      store.load_checkpoint(Timekeeping::Handoff::Checkpoint.build(tables: lower))
+
+      next_ids = %w[invoice_operations audit_events idempotency_receipts].index_with do |table|
+        ApplicationRecord.connection.select_value(
+          "SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END FROM #{table}_id_seq"
+        ).to_i
+      end
+      expect(next_ids).to eq("invoice_operations" => 301, "audit_events" => 401, "idempotency_receipts" => 501)
     end
 
     it "refuses to export while a prepared invoice operation remains" do

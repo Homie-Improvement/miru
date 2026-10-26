@@ -169,18 +169,6 @@ module Timekeeping
           value.nil? ? Checkpoint::JSON_NULL : value
         end
 
-        # JSON text with each BigDecimal written as a bare number. The default
-        # encoders write a BigDecimal as a quoted string.
-        def jsonb_text(value)
-          case value
-          when Hash then "{#{value.map { |key, item| "#{JSON.generate(key)}:#{jsonb_text(item)}" }.join(',')}}"
-          when Array then "[#{value.map { |item| jsonb_text(item) }.join(',')}]"
-          when BigDecimal then value.to_s("F")
-          when Checkpoint::JSON_NULL then "null"
-          else JSON.generate(value)
-          end
-        end
-
         # A column on only one side would be dropped or left unfilled.
         def check_columns!(table)
           stored = connection.columns(table_name(table)).map(&:name)
@@ -226,29 +214,12 @@ module Timekeeping
 
           rows.each_slice(INSERT_BATCH_SIZE) do |batch|
             values = batch.map do |row|
-              "(#{columns.map { |column| sql_literal(row.fetch(column), stored_columns.fetch(column)) }.join(', ')})"
+              "(#{columns.map { |column| LosslessSql.literal(connection, row.fetch(column), stored_columns.fetch(column)) }.join(', ')})"
             end
             connection.execute("INSERT INTO #{quoted_table(table)} (#{column_list}) VALUES #{values.join(', ')}")
           end
         rescue ActiveRecord::StatementInvalid => error
           raise Store::Error, "#{table_name(table)}: #{error.message}"
-        end
-
-        # Floats go in as quoted text: Float#to_s is the shortest decimal that
-        # reads back to the same bits, and an unquoted -0.0 would be parsed as
-        # the negation of the number zero and stored as 0.
-        def sql_literal(value, column)
-          # Column#sql_type names an array column's element type only.
-          sql_type = column.array? ? "#{column.sql_type}[]" : column.sql_type
-          literal =
-            if value.is_a?(Float)
-              connection.quote(value.to_s)
-            elsif column.type == :jsonb && !value.nil?
-              connection.quote(jsonb_text(value))
-            else
-              connection.quote(connection.lookup_cast_type(sql_type).serialize(value))
-            end
-          "#{literal}::#{sql_type}"
         end
 
         # The checkpoint carries only terminal invoice operations. A prepared

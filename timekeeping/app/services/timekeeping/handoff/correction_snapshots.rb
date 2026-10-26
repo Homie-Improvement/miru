@@ -27,7 +27,7 @@ module Timekeeping
           lock_entries!(keys)
           OutboxSnapshot.lock_for_insert!
           OutboxSnapshot.where([:company_id, :id] => keys, generation:).delete_all
-          OutboxSnapshot.insert_all!(snapshots.map { |snapshot| snapshot.merge("version" => version, "generation" => generation) }) if snapshots.any?
+          insert_snapshots!(snapshots, version:, generation:) if snapshots.any?
           raise_stored_versions!(keys, version)
         end
         snapshots.size
@@ -73,6 +73,22 @@ module Timekeeping
         raise Store::Error, "correction snapshots name entries that are not stored, for company_id #{companies.join(', ')}"
       end
 
+      # Active Record writes a jsonb decimal as a quoted string, so the rows go
+      # in through LosslessSql, which keeps each one a JSON number.
+      def insert_snapshots!(snapshots, version:, generation:)
+        connection = OutboxSnapshot.connection
+        stored_columns = OutboxSnapshot.columns_hash
+        columns = SNAPSHOT_FIELDS + %w[version generation]
+        values = snapshots.map do |snapshot|
+          row = snapshot.merge("version" => version, "generation" => generation)
+          "(#{columns.map { |column| LosslessSql.literal(connection, row.fetch(column), stored_columns.fetch(column)) }.join(', ')})"
+        end
+        connection.execute(<<~SQL.squish)
+          INSERT INTO outbox_snapshots (#{columns.map { |column| connection.quote_column_name(column) }.join(', ')})
+          VALUES #{values.join(', ')}
+        SQL
+      end
+
       # EntryWriter gives an entry's next write the stored version plus one, and
       # the projection applies only a higher version than it holds. An entry
       # stored below the correction's version would make its first edit equal
@@ -82,7 +98,7 @@ module Timekeeping
         Entry.where([:company_id, :id] => keys).where("version < ?", version).update_all(version:)
       end
 
-      private_class_method :check_shape!, :positive_integer?, :lock_entries!, :raise_stored_versions!
+      private_class_method :check_shape!, :positive_integer?, :lock_entries!, :insert_snapshots!, :raise_stored_versions!
     end
   end
 end

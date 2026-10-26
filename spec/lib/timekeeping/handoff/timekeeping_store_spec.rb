@@ -107,6 +107,25 @@ RSpec.describe Timekeeping::Handoff::TimekeepingStore do
   end
 end
 
+RSpec.describe Timekeeping::Handoff::TimekeepingStore, "correction transport" do
+  it "sends a jsonb decimal from the checkpoint as a bare JSON number, not a string" do
+    checkpoint = Timekeeping::Handoff::Checkpoint.from_json(
+      Rails.root.join("spec/fixtures/files/timekeeping_handoff/monolith_checkpoint.json").read
+    )
+    snapshot = checkpoint.rows.fetch("entries").first.except("version")
+    url = "http://timekeeping-handoff.test/internal/v1/handoff/correction_snapshots"
+    stub_request(:put, url).to_return(status: 200, body: JSON.generate("written" => 1))
+
+    described_class.new(base_url: "http://timekeeping-handoff.test", token: "svc-token")
+      .write_correction_snapshots(snapshots: [snapshot], version: 1, generation: 2)
+
+    expect(a_request(:put, url).with do |request|
+      sent = JSON.parse(request.body, decimal_class: BigDecimal).fetch("snapshots").first.fetch("source_metadata")
+      sent == snapshot.fetch("source_metadata") && sent.fetch("rate").is_a?(BigDecimal)
+    end).to have_been_made.once
+  end
+end
+
 # A real socket, because WebMock answers before Net::HTTP's own retry runs.
 RSpec.describe Timekeeping::Handoff::TimekeepingStore, "on a read timeout" do
   it "sends a timed-out checkpoint load once and raises Store::Error" do

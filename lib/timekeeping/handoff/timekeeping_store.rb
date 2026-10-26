@@ -62,9 +62,10 @@ module Timekeeping
       end
 
       # Replaces the snapshots of each given entry at generation with one at
-      # version. Returns the number written.
+      # version. Returns the number written. Decimals in the snapshots' jsonb
+      # fields go out as bare JSON numbers, so none is rounded or quoted.
       def write_correction_snapshots(snapshots:, version:, generation:)
-        body = { "snapshots" => snapshots, "version" => version, "generation" => generation }.to_json
+        body = LosslessSql.json_text("snapshots" => snapshots, "version" => version, "generation" => generation)
         integer_field(request(:put, CORRECTION_SNAPSHOTS_PATH, body), "written")
       end
 

@@ -122,4 +122,43 @@ RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "stored data" do
     end
     expect(OutboxSnapshot.count).to eq(0)
   end
+
+  it "replaces an earlier correction of the same entry and generation with the new contents" do
+    entry_id = timekeeping_arrange.entry(company:, user: owner, project:, version: 0)
+    Timekeeping::Admission.fence!
+    described_class.write!(snapshots: [correction_snapshot_for(entry_id).merge("locked" => false)], version: 1, generation: 2)
+
+    described_class.write!(snapshots: [correction_snapshot_for(entry_id).merge("locked" => true, "note" => "Replaced")],
+                           version: 1, generation: 2)
+
+    expect(OutboxSnapshot.where(id: entry_id, generation: 2).pluck(:version, :locked, :note))
+      .to eq([[1, true, "Replaced"]])
+  end
+
+  it "keeps the earlier correction and the entry version when the insert fails after the old rows were deleted" do
+    entry_id = timekeeping_arrange.entry(company:, user: owner, project:, version: 0)
+    Timekeeping::Admission.fence!
+    described_class.write!(snapshots: [correction_snapshot_for(entry_id)], version: 1, generation: 2)
+    before = correction_table_state
+
+    # source_metadata is NOT NULL, so this snapshot passes the shape check and fails at the insert.
+    expect do
+      described_class.write!(snapshots: [correction_snapshot_for(entry_id).merge("source_metadata" => nil)],
+                             version: 3, generation: 2)
+    end.to raise_error(ActiveRecord::NotNullViolation)
+    expect(correction_table_state).to eq(before)
+  end
+
+  it "stores a jsonb decimal finer than a Float exactly, as a JSON number" do
+    entry_id = timekeeping_arrange.entry(company:, user: owner, project:, version: 0)
+    Timekeeping::Admission.fence!
+    snapshot = correction_snapshot_for(entry_id).merge("source_metadata" => { "rate" => BigDecimal("1.00000000000000000001") })
+
+    described_class.write!(snapshots: [snapshot], version: 1, generation: 2)
+
+    stored = ApplicationRecord.connection.select_value(
+      "SELECT source_metadata::text FROM outbox_snapshots WHERE id = #{Integer(entry_id)}"
+    )
+    expect(stored).to eq('{"rate": 1.00000000000000000001}')
+  end
 end

@@ -13,10 +13,11 @@ class Timekeeping::Internal::V1::Handoff::BaseController < Timekeeping::Internal
 
     # The request body as plain JSON values. The services take plain Hashes,
     # not ActionController::Parameters, and tell an Integer from a string, so
-    # the body is read exactly as sent.
+    # the body is read exactly as sent. Decimals are read as BigDecimal, so a
+    # jsonb number finer than a Float is not rounded.
     def json_body
       body = request.raw_post.presence || "{}"
-      document = JSON.parse(body)
+      document = JSON.parse(body, decimal_class: BigDecimal)
       raise Timekeeping::Handoff::Checkpoint::ShapeError, "the request body is not a JSON object" unless document.is_a?(Hash)
 
       document

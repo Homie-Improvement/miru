@@ -208,3 +208,33 @@ RSpec.describe "Timekeeping internal handoff fence that cannot take the admissio
     expect(Timekeeping::Admission.current.generation).to eq(1)
   end
 end
+
+RSpec.describe "Timekeeping internal handoff correction snapshots, jsonb decimals" do
+  include_context "timekeeping entry writes without transactional fixtures"
+
+  it "stores a decimal sent as a bare JSON number exactly" do
+    service_token = "service-#{SecureRandom.hex(24)}"
+    at = Time.utc(2026, 3, 2, 9)
+    Entry.insert_all!([{ id: 31, company_id: 1, version: 0, project_id: 10, user_id: 20,
+                         work_date: Date.new(2026, 3, 2), duration: 30.0, bill_status: "unbilled",
+                         created_at: at, updated_at: at }])
+    Timekeeping::Admission.fence!
+    snapshot = (Timekeeping::OutboxFields::ENTRY_FIELDS - ["version"]).index_with { nil }.merge(
+      "id" => 31, "company_id" => 1, "project_id" => 10, "user_id" => 20, "work_date" => "2026-03-02",
+      "duration" => 30.0, "note" => "", "bill_status" => "unbilled", "review_status" => "not_required",
+      "locked" => true, "source" => "manual", "source_metadata" => { "rate" => BigDecimal("1.00000000000000000001") },
+      "proof_metadata" => {}, "created_at" => at.iso8601, "updated_at" => at.iso8601
+    )
+    body = Timekeeping::Handoff::LosslessSql.json_text("generation" => 2, "version" => 1, "snapshots" => [snapshot])
+
+    with_timekeeping_env(Timekeeping::Environment::SERVICE_TOKEN => service_token) do
+      put "/internal/v1/handoff/correction_snapshots", params: body,
+                                                       headers: { "Authorization" => "Bearer #{service_token}",
+                                                                  "CONTENT_TYPE" => "application/json" }
+    end
+
+    expect([response.status, response.parsed_body]).to eq([200, { "written" => 1 }])
+    expect(ApplicationRecord.connection.select_value("SELECT source_metadata::text FROM outbox_snapshots WHERE id = 31"))
+      .to eq('{"rate": 1.00000000000000000001}')
+  end
+end

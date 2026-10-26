@@ -15,18 +15,52 @@ RSpec.describe Timekeeping::Handoff::CorrectionSnapshots do
     snapshot = entry.attributes.slice(*(Timekeeping::OutboxFields::ENTRY_FIELDS - ["version"])).merge("locked" => true)
     Timekeeping::Admission.fence!
 
-    start = Queue.new
+    # A third connection holds the entry row, so both writers stop at the
+    # lock the replacement takes before it deletes and inserts.
+    held = Queue.new
+    release = Queue.new
+    holder_pid = Queue.new
+    holder = Thread.new do
+      ApplicationRecord.connection_pool.with_connection do |connection|
+        holder_pid << connection.select_value("SELECT pg_backend_pid()")
+        connection.transaction do
+          connection.execute("SELECT 1 FROM entries WHERE id = #{Integer(entry.id)} FOR UPDATE")
+          held << true
+          release.pop(timeout: 10)
+        end
+      end
+    end
+    expect(held.pop(timeout: 10)).to be(true)
+    pid = holder_pid.pop(timeout: 10)
+
     writers = Array.new(2) do
       Thread.new do
         ApplicationRecord.connection_pool.with_connection do
-          start.pop
           described_class.write!(snapshots: [snapshot], version: 1, generation: 2)
         end
       end
     end
-    2.times { start << true }
-    writers.each { |writer| writer.join(10) }
 
+    # The second writer may queue behind the first rather than the holder, so
+    # this counts every session blocked by any lock, not only by the holder.
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+    waiting = 0
+    while waiting < 2 && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      waiting = ApplicationRecord.connection.select_value(ApplicationRecord.sanitize_sql_array(
+        ["SELECT COUNT(*) FROM pg_stat_activity WHERE pid <> ? AND cardinality(pg_blocking_pids(pid)) > 0", pid]
+      )).to_i
+      sleep 0.02
+    end
+    expect(waiting).to eq(2)
+
+    release << true
+    holder.join(10)
+    results = writers.map { |writer| writer.join(10)&.value }
+
+    expect(results).to eq([1, 1])
     expect(OutboxSnapshot.where(company_id: 9, id: entry.id, generation: 2).pluck(:version)).to eq([1])
+  ensure
+    release&.push(true)
+    [holder, *writers].compact.each { |thread| thread.join(10) || thread.kill }
   end
 end
