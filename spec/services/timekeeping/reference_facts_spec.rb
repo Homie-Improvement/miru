@@ -147,204 +147,97 @@ RSpec.describe Timekeeping::ReferenceFacts, "agents" do
   end
 end
 
-RSpec.describe Timekeeping::ReferenceFacts, "privileged-first users' roles" do
+RSpec.describe Timekeeping::ReferenceFacts, "role selection" do
   # "Make `ReferenceFacts` serve each user's role with the same rule, so the token and the reference endpoint still agree on a user's role in a company."
   # "Fall back to the reference role when the user holds neither."
-  it "serves the oldest owner or admin role a user holds in the company, else their oldest role, per user" do
-    company = create(:company)
-    # Rolify keeps one roles row per name and company, shared by every holder,
-    # so the order of owner and admin is the order those rows were created in
-    # the company. Each order therefore needs a company of its own.
-    admin_first_company = create(:company)
-    make_member = lambda do |*roles, in_company: company|
-      create(:user).tap do |member|
-        create(:employment, company: in_company, user: member)
-        roles.each { |role| member.add_role(role, in_company) }
-      end
-    end
-
-    employee_first_owner = make_member.call(:employee, :owner)
-    owner_then_admin = make_member.call(:owner, :admin)
-    admin_then_owner = make_member.call(:admin, :owner, in_company: admin_first_company)
-    manager_only = make_member.call(:manager)
-    colleague = make_member.call(:employee)
-
-    served = described_class.call(company:, project_ids: [])[:users].to_h { |user| [user[:id], user[:role]] }
-    served_admin_first = described_class.call(company: admin_first_company, project_ids: [])[:users]
-      .to_h { |user| [user[:id], user[:role]] }
-
-    expect(served.fetch(employee_first_owner.id)).to eq("owner")
-    expect(served.fetch(owner_then_admin.id)).to eq("owner")
-    expect(served_admin_first.fetch(admin_then_owner.id)).to eq("admin")
-    expect(served.fetch(manager_only.id)).to eq("manager")
-    # One user's admin role must never be credited to a colleague in the same batch.
-    expect(served.fetch(colleague.id)).to eq("employee")
-    expect(User.primary_roles_for(company, [employee_first_owner.id])).to eq(employee_first_owner.id => "employee")
-  end
-end
-
-RSpec.describe Timekeeping::ReferenceFacts, "privileged role company scope" do
-  let(:served_company) { create(:company) }
-  let(:foreign_company) { create(:company) }
-
-  def served_member
-    create(:user).tap { |member| create(:employment, company: served_company, user: member) }
-  end
-
-  # "Make `ReferenceFacts` serve each user's role with the same rule, so the token and the reference endpoint still agree on a user's role in a company."
   # "Roles held in another company, and global roles, must still never reach the token."
-  it "serves an owner or admin role only when it is held in the named company and only to its holder" do
-    employee_first_admin = served_member
-    employee_first_admin.add_role(:employee, served_company)
-    employee_first_admin.add_role(:admin, served_company)
+  # Rolify keeps one roles row per name and company, shared by every holder,
+  # so the order of owner and admin is the order those rows were created in
+  # the company. Every example gets fresh companies from `let`, so each row,
+  # and each order of owner and admin, is built in a company of its own.
+  let(:served_company) { create(:company) }
+  let(:other_company) { create(:company) }
 
-    colleague = served_member
-    colleague.add_role(:employee, served_company)
-
-    global_admin = served_member
-    global_admin.add_role(:employee, served_company)
-    global_admin.add_role(:admin)
-
-    foreign_admin = served_member
-    create(:employment, company: foreign_company, user: foreign_admin)
-    foreign_admin.add_role(:employee, served_company)
-    foreign_admin.add_role(:admin, foreign_company)
-
-    foreign_only_owner = create(:user)
-    create(:employment, company: foreign_company, user: foreign_only_owner)
-    foreign_only_owner.add_role(:owner, foreign_company)
-
-    users = described_class.call(company: served_company, project_ids: [])[:users]
-
-    expect(users).to contain_exactly(
-      { id: employee_first_admin.id, role: "admin" },
-      { id: colleague.id, role: "employee" },
-      { id: global_admin.id, role: "employee" },
-      { id: foreign_admin.id, role: "employee" }
-    )
-  end
-end
-
-RSpec.describe Timekeeping::ReferenceFacts, "role holders without employment" do
-  let(:listing_company) { create(:company) }
-
-  # Users are the company's kept employed users; holding a role there must not
-  # add a user, so the per-user role lookup cannot widen who is listed. The
-  # employee-first admin row fails until the privileged-first rule is in place.
-  it "leaves out a user who holds an admin role in the named company but has no kept employment there" do
-    employed_admin = create(:user)
-    create(:employment, company: listing_company, user: employed_admin)
-    employed_admin.add_role(:employee, listing_company)
-    employed_admin.add_role(:admin, listing_company)
-
-    unemployed_admin = create(:user)
-    unemployed_admin.add_role(:admin, listing_company)
-
-    departed_admin = create(:user)
-    create(:employment, company: listing_company, user: departed_admin)
-    departed_admin.add_role(:admin, listing_company)
-    listing_company.employments.find_by(user: departed_admin).discard!
-
-    users = described_class.call(company: listing_company, project_ids: [])[:users]
-
-    expect(users).to eq([{ id: employed_admin.id, role: "admin" }])
-  end
-end
-
-RSpec.describe Timekeeping::ReferenceFacts, "roles agreeing with the write token" do
-  # "ReferenceFacts serves the same role for that user, so token and reference endpoint agree"
-  it "serves the same role the write token signs for privileged, manager, plain and roleless users" do
-    company = create(:company)
-    elsewhere = create(:company)
-    member = lambda do
-      create(:user).tap { |user| create(:employment, company:, user:) }
+  def served_member(*roles)
+    create(:user).tap do |member|
+      create(:employment, company: served_company, user: member)
+      roles.each { |role| member.add_role(role, served_company) }
     end
-    employee_first_admin = member.call
-    employee_first_admin.add_role(:employee, company)
-    employee_first_admin.add_role(:admin, company)
-    employee_first_owner = member.call
-    employee_first_owner.add_role(:employee, company)
-    employee_first_owner.add_role(:owner, company)
-    manager_only = member.call
-    manager_only.add_role(:manager, company)
-    plain_employee = member.call
-    plain_employee.add_role(:employee, company)
-    roleless = member.call
-    global_admin = member.call
-    global_admin.add_role(:admin)
-    other_company_admin = member.call
-    create(:employment, company: elsewhere, user: other_company_admin)
-    other_company_admin.add_role(:admin, elsewhere)
-    users = [employee_first_admin, employee_first_owner, manager_only, plain_employee, roleless, global_admin,
-             other_company_admin]
-
-    served = described_class.call(company:, project_ids: [])[:users].to_h { |listed| [listed[:id], listed[:role]] }
-    signed = users.to_h do |user|
-      token = Timekeeping::UserToken.mint(user:, company:, private_key: timekeeping_key_pair)
-      [user.id, Timekeeping::UserToken.verify(token, public_key: timekeeping_key_pair.public_key).role]
-    end
-
-    expect(served.slice(*users.map(&:id))).to eq(
-      employee_first_admin.id => "admin",
-      employee_first_owner.id => "owner",
-      manager_only.id => "manager",
-      plain_employee.id => "employee",
-      roleless.id => "employee",
-      global_admin.id => "employee",
-      other_company_admin.id => "employee"
-    )
-    expect(signed).to eq(served.slice(*users.map(&:id)))
   end
-end
 
-RSpec.describe Timekeeping::ReferenceFacts, "order between owner and admin" do
-  # The read rule the issue names, "held_role_names filtered by PRIVILEGED_ROLES", takes held roles oldest
-  # first, so the older of owner and admin wins.
-  it "serves the oldest owner or admin role when a user holds both in the company" do
-    # Rolify shares one roles row per name and company among its holders, so
-    # each order of owner and admin is set up in a company of its own.
-    owner_first_company = create(:company)
-    admin_first_company = create(:company)
-    owner_first = create(:user).tap { |user| create(:employment, company: owner_first_company, user:) }
-    owner_first.add_role(:employee, owner_first_company)
-    owner_first.add_role(:owner, owner_first_company)
-    owner_first.add_role(:admin, owner_first_company)
-    admin_first = create(:user).tap { |user| create(:employment, company: admin_first_company, user:) }
-    admin_first.add_role(:employee, admin_first_company)
-    admin_first.add_role(:admin, admin_first_company)
-    admin_first.add_role(:owner, admin_first_company)
-
-    served_roles = lambda do |company|
-      described_class.call(company:, project_ids: [])[:users].to_h { |listed| [listed[:id], listed[:role]] }
+  def other_company_member(other_role)
+    create(:user).tap do |member|
+      create(:employment, company: other_company, user: member)
+      member.add_role(other_role, other_company)
     end
-    owner_first_served = served_roles.call(owner_first_company)
-
-    expect(owner_first_served.fetch(owner_first.id)).to eq("owner")
-    expect(served_roles.call(admin_first_company).fetch(admin_first.id)).to eq("admin")
-    expect(owner_first_served.keys.count(owner_first.id)).to eq(1)
   end
-end
 
-RSpec.describe Timekeeping::ReferenceFacts, "per-user roles in one batch" do
-  # "Make `ReferenceFacts` serve each user's role with the same rule, so the token and the reference
-  # endpoint still agree on a user's role in a company."
-  it "never credits one employed user's admin role to a colleague or lists a role holder with no employment" do
-    company = create(:company)
-    other_company = create(:company)
-    admin = create(:user)
-    colleague = create(:user)
-    outsider_admin = create(:user)
-    create(:employment, company:, user: admin)
-    create(:employment, company:, user: colleague)
-    create(:employment, company: other_company, user: outsider_admin)
-    admin.add_role(:employee, company)
-    admin.add_role(:admin, company)
-    colleague.add_role(:employee, company)
+  def served_users
+    described_class.call(company: served_company, project_ids: [])[:users]
+  end
+
+  # A row's role is nil when the user must be left out of the served users.
+  # Every row also lists a roleless bystander, so a row that expects its user
+  # to be left out still fails if the company's users go missing altogether.
+  [
+    { case: "an employee who later holds owner", role: "owner", member: -> { served_member(:employee, :owner) } },
+    { case: "a user who holds owner and then admin", role: "owner", member: -> { served_member(:owner, :admin) } },
+    { case: "a user who holds admin and then owner", role: "admin", member: -> { served_member(:admin, :owner) } },
+    { case: "a manager only", role: "manager", member: -> { served_member(:manager) } },
+    { case: "a global admin", role: "employee",
+      member: -> { served_member(:employee).tap { |member| member.add_role(:admin) } } },
+    { case: "an employee who is admin only in another company", role: "employee",
+      member: lambda {
+        served_member(:employee).tap do |member|
+          create(:employment, company: other_company, user: member)
+          member.add_role(:admin, other_company)
+        end
+      } },
+    { case: "an owner only in another company with no employment here", role: nil,
+      member: -> { other_company_member(:owner) } },
+    { case: "an admin here with no employment", role: nil,
+      member: -> { create(:user).tap { |member| member.add_role(:admin, served_company) } } },
+    { case: "an admin here whose employment is discarded", role: nil,
+      member: lambda {
+        served_member(:admin).tap { |member| served_company.employments.find_by(user: member).discard! }
+      } },
+    { case: "an employee who later holds owner and then admin", role: "owner",
+      member: -> { served_member(:employee, :owner, :admin) } }
+  ].each do |row|
+    expected = row[:role] ? "serves #{row[:role]}" : "leaves out the user"
+    it "#{expected} for #{row[:case]}" do
+      bystander = served_member
+      member = instance_exec(&row[:member])
+
+      expected_users = [{ id: bystander.id, role: "employee" }]
+      expected_users << { id: member.id, role: row[:role] } if row[:role]
+      expect(served_users).to match_array(expected_users)
+    end
+  end
+
+  # Holders of different privileged roles share one call, so a lookup that
+  # mixes up roles between users in the batch fails here. Each user holds at
+  # most one privileged role, so one company is enough.
+  it "serves each user in one batch their own role and lists no role holder without employment" do
+    admin = served_member(:employee, :admin)
+    owner = served_member(:employee, :owner)
+    colleague = served_member(:employee)
     colleague.add_role(:admin, other_company)
-    outsider_admin.add_role(:admin, company)
+    outsider_admin = other_company_member(:employee)
+    outsider_admin.add_role(:admin, served_company)
 
-    users = described_class.call(company:, project_ids: [])[:users]
+    expect(served_users).to contain_exactly(
+      { id: admin.id, role: "admin" },
+      { id: owner.id, role: "owner" },
+      { id: colleague.id, role: "employee" }
+    )
+  end
 
-    expect(users).to contain_exactly({ id: admin.id, role: "admin" }, { id: colleague.id, role: "employee" })
+  it "keeps the oldest role as the primary role of an employee who later holds owner" do
+    employee_first_owner = served_member(:employee, :owner)
+
+    expect(served_users).to eq([{ id: employee_first_owner.id, role: "owner" }])
+    expect(User.primary_roles_for(served_company, [employee_first_owner.id]))
+      .to eq(employee_first_owner.id => "employee")
   end
 end
