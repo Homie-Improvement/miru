@@ -180,25 +180,6 @@ RSpec.describe Timekeeping::Handoff::TimekeepingStore do
   end
 end
 
-RSpec.describe Timekeeping::Handoff::TimekeepingStore do
-  # "one table-driven failures block (blank token/URL, 401/409/503, timeout, ECONNREFUSED, malformed body)"
-  # The old files checked a blank token only for export_checkpoint and highest_outbox_position.
-  it "refuses fence and admit with a blank token without sending a request" do
-    stub_request(:any, /timekeeping-handoff\.test/)
-
-    [
-      described_class.new(base_url: "http://timekeeping-handoff.test", token: ""),
-      described_class.new(base_url: "http://timekeeping-handoff.test", token: nil),
-      described_class.new(base_url: "", token: "service-token")
-    ].each do |store|
-      expect { store.fence_admission }.to raise_error(Timekeeping::Handoff::Store::Error)
-      expect { store.admit(generation: 2) }.to raise_error(Timekeeping::Handoff::Store::Error)
-    end
-
-    expect(a_request(:any, /timekeeping-handoff\.test/)).not_to have_been_made
-  end
-end
-
 RSpec.describe Timekeeping::Handoff::TimekeepingStore, "per method" do
   base_url = "http://timekeeping-handoff.test"
   empty_checkpoint = lambda do
