@@ -3,44 +3,10 @@
 require "rails_helper"
 
 RSpec.describe "Timekeeping entry-snapshot request specs" do
-  # "Keep one example each for the company mismatch, the foreign project and a malformed body, plus the tenancy, idempotency and handoff examples."
-  it "keeps one company-mismatch refusal for the entry-snapshot endpoint, carrying the no-leak and no-row-in-company-B checks" do
-    directory = Rails.root.join("spec/requests/internal/v1/timekeeping")
-    mismatch_files = Dir[directory.join("*_spec.rb")].select do |path|
-      File.read(path).include?("company_b.timesheet_entries.where(id: stored.id)")
-    end
-    expect(mismatch_files.map { |path| File.basename(path) }).to eq(["entry_snapshots_spec.rb"])
-
-    folded = File.read(directory.join("entry_snapshots_spec.rb"))
-    expect(folded.scan("company_b.timesheet_entries.where(id: stored.id)").size).to eq(1)
-    expect(folded).to include("\"company_id\\\":")
-  end
-
-  # "Keep one example each for the company mismatch, the foreign project and a malformed body, plus the tenancy, idempotency and handoff examples."
-  it "keeps the foreign-project, malformed-body, idempotency and handoff examples in entry_snapshots_spec.rb" do
-    folded = File.read(Rails.root.join("spec/requests/internal/v1/timekeeping/entry_snapshots_spec.rb"))
-
-    expect(folded).to include("refuses a batch whose snapshot names another company's project and writes nothing from it")
-    expect(folded).to include("company_b.timesheet_entries.where(note: \"private note of A\")")
-    expect(folded).to include("refuses an entry carrying a column outside the contract or an unknown bill_status and stores nothing")
-    expect(folded).to include("idempotency_key_reused")
-    expect(folded).to include("final_outbox_position: 10")
-    expect(folded.scan("final_outbox_position: 10").size).to eq(1)
-  end
-
-  # "Leave upsert, replay and handoff semantics to the consumer spec and the shared contract examples in monolith_projection_spec."
-  it "leaves version-upsert semantics to the shared contract examples rather than the request specs" do
-    request_specs = Dir[Rails.root.join("spec/requests/internal/v1/timekeeping/*_spec.rb")].map { |path| File.read(path) }
-    expect(request_specs.join).not_to include("applies v2, ignores a later v1 and a repeated v2")
-
-    contract_examples = File.read(Rails.root.join("spec/contracts/timekeeping/entry_snapshot_examples.rb"))
-    expect(contract_examples).to include("upserts by version: v2, then v1, then v2 again leaves v2")
-    monolith = File.read(Rails.root.join("spec/contracts/timekeeping/monolith_projection_spec.rb"))
-    expect(monolith).to include("it_behaves_like \"timekeeping entry snapshot endpoint\"")
-  end
-
   # "Fold entry_snapshots_{2,3,4,5}\_spec.rb into entry_snapshots_spec.rb." A second file would bring back a
   # second copy of the refusal assertions, and "the looser copies would not notice a regression to 403".
+  # entry_snapshots_spec.rb itself holds the one credential table and the one company-mismatch, foreign-project,
+  # malformed-body, idempotency and handoff-window examples; version upsert stays with the shared contract examples.
   it "keeps the endpoint's request specs in one file with no 401-or-403 assertion" do
     spec_dir = Rails.root.join("spec/requests/internal/v1/timekeeping")
     expect(Dir.glob(spec_dir.join("entry_snapshots*_spec.rb")).map { |path| File.basename(path) }).to eq(["entry_snapshots_spec.rb"])
