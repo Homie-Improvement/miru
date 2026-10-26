@@ -78,10 +78,10 @@ class TimekeepingOwnership < ApplicationRecord
   private_class_method :begun?
 
   # True once the generation has been raised or any other column leaves its
-  # initial value. The flip clears
-  # handoff_step, and an aborted handoff leaves the legacy store at a raised
-  # generation, so handoff_step alone cannot tell. An owner or store value
-  # other than the initial one counts as begun, known or not.
+  # initial value. The flip clears handoff_step, and an aborted handoff leaves
+  # the legacy store at a raised generation, so handoff_step alone cannot
+  # tell. An owner or store value other than the initial one counts as begun,
+  # known or not.
   def handoff_begun?
     generation > INITIAL_GENERATION ||
       !handoff_step.nil? ||

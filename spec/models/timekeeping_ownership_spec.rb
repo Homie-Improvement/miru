@@ -275,8 +275,6 @@ RSpec.describe TimekeepingOwnership, type: :model do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe TimekeepingOwnership, type: :model do
   # "Seed and demo builders are refused before their first write once a handoff has begun, including after a flip and after a rollback"
   # "`handoff_step` alone is not enough, because the flip clears it."

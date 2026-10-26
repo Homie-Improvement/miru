@@ -70,8 +70,6 @@ RSpec.describe Analytics::DemoSeeder do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Analytics::DemoSeeder do
   it "refuses demo seeding for every company once the global handoff has begun" do
     first_company = create(:company, base_currency: "USD", standard_price: 120)
