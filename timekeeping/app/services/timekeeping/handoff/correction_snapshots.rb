@@ -33,8 +33,12 @@ module Timekeeping
         snapshots.size
       end
 
-      # Two snapshots for one entry would both be inserted, and the projection
-      # would apply only the first, so they are refused instead of picking one.
+      # Every value is checked before anything is written: the projection
+      # refuses a whole batch for one value it cannot store, and the relay
+      # delivers in outbox order, so one such snapshot would hold back every
+      # later one. Two snapshots for one entry would both be inserted, and the
+      # projection would apply only the first, so they are refused instead of
+      # picking one.
       def check_shape!(snapshots, version:, generation:)
         raise Checkpoint::ShapeError, "version must be a positive Integer" unless positive_integer?(version)
         raise Checkpoint::ShapeError, "generation must be a positive Integer" unless positive_integer?(generation)
@@ -45,9 +49,9 @@ module Timekeeping
           missing = SNAPSHOT_FIELDS - snapshot.keys
           raise Checkpoint::ShapeError, "correction snapshot: unknown fields: #{unknown.join(', ')}" if unknown.any?
           raise Checkpoint::ShapeError, "correction snapshot: missing fields: #{missing.join(', ')}" if missing.any?
-          unless positive_integer?(snapshot["company_id"]) && positive_integer?(snapshot["id"])
-            raise Checkpoint::ShapeError, "correction snapshot: company_id and id must be positive Integers"
-          end
+
+          invalid = SnapshotValues.invalid_fields(snapshot)
+          raise Checkpoint::ShapeError, "correction snapshot: invalid #{invalid.join(', ')}" if invalid.any?
         end
 
         duplicates = snapshots.map { |snapshot| snapshot.values_at("company_id", "id") }.tally.select { |_, count| count > 1 }
