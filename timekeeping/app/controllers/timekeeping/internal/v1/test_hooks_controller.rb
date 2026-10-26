@@ -10,11 +10,11 @@ class Timekeeping::Internal::V1::TestHooksController < ApplicationController
 
   def pause
     Timekeeping::TestHooks.pause_relay!
-    head :no_content
+    head 204
   end
 
   def resume
     Timekeeping::TestHooks.resume_relay!
-    head :no_content
+    head 204
   end
 end
