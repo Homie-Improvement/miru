@@ -133,15 +133,16 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
                        intents: [recon_checks_intent(101), recon_checks_intent(202)],
                        source_intents: [recon_checks_intent(101), recon_checks_intent(202)],
                        next_entry_id: 2, money_before: recon_checks_snapshots, money_after: recon_checks_snapshots,
-                       checkpoint: nil, **options)
+                       source: nil, checkpoint: nil, **options)
     source_tables = recon_checks_canonical(source_tables)
     checkpoint_tables = recon_checks_canonical(checkpoint_tables)
     projection ||= recon_checks_projection(checkpoint_tables["entries"])
-    # A prebuilt checkpoint lets a test hand over rows Checkpoint.build would refuse.
+    # A prebuilt checkpoint lets a test hand over rows Checkpoint.build would refuse,
+    # or keep hold of the exact objects run receives.
+    source ||= Timekeeping::Handoff::Checkpoint.build(tables: source_tables)
     checkpoint ||= Timekeeping::Handoff::Checkpoint.build(tables: checkpoint_tables)
     described_class.run(
-      source: Timekeeping::Handoff::Checkpoint.build(tables: source_tables),
-      checkpoint:,
+      source:, checkpoint:,
       projection:, source_intents:, intents:, next_entry_id:, money_before:, money_after:, **options
     )
   end
@@ -682,16 +683,18 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
     source_tables = recon_checks_tables(entries: [recon_checks_entry(101, note: "original", source_metadata: nested)])
     checkpoint_tables = recon_checks_tables(entries: [recon_checks_entry(101, note: "changed", source_metadata: nested)])
     projection = recon_checks_projection(source_tables["entries"])
-    inputs_before = Marshal.load(Marshal.dump([source_tables, checkpoint_tables, projection]))
+    source = Timekeeping::Handoff::Checkpoint.build(tables: source_tables)
+    checkpoint = Timekeeping::Handoff::Checkpoint.build(tables: checkpoint_tables)
+    inputs_before = Marshal.load(Marshal.dump([source.rows, checkpoint.rows, projection]))
 
     result = nil
     writes = recon_checks_writes_during do
-      result = recon_checks_run(source_tables:, checkpoint_tables:, projection:)
+      result = recon_checks_run(source:, checkpoint:, projection:)
     end
 
     expect(result.companies.fetch(101)).to be_abort
     expect(writes).to eq([])
-    expect([source_tables, checkpoint_tables, projection]).to eq(inputs_before)
+    expect([source.rows, checkpoint.rows, projection]).to eq(inputs_before)
   end
 
   # A second run stands in for a resumed handoff: if the first run repaired the row in place, the second would pass.
