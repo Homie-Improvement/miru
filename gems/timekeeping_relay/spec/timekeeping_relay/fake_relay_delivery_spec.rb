@@ -40,6 +40,7 @@ RSpec.describe TimekeepingRelay::Relay, "delivery to the fake projection" do
     expect(endpoint.posts[1][:key]).to eq(endpoint.posts[0][:key])
     expect(endpoint.posts[1][:batch]).to eq(endpoint.posts[0][:batch])
     expect(endpoint.posts[1][:answer].status).to eq(200)
+    expect(endpoint.posts[1][:answer].body).to eq(endpoint.posts[0][:answer].body)
     expect(projection.projected_entry(77)).to eq(projected)
     expect(source.sent_positions).to eq([3])
   end
