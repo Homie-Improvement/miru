@@ -62,5 +62,5 @@ PR #86, head commit `5b757b144b064084341ef0a7543debbe92f7abbd`:
 
 - `app/controllers/api/v1/invoices/bulk_deletion_controller.rb` wraps the batch in `Timekeeping::BillingFence.transaction` and adds `destroy_in_savepoint`. Its comment says the invoice destroys line items and taxes before payments refuse, and that inside the shared transaction Rails does not roll those deletions back by itself.
 - `spec/requests/api/v1/invoices/bulk_deletion_spec.rb` adds a mixed-batch example with no handoff. It expects 422 naming only the paid invoice, and it expects the paid invoice's line-item count, tax count, `amount`, `tax` and `outstanding_amount` to equal the baseline.
-- `spec/requests/api/v1/invoices/bulk_deletion_fence_spec.rb` repeats the check with an invoice tax row.
+- That PR also added a duplicate of this check in `bulk_deletion_fence_spec.rb`. The duplicate has since been folded into `spec/requests/api/v1/invoices/bulk_deletion_spec.rb`, whose mixed-batch baseline now also compares `discount`.
 - The plan review raised this as a blocker before the savepoint existed.
