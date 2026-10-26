@@ -1,0 +1,40 @@
+# The Timekeeping service's queue processes (docs/architecture/timekeeping-soa.md
+# section 11.1). Only the relay worker is started, never a default worker, so
+# the timekeeping_relay queue is worked by one thread in one process, as the
+# monolith's billing_sync worker is. That keeps snapshot batches leaving in
+# outbox_position order. RelayJob also holds a database lock while it runs, so a
+# second run started any other way returns at once rather than racing this one.
+default: &default
+  dispatchers:
+    - polling_interval: 1
+      batch_size: 500
+      recurring_tasks:
+        timekeeping_relay:
+          class: RelayJob
+          # Well inside the 5-minute outbox lag alert of section 11.3.
+          schedule: every 10 seconds
+  workers:
+    - queues: timekeeping_relay
+      threads: 1
+      processes: 1
+      polling_interval: 0.5
+
+development:
+  <<: *default
+
+test:
+  <<: *default
+
+production:
+  dispatchers:
+    - polling_interval: <%= ENV.fetch("SOLID_QUEUE_DISPATCHER_POLLING_INTERVAL", "1").to_i %>
+      batch_size: <%= ENV.fetch("SOLID_QUEUE_DISPATCHER_BATCH_SIZE", "100").to_i %>
+      recurring_tasks:
+        timekeeping_relay:
+          class: RelayJob
+          schedule: every 10 seconds
+  workers:
+    - queues: timekeeping_relay
+      threads: 1
+      processes: 1
+      polling_interval: <%= ENV.fetch("SOLID_QUEUE_WORKER_POLLING_INTERVAL", "0.5").to_f %>

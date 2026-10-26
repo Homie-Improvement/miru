@@ -22,5 +22,11 @@ Rails.application.routes.draw do
       post "admission/fence", to: "admissions#fence"
       post "admission/admit", to: "admissions#admit"
     end
+
+    # Drawn only when the test hooks are loaded, so elsewhere these paths 404.
+    if defined?(Timekeeping::TestHooks)
+      post "test-hooks/relay/pause", to: "test_hooks#pause"
+      post "test-hooks/relay/resume", to: "test_hooks#resume"
+    end
   end
 end
