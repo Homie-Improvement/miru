@@ -6,8 +6,8 @@ require "openssl"
 
 module Timekeeping
   # Reads the facts an entry write is decided on (edit_days, the company's
-  # users and agents, and the requested projects) from the monolith's reference endpoint,
-  # whose shape is contracts/timekeeping/reference.yml. Every call makes a
+  # users and agents, and the requested projects) from the monolith's
+  # reference endpoint, whose shape is contracts/timekeeping/reference.yml. Every call makes a
   # fresh request: there is no cache, so a write never acts on an older copy.
   # Any failure to read the facts raises Unavailable, so callers refuse the
   # write rather than guess.

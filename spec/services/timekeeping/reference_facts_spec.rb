@@ -138,8 +138,6 @@ RSpec.describe Timekeeping::ReferenceFacts, "agents" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::ReferenceFacts do
   # The issue asks for "the reference endpoint ... to return the company's agents with their users".
   # The agent of the same user in another company must never appear: another company's facts stay out.
@@ -179,8 +177,6 @@ RSpec.describe Timekeeping::ReferenceFacts do
     expect(described_class.call(company: create(:company), project_ids: [])[:agents]).to eq([])
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::ReferenceFacts do
   # The issue asks "the reference endpoint (contracts/timekeeping/reference.yml and the monolith's

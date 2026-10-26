@@ -250,8 +250,6 @@ RSpec.describe "Internal::V1::Companies::References agents", type: :request do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Internal::V1::Companies::References agents", type: :request do
   # The issue asks for "the reference endpoint (contracts/timekeeping/reference.yml and the monolith's
   # reference controller) to return the company's agents with their users".

@@ -172,9 +172,6 @@ RSpec.describe Timekeeping::EntryWriter, "agent ownership" do
   end
 end
 
-require "rails_helper"
-require "webmock/rspec"
-
 RSpec.describe Timekeeping::EntryWriter, "agent ownership on an update that changes only user_id" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
@@ -203,9 +200,6 @@ RSpec.describe Timekeeping::EntryWriter, "agent ownership on an update that chan
     expect(OutboxSnapshot.where(id: entry_id).count).to eq(0)
   end
 end
-
-require "rails_helper"
-require "webmock/rspec"
 
 RSpec.describe Timekeeping::EntryWriter, "agent ownership on a create with an unknown or foreign agent" do
   include_context "timekeeping entry writes"
@@ -236,9 +230,6 @@ RSpec.describe Timekeeping::EntryWriter, "agent ownership on a create with an un
     expect(entry_write_counts).to eq(before)
   end
 end
-
-require "rails_helper"
-require "webmock/rspec"
 
 RSpec.describe Timekeeping::EntryWriter, "agent ownership on a retried create" do
   include_context "timekeeping entry writes"
@@ -276,9 +267,6 @@ RSpec.describe Timekeeping::EntryWriter, "agent ownership on a retried create" d
   end
 end
 
-require "rails_helper"
-require "webmock/rspec"
-
 RSpec.describe Timekeeping::EntryWriter, "agent ownership on a create with the user's own agent" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
@@ -300,9 +288,6 @@ RSpec.describe Timekeeping::EntryWriter, "agent ownership on a create with the u
     expect(OutboxSnapshot.sole.attributes).to include("id" => entry.id, "agent_id" => own_agent, "user_id" => own_owner)
   end
 end
-
-require "rails_helper"
-require "webmock/rspec"
 
 RSpec.describe Timekeeping::EntryWriter do
   include_context "timekeeping entry writes"
@@ -426,9 +411,6 @@ RSpec.describe Timekeeping::EntryWriter do
   end
 end
 
-require "rails_helper"
-require "webmock/rspec"
-
 RSpec.describe Timekeeping::EntryWriter, "agent check on a retried create" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
@@ -463,9 +445,6 @@ RSpec.describe Timekeeping::EntryWriter, "agent check on a retried create" do
     expect(OutboxSnapshot.count).to eq(1)
   end
 end
-
-require "rails_helper"
-require "webmock/rspec"
 
 RSpec.describe Timekeeping::EntryWriter, "agent of another company on create" do
   include_context "timekeeping entry writes"

@@ -3,8 +3,9 @@
 module Timekeeping
   # Reads the facts the Timekeeping service decides writes on: the company's
   # edit window, its users' roles, billable and membership facts for the
-  # requested projects, and its agents with their users. Every query starts from the company, so a project or
-  # user of another company can never appear. A requested project the company
+  # requested projects, and its agents with their users. Every query starts
+  # from the company, so a project, user or agent of another company can never
+  # appear. A requested project the company
   # does not own is reported in missing_project_ids exactly like an id that
   # does not exist, so the result never reveals another company's records.
   class ReferenceFacts

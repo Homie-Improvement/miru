@@ -256,9 +256,6 @@ RSpec.describe Timekeeping::ReferenceClient do
   end
 end
 
-require "rails_helper"
-require "webmock/rspec"
-
 RSpec.describe Timekeeping::ReferenceClient, "a response without agents" do
   # A response with no agents list must refuse the write (503 reference_unavailable), never let it commit
   # with the agent ownership check skipped.
@@ -272,9 +269,6 @@ RSpec.describe Timekeeping::ReferenceClient, "a response without agents" do
     expect { client.fetch(company_id: 5, project_ids: []) }.to raise_error(described_class::Unavailable)
   end
 end
-
-require "rails_helper"
-require "webmock/rspec"
 
 RSpec.describe Timekeeping::ReferenceClient, "a malformed agents list" do
   # A malformed agent must not be read as "no agent" or matched loosely: the write is refused instead.

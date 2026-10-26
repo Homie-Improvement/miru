@@ -483,9 +483,6 @@ RSpec.describe "Entry write routes", "agent ownership on update" do
   end
 end
 
-require "rails_helper"
-require "webmock/rspec"
-
 RSpec.describe "Entry write routes" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
@@ -512,9 +509,6 @@ RSpec.describe "Entry write routes" do
   end
 end
 
-require "rails_helper"
-require "webmock/rspec"
-
 RSpec.describe "Entry write routes" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
@@ -540,9 +534,6 @@ RSpec.describe "Entry write routes" do
     expect(Entry.find(entry_id).agent_id).to be_nil
   end
 end
-
-require "rails_helper"
-require "webmock/rspec"
 
 RSpec.describe "Entry write routes" do
   include_context "timekeeping entry writes"
@@ -572,9 +563,6 @@ RSpec.describe "Entry write routes" do
     expect(entry_write_counts).to eq(before)
   end
 end
-
-require "rails_helper"
-require "webmock/rspec"
 
 RSpec.describe "Entry write routes with a foreign agent on create" do
   include_context "timekeeping entry writes"
@@ -610,9 +598,6 @@ RSpec.describe "Entry write routes with a foreign agent on create" do
     expect(entry_write_counts).to eq(before)
   end
 end
-
-require "rails_helper"
-require "webmock/rspec"
 
 RSpec.describe "Entry write routes with a foreign agent on update" do
   include_context "timekeeping entry writes"
@@ -815,9 +800,6 @@ RSpec.describe "Entry write routes" do
   end
 end
 
-require "rails_helper"
-require "webmock/rspec"
-
 RSpec.describe "Entry write routes with an agent owned by the acting user" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
@@ -851,9 +833,6 @@ RSpec.describe "Entry write routes with an agent owned by the acting user" do
     expect(response.parsed_body.values_at("user_id", "agent_id")).to eq([employee, employee_agent])
   end
 end
-
-require "rails_helper"
-require "webmock/rspec"
 
 RSpec.describe "Entry write routes updating only agent_id" do
   include_context "timekeeping entry writes"

@@ -154,8 +154,6 @@ RSpec.describe Timekeeping::EntryDecision do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::EntryDecision do
   # The issue: the entry API "still commits any positive agent_id without checking that the agent
   # exists and belongs to the entry's company and user (design rule S7)". An agent that exists in
