@@ -26,12 +26,14 @@ module Timekeeping
     # Returns the entry Hashes of the list route's "entries" answer.
     # The token speaks for the acting user, whose employment the token
     # requires, while user_id only filters the list: the user being read may
-    # have left the company.
+    # have left the company. It is a read token, so it carries any owner or
+    # admin role the acting user holds in the company, the same roles that let
+    # the index controllers read a colleague; Timekeeping refuses it for writes.
     def list_entries(company_id:, user_id:, from:, to:, acting_user_id: user_id)
       raise Error, "#{BASE_URL_ENV} is not set" if @base_url.blank?
 
       company = Company.find(company_id)
-      token = UserToken.mint(user: company.users.find(acting_user_id), company:)
+      token = UserToken.mint(user: company.users.find(acting_user_id), company:, purpose: :read)
       response = get(list_uri(company_id:, user_id:, from:, to:), token)
       raise Error, "Timekeeping entry list answered #{response.code}" unless response.is_a?(Net::HTTPOK)
 
