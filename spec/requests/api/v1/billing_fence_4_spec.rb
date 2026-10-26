@@ -66,13 +66,10 @@ RSpec.describe "Billing fence on invoice update", type: :request do
     # Amounts are passed explicitly because the invoice_tax factory otherwise derives them from the line items.
     gst_row = create(:invoice_tax, invoice:, tax_configuration: gst, name: "GST", calculation_method: "percentage", value: 10, amount: 10)
     service_row = create(:invoice_tax, invoice:, tax_configuration: service, name: "Service", calculation_method: "percentage", value: 5, amount: 5)
-    # The invoice's scalar tax is a derived total, so only the stored rows show whether a tax row was written.
-    tax_fields = ["id"] + Timekeeping::FinancialSnapshot::INVOICE_TAX_FIELDS.map(&:to_s)
-    stored_tax_rows = -> { InvoiceTax.where(invoice_id: invoice.id).order(:id).map { |row| row.attributes.slice(*tax_fields) } }
     invoice.reload
     money_before = [invoice.amount, invoice.tax, invoice.discount, invoice.outstanding_amount, line_item.reload.rate, line_item.quantity]
     expect(money_before[4]).to eq(100)
-    tax_rows_before = stored_tax_rows.call
+    tax_rows_before = stored_invoice_tax_rows(invoice.id)
     expect(tax_rows_before.map { |row| [row["id"], row["name"], row["value"].to_f, row["amount"].to_f] }).to eq(
       [[gst_row.id, "GST", 10.0, 10.0], [service_row.id, "Service", 5.0, 5.0]]
     )
@@ -107,6 +104,6 @@ RSpec.describe "Billing fence on invoice update", type: :request do
     expect([invoice.amount, invoice.tax, invoice.discount, invoice.outstanding_amount, line_item.reload.rate, line_item.quantity]).to eq(money_before)
     expect(invoice.invoice_line_items.count).to eq(1)
     expect(invoice.invoice_taxes.count).to eq(2)
-    expect(stored_tax_rows.call).to eq(tax_rows_before)
+    expect(stored_invoice_tax_rows(invoice.id)).to eq(tax_rows_before)
   end
 end

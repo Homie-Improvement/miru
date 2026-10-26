@@ -69,10 +69,14 @@ RSpec.describe "Billing fence on invoice update", type: :request do
     sign_in user
   end
 
-  # The invoice's scalar tax is a derived total, so only the stored rows show whether a tax row was written.
-  def stored_tax_rows
-    tax_fields = ["id"] + Timekeeping::FinancialSnapshot::INVOICE_TAX_FIELDS.map(&:to_s)
-    InvoiceTax.where(invoice_id: invoice.id).order(:id).map { |row| row.attributes.slice(*tax_fields) }
+  # Reads the seeded tax rows once and checks they hold the seeded values, so a failed seed or a broken
+  # read fails here instead of comparing nothing with nothing after the refusal.
+  def seeded_tax_baseline
+    rows = stored_invoice_tax_rows(invoice.id)
+    expect(rows.map { |row| [row["id"], row["name"], row["value"].to_f, row["amount"].to_f] }).to eq(
+      [[gst_row.id, "GST", 10.0, 10.0], [service_row.id, "Service", 5.0, 5.0]]
+    )
+    rows
   end
 
   # "Every invoice, line-item, invoice-tax and payment write, mobile-collection payments included,
@@ -82,10 +86,7 @@ RSpec.describe "Billing fence on invoice update", type: :request do
     money_before = invoice.attributes.slice("amount", "tax", "discount", "outstanding_amount")
     line_before = line_item.reload.attributes.slice("rate", "quantity")
     expect(line_before).to eq("rate" => 100, "quantity" => 60)
-    tax_rows_before = stored_tax_rows
-    expect(tax_rows_before.map { |row| [row["id"], row["name"], row["value"].to_f, row["amount"].to_f] }).to eq(
-      [[gst_row.id, "GST", 10.0, 10.0], [service_row.id, "Service", 5.0, 5.0]]
-    )
+    tax_rows_before = seeded_tax_baseline
 
     TimekeepingOwnership.current.update!(handoff_step: "settle")
 
@@ -117,7 +118,105 @@ RSpec.describe "Billing fence on invoice update", type: :request do
     expect(response.parsed_body["reason"]).to eq("ownership_moving")
     expect(invoice.reload.attributes.slice("amount", "tax", "discount", "outstanding_amount")).to eq(money_before)
     expect(line_item.reload.attributes.slice("rate", "quantity")).to eq(line_before)
-    expect(stored_tax_rows).to eq(tax_rows_before)
+    expect(stored_invoice_tax_rows(invoice.id)).to eq(tax_rows_before)
+  end
+
+  # "Seed and assert a nonempty tax baseline, attempt nested tax changes during handoff, and compare the stored rows after refusal."
+  # The 503 is retryable, so a client resends the same request; neither attempt may write a tax row.
+  it "refuses a retried invoice update with nested tax update, add and destroy twice and leaves the seeded tax rows unchanged after both refusals" do
+    baseline = seeded_tax_baseline
+
+    TimekeepingOwnership.current.update!(handoff_step: "settle")
+    params = {
+      invoice: {
+        client_id: client.id,
+        invoice_number: "FENCE-U-001",
+        issue_date: invoice.issue_date.iso8601,
+        due_date: invoice.due_date.iso8601,
+        status: "draft",
+        currency: company.base_currency,
+        # Indexed keys keep the id-less new row apart from the destroy row, as in the update example above.
+        invoice_taxes_attributes: {
+          "0" => { id: gst_row.id, tax_configuration_id: gst.id, name: "GST", calculation_method: "percentage", value: 18, amount: 99 },
+          "1" => { tax_configuration_id: gst.id, name: "Added", calculation_method: "percentage", value: 3, amount: 3 },
+          "2" => { id: service_row.id, _destroy: "1" }
+        },
+        invoice_line_items_attributes: [
+          { id: line_item.id, name: "Keep", description: "Keep", date: line_item.date.iso8601, rate: 250, quantity: 90 }
+        ]
+      }
+    }
+
+    2.times do
+      send_request :patch, api_v1_invoice_path(invoice), params:, headers: auth_headers(user)
+      expect(response).to have_http_status(:service_unavailable)
+      expect(response.parsed_body["reason"]).to eq("ownership_moving")
+    end
+
+    expect(stored_invoice_tax_rows(invoice.id)).to eq(baseline)
+  end
+
+  # "Seed and assert a nonempty tax baseline, attempt nested tax changes during handoff, and compare the stored rows after refusal."
+  # A payload that only destroys rows sends no invoice scalar change, so only the stored rows can show a write.
+  it "refuses an invoice update during a handoff that destroys every seeded tax row and keeps all of them stored" do
+    baseline = seeded_tax_baseline
+
+    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(handoff_step: "close_admission")
+
+    expect do
+      send_request :patch, api_v1_invoice_path(invoice), params: {
+        invoice: {
+          client_id: client.id,
+          invoice_number: "FENCE-U-001",
+          issue_date: invoice.issue_date.iso8601,
+          due_date: invoice.due_date.iso8601,
+          status: "draft",
+          currency: company.base_currency,
+          invoice_taxes_attributes: [
+            { id: gst_row.id, _destroy: "1" },
+            { id: service_row.id, _destroy: "1" }
+          ]
+        }
+      }, headers: auth_headers(user)
+    end.to not_change(InvoiceTax, :count)
+
+    expect(response).to have_http_status(:service_unavailable)
+    expect(response.parsed_body["reason"]).to eq("ownership_moving")
+    expect(stored_invoice_tax_rows(invoice.id)).to eq(baseline)
+  end
+
+  # "Seed and assert a nonempty tax baseline, attempt nested tax changes during handoff, and compare the stored rows after refusal."
+  # A wrong tax row id must still meet the ownership_moving refusal, not a lookup error, and must touch no row.
+  it "refuses an invoice update during a handoff that names another invoice's tax row id and leaves both invoices' tax rows unchanged" do
+    other_invoice = create(:invoice, company:, client:, invoice_number: "FENCE-TAX-OTHER", status: :draft)
+    create(:invoice_line_item, invoice: other_invoice, timesheet_entry: nil, name: "Other", description: "Other", rate: 100, quantity: 60)
+    other_row = create(:invoice_tax, invoice: other_invoice, tax_configuration: gst, name: "GST", calculation_method: "percentage", value: 10, amount: 10)
+    seeded_tax_baseline
+    baseline = stored_invoice_tax_rows(invoice.id, other_invoice.id)
+    expect(baseline.map { |row| [row["id"], row["invoice_id"], row["amount"].to_f] }).to eq(
+      [[gst_row.id, invoice.id, 10.0], [service_row.id, invoice.id, 5.0], [other_row.id, other_invoice.id, 10.0]]
+    )
+
+    TimekeepingOwnership.current.update!(handoff_step: "freeze")
+
+    send_request :patch, api_v1_invoice_path(invoice), params: {
+      invoice: {
+        client_id: client.id,
+        invoice_number: "FENCE-U-001",
+        issue_date: invoice.issue_date.iso8601,
+        due_date: invoice.due_date.iso8601,
+        status: "draft",
+        currency: company.base_currency,
+        invoice_taxes_attributes: [
+          { id: other_row.id, tax_configuration_id: gst.id, name: "GST", calculation_method: "percentage", value: 18, amount: 99 },
+          { id: gst_row.id, tax_configuration_id: gst.id, name: "GST", calculation_method: "percentage", value: 18, amount: 99 }
+        ]
+      }
+    }, headers: auth_headers(user)
+
+    expect(response).to have_http_status(:service_unavailable)
+    expect(response.parsed_body["reason"]).to eq("ownership_moving")
+    expect(stored_invoice_tax_rows(invoice.id, other_invoice.id)).to eq(baseline)
   end
 end
 
@@ -189,159 +288,5 @@ RSpec.describe "Billing fence on Razorpay payment links", type: :request do
     expect(response.parsed_body["reason"]).to eq("ownership_moving")
     expect(razorpay_client).not_to have_received(:create_payment_link)
     expect(invoice.reload.payment_infos).to eq(infos_before)
-  end
-end
-
-RSpec.describe "Billing fence on retried invoice update with nested taxes", type: :request do
-  # "Seed and assert a nonempty tax baseline, attempt nested tax changes during handoff, and compare the stored rows after refusal."
-  # The 503 is retryable, so a client resends the same request; neither attempt may write a tax row.
-  it "refuses a retried invoice update with nested tax update, add and destroy twice and leaves the seeded tax rows unchanged after both refusals" do
-    company = create(:company, base_currency: "USD")
-    client = create(:client, company:)
-    user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    sign_in user
-    invoice = create(:invoice, company:, client:, invoice_number: "FENCE-TAX-RETRY", status: :draft)
-    line_item = create(:invoice_line_item, invoice:, timesheet_entry: nil, name: "Keep", description: "Keep", rate: 100, quantity: 60)
-    gst = create(:tax_configuration, company:, name: "GST", calculation_method: "percentage", value: 10)
-    service = create(:tax_configuration, company:, name: "Service", calculation_method: "percentage", value: 5)
-    gst_row = create(:invoice_tax, invoice:, tax_configuration: gst, name: "GST", calculation_method: "percentage", value: 10, amount: 10)
-    service_row = create(:invoice_tax, invoice:, tax_configuration: service, name: "Service", calculation_method: "percentage", value: 5, amount: 5)
-
-    tax_fields = ["id"] + Timekeeping::FinancialSnapshot::INVOICE_TAX_FIELDS.map(&:to_s)
-    read_tax_rows = -> { InvoiceTax.where(invoice_id: invoice.id).order(:id).map { |row| row.attributes.slice(*tax_fields) } }
-    baseline = read_tax_rows.call
-    expect(baseline.map { |row| [row["id"], row["name"], row["value"].to_f, row["amount"].to_f] }).to eq(
-      [[gst_row.id, "GST", 10.0, 10.0], [service_row.id, "Service", 5.0, 5.0]]
-    )
-
-    TimekeepingOwnership.current.update!(handoff_step: "settle")
-    params = {
-      invoice: {
-        client_id: client.id,
-        invoice_number: "FENCE-TAX-RETRY",
-        issue_date: invoice.issue_date.iso8601,
-        due_date: invoice.due_date.iso8601,
-        status: "draft",
-        currency: company.base_currency,
-        # Indexed keys keep the id-less new row apart from the destroy row, as in the update example above.
-        invoice_taxes_attributes: {
-          "0" => { id: gst_row.id, tax_configuration_id: gst.id, name: "GST", calculation_method: "percentage", value: 18, amount: 99 },
-          "1" => { tax_configuration_id: gst.id, name: "Added", calculation_method: "percentage", value: 3, amount: 3 },
-          "2" => { id: service_row.id, _destroy: "1" }
-        },
-        invoice_line_items_attributes: [
-          { id: line_item.id, name: "Keep", description: "Keep", date: line_item.date.iso8601, rate: 250, quantity: 90 }
-        ]
-      }
-    }
-
-    2.times do
-      send_request :patch, api_v1_invoice_path(invoice), params:, headers: auth_headers(user)
-      expect(response).to have_http_status(:service_unavailable)
-      expect(response.parsed_body["reason"]).to eq("ownership_moving")
-    end
-
-    expect(read_tax_rows.call).to eq(baseline)
-  end
-end
-
-RSpec.describe "Billing fence on invoice update destroying all taxes", type: :request do
-  # "Seed and assert a nonempty tax baseline, attempt nested tax changes during handoff, and compare the stored rows after refusal."
-  # A payload that only destroys rows sends no invoice scalar change, so only the stored rows can show a write.
-  it "refuses an invoice update during a handoff that destroys every seeded tax row and keeps all of them stored" do
-    company = create(:company, base_currency: "USD")
-    client = create(:client, company:)
-    user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    sign_in user
-    invoice = create(:invoice, company:, client:, invoice_number: "FENCE-TAX-DESTROY", status: :draft)
-    create(:invoice_line_item, invoice:, timesheet_entry: nil, name: "Keep", description: "Keep", rate: 100, quantity: 60)
-    gst = create(:tax_configuration, company:, name: "GST", calculation_method: "percentage", value: 10)
-    service = create(:tax_configuration, company:, name: "Service", calculation_method: "percentage", value: 5)
-    gst_row = create(:invoice_tax, invoice:, tax_configuration: gst, name: "GST", calculation_method: "percentage", value: 10, amount: 10)
-    service_row = create(:invoice_tax, invoice:, tax_configuration: service, name: "Service", calculation_method: "percentage", value: 5, amount: 5)
-
-    tax_fields = ["id"] + Timekeeping::FinancialSnapshot::INVOICE_TAX_FIELDS.map(&:to_s)
-    read_tax_rows = -> { InvoiceTax.where(invoice_id: invoice.id).order(:id).map { |row| row.attributes.slice(*tax_fields) } }
-    baseline = read_tax_rows.call
-    expect(baseline.map { |row| [row["id"], row["name"], row["amount"].to_f] }).to eq(
-      [[gst_row.id, "GST", 10.0], [service_row.id, "Service", 5.0]]
-    )
-
-    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(handoff_step: "close_admission")
-
-    expect do
-      send_request :patch, api_v1_invoice_path(invoice), params: {
-        invoice: {
-          client_id: client.id,
-          invoice_number: "FENCE-TAX-DESTROY",
-          issue_date: invoice.issue_date.iso8601,
-          due_date: invoice.due_date.iso8601,
-          status: "draft",
-          currency: company.base_currency,
-          invoice_taxes_attributes: [
-            { id: gst_row.id, _destroy: "1" },
-            { id: service_row.id, _destroy: "1" }
-          ]
-        }
-      }, headers: auth_headers(user)
-    end.to not_change(InvoiceTax, :count)
-
-    expect(response).to have_http_status(:service_unavailable)
-    expect(response.parsed_body["reason"]).to eq("ownership_moving")
-    expect(read_tax_rows.call).to eq(baseline)
-  end
-end
-
-RSpec.describe "Billing fence on invoice update naming a foreign tax row", type: :request do
-  # "Seed and assert a nonempty tax baseline, attempt nested tax changes during handoff, and compare the stored rows after refusal."
-  # A wrong tax row id must still meet the ownership_moving refusal, not a lookup error, and must touch no row.
-  it "refuses an invoice update during a handoff that names another invoice's tax row id and leaves both invoices' tax rows unchanged" do
-    company = create(:company, base_currency: "USD")
-    client = create(:client, company:)
-    user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    sign_in user
-    gst = create(:tax_configuration, company:, name: "GST", calculation_method: "percentage", value: 10)
-    invoice = create(:invoice, company:, client:, invoice_number: "FENCE-TAX-OWN", status: :draft)
-    other_invoice = create(:invoice, company:, client:, invoice_number: "FENCE-TAX-OTHER", status: :draft)
-    create(:invoice_line_item, invoice:, timesheet_entry: nil, name: "Keep", description: "Keep", rate: 100, quantity: 60)
-    create(:invoice_line_item, invoice: other_invoice, timesheet_entry: nil, name: "Other", description: "Other", rate: 100, quantity: 60)
-    own_row = create(:invoice_tax, invoice:, tax_configuration: gst, name: "GST", calculation_method: "percentage", value: 10, amount: 10)
-    other_row = create(:invoice_tax, invoice: other_invoice, tax_configuration: gst, name: "GST", calculation_method: "percentage", value: 10, amount: 10)
-
-    tax_fields = ["id"] + Timekeeping::FinancialSnapshot::INVOICE_TAX_FIELDS.map(&:to_s)
-    read_tax_rows = lambda do
-      InvoiceTax.where(invoice_id: [invoice.id, other_invoice.id]).order(:id).map { |row| row.attributes.slice(*tax_fields) }
-    end
-    baseline = read_tax_rows.call
-    expect(baseline.map { |row| [row["id"], row["invoice_id"], row["amount"].to_f] }).to eq(
-      [[own_row.id, invoice.id, 10.0], [other_row.id, other_invoice.id, 10.0]]
-    )
-
-    TimekeepingOwnership.current.update!(handoff_step: "freeze")
-
-    send_request :patch, api_v1_invoice_path(invoice), params: {
-      invoice: {
-        client_id: client.id,
-        invoice_number: "FENCE-TAX-OWN",
-        issue_date: invoice.issue_date.iso8601,
-        due_date: invoice.due_date.iso8601,
-        status: "draft",
-        currency: company.base_currency,
-        invoice_taxes_attributes: [
-          { id: other_row.id, tax_configuration_id: gst.id, name: "GST", calculation_method: "percentage", value: 18, amount: 99 },
-          { id: own_row.id, tax_configuration_id: gst.id, name: "GST", calculation_method: "percentage", value: 18, amount: 99 }
-        ]
-      }
-    }, headers: auth_headers(user)
-
-    expect(response).to have_http_status(:service_unavailable)
-    expect(response.parsed_body["reason"]).to eq("ownership_moving")
-    expect(read_tax_rows.call).to eq(baseline)
   end
 end
