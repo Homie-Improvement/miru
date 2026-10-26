@@ -73,3 +73,36 @@ RSpec.describe Timekeeping::ProjectionConsumer do
     expect(EntrySnapshotReceipt.where(id: live.id)).to exist
   end
 end
+
+RSpec.describe Timekeeping::SnapshotDeliveryReceipts, "decimal fingerprints" do
+  let(:decimal_receipt_answer) { Timekeeping::ProjectionConsumer::Result.new(status: 200, body: { "applied" => 1, "ignored" => 0 }) }
+
+  def decimal_receipt_body(rate)
+    %({"schema_version":1,"snapshots":[{"entry":{"duration":30.0,"source_metadata":{"rate":#{rate}}}}]})
+  end
+
+  def decimal_receipt(key, batch)
+    described_class.new(key:, batch:, company_ids: [1])
+  end
+
+  it "replays a receipt stored when decimals were read as Floats for the same body read with exact decimals" do
+    key = SecureRandom.uuid
+    body = decimal_receipt_body("1.25")
+    decimal_receipt(key, JSON.parse(body)).store(decimal_receipt_answer)
+
+    replay = decimal_receipt(key, JSON.parse(body, decimal_class: BigDecimal)).stored_answer
+
+    expect(replay&.status).to eq(200)
+  end
+
+  it "tells a JSON number from a JSON string of the same digits, and a fine decimal from its rounded Float" do
+    key = SecureRandom.uuid
+    decimal_receipt(key, JSON.parse(decimal_receipt_body("1.00000000000000000001"), decimal_class: BigDecimal))
+      .store(decimal_receipt_answer)
+
+    as_string = decimal_receipt(key, JSON.parse(decimal_receipt_body('"1.00000000000000000001"'), decimal_class: BigDecimal))
+    rounded = decimal_receipt(key, JSON.parse(decimal_receipt_body("1.0"), decimal_class: BigDecimal))
+
+    expect([as_string.stored_answer.status, rounded.stored_answer.status]).to eq([422, 422])
+  end
+end
