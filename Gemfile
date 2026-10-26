@@ -163,6 +163,9 @@ gem "countries", "~> 6.0"
 # Use google calendar for integration with Miru
 gem "google-api-client", require: "google/apis/calendar_v3"
 
+# The time-entry handoff checkpoint and store, shared with the Timekeeping service
+gem "timekeeping_handoff", path: "gems/timekeeping_handoff"
+
 group :development, :test, :ci do
   # See https://edgeguides.rubyonrails.org/debugging_rails_applications.html#debugging-with-the-debug-gem
   gem "debug", ">= 1.0.0", platforms: %i[mri windows]
