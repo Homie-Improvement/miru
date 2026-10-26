@@ -17,4 +17,22 @@ RSpec.describe Invoices::ReservationOutcome do
       expect { described_class.new(state:, conflicts: [], counts: {}) }.to raise_error(ArgumentError)
     end
   end
+
+  it "keeps conflicts and counts frozen and unchanged when the caller later edits its own objects" do
+    conflict = { entry_id: 4, reason: +"on_another_invoice" }
+    conflicts = [conflict]
+    counts = { "billed" => 2 }
+
+    outcome = described_class.new(state: "refused", conflicts:, counts:)
+    conflict[:reason] << "_changed"
+    conflicts << { entry_id: 5, reason: "not_found" }
+    counts["billed"] = 9
+
+    expect(outcome.conflicts).to eq([{ entry_id: 4, reason: "on_another_invoice" }])
+    expect(outcome.counts).to eq("billed" => 2)
+    expect(outcome.conflicts).to be_frozen
+    expect(outcome.conflicts).to all(be_frozen)
+    expect(outcome.counts).to be_frozen
+    expect(counts).not_to be_frozen
+  end
 end
