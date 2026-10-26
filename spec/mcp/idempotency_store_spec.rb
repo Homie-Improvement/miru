@@ -80,7 +80,7 @@ RSpec.describe MCP::Miru::IdempotencyStore do
       expect(calls).to eq(2)
     end
 
-    it "does not run a duplicate request while the first request is in progress" do
+    it "does not run a duplicate request while the first request is in progress", committed_data: true do
       duplicate_error = nil
 
       described_class.fetch(tool_name:, idempotency_key: "in-progress", authorization:) do
