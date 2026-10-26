@@ -262,7 +262,10 @@ module TimekeepingContract
         return Wire.error(@entry_contract, "not_found") unless acting.fetch("company_id") == company_id
         return entry_route(route, company_id, acting, params, headers, body) unless ENTRY_WRITE_ROUTES.include?(route)
         return Wire.error(@entry_contract, "stale_generation") unless generation_current?(headers["Ownership-Generation"])
-        return Wire.error(@entry_contract, "credential_in_body") if @policies[:credential_in_body].call(body:, credentials:)
+        # The request's own bearer counts too: in token mode a signed token is
+        # never stored in credentials, and the real service refuses it as well.
+        held = (credentials + [Wire.bearer(headers)]).compact.reject(&:empty?).uniq
+        return Wire.error(@entry_contract, "credential_in_body") if @policies[:credential_in_body].call(body:, credentials: held)
         return respond(400, "reason" => "bad_request") if malformed_duration?(body)
 
         @receipts.answer(company_scope: company_id, actor: ["user", acting["id"]], operation: "#{route} #{params["entry_id"]}",

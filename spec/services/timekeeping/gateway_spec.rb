@@ -267,6 +267,64 @@ RSpec.describe Timekeeping::Gateway do
     expect(seen_after).to eq("caller_mark")
   end
 
+  it "puts back the caller's writer mark when the legacy write fails, keeping the write's own error" do
+    connection = ActiveRecord::Base.connection
+    raised = nil
+    seen_after = ActiveRecord::Base.transaction do
+      connection.execute("SET LOCAL miru.writer = 'caller_mark'")
+      begin
+        gw_gateway.create(user: gw_admin, project: gw_project, attributes: gw_attributes.merge(duration: -5))
+      rescue ActiveRecord::RecordInvalid => error
+        raised = error
+      end
+      connection.select_value("SELECT current_setting('miru.writer', true)")
+    end
+
+    expect(raised).to be_a(ActiveRecord::RecordInvalid)
+    expect(seen_after).to eq("caller_mark")
+  end
+
+  def gw_own_by_timekeeping(project = gw_project)
+    gw_ownership.update_columns(owner: "timekeeping", generation: 2)
+    gw_fake.generation = 2
+    gw_fake.register_company(id: gw_company.id, edit_days: gw_company.timesheet_edit_days)
+    gw_fake.register_user(id: gw_admin.id, company_id: gw_company.id, role: "admin")
+    gw_fake.register_project(id: project.id, company_id: gw_company.id)
+  end
+
+  it "refuses a forwarded create already marked billed before anything is sent, as the legacy store does" do
+    gw_own_by_timekeeping
+
+    expect do
+      gw_with_key do
+        gw_gateway.create(user: gw_admin, project: gw_project, attributes: gw_attributes.merge(bill_status: "billed"))
+      end
+    end.to raise_error(ActiveRecord::RecordInvalid)
+    expect(gw_fake.requests).to be_empty
+  end
+
+  it "forwards the project's billing default when a create leaves bill_status out" do
+    non_billable = create(:project, billable: false, client: create(:client, company: gw_company))
+    gw_own_by_timekeeping(non_billable)
+    gw_fake.register_project(id: gw_project.id, company_id: gw_company.id)
+    attributes = gw_attributes.except(:bill_status)
+
+    # Two requests, so the two creates carry different Idempotency-Keys.
+    second_context = Timekeeping::WriteContext.new(company: gw_company, actor: gw_admin, actor_kind: "user",
+                                                   request_id: "req-gateway-2")
+    second_gateway = described_class.new(
+      context: second_context, write_client: Timekeeping::EntryWriteClient.new(base_url: gw_base_url),
+      read_client: Timekeeping::EntryApiClient.new(base_url: gw_base_url)
+    )
+    gw_with_key do
+      gw_gateway.create(user: gw_admin, project: non_billable, attributes:)
+      second_gateway.create(user: gw_admin, project: gw_project, attributes:)
+    end
+
+    sent = gw_fake.requests.map { |request| request[:body]["bill_status"] }
+    expect(sent).to eq(%w[non_billable unbilled])
+  end
+
   it "raises StaleGeneration for a wrong expected generation, writing nothing and emitting one event" do
     events = gw_refusal_events do
       expect do

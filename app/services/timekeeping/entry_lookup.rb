@@ -32,7 +32,10 @@ module Timekeeping
     def find(ownership:, context:, entry_id:, local_owner:, read_client:, scope: :company)
       in_scope = SCOPES.fetch(scope)
       found = find_in_owner(ownership:, context:, entry_id:, local_owner:, read_client:)
-      unless found.entry.company_id == context.company.id && in_scope.call(found.entry, context)
+      # The write that follows targets found.entry.id, so an answer for any
+      # other id must not stand in for the requested one.
+      unless found.entry.id.to_s == entry_id.to_s && found.entry.company_id == context.company.id &&
+             in_scope.call(found.entry, context)
         raise not_found
       end
 
@@ -62,7 +65,16 @@ module Timekeeping
       entry = EntryReader.hydrate([row], company: context.company, user_id: row["user_id"]).first
       raise not_found if entry.nil?
 
-      Found.new(entry:, version: row["version"])
+      # Without a version the write would go out with no If-Match, and
+      # Timekeeping would apply it to whatever the entry has become since the
+      # policy check. The contract always answers one, so its absence is an
+      # unexpected answer.
+      version = row["version"]
+      unless version.is_a?(Integer) && !version.negative?
+        raise EntryWriteClient::Error, "Timekeeping entry show answered no valid version"
+      end
+
+      Found.new(entry:, version:)
     end
 
     def not_found

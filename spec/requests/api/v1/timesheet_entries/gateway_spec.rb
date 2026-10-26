@@ -243,7 +243,14 @@ RSpec.describe "Api::V1::TimesheetEntry gateway error bodies", type: :request do
   end
 
   it "never shows the body of a Timekeeping error answer to the client" do
-    [403, 409, 422, 500].each do |status|
+    # Each Timekeeping status maps to the monolith's own status and fixed message.
+    expected_answers = {
+      403 => [403, { "errors" => I18n.t("pundit.default") }],
+      409 => [409, { "errors" => I18n.t("errors.entry_version_conflict"), "reason" => "version_conflict" }],
+      422 => [422, { "errors" => I18n.t("errors.entry_write_rejected") }],
+      500 => [503, { "errors" => "Timekeeping entry create answered 500" }]
+    }
+    expected_answers.each do |status, (expected_status, expected_body)|
       stub_request(:post, create_url).to_return(
         status:, body: { reason: "version_conflict", detail: leak_marker }.to_json,
         headers: { "Content-Type" => "application/json" }
@@ -257,6 +264,7 @@ RSpec.describe "Api::V1::TimesheetEntry gateway error bodies", type: :request do
       # "Timekeeping errors map to the monolith's own status and message, and raw bodies are never shown to the client."
       expect([status, response.status]).not_to eq([status, 200])
       expect([status, response.body.include?(leak_marker)]).to eq([status, false])
+      expect([status, response.status, response.parsed_body]).to eq([status, expected_status, expected_body])
     end
     expect(TimesheetEntry.where(company_id: company.id)).not_to exist
   end

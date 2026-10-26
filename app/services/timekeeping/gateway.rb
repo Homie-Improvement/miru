@@ -97,7 +97,8 @@ module Timekeeping
         when :prepared
           local_owner.create_entry(context:, user:, project:, attributes:)
         when :timekeeping
-          body = EntryWriteClient.create_body(user:, project:, attributes:)
+          body = EntryWriteClient.create_body(user:, project:, attributes: checked_create_attributes(user:, project:,
+                                                                                                    attributes:))
           hydrate(write_client.create_entry(context:, generation: ownership.generation, body:), user_id: user.id)
         end
       end
@@ -178,6 +179,19 @@ module Timekeeping
           ownership.handoff_step.blank? &&
           TimekeepingOwnership::OWNERS.include?(ownership.owner) &&
           TimekeepingOwnership::MONOLITH_STORES.include?(ownership.monolith_store)
+      end
+
+      # Runs the legacy model's create validations on an unsaved draft before
+      # forwarding, so a create the legacy store refuses today, such as one
+      # already marked billed, is refused the same way (422) and never reaches
+      # Timekeeping. The draft also fills bill_status from the project when the
+      # request leaves it out (non_billable for a non-billable project), which
+      # Timekeeping's own default (unbilled) would get wrong.
+      def checked_create_attributes(user:, project:, attributes:)
+        draft = project.timesheet_entries.new(attributes)
+        draft.user = user
+        draft.validate!
+        attributes.to_h.stringify_keys.merge("bill_status" => draft.bill_status)
       end
 
       def find_authorized(ownership:, entry_id:, authorize:, scope:)

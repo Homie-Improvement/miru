@@ -123,6 +123,17 @@ RSpec.describe TimekeepingContract::FakeTimekeeping, "in token mode" do
     expect(token_mode_fake.stored_entry(entry.fetch("id"))["discarded_at"]).to be_nil
   end
 
+  it "refuses a write carrying its own signed bearer nested in source_metadata" do
+    admin = token_mode_member(:admin)
+    token = token_mode_token(admin)
+    body = token_mode_create_body.merge("source_metadata" => { "tool" => { "auth" => token } })
+
+    response = token_mode_fake.call("POST", token_mode_entries_path, headers: token_mode_headers(token), body:)
+
+    expect(response.status).to eq(422)
+    expect(response.body["reason"]).to eq("credential_in_body")
+  end
+
   it "refuses a write whose duration is not a JSON number, as Timekeeping does" do
     admin = token_mode_member(:admin)
 

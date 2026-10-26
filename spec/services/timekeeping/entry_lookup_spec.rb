@@ -9,14 +9,16 @@ RSpec.describe Timekeeping::EntryLookup do
   let(:lookup_admin) { create(:user, current_workspace_id: lookup_company.id) }
   let(:lookup_foreign_company) { create(:company) }
   let(:lookup_foreign_user) { create(:user, current_workspace_id: lookup_foreign_company.id) }
-  let(:lookup_foreign_project) { create(:project, billable: true, client: create(:client, company: lookup_foreign_company)) }
+  let(:lookup_project) { create(:project, billable: true, client: create(:client, company: lookup_company)) }
   let(:lookup_context) do
     Timekeeping::WriteContext.new(company: lookup_company, actor: lookup_admin, actor_kind: "user", request_id: "req-tenant-1")
   end
+  # Only company_id is foreign: the user and project are this company's, so
+  # the company check itself is what refuses the row.
   let(:lookup_foreign_row) do
     {
-      "id" => 4242, "company_id" => lookup_foreign_company.id, "version" => 1, "project_id" => lookup_foreign_project.id,
-      "user_id" => lookup_foreign_user.id, "work_date" => Date.current.iso8601, "duration" => 60.0, "note" => "Foreign",
+      "id" => 4242, "company_id" => lookup_foreign_company.id, "version" => 1, "project_id" => lookup_project.id,
+      "user_id" => lookup_admin.id, "work_date" => Date.current.iso8601, "duration" => 60.0, "note" => "Foreign",
       "bill_status" => "unbilled", "review_status" => "not_required", "source" => "manual", "source_metadata" => {},
       "agent_id" => nil, "proof_url" => nil, "proof_metadata" => nil, "locked" => false
     }
@@ -189,6 +191,37 @@ RSpec.describe Timekeeping::EntryLookup do
                           scope: :actor)
       end.to raise_error(ActiveRecord::RecordNotFound)
     end
+
+    def owner_lookup_client_answering(row)
+      Class.new { define_method(:show_entry) { |**| row } }.new
+    end
+
+    it "raises RecordNotFound when the answer is a same-company entry with another id" do
+      client = owner_lookup_client_answering(owner_lookup_row(id: 5152, user_id: owner_lookup_colleague.id))
+
+      expect { owner_lookup_find(ownership: owner_lookup_ownership, entry_id: 5151, read_client: client) }
+        .to raise_error(ActiveRecord::RecordNotFound)
+    end
+
+    it "raises RecordNotFound when the answer names this company but another company's project" do
+      foreign_project = create(:project, billable: true, client: create(:client, company: create(:company)))
+      row = owner_lookup_row(id: 5151, user_id: owner_lookup_colleague.id).merge("project_id" => foreign_project.id)
+
+      expect do
+        owner_lookup_find(ownership: owner_lookup_ownership, entry_id: 5151, read_client: owner_lookup_client_answering(row))
+      end.to raise_error(ActiveRecord::RecordNotFound)
+    end
+
+    it "refuses an answer with no valid version, so no write can go out without If-Match" do
+      [nil, "3", -1].each do |version|
+        row = owner_lookup_row(id: 5151, user_id: owner_lookup_colleague.id).merge("version" => version)
+
+        expect do
+          owner_lookup_find(ownership: owner_lookup_ownership, entry_id: 5151,
+                            read_client: owner_lookup_client_answering(row))
+        end.to raise_error(Timekeeping::EntryWriteClient::Error)
+      end
+    end
   end
 
   context "when the prepared monolith owns the entries" do
@@ -212,6 +245,15 @@ RSpec.describe Timekeeping::EntryLookup do
       local_owner = Timekeeping::FakeLocalOwner.new(entries: { 6162 => entry })
 
       expect { owner_lookup_find(ownership: owner_lookup_ownership, entry_id: 6162, local_owner:) }
+        .to raise_error(ActiveRecord::RecordNotFound)
+    end
+
+    it "raises RecordNotFound when the local owner answers an entry with another id" do
+      entry = TimesheetEntry.new(id: 6163, company_id: owner_lookup_company.id, user_id: owner_lookup_colleague.id,
+                                 project: owner_lookup_project)
+      local_owner = Timekeeping::FakeLocalOwner.new(entries: { 6161 => entry })
+
+      expect { owner_lookup_find(ownership: owner_lookup_ownership, entry_id: 6161, local_owner:) }
         .to raise_error(ActiveRecord::RecordNotFound)
     end
 
