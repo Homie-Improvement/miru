@@ -71,12 +71,13 @@ RSpec.describe Analytics::DemoSeeder do
 end
 
 RSpec.describe Analytics::DemoSeeder do
-  it "refuses demo seeding for every company once the global handoff has begun" do
+  it "refuses demo seeding for every company once Timekeeping owns entries after the flip" do
     first_company = create(:company, base_currency: "USD", standard_price: 120)
     second_company = create(:company, base_currency: "USD", standard_price: 120)
     TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
     user_count = User.count
     client_count = Client.count
+    project_count = Project.count
     expect(user_count).to eq(User.count)
 
     # "The ownership record is one global row, so this refusal applies to every company at once."
@@ -86,25 +87,9 @@ RSpec.describe Analytics::DemoSeeder do
 
     expect(User.count).to eq(user_count)
     expect(Client.count).to eq(client_count)
+    expect(Project.count).to eq(project_count)
     expect(first_company.clients.count).to eq(0)
     expect(second_company.clients.count).to eq(0)
-  end
-end
-
-RSpec.describe Analytics::DemoSeeder do
-  # "`db/seeds.rb`, `db/seeds/timesheet_data.rb` and `Analytics::DemoSeeder` (`app/services/analytics/demo_seeder.rb`) check the ownership record before their first write and refuse once a handoff has begun."
-  it "refuses to seed demo data once Timekeeping owns entries after the flip" do
-    company = create(:company, base_currency: "USD", standard_price: 120)
-    TimekeepingOwnership.current.update_columns(generation: 2, handoff_step: nil, owner: "timekeeping", monolith_store: "legacy")
-    baseline = { users: User.count, clients: Client.count, projects: Project.count }
-    expect(baseline.values).to all(be >= 0)
-
-    expect { described_class.new(company: company).process }
-      .to raise_error(TimekeepingOwnership::HandoffBegun)
-
-    expect(User.count).to eq(baseline[:users])
-    expect(Client.count).to eq(baseline[:clients])
-    expect(Project.count).to eq(baseline[:projects])
   end
 end
 

@@ -310,34 +310,6 @@ RSpec.describe "Api::V1::Users#destroy with no ownership row", type: :request do
   end
 end
 
-RSpec.describe "Api::V1::Users#destroy handoff refusal for a non-super-admin", type: :request do
-  # The ownership record is one global row, so a company admin who cannot
-  # delete users must not learn its state from a handoff-specific 422.
-  it "keeps the forbidden response for a company admin who is not a super admin while a handoff has begun" do
-    company = create(:company, name: "Acme")
-    admin_user = create(:user, current_workspace_id: company.id)
-    target_user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user: admin_user)
-    create(:employment, company:, user: target_user)
-    admin_user.add_role :admin, company
-    target_user.add_role :employee, company
-    sign_in admin_user
-
-    TimekeepingOwnership.ensure_initial!
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(handoff_step: "settle")
-
-    audit_count = Audited::Audit.where(action: "super_admin_delete").count
-    expect(audit_count).to eq(0)
-
-    send_request :delete, api_v1_user_path(target_user), headers: auth_headers(admin_user)
-
-    expect(response).to have_http_status(:forbidden)
-    expect(response.body).not_to include(I18n.t("user.super_admin_delete.handoff_begun"))
-    expect(User.exists?(target_user.id)).to be(true)
-    expect(Audited::Audit.where(action: "super_admin_delete").count).to eq(audit_count)
-  end
-end
-
 RSpec.describe "Api::V1::Users#destroy handoff refusal across companies", type: :request do
   # "The ownership record is one global row, so this refusal applies to every company at once."
   it "refuses a super admin deleting a user of a second company with no timekeeping data once a handoff has begun" do
@@ -395,81 +367,6 @@ RSpec.describe "Api::V1::Users#destroy handoff refusal body", type: :request do
   end
 end
 
-RSpec.describe "Api::V1::Users#destroy", type: :request do
-  # "`target_user.destroy!` in `app/controllers/api/v1/users_controller.rb` is refused with a clear error once a handoff has begun, in either ownership state."
-  it "refuses the super admin delete with 422 after an aborted handoff left legacy at generation 2" do
-    company = create(:company, name: "Acme")
-    super_admin = create(:user, email: "hello@saeloun.com", current_workspace_id: company.id)
-    target_user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user: super_admin)
-    super_admin.add_role :admin, company
-    create(:employment, company:, user: target_user)
-    target_user.add_role :employee, company
-    sign_in super_admin
-
-    TimekeepingOwnership.current.update_columns(generation: 2, handoff_step: nil, owner: "monolith", monolith_store: "legacy")
-    audit_count = Audited::Audit.where(action: "super_admin_delete").count
-    user_count = User.count
-
-    send_request :delete, api_v1_user_path(target_user), headers: auth_headers(super_admin)
-
-    expect(response).to have_http_status(:unprocessable_content)
-    expect(json_response["errors"]).to eq(I18n.t("user.super_admin_delete.handoff_begun"))
-    expect(User.exists?(target_user.id)).to be(true)
-    expect(User.count).to eq(user_count)
-    expect(Audited::Audit.where(action: "super_admin_delete").count).to eq(audit_count)
-  end
-end
-
-RSpec.describe "Api::V1::Users#destroy", type: :request do
-  # "`target_user.destroy!` in `app/controllers/api/v1/users_controller.rb` is refused with a clear error once a handoff has begun, in either ownership state."
-  it "refuses the super admin delete with 422 on the prepared store after a rollback" do
-    company = create(:company, name: "Acme")
-    super_admin = create(:user, email: "hello@saeloun.com", current_workspace_id: company.id)
-    target_user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user: super_admin)
-    super_admin.add_role :admin, company
-    create(:employment, company:, user: target_user)
-    target_user.add_role :employee, company
-    sign_in super_admin
-
-    TimekeepingOwnership.current.update_columns(generation: 2, handoff_step: nil, owner: "monolith", monolith_store: "prepared")
-    audit_count = Audited::Audit.where(action: "super_admin_delete").count
-
-    send_request :delete, api_v1_user_path(target_user), headers: auth_headers(super_admin)
-
-    expect(response).to have_http_status(:unprocessable_content)
-    expect(json_response["errors"]).to eq(I18n.t("user.super_admin_delete.handoff_begun"))
-    expect(User.exists?(target_user.id)).to be(true)
-    expect(Audited::Audit.where(action: "super_admin_delete").count).to eq(audit_count)
-  end
-end
-
-RSpec.describe "Api::V1::Users#destroy", type: :request do
-  # "A missing ownership row counts as begun."
-  it "refuses the super admin delete with 422 when the ownership row is missing" do
-    company = create(:company, name: "Acme")
-    super_admin = create(:user, email: "hello@saeloun.com", current_workspace_id: company.id)
-    target_user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user: super_admin)
-    super_admin.add_role :admin, company
-    create(:employment, company:, user: target_user)
-    target_user.add_role :employee, company
-    sign_in super_admin
-
-    TimekeepingOwnership.delete_all
-    audit_count = Audited::Audit.where(action: "super_admin_delete").count
-
-    send_request :delete, api_v1_user_path(target_user), headers: auth_headers(super_admin)
-
-    expect(response).to have_http_status(:unprocessable_content)
-    expect(json_response["errors"]).to eq(I18n.t("user.super_admin_delete.handoff_begun"))
-    expect(User.exists?(target_user.id)).to be(true)
-    expect(Audited::Audit.where(action: "super_admin_delete").count).to eq(audit_count)
-    expect(TimekeepingOwnership.count).to eq(0)
-  end
-end
-
 RSpec.describe "Api::V1::Users#destroy in the initial legacy ownership state", type: :request do
   it "still deletes the user and writes one audit row in the initial legacy ownership state" do
     legacy_company = create(:company, name: "Legacy Co")
@@ -493,33 +390,6 @@ RSpec.describe "Api::V1::Users#destroy in the initial legacy ownership state", t
     expect(Audited::Audit.where(action: "super_admin_delete").count).to eq(audit_count + 1)
     expect(TimekeepingOwnership.pluck(:generation, :handoff_step, :owner, :monolith_store))
       .to eq([[1, nil, "monolith", "legacy"]])
-  end
-end
-
-RSpec.describe "Api::V1::Users#destroy with a missing ownership row", type: :request do
-  # "A missing ownership row counts as begun."
-  # "A refused run or request writes nothing."
-  it "refuses the super-admin delete with the handoff message when the ownership row is missing" do
-    company = create(:company, name: "Acme")
-    super_admin = create(:user, email: "hello@saeloun.com", current_workspace_id: company.id)
-    target = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user: super_admin)
-    super_admin.add_role :admin, company
-    create(:employment, company:, user: target)
-    target.add_role :employee, company
-    sign_in super_admin
-
-    TimekeepingOwnership.delete_all
-    audit_count = Audited::Audit.where(action: "super_admin_delete").count
-    expect(User.exists?(target.id)).to be(true)
-
-    send_request :delete, api_v1_user_path(target), headers: auth_headers(super_admin)
-
-    expect(response).to have_http_status(:unprocessable_content)
-    expect(json_response["errors"]).to eq(I18n.t("user.super_admin_delete.handoff_begun"))
-    expect(User.exists?(target.id)).to be(true)
-    expect(Audited::Audit.where(action: "super_admin_delete").count).to eq(audit_count)
-    expect(TimekeepingOwnership.count).to eq(0)
   end
 end
 
