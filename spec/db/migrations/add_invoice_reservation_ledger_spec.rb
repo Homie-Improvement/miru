@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 require "rails_helper"
-require Rails.root.join("db/migrate/20261026130100_add_invoice_reservation_ledger")
+require Rails.root.join("db/migrate/20261026134500_add_invoice_reservation_ledger")
 
 # Runs only this migration's down and up inside the example's transaction, so
 # the schema is restored after the example even when an assertion fails.
