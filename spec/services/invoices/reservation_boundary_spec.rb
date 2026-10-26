@@ -415,6 +415,37 @@ RSpec.describe Invoices::ReservationBoundary do
 
     expect([held_only_entry, line_entry].map { |entry| entry.reload.bill_status }).to eq(%w[billed billed])
   end
+
+  # "A discarded draft (L2): \"Its reservations are released.\""
+  it "unlocks a discarded draft's entries with one intent, and the invoice-number rename adds none" do
+    entry = boundary_flush_entry
+    draft = create(:invoice, company: boundary_flush_company, client: boundary_flush_client)
+    create(:invoice_line_item, invoice: draft, timesheet_entry: entry, rate: 100, quantity: 60)
+    expect(entry.reload.locked).to be(true)
+
+    expect { Invoice.find(draft.id).discard! }.to change { boundary_flush_intents(draft).count }.by(1)
+
+    expect(entry.reload.locked).to be(false)
+  end
+
+  # A successor that took a discarded sent invoice's retained entry drops that claim, so its own
+  # discard frees the entry instead of leaving it locked by the old invoice.
+  it "unlocks an entry taken from a discarded sent invoice when the taking draft is discarded" do
+    entry = boundary_flush_entry
+    sent = create(:invoice, company: boundary_flush_company, client: boundary_flush_client)
+    create(:invoice_line_item, invoice: sent, timesheet_entry: entry, rate: 100, quantity: 60)
+    sent.update!(status: :sent)
+    Invoice.find(sent.id).discard!
+    expect(entry.reload.locked).to be(true)
+
+    draft = create(:invoice, company: boundary_flush_company, client: boundary_flush_client)
+    create(:invoice_line_item, invoice: draft, timesheet_entry: entry, rate: 100, quantity: 60)
+    expect(entry.reload.locked).to be(true)
+
+    Invoice.find(draft.id).discard!
+
+    expect(entry.reload.locked).to be(false)
+  end
 end
 
 RSpec.describe Invoices::ReservationBoundary, committed_data: true do

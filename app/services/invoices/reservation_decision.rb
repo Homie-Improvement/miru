@@ -4,8 +4,9 @@ module Invoices
   # Decides what an invoice save sends to the reservation port: nil when
   # nothing changes, or the entry set and disposition the invoice should hold.
   #
-  # A draft holds what it held plus its lines; a discarded or destroyed draft
-  # sends nothing, so its entries stay locked as they do today. A live
+  # A draft holds what it held plus its lines, and a discarded draft holds
+  # nothing, so its entries are released; a destroyed draft sends nothing, so
+  # its entries stay locked as they do today. A live
   # non-draft sends nothing either: only draft saves lock entries, so a sent
   # invoice saved directly keeps its entries' lock state as it is, and
   # removing its line never releases one. A discarded or destroyed non-draft
@@ -21,7 +22,7 @@ module Invoices
 
     # Named on its own, apart from the destroyed-draft row, so that changing
     # what a discarded draft sends stays a one-row change.
-    DISCARDED_DRAFT = SEND_NOTHING
+    DISCARDED_DRAFT = ->(held:, lines:) { { entries: [], disposition: ACTIVE } }.freeze
 
     RETAIN_HELD = ->(held:, lines:) { { entries: held[:entries], disposition: RETAINED } }
 
