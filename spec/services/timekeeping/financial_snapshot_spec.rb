@@ -4,213 +4,391 @@
 
 require "rails_helper"
 
-RSpec.describe Timekeeping::FinancialSnapshot, :two_tenant_seed do
-  it "taking a snapshot twice sends no write to any billing table and leaves every billing row as it was" do
-    invoice_ids = Invoice.where(company_id: fork_and_leaf.id).order(:id).pluck(:id)
-    expect(invoice_ids).not_to be_empty
-
-    billing_rows = lambda do
-      {
-        invoices: Invoice.where(id: invoice_ids).order(:id).map(&:attributes),
-        line_items: InvoiceLineItem.where(invoice_id: invoice_ids).order(:id).map(&:attributes),
-        invoice_taxes: InvoiceTax.where(invoice_id: invoice_ids).order(:id).map(&:attributes)
-      }
-    end
-    rows_before = billing_rows.call
-    expect(rows_before[:line_items]).not_to be_empty
-
-    # The issue says: "The snapshot only reads: it writes no billing table."
-    billing_writes = []
-    write_pattern = /\A\s*(INSERT|UPDATE|DELETE)\b.*\b(invoices|invoice_line_items|invoice_taxes)\b/im
-    subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
-      billing_writes << payload[:sql] if payload[:sql].match?(write_pattern)
-    end
-    begin
-      described_class.take(company_id: fork_and_leaf.id)
-      described_class.take(company_id: fork_and_leaf.id)
-    ensure
-      ActiveSupport::Notifications.unsubscribe(subscriber)
-    end
-
-    expect(billing_writes).to eq([])
-    expect(billing_rows.call).to eq(rows_before)
+RSpec.describe Timekeeping::FinancialSnapshot do
+  def ids_by_kind(snapshot)
+    snapshot[:values].keys.group_by(&:first).transform_values { |keys| keys.map { |key| key[1] }.uniq }
   end
-end
 
-RSpec.describe Timekeeping::FinancialSnapshot, :two_tenant_seed do
-  it "a repeated snapshot with no change compares as identical and stores no snapshot change event" do
-    stored_events = RailsEventViewer::Entry.where(name: "Timekeeping::FinancialSnapshotChanged")
+  # All examples that read the seeded businesses share one group, so the
+  # seed loads once. Each example's writes roll back with its transaction.
+  context "with the two seeded businesses", :two_tenant_seed do
+    let(:stored_snapshot_events) { RailsEventViewer::Entry.where(name: "Timekeeping::FinancialSnapshotChanged") }
 
-    expect do
+    # "Timekeeping::FinancialSnapshot.take(company_id:) returns invoice amount, tax, discount, outstanding_amount,
+    # each line item's rate and quantity, every invoice_taxes row and the rendered PDF totals for that company only"
+    it "take holds every invoice money value, line item, invoice tax row and printed PDF total of the company" do
+      invoice = Invoice.where(company_id: fork_and_leaf.id).joins(:invoice_line_items).order(:id).first
+      line_item = invoice.invoice_line_items.order(:id).first
+      invoice_tax = create(:invoice_tax, invoice:)
+      invoice.reload
+
+      values = described_class.take(company_id: fork_and_leaf.id)[:values]
+
+      %i[amount tax discount outstanding_amount].each do |field|
+        expect(values.fetch([:invoice, invoice.id, field])).to eq(invoice.public_send(field))
+      end
+      expect(values.fetch([:line_item, line_item.id, :rate])).to eq(line_item.rate)
+      expect(values.fetch([:line_item, line_item.id, :quantity])).to eq(line_item.quantity)
+      expect(values.fetch([:invoice_tax, invoice_tax.id, :amount])).to eq(invoice_tax.amount)
+      expect(values.fetch([:invoice_tax, invoice_tax.id, :value])).to eq(invoice_tax.value)
+
+      printed = PdfGeneration::InvoiceService.printed_totals(invoice)
+      expect(values.fetch([:pdf_total, invoice.id, :sub_total])).to eq(printed[:sub_total])
+      expect(values.fetch([:pdf_total, invoice.id, :total])).to eq(printed[:total])
+      expect(values.fetch([:pdf_invoice_tax, invoice_tax.id, :amount])).to eq(printed[:invoice_taxes].first[:amount])
+    end
+
+    # "A snapshot of one company never contains another company's invoices."
+    it "keeps each seeded company's snapshot to exactly its own invoice, line item and invoice tax ids" do
+      [fork_and_leaf, copper_kettle].each do |company|
+        create(:invoice_tax, invoice: company.invoices.order(:id).first)
+      end
+
+      ids_by_company = [fork_and_leaf, copper_kettle].to_h do |company|
+        invoice_ids = Invoice.where(company_id: company.id).pluck(:id)
+        # An empty snapshot would pass every ownership check below, so require real seeded rows first.
+        expect(invoice_ids).not_to be_empty
+        company_tax_ids = InvoiceTax.where(invoice_id: invoice_ids).pluck(:id)
+
+        snapshot = described_class.take(company_id: company.id)
+        ids = ids_by_kind(snapshot)
+
+        # "Every check is keyed by `company_id`. No report or result mixes companies."
+        expect(snapshot[:company_id]).to eq(company.id)
+        expect(ids.fetch(:invoice)).to match_array(invoice_ids)
+        expect(ids.fetch(:pdf_total)).to match_array(invoice_ids)
+        expect(ids.fetch(:line_item)).to match_array(InvoiceLineItem.where(invoice_id: invoice_ids).pluck(:id))
+        expect(ids.fetch(:invoice_tax)).to match_array(company_tax_ids)
+        expect(ids.fetch(:pdf_invoice_tax)).to all(satisfy { |id| company_tax_ids.include?(id) })
+        [company.id, ids]
+      end
+
+      fork_ids = ids_by_company.fetch(fork_and_leaf.id)
+      copper_ids = ids_by_company.fetch(copper_kettle.id)
+      %i[invoice line_item invoice_tax].each do |kind|
+        expect(fork_ids.fetch(kind) & copper_ids.fetch(kind)).to eq([])
+      end
+    end
+
+    # "Include discarded invoices, so a change to any invoice row is caught."
+    it "includes a discarded invoice of the requested company but never a discarded invoice of the other company" do
+      fork_invoice = Invoice.where(company_id: fork_and_leaf.id).order(:id).first
+      copper_invoice = Invoice.where(company_id: copper_kettle.id).order(:id).first
+      expect(fork_invoice).to be_present
+      expect(copper_invoice).to be_present
+      fork_invoice.update_column(:discarded_at, Time.current)
+      copper_invoice.update_column(:discarded_at, Time.current)
+
+      invoice_ids = ids_by_kind(described_class.take(company_id: fork_and_leaf.id)).fetch(:invoice)
+
+      expect(invoice_ids).to include(fork_invoice.id)
+      expect(invoice_ids).not_to include(copper_invoice.id)
+    end
+
+    it "a taken snapshot is a frozen value that keeps its old amount after the invoice changes" do
+      invoice = Invoice.where(company_id: fork_and_leaf.id).order(:id).first
+      old_amount = invoice.amount
       before = described_class.take(company_id: fork_and_leaf.id)
+
+      expect(before).to be_frozen
+      expect(before[:values]).to be_frozen
+      expect(before[:values][[:invoice, invoice.id, :amount]]).to eq(old_amount)
+
+      new_amount = old_amount + BigDecimal("10.00")
+      invoice.update_column(:amount, new_amount)
       after = described_class.take(company_id: fork_and_leaf.id)
 
-      # A no-change check over an empty snapshot would pass for the wrong reason.
-      expect(before[:values].keys.map(&:first)).to include(:invoice, :line_item, :pdf_total)
+      # The before snapshot must still hold the value read before the change, or the comparison would see nothing.
+      expect(before[:values][[:invoice, invoice.id, :amount]]).to eq(old_amount)
+      expect(after[:values][[:invoice, invoice.id, :amount]]).to eq(new_amount)
 
-      # The issue says: "An empty list means identical."
-      differences = described_class.compare(before, after)
+      amount_difference = described_class.compare(before, after).find do |difference|
+        difference.kind == :invoice && difference.record_id == invoice.id && difference.field == :amount
+      end
+      expect(amount_difference).to have_attributes(company_id: fork_and_leaf.id, old_value: old_amount, new_value: new_amount)
+    end
+
+    # "Taking a snapshot writes no billing table, and the rendered PDF output is unchanged"
+    it "sends no write to any billing table, even for an invoice whose stored amount disagrees with its line items" do
+      invoice = fork_and_leaf.invoices.joins(:invoice_line_items).order(:id).first
+      create(:invoice_tax, invoice:)
+      # A stale stored amount is what a totals-sync callback would rewrite if the snapshot saved anything.
+      invoice.update_columns(amount: invoice.amount.to_d + 123, outstanding_amount: invoice.outstanding_amount.to_d + 123)
+
+      invoice_ids = Invoice.where(company_id: fork_and_leaf.id).order(:id).pluck(:id)
+      billing_rows = lambda do
+        {
+          invoices: Invoice.where(id: invoice_ids).order(:id).map(&:attributes),
+          line_items: InvoiceLineItem.where(invoice_id: invoice_ids).order(:id).map(&:attributes),
+          invoice_taxes: InvoiceTax.where(invoice_id: invoice_ids).order(:id).map(&:attributes)
+        }
+      end
+      rows_before = billing_rows.call
+      expect(rows_before.values).to all(be_present)
+
+      billing_writes = []
+      record_billing_write = lambda do |*, payload|
+        sql = payload[:sql].to_s
+        if sql.match?(/\A\s*(INSERT|UPDATE|DELETE)\b/i) && sql.match?(/\b(invoices|invoice_line_items|invoice_taxes)\b/)
+          billing_writes << sql
+        end
+      end
+      # "The snapshot only reads: it writes no billing table."
+      ActiveSupport::Notifications.subscribed(record_billing_write, "sql.active_record") do
+        described_class.take(company_id: fork_and_leaf.id)
+        described_class.take(company_id: fork_and_leaf.id)
+      end
+
+      expect(billing_writes).to eq([])
+      expect(billing_rows.call).to eq(rows_before)
+    end
+
+    # "Two snapshots with no change between them compare as identical"
+    it "compares two unchanged snapshots as identical, emits nothing, and ignores the other company's change" do
+      invoice = fork_and_leaf.invoices.joins(:invoice_line_items).distinct.order(:id).first
+      expect(invoice).to be_present
+      create(:invoice_tax, invoice:)
+
+      before_snapshot = described_class.take(company_id: fork_and_leaf.id)
+
+      # A no-change check passes falsely when it reads nothing, so the baseline must hold real rows of every kind.
+      kinds = before_snapshot[:values].keys.map(&:first)
+      expect(kinds).to include(:invoice, :line_item, :invoice_tax, :pdf_total, :pdf_invoice_tax)
+
+      copper_invoice = copper_kettle.invoices.order(:id).first
+      copper_invoice.update_column(:amount, (copper_invoice.amount || 0) + 10)
+
+      # "An empty list means identical."
+      differences = described_class.compare(before_snapshot, described_class.take(company_id: fork_and_leaf.id))
       expect(differences).to eq([])
-      expect(described_class.report(differences)).to eq([])
-    end.not_to change { stored_events.count }
-  end
-end
 
-RSpec.describe Timekeeping::FinancialSnapshot, :two_tenant_seed do
-  it "reporting snapshot differences stores one event per difference carrying the company id and no money values" do
-    invoice = Invoice.where(company_id: fork_and_leaf.id).order(:id).first
-    before = described_class.take(company_id: fork_and_leaf.id)
-    invoice.update_column(:tax, (invoice.tax || 0) + BigDecimal("10.00"))
-    after = described_class.take(company_id: fork_and_leaf.id)
-    differences = described_class.compare(before, after)
-    expect(differences).not_to be_empty
-
-    stored_events = RailsEventViewer::Entry.where(name: "Timekeeping::FinancialSnapshotChanged")
-
-    # The issue says: "Each difference is emitted as a signal carrying `company_id` through `Rails.event.notify`, following `app/events/users/signed_in.rb`."
-    expect { described_class.report(differences) }.to change { stored_events.count }.by(differences.size)
-
-    stored = stored_events.order(:id).last(differences.size).map { |entry| entry.payload["data"] }
-    expect(stored).to all(include("company_id" => fork_and_leaf.id))
-    expect(stored.pluck("record_id")).to match_array(differences.map(&:record_id))
-    stored.each { |data| expect(data.keys).not_to include("old_value", "new_value") }
-    expect(stored.pluck("company_id")).not_to include(copper_kettle.id)
-  end
-end
-
-RSpec.describe Timekeeping::FinancialSnapshot, :two_tenant_seed do
-  it "a taken snapshot is a frozen value that keeps its old amount after the invoice changes" do
-    invoice = Invoice.where(company_id: fork_and_leaf.id).order(:id).first
-    old_amount = invoice.amount
-    before = described_class.take(company_id: fork_and_leaf.id)
-
-    expect(before).to be_frozen
-    expect(before[:values]).to be_frozen
-    expect(before[:values][[:invoice, invoice.id, :amount]]).to eq(old_amount)
-
-    new_amount = old_amount + BigDecimal("10.00")
-    invoice.update_column(:amount, new_amount)
-    after = described_class.take(company_id: fork_and_leaf.id)
-
-    # The before snapshot must still hold the value read before the change, or the comparison would see nothing.
-    expect(before[:values][[:invoice, invoice.id, :amount]]).to eq(old_amount)
-    expect(after[:values][[:invoice, invoice.id, :amount]]).to eq(new_amount)
-
-    amount_difference = described_class.compare(before, after).find do |difference|
-      difference.kind == :invoice && difference.record_id == invoice.id && difference.field == :amount
+      expect do
+        assert_no_event_reported("Timekeeping::FinancialSnapshotChanged") do
+          expect(described_class.report(differences)).to eq([])
+        end
+      end.not_to change { stored_snapshot_events.count }
     end
-    expect(amount_difference).to have_attributes(company_id: fork_and_leaf.id, old_value: old_amount, new_value: new_amount)
-  end
-end
 
-RSpec.describe Timekeeping::FinancialSnapshot, :two_tenant_seed do
-  # "Timekeeping::FinancialSnapshot.take(company_id:) returns invoice amount, tax, discount, outstanding_amount,
-  # each line item's rate and quantity, every invoice_taxes row and the rendered PDF totals for that company only"
-  it "take holds every invoice money value, line item, invoice tax row and printed PDF total of the company and none of the other company" do
-    invoice = Invoice.where(company_id: fork_and_leaf.id).joins(:invoice_line_items).order(:id).first
-    line_item = invoice.invoice_line_items.order(:id).first
-    invoice_tax = create(:invoice_tax, invoice: invoice)
-    invoice.reload
+    it "refuses to compare snapshots of two different companies in either order" do
+      fork_snapshot = described_class.take(company_id: fork_and_leaf.id)
+      copper_snapshot = described_class.take(company_id: copper_kettle.id)
 
-    values = described_class.take(company_id: fork_and_leaf.id)[:values]
-
-    %i[amount tax discount outstanding_amount].each do |field|
-      expect(values.fetch([:invoice, invoice.id, field])).to eq(invoice.public_send(field))
+      # "A pure function compares a before snapshot and an after snapshot of the same company."
+      # "Every check is keyed by `company_id`. No report or result mixes companies."
+      expect { described_class.compare(fork_snapshot, copper_snapshot) }.to raise_error(ArgumentError)
+      expect { described_class.compare(copper_snapshot, fork_snapshot) }.to raise_error(ArgumentError)
     end
-    expect(values.fetch([:line_item, line_item.id, :rate])).to eq(line_item.rate)
-    expect(values.fetch([:line_item, line_item.id, :quantity])).to eq(line_item.quantity)
-    expect(values.fetch([:invoice_tax, invoice_tax.id, :amount])).to eq(invoice_tax.amount)
-    expect(values.fetch([:invoice_tax, invoice_tax.id, :value])).to eq(invoice_tax.value)
 
-    printed = PdfGeneration::InvoiceService.printed_totals(invoice)
-    expect(values.fetch([:pdf_total, invoice.id, :sub_total])).to eq(printed[:sub_total])
-    expect(values.fetch([:pdf_total, invoice.id, :total])).to eq(printed[:total])
-    expect(values.fetch([:pdf_invoice_tax, invoice_tax.id, :amount])).to eq(printed[:invoice_taxes].first[:amount])
+    it "a money change in one company shows no difference in the other company's comparison" do
+      copper_invoice = Invoice.where(company_id: copper_kettle.id).order(:id).first
+      expect(copper_invoice).to be_present
+      fork_before = described_class.take(company_id: fork_and_leaf.id)
+      copper_before = described_class.take(company_id: copper_kettle.id)
+      expect(fork_before[:values]).not_to be_empty
 
-    other_invoice_ids = Invoice.where(company_id: copper_kettle.id).pluck(:id)
-    other_line_item_ids = InvoiceLineItem.where(invoice_id: other_invoice_ids).pluck(:id)
-    expect(other_invoice_ids).not_to be_empty
-    invoice_ids = values.keys.filter_map { |kind, id, _| id if kind == :invoice || kind == :pdf_total }
-    line_item_ids = values.keys.filter_map { |kind, id, _| id if kind == :line_item }
-    expect(invoice_ids & other_invoice_ids).to be_empty
-    expect(line_item_ids & other_line_item_ids).to be_empty
+      copper_invoice.update_column(:outstanding_amount, copper_invoice.outstanding_amount.to_d + BigDecimal("10.00"))
+
+      fork_differences = described_class.compare(fork_before, described_class.take(company_id: fork_and_leaf.id))
+      copper_differences = described_class.compare(copper_before, described_class.take(company_id: copper_kettle.id))
+
+      expect(fork_differences).to eq([])
+      expect(copper_differences).not_to be_empty
+      expect(copper_differences.map(&:company_id).uniq).to eq([copper_kettle.id])
+      expect(copper_differences.map(&:record_id)).to include(copper_invoice.id)
+    end
+
+    # "A mutated invoice, line item, invoice tax or PDF total value makes the comparison fail and names the changed value"
+    it "reports exactly the expected keys for one change of each kind on seeded invoice money" do
+      company_id = fork_and_leaf.id
+      line_item = InvoiceLineItem.joins(:invoice)
+        .where(invoices: { company_id: })
+        .where("invoice_line_items.quantity > 0 AND invoice_line_items.rate > 0")
+        .order(:id).first
+      invoice = line_item.invoice
+      invoice_tax = create(:invoice_tax, invoice:, amount: BigDecimal("25"), value: BigDecimal("5"))
+      i, l, t = invoice.id, line_item.id, invoice_tax.id
+
+      # update_column skips model callbacks, but the printed PDF totals still read the changed column,
+      # so each change is checked against its full set of stored and printed keys.
+      mutations = [
+        [invoice, :amount, [[:invoice, i, :amount], [:pdf_total, i, :invoice_amount]]],
+        [invoice, :tax, [[:invoice, i, :tax], [:pdf_total, i, :invoice_tax], [:pdf_total, i, :total]]],
+        [invoice, :discount, [[:invoice, i, :discount], [:pdf_total, i, :invoice_discount], [:pdf_total, i, :total]]],
+        [invoice, :outstanding_amount, [[:invoice, i, :outstanding_amount]]],
+        [line_item, :rate, [[:line_item, l, :rate], [:pdf_total, i, :sub_total], [:pdf_total, i, :total]]],
+        [line_item, :quantity, [[:line_item, l, :quantity], [:pdf_total, i, :sub_total], [:pdf_total, i, :total]]],
+        [invoice_tax, :amount, [[:invoice_tax, t, :amount], [:pdf_invoice_tax, t, :amount]]],
+        [invoice_tax, :value, [[:invoice_tax, t, :value]]],
+        # amount_paid is not a compared stored value, so this change moves only a printed PDF amount.
+        [invoice, :amount_paid, [[:pdf_total, i, :invoice_amount_paid]]]
+      ]
+
+      baseline = described_class.take(company_id:)
+
+      mutations.each do |record, field, expected_keys|
+        original = record.reload.public_send(field)
+        changed = (original || 0) + 10
+        record.update_column(field, changed)
+
+        differences = described_class.compare(baseline, described_class.take(company_id:))
+
+        expect(differences.map { |d| [d.kind, d.record_id, d.field] }).to match_array(expected_keys), "after changing #{record.class.name}##{field}"
+        expect(differences.map(&:company_id).uniq).to eq([company_id])
+
+        own = differences.find { |d| [d.kind, d.record_id, d.field] == expected_keys.first }
+        if field == :amount_paid
+          # "The stored `amount` can differ from the printed total, so the PDF totals must be part of the snapshot."
+          expect(own.old_value).to be_a(String)
+          expect(own.new_value).to eq(PdfGeneration::InvoiceService.printed_totals(invoice.reload)[:invoice_amount_paid])
+          expect(own.new_value).not_to eq(own.old_value)
+        else
+          expect(own.old_value).to eq(original)
+          expect(own.new_value).to eq(changed)
+        end
+
+        record.update_column(field, original)
+      end
+    end
+
+    # "Each difference is emitted as a signal carrying `company_id` through `Rails.event.notify`, following `app/events/users/signed_in.rb`."
+    # The event history spans every workspace and docs/ai/events.md says payloads hold identifiers and enums only,
+    # so the old and new money values must stay out of the signal.
+    it "reports one stored signal per difference carrying identifiers and the company id but no money values" do
+      invoice = fork_and_leaf.invoices.order(:id).first
+      expect(invoice).to be_present
+      before_snapshot = described_class.take(company_id: fork_and_leaf.id)
+      invoice.update_column(:amount, BigDecimal("987654.32"))
+      differences = described_class.compare(before_snapshot, described_class.take(company_id: fork_and_leaf.id))
+      expect(differences).not_to be_empty
+
+      returned = nil
+      event = assert_event_reported("Timekeeping::FinancialSnapshotChanged") do
+        expect { returned = described_class.report(differences) }
+          .to change { stored_snapshot_events.count }.by(differences.size)
+      end
+
+      expect(returned).to eq(differences)
+      expect(event[:payload].to_h[:data].keys).to contain_exactly(:company_id, :kind, :record_id, :field)
+      expect(event[:payload].to_h[:data][:company_id]).to eq(fork_and_leaf.id)
+      expect(JSON.generate(event[:payload].to_h)).not_to include("987654")
+
+      stored = stored_snapshot_events.order(:id).last(differences.size).map { |entry| entry.payload["data"] }
+      stored.each { |data| expect(data.keys).to match_array(%w[company_id kind record_id field]) }
+      expect(stored.pluck("company_id").uniq).to eq([fork_and_leaf.id])
+      expect(stored.map { |data| [data["kind"].to_s, data["record_id"], data["field"].to_s] })
+        .to match_array(differences.map { |d| [d.kind.to_s, d.record_id, d.field.to_s] })
+    end
+
+    it "emits one signal per difference with each difference's own company_id when one list holds two companies' changes" do
+      fork_invoice = fork_and_leaf.invoices.order(:id).first
+      copper_invoice = copper_kettle.invoices.order(:id).first
+
+      fork_before = described_class.take(company_id: fork_and_leaf.id)
+      copper_before = described_class.take(company_id: copper_kettle.id)
+      fork_invoice.update_column(:outstanding_amount, fork_invoice.outstanding_amount.to_d + 10)
+      copper_invoice.update_column(:outstanding_amount, copper_invoice.outstanding_amount.to_d + 10)
+
+      differences =
+        described_class.compare(fork_before, described_class.take(company_id: fork_and_leaf.id)) +
+        described_class.compare(copper_before, described_class.take(company_id: copper_kettle.id))
+      expect(differences.map(&:company_id)).to contain_exactly(fork_and_leaf.id, copper_kettle.id)
+
+      recorded = []
+      recorder = Object.new
+      recorder.define_singleton_method(:emit) { |event| recorded << event }
+      Rails.event.subscribe(recorder)
+      begin
+        described_class.report(differences)
+      ensure
+        Rails.event.unsubscribe(recorder)
+      end
+
+      signals = recorded.select { |event| event[:name] == "Timekeeping::FinancialSnapshotChanged" }
+      expect(signals.size).to eq(differences.size)
+      expect(signals.map { |event| event[:payload].to_h[:data] }).to contain_exactly(
+        { company_id: fork_and_leaf.id, kind: :invoice, record_id: fork_invoice.id, field: :outstanding_amount },
+        { company_id: copper_kettle.id, kind: :invoice, record_id: copper_invoice.id, field: :outstanding_amount }
+      )
+    end
   end
-end
 
-RSpec.describe Timekeeping::FinancialSnapshot, :two_tenant_seed do
-  # "A mutated invoice, line item, invoice tax or PDF total value makes the comparison fail and names the changed value"
-  it "a changed line item rate is reported with the printed subtotal and total it moves and no stored invoice value" do
-    line_item = InvoiceLineItem.joins(:invoice).where(invoices: { company_id: fork_and_leaf.id })
-      .where("invoice_line_items.quantity > 0").order(:id).first
-    invoice_id = line_item.invoice_id
-    before = described_class.take(company_id: fork_and_leaf.id)
+  context "with a company built for the example" do
+    let(:company) { create(:company) }
 
-    line_item.update_column(:rate, line_item.rate + 10)
-    differences = described_class.compare(before, described_class.take(company_id: fork_and_leaf.id))
+    # A wrong company id must not yield an empty snapshot: two empty snapshots
+    # compare as identical, which would prove "Two snapshots with no change
+    # between them compare as identical" over no money at all.
+    it "raises for a company id that does not exist rather than returning an empty snapshot" do
+      missing_company_id = (Company.maximum(:id) || 0) + 1_000
 
-    expect(differences.map { |d| [d.kind, d.record_id, d.field] }).to contain_exactly(
-      [:line_item, line_item.id, :rate], [:pdf_total, invoice_id, :sub_total], [:pdf_total, invoice_id, :total]
-    )
-    expect(differences.map(&:company_id).uniq).to eq([fork_and_leaf.id])
-    rate_change = differences.find { |d| d.field == :rate }
-    expect(rate_change.new_value - rate_change.old_value).to eq(BigDecimal("10"))
-  end
-end
+      expect { described_class.take(company_id: missing_company_id) }
+        .to raise_error(ActiveRecord::RecordNotFound)
+    end
 
-RSpec.describe Timekeeping::FinancialSnapshot, :two_tenant_seed do
-  # "A mutated invoice, line item, invoice tax or PDF total value makes the comparison fail and names the changed value"
-  it "a changed line item quantity is reported with the printed subtotal and total it moves" do
-    line_item = InvoiceLineItem.joins(:invoice).where(invoices: { company_id: fork_and_leaf.id })
-      .where("invoice_line_items.rate > 0").order(:id).first
-    invoice_id = line_item.invoice_id
-    original_quantity = line_item.quantity
-    before = described_class.take(company_id: fork_and_leaf.id)
+    # A comparison that only walks the keys of the after snapshot would miss a row that vanished.
+    it "reports a deleted line item with its old values and nil new values" do
+      invoice = create(:invoice, company:, client: create(:client, company:))
+      line_item = create(:invoice_line_item, invoice:, timesheet_entry: nil, quantity: 600, rate: 100)
 
-    line_item.update_column(:quantity, original_quantity + 10)
-    differences = described_class.compare(before, described_class.take(company_id: fork_and_leaf.id))
+      before_snapshot = described_class.take(company_id: company.id)
+      line_item.delete
+      differences = described_class.compare(before_snapshot, described_class.take(company_id: company.id))
 
-    expect(differences.map { |d| [d.kind, d.record_id, d.field] }).to contain_exactly(
-      [:line_item, line_item.id, :quantity], [:pdf_total, invoice_id, :sub_total], [:pdf_total, invoice_id, :total]
-    )
-    expect(differences.map(&:company_id).uniq).to eq([fork_and_leaf.id])
-    quantity_change = differences.find { |d| d.field == :quantity }
-    expect([quantity_change.old_value, quantity_change.new_value]).to eq([original_quantity, original_quantity + 10])
-  end
-end
+      rate = differences.find { |d| [d.kind, d.record_id, d.field] == [:line_item, line_item.id, :rate] }
+      quantity = differences.find { |d| [d.kind, d.record_id, d.field] == [:line_item, line_item.id, :quantity] }
+      expect(rate).to have_attributes(old_value: BigDecimal("100"), new_value: nil)
+      expect(quantity).to have_attributes(old_value: 600, new_value: nil)
+      expect(differences.map(&:company_id).uniq).to eq([company.id])
+    end
 
-RSpec.describe Timekeeping::FinancialSnapshot, :two_tenant_seed do
-  # "A mutated invoice, line item, invoice tax or PDF total value makes the comparison fail and names the changed value"
-  it "a changed invoice tax amount is reported on the tax row and its printed amount" do
-    invoice = Invoice.where(company_id: fork_and_leaf.id).joins(:invoice_line_items).order(:id).first
-    invoice_tax = create(:invoice_tax, invoice: invoice)
-    before = described_class.take(company_id: fork_and_leaf.id)
+    # "every `invoice_taxes` row" is part of the money check, so a row that
+    # appears after the first snapshot is a change, not something to skip.
+    it "reports an invoice tax row added between snapshots with a nil old value" do
+      invoice = create(:invoice_with_invoice_line_items, company:, length: 1)
 
-    invoice_tax.update_column(:amount, invoice_tax.amount + 10)
-    differences = described_class.compare(before, described_class.take(company_id: fork_and_leaf.id))
+      before_snapshot = described_class.take(company_id: company.id)
+      added_tax = create(:invoice_tax, invoice:)
+      differences = described_class.compare(before_snapshot, described_class.take(company_id: company.id))
 
-    expect(differences.map { |d| [d.kind, d.record_id, d.field] }).to contain_exactly(
-      [:invoice_tax, invoice_tax.id, :amount], [:pdf_invoice_tax, invoice_tax.id, :amount]
-    )
-    expect(differences.map(&:company_id).uniq).to eq([fork_and_leaf.id])
-    row_change = differences.find { |d| d.kind == :invoice_tax }
-    expect(row_change.new_value - row_change.old_value).to eq(BigDecimal("10"))
-  end
-end
+      added_amount = differences.find { |d| d.kind == :invoice_tax && d.record_id == added_tax.id && d.field == :amount }
+      expect(added_amount).to have_attributes(old_value: nil, new_value: added_tax.reload.amount, company_id: company.id)
+    end
 
-RSpec.describe Timekeeping::FinancialSnapshot, :two_tenant_seed do
-  # "The stored `amount` can differ from the printed total, so the PDF totals must be part of the snapshot."
-  it "a value that changes only a printed PDF total is reported on that printed total alone" do
-    invoice = Invoice.where(company_id: fork_and_leaf.id).order(:id).first
-    before = described_class.take(company_id: fork_and_leaf.id)
+    # "Include discarded invoices, so a change to any invoice row is caught."
+    # Discarding between two snapshots must not make the invoice's values look
+    # deleted, and a later change to the discarded row must still be reported.
+    it "keeps an invoice discarded between snapshots and reports a money change made after the discard" do
+      invoice = create(:invoice_with_invoice_line_items, company:, length: 1)
 
-    invoice.update_column(:amount_paid, (invoice.amount_paid || 0) + 10)
-    differences = described_class.compare(before, described_class.take(company_id: fork_and_leaf.id))
+      before_snapshot = described_class.take(company_id: company.id)
+      invoice.discard!
+      invoice.update_column(:outstanding_amount, invoice.reload.outstanding_amount + BigDecimal("10.00"))
+      differences = described_class.compare(before_snapshot, described_class.take(company_id: company.id))
 
-    expect(differences.map { |d| [d.kind, d.record_id, d.field] }).to eq([[:pdf_total, invoice.id, :invoice_amount_paid]])
-    change = differences.first
-    expect(change.company_id).to eq(fork_and_leaf.id)
-    expect(change.old_value).to be_a(String)
-    expect(change.new_value).to eq(PdfGeneration::InvoiceService.printed_totals(invoice.reload)[:invoice_amount_paid])
-    expect(change.new_value).not_to eq(change.old_value)
+      invoice_differences = differences.select { |d| d.kind == :invoice && d.record_id == invoice.id }
+      expect(invoice_differences.map(&:field)).to eq([:outstanding_amount])
+      expect(invoice_differences.first).to have_attributes(
+        company_id: company.id,
+        old_value: invoice.outstanding_amount - BigDecimal("10.00"),
+        new_value: invoice.outstanding_amount
+      )
+    end
+
+    # "Store values as decimal or rendered strings, never as floats."
+    it "stores no Float value, even for an invoice with no line items" do
+      client = create(:client, company:)
+      empty_invoice = create(:invoice, company:, client:)
+      invoice = create(:invoice, company:, client:)
+      line_item = create(:invoice_line_item, invoice:, timesheet_entry: nil, quantity: 600, rate: 100)
+      create(:invoice_tax, invoice:)
+
+      values = described_class.take(company_id: company.id)[:values]
+
+      expect(values).to have_key([:pdf_total, empty_invoice.id, :sub_total])
+      expect(values.values.grep(Float)).to eq([])
+      expect(values[[:line_item, line_item.id, :quantity]]).to eq(600)
+      expect(values[[:line_item, line_item.id, :rate]]).to be_a(BigDecimal)
+      expect(values[[:pdf_total, invoice.id, :sub_total]]).to be_a(String)
+    end
   end
 end
