@@ -120,4 +120,24 @@ RSpec.describe Timekeeping::ReservationOperations, "under concurrent requests" d
     expect(InvoiceOperation.pluck(:state)).to eq(["committed"])
     expect(Reservation.where(entry_id:).pluck(:invoice_id, :state)).to eq([[501, "committed"]])
   end
+
+  # The waiting prepare must see the entry as the abort left it (unlocked), so
+  # reserving it again is a locked flip with its own version, audit and snapshot.
+  it "records the relock when a prepare for another invoice waits on an abort of the same entry" do
+    operation_id = SecureRandom.uuid
+    expect(described_class.new.call(race_request(:prepare, operation_id:, entry_ids: [entry_id])).status).to eq(200)
+    version_after_lock = Entry.find(entry_id).version
+
+    aborted, prepared = race_reservations(
+      race_request(:abort, operation_id:),
+      race_request(:prepare, operation_id: SecureRandom.uuid, invoice_id: 502, entry_ids: [entry_id]),
+      hold_at: :rows_locked
+    )
+
+    expect([aborted.first, prepared.first]).to eq([200, 200])
+    expect(Entry.find(entry_id).version).to eq(version_after_lock + 2)
+    expect(AuditEvent.where(entry_id:).order(:id).pluck(:action, :after))
+      .to eq([["prepare", { "locked" => true }], ["abort", { "locked" => false }], ["prepare", { "locked" => true }]])
+    expect(OutboxSnapshot.where(id: entry_id).order(:outbox_position).pluck(:locked)).to eq([true, false, true])
+  end
 end

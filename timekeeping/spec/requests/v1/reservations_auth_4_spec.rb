@@ -33,7 +33,7 @@ RSpec.describe "Timekeeping reservation routes: who may call them" do
       "detach_entries" => ["/v1/companies/#{company}/agents/77/detach-entries", {}]
     }
     expected = { owner_token => 403, no_operations => 403, foreign_service => 404 }
-    before_counts = [Reservation.count, AuditEvent.count, OutboxSnapshot.count, IdempotencyReceipt.count]
+    before_counts = [Reservation.count, AuditEvent.count, OutboxSnapshot.count, ServiceIdempotencyReceipt.count]
 
     paths.each do |route, (path, body)|
       expected.each do |credential, status|
@@ -44,7 +44,7 @@ RSpec.describe "Timekeeping reservation routes: who may call them" do
       end
     end
 
-    expect([Reservation.count, AuditEvent.count, OutboxSnapshot.count, IdempotencyReceipt.count]).to eq(before_counts)
+    expect([Reservation.count, AuditEvent.count, OutboxSnapshot.count, ServiceIdempotencyReceipt.count]).to eq(before_counts)
     expect(Entry.find(billable).bill_status).to eq("unbilled")
     expect(Entry.find(agent_entry).agent_id).to eq(77)
     expect(Reservation.where(entry_id: free_entry).count).to eq(0)

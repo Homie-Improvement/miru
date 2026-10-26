@@ -28,7 +28,7 @@ RSpec.describe "Reservation operation replays" do
     expect(send_command.call("prepare", prepare_body).status).to eq(200)
     first_commit = send_command.call("commit")
     expect([first_commit.status, first_commit.parsed_body]).to eq([200, { "reserved" => 1, "released" => 0 }])
-    counts = -> { [Reservation.count, AuditEvent.count, OutboxSnapshot.count, IdempotencyReceipt.count, Entry.sum(:version)] }
+    counts = -> { [Reservation.count, AuditEvent.count, OutboxSnapshot.count, ServiceIdempotencyReceipt.count, Entry.sum(:version)] }
     after_commit = counts.call
 
     # "A replay after a terminal state changes nothing."
@@ -186,7 +186,7 @@ RSpec.describe "Mark-billed transaction" do
     expect(Entry.find(billable).bill_status).to eq("unbilled")
     expect(AuditEvent.where(company_id: company).count).to eq(0)
     expect(OutboxSnapshot.where(company_id: company).count).to eq(0)
-    expect(IdempotencyReceipt.where(company_id: company).count).to eq(0)
+    expect(ServiceIdempotencyReceipt.where(company_id: company).count).to eq(0)
   end
 end
 
@@ -284,7 +284,7 @@ RSpec.describe "Detach-entries transaction" do
     expect([entry.agent_id, entry.version]).to eq([77, 1])
     expect(AuditEvent.where(entry_id:)).to be_empty
     expect(OutboxSnapshot.count).to eq(0)
-    expect(IdempotencyReceipt.count).to eq(0)
+    expect(ServiceIdempotencyReceipt.count).to eq(0)
   end
 end
 

@@ -21,7 +21,7 @@ RSpec.describe "Reservation prepare access" do
       timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: all_routes - ["prepare"]) => [403, "forbidden"],
       timekeeping_arrange.service_identity(company: other_company, name: "invoice-boundary", operations: all_routes) => [404, "not_found"]
     }
-    counts = -> { [Reservation.count, InvoiceOperation.count, AuditEvent.count, OutboxSnapshot.count, IdempotencyReceipt.count] }
+    counts = -> { [Reservation.count, InvoiceOperation.count, AuditEvent.count, OutboxSnapshot.count, ServiceIdempotencyReceipt.count] }
     before = counts.call
 
     credentials.each do |credential, (status, reason)|
@@ -123,7 +123,7 @@ RSpec.describe "Reservation mark-billed access" do
     billable = timekeeping_arrange.reserved_entry(company:, invoice_id: 501, state: "committed")
     expect(Entry.find(billable).bill_status).to eq("unbilled")
     all_routes = %w[prepare commit abort mark_billed detach_entries]
-    before = [AuditEvent.count, OutboxSnapshot.count, IdempotencyReceipt.count]
+    before = [AuditEvent.count, OutboxSnapshot.count, ServiceIdempotencyReceipt.count]
 
     {
       nil => 401,
@@ -140,7 +140,7 @@ RSpec.describe "Reservation mark-billed access" do
       expect(response.status).to eq(status)
       expect(Entry.find(billable).bill_status).to eq("unbilled")
     end
-    expect([AuditEvent.count, OutboxSnapshot.count, IdempotencyReceipt.count]).to eq(before)
+    expect([AuditEvent.count, OutboxSnapshot.count, ServiceIdempotencyReceipt.count]).to eq(before)
   end
 end
 
@@ -154,7 +154,7 @@ RSpec.describe "Reservation detach-entries access" do
     agent_entry = timekeeping_arrange.entry(company:, user:, project: timekeeping_arrange.project(company:), agent_id: 77)
     expect(Entry.find(agent_entry).agent_id).to eq(77)
     all_routes = %w[prepare commit abort mark_billed detach_entries]
-    before = [AuditEvent.count, OutboxSnapshot.count, IdempotencyReceipt.count]
+    before = [AuditEvent.count, OutboxSnapshot.count, ServiceIdempotencyReceipt.count]
 
     {
       nil => 401,
@@ -171,7 +171,7 @@ RSpec.describe "Reservation detach-entries access" do
       expect(response.status).to eq(status)
       expect(Entry.find(agent_entry).agent_id).to eq(77)
     end
-    expect([AuditEvent.count, OutboxSnapshot.count, IdempotencyReceipt.count]).to eq(before)
+    expect([AuditEvent.count, OutboxSnapshot.count, ServiceIdempotencyReceipt.count]).to eq(before)
   end
 end
 

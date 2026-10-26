@@ -57,12 +57,27 @@ class CreateInvoiceOperations < ActiveRecord::Migration[8.1]
     # A service has a name and no numeric id, so a service row carries
     # actor_name and a user row carries actor_id. Every existing row is a user
     # row with actor_id set, so the check holds for them.
+    #
+    # Rolling back would make actor_id NOT NULL again, which service rows
+    # cannot satisfy. The rollback stops instead of deleting audit history.
     def record_service_actors_on_audit_events
       add_column :audit_events, :actor_name, :string
-      change_column_null :audit_events, :actor_id, true
+      reversible do |direction|
+        direction.up { change_column_null :audit_events, :actor_id, true }
+        direction.down { restore_user_only_audit_actors }
+      end
       add_check_constraint :audit_events,
         "(actor_type = 'service' AND actor_name IS NOT NULL) OR (actor_type <> 'service' AND actor_id IS NOT NULL)",
         name: "audit_events_actor_check"
+    end
+
+    def restore_user_only_audit_actors
+      if select_value("SELECT 1 FROM audit_events WHERE actor_id IS NULL LIMIT 1")
+        raise ActiveRecord::IrreversibleMigration,
+          "audit_events holds service rows with no actor_id; rolling back would require deleting audit history"
+      end
+
+      change_column_null :audit_events, :actor_id, false
     end
 
     # Stored 2xx answers of service commands, kept apart from the user receipts

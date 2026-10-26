@@ -54,7 +54,7 @@ RSpec.describe "Timekeeping reservations tenant isolation: credential bound to a
     billable = timekeeping_arrange.reserved_entry(company:, invoice_id: 501, state: "committed")
     other_service = timekeeping_arrange.service_identity(company: other_company, name: "invoice-boundary", operations:)
     generation = timekeeping_arrange.current_generation
-    counts = -> { [Reservation.count, AuditEvent.count, OutboxSnapshot.count, IdempotencyReceipt.count] }
+    counts = -> { [Reservation.count, AuditEvent.count, OutboxSnapshot.count, ServiceIdempotencyReceipt.count] }
     before = counts.call
 
     # "The background credential (`TIMEKEEPING_SERVICE_TOKEN`) is bound to one `company_id` per request"

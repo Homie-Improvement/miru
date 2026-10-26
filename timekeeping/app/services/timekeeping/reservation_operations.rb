@@ -195,10 +195,14 @@ module Timekeeping
       end
 
       # The company's entries with these ids, discarded ones included, locked
-      # in id order so two writers over the same entries wait in turn.
+      # in id order so two writers over the same entries wait in turn. The
+      # reservation flag is read in a second statement once the locks are
+      # held: a statement that waited on a lock still evaluates its
+      # reservation subquery against the snapshot taken before the wait, so it
+      # would miss the change the lock holder just committed.
       def lock_entries(company_id, entry_ids)
-        Entry.where(company_id:, id: entry_ids.uniq).select("entries.*", EntriesQuery::RESERVED)
-          .order(:id).lock("FOR UPDATE OF entries").to_a
+        ids = Entry.where(company_id:, id: entry_ids.uniq).order(:id).lock("FOR UPDATE").pluck(:id)
+        WriteSteps.reserved_rows(company_id, ids).values_at(*ids)
       end
 
       # Each entry's reservations in the form ReservationDecision reads, seen
