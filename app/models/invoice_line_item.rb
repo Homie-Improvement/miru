@@ -59,13 +59,14 @@ class InvoiceLineItem < ApplicationRecord
   # invoice's company at validation and save, when nested attributes have set
   # the invoice.
   def linked_timesheet_entry_ids=(ids)
-    @pending_linked_timesheet_entry_ids = Array(ids).reject(&:blank?).map { |id| Integer(id.to_s, exception: false) }.uniq
+    id_type = TimesheetEntry.type_for_attribute(:id)
+    @pending_linked_timesheet_entry_ids = Array(ids).reject(&:blank?).map { |id| id_type.cast(id) }.uniq
   end
 
   # Nested invoice saves validate and save only children that report a change.
   # Pending linked ids change no column, so they are counted here.
   def changed_for_autosave?
-    super || !@pending_linked_timesheet_entry_ids.nil?
+    super || pending_linked_timesheet_entry_ids?
   end
 
   private
@@ -76,22 +77,30 @@ class InvoiceLineItem < ApplicationRecord
       TimesheetEntry.where(company_id: invoice.company_id)
     end
 
+    def pending_linked_timesheet_entry_ids?
+      !@pending_linked_timesheet_entry_ids.nil?
+    end
+
     # The pending ids' entries, or nil when any id is not an entry of the
-    # invoice's company.
+    # invoice's company. The rows are key-share locked, like the direct entry,
+    # so none can be deleted between this lookup and the save's commit.
     def pending_linked_entries_in_invoice_company
       requested_ids = @pending_linked_timesheet_entry_ids
-      entries = entries_in_invoice_company.where(id: requested_ids.compact).to_a
+      entries = entries_in_invoice_company.where(id: requested_ids.compact).lock("FOR KEY SHARE").to_a
       entries if entries.size == requested_ids.size
     end
 
     # Assigning links on a saved line writes join rows at once, so it waits for
-    # save and validation stays read-only. Unresolved ids stay pending, which
-    # validation reports as not found.
+    # save and validation stays read-only. Ids that stopped resolving after
+    # validation refuse the save rather than leave the old links in place.
     def link_pending_linked_timesheet_entries
-      return if @pending_linked_timesheet_entry_ids.nil?
+      return unless pending_linked_timesheet_entry_ids?
 
       entries = pending_linked_entries_in_invoice_company
-      return if entries.nil?
+      if entries.nil?
+        errors.add(:linked_timesheet_entries, :not_found)
+        throw :abort
+      end
 
       self.linked_timesheet_entries = entries
       @pending_linked_timesheet_entry_ids = nil
@@ -109,12 +118,16 @@ class InvoiceLineItem < ApplicationRecord
       errors.add(:timesheet_entry, :not_found)
     end
 
+    # Pending ids replace the current links at save, so only they are checked;
+    # links that the replacement removes do not block it.
     def linked_timesheet_entries_found_in_invoice_company
-      unresolved_ids = !@pending_linked_timesheet_entry_ids.nil? && pending_linked_entries_in_invoice_company.nil?
-      foreign_entry = invoice.present? &&
-        linked_timesheet_entries.any? { |entry| entry.company_id != invoice.company_id }
+      found = if pending_linked_timesheet_entry_ids?
+        !pending_linked_entries_in_invoice_company.nil?
+      else
+        invoice.blank? || linked_timesheet_entries.all? { |entry| entry.company_id == invoice.company_id }
+      end
 
-      errors.add(:linked_timesheet_entries, :not_found) if unresolved_ids || foreign_entry
+      errors.add(:linked_timesheet_entries, :not_found) unless found
     end
 
     def unlock_timesheet_entries

@@ -508,4 +508,54 @@ RSpec.describe InvoiceLineItem, type: :model do
     line.save!
     expect(InvoiceLineItemTimeEntry.where(invoice_line_item_id: line.id).pluck(:timesheet_entry_id)).to eq([entry.id])
   end
+
+  it "reads zero-padded linked ids as decimal, the way the id column casts them" do
+    invoice = create(:invoice)
+    project = create(:project, client: invoice.client, billable: true)
+    user = create(:user, current_workspace: invoice.company)
+    entry = create(:timesheet_entry, user:, project:, bill_status: "unbilled")
+    line = create(:invoice_line_item, invoice:, timesheet_entry: nil)
+
+    line.linked_timesheet_entry_ids = ["0#{entry.id}"]
+    line.save!
+
+    expect(line.reload.linked_timesheet_entries).to eq([entry])
+  end
+
+  it "clears and replaces links even when a current link no longer belongs to the invoice's company" do
+    invoice = create(:invoice)
+    project = create(:project, client: invoice.client, billable: true)
+    user = create(:user, current_workspace: invoice.company)
+    stale_entry = create(:timesheet_entry, user:, project:, bill_status: "unbilled")
+    replacement = create(:timesheet_entry, user:, project:, bill_status: "unbilled")
+    line = create(:invoice_line_item, invoice:, timesheet_entry: nil)
+    create(:invoice_line_item_time_entry, invoice_line_item: line, timesheet_entry: stale_entry)
+    stale_entry.update_column(:company_id, nil)
+
+    line = InvoiceLineItem.find(line.id)
+    line.linked_timesheet_entry_ids = [replacement.id]
+    expect(line.save).to be(true)
+    expect(line.reload.linked_timesheet_entries).to eq([replacement])
+
+    line.linked_timesheet_entry_ids = []
+    expect(line.save).to be(true)
+    expect(InvoiceLineItemTimeEntry.where(invoice_line_item_id: line.id)).to be_empty
+  end
+
+  it "refuses the save when a pending linked entry stops resolving after validation" do
+    invoice = create(:invoice)
+    project = create(:project, client: invoice.client, billable: true)
+    user = create(:user, current_workspace: invoice.company)
+    entry = create(:timesheet_entry, user:, project:, bill_status: "unbilled")
+    line = create(:invoice_line_item, invoice:, timesheet_entry: nil)
+    line.linked_timesheet_entry_ids = [entry.id]
+    expect(line).to be_valid
+
+    # Stands for another transaction moving the entry out of the company between validation and save.
+    entry.update_column(:company_id, nil)
+
+    expect(line.save(validate: false)).to be(false)
+    expect(line.errors[:linked_timesheet_entries]).to eq(["not found"])
+    expect(InvoiceLineItemTimeEntry.where(invoice_line_item_id: line.id)).to be_empty
+  end
 end
