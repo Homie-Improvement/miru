@@ -10,14 +10,9 @@ RSpec.describe Timekeeping::ProjectionConsumer do
   let(:receipt_user) { create(:user).tap { |user| create(:employment, company: receipt_company, user:) } }
 
   def receipt_batch(version:)
-    entry = TimekeepingContract.load(:entry_snapshots).fetch("entry_fields").index_with(nil).merge(
-      "id" => 80_101, "company_id" => receipt_company.id, "version" => version, "project_id" => receipt_project.id,
-      "user_id" => receipt_user.id, "work_date" => "2026-03-02", "duration" => 90.0, "note" => "v#{version}",
-      "bill_status" => "unbilled", "review_status" => "not_required", "locked" => false, "source" => "manual",
-      "source_metadata" => {}, "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z",
-      "updated_at" => "2026-03-02T09:00:00Z"
-    )
-    { "schema_version" => 1, "snapshots" => [{ "generation" => 1, "outbox_position" => 5, "entry" => entry }] }
+    entry = TimekeepingSnapshots.entry(id: 80_101, company_id: receipt_company.id, version:,
+                                       project_id: receipt_project.id, user_id: receipt_user.id)
+    TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation: 1, outbox_position: 5))
   end
 
   it "replays the first answer for the same key and batch after the flip and rejects a changed batch under that key" do
@@ -44,14 +39,9 @@ RSpec.describe Timekeeping::ProjectionConsumer do
   let(:retry_user) { create(:user).tap { |user| create(:employment, company: retry_company, user:) } }
 
   def retry_batch(generation:)
-    entry = TimekeepingContract.load(:entry_snapshots).fetch("entry_fields").index_with(nil).merge(
-      "id" => 80_201, "company_id" => retry_company.id, "version" => 1, "project_id" => retry_project.id,
-      "user_id" => retry_user.id, "work_date" => "2026-03-02", "duration" => 90.0, "note" => "v1",
-      "bill_status" => "unbilled", "review_status" => "not_required", "locked" => false, "source" => "manual",
-      "source_metadata" => {}, "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z",
-      "updated_at" => "2026-03-02T09:00:00Z"
-    )
-    { "schema_version" => 1, "snapshots" => [{ "generation" => generation, "outbox_position" => 1, "entry" => entry }] }
+    entry = TimekeepingSnapshots.entry(id: 80_201, company_id: retry_company.id, version: 1,
+                                       project_id: retry_project.id, user_id: retry_user.id)
+    TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation:))
   end
 
   it "does not store a 409 so a retry under the same key is evaluated again and applies" do

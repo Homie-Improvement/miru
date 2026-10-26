@@ -1,11 +1,14 @@
 # frozen_string_literal: true
 
 class InvoiceLineItem < ApplicationRecord
+  include BillingFenced
+
   belongs_to :invoice
   belongs_to :timesheet_entry, optional: true
   has_many :invoice_line_item_time_entries, dependent: :destroy
   has_many :linked_timesheet_entries, through: :invoice_line_item_time_entries, source: :timesheet_entry
 
+  before_save :link_pending_linked_timesheet_entries
   before_update :capture_previous_invoice_id, if: :will_save_change_to_invoice_id?
   before_destroy :unlock_timesheet_entries
   after_save :sync_invoice_totals
@@ -14,11 +17,9 @@ class InvoiceLineItem < ApplicationRecord
   validates :name, :date, :rate, :quantity, presence: true
   validates :rate, numericality: { greater_than_or_equal_to: 0 }
   validates :quantity, numericality: { greater_than_or_equal_to: 0 }
-  # No database key checks this column, so a supplied id must name a real entry.
   # Manual lines keep a NULL timesheet_entry_id.
-  validates :timesheet_entry, presence: { message: :required }, unless: -> { timesheet_entry_id.nil? }
-  validate :timesheet_entry_belongs_to_invoice_company
-  validate :linked_timesheet_entries_belong_to_invoice_company
+  validate :timesheet_entry_found_in_invoice_company, unless: -> { timesheet_entry_id.nil? }
+  validate :linked_timesheet_entries_found_in_invoice_company
 
   def self.total_cost_of_all_line_items
     (self.sum("quantity * rate") / 60.0).round(3)
@@ -54,22 +55,81 @@ class InvoiceLineItem < ApplicationRecord
     CompanyDateFormattingService.new(date, company: invoice.company).process
   end
 
+  # The Rails ids writer would look the ids up in every company, and raise
+  # RecordNotFound for a missing one, so a caller could tell a missing id from
+  # another company's id. The ids are kept here and resolved within the
+  # invoice's company at validation and save, when nested attributes have set
+  # the invoice.
+  def linked_timesheet_entry_ids=(ids)
+    id_type = TimesheetEntry.type_for_attribute(:id)
+    @pending_linked_timesheet_entry_ids = Array(ids).reject(&:blank?).map { |id| id_type.cast(id) }.uniq
+  end
+
+  # Nested invoice saves validate and save only children that report a change.
+  # Pending linked ids change no column, so they are counted here.
+  def changed_for_autosave?
+    super || pending_linked_timesheet_entry_ids?
+  end
+
   private
 
-    def timesheet_entry_belongs_to_invoice_company
-      return if timesheet_entry.blank? || invoice.blank?
-      return if timesheet_entry.company&.id == invoice.company_id
+    def entries_in_invoice_company
+      return TimesheetEntry.none if invoice.blank?
 
-      errors.add(:timesheet_entry, "must belong to the same company")
+      TimesheetEntry.where(company_id: invoice.company_id)
     end
 
-    def linked_timesheet_entries_belong_to_invoice_company
-      return if invoice.blank? || linked_timesheet_entries.blank?
+    def pending_linked_timesheet_entry_ids?
+      !@pending_linked_timesheet_entry_ids.nil?
+    end
 
-      invalid_entry = linked_timesheet_entries.find { |entry| entry.company&.id != invoice.company_id }
-      return unless invalid_entry
+    # The pending ids' entries, or nil when any id is not an entry of the
+    # invoice's company. The rows are key-share locked, like the direct entry,
+    # so none can be deleted between this lookup and the save's commit.
+    def pending_linked_entries_in_invoice_company
+      requested_ids = @pending_linked_timesheet_entry_ids
+      entries = entries_in_invoice_company.where(id: requested_ids.compact).lock("FOR KEY SHARE").to_a
+      entries if entries.size == requested_ids.size
+    end
 
-      errors.add(:linked_timesheet_entries, "must belong to the same company")
+    # Assigning links on a saved line writes join rows at once, so it waits for
+    # save and validation stays read-only. Ids that stopped resolving after
+    # validation refuse the save rather than leave the old links in place.
+    def link_pending_linked_timesheet_entries
+      return unless pending_linked_timesheet_entry_ids?
+
+      entries = pending_linked_entries_in_invoice_company
+      if entries.nil?
+        errors.add(:linked_timesheet_entries, :not_found)
+        throw :abort
+      end
+
+      self.linked_timesheet_entries = entries
+      @pending_linked_timesheet_entry_ids = nil
+    end
+
+    # Missing ids, other companies' ids and entries with no company get the same
+    # error, so no response shows whether an id exists in another company.
+    # No database key checks timesheet_entry_id, so the row is locked to stop it
+    # being deleted before this save commits. FOR KEY SHARE still blocks a
+    # delete but not the later update of the entry's locked flag; FOR SHARE
+    # would deadlock two invoices saving the same entry at once.
+    def timesheet_entry_found_in_invoice_company
+      return if entries_in_invoice_company.where(id: timesheet_entry_id).lock("FOR KEY SHARE").exists?
+
+      errors.add(:timesheet_entry, :not_found)
+    end
+
+    # Pending ids replace the current links at save, so only they are checked;
+    # links that the replacement removes do not block it.
+    def linked_timesheet_entries_found_in_invoice_company
+      found = if pending_linked_timesheet_entry_ids?
+        !pending_linked_entries_in_invoice_company.nil?
+      else
+        invoice.blank? || linked_timesheet_entries.all? { |entry| entry.company_id == invoice.company_id }
+      end
+
+      errors.add(:linked_timesheet_entries, :not_found) unless found
     end
 
     def unlock_timesheet_entries

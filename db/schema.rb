@@ -439,7 +439,8 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_26_130000) do
 
   create_table "entry_audits", force: :cascade do |t|
     t.string "action", null: false
-    t.bigint "actor_id", null: false
+    t.bigint "actor_id"
+    t.string "actor_name"
     t.string "actor_type", null: false
     t.jsonb "after", null: false
     t.jsonb "before"
@@ -448,6 +449,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_26_130000) do
     t.datetime "entry_created_at", null: false
     t.bigint "entry_id", null: false
     t.index ["company_id", "entry_id"], name: "index_entry_audits_on_company_id_and_entry_id"
+    t.check_constraint "actor_type::text = 'service'::text AND actor_name IS NOT NULL OR actor_type::text <> 'service'::text AND actor_id IS NOT NULL", name: "entry_audits_actor_check"
   end
 
   create_table "entry_outbox_items", primary_key: "outbox_position", force: :cascade do |t|
@@ -1056,6 +1058,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_26_130000) do
     t.string "disposition", null: false
     t.bigint "entry_id", null: false
     t.bigint "invoice_id", null: false
+    t.bigint "invoice_operation_id"
     t.uuid "operation_id", null: false
     t.string "state", null: false
     t.index ["company_id", "entry_id"], name: "index_reservations_on_company_id_and_entry_id"

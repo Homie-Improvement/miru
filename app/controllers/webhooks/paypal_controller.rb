@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 class Webhooks::PaypalController < ActionController::API
+  include OwnershipMovingResponse
+
   before_action { Rails.event.set_context(source: "paypal_webhook", request_id: request.request_id) }
   MAX_WEBHOOK_BODY_BYTES = 1.megabyte
 
@@ -17,6 +19,10 @@ class Webhooks::PaypalController < ActionController::API
       log_failure(fulfillment, status)
       render json: { error: fulfillment.error || "Unable to process PayPal webhook" }, status:
     end
+  rescue Timekeeping::BillingFence::OwnershipMoving => exception
+    # A retryable 503, so PayPal redelivers the event after the handoff; a 500
+    # or 200 here would lose the customer's payment.
+    render_ownership_moving(exception)
   rescue StandardError => exception
     log_processing_error(exception)
     render json: { error: "Unable to process PayPal webhook" }, status: 500

@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 class ClientPaymentMailer < ApplicationMailer
+  self.delivery_job = BillingFencedMailDeliveryJob
+
   def payment
     @invoice = Invoice.find(params[:invoice_id])
     @invoice_url = "#{ENV['APP_BASE_URL']}/invoices/#{@invoice.external_view_key}/view"
@@ -16,7 +18,8 @@ class ClientPaymentMailer < ApplicationMailer
         reply_to: default_reply_to_address
       )
 
-      @invoice.update_columns(client_payment_sent_at: DateTime.current)
+      # update_columns skips the model's billing guard, so the fence is taken here.
+      Timekeeping::BillingFence.transaction { @invoice.update_columns(client_payment_sent_at: DateTime.current) }
     end
   end
 

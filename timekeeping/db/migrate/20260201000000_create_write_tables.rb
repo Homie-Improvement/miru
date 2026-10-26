@@ -19,9 +19,10 @@ class CreateWriteTables < ActiveRecord::Migration[8.1]
       t.index %i[company_id entry_id]
     end
 
-    # The entry snapshot outbox. Its columns are exactly
+    # The entry snapshot outbox. The columns created here are exactly
     # contracts/timekeeping/entry_snapshots.yml entry_fields plus generation and
     # outbox_position, so a row carries ids and never a name, email or token.
+    # AddRelayColumnsToOutboxSnapshots adds the relay's bookkeeping columns.
     # id is the entry's id; outbox_position is the sequence-backed key the
     # relay delivers in order. A rolled-back write leaves a gap in positions.
     create_table :outbox_snapshots, primary_key: :outbox_position do |t|

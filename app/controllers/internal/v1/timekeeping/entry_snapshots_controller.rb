@@ -10,13 +10,19 @@ class Internal::V1::Timekeeping::EntrySnapshotsController < Internal::V1::BaseCo
     render json: result.body, status: result.status
   end
 
+  # The deepest batch Timekeeping can send: an entry body it admitted under
+  # JSON's default limit of 100 levels, carried three levels down (batch,
+  # snapshots list, item). The relay delivers in order and never skips a row,
+  # so a stored snapshot this parser refused would hold back every later one.
+  BATCH_MAX_NESTING = 103
+
   private
 
     # The raw body, not params: the consumer checks the contract's exact key
     # lists, which Rails parameter wrapping would extend with its own key.
     # A body that is not JSON reaches the consumer as nil and is refused there.
     def batch
-      JSON.parse(request.raw_post)
+      JSON.parse(request.raw_post, max_nesting: BATCH_MAX_NESTING)
     rescue JSON::ParserError
       nil
     end

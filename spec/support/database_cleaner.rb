@@ -30,10 +30,13 @@ module TestDatabaseCleanup
     end
   end
 
-  # System, committed_data and without_transaction examples run with no
-  # enclosing transaction.
-  def committed?(metadata)
-    metadata[:type] == :system || metadata[:committed_data] || metadata[:without_transaction]
+  # System, committed_data (spec/support/committed_data.rb) and
+  # without_transaction examples run with no enclosing transaction, so their
+  # writes really commit.
+  def committed?(example)
+    example.metadata[:type] == :system ||
+      example.metadata[:without_transaction] ||
+      CommittedDataMode.example?(example)
   end
 end
 
@@ -50,25 +53,21 @@ RSpec.configure do |config|
     DatabaseCleaner.strategy = :transaction
   end
 
-  config.before do
-    DatabaseCleaner.start unless TestDatabaseCleanup.committed?(RSpec.current_example.metadata)
+  config.before do |example|
+    DatabaseCleaner.start unless TestDatabaseCleanup.committed?(example)
   end
 
-  config.append_after do
-    DatabaseCleaner.clean unless TestDatabaseCleanup.committed?(RSpec.current_example.metadata)
+  config.append_after do |example|
+    DatabaseCleaner.clean unless TestDatabaseCleanup.committed?(example)
   end
 
   config.before(:each, type: :system) do
     TestDatabaseCleanup.delete_all_committed!
   end
 
+  # Before as well as after (the after step is in spec/support/committed_data.rb):
+  # a tagged example starts from committed-empty tables whatever ran before it.
   config.before(:each, committed_data: true) do
-    TestDatabaseCleanup.delete_all_committed!
-  end
-
-  # Also after: a committed row left here would reach the next example,
-  # whatever order the suite runs in.
-  config.append_after(:each, committed_data: true) do
     TestDatabaseCleanup.delete_all_committed!
   end
 

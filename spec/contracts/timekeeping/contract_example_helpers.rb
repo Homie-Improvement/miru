@@ -83,12 +83,7 @@ module TimekeepingContractExampleHelpers
   # foreign keys to them can store the row.
   def snapshot_item(entry_id:, company:, version:, generation: timekeeping_arrange.current_generation, outbox_position: version,
                     project: timekeeping_arrange.project(company:), user: timekeeping_arrange.user(company:, role: "employee"), **fields)
-    entry = TimekeepingContract.load(:entry_snapshots).fetch("entry_fields").index_with(nil).merge(
-      "id" => entry_id, "company_id" => company, "version" => version, "project_id" => project, "user_id" => user,
-      "work_date" => "2026-03-02", "duration" => 90.0, "note" => "v#{version}", "bill_status" => "unbilled",
-      "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
-      "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z", "updated_at" => "2026-03-02T09:00:00Z"
-    ).merge(fields.transform_keys(&:to_s))
-    { "generation" => generation, "outbox_position" => outbox_position, "entry" => entry }
+    entry = TimekeepingSnapshots.entry(id: entry_id, company_id: company, version:, project_id: project, user_id: user, **fields)
+    TimekeepingSnapshots.item(entry, generation:, outbox_position:)
   end
 end

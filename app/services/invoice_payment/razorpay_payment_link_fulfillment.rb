@@ -15,11 +15,15 @@ class InvoicePayment::RazorpayPaymentLinkFulfillment < ApplicationService
     return false unless payment_link["status"] == "paid"
 
     payment = nil
-    invoice.with_lock do
-      return true if invoice.paid?
+    # The ownership lock is taken before the invoice lock, in the same order
+    # as the Razorpay webhook, so the two paths cannot deadlock during a handoff.
+    Timekeeping::BillingFence.transaction do
+      invoice.with_lock do
+        return true if invoice.paid?
 
-      payment = InvoicePayment::Settle.process(payment_params(payment_link), invoice)
-      invoice.update!(razorpay_payment_id:)
+        payment = InvoicePayment::Settle.process(payment_params(payment_link), invoice)
+        invoice.update!(razorpay_payment_id:)
+      end
     end
 
     enqueue_auto_payout(payment)

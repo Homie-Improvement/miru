@@ -5,6 +5,7 @@ class Invoice < ApplicationRecord
   include InvoiceSendable
   include ClientPaymentSendable
   include Searchable
+  include BillingFenced
 
   # Audit currency conversions and amount changes
   audited associated_with: :company,

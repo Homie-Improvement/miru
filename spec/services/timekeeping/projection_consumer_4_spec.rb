@@ -10,20 +10,14 @@ RSpec.describe Timekeeping::ProjectionConsumer do
     project = create(:project, client: create(:client, company:))
     user = create(:user)
     create(:employment, company:, user:)
-    contract = TimekeepingContract.load(:entry_snapshots)
     item = lambda do |version, position|
-      entry = contract.fetch("entry_fields").index_with(nil).merge(
-        "id" => 90_101, "company_id" => company.id, "version" => version, "project_id" => project.id,
-        "user_id" => user.id, "work_date" => "2026-03-02", "duration" => 90.0, "note" => "v#{version}",
-        "bill_status" => "unbilled", "review_status" => "not_required", "locked" => false, "source" => "manual",
-        "source_metadata" => {}, "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z",
-        "updated_at" => "2026-03-02T09:00:00Z"
-      )
-      { "generation" => TimekeepingOwnership.current.generation, "outbox_position" => position, "entry" => entry }
+      entry = TimekeepingSnapshots.entry(id: 90_101, company_id: company.id, version:, project_id: project.id,
+                                         user_id: user.id)
+      TimekeepingSnapshots.item(entry, generation: TimekeepingOwnership.current.generation, outbox_position: position)
     end
 
     # Listed out of order on purpose: the consumer applies snapshots in outbox_position order.
-    batch = { "schema_version" => contract.fetch("schema_version"), "snapshots" => [item.call(2, 2), item.call(1, 1)] }
+    batch = TimekeepingSnapshots.batch(item.call(2, 2), item.call(1, 1))
     result = described_class.call(batch:, idempotency_key: nil)
 
     # "It upserts by entry `id` and applies a snapshot only when its `version` is higher than the row's."
@@ -43,17 +37,10 @@ RSpec.describe Timekeeping::ProjectionConsumer do
     user = create(:user)
     create(:employment, company: company_a, user:)
     create(:employment, company: company_b, user:)
-    contract = TimekeepingContract.load(:entry_snapshots)
     batch_for = lambda do |company, project, version|
-      entry = contract.fetch("entry_fields").index_with(nil).merge(
-        "id" => 90_201, "company_id" => company.id, "version" => version, "project_id" => project.id,
-        "user_id" => user.id, "work_date" => "2026-03-02", "duration" => 90.0, "note" => "v#{version}",
-        "bill_status" => "unbilled", "review_status" => "not_required", "locked" => false, "source" => "manual",
-        "source_metadata" => {}, "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z",
-        "updated_at" => "2026-03-02T09:00:00Z"
-      )
-      { "schema_version" => contract.fetch("schema_version"),
-        "snapshots" => [{ "generation" => TimekeepingOwnership.current.generation, "outbox_position" => version, "entry" => entry }] }
+      entry = TimekeepingSnapshots.entry(id: 90_201, company_id: company.id, version:, project_id: project.id,
+                                         user_id: user.id)
+      TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation: TimekeepingOwnership.current.generation))
     end
     read_row = -> { ActiveRecord::Base.connection.select_one("SELECT * FROM timesheet_entries WHERE id = 90201") }
 
@@ -76,17 +63,10 @@ RSpec.describe Timekeeping::ProjectionConsumer do
     project = create(:project, client: create(:client, company:))
     user = create(:user)
     create(:employment, company:, user:)
-    contract = TimekeepingContract.load(:entry_snapshots)
     batch_for = lambda do |version, discarded_at|
-      entry = contract.fetch("entry_fields").index_with(nil).merge(
-        "id" => 90_301, "company_id" => company.id, "version" => version, "project_id" => project.id,
-        "user_id" => user.id, "work_date" => "2026-03-02", "duration" => 90.0, "note" => "v#{version}",
-        "bill_status" => "unbilled", "review_status" => "not_required", "locked" => false, "source" => "manual",
-        "source_metadata" => {}, "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z",
-        "updated_at" => "2026-03-02T09:00:00Z", "discarded_at" => discarded_at
-      )
-      { "schema_version" => contract.fetch("schema_version"),
-        "snapshots" => [{ "generation" => TimekeepingOwnership.current.generation, "outbox_position" => version, "entry" => entry }] }
+      entry = TimekeepingSnapshots.entry(id: 90_301, company_id: company.id, version:, project_id: project.id,
+                                         user_id: user.id, discarded_at:)
+      TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation: TimekeepingOwnership.current.generation))
     end
 
     # "A discard arrives as a snapshot with `discarded_at` set (a 'tombstone'), never as a row delete."
@@ -120,16 +100,9 @@ RSpec.describe Timekeeping::ProjectionConsumer do
     user = create(:user)
     create(:employment, company:, user:)
     ordinary = create(:timesheet_entry, user:, project:)
-    contract = TimekeepingContract.load(:entry_snapshots)
-    entry = contract.fetch("entry_fields").index_with(nil).merge(
-      "id" => ordinary.id + 1000, "company_id" => company.id, "version" => 1, "project_id" => project.id,
-      "user_id" => user.id, "work_date" => "2026-03-02", "duration" => 90.0, "note" => "v1",
-      "bill_status" => "unbilled", "review_status" => "not_required", "locked" => false, "source" => "manual",
-      "source_metadata" => {}, "proof_metadata" => {}, "created_at" => "2026-03-02T09:00:00Z",
-      "updated_at" => "2026-03-02T09:00:00Z"
-    )
-    batch = { "schema_version" => contract.fetch("schema_version"),
-              "snapshots" => [{ "generation" => TimekeepingOwnership.current.generation, "outbox_position" => 1, "entry" => entry }] }
+    entry = TimekeepingSnapshots.entry(id: ordinary.id + 1000, company_id: company.id, version: 1,
+                                       project_id: project.id, user_id: user.id)
+    batch = TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation: TimekeepingOwnership.current.generation))
 
     result = described_class.call(batch:, idempotency_key: nil)
 
