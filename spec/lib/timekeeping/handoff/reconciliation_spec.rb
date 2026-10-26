@@ -462,8 +462,9 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
     tables
   end
 
-  def recon_checks_run(checkpoint_tables: recon_checks_tables, projection: nil,
-                       intents: [recon_checks_intent(101), recon_checks_intent(202)], **options)
+  def recon_checks_run(checkpoint_tables: recon_checks_tables, projection: nil, source_tables: recon_checks_tables,
+                       intents: [recon_checks_intent(101), recon_checks_intent(202)],
+                       source_intents: [recon_checks_intent(101), recon_checks_intent(202)], **options)
     projection ||= checkpoint_tables["entries"].map do |row|
       row.merge(
         "bill_status" => TimesheetEntry.bill_statuses.fetch(row["bill_status"]),
@@ -472,9 +473,9 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
     end
     money = [101, 202].index_with { |company_id| { company_id:, values: {} } }
     described_class.run(
-      source: Timekeeping::Handoff::Checkpoint.build(tables: recon_checks_tables),
+      source: Timekeeping::Handoff::Checkpoint.build(tables: source_tables),
       checkpoint: Timekeeping::Handoff::Checkpoint.build(tables: checkpoint_tables),
-      projection:, source_intents: [recon_checks_intent(101), recon_checks_intent(202)], intents:,
+      projection:, source_intents:, intents:,
       next_entry_id: 2, money_before: money, money_after: money, **options
     )
   end
@@ -612,6 +613,186 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
       expect { described_class.report(result) }.to change { stored.count }.by(2)
     end
     expect(stored.order(:id).last(2).map { |row| row.payload["data"]["company_id"] }).to eq([101, 101])
+  end
+
+  it "separates totals by user and by month when the company total is unchanged" do
+    entries = lambda do |durations|
+      [
+        recon_checks_entry(101, duration: durations[0]),
+        recon_checks_entry(101, id: 2, duration: durations[1], work_date: Date.new(2026, 2, 3), locked: false),
+        recon_checks_entry(101, id: 3, user_id: 2, duration: durations[2], locked: false)
+      ]
+    end
+    result = recon_checks_run(
+      source_tables: recon_checks_tables(entries: entries.call([60.0, 60.0, 60.0])),
+      checkpoint_tables: recon_checks_tables(entries: entries.call([90.0, 45.0, 45.0]))
+    )
+
+    totals = result.companies.fetch(101).checks.fetch(:totals)
+    expect(totals.map { |difference| [difference.row_key, difference.field] }).to contain_exactly(
+      [[1, "2026-01"], "duration_sum"], [[1, "2026-02"], "duration_sum"], [[2, "2026-01"], "duration_sum"]
+    )
+    expect(result.companies.fetch(101)).to be_abort
+    expect(result.companies.fetch(202).checks.values.flatten).to eq([])
+  end
+
+  it "reports a changed count when an entry moves to another month" do
+    moved = [recon_checks_entry(101), recon_checks_entry(101, id: 2, locked: false)]
+    result = recon_checks_run(
+      source_tables: recon_checks_tables(entries: moved),
+      checkpoint_tables: recon_checks_tables(entries: [moved[0], moved[1].merge("work_date" => Date.new(2026, 2, 3))])
+    )
+    totals = result.companies.fetch(101).checks.fetch(:totals)
+    expect(totals.map { |difference| [difference.row_key, difference.field, difference.reason] })
+      .to include([[1, "2026-01"], "count", :changed], [[1, "2026-02"], nil, :missing_in_source])
+    expect(result.companies.fetch(202).checks.fetch(:totals)).to eq([])
+  end
+
+  it "passes a failed intent whose operation aborted and a failed intent with no operation" do
+    failed_intents = [recon_checks_intent(101, state: "failed"), recon_checks_intent(202)]
+    aborted = recon_checks_tables(invoice_operations: [recon_checks_operation(101, state: "aborted")])
+    with_abort = recon_checks_run(
+      source_tables: aborted, checkpoint_tables: aborted, intents: failed_intents, source_intents: failed_intents
+    )
+    expect(with_abort.companies.fetch(101).checks.fetch(:operation_receipts)).to eq([])
+    expect(with_abort).not_to be_abort
+
+    no_operation = recon_checks_tables(invoice_operations: [])
+    without = recon_checks_run(
+      source_tables: no_operation, checkpoint_tables: no_operation, intents: failed_intents,
+      source_intents: failed_intents
+    )
+    expect(without.companies.fetch(101).checks.fetch(:operation_receipts)).to eq([])
+    expect(without).not_to be_abort
+  end
+
+  it "reports a changed operation row whose state rules still hold" do
+    tables = recon_checks_tables(invoice_operations: [recon_checks_operation(101, desired_entry_ids: [1, 2])])
+    result = recon_checks_run(checkpoint_tables: tables)
+    differences = result.companies.fetch(101).checks.fetch(:operation_receipts)
+    expect(differences.map { |difference| [difference.table, difference.row_key, difference.field, difference.reason] })
+      .to eq([["invoice_operations", [recon_checks_operation_id], "desired_entry_ids", :changed]])
+    expect_recon_checks_abort_in_a(result, :operation_receipts, reason: :changed, field: "desired_entry_ids")
+  end
+
+  it "does not let another invoice's committed operation settle an intent" do
+    other_invoice_intents = [recon_checks_intent(101, invoice_id: 20), recon_checks_intent(202)]
+    result = recon_checks_run(intents: other_invoice_intents, source_intents: other_invoice_intents)
+    expect_recon_checks_abort_in_a(result, :operation_receipts, reason: :intent_without_committed_operation)
+  end
+
+  it "does not let an operation row correction explain the matching intent row change" do
+    tables = recon_checks_tables(invoice_operations: [recon_checks_operation(101, invoice_id: 2)])
+    intents = [recon_checks_intent(101, invoice_id: 2), recon_checks_intent(202)]
+    correction = described_class::Correction.new(
+      check: :operation_receipts, row_key: [recon_checks_operation_id], field: "invoice_id"
+    )
+    result = recon_checks_run(checkpoint_tables: tables, intents:, listed_corrections: { 101 => [correction] })
+
+    report = result.companies.fetch(101)
+    expect(report.listed.map(&:table)).to eq(["invoice_operations"])
+    expect(report.unlisted.map(&:table).uniq).to eq(["invoice_operation_intents"])
+    expect(report).to be_abort
+  end
+
+  it "still aborts on a duplicate committed reservation when the added row is listed" do
+    source = recon_checks_tables(reservations: [])
+    loaded = recon_checks_tables(reservations: [recon_checks_reservation(101), recon_checks_reservation(101, invoice_id: 2)])
+    correction = described_class::Correction.new(check: :reservations, row_key: [1, "committed"], field: nil)
+    result = recon_checks_run(source_tables: source, checkpoint_tables: loaded, listed_corrections: { 101 => [correction] })
+
+    report = result.companies.fetch(101)
+    expect(report.listed.map(&:reason)).to include(:missing_in_source)
+    expect(report.unlisted.map(&:reason)).to include(:duplicate_key)
+    expect(report).to be_abort
+    expect(result.companies.fetch(202)).not_to be_abort
+  end
+
+  it "keeps an unmatched projection row with a company under that company" do
+    source = recon_checks_tables.merge(
+      "entries" => [recon_checks_entry(101, id: 7, locked: false), recon_checks_entry(202, id: 8, locked: false)],
+      "reservations" => []
+    )
+    projection = (source["entries"] + [recon_checks_entry(202, id: 7, locked: false)]).map do |row|
+      row.merge(
+        "bill_status" => TimesheetEntry.bill_statuses.fetch(row["bill_status"]),
+        "review_status" => TimesheetEntry.review_statuses.fetch(row["review_status"])
+      )
+    end
+    result = recon_checks_run(source_tables: source, checkpoint_tables: source, projection:)
+
+    expect(result.companies.fetch(101).checks.fetch(:projection)).to eq([])
+    expect(result.companies.fetch(202).checks.fetch(:projection).map { |difference| [difference.row_key, difference.reason] })
+      .to eq([[[7], :missing_in_checkpoint]])
+    expect(result.companies.fetch(202)).to be_abort
+    expect(result.unassigned).to eq([])
+  end
+
+  it "reports a projection that unlocked an entry the checkpoint keeps locked" do
+    unreserved = recon_checks_tables(reservations: [])
+    projection = unreserved["entries"].map do |row|
+      row.merge(
+        "bill_status" => TimesheetEntry.bill_statuses.fetch(row["bill_status"]),
+        "review_status" => TimesheetEntry.review_statuses.fetch(row["review_status"]),
+        "locked" => row["company_id"] == 202
+      )
+    end
+    result = recon_checks_run(
+      source_tables: recon_checks_tables(reservations: []), checkpoint_tables: unreserved, projection:
+    )
+    expect_recon_checks_abort_in_a(result, :projection, reason: :changed, field: "locked")
+  end
+
+  it "reads no database while it runs" do
+    recon_checks_run
+    queries = []
+    subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") { |*, payload| queries << payload[:sql] }
+    begin
+      recon_checks_run
+    ensure
+      ActiveSupport::Notifications.unsubscribe(subscriber)
+    end
+    expect(queries).to eq([])
+  end
+
+  it "reports a stored discount and the printed values it moves, by identifiers only" do
+    before_values = {
+      [:invoice, 9, :discount] => BigDecimal("5"), [:pdf_total, 9, :invoice_discount] => "$5.00",
+      [:pdf_total, 9, :total] => "$95.00"
+    }
+    after_values = {
+      [:invoice, 9, :discount] => BigDecimal("15"), [:pdf_total, 9, :invoice_discount] => "$15.00",
+      [:pdf_total, 9, :total] => "$85.00"
+    }
+    money_before = { 101 => { company_id: 101, values: before_values }, 202 => { company_id: 202, values: {} } }
+    money_after = { 101 => { company_id: 101, values: after_values }, 202 => { company_id: 202, values: {} } }
+    result = recon_checks_run(money_before:, money_after:)
+
+    money = result.companies.fetch(101).checks.fetch(:money)
+    expect(money.map { |difference| [difference.company_id, difference.row_key, difference.field] }).to contain_exactly(
+      [101, [:invoice, 9], :discount], [101, [:pdf_total, 9], :invoice_discount], [101, [:pdf_total, 9], :total]
+    )
+
+    financial = RailsEventViewer::Entry.where(name: "Timekeeping::FinancialSnapshotChanged")
+    reconciliation = RailsEventViewer::Entry.where(name: "Timekeeping::ReconciliationDifferenceFound")
+    expect { described_class.report(result) }
+      .to change { financial.count }.by(3).and change { reconciliation.count }.by(3)
+
+    stored = financial.order(:id).last(3).map { |row| row.payload["data"] }
+    expect(stored.map { |data| [data["company_id"], data["kind"], data["record_id"], data["field"]] })
+      .to contain_exactly([101, "invoice", 9, "discount"], [101, "pdf_total", 9, "invoice_discount"],
+                          [101, "pdf_total", 9, "total"])
+    expect(reconciliation.order(:id).last(3).map { |row| row.payload["data"]["company_id"] }).to eq([101, 101, 101])
+  end
+
+  it "accepts intent rows with their stored id and compares that id" do
+    with_ids = [recon_checks_intent(101, id: 1), recon_checks_intent(202, id: 2)]
+    expect(recon_checks_run(source_intents: with_ids, intents: with_ids)).not_to be_abort
+
+    changed = recon_checks_run(
+      source_intents: with_ids, intents: [recon_checks_intent(101, id: 9), recon_checks_intent(202, id: 2)]
+    )
+    expect_recon_checks_abort_in_a(changed, :operation_receipts, reason: :changed, field: "id")
   end
 
   it "keeps the check table frozen" do

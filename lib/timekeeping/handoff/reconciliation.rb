@@ -29,9 +29,12 @@ module Timekeeping
 
       # A difference the pre-flight expects for one company. It explains only
       # the difference with the same check, row and field, so a second change
-      # on the same row still aborts.
+      # on the same row still aborts. A key held by two rows is never one
+      # correction: the pre-flight lists single rows, so a duplicate always aborts.
       Correction = Data.define(:check, :row_key, :field) do
         def explains?(difference)
+          return false if difference.reason == :duplicate_key
+
           check == difference.check && row_key == difference.row_key && field&.to_s == difference.field&.to_s
         end
       end
@@ -102,8 +105,11 @@ module Timekeeping
       }.freeze
 
       # The columns of a monolith invoice_operation_intents row. Intents are
-      # not checkpoint rows, so they have their own shape here.
-      INTENT_COLUMNS = %w[company_id invoice_id operation_id generation state created_at finished_at].freeze
+      # not checkpoint rows, so they have their own shape here. id is compared
+      # when a caller reads it, but a row may leave it out, because the
+      # table's unique key is (company_id, invoice_id, operation_id).
+      INTENT_COLUMNS = %w[id company_id invoice_id operation_id generation state created_at finished_at].freeze
+      OPTIONAL_INTENT_COLUMNS = %w[id].freeze
 
       # The columns of a timesheet_entries row, which are the checkpoint
       # entry's columns.
@@ -115,6 +121,9 @@ module Timekeeping
       ENTRY_KEY = ->(row) { [row["id"]] }
       RESERVATION_KEY = ->(row) { [row["entry_id"], row["state"]] }
       OPERATION_KEY = ->(row) { [row["operation_id"]] }
+      # An intent and the operation it settles share both the invoice and the
+      # operation id, so an operation of another invoice never answers for it.
+      RECEIPT_LINK_KEY = ->(row) { [row["invoice_id"], row["operation_id"]] }
 
       # What an intent's state requires of the operations with its
       # operation_id: the reason it breaks the rule, or nil when it holds.
@@ -222,8 +231,8 @@ module Timekeeping
           def check_inputs!(projection:, source_intents:, intents:, next_entry_id:, money_before:, money_after:,
                             expected_reservations:)
             check_columns!("projection", projection, PROJECTION_COLUMNS)
-            check_columns!("source_intents", source_intents, INTENT_COLUMNS)
-            check_columns!("intents", intents, INTENT_COLUMNS)
+            check_columns!("source_intents", source_intents, INTENT_COLUMNS, optional: OPTIONAL_INTENT_COLUMNS)
+            check_columns!("intents", intents, INTENT_COLUMNS, optional: OPTIONAL_INTENT_COLUMNS)
             [source_intents, intents].flatten.each do |row|
               raise Checkpoint::ShapeError, "intents: a row has no company_id" unless row["company_id"].is_a?(Integer)
             end
@@ -251,10 +260,10 @@ module Timekeeping
             end
           end
 
-          def check_columns!(name, rows, columns)
+          def check_columns!(name, rows, columns, optional: [])
             rows.each do |row|
               unknown = row.keys - columns
-              missing = columns - row.keys
+              missing = columns - optional - row.keys
               raise Checkpoint::ShapeError, "#{name}: unknown columns: #{unknown.join(', ')}" if unknown.any?
               raise Checkpoint::ShapeError, "#{name}: missing columns: #{missing.join(', ')}" if missing.any?
             end
@@ -264,28 +273,23 @@ module Timekeeping
             tables.transform_values { |rows| rows.group_by { |row| row["company_id"] } }
           end
 
-          # Places each projection row under a company. A row whose company_id
-          # and id match a checkpoint entry goes to that company. A row whose
-          # company_id is nil or matches no such entry goes to the one company
-          # whose checkpoint entry has its id, where its company_id then shows
-          # as a difference. A row whose id no checkpoint entry has stays under
-          # its own company_id, where it shows as missing from the checkpoint.
-          # A row that no single company claims, or that has no entry and no
-          # company_id, is unassigned, so it is neither dropped nor filed under
-          # a guessed company.
+          # Places each projection row under a company. A row with a company_id
+          # stays under it, so a row with no matching checkpoint entry shows as
+          # missing from the checkpoint in that company's report. A row whose
+          # company_id is nil goes to the one company whose checkpoint entry
+          # has its id, where its company_id then shows as a difference. A nil
+          # row that no single company claims is unassigned, so it is neither
+          # dropped nor filed under a guessed company.
           #
           # Returns [{ company_id => [normalised rows] }, [unassigned Difference]].
           def place_projection(projection, checkpoint_entries)
-            entry_keys = checkpoint_entries.to_set { |row| [row["company_id"], row["id"]] }
             companies_by_id = checkpoint_entries.group_by { |row| row["id"] }
               .transform_values { |rows| rows.map { |row| row["company_id"] }.uniq }
 
             placed = projection.group_by do |row|
-              next row["company_id"] if entry_keys.include?([row["company_id"], row["id"]])
+              next row["company_id"] unless row["company_id"].nil?
 
               candidates = companies_by_id.fetch(row["id"], [])
-              next row["company_id"] if candidates.empty?
-
               candidates.one? ? candidates.first : nil
             end
 
@@ -386,8 +390,10 @@ module Timekeeping
             )
           end
 
-          # Compares every column but locked with the checkpoint entry. locked
-          # must instead say whether the entry has a committed reservation.
+          # Compares every column with the checkpoint entry, locked included.
+          # locked must also say whether the entry has a committed reservation.
+          # A listed locked correction carries field "locked", so it explains
+          # both of these differences for its row.
           def check_projection(inputs, company_id)
             entries = inputs.rows(:checkpoint, "entries", company_id)
             projected = inputs.projection.fetch(company_id, [])
@@ -397,7 +403,7 @@ module Timekeeping
             field_differences = compare_rows(
               company_id:, check: :projection, table: "timesheet_entries", key: ENTRY_KEY,
               expected: entries, actual: projected,
-              encode: ->(row) { encoder("entries").call(row).except("locked") },
+              encode: encoder("entries"),
               missing: %i[missing_in_projection missing_in_checkpoint]
             )
 
@@ -438,7 +444,7 @@ module Timekeeping
           def check_operation_receipts(inputs, company_id)
             operations = inputs.rows(:checkpoint, "invoice_operations", company_id)
             current_intents = inputs.intent_rows(:intents, company_id)
-            operation_states = operations.group_by { |row| row["operation_id"] }
+            operation_states = operations.group_by(&RECEIPT_LINK_KEY)
               .transform_values { |rows| rows.map { |row| row["state"] } }
 
             prepared = operations.filter_map do |row|
@@ -450,12 +456,12 @@ module Timekeeping
               )
             end
             intent_breaches = current_intents.filter_map do |intent|
-              reason = INTENT_RULES.fetch(intent["state"]).call(operation_states.fetch(intent["operation_id"], []))
+              reason = INTENT_RULES.fetch(intent["state"]).call(operation_states.fetch(RECEIPT_LINK_KEY.call(intent), []))
               next unless reason
 
               Difference.new(
                 company_id:, check: :operation_receipts, table: "invoice_operation_intents",
-                row_key: OPERATION_KEY.call(intent), field: "state", reason:
+                row_key: RECEIPT_LINK_KEY.call(intent), field: "state", reason:
               )
             end
 
@@ -464,7 +470,7 @@ module Timekeeping
               expected: inputs.rows(:source, "invoice_operations", company_id), actual: operations,
               encode: encoder("invoice_operations")
             ) + compare_rows(
-              company_id:, check: :operation_receipts, table: "invoice_operation_intents", key: OPERATION_KEY,
+              company_id:, check: :operation_receipts, table: "invoice_operation_intents", key: RECEIPT_LINK_KEY,
               expected: inputs.intent_rows(:source_intents, company_id), actual: current_intents,
               encode: ->(row) { row.slice(*INTENT_COLUMNS) }
             ) + prepared + intent_breaches
@@ -517,9 +523,10 @@ module Timekeeping
               difference = ->(field, reason) { Difference.new(company_id:, check:, table:, row_key:, field:, reason:) }
               old_rows = expected_rows.fetch(row_key, [])
               new_rows = actual_rows.fetch(row_key, [])
-              next [difference.call(nil, missing.first)] if new_rows.empty?
-              next [difference.call(nil, missing.last)] if old_rows.empty?
-              next [difference.call(nil, :duplicate_key)] if old_rows.size > 1 || new_rows.size > 1
+              duplicate = old_rows.size > 1 || new_rows.size > 1 ? [difference.call(nil, :duplicate_key)] : []
+              next duplicate + [difference.call(nil, missing.first)] if new_rows.empty?
+              next duplicate + [difference.call(nil, missing.last)] if old_rows.empty?
+              next duplicate if duplicate.any?
 
               old_values = encode.call(old_rows.first)
               new_values = encode.call(new_rows.first)

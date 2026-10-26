@@ -43,8 +43,9 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
     )
 
     report = result.companies.fetch(101)
-    expect(report.unlisted.map { |d| d.field.to_s }).to include("note")
-    expect(report.unlisted.map { |d| d.field.to_s }).not_to include("locked")
+    entry_differences = report.unlisted.select { |d| d.check == :entries }
+    expect(entry_differences.map { |d| d.field.to_s }).to include("note")
+    expect(entry_differences.map { |d| d.field.to_s }).not_to include("locked")
     expect(report).to be_abort
     expect(result).to be_abort
   end
@@ -303,7 +304,8 @@ RSpec.describe Timekeeping::Handoff::Reconciliation do
 
     affected = result.companies.fetch(101)
     expect(affected).to be_abort
-    expect(affected.unlisted.map(&:row_key)).to include([operation_id])
+    # An intent is identified by its invoice and operation, the table's unique key.
+    expect(affected.unlisted.map(&:row_key)).to include([5, operation_id])
     expect(result.companies.fetch(202)).not_to be_abort
     expect(result).to be_abort
   end
