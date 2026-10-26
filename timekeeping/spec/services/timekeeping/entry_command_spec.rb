@@ -90,4 +90,16 @@ RSpec.describe Timekeeping::EntryCommand do
     expect { build(:create, body: create_body.except("duration")) }.to raise_error(ActionController::BadRequest)
     expect { build(:bulk_delete, body: { "entry_ids" => 5 }) }.to raise_error(ActionController::BadRequest)
   end
+
+  it "refuses a source or bill_status the monolith's projection cannot store, and accepts every one it can" do
+    expect { build(:create, body: create_body(source: "fax")) }.to raise_error(ActionController::BadRequest)
+    expect { build(:create, body: create_body(bill_status: "paid")) }.to raise_error(ActionController::BadRequest)
+
+    %w[manual cli mcp automation import].each do |source|
+      expect(build(:create, body: create_body(source:))).to be_a(described_class)
+    end
+    %w[non_billable unbilled billed].each do |bill_status|
+      expect(build(:create, body: create_body(bill_status:))).to be_a(described_class)
+    end
+  end
 end
