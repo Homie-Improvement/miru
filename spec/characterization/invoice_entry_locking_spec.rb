@@ -83,19 +83,23 @@ RSpec.describe "Characterization: invoice timesheet entry locking", type: :reque
   end
 
   describe "draft line item edit that re-saves the invoice" do
-    it "locks the draft's entries again when the edit changes the invoice totals" do
+    # Deliberate change: the per-save re-lock is retired. A totals-only re-save
+    # changes no entry set, so it sends no reservation operation.
+    it "keeps the draft's entries locked and writes no intent when the edit changes only the invoice totals" do
       invoice = create(:invoice, company:, client:)
       line = locking_spec_direct_line(invoice)
       aggregate_entries = [locking_spec_entry, locking_spec_entry]
       locking_spec_aggregate_line(invoice, aggregate_entries)
       entries = [line.timesheet_entry] + aggregate_entries
-      force_locked(entries, locked: false)
+      expect_entries_state(entries, locked: true)
       amount_before = invoice.reload.amount
+      intents_before = InvoiceOperationIntent.where(invoice_id: invoice.id).count
 
       InvoiceLineItem.find(line.id).update!(quantity: line.quantity + 60)
 
       expect(invoice.reload.amount).not_to eq(amount_before)
       expect_entries_state(entries, locked: true)
+      expect(InvoiceOperationIntent.where(invoice_id: invoice.id).count).to eq(intents_before)
     end
   end
 
