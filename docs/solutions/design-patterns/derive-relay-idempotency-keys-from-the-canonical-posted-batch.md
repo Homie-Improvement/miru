@@ -56,6 +56,6 @@ Keep a single serializer for the key and the body. If they use different seriali
 - `gems/timekeeping_relay/lib/timekeeping_relay/batch_json.rb`: its comment says the consumer fingerprints the body and refuses a reused key whose body differs, so the key must come from exactly the posted text.
 - `gems/timekeeping_relay/lib/timekeeping_relay/idempotency_key.rb`: its comment explains why positions alone are not enough, and the key is hashed from the canonical JSON.
 - `gems/timekeeping_relay/lib/timekeeping_relay/relay.rb` canonicalizes the batch before the key is taken. `gems/timekeeping_relay/lib/timekeeping_relay/http_endpoint.rb` posts `BatchJson.generate(batch)`.
-- `gems/timekeeping_relay/spec/timekeeping_relay/fake_relay_adversarial_spec.rb`: two sources with equal positions and different entries both reach the fake projection.
+- `gems/timekeeping_relay/spec/timekeeping_relay/fake_relay_delivery_spec.rb`: two sources with equal positions and different entries both reach the fake projection.
 - `gems/timekeeping_relay/spec/timekeeping_relay/batch_json_spec.rb`: after a lost mark, a retry of the row rebuilt with reversed entry keys gets 200 twice and is marked sent.
 - `gems/timekeeping_relay/spec/timekeeping_relay/idempotency_key_spec.rb`: reordered input gives the same key, and a changed generation, version or entry id gives a different key.

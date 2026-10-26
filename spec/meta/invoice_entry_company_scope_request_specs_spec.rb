@@ -43,22 +43,319 @@ RSpec.describe "Invoice entry company-scope request specs" do
       end
     end
   end
+end
 
-  it "sends every company-scope request in the invoice create and update specs through one params helper per file" do
+RSpec.describe "Company-scope params builder report with an assertion helper method" do
+  # "Those restrictions prevent extracting repeated assertions into a helper, even when every request still uses one parameter builder."
+  it "allows an assertion-only helper method beside the one company-scope params builder" do
+    section = <<~RUBY
+      RSpec.describe "Api::V1::Invoices#create timesheet entry company scope", type: :request do
+        def post_company_scope_invoice(*entry_refs)
+          send_request :post, api_v1_invoices_path, params: { invoice: { entries: entry_refs } }
+          [response.status, response.body]
+        end
+
+        def expect_nothing_written(&block)
+          expect(&block).to not_change(Invoice, :count)
+            .and not_change(InvoiceLineItem, :count)
+            .and not_change(InvoiceLineItemTimeEntry, :count)
+        end
+
+        it "refuses" do
+          expect_nothing_written { post_company_scope_invoice(1) }
+        end
+      end
+    RUBY
+
+    report = params_builder_report(section)
+
+    expect(report[:builders]).to eq(["post_company_scope_invoice"])
+    expect(report[:stray_requests]).to eq(0)
+  end
+end
+
+RSpec.describe "Company-scope params builder report with one-line assertion helpers" do
+  # A one-line helper ends on its own line, so a request sent in a later example is not taken as its body.
+  it "keeps endless and semicolon one-line helpers out of the builders and counts a later request as stray" do
+    section = <<~RUBY
+      RSpec.describe "Api::V1::Invoices#create timesheet entry company scope", type: :request do
+        def post_company_scope_invoice(*entry_refs)
+          send_request :post, api_v1_invoices_path, params: { invoice: { entries: entry_refs } }
+          [response.status, response.body]
+        end
+
+        def refused?(result) = result.first == 422
+        def not_found_error; "not found"; end
+
+        it "refuses" do
+          send_request :post, api_v1_invoices_path, params: { invoice: {} }
+        end
+      end
+    RUBY
+
+    report = params_builder_report(section)
+
+    expect(report[:builders]).to eq(["post_company_scope_invoice"])
+    expect(report[:stray_requests]).to eq(1)
+  end
+end
+
+RSpec.describe "Company-scope params builder report with send_request named in assertions" do
+  it "does not take a string or symbol naming send_request as a request call" do
+    section = <<~RUBY
+      RSpec.describe "Api::V1::Invoices#create timesheet entry company scope", type: :request do
+        def post_company_scope_invoice(*entry_refs)
+          send_request :post, api_v1_invoices_path, params: { invoice: { entries: entry_refs } }
+        end
+
+        def expect_safe_message(message)
+          expect(message).not_to include("send_request")
+        end
+
+        def expect_request_sent
+          expect(self).to have_received(:send_request)
+        end
+      end
+    RUBY
+
+    report = params_builder_report(section)
+
+    expect(report[:builders]).to eq(["post_company_scope_invoice"])
+    expect(report[:stray_requests]).to eq(0)
+  end
+end
+
+RSpec.describe "Company-scope params builder report with an endless builder" do
+  # A nested parenthesis in a default argument must not hide that the builder ends on its def line.
+  it "ends an endless builder with a parenthesized default on its def line and counts a later request as stray" do
+    section = <<~RUBY
+      RSpec.describe "Api::V1::Invoices#create timesheet entry company scope", type: :request do
+        def post_company_scope_invoice(ref = missing_id.to_s()) = send_request(:post, api_v1_invoices_path, params: {})
+
+        it "refuses" do
+          send_request :post, api_v1_invoices_path, params: { invoice: {} }
+        end
+      end
+    RUBY
+
+    report = params_builder_report(section)
+
+    expect(report[:builders]).to eq(["post_company_scope_invoice"])
+    expect(report[:stray_requests]).to eq(1)
+  end
+
+  it "stops the scan when a multi-line method has no closing end at its own indentation" do
+    section = <<~RUBY
+      RSpec.describe "Api::V1::Invoices#create timesheet entry company scope", type: :request do
+        def post_company_scope_invoice(*entry_refs)
+          send_request :post, api_v1_invoices_path, params: {}
+    RUBY
+
+    expect { params_builder_report(section) }
+      .to raise_error(ArgumentError, "no closing end found for method post_company_scope_invoice")
+  end
+end
+
+RSpec.describe "Company-scope params builder report with an assertion lambda" do
+  # "It also forbids lambdas regardless of their purpose."
+  it "allows an assertion-only lambda beside the one company-scope params builder" do
+    section = <<~RUBY
+      RSpec.describe "Api::V1::Invoices#update timesheet entry company scope", type: :request do
+        def patch_company_scope_line(line, entry_ref)
+          send_request :patch, api_v1_invoice_path(scope_invoice), params: { invoice: { line: line, ref: entry_ref } }
+          [response.status, response.body]
+        end
+
+        let(:expect_not_found) { ->(result) { expect(JSON.parse(result.last)["errors"]).to include("not found") } }
+
+        it "refuses" do
+          expect_not_found.call(patch_company_scope_line(manual_line, timesheet_entry_id: missing_id))
+        end
+      end
+    RUBY
+
+    report = params_builder_report(section)
+
+    expect(report[:builders]).to eq(["patch_company_scope_line"])
+    expect(report[:stray_requests]).to eq(0)
+  end
+end
+
+RSpec.describe "Company-scope params builder report with two builders" do
+  # "Limit the check to parameter builders, or remove the blanket method and lambda counts."
+  # The "one params helper" rule must still see a second builder.
+  it "reports both methods when two company-scope helpers each send a request" do
+    section = <<~RUBY
+      RSpec.describe "Api::V1::Invoices#create timesheet entry company scope", type: :request do
+        def post_company_scope_invoice(*entry_refs)
+          send_request :post, api_v1_invoices_path, params: { invoice: { entries: entry_refs } }
+          [response.status, response.body]
+        end
+
+        def post_other_invoice(entry_id)
+          send_request :post, api_v1_invoices_path, params: { invoice: { entry: entry_id } }
+          [response.status, response.body]
+        end
+      end
+    RUBY
+
+    report = params_builder_report(section)
+
+    expect(report[:builders]).to contain_exactly("post_company_scope_invoice", "post_other_invoice")
+    expect(report[:stray_requests]).to eq(0)
+  end
+end
+
+RSpec.describe "Company-scope params builder report with stray requests" do
+  # "Those restrictions prevent extracting repeated assertions into a helper, even when every request still uses one parameter builder."
+  # A request outside the builder breaks "every request still uses one parameter builder".
+  it "counts requests sent inline in an example or through a lambda as stray" do
+    section = <<~RUBY
+      RSpec.describe "Api::V1::Invoices#create timesheet entry company scope", type: :request do
+        def post_company_scope_invoice(*entry_refs)
+          send_request :post, api_v1_invoices_path, params: { invoice: { entries: entry_refs } }
+          [response.status, response.body]
+        end
+
+        let(:post_inline) { ->(entry_id) { send_request :post, api_v1_invoices_path, params: { invoice: { entry: entry_id } } } }
+
+        it "refuses" do
+          send_request :post, api_v1_invoices_path, params: { invoice: { entry: missing_id } }
+          post_inline.call(missing_id)
+        end
+      end
+    RUBY
+
+    report = params_builder_report(section)
+
+    expect(report[:builders]).to eq(["post_company_scope_invoice"])
+    expect(report[:stray_requests]).to eq(2)
+  end
+
+  # "The issue asks for \"one params helper\"" - lifting the lambda ban must not let a lambda send requests around the builder.
+  it "reports a lambda inside an example that sends the request as a stray request beside the one builder" do
+    section = <<~RUBY
+      RSpec.describe "Api::V1::Invoices#update timesheet entry company scope", type: :request do
+        def patch_company_scope_line(line, entry_ref)
+          send_request :patch, api_v1_invoice_path(scope_invoice), params: { invoice: {} }
+          [response.status, response.body]
+        end
+
+        it "refuses" do
+          sneaky = -> { send_request :patch, api_v1_invoice_path(scope_invoice), params: { invoice: {} } }
+          sneaky.call
+        end
+      end
+    RUBY
+
+    report = params_builder_report(section)
+
+    expect(report[:builders]).to eq(["patch_company_scope_line"])
+    expect(report[:stray_requests]).to eq(1)
+  end
+end
+
+RSpec.describe "Company-scope params builder report with a nested second builder" do
+  # "Limit the check to parameter builders, or remove the blanket method and lambda counts."
+  # Narrowing the count must still see a second method that sends a request, even one nested deeper than the first.
+  it "reports both builders when a second method inside a context also sends a company-scope request" do
+    section = <<~RUBY
+      RSpec.describe "Api::V1::Invoices#create timesheet entry company scope", type: :request do
+        def post_company_scope_invoice(*entry_refs)
+          send_request :post, api_v1_invoices_path, params: { invoice: {} }
+          [response.status, response.body]
+        end
+
+        context "with a nested helper" do
+          def post_again(entry_ref)
+            [1].each do
+              send_request :post, api_v1_invoices_path, params: { invoice: entry_ref }
+            end
+          end
+        end
+      end
+    RUBY
+
+    report = params_builder_report(section)
+
+    expect(report[:builders]).to contain_exactly("post_company_scope_invoice", "post_again")
+    expect(report[:stray_requests]).to eq(0)
+  end
+end
+
+RSpec.describe "Company-scope params builder report with comments" do
+  # "Those restrictions prevent extracting repeated assertions into a helper, even when every request still uses one parameter builder."
+  it "ignores comments that mention send_request when finding builders and stray requests" do
+    section = <<~RUBY
+      RSpec.describe "Api::V1::Invoices#create timesheet entry company scope", type: :request do
+        def post_company_scope_invoice(*entry_refs)
+          send_request :post, api_v1_invoices_path, params: { invoice: { entries: entry_refs } }
+          [response.status, response.body]
+        end
+
+        def expect_not_found(result)
+          # Check the send_request response.
+          expect(JSON.parse(result.last)["errors"]).to include("not found") # from send_request
+        end
+
+        # Check the send_request response.
+        it "refuses" do
+          expect_not_found(post_company_scope_invoice(1))
+        end
+      end
+    RUBY
+
+    report = params_builder_report(section)
+
+    expect(report[:builders]).to eq(["post_company_scope_invoice"])
+    expect(report[:stray_requests]).to eq(0)
+  end
+end
+
+RSpec.describe "Company-scope section bounds" do
+  it "stops the company-scope section at the next top-level describe" do
+    source = <<~RUBY
+      RSpec.describe "Earlier block", type: :request do
+        def post_earlier
+          send_request :post, api_v1_invoices_path, params: {}
+        end
+      end
+
+      RSpec.describe "Api::V1::Invoices#create timesheet entry company scope", type: :request do
+        def post_company_scope_invoice(*entry_refs)
+          send_request :post, api_v1_invoices_path, params: { invoice: { entries: entry_refs } }
+        end
+      end
+
+      RSpec.describe "Later block", type: :request do
+        def post_later
+          send_request :post, api_v1_invoices_path, params: {}
+        end
+      end
+    RUBY
+
+    section = company_scope_section(source, "Api::V1::Invoices#create timesheet entry company scope")
+
+    expect(section).to start_with('RSpec.describe "Api::V1::Invoices#create timesheet entry company scope"')
+    expect(section).not_to include("post_earlier")
+    expect(section).not_to include("Later block")
+    expect(params_builder_report(section)[:builders]).to eq(["post_company_scope_invoice"])
+  end
+end
+
+RSpec.describe "Company-scope params builder report on the real request specs" do
+  # "Today each describe has exactly one method, the params helper, so the check matches the issue's \"one params helper\"."
+  it "finds exactly one request-sending builder and no stray requests in the real invoice create and update company-scope describes" do
+    dir = Rails.root.join("spec/requests/api/v1/invoices")
     {
-      "create_spec.rb" => "Api::V1::Invoices#create timesheet entry company scope",
-      "update_spec.rb" => "Api::V1::Invoices#update timesheet entry company scope"
-    }.each do |file_name, describe_name|
-      source = File.read(invoice_request_spec_dir.join(file_name))
-      start = source.index("RSpec.describe \"#{describe_name}\"")
-      expect(start).not_to be_nil, "#{file_name} has no describe named #{describe_name}"
+      "create_spec.rb" => ["Api::V1::Invoices#create timesheet entry company scope", "post_company_scope_invoice"],
+      "update_spec.rb" => ["Api::V1::Invoices#update timesheet entry company scope", "patch_company_scope_line"]
+    }.each do |file_name, (describe_name, builder_name)|
+      section = company_scope_section(File.read(dir.join(file_name)), describe_name)
+      report = params_builder_report(section)
 
-      scope_section = source[start..]
-      helper_definitions = scope_section.scan(/^\s*def\s+\w+/)
-      inline_param_builders = scope_section.scan(/lambda\s+do|->\s*\(|lambda\s*\{/)
-
-      expect(helper_definitions.size).to eq(1), "#{file_name} defines #{helper_definitions.size} helpers in its company-scope describe"
-      expect(inline_param_builders).to be_empty, "#{file_name} builds params inline with a lambda"
+      expect(report[:builders]).to eq([builder_name]), "#{file_name} builders: #{report[:builders].inspect}"
+      expect(report[:stray_requests]).to eq(0), "#{file_name} sends #{report[:stray_requests]} requests outside #{builder_name}"
     end
   end
 end

@@ -35,10 +35,15 @@ RSpec.describe Timekeeping::BillingFence do
   # A missing row fails closed with the same refusal; a 404 would tell a caller its invoice was not found.
   it "refuses with OwnershipMoving rather than RecordNotFound when the ownership row is missing" do
     TimekeepingOwnership.delete_all
+    block_ran = false
 
     expect {
       ActiveRecord::Base.transaction { described_class.admit! }
     }.to raise_error(Timekeeping::BillingFence::OwnershipMoving)
+    expect {
+      described_class.transaction { block_ran = true }
+    }.to raise_error(Timekeeping::BillingFence::OwnershipMoving)
+    expect(block_ran).to be(false)
   end
 end
 
