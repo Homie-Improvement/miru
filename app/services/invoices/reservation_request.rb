@@ -13,6 +13,7 @@ module Invoices
       Array(entries).map { |entry_id| Integer(entry_id) }.uniq.sort.freeze
     end
 
+    # :reek:LongParameterList
     def initialize(company_id:, invoice_id:, operation_id:, generation:, disposition:, entries:)
       # The request is the only value that carries the company across the
       # reservation port, so a request without one is refused here rather than
