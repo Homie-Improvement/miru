@@ -39,23 +39,14 @@ module Invoices
       connection = ApplicationRecord.connection
       raise OperationErrors::NoTransaction unless connection.transaction_open?
 
-      OperationLock.acquire!(connection, company_id: request.company_id, invoice_id: request.invoice_id)
-      # The intent stores the ownership row's generation, and commit and abort
-      # are rebuilt from the intent, so a request built for another generation
-      # would settle under a different one than it prepared under.
-      raise Timekeeping::BillingFence::OwnershipMoving unless request.generation == TimekeepingOwnership.current.generation
-
+      lock_current_generation!(connection, request)
       write_pending_intent(request)
 
       settlement = { commit_item_id: nil }
-      transaction = connection.current_transaction
-      transaction.after_commit { deliver(settlement[:commit_item_id]) if settlement[:commit_item_id] }
-      transaction.after_rollback { after_outermost_transaction(connection) { record_failure(request) } }
+      register_settlement_callbacks(connection, request, settlement)
 
       outcome = reservations.prepare(request)
-      route = PREPARE_ROUTES.fetch(outcome.state)
-      raise route.new(outcome) if route == OperationErrors::Refused
-      raise route unless route == :settle
+      raise_unless_prepared!(outcome)
 
       settlement[:commit_item_id] = settle(request, holding)
       outcome
@@ -64,6 +55,28 @@ module Invoices
     private
 
       attr_reader :reservations
+
+      # The intent stores the ownership row's generation, and commit and abort
+      # are rebuilt from the intent, so a request built for another generation
+      # would settle under a different one than it prepared under.
+      def lock_current_generation!(connection, request)
+        OperationLock.acquire!(connection, company_id: request.company_id, invoice_id: request.invoice_id)
+        raise Timekeeping::BillingFence::OwnershipMoving unless request.generation == TimekeepingOwnership.current.generation
+      end
+
+      # After commit, the commit row is delivered inline. After rollback, the
+      # failure is recorded once the outermost transaction has ended.
+      def register_settlement_callbacks(connection, request, settlement)
+        transaction = connection.current_transaction
+        transaction.after_commit { deliver(settlement[:commit_item_id]) if settlement[:commit_item_id] }
+        transaction.after_rollback { after_outermost_transaction(connection) { record_failure(request) } }
+      end
+
+      def raise_unless_prepared!(outcome)
+        route = PREPARE_ROUTES.fetch(outcome.state)
+        raise route.new(outcome) if route == OperationErrors::Refused
+        raise route unless route == :settle
+      end
 
       # Rails runs after_rollback callbacks when a savepoint rolls back, while
       # the enclosing transaction is still open. The failure write must commit
