@@ -461,12 +461,23 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
     changes_for_a.each do |table, rows_for_a|
       tables[table.to_s] = rows_for_a + tables[table.to_s].reject { |row| row["company_id"] == 101 }
     end
-    tables
+    recon_checks_canonical(tables)
+  end
+
+  # Fills every canonical checkpoint column a fixture row leaves out with nil,
+  # so the rows keep fitting Checkpoint::TABLES when it gains a column.
+  def recon_checks_canonical(tables)
+    tables.to_h do |table, rows|
+      defaults = Timekeeping::Handoff::Checkpoint::TABLES.fetch(table).index_with { nil }
+      [table, rows.map { |row| row.reverse_merge(defaults) }]
+    end
   end
 
   def recon_checks_run(checkpoint_tables: recon_checks_tables, projection: nil, source_tables: recon_checks_tables,
                        intents: [recon_checks_intent(101), recon_checks_intent(202)],
                        source_intents: [recon_checks_intent(101), recon_checks_intent(202)], **options)
+    source_tables = recon_checks_canonical(source_tables)
+    checkpoint_tables = recon_checks_canonical(checkpoint_tables)
     projection ||= checkpoint_tables["entries"].map do |row|
       row.merge(
         "bill_status" => TimesheetEntry.bill_statuses.fetch(row["bill_status"]),
