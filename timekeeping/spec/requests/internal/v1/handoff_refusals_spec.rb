@@ -3,167 +3,102 @@
 
 require "rails_helper"
 
-RSpec.describe "Timekeeping handoff export refusals" do
-  let(:export_refusal_token) { "service-#{SecureRandom.hex(24)}" }
+# The handoff routes read and replace every company's rows at once, so only the
+# service bearer may reach them: no user token of any role, and no near-miss of
+# the service token.
+RSpec.describe "Timekeeping internal handoff routes refuse callers without the service token" do
+  include_context "timekeeping entry writes without transactional fixtures"
 
-  around do |example|
-    with_timekeeping_env(
-      Timekeeping::Environment::TOKEN_PUBLIC_KEY => rsa_key_pair.public_key.to_pem,
-      Timekeeping::Environment::SERVICE_TOKEN => export_refusal_token
-    ) { example.run }
+  around { |example| with_handoff_env(public_key: true) { example.run } }
+
+  # Every stored row a handoff route could write, plus the admission generation
+  # and the next entry id, so a refusal answered after any write is caught.
+  def refused_handoff_state
+    handoff_stored_rows.merge("admission_generation" => Timekeeping::Admission.current.generation,
+                              "next_entry_id" => handoff_next_id("entries"))
   end
 
-  # "Every handoff endpoint refuses a caller without service credentials"
-  # The export holds every company's rows, so a company admin must not read it.
-  it "refuses a checkpoint export to a caller without the service token and returns no rows" do
+  def refused_handoff_callers
+    {
+      "no bearer" => nil,
+      "near-miss service token" => "Bearer #{handoff_service_token}x",
+      "owner token" => "Bearer #{mint_token({ sub: 7, company_id: 1, role: 'owner' })}",
+      "admin token" => "Bearer #{mint_token({ sub: 7, company_id: 1, role: 'admin' })}",
+      "employee token" => "Bearer #{mint_token}"
+    }
+  end
+
+  # Bodies that would change stored state if a refused call reached its
+  # controller: an empty checkpoint deletes the seeded entry, the sequence
+  # target moves the next id, and the snapshot at version 2 raises the
+  # version-1 entry to 2.
+  def refused_handoff_bodies(entry)
+    empty_checkpoint = Timekeeping::Handoff::Checkpoint.build(
+      tables: Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }
+    ).to_json
+    {
+      checkpoint_load: empty_checkpoint,
+      entry_id_sequence: { above: 9_000_000_000 },
+      correction_snapshots: { generation: 2, version: 2, snapshots: [handoff_correction_snapshot(entry, locked: true)] },
+      admission_admit: { generation: 4 }
+    }
+  end
+
+  def create_private_entry
     Entry.create!(company_id: 1, user_id: 1, project_id: 2, work_date: "2026-03-02", duration: 30.0,
                   note: "Private", bill_status: "unbilled", source: "manual", source_metadata: {})
-    bearers = [nil, "Bearer #{export_refusal_token}x", "Bearer #{mint_token({ sub: 7, company_id: 1, role: 'admin' })}"]
+  end
 
-    answers = bearers.map do |bearer|
-      get "/internal/v1/handoff/checkpoint", headers: bearer ? { "Authorization" => bearer } : {}
-      [response.status, response.parsed_body]
+  # Sends every route as every refused caller and compares the stored state to
+  # the one baseline after each request, labelled with the route and caller.
+  def expect_every_refused_caller_to_change_nothing(entry, baseline)
+    bodies = refused_handoff_bodies(entry)
+    HandoffRequests::HANDOFF_ROUTES.each_key do |route|
+      refused_handoff_callers.each do |caller_name, authorization|
+        handoff_request(route, body: bodies.fetch(route, HandoffRequests::HANDOFF_ROUTES.fetch(route)[2]), authorization:)
+
+        expect([route, caller_name, response.status, response.parsed_body])
+          .to eq([route, caller_name, 401, { "reason" => "unauthorized" }])
+        expect([route, caller_name, refused_handoff_state]).to eq([route, caller_name, baseline])
+      end
     end
-
-    expect(answers).to all(eq([401, { "reason" => "unauthorized" }]))
-  end
-end
-
-RSpec.describe "Timekeeping handoff sequence refusals" do
-  let(:sequence_refusal_token) { "service-#{SecureRandom.hex(24)}" }
-
-  around do |example|
-    with_timekeeping_env(
-      Timekeeping::Environment::TOKEN_PUBLIC_KEY => rsa_key_pair.public_key.to_pem,
-      Timekeeping::Environment::SERVICE_TOKEN => sequence_refusal_token
-    ) { example.run }
-  end
-
-  # "Every handoff endpoint refuses a caller without service credentials"
-  # A refused call must not move the sequence before answering 401.
-  it "refuses a sequence advance from a caller without the service token and leaves the next entry id low" do
-    bearers = [nil, "Bearer #{sequence_refusal_token}x", "Bearer #{mint_token({ sub: 7, company_id: 1, role: 'owner' })}"]
-
-    answers = bearers.map do |bearer|
-      headers = { "Content-Type" => "application/json" }
-      headers["Authorization"] = bearer if bearer
-      post "/internal/v1/handoff/entry_id_sequence", params: { above: 9_000_000_000 }.to_json, headers: headers
-      [response.status, response.parsed_body]
-    end
-    next_entry = Entry.create!(company_id: 1, user_id: 1, project_id: 2, work_date: "2026-03-02", duration: 30.0,
-                               note: "", bill_status: "unbilled", source: "manual", source_metadata: {})
-
-    expect(answers).to all(eq([401, { "reason" => "unauthorized" }]))
-    expect(next_entry.id).to be < 9_000_000_000
-  end
-end
-
-RSpec.describe "Timekeeping handoff outbox position refusals" do
-  let(:outbox_refusal_token) { "service-#{SecureRandom.hex(24)}" }
-
-  around do |example|
-    with_timekeeping_env(
-      Timekeeping::Environment::TOKEN_PUBLIC_KEY => rsa_key_pair.public_key.to_pem,
-      Timekeeping::Environment::SERVICE_TOKEN => outbox_refusal_token
-    ) { example.run }
-  end
-
-  # "Every handoff endpoint refuses a caller without service credentials"
-  it "refuses the outbox position to a caller without the service token" do
-    bearers = [nil, "Bearer #{outbox_refusal_token}x", "Bearer #{mint_token({ sub: 7, company_id: 1, role: 'owner' })}"]
-
-    answers = bearers.map do |bearer|
-      get "/internal/v1/handoff/outbox_position", headers: bearer ? { "Authorization" => bearer } : {}
-      [response.status, response.parsed_body]
-    end
-
-    expect(answers).to all(eq([401, { "reason" => "unauthorized" }]))
-  end
-end
-
-RSpec.describe "Timekeeping handoff correction snapshot refusals" do
-  let(:correction_refusal_token) { "service-#{SecureRandom.hex(24)}" }
-
-  around do |example|
-    with_timekeeping_env(
-      Timekeeping::Environment::TOKEN_PUBLIC_KEY => rsa_key_pair.public_key.to_pem,
-      Timekeeping::Environment::SERVICE_TOKEN => correction_refusal_token
-    ) { example.run }
-  end
-
-  # "Every handoff endpoint refuses a caller without service credentials"
-  # A 401 sent after the snapshots were written would still leak them to the relay.
-  it "refuses correction snapshots from a caller without the service token and writes no outbox row" do
-    entry = Entry.create!(company_id: 1, user_id: 1, project_id: 2, work_date: "2026-03-02", duration: 30.0,
-                          note: "", bill_status: "unbilled", source: "manual", source_metadata: {})
-    Timekeeping::Admission.fence!
-    snapshot = entry.attributes.slice(*(Timekeeping::OutboxFields::ENTRY_FIELDS - ["version"])).merge("locked" => true)
-    body = { generation: 2, version: 1, snapshots: [snapshot] }.to_json
-    bearers = [nil, "Bearer #{correction_refusal_token}x", "Bearer #{mint_token({ sub: 7, company_id: 1, role: 'admin' })}"]
-
-    answers = bearers.map do |bearer|
-      headers = { "Content-Type" => "application/json" }
-      headers["Authorization"] = bearer if bearer
-      put "/internal/v1/handoff/correction_snapshots", params: body, headers: headers
-      [response.status, response.parsed_body]
-    end
-
-    expect(answers).to all(eq([401, { "reason" => "unauthorized" }]))
-    expect(OutboxSnapshot.count).to eq(0)
-    expect(entry.reload.version).to eq(1)
-  end
-end
-
-RSpec.describe "Timekeeping handoff fence refusals" do
-  let(:fence_refusal_token) { "service-#{SecureRandom.hex(24)}" }
-
-  around do |example|
-    with_timekeeping_env(
-      Timekeeping::Environment::TOKEN_PUBLIC_KEY => rsa_key_pair.public_key.to_pem,
-      Timekeeping::Environment::SERVICE_TOKEN => fence_refusal_token
-    ) { example.run }
   end
 
   # "Every handoff endpoint refuses a caller without service credentials"
   # A user who could fence would stop every company's entry writes.
-  it "refuses a fence from a caller without the service token and keeps admitting writes" do
+  it "refuses every route while writes are admitted, keeps admitting at generation 3 and changes no row" do
     Timekeeping::Admission.admit!(generation: 3)
-    bearers = [nil, "Bearer #{fence_refusal_token}x", "Bearer #{mint_token({ sub: 7, company_id: 1, role: 'owner' })}"]
+    entry = create_private_entry
+    baseline = refused_handoff_state
+    expect([baseline["entries"].size, baseline["outbox_snapshots"], baseline["admission_generation"]]).to eq([1, [], 3])
 
-    answers = bearers.map do |bearer|
-      post "/internal/v1/handoff/admission/fence", headers: bearer ? { "Authorization" => bearer } : {}
-      [response.status, response.parsed_body]
-    end
-
-    expect(answers).to all(eq([401, { "reason" => "unauthorized" }]))
-    expect(Timekeeping::Admission.current.generation).to eq(3)
-  end
-end
-
-RSpec.describe "Timekeeping handoff admit refusals" do
-  let(:admit_refusal_token) { "service-#{SecureRandom.hex(24)}" }
-
-  around do |example|
-    with_timekeeping_env(
-      Timekeeping::Environment::TOKEN_PUBLIC_KEY => rsa_key_pair.public_key.to_pem,
-      Timekeeping::Environment::SERVICE_TOKEN => admit_refusal_token
-    ) { example.run }
+    expect_every_refused_caller_to_change_nothing(entry, baseline)
   end
 
   # "Every handoff endpoint refuses a caller without service credentials"
-  # An admit during a handoff would let writes land in a store about to be replaced.
-  it "refuses an admit from a caller without the service token and leaves Timekeeping fenced" do
+  # While fenced, a load or correction that got through would be accepted, and
+  # an admit would let writes land in a store about to be replaced.
+  it "refuses every route while fenced, leaves the fence in place and changes no row" do
     Timekeeping::Admission.fence!
-    bearers = [nil, "Bearer #{admit_refusal_token}x", "Bearer #{mint_token({ sub: 7, company_id: 1, role: 'admin' })}"]
+    entry = create_private_entry
+    baseline = refused_handoff_state
+    expect([baseline["entries"].size, baseline["outbox_snapshots"], baseline["admission_generation"]]).to eq([1, [], nil])
 
-    answers = bearers.map do |bearer|
-      headers = { "Content-Type" => "application/json" }
-      headers["Authorization"] = bearer if bearer
-      post "/internal/v1/handoff/admission/admit", params: { generation: 4 }.to_json, headers: headers
-      [response.status, response.parsed_body]
+    expect_every_refused_caller_to_change_nothing(entry, baseline)
+    expect(entry.reload.version).to eq(1)
+  end
+
+  # "Every handoff endpoint refuses a caller without service credentials"
+  it "refuses the service bearer on every handoff route when TIMEKEEPING_SERVICE_TOKEN is empty" do
+    with_handoff_env(public_key: true, service_token: "") do
+      HandoffRequests::HANDOFF_ROUTES.each_key do |route|
+        ["Bearer ", "Bearer anything"].each do |authorization|
+          handoff_request(route, authorization:)
+
+          expect([route, authorization, response.status, response.parsed_body])
+            .to eq([route, authorization, 401, { "reason" => "unauthorized" }])
+        end
+      end
     end
-
-    expect(answers).to all(eq([401, { "reason" => "unauthorized" }]))
-    expect(Timekeeping::Admission.current.generation).to be_nil
   end
 end
