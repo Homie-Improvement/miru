@@ -37,14 +37,12 @@ module Timekeeping
       return nil unless @key
 
       lock_key
+      # The relay sends a new key with almost every batch, so expired receipts
+      # are pruned here, through the expires_at index, or the table would grow
+      # without bound. An expired receipt under this key no longer answers.
+      EntrySnapshotReceipt.expired.delete_all
       receipt = EntrySnapshotReceipt.find_by(@scope)
       return nil unless receipt
-
-      if receipt.expires_at <= Time.current
-        # An expired receipt no longer answers; deleting it makes room for the new one.
-        receipt.destroy!
-        return nil
-      end
       return KEY_REUSED if receipt.request_digest != @digest
 
       ProjectionConsumer::Result.new(status: receipt.response_status, body: receipt.response_body)

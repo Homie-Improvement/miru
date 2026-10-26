@@ -159,7 +159,7 @@ RSpec.describe Timekeeping::ProjectionConsumer do
     # "A snapshot whose `company_id` differs from the row's is refused."
     result = described_class.call(batch: tenant_item(company: intruder_company, version: 5), idempotency_key: SecureRandom.uuid)
 
-    expect(result.status).not_to eq(200)
+    expect([result.status, result.body.to_h.deep_stringify_keys]).to eq([409, { "reason" => "stale_generation" }])
     expect(result.body.to_s).not_to include(owner_company.id.to_s)
     expect(TimesheetEntry.find(70_501).attributes).to eq(before)
   end

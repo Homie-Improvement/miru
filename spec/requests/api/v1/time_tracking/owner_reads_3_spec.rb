@@ -36,4 +36,21 @@ RSpec.describe "Owner-aware time-tracking reads", type: :request do
     end
     expect(TimesheetEntry.where(id: owner_entry.fetch("id"))).not_to exist
   end
+
+  it "answers both reads with a JSON 503 when Timekeeping owns entries and cannot be read" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role(:admin, company)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    allow(Timekeeping::EntryApiClient).to receive(:new).and_return(Timekeeping::EntryApiClient.new(base_url: nil))
+    sign_in user
+
+    [api_v1_time_tracking_index_path, api_v1_timesheet_entry_index_path].each do |path|
+      send_request :get, path, params: { from: "2026-03-01", to: "2026-03-31" }, headers: auth_headers(user)
+
+      expect([path, response.status]).to eq([path, 503])
+      expect(json_response).to eq("errors" => "TIMEKEEPING_BASE_URL is not set")
+    end
+  end
 end

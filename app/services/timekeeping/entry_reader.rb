@@ -17,7 +17,10 @@ module Timekeeping
   module EntryReader
     module_function
 
-    def list(company_id:, user_id:, from:, to:, ownership: TimekeepingOwnership.current,
+    # acting_user_id names who is reading, which can differ from user_id when
+    # an owner or admin reads another user's entries, including a user who has
+    # since left the company. It defaults to the user being read.
+    def list(company_id:, user_id:, from:, to:, acting_user_id: user_id, ownership: TimekeepingOwnership.current,
              timekeeping_client: EntryApiClient.new)
       company = Company.find(company_id)
 
@@ -28,7 +31,7 @@ module Timekeeping
         rows = PreparedEntry.where(company_id:, user_id:, discarded_at: nil, work_date: from..to).map(&:attributes)
         hydrate(rows, company:, user_id:)
       when :timekeeping
-        hydrate(timekeeping_client.list_entries(company_id:, user_id:, from:, to:), company:, user_id:)
+        hydrate(timekeeping_client.list_entries(company_id:, user_id:, from:, to:, acting_user_id:), company:, user_id:)
       end
     end
 

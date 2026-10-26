@@ -20,7 +20,9 @@ module TimekeepingContract
       @index_path = TimekeepingContract.load(:entry_api).dig("routes", "index", "path")
     end
 
-    def list_entries(company_id:, user_id:, from:, to:)
+    # The acting user the real client mints its token for is not used: the
+    # fake always reads as a fresh owner of the company.
+    def list_entries(company_id:, user_id:, from:, to:, **)
       token = @timekeeping.issue_token(@timekeeping.add_user(company_id:, role: ACTING_ROLE))
       query = URI.encode_www_form(user_id:, from: from.to_date.iso8601, to: to.to_date.iso8601)
       path = "#{@index_path.sub("{company_id}", company_id.to_s)}?#{query}"

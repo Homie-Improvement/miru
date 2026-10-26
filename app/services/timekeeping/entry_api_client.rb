@@ -24,16 +24,20 @@ module Timekeeping
     end
 
     # Returns the entry Hashes of the list route's "entries" answer.
-    def list_entries(company_id:, user_id:, from:, to:)
+    # The token speaks for the acting user, whose employment the token
+    # requires, while user_id only filters the list: the user being read may
+    # have left the company.
+    def list_entries(company_id:, user_id:, from:, to:, acting_user_id: user_id)
       raise Error, "#{BASE_URL_ENV} is not set" if @base_url.blank?
 
       company = Company.find(company_id)
-      token = UserToken.mint(user: company.users.find(user_id), company:)
+      token = UserToken.mint(user: company.users.find(acting_user_id), company:)
       response = get(list_uri(company_id:, user_id:, from:, to:), token)
       raise Error, "Timekeeping entry list answered #{response.code}" unless response.is_a?(Net::HTTPOK)
 
       JSON.parse(response.body).fetch("entries")
-    rescue SystemCallError, IOError, Timeout::Error, JSON::ParserError, KeyError => error
+    rescue SystemCallError, IOError, Timeout::Error, SocketError, OpenSSL::SSL::SSLError, Net::ProtocolError,
+           JSON::ParserError, KeyError => error
       raise Error, "Timekeeping entry list failed: #{error.class}"
     end
 

@@ -9,6 +9,7 @@ module ErrorHandler
     rescue_from Discard::RecordNotDiscarded, with: :record_not_discarded
     rescue_from ActiveRecord::RecordInvalid, with: :record_invalid
     rescue_from Pagy::VariableError, with: :invalid_param_value
+    rescue_from Timekeeping::EntryApiClient::Error, with: :timekeeping_unavailable
   end
 
   private
@@ -56,6 +57,17 @@ module ErrorHandler
       respond_to do |format|
         format.json { render json: { errors: exception.record.errors.full_messages.first }, status: 422 }
         format.html { render file: "public/422.html", status: 422, layout: false, alert: message }
+      end
+    end
+
+    # The Timekeeping service owns entries and could not be read. The read
+    # never falls back to the projection, so the client is told to retry.
+    def timekeeping_unavailable(exception)
+      message = exception.message
+
+      respond_to do |format|
+        format.json { render json: { errors: message }, status: 503 }
+        format.html { render file: "public/500.html", status: 503, layout: false, alert: message }
       end
     end
 

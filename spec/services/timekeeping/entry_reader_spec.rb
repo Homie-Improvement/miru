@@ -45,7 +45,7 @@ RSpec.describe Timekeeping::EntryReader do
               listed.call(91_002, company_b.id, project_b.id),
               listed.call(91_003, company_a.id, project_b.id)]
     timekeeping_client = Class.new do
-      define_method(:list_entries) { |company_id:, user_id:, from:, to:| answer }
+      define_method(:list_entries) { |company_id:, user_id:, from:, to:, acting_user_id:| answer }
     end.new
 
     entries = described_class.list(company_id: company_a.id, user_id: user.id, from: Date.new(2026, 3, 1),

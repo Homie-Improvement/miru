@@ -67,4 +67,19 @@ RSpec.describe Timekeeping::ProjectionConsumer do
     expect([retried.status, retried.body.deep_stringify_keys]).to eq([200, { "applied" => 1, "ignored" => 0 }])
     expect(TimesheetEntry.find(80_201).version).to eq(1)
   end
+
+  it "prunes expired receipts stored under other keys and keeps live ones on a keyed delivery" do
+    receipt_attributes = { company_ids: [retry_company.id], actor: "timekeeping", request_digest: "digest",
+                           response_status: 200, response_body: { "applied" => 1, "ignored" => 0 } }
+    expired = EntrySnapshotReceipt.create!(**receipt_attributes, key: "expired-key", created_at: 2.days.ago,
+                                           expires_at: 1.day.ago)
+    live = EntrySnapshotReceipt.create!(**receipt_attributes, key: "live-key", created_at: 1.hour.ago,
+                                        expires_at: 23.hours.from_now)
+
+    result = described_class.call(batch: retry_batch(generation: 1), idempotency_key: SecureRandom.uuid)
+
+    expect(result.status).to eq(200)
+    expect(EntrySnapshotReceipt.where(id: expired.id)).not_to exist
+    expect(EntrySnapshotReceipt.where(id: live.id)).to exist
+  end
 end
