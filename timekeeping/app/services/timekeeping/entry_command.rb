@@ -10,8 +10,8 @@ module Timekeeping
   # the locked rows.
   #
   # route is one of :create, :update, :destroy, :bulk_move, :bulk_delete.
-  class EntryCommand < Data.define(:route, :company_id, :actor_id, :role, :entry_id, :operation, :key, :fingerprint,
-                                   :body, :project_id, :generation, :if_match, :facts, :today)
+  class EntryCommand < Data.define(:route, :company_id, :actor_id, :role, :primary_role, :entry_id, :operation, :key,
+                                   :fingerprint, :body, :project_id, :generation, :if_match, :facts, :today)
     ID = /\A[0-9]{1,19}\z/
     ACTOR_TYPE = "user"
     UNBILLED = "unbilled"
@@ -68,7 +68,8 @@ module Timekeeping
       facts = reference_client.fetch(company_id:, project_ids:)
 
       new(
-        route:, company_id:, actor_id: identity.user_id, role: identity.role, entry_id: target_id,
+        route:, company_id:, actor_id: identity.user_id, role: identity.role, primary_role: identity.primary_role,
+        entry_id: target_id,
         operation: "#{route} #{target_id}", key:, fingerprint: Digest::SHA256.hexdigest(JSON.generate(body)),
         body:, project_id:, generation: headers["Ownership-Generation"], if_match: headers["If-Match"], facts:, today:
       )

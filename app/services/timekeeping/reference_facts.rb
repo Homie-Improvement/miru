@@ -9,6 +9,10 @@ module Timekeeping
   # does not own is reported in missing_project_ids exactly like an id that
   # does not exist, so the result never reveals another company's records.
   class ReferenceFacts
+    # The roles that act for colleagues, as the entry API contract names them.
+    PRIVILEGED_ROLES = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/entry_api.yml"))
+      .fetch("privileged_roles").freeze
+
     def self.call(company:, project_ids:)
       new(company:, project_ids:).call
     end
@@ -22,7 +26,7 @@ module Timekeeping
       {
         company_id: company.id,
         edit_days: company.timesheet_edit_days,
-        users: User.primary_roles_for(company, user_ids).map { |id, role| { id:, role: } },
+        users: user_ids.map { |id| { id:, role: role_from(held_role_names_by_user_id.fetch(id, [])) } },
         projects: projects.map { |project| project_facts(project) },
         missing_project_ids: requested_project_ids - projects.map(&:id),
         agents: agents
@@ -58,6 +62,27 @@ module Timekeeping
           .where(id: company.employments.kept.select(:user_id))
           .order(:id)
           .pluck(:id)
+      end
+
+      # The oldest owner or admin role the user holds in the company, matching
+      # the monolith's has_role?(:owner | :admin, company) checks that let a
+      # user act for colleagues; otherwise their oldest role there, as
+      # User.primary_roles_for picks it.
+      def role_from(held_role_names)
+        held_role_names.find { |name| PRIVILEGED_ROLES.include?(name) } || held_role_names.first || User::DEFAULT_ROLE
+      end
+
+      # Each listed user's role names, oldest first. Only roles whose resource
+      # is exactly this company count, so a role held in another company or a
+      # global role never reaches a user's role here.
+      def held_role_names_by_user_id
+        @held_role_names_by_user_id ||= Role.where(resource: company)
+          .joins(:users)
+          .where(users: { id: user_ids })
+          .order("roles.id")
+          .pluck("users.id", "roles.name")
+          .group_by(&:first)
+          .transform_values { |pairs| pairs.map(&:last) }
       end
 
       def member_user_ids_by_project_id
