@@ -323,6 +323,65 @@ jobs:
       - name: Run service specs
         run: bundle exec rspec
 
+  # Boots a real Timekeeping server from its own bundle and database, makes
+  # real entry writes through it, and runs the monolith's timekeeping:alerts
+  # task against its metrics endpoint. The spec starts and stops the server.
+  timekeeping-alerts-live:
+    name: Timekeeping alerts against a live service
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    if: github.event_name != 'push' || !contains(github.event.head_commit.message, 'skip ci')
+    env:
+      RAILS_ENV: test
+      DB_HOST: localhost
+      DB_USER: root
+      DB_PASS: password
+      CI: true
+      TIMEKEEPING_LIVE: "1"
+      # The live specs render no pages, so they need no Vite build (and this job installs no Node).
+      SKIP_VITE_TEST_BUILD: "1"
+      TIMEKEEPING_DATABASE_URL: postgres://root:password@localhost:5432/timekeeping_live_test
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: miru_web_test
+          POSTGRES_USER: root
+          POSTGRES_PASSWORD: password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U root -d miru_web_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Setup Ruby for the monolith
+        uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1
+        with:
+          ruby-version: '4.0.1'
+          bundler-cache: true
+          bundler: latest
+
+      - name: Install the Timekeeping bundle
+        uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1
+        with:
+          ruby-version: '4.0.1'
+          bundler-cache: true
+          bundler: latest
+          working-directory: timekeeping
+
+      - name: Setup monolith test database
+        run: bundle exec rails db:test:prepare
+
+      - name: Run live alert specs
+        run: bundle exec rspec spec/integration/timekeeping/alerts_live_spec.rb
+
   security-audit:
     name: Security audit
     runs-on: ubuntu-latest

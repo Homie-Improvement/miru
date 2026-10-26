@@ -25,6 +25,7 @@ module Timekeeping
       def record_write_metric
         started = monotonic_ms
         outcome = :write
+        wait_for_test_write_delay
         yield
         outcome = WriteMetrics.outcome_for(response.status)
       ensure
@@ -39,6 +40,16 @@ module Timekeeping
         WriteMetrics.new(clock: -> { Time.current }).record(company_id:, outcome:, latency_ms:)
       rescue StandardError => e
         logger.warn("write metric not recorded: #{e.class}")
+      end
+
+      # The delay a test set through Timekeeping::TestHooks, inside the measured
+      # time so it reaches the latency buckets. Outside the test environment
+      # the hooks are not loaded and writes never wait here.
+      def wait_for_test_write_delay
+        return unless defined?(Timekeeping::TestHooks)
+
+        delay = Timekeeping::TestHooks.write_delay_seconds
+        sleep(delay) if delay.positive?
       end
 
       def monotonic_ms
