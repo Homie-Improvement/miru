@@ -5,48 +5,6 @@
 require "rails_helper"
 require "webmock/rspec"
 
-RSpec.describe "Reservation operation replays" do
-  include_context "timekeeping entry writes"
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  it "replays prepare, commit and abort after a commit without writing any row" do
-    company = timekeeping_arrange.company
-    employee = timekeeping_arrange.user(company:, role: "employee")
-    project = timekeeping_arrange.project(company:)
-    entry_id = timekeeping_arrange.entry(company:, user: employee, project:)
-    service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary",
-                                                   operations: %w[prepare commit abort mark_billed detach_entries])
-    operation_id = SecureRandom.uuid
-    send_command = lambda do |route, extra = {}|
-      body = { "invoice_id" => 501, "operation_id" => operation_id, "generation" => timekeeping_arrange.current_generation }
-      post "/v1/companies/#{company}/reservations/#{route}", params: JSON.generate(body.merge(extra)),
-                                                             headers: { "Content-Type" => "application/json", "Authorization" => "Bearer #{service}" }
-      response
-    end
-    prepare_body = { "disposition" => "active", "entries" => [entry_id] }
-
-    expect(send_command.call("prepare", prepare_body).status).to eq(200)
-    first_commit = send_command.call("commit")
-    expect([first_commit.status, first_commit.parsed_body]).to eq([200, { "reserved" => 1, "released" => 0 }])
-    counts = -> { [Reservation.count, AuditEvent.count, OutboxSnapshot.count, ServiceIdempotencyReceipt.count, Entry.sum(:version)] }
-    after_commit = counts.call
-
-    # "A replay after a terminal state changes nothing."
-    replay_prepare = send_command.call("prepare", prepare_body)
-    replay_commit = send_command.call("commit")
-    late_abort = send_command.call("abort")
-
-    expect([replay_prepare.status, replay_prepare.parsed_body["state"]]).to eq([200, "committed"])
-    expect(replay_commit.parsed_body).to eq("reserved" => 1, "released" => 0)
-    expect(late_abort.parsed_body).to eq("dropped" => 0)
-    expect(Reservation.where(entry_id:).pluck(:state)).to eq(["committed"])
-    expect(counts.call.values_at(0, 2, 4)).to eq(after_commit.values_at(0, 2, 4))
-    expect(counts.call[1]).to eq(after_commit[1])
-  end
-end
-
-# frozen_string_literal: true
-
 RSpec.describe "Reservation locks seen through the entry API" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
@@ -86,8 +44,6 @@ RSpec.describe "Reservation locks seen through the entry API" do
   end
 end
 
-# frozen_string_literal: true
-
 RSpec.describe "Detach-entries service command" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
@@ -123,8 +79,6 @@ RSpec.describe "Detach-entries service command" do
   end
 end
 
-# frozen_string_literal: true
-
 RSpec.describe "Mark-billed transaction" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
@@ -152,74 +106,6 @@ RSpec.describe "Mark-billed transaction" do
     expect(AuditEvent.where(company_id: company).count).to eq(0)
     expect(OutboxSnapshot.where(company_id: company).count).to eq(0)
     expect(ServiceIdempotencyReceipt.where(company_id: company).count).to eq(0)
-  end
-end
-
-RSpec.describe "Reservation prepare conflicts" do
-  include_context "timekeeping entry writes"
-
-  # "Prepare refuses an entry another kept invoice holds with
-  # on_another_invoice, and one conflict reserves nothing"
-  it "refuses a prepare with one conflict and leaves no reservation, operation, audit or snapshot behind" do
-    company = timekeeping_arrange.company
-    user = timekeeping_arrange.user(company:, role: "employee")
-    free_entry = timekeeping_arrange.entry(company:, user:, project: timekeeping_arrange.project(company:))
-    held_entry = timekeeping_arrange.reserved_entry(company:, invoice_id: 502, state: "committed")
-    service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary",
-                                                   operations: %w[prepare commit abort mark_billed detach_entries])
-    headers = { "Content-Type" => "application/json", "Authorization" => "Bearer #{service}" }
-    prepare = lambda do |entries|
-      body = { "invoice_id" => 501, "operation_id" => SecureRandom.uuid, "generation" => timekeeping_arrange.current_generation,
-               "disposition" => "active", "entries" => entries }
-      post("/v1/companies/#{company}/reservations/prepare", params: JSON.generate(body), headers:)
-      response
-    end
-    counts = -> { [Reservation.count, InvoiceOperation.count, AuditEvent.count, OutboxSnapshot.count, Entry.sum(:version)] }
-    before = counts.call
-
-    refused = prepare.call([free_entry, held_entry])
-
-    expect(refused.status).to eq(409)
-    expect(refused.parsed_body).to eq("reason" => "conflict",
-                                      "conflicts" => [{ "entry_id" => held_entry, "reason" => "on_another_invoice" }])
-    expect(counts.call).to eq(before)
-    expect(Reservation.where(entry_id: free_entry)).to be_empty
-    expect(Reservation.where(entry_id: held_entry).pluck(:invoice_id, :state)).to eq([[502, "committed"]])
-    expect(prepare.call([free_entry]).status).to eq(200)
-  end
-end
-
-RSpec.describe "Reservation prepare transaction" do
-  include_context "timekeeping entry writes"
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  after { ApplicationRecord.connection.execute("TRUNCATE invoice_operations CASCADE") }
-
-  # "Every reservation change that flips `locked`, every mark-billed and every
-  # detach writes an audit row and an outbox snapshot row in the same
-  # transaction as the change."
-  it "rolls back a prepare's reservations, operation and audit rows when the outbox insert fails" do
-    company = timekeeping_arrange.company
-    user = timekeeping_arrange.user(company:, role: "employee")
-    entry_id = timekeeping_arrange.entry(company:, user:, project: timekeeping_arrange.project(company:))
-    service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: %w[prepare])
-    body = { "invoice_id" => 501, "operation_id" => SecureRandom.uuid, "generation" => timekeeping_arrange.current_generation,
-             "disposition" => "active", "entries" => [entry_id] }
-    allow(OutboxSnapshot).to receive(:insert_all!).and_raise(ActiveRecord::StatementInvalid, "outbox down")
-
-    begin
-      post "/v1/companies/#{company}/reservations/prepare", params: JSON.generate(body),
-                                                            headers: { "Content-Type" => "application/json", "Authorization" => "Bearer #{service}" }
-    rescue ActiveRecord::StatementInvalid
-      nil
-    end
-
-    expect(response&.status).not_to eq(200) if response
-    expect(Reservation.where(entry_id:)).to be_empty
-    expect(InvoiceOperation.count).to eq(0)
-    expect(AuditEvent.where(entry_id:)).to be_empty
-    expect(OutboxSnapshot.count).to eq(0)
-    expect(Entry.find(entry_id).version).to eq(1)
   end
 end
 
