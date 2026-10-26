@@ -17,6 +17,12 @@ class ApplicationController < ActionController::API
       render_reason(decision) unless decision == :allowed
     end
 
+    # For the internal routes, which only the service identity may call.
+    def authorize_service!
+      decision = Timekeeping::ServiceAccess.decide(identity)
+      render_reason(decision) unless decision == :allowed
+    end
+
     # What Timekeeping::EntriesQuery needs, from the verified claims only.
     def visibility
       { company_id: identity.company_id, role: identity.role, acting_user_id: identity.user_id }

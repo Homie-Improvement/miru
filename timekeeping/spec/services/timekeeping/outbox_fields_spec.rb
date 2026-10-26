@@ -14,8 +14,12 @@ RSpec.describe Timekeeping::OutboxFields do
     expect(described_class::ENTRY_FIELDS).to eq(contract_fields)
   end
 
-  it "adds only generation and outbox_position for a row, matching the table's columns" do
+  it "adds only generation and outbox_position for a row" do
     expect(described_class::ROW_FIELDS).to eq(contract_fields + %w[generation outbox_position])
-    expect(OutboxSnapshot.column_names).to match_array(described_class::ROW_FIELDS)
+  end
+
+  it "matches the table's columns with the relay's bookkeeping added" do
+    expect(described_class::RELAY_FIELDS).to eq(%w[enqueued_at sent_at])
+    expect(OutboxSnapshot.column_names).to match_array(described_class::ROW_FIELDS + described_class::RELAY_FIELDS)
   end
 end
