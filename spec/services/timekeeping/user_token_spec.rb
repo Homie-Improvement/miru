@@ -248,7 +248,13 @@ RSpec.describe Timekeeping::UserToken, "write role agrees with reference facts" 
       member: -> { scoped_member(:employee).tap { |member| member.add_role(:admin) } } },
     { case: "another company's admin", role: "employee",
       member: -> { elsewhere_member(:employee, elsewhere_role: :admin) } },
-    { case: "another company's owner", role: "employee", member: -> { elsewhere_member(elsewhere_role: :owner) } }
+    { case: "another company's owner", role: "employee", member: -> { elsewhere_member(elsewhere_role: :owner) } },
+    # These two hold no role in the company, so the role falls back to the
+    # default while a global or foreign admin role exists.
+    { case: "a global admin with no role in the company", role: "employee",
+      member: -> { scoped_member.tap { |member| member.add_role(:admin) } } },
+    { case: "another company's admin with no role in the company", role: "employee",
+      member: -> { elsewhere_member(elsewhere_role: :admin) } }
   ].each do |row|
     it "signs #{row[:role]} on the write token of #{row[:case]}, and the reference facts serve the same role" do
       member = instance_exec(&row[:member])
