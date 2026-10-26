@@ -1,0 +1,8 @@
+# frozen_string_literal: true
+
+source "https://rubygems.org"
+
+gemspec
+
+# The spec suite needs only RSpec, so it proves the gem loads without Rails.
+gem "rspec", "~> 3.13"
