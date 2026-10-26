@@ -15,14 +15,18 @@ module Timekeeping
   # is counted under its own company; access decisions and log tags read
   # company_id, which stays nil for an expired token.
   #
+  # purpose is the token's signed purpose claim ("read" or "write"), or nil for
+  # a token signed without one. Only WriteAccess reads it: a read token may
+  # carry a raised role, so it must never authorize a write.
+  #
   # A service caller is either the raw shared TIMEKEEPING_SERVICE_TOKEN, which
   # acts for no company and holds no operations, or a signed service token
   # (Timekeeping::ServiceTokenVerifier), whose verified claims give its
   # service_name, its one company_id and the operations it may run.
-  Identity = Data.define(:kind, :status, :user_id, :company_id, :role, :signed_company_id, :service_name,
-                         :operations) do
-    def initialize(signed_company_id: nil, service_name: nil, operations: [], **fields)
-      super(signed_company_id:, service_name:, operations: operations.freeze, **fields)
+  Identity = Data.define(:kind, :status, :user_id, :company_id, :role, :signed_company_id, :purpose,
+                         :service_name, :operations) do
+    def initialize(signed_company_id: nil, purpose: nil, service_name: nil, operations: [], **fields)
+      super(signed_company_id:, purpose:, service_name:, operations: operations.freeze, **fields)
     end
 
     def self.anonymous(status, signed_company_id: nil)
@@ -52,7 +56,8 @@ module Timekeeping
         user_id: claims.fetch("sub"),
         company_id: claims.fetch("company_id"),
         role: claims.fetch("role"),
-        signed_company_id: claims.fetch("company_id")
+        signed_company_id: claims.fetch("company_id"),
+        purpose: claims["purpose"]
       )
     end
 

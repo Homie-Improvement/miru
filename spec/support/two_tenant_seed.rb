@@ -16,6 +16,9 @@ RSpec.shared_context "two tenant seed" do
 
   after(:all) do
     DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
+    # Truncation empties the ownership table; restore its one row, as the
+    # suite setup in spec/support/database_cleaner.rb does, so later specs find it.
+    TimekeepingOwnership.ensure_initial!
   end
 
   let(:fork_and_leaf) { Company.find_by!(name: "Fork & Leaf Salads") }
