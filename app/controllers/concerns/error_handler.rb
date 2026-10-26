@@ -13,9 +13,13 @@ module ErrorHandler
     rescue_from Timekeeping::EntryApiClient::Error, with: :timekeeping_unavailable
     rescue_from Timekeeping::BillingFence::OwnershipMoving, with: :render_ownership_moving
     rescue_from Timekeeping::Gateway::StaleGeneration, with: :render_stale_generation
+    rescue_from Timekeeping::EntryWriteClient::Forbidden, with: :render_timekeeping_forbidden
+    rescue_from Timekeeping::EntryWriteClient::Conflict, with: :render_entry_version_conflict
+    rescue_from Timekeeping::EntryWriteClient::Rejected, with: :render_entry_write_rejected
   end
 
   STALE_GENERATION_REASON = "stale_generation"
+  VERSION_CONFLICT_REASON = "version_conflict"
 
   private
 
@@ -80,6 +84,23 @@ module ErrorHandler
     # it changed nothing. The client reloads and retries against the new owner.
     def render_stale_generation(_exception)
       render json: { errors: I18n.t("errors.stale_generation"), reason: STALE_GENERATION_REASON }, status: 409
+    end
+
+    # The answers below come from a forwarded Timekeeping entry write. Each
+    # renders a fixed monolith message, never the exception's message or
+    # Timekeeping's answer body.
+
+    def render_timekeeping_forbidden(_exception)
+      render json: { errors: I18n.t("pundit.default") }, status: 403
+    end
+
+    # The entry changed after it was checked, so nothing was written.
+    def render_entry_version_conflict(_exception)
+      render json: { errors: I18n.t("errors.entry_version_conflict"), reason: VERSION_CONFLICT_REASON }, status: 409
+    end
+
+    def render_entry_write_rejected(_exception)
+      render json: { errors: I18n.t("errors.entry_write_rejected") }, status: 422
     end
 
     def invalid_param_value(exception)

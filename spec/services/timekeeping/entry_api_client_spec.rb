@@ -197,3 +197,41 @@ RSpec.describe Timekeeping::EntryApiClient, "read token role" do
     )
   end
 end
+
+RSpec.describe Timekeeping::EntryApiClient, "show_entry" do
+  let(:show_company) { create(:company) }
+  let(:show_admin) do
+    create(:user).tap do |admin|
+      create(:employment, company: show_company, user: admin)
+      admin.add_role(:admin, show_company)
+    end
+  end
+  let(:show_url) { "http://timekeeping.test/v1/companies/#{show_company.id}/entries/41" }
+
+  def show_entry_call
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
+      described_class.new(base_url: "http://timekeeping.test").show_entry(
+        company_id: show_company.id, entry_id: 41, acting_user_id: show_admin.id, request_id: "req-show-1"
+      )
+    end
+  end
+
+  it "reads the entry for the acting user and sends the request id" do
+    stub_request(:get, show_url).to_return(status: 200, body: { "id" => 41, "company_id" => show_company.id }.to_json)
+
+    expect(show_entry_call).to eq("id" => 41, "company_id" => show_company.id)
+    expect(WebMock).to have_requested(:get, show_url).with(headers: { "X-Request-Id" => "req-show-1" })
+  end
+
+  it "maps a missing entry to not found, a refused actor to forbidden and anything else to its own error" do
+    raised = [404, 403, 401, 500].map do |status|
+      stub_request(:get, show_url).to_return(status:, body: { reason: "detail" }.to_json)
+      show_entry_call
+    rescue StandardError => error
+      error.class
+    end
+
+    expect(raised).to eq([ActiveRecord::RecordNotFound, Timekeeping::EntryWriteClient::Forbidden,
+                          described_class::Error, described_class::Error])
+  end
+end
