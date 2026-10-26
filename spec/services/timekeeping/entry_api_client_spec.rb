@@ -88,34 +88,6 @@ RSpec.describe Timekeeping::EntryApiClient, "write token role while read tokens 
   end
 end
 
-RSpec.describe Timekeeping::EntryApiClient, "raised write role" do
-  # "A write token for a user who holds employee first and admin or owner later in a company signs the admin or owner role with purpose write"
-  it "sends a write token with the admin role for an employee-first admin while read tokens are off" do
-    company = create(:company)
-    admin = create(:user).tap { |user| create(:employment, company:, user:) }
-    admin.add_role(:employee, company)
-    admin.add_role(:admin, company)
-    tokens = []
-    stub_request(:get, %r{\Ahttp://timekeeping\.test/v1/companies/#{company.id}/entries}).to_return do |request|
-      tokens << request.headers["Authorization"].delete_prefix("Bearer ")
-      { status: 200, body: { entries: [] }.to_json }
-    end
-
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
-      with_timekeeping_env(described_class::READ_TOKENS_ENV, "false") do
-        described_class.new(base_url: "http://timekeeping.test").list_entries(
-          company_id: company.id, user_id: admin.id, from: Date.new(2026, 3, 1), to: Date.new(2026, 3, 31)
-        )
-      end
-    end
-
-    claims = Timekeeping::UserToken.verify(tokens.first, public_key: timekeeping_key_pair.public_key)
-    expect([claims.user_id, claims.company_id, claims.role, claims.purpose])
-      .to eq([admin.id, company.id, "admin", "write"])
-    expect(admin.primary_role(company)).to eq("employee")
-  end
-end
-
 RSpec.describe Timekeeping::EntryApiClient, "write token role with read tokens off" do
   # "A write token for a user who holds employee first and admin or owner later in a company signs
   # the admin or owner role with purpose write"
@@ -135,7 +107,7 @@ RSpec.describe Timekeeping::EntryApiClient, "write token role with read tokens o
         user.add_role(:employee, company)
         user.add_role(privileged, company)
       end
-      [nil, "false"].map do |read_tokens_enabled|
+      [nil, "false", "true"].map do |read_tokens_enabled|
         with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
           with_timekeeping_env(described_class::READ_TOKENS_ENV, read_tokens_enabled) do
             described_class.new(base_url: "http://timekeeping.test").list_entries(
@@ -149,8 +121,85 @@ RSpec.describe Timekeeping::EntryApiClient, "write token role with read tokens o
       end
     end
 
+    # The flag chooses only the purpose claim; the role is the same either way.
     expect(signed.map { |_id, role, primary, purpose| [role, primary, purpose] }).to eq(
-      [%w[admin employee write]] * 2 + [%w[owner employee write]] * 2
+      [%w[admin employee write], %w[admin employee write], %w[admin employee read],
+       %w[owner employee write], %w[owner employee write], %w[owner employee read]]
+    )
+  end
+end
+
+RSpec.describe Timekeeping::EntryApiClient, "read token role" do
+  let(:read_role_company) { create(:company) }
+  let(:read_role_list_url) { %r{\Ahttp://timekeeping\.test/v1/companies/#{read_role_company.id}/entries} }
+  let(:read_role_colleague) do
+    create(:user).tap { |colleague| create(:employment, company: read_role_company, user: colleague) }
+  end
+
+  def read_role_member
+    create(:user).tap { |member| create(:employment, company: read_role_company, user: member) }
+  end
+
+  # Lists the colleague's entries for each actor with read tokens on, and
+  # returns the entries of the last list with the verified claims of every
+  # token sent.
+  def read_role_list(actors, answer_entries: [])
+    tokens = []
+    stub_request(:get, read_role_list_url).to_return do |request|
+      tokens << request.headers["Authorization"].delete_prefix("Bearer ")
+      { status: 200, body: { entries: answer_entries }.to_json }
+    end
+
+    entries = with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
+      with_timekeeping_env(described_class::READ_TOKENS_ENV, "true") do
+        actors.map do |actor|
+          described_class.new(base_url: "http://timekeeping.test").list_entries(
+            company_id: read_role_company.id, user_id: read_role_colleague.id, from: Date.new(2026, 3, 1),
+            to: Date.new(2026, 3, 31), acting_user_id: actor.id
+          )
+        end.last
+      end
+    end
+    claims = tokens.map { |token| Timekeeping::UserToken.verify(token, public_key: timekeeping_key_pair.public_key) }
+    [entries, claims]
+  end
+
+  # The employee role is added first, so it has the lower roles.id and sorts
+  # first: the primary role says employee, while the index controllers let
+  # this user read colleagues through has_role?(:admin, company).
+  it "reads a colleague for an admin whose employee role is older with an admin read token for that company" do
+    admin = read_role_member
+    admin.add_role(:employee, read_role_company)
+    admin.add_role(:admin, read_role_company)
+
+    entries, claims = read_role_list([admin], answer_entries: [{ "id" => 5, "user_id" => read_role_colleague.id }])
+
+    expect(entries).to eq([{ "id" => 5, "user_id" => read_role_colleague.id }])
+    expect(WebMock).to have_requested(:get, read_role_list_url)
+      .with(query: hash_including("user_id" => read_role_colleague.id.to_s))
+    expect(claims.map { |claim| [claim.user_id, claim.company_id, claim.role, claim.purpose] })
+      .to eq([[admin.id, read_role_company.id, "admin", "read"]])
+    expect(admin.primary_role(read_role_company)).to eq("employee")
+  end
+
+  # The raised role must not widen a plain employee, nor a user whose admin
+  # role is in another company.
+  it "keeps the employee role on the read token for a plain employee or an admin of another company" do
+    other_company = create(:company)
+    plain_employee = read_role_member
+    plain_employee.add_role(:employee, read_role_company)
+    admin_elsewhere = read_role_member
+    create(:employment, company: other_company, user: admin_elsewhere)
+    admin_elsewhere.add_role(:admin, other_company)
+    admin_elsewhere.add_role(:employee, read_role_company)
+
+    _entries, claims = read_role_list([plain_employee, admin_elsewhere])
+
+    expect(claims.map { |claim| [claim.user_id, claim.company_id, claim.role, claim.purpose] }).to eq(
+      [
+        [plain_employee.id, read_role_company.id, "employee", "read"],
+        [admin_elsewhere.id, read_role_company.id, "employee", "read"]
+      ]
     )
   end
 end

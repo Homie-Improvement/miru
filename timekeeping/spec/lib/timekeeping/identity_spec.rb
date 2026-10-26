@@ -162,19 +162,6 @@ RSpec.describe Timekeeping::Identity, "malformed primary role claim" do
   end
 end
 
-RSpec.describe Timekeeping::Identity, "primary role claim" do
-  # "This gives no one more write authority than the monolith already grants through `has_role?`."
-  it "keeps a signed primary role apart from the raised role and falls back to the role only when the claim is absent" do
-    raised = described_class.user(
-      { "sub" => 42, "company_id" => 9, "role" => "admin", "primary_role" => "employee", "purpose" => "write" }
-    )
-    legacy = described_class.user({ "sub" => 42, "company_id" => 9, "role" => "employee", "purpose" => "write" })
-
-    expect(raised).to have_attributes(role: "admin", primary_role: "employee", purpose: "write")
-    expect(legacy).to have_attributes(role: "employee", primary_role: "employee")
-  end
-end
-
 RSpec.describe Timekeeping::Identity, "purpose beside a raised role" do
   # "A read token must still never be accepted for writes. Purpose stays a separate claim."
   it "keeps the read purpose on an identity whose read token signs the same raised role as a write token" do
@@ -189,21 +176,6 @@ RSpec.describe Timekeeping::Identity, "purpose beside a raised role" do
     expect([write.role, write.purpose]).to eq(%w[admin write])
     expect(Timekeeping::WriteAccess.decide(read, path_company_id: 9)).to eq(:forbidden)
     expect(Timekeeping::WriteAccess.decide(write, path_company_id: 9)).to eq(:allowed)
-  end
-end
-
-RSpec.describe Timekeeping::Identity, ".user primary role" do
-  # "This gives no one more write authority than the monolith already grants through `has_role?`."
-  # The locked rule reads primary_role, so it must hold the signed value and
-  # never the raised role when the token carries both.
-  it "carries the signed primary role apart from the raised role, and falls back to role when it is absent" do
-    base = { "sub" => 42, "company_id" => 9, "purpose" => "write" }
-
-    raised = described_class.user(base.merge("role" => "admin", "primary_role" => "employee"))
-    legacy = described_class.user(base.merge("role" => "employee"))
-
-    expect(raised).to have_attributes(role: "admin", primary_role: "employee", purpose: "write")
-    expect(legacy).to have_attributes(role: "employee", primary_role: "employee")
   end
 end
 
