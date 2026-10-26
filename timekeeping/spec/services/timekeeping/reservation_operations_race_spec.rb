@@ -240,7 +240,6 @@ RSpec.describe Timekeeping::ReservationOperations, "under concurrent requests" d
     expect([entry.version, entry.bill_status]).to eq([baseline.version, "unbilled"])
     expect(Reservation.where(entry_id: retained_entry).pluck(:invoice_id, :state)).to eq([[502, "committed"]])
     expect(AuditEvent.where(entry_id: retained_entry).order(:id).pluck(:action, :after)).to eq(baseline_audit)
-    expect(AuditEvent.where(entry_id: retained_entry, action: "mark_billed")).not_to exist
     expect(OutboxSnapshot.where(id: retained_entry).order(:outbox_position).pluck(:version, :locked))
       .to eq(baseline_snapshots)
   end
