@@ -32,6 +32,8 @@ RSpec.describe TimekeepingRules::ReservationDecision, ".call" do
     current = { 1 => held, 2 => held, 3 => held, 4 => held }
     # Remaining lines: a direct line for entry 1 and a grouped line for entries 2 and 3.
     # Entry 4's line was removed.
+    # Only remaining lines are passed, so an entry whose own direct line was removed stays held
+    # while a grouped line still lists it, as 2 and 3 do here.
     desired = [1, [2, 3]]
 
     # "A draft's removed line releases only entries no remaining direct or grouped line references."
