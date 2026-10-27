@@ -45,9 +45,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded foreign-
   end
 end
 
-require "rails_helper"
-require_relative "../../../../../support/timekeeping/fake_timekeeping"
-
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded mixed-tenant bulk move", type: :request do
   let(:company) { create(:company) }
   let(:other_company) { create(:company) }
@@ -100,9 +97,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded mixed-te
   end
 end
 
-require "rails_helper"
-require_relative "../../../../../support/timekeeping/fake_timekeeping"
-
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded employee bulk move scope", type: :request do
   let(:company) { create(:company) }
   let(:project) { create(:project, billable: true, client: create(:client, company:)) }
@@ -154,9 +148,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded employee
   end
 end
 
-require "rails_helper"
-require_relative "../../../../../support/timekeeping/fake_timekeeping"
-
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded foreign target project", type: :request do
   let(:company) { create(:company) }
   let(:other_company) { create(:company) }
@@ -197,9 +188,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded foreign 
     expect(fake.stored_entry(entry_id)["project_id"]).to eq(project.id)
   end
 end
-
-require "rails_helper"
-require_relative "../../../../../support/timekeeping/fake_timekeeping"
 
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded bulk move credentials", type: :request do
   let(:company) { create(:company) }
@@ -257,9 +245,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded bulk mov
   end
 end
 
-require "rails_helper"
-require_relative "../../../../../support/timekeeping/fake_timekeeping"
-
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded malformed bulk ids", type: :request do
   let(:company) { create(:company) }
   let(:project) { create(:project, billable: true, client: create(:client, company:)) }
@@ -303,9 +288,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded malforme
   end
 end
 
-require "rails_helper"
-require_relative "../../../../../support/timekeeping/fake_timekeeping"
-
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded foreign-only bulk delete", type: :request do
   let(:company) { create(:company) }
   let(:other_company) { create(:company) }
@@ -347,8 +329,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded foreign-
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Api::V1::TimesheetEntry::BulkAction legacy generation bump", type: :request, committed_data: true do
   let(:bump_company) { create(:company) }
   let(:bump_client) { create(:client, company: bump_company) }
@@ -387,9 +367,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkAction legacy generation bump", typ
     expect(TimesheetEntry.where(id: entries.map(&:id)).pluck(:project_id)).to all(eq(bump_source_project.id))
   end
 end
-
-require "rails_helper"
-require_relative "../../../../../support/timekeeping/fake_timekeeping"
 
 RSpec.describe "Api::V1::TimesheetEntry::BulkAction forwarded stale move", type: :request do
   let(:stale_company) { create(:company) }
@@ -438,9 +415,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkAction forwarded stale move", type:
     end
   end
 end
-
-require "rails_helper"
-require_relative "../../../../../support/timekeeping/fake_timekeeping"
 
 RSpec.describe "Api::V1::TimesheetEntry::BulkAction handoff refusal", type: :request do
   let(:handoff_company) { create(:company) }
@@ -493,9 +467,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkAction handoff refusal", type: :req
   end
 end
 
-require "rails_helper"
-require_relative "../../../../../support/timekeeping/fake_timekeeping"
-
 RSpec.describe "Api::V1::TimesheetEntry::BulkAction forwarded validation skip", type: :request do
   let(:skip_company) { create(:company) }
   let(:skip_client) { create(:client, company: skip_company) }
@@ -540,9 +511,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkAction forwarded validation skip", 
     expect(skip_fake.stored_entry(entry["id"])["project_id"]).to eq(skip_source_project.id)
   end
 end
-
-require "rails_helper"
-require_relative "../../../../../support/timekeeping/fake_timekeeping"
 
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded mixed tenant ids", type: :request do
   let(:company) { create(:company) }
@@ -601,9 +569,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded mixed te
   end
 end
 
-require "rails_helper"
-require_relative "../../../../../support/timekeeping/fake_timekeeping"
-
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded employee scope", type: :request do
   let(:company) { create(:company) }
   let(:client) { create(:client, company:) }
@@ -660,9 +625,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded employee
   end
 end
 
-require "rails_helper"
-require_relative "../../../../../support/timekeeping/fake_timekeeping"
-
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded foreign target project", type: :request do
   let(:company) { create(:company) }
   let(:client) { create(:client, company:) }
@@ -705,9 +667,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded foreign 
     expect(fake.stored_entry(own["id"])["project_id"]).to eq(project.id)
   end
 end
-
-require "rails_helper"
-require_relative "../../../../../support/timekeeping/fake_timekeeping"
 
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded delete tenant boundary", type: :request do
   let(:company) { create(:company) }
@@ -764,9 +723,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded delete t
   end
 end
 
-require "rails_helper"
-require_relative "../../../../../support/timekeeping/fake_timekeeping"
-
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#update forwarded success", type: :request do
   let(:company) { create(:company) }
   let(:admin) { create(:user, current_workspace_id: company.id) }
@@ -812,9 +768,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#update forwarded s
   end
 end
 
-require "rails_helper"
-require_relative "../../../../../support/timekeeping/fake_timekeeping"
-
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#update forwarded A9 skip", type: :request do
   let(:company) { create(:company) }
   let(:employee) { create(:user, current_workspace_id: company.id) }
@@ -853,9 +806,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#update forwarded A
     expect(fake.stored_entry(locked_id)["locked"]).to be(true)
   end
 end
-
-require "rails_helper"
-require_relative "../../../../../support/timekeeping/fake_timekeeping"
 
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#destroy forwarded mixed ids", type: :request do
   let(:company) { create(:company) }
@@ -898,9 +848,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#destroy forwarded 
   end
 end
 
-require "rails_helper"
-require_relative "../../../../../support/timekeeping/fake_timekeeping"
-
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#update forwarded foreign ids", type: :request do
   let(:company) { create(:company) }
   let(:admin) { create(:user, current_workspace_id: company.id) }
@@ -937,9 +884,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#update forwarded f
   end
 end
 
-require "rails_helper"
-require_relative "../../../../../support/timekeeping/fake_timekeeping"
-
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#update forwarded malformed id", type: :request do
   let(:company) { create(:company) }
   let(:admin) { create(:user, current_workspace_id: company.id) }
@@ -972,9 +916,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#update forwarded m
     expect(bulk_call[:body]["entry_ids"]).to eq([entry_id])
   end
 end
-
-require "rails_helper"
-require_relative "../../../../../support/timekeeping/fake_timekeeping"
 
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#update forwarded validation skip", type: :request do
   let(:company) { create(:company) }
@@ -1009,9 +950,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#update forwarded v
   end
 end
 
-require "rails_helper"
-require_relative "../../../../../support/timekeeping/fake_timekeeping"
-
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#destroy forwarded handoff", type: :request do
   let(:company) { create(:company) }
   let(:admin) { create(:user, current_workspace_id: company.id) }
@@ -1044,8 +982,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#destroy forwarded 
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#update legacy handoff", type: :request do
   let(:company) { create(:company) }
   let(:admin) { create(:user, current_workspace_id: company.id) }
@@ -1074,8 +1010,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#update legacy hand
     expect(second.reload.project_id).to eq(source_project.id)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded id boundary", type: :request do
   around { |example| with_forwarded_timekeeping_env { example.run } }
@@ -1118,8 +1052,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded id bound
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded malformed id", type: :request do
   around { |example| with_forwarded_timekeeping_env { example.run } }
 
@@ -1147,8 +1079,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded malforme
     expect(fake.stored_entry(entry_id)["project_id"]).to eq(to_project.id)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded stale generation", type: :request do
   around { |example| with_forwarded_timekeeping_env { example.run } }
@@ -1182,8 +1112,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded stale ge
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded handoff", type: :request do
   around { |example| with_forwarded_timekeeping_env { example.run } }
 
@@ -1208,8 +1136,6 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded handoff"
     expect(fake.stored_entry(entry_id)["discarded_at"]).to be_nil
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded validation skip", type: :request do
   around { |example| with_forwarded_timekeeping_env { example.run } }
