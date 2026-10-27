@@ -14,7 +14,8 @@ module Timekeeping
         "reservations" => "reservations",
         "invoice_operations" => "invoice_operations",
         "entry_audits" => "audit_events",
-        "idempotency_records" => "idempotency_receipts"
+        "idempotency_records" => "idempotency_receipts",
+        "service_idempotency_receipts" => "service_idempotency_receipts"
       }.freeze
 
       def initialize(connection:)

@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_10_26_134500) do
+ActiveRecord::Schema[8.1].define(version: 2026_10_27_090000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pg_stat_statements"
@@ -1079,6 +1079,18 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_26_134500) do
     t.datetime "updated_at", null: false
     t.index ["name", "resource_type", "resource_id"], name: "index_roles_on_name_and_resource_type_and_resource_id"
     t.index ["resource_type", "resource_id"], name: "index_roles_on_resource"
+  end
+
+  create_table "service_idempotency_receipts", force: :cascade do |t|
+    t.string "actor_name", null: false
+    t.text "body", null: false
+    t.bigint "company_id", null: false
+    t.datetime "created_at", null: false
+    t.string "fingerprint", null: false
+    t.string "key", null: false
+    t.string "operation", null: false
+    t.integer "status", null: false
+    t.index ["company_id", "actor_name", "operation", "key"], name: "index_service_idempotency_receipts_on_receipt_key", unique: true
   end
 
   create_table "solid_cable_messages", force: :cascade do |t|

@@ -456,7 +456,8 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
       "reservations" => [recon_checks_reservation(101), recon_checks_reservation(202)],
       "invoice_operations" => [recon_checks_operation(101), recon_checks_operation(202)],
       "entry_audits" => [recon_checks_audit(101), recon_checks_audit(202)],
-      "idempotency_records" => [recon_checks_receipt(101), recon_checks_receipt(202)]
+      "idempotency_records" => [recon_checks_receipt(101), recon_checks_receipt(202)],
+      "service_idempotency_receipts" => []
     }
     changes_for_a.each do |table, rows_for_a|
       tables[table.to_s] = rows_for_a + tables[table.to_s].reject { |row| row["company_id"] == 101 }

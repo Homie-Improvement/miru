@@ -29,23 +29,34 @@ module Timekeeping
   # 7. Write the entries with version + 1, one audit row per change, one
   #    outbox row per change under the outbox lock, and the receipt last.
   #
+  # The reservation routes (prepare, commit, abort) and the service commands
+  # (mark_billed, detach_entries) admit only service actors. LocalOwner.call
+  # decides their access with ServiceAccess and hands an allowed call to
+  # ReservationOperations or ServiceCommands, which take their own steps.
+  #
   # A refusal at any step writes nothing. checkpoint is called with each name
   # in STEPS as that step finishes, so a spec can fail the transaction at a
   # known point; an error it raises is never rescued here.
   class LocalOwner
+    # The entry writes' steps, then those only the reservation and service
+    # command writers take.
     STEPS = %i[
       receipt_key_locked generation_checked request_checked receipt_checked project_checked
       rows_locked rules_checked entry_written audit_written outbox_written receipt_written
+      operation_key_locked operation_checked decision_made reservations_written
     ].freeze
 
     ENTRY_API = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/entry_api.yml")).freeze
     IDEMPOTENCY = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/idempotency.yml")).freeze
+    RESERVATIONS = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/reservations.yml")).freeze
 
     # Every reason this owner answers with and its status: the contracts'
     # errors, plus this owner's own answers to a request without a key and to
-    # a body value the entries table or the projection could not take.
-    STATUS = [ENTRY_API, IDEMPOTENCY].flat_map { |contract| contract.fetch("errors").values }
-      .to_h { |error| [error.dig("body", "reason").to_sym, error.fetch("status")] }
+    # a body value the entries table or the projection could not take. An
+    # error whose body the owner builds itself, such as conflict, names its
+    # reason beside the status instead of in a fixed body.
+    STATUS = [ENTRY_API, IDEMPOTENCY, RESERVATIONS].flat_map { |contract| contract.fetch("errors").values }
+      .to_h { |error| [(error.dig("body", "reason") || error.fetch("reason")).to_sym, error.fetch("status")] }
       .merge(idempotency_key_required: 422, invalid_request: 400)
       .freeze
 
@@ -66,11 +77,6 @@ module Timekeeping
     ACTOR_TYPE = "user"
     UNBILLED = "unbilled"
     ID = TimekeepingRules::EntryDecision::ID
-    KEY_SEPARATOR = "\u001F"
-    # The one key every writer of entry_outbox_items takes just before its
-    # inserts and holds until commit, so outbox positions commit in the order
-    # they were drawn and the relay never passes a position still uncommitted.
-    OUTBOX_LOCK_KEY = 2_026_034_001
 
     ROUTE_WRITERS = {
       create: :create_entry,
@@ -115,8 +121,27 @@ module Timekeeping
       self.table_name = "entry_audits"
     end
 
+    # The reservation routes; every other route ServiceAccess knows is a
+    # service command.
+    RESERVATION_ROUTES = %i[prepare commit abort].freeze
+
+    # :reek:LongParameterList
     def self.call(operation:, company_id:, generation:, actor:, params:, checkpoint: ->(_step) { })
-      new(operation:, company_id:, generation:, actor:, params:, checkpoint:).call
+      route = operation.to_sym
+      return new(operation:, company_id:, generation:, actor:, params:, checkpoint:).call unless ServiceAccess.routes.include?(route)
+
+      # Access is decided on the actor alone, before any lock or read, so a
+      # refused caller never sees a stored answer and nothing is written.
+      access = ServiceAccess.decide(actor:, company_id:, route:)
+      return Outcome.refusal(access) unless access == :allowed
+
+      # As the service does, a body holding a credential is refused before any
+      # other check, so no operation row or receipt can store one.
+      body = params.fetch("body", nil)
+      return Outcome.refusal(:credential_in_body) if body.is_a?(Hash) && WriteSteps.credential_in_body?(body)
+
+      writer = RESERVATION_ROUTES.include?(route) ? ReservationOperations : ServiceCommands
+      writer.call(route:, company_id:, generation:, actor:, params:, checkpoint:)
     end
 
     # :reek:LongParameterList
@@ -160,7 +185,7 @@ module Timekeeping
       def write
         lock_receipt_key unless key.empty?
         checkpoint.call(:receipt_key_locked)
-        stored_generation = admitted_generation
+        stored_generation = WriteSteps.admitted_generation
         refusal = admission_refusal(stored_generation)
         return refusal if refusal
 
@@ -174,7 +199,7 @@ module Timekeeping
       # The generation fence, then the checks on the request itself. Both come
       # before the receipt, so a fenced or malformed request is never replayed.
       def admission_refusal(stored_generation)
-        return Outcome.refusal(:stale_generation) unless generation_matches?(stored_generation)
+        return Outcome.refusal(:stale_generation) unless WriteSteps.generation_matches?(generation, stored_generation)
 
         checkpoint.call(:generation_checked)
         refusal = request_refusal
@@ -198,10 +223,12 @@ module Timekeeping
 
       def commit_change(written, stored_generation)
         checkpoint.call(:entry_written)
-        rows = reserved_rows(written.changes.map(&:entry_id))
+        rows = WriteSteps.reserved_rows(company_id, written.changes.map(&:entry_id))
         write_audit(written.changes, rows)
         checkpoint.call(:audit_written)
-        write_outbox(written.changes.map { |change| rows.fetch(change.entry_id) }, stored_generation)
+        WriteSteps.write_outbox(
+          company_id:, rows: written.changes.map { |change| rows.fetch(change.entry_id) }, generation: stored_generation
+        )
         checkpoint.call(:outbox_written)
         outcome = Outcome.success(written.status, written.payload.call(rows))
         store_receipt(outcome)
@@ -249,24 +276,6 @@ module Timekeeping
         Integer(value, 10) if value.is_a?(String) && ID.match?(value)
       end
 
-      # Generation
-
-      # The one generation this owner admits, read FOR SHARE so a handoff that
-      # updates the row waits for this write to commit. nil while the monolith
-      # is not the prepared owner, during a handoff, or when the row is missing.
-      def admitted_generation
-        ownership = TimekeepingOwnership.lock("FOR SHARE").find_by(id: TimekeepingOwnership::SINGLETON_ID)
-        return if ownership.nil? || !ownership.handoff_step.nil? || EntryOwner.for(ownership) != :prepared
-
-        ownership.generation
-      end
-
-      # nil matches nothing, and a sent value that is not a plain integer
-      # never matches, so neither a missing header nor "abc" can be admitted.
-      def generation_matches?(stored_generation)
-        !stored_generation.nil? && ID.match?(generation.to_s) && Integer(generation.to_s, 10) == stored_generation
-      end
-
       # Request checks
 
       def request_refusal
@@ -289,19 +298,7 @@ module Timekeeping
       end
 
       def credential_in_body?
-        TimekeepingRules::CredentialScan.found?(
-          body,
-          held_token: ENV.fetch(Internal::V1::BaseController::SERVICE_TOKEN_ENV, nil),
-          public_key: token_public_key
-        )
-      end
-
-      # The public half of the key the monolith signs user tokens with. An
-      # unset or unreadable key is not held, so it matches nothing.
-      def token_public_key
-        UserToken.private_key_from_env.public_key
-      rescue UserToken::MissingKeyError
-        nil
+        WriteSteps.credential_in_body?(body)
       end
 
       # A field is checked only when the body sends it: an absent field keeps
@@ -322,12 +319,9 @@ module Timekeeping
       # Receipts
 
       # Only writers with the same company, actor, operation and key wait on
-      # each other. The lock is taken on two signed 32-bit keys from a digest
-      # of those parts; rows are always read by their columns.
+      # each other.
       def lock_receipt_key
-        advisory_lock(*Digest::SHA256.digest(
-          [company_id, ACTOR_TYPE, actor.user_id || actor.name, request_operation, key].join(KEY_SEPARATOR)
-        ).unpack("l>l>"))
+        WriteSteps.lock_key(company_id, ACTOR_TYPE, actor.user_id || actor.name, request_operation, key)
       end
 
       def find_receipt
@@ -337,13 +331,13 @@ module Timekeeping
       def answer_from(receipt)
         return Outcome.refusal(:idempotency_key_reused) unless receipt.fingerprint == fingerprint
 
-        Outcome.new(status: receipt.status, body: JSON.parse(receipt.body))
+        Outcome.new(status: receipt.status, body: WriteSteps.replayed_body(receipt.body))
       end
 
       def store_receipt(outcome)
         Receipt.create!(
           company_id:, actor_type: ACTOR_TYPE, actor_id: actor.user_id, operation: request_operation, key:,
-          fingerprint:, status: outcome.status, body: JSON.generate(outcome.body), created_at: Time.current
+          fingerprint:, status: outcome.status, body: WriteSteps.receipt_body(outcome.body), created_at: Time.current
         )
       rescue ActiveRecord::RecordNotUnique => error
         raise ReceiptTaken, error.message
@@ -490,13 +484,7 @@ module Timekeeping
           relation = relation.where(user_id: scope) unless scope == :company
         end
         locked_ids = relation.order(:id).lock("FOR UPDATE").pluck(:id)
-        reserved_rows(locked_ids).values_at(*locked_ids)
-      end
-
-      # The company's entries with these ids as stored now, discarded ones
-      # included, each with the reservation flag, keyed by id.
-      def reserved_rows(entry_ids)
-        LocalEntry.with_reserved.where(company_id:, id: entry_ids).index_by(&:id)
+        WriteSteps.reserved_rows(company_id, locked_ids).values_at(*locked_ids)
       end
 
       def version_matches?(entry)
@@ -549,45 +537,8 @@ module Timekeeping
         end
       end
 
-      def write_outbox(rows, stored_generation)
-        return if rows.empty?
-
-        advisory_lock(OUTBOX_LOCK_KEY)
-        now = Time.current
-        LocalOutboxEntry.insert_all!(rows.map do |row|
-          { company_id:, entry_id: row.id, generation: stored_generation, payload: snapshot(row), created_at: now }
-        end)
-      end
-
-      # The contract snapshot of one entry, read with the reservation flag:
-      # locked is that flag, never the stored entries.locked column.
-      def snapshot(row)
-        json_fields(row, SnapshotBatch::ENTRY_FIELDS)
-      end
-
       def response_body(row)
-        json_fields(row, RESPONSE_FIELDS)
-      end
-
-      def json_fields(row, fields)
-        fields.index_with { |field| json_value(field == "locked" ? row.reserved : row[field]) }
-      end
-
-      # Times as UTC with microseconds, the precision the column stores, and
-      # dates as ISO 8601; every other value, a Float duration included, as is.
-      def json_value(value)
-        case value
-        when Time, ActiveSupport::TimeWithZone then value.utc.iso8601(6)
-        when Date then value.iso8601
-        else value
-        end
-      end
-
-      def advisory_lock(*keys)
-        placeholders = Array.new(keys.size, "?").join(", ")
-        ApplicationRecord.connection.execute(
-          ApplicationRecord.sanitize_sql_array(["SELECT pg_advisory_xact_lock(#{placeholders})", *keys])
-        )
+        WriteSteps.json_fields(row, RESPONSE_FIELDS)
       end
   end
 end
