@@ -303,16 +303,16 @@ module Imports
         )
       end
 
-      # A row an earlier run of this import already wrote (its line is in
-      # written_rows) accounts for one stored match, and is skipped when that
-      # match is stored here. Every other row matching a stored entry is
+      # A row an earlier run of this import already tried to write (its line is
+      # in attempted_rows) accounts for one stored match, and is skipped when
+      # that match is stored here. Every other row matching a stored entry is
       # skipped however often it repeats, so a stored entry of another import
       # still skips all of its matching rows, while an identical row a failed
-      # run never reached is written on the rerun.
+      # run never wrote is written on the rerun.
       def skip_stored_duplicates
-        written = data_import.written_rows.to_set
+        attempted = data_import.attempted_rows.to_set
         unmatched = @stored_duplicates.dup
-        own, others = @planned_rows.partition { |row| written.include?(row[:row]) }
+        own, others = @planned_rows.partition { |row| attempted.include?(row[:row]) }
         skipped = own.select { |row| take_stored_match(unmatched, row[:duplicate_key]) }
         skipped += others.select { |row| unmatched.fetch(row[:duplicate_key], 0).positive? }
         @duplicate_rows = skipped.size
@@ -521,6 +521,7 @@ module Imports
       end
 
       def create_entry(gateway, row, expected_generation)
+        record_attempted_row(row)
         gateway.import(
           user: row[:user],
           project: row[:project_plan][:record],
@@ -535,17 +536,17 @@ module Imports
           idempotency_key: row_idempotency_key(row),
           expected_generation:
         )
-        record_written_row(row)
         @imported_rows += 1
       end
 
-      # Kept across runs, and saved as each row is written, so a rerun after
-      # any failure, a crash included, knows which stored entries this import
-      # wrote itself.
-      def record_written_row(row)
+      # Saved before the write, and kept across runs, so no failure between the
+      # write and this record (a crash, a lost answer from Timekeeping) can
+      # leave a written row unrecorded. A recorded row whose write never
+      # happened has no stored match to take, so the rerun writes it.
+      def record_attempted_row(row)
         DataImport.where(id: data_import.id)
-          .where.not("? = ANY(written_rows)", row[:row])
-          .update_all(["written_rows = array_append(written_rows, ?)", row[:row]])
+          .where.not("? = ANY(attempted_rows)", row[:row])
+          .update_all(["attempted_rows = array_append(attempted_rows, ?)", row[:row]])
       end
 
       # The same row of the same data import always gives the same key, so a

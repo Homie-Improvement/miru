@@ -345,6 +345,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_27_164215) do
   end
 
   create_table "data_imports", force: :cascade do |t|
+    t.integer "attempted_rows", default: [], null: false, array: true
     t.bigint "company_id", null: false
     t.datetime "created_at", null: false
     t.boolean "dry_run", default: false, null: false
@@ -363,7 +364,6 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_27_164215) do
     t.integer "total_rows", default: 0, null: false
     t.datetime "updated_at", null: false
     t.bigint "user_id", null: false
-    t.integer "written_rows", default: [], null: false, array: true
     t.index ["company_id", "created_at"], name: "index_data_imports_on_company_id_and_created_at"
     t.index ["user_id"], name: "index_data_imports_on_user_id"
   end

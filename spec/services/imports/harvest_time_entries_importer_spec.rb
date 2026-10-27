@@ -558,6 +558,29 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     expect(fwd_fake.outbox.map { |row| row["entry"]["id"] }.uniq.size).to eq(2)
     expect(fwd_import.reload).to have_attributes(status: "completed", imported_rows: 1, skipped_rows: 1)
   end
+
+  it "skips a forwarded row on a rerun when the run stopped right after Timekeeping stored it" do
+    calls = 0
+    allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_wrap_original do |original, *args, **kwargs|
+      calls += 1
+      result = original.call(*args, **kwargs)
+      # Timekeeping stored the entry; the run stops before anything else happens.
+      raise IOError, "worker stopped" if calls == 1
+
+      result
+    end
+
+    expect { described_class.new(fwd_import).process }.to raise_error(IOError)
+    create(:timesheet_entry, project: fwd_project, user: fwd_paul, work_date: Date.new(2026, 1, 5), duration: 90,
+                             note: "first row", bill_status: "unbilled", source: "import")
+    allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_call_original
+    described_class.new(fwd_import.reload).process
+
+    posted_notes = fwd_fake.requests.filter_map { |request| request[:body]&.dig("note") if request[:method] == "POST" }
+    expect(posted_notes).to eq(["first row", "second row"])
+    expect(fwd_fake.outbox.map { |row| row["entry"]["id"] }.uniq.size).to eq(2)
+    expect(fwd_import.reload).to have_attributes(status: "completed", imported_rows: 1, skipped_rows: 1)
+  end
 end
 
 RSpec.describe Imports::HarvestTimeEntriesImporter do
@@ -1191,6 +1214,32 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     expect(rerun_dup_entries("second")).to eq(1)
     expect(rerun_dup_entries("third")).to eq(1)
     expect(import.reload).to have_attributes(status: "completed", imported_rows: 1, skipped_rows: 3)
+  end
+
+  it "writes the second identical row on a rerun when the run stopped right after the first row was written" do
+    import = rerun_dup_import_with(<<~CSV)
+      Date,Client,Project,Hours,First Name,Last Name,Billable?,Notes
+      2026-01-05,Acme LLC,Website,1,Paul,Connors,Yes,same work
+      2026-01-05,Acme LLC,Website,1,Paul,Connors,Yes,same work
+    CSV
+    calls = 0
+    allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_wrap_original do |original, *args, **kwargs|
+      calls += 1
+      result = original.call(*args, **kwargs)
+      # The entry is committed; the run stops before anything else happens.
+      raise IOError, "worker stopped" if calls == 1
+
+      result
+    end
+
+    expect { described_class.new(import).process }.to raise_error(IOError)
+    expect(rerun_dup_entries("same work")).to eq(1)
+
+    allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_call_original
+    described_class.new(import.reload).process
+
+    expect(rerun_dup_entries("same work")).to eq(2)
+    expect(import.reload).to have_attributes(status: "completed", imported_rows: 1, skipped_rows: 1)
   end
 
   it "skips every matching row of an upload queued before an earlier upload stored its entry" do
