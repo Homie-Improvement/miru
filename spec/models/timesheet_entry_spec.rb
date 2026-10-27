@@ -307,6 +307,18 @@ RSpec.describe TimesheetEntry, type: :model do
 
       expect(timesheet_entry.source_metadata["tool"]).to eq("x" * 100)
     end
+
+    it "gives a forwarded write the same source fields a save stores" do
+      fields = described_class.normalized_source_fields(
+        source: "cli", source_metadata: { "tool" => " codex ", mcp_server: "miru", extra: "drop-me", skill: "" }
+      )
+
+      expect(fields).to eq("source" => "mcp", "source_metadata" => { "tool" => "codex", "mcp_server" => "miru" })
+      expect(described_class.normalized_source_fields(source: "CLI", source_metadata: nil))
+        .to eq("source" => "cli", "source_metadata" => {})
+      expect(described_class.normalized_source_fields(source: nil, source_metadata: { tool: "harvest" }))
+        .to eq("source" => "automation", "source_metadata" => { "tool" => "harvest" })
+    end
   end
 
   describe "#ensure_bill_status_is_set" do

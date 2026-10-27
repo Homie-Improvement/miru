@@ -399,6 +399,32 @@ RSpec.describe Timekeeping::LocalOwner, "answers and snapshots" do
     expect(payload["updated_at"]).to match(microsecond_utc)
   end
 
+  it "stores and answers an entry's agent run and session ids on create" do
+    params = create_params("run-ids")
+    params["body"] = params["body"].merge("external_run_id" => "run_123", "external_session_id" => "session_123")
+
+    outcome = call_as_owner(:create, params)
+
+    expect(outcome.status).to eq(201)
+    expect(outcome.body).to include("external_run_id" => "run_123", "external_session_id" => "session_123")
+    expect(Timekeeping::LocalEntry.find(outcome.body.fetch("id")))
+      .to have_attributes(external_run_id: "run_123", external_session_id: "session_123")
+  end
+
+  it "stores an agent create as pending_review and a create without an agent as not_required" do
+    agent = create(:agent, company:, user: owner)
+    agent_params = create_params("agent-review")
+    agent_params["body"] = agent_params["body"].merge("agent_id" => agent.id, "review_status" => "approved")
+
+    agent_outcome = call_as_owner(:create, agent_params)
+    plain_outcome = call_as_owner(:create, create_params("plain-review"))
+
+    expect([agent_outcome.status, plain_outcome.status]).to eq([201, 201])
+    expect(agent_outcome.body["review_status"]).to eq("pending_review")
+    expect(plain_outcome.body["review_status"]).to eq("not_required")
+    expect(Timekeeping::LocalEntry.find(agent_outcome.body.fetch("id")).review_status).to eq("pending_review")
+  end
+
   it "answers a replay and a reused key right after receipt_checked, before any later step runs" do
     expect(call_as_owner(:create, create_params("replay-steps")).status).to eq(201)
     steps_until_receipt = %i[receipt_key_locked generation_checked request_checked receipt_checked]

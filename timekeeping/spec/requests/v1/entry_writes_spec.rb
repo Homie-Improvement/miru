@@ -147,6 +147,18 @@ RSpec.describe "Entry write routes" do
       expect([response.status, reason]).to eq([422, "credential_in_body"])
       expect(entry_write_counts).to eq(before)
     end
+
+    # "An anonymous or user-delegated request never gets it."
+    it "refuses the provider's service token copied into a note or glued between other text, and writes nothing" do
+      before = entry_write_counts
+
+      ["copied #{provider_service_token}", "glued#{provider_service_token}tail"].each do |note|
+        send_write(:post, entries_path, employee_token, entry_body(note:))
+
+        expect([note, response.status, reason]).to eq([note, 422, "credential_in_body"])
+      end
+      expect(entry_write_counts).to eq(before)
+    end
   end
 
   it "creates an entry from a body without bill_status as unbilled" do
@@ -353,6 +365,376 @@ RSpec.describe "Entry writes carrying a service token" do
       expect([response.status, response.parsed_body]).to eq([422, { "reason" => "credential_in_body" }])
     end
     expect(entry_write_counts).to eq(before_counts)
+  end
+end
+
+# The entry API must not commit an agent_id "without checking that the agent
+# exists and belongs to the entry's company and user (design rule S7)". Every
+# refusal answers 404 not_found and writes nothing.
+RSpec.describe "Entry write routes", "agent ownership" do
+  include_context "timekeeping entry writes"
+  include_context "timekeeping entry writes without transactional fixtures"
+
+  let(:agent_company) { timekeeping_arrange.company }
+  let(:agent_project) { timekeeping_arrange.project(company: agent_company) }
+  let(:agent_owner) { timekeeping_arrange.user(company: agent_company, role: "owner") }
+  let(:agent_employee) { timekeeping_arrange.user(company: agent_company, role: "employee") }
+  let(:agent_colleague) { timekeeping_arrange.user(company: agent_company, role: "employee") }
+  let(:colleague_agent) { timekeeping_arrange.agent(company: agent_company, user: agent_colleague) }
+  let(:agent_entries_path) { "/v1/companies/#{agent_company}/entries" }
+
+  def agent_entry_body(**fields)
+    { "project_id" => agent_project, "work_date" => "2026-03-02", "duration" => 45.0, "note" => "Review",
+      "source" => "manual", "source_metadata" => {} }.merge(fields.transform_keys(&:to_s))
+  end
+
+  def agent_write_headers(user)
+    { "Content-Type" => "application/json", "Authorization" => "Bearer #{timekeeping_arrange.token_for(user)}",
+      "Ownership-Generation" => timekeeping_arrange.current_generation.to_s, "Idempotency-Key" => SecureRandom.uuid }
+  end
+
+  def expect_agent_not_found
+    expect([response.status, response.parsed_body]).to eq([404, { "reason" => "not_found" }])
+  end
+
+  # The shared entry API contract examples, run against this provider by
+  # timekeeping/spec/contracts/entry_provider_spec.rb, own the foreign-versus-missing,
+  # colleague-agent and user-only-update refusals; the writer spec owns their
+  # row counts. These cases cover what those do not.
+
+  # The agent must belong to the entry's user, which is the user the body names, not the acting owner.
+  it "refuses an owner's create for an employee that carries the owner's own agent, and accepts the employee's agent" do
+    owner_agent = timekeeping_arrange.agent(company: agent_company, user: agent_owner)
+    employee_agent = timekeeping_arrange.agent(company: agent_company, user: agent_employee)
+    before = entry_write_counts
+
+    post agent_entries_path, params: JSON.generate(agent_entry_body(user_id: agent_employee, agent_id: owner_agent)),
+                             headers: agent_write_headers(agent_owner)
+    expect_agent_not_found
+    expect(entry_write_counts).to eq(before)
+
+    post agent_entries_path, params: JSON.generate(agent_entry_body(user_id: agent_employee, agent_id: employee_agent)),
+                             headers: agent_write_headers(agent_owner)
+    expect(response.status).to eq(201)
+    expect(response.parsed_body.values_at("user_id", "agent_id")).to eq([agent_employee, employee_agent])
+  end
+
+  # The body names no user_id, so the check must use the entry's stored user.
+  it "refuses an update that sets a colleague's agent while the stored user stays, and leaves the entry unchanged" do
+    entry_id = timekeeping_arrange.entry(company: agent_company, user: agent_employee, project: agent_project)
+    version_before = Entry.find(entry_id).version
+    before = entry_write_counts
+
+    patch "#{agent_entries_path}/#{entry_id}", params: JSON.generate("agent_id" => colleague_agent),
+                                               headers: agent_write_headers(agent_owner)
+
+    expect_agent_not_found
+    expect(entry_write_counts).to eq(before)
+    stored = Entry.find(entry_id)
+    expect([stored.agent_id, stored.user_id, stored.version]).to eq([nil, agent_employee, version_before])
+  end
+
+  it "refuses an update that sets another company's agent and leaves the entry untouched" do
+    entry_id = timekeeping_arrange.entry(company: agent_company, user: agent_owner, project: agent_project)
+    other_company = timekeeping_arrange.company
+    foreign_agent = timekeeping_arrange.agent(company: other_company,
+                                              user: timekeeping_arrange.user(company: other_company, role: "owner"))
+    before = entry_write_counts
+
+    patch "#{agent_entries_path}/#{entry_id}", params: JSON.generate("agent_id" => foreign_agent),
+                                               headers: agent_write_headers(agent_owner)
+
+    expect_agent_not_found
+    expect(Entry.find(entry_id).agent_id).to be_nil
+    expect(entry_write_counts).to eq(before)
+  end
+
+  # "The entry API now refuses a zero or negative agent_id": that shape refusal must stay a 400,
+  # answered before the ownership check, not become the new 404 for unknown agents.
+  it "still refuses a zero or negative agent_id with 400 and writes nothing" do
+    before = entry_write_counts
+
+    statuses = [0, -1, -3].map do |agent_id|
+      post agent_entries_path, params: JSON.generate(agent_entry_body(agent_id:)), headers: agent_write_headers(agent_employee)
+      response.status
+    end
+
+    expect(statuses).to eq([400, 400, 400])
+    expect(entry_write_counts).to eq(before)
+  end
+
+  # Writes that keep the agent/user pair valid, or clear the agent, must not
+  # be refused by the agent ownership check.
+  it "clears the agent with a null agent_id, and moves and deletes agent entries" do
+    other_project = timekeeping_arrange.project(company: agent_company)
+    owner_agent = timekeeping_arrange.agent(company: agent_company, user: agent_owner)
+    cleared, moved, deleted = Array.new(3) do
+      timekeeping_arrange.entry(company: agent_company, user: agent_owner, project: agent_project, agent_id: owner_agent)
+    end
+
+    patch "#{agent_entries_path}/#{cleared}", params: JSON.generate("agent_id" => nil), headers: agent_write_headers(agent_owner)
+    expect(response.status).to eq(200)
+    post "#{agent_entries_path}/bulk-move", params: JSON.generate("entry_ids" => [moved], "project_id" => other_project),
+                                            headers: agent_write_headers(agent_owner)
+    expect(response.status).to eq(200)
+    expect(response.parsed_body.fetch("results")).to eq([{ "entry_id" => moved, "result" => "moved" }])
+    delete "#{agent_entries_path}/#{deleted}", headers: agent_write_headers(agent_owner)
+    expect(response.status).to eq(200)
+
+    expect(Entry.find(cleared).agent_id).to be_nil
+    expect([Entry.find(moved).project_id, Entry.find(moved).agent_id]).to eq([other_project, owner_agent])
+    expect(Entry.find(deleted).discarded_at).not_to be_nil
+  end
+end
+
+RSpec.describe "Entry write routes" do
+  include_context "timekeeping entry writes"
+  include_context "timekeeping entry writes without transactional fixtures"
+
+  let(:replay_company) { timekeeping_arrange.company }
+  let(:replay_project) { timekeeping_arrange.project(company: replay_company) }
+  let(:replay_admin) { timekeeping_arrange.user(company: replay_company, role: "admin") }
+  let(:replay_employee) { timekeeping_arrange.user(company: replay_company, role: "employee") }
+
+  # "Address this in follow-up design work with an authenticated replay path; do not treat every missing entry as a successful delete."
+  # "Replaying it needs a separate design that keeps the lookup-then-authorize order, and nothing is deleted twice meanwhile."
+  it "answers an admin's replay-only DELETE of a colleague's kept entry with no receipt as not found and writes nothing" do
+    entry_id = timekeeping_arrange.entry(company: replay_company, user: replay_employee, project: replay_project)
+    before = entry_write_counts
+
+    process(:delete, "/v1/companies/#{replay_company}/entries/#{entry_id}", headers: {
+      "Authorization" => "Bearer #{timekeeping_arrange.token_for(replay_admin)}",
+      "Ownership-Generation" => timekeeping_arrange.current_generation.to_s,
+      "Idempotency-Key" => SecureRandom.uuid,
+      "Idempotency-Replay" => "only"
+    })
+
+    expect(response.status).to eq(404)
+    expect(response.parsed_body).to eq("reason" => "not_found")
+    expect(Entry.find(entry_id).discarded_at).to be_nil
+    expect(entry_write_counts).to eq(before)
+  end
+end
+
+RSpec.describe "Entry write routes" do
+  include_context "timekeeping entry writes"
+  include_context "timekeeping entry writes without transactional fixtures"
+
+  let(:company) { timekeeping_arrange.company }
+  let(:project) { timekeeping_arrange.project(company:) }
+  let(:owner) { timekeeping_arrange.user(company:, role: "owner") }
+  let(:employee) { timekeeping_arrange.user(company:, role: "employee") }
+  let(:owner_token) { timekeeping_arrange.token_for(owner) }
+  let(:entry_id) { timekeeping_arrange.entry(company:, user: employee, project:) }
+
+  def replay_only_delete(token, key:, if_match: "replay-only")
+    headers = { "Content-Type" => "application/json", "Authorization" => "Bearer #{token}",
+                "Ownership-Generation" => timekeeping_arrange.current_generation.to_s,
+                "Idempotency-Key" => key, "Idempotency-Replay" => "only", "If-Match" => if_match }.compact
+    process(:delete, "/v1/companies/#{company}/entries/#{entry_id}", headers:)
+    response
+  end
+
+  # "do not treat every missing entry as a successful delete"
+  # "Replaying it needs a separate design that keeps the lookup-then-authorize order, and nothing is deleted twice meanwhile."
+  it "answers a replay-only delete with no stored receipt with not_found and changes no entry, audit, outbox or receipt row" do
+    entry_id
+    before = entry_write_counts
+
+    replay_only_delete(owner_token, key: SecureRandom.uuid)
+    expect([response.status, response.parsed_body]).to eq([404, { "reason" => "not_found" }])
+
+    replay_only_delete(owner_token, key: SecureRandom.uuid, if_match: nil)
+    expect([response.status, response.parsed_body]).to eq([404, { "reason" => "not_found" }])
+
+    expect(entry_write_counts).to eq(before)
+    expect(Entry.find(entry_id).discarded_at).to be_nil
+  end
+end
+
+RSpec.describe "Entry write routes" do
+  include_context "timekeeping entry writes"
+  include_context "timekeeping entry writes without transactional fixtures"
+
+  let(:replay_company) { timekeeping_arrange.company }
+  let(:replay_project) { timekeeping_arrange.project(company: replay_company) }
+  let(:replay_owner) { timekeeping_arrange.user(company: replay_company, role: "owner") }
+  let(:replay_employee) { timekeeping_arrange.user(company: replay_company, role: "employee") }
+  let(:replay_entry_id) { timekeeping_arrange.entry(company: replay_company, user: replay_employee, project: replay_project) }
+
+  def replay_delete_headers(key, **extra)
+    { "Authorization" => "Bearer #{timekeeping_arrange.token_for(replay_owner)}",
+      "Ownership-Generation" => timekeeping_arrange.current_generation.to_s, "Idempotency-Key" => key }.merge(extra)
+  end
+
+  # "Allow delete retries to reach the stored answer."
+  # "Replaying it needs a separate design that keeps the lookup-then-authorize order, and nothing is deleted twice meanwhile."
+  it "answers a replay-only delete retry with the first delete's stored answer and writes nothing more" do
+    path = "/v1/companies/#{replay_company}/entries/#{replay_entry_id}"
+    key = SecureRandom.uuid
+
+    process(:delete, path, headers: replay_delete_headers(key))
+    first_status = response.status
+    first_body = response.parsed_body
+    after_first = entry_write_counts
+
+    process(:delete, path, headers: replay_delete_headers(key, "Idempotency-Replay" => "only",
+                                                                "If-Match" => "replay-only"))
+
+    expect(first_status).to eq(200)
+    expect([response.status, response.parsed_body]).to eq([first_status, first_body])
+    expect(entry_write_counts).to eq(after_first)
+  end
+end
+
+RSpec.describe "Entry write routes" do
+  include_context "timekeeping entry writes"
+  include_context "timekeeping entry writes without transactional fixtures"
+
+  let(:replay_company) { timekeeping_arrange.company }
+  let(:replay_project) { timekeeping_arrange.project(company: replay_company) }
+  let(:replay_owner) { timekeeping_arrange.user(company: replay_company, role: "owner") }
+  let(:replay_employee) { timekeeping_arrange.user(company: replay_company, role: "employee") }
+
+  def replay_delete(company_id, entry_id, token, key:, replay_only:)
+    headers = { "Authorization" => "Bearer #{token}", "Idempotency-Key" => key,
+                "Ownership-Generation" => timekeeping_arrange.current_generation.to_s }
+    if replay_only
+      headers["Idempotency-Replay"] = "only"
+      headers["If-Match"] = "replay-only"
+    end
+    delete "/v1/companies/#{company_id}/entries/#{entry_id}", headers: headers
+    response
+  end
+
+  it "answers a replay-only DELETE with not_found for another company reusing the key and for a key with no receipt, discarding nothing" do
+    deleted_id = timekeeping_arrange.entry(company: replay_company, user: replay_employee, project: replay_project)
+    kept_id = timekeeping_arrange.entry(company: replay_company, user: replay_employee, project: replay_project)
+    key = SecureRandom.uuid
+    first = replay_delete(replay_company, deleted_id, timekeeping_arrange.token_for(replay_employee), key:, replay_only: false)
+    expect(first.status).to eq(200)
+    receipts_after_delete = IdempotencyReceipt.count
+
+    # "Address this in follow-up design work with an authenticated replay path; do not treat every missing entry as a successful delete."
+    # Another company's owner, sending the same key for the same entry id, must not reach the stored answer.
+    foreign_company = timekeeping_arrange.company
+    foreign_owner = timekeeping_arrange.user(company: foreign_company, role: "owner")
+    foreign = replay_delete(foreign_company, deleted_id, timekeeping_arrange.token_for(foreign_owner), key:, replay_only: true)
+    expect([foreign.status, foreign.parsed_body]).to eq([404, { "reason" => "not_found" }])
+
+    # A replay-only DELETE with no receipt behind it is answered from nothing and discards nothing, even for a kept entry.
+    no_receipt = replay_delete(replay_company, kept_id, timekeeping_arrange.token_for(replay_owner), key: SecureRandom.uuid,
+                                                                                                     replay_only: true)
+    expect([no_receipt.status, no_receipt.parsed_body]).to eq([404, { "reason" => "not_found" }])
+    expect(Entry.find(kept_id).discarded_at).to be_nil
+    expect(IdempotencyReceipt.count).to eq(receipts_after_delete)
+  end
+end
+
+RSpec.describe "Entry write routes, replay-only delete" do
+  include_context "timekeeping entry writes"
+  include_context "timekeeping entry writes without transactional fixtures"
+
+  let(:company) { timekeeping_arrange.company }
+  let(:project) { timekeeping_arrange.project(company:) }
+  let(:admin) { timekeeping_arrange.user(company:, role: "admin") }
+  let(:employee) { timekeeping_arrange.user(company:, role: "employee") }
+
+  def replay_only_delete_request(entry_id, token, key:, replay_only: true, if_match: "replay-only")
+    headers = { "Authorization" => "Bearer #{token}", "Idempotency-Key" => key,
+                "Ownership-Generation" => timekeeping_arrange.current_generation.to_s, "If-Match" => if_match }
+    headers["Idempotency-Replay"] = "only" if replay_only
+    delete "/v1/companies/#{company}/entries/#{entry_id}", headers: headers.compact
+    response
+  end
+
+  # A provider that does not read Idempotency-Replay sees an ordinary DELETE;
+  # the If-Match value never matches a version, so it refuses without writing.
+  it "refuses a DELETE whose If-Match is replay-only with version_conflict and discards nothing" do
+    entry_id = timekeeping_arrange.entry(company:, user: employee, project:)
+    before = entry_write_counts
+
+    answer = replay_only_delete_request(entry_id, timekeeping_arrange.token_for(admin), key: SecureRandom.uuid,
+                                                                                       replay_only: false)
+
+    expect([answer.status, answer.parsed_body]).to eq([409, { "reason" => "version_conflict" }])
+    expect(Entry.find(entry_id).discarded_at).to be_nil
+    expect(entry_write_counts).to eq(before)
+  end
+
+  it "replays a committed delete after the generation advanced, writing nothing more" do
+    entry_id = timekeeping_arrange.entry(company:, user: employee, project:)
+    token = timekeeping_arrange.token_for(admin)
+    key = SecureRandom.uuid
+    first = replay_only_delete_request(entry_id, token, key:, replay_only: false, if_match: nil)
+    first_body = first.parsed_body
+    expect(first.status).to eq(200)
+    discarded_at = Entry.find(entry_id).discarded_at
+    after_first = entry_write_counts
+
+    timekeeping_arrange.set_generation(timekeeping_arrange.current_generation + 1)
+    replay = replay_only_delete_request(entry_id, token, key:)
+
+    expect([replay.status, replay.parsed_body]).to eq([200, first_body])
+    expect(Entry.find(entry_id).discarded_at).to eq(discarded_at)
+    expect(entry_write_counts).to eq(after_first)
+  end
+
+  it "answers not_found to another actor's replay and to a replay of another entry under the same key" do
+    deleted_id = timekeeping_arrange.entry(company:, user: employee, project:)
+    other_id = timekeeping_arrange.entry(company:, user: employee, project:)
+    key = SecureRandom.uuid
+    replay_only_delete_request(deleted_id, timekeeping_arrange.token_for(admin), key:, replay_only: false, if_match: nil)
+    after_first = entry_write_counts
+
+    colleague_admin = timekeeping_arrange.user(company:, role: "admin")
+    other_actor = replay_only_delete_request(deleted_id, timekeeping_arrange.token_for(colleague_admin), key:)
+    expect([other_actor.status, other_actor.parsed_body]).to eq([404, { "reason" => "not_found" }])
+
+    other_entry = replay_only_delete_request(other_id, timekeeping_arrange.token_for(admin), key:)
+    expect([other_entry.status, other_entry.parsed_body]).to eq([404, { "reason" => "not_found" }])
+    expect(Entry.find(other_id).discarded_at).to be_nil
+    expect(entry_write_counts).to eq(after_first)
+  end
+end
+
+RSpec.describe "Entry write routes", "agent run identifiers" do
+  include_context "timekeeping entry writes"
+  include_context "timekeeping entry writes without transactional fixtures"
+
+  let(:run_company) { timekeeping_arrange.company }
+  let(:run_project) { timekeeping_arrange.project(company: run_company) }
+  let(:run_employee) { timekeeping_arrange.user(company: run_company, role: "employee") }
+  let(:run_agent) { timekeeping_arrange.agent(company: run_company, user: run_employee) }
+
+  # "A forwarded agent create with `external_run_id: "run_123"` and `external_session_id: "session_123"` stores both, and both appear in the snapshot."
+  it "stores an agent create's run and session ids on the entry and its outbox snapshot, and a retry with the same key writes nothing more" do
+    body = { "project_id" => run_project, "work_date" => "2026-03-02", "duration" => 60.0, "note" => "Agent run",
+             "source" => "automation", "source_metadata" => {}, "agent_id" => run_agent,
+             "external_run_id" => "run_123", "external_session_id" => "session_123" }
+    headers = { "Content-Type" => "application/json",
+                "Authorization" => "Bearer #{timekeeping_arrange.token_for(run_employee)}",
+                "Ownership-Generation" => timekeeping_arrange.current_generation.to_s,
+                "Idempotency-Key" => SecureRandom.uuid }
+
+    post "/v1/companies/#{run_company}/entries", params: JSON.generate(body), headers: headers
+
+    expect(response.status).to eq(201)
+    answer = response.parsed_body
+    expect(answer.values_at("external_run_id", "external_session_id")).to eq(%w[run_123 session_123])
+    entry_id = answer.fetch("id")
+    expect(Entry.find(entry_id).attributes.values_at("external_run_id", "external_session_id"))
+      .to eq(%w[run_123 session_123])
+    expect(OutboxSnapshot.where(id: entry_id).pluck(:external_run_id, :external_session_id))
+      .to eq([%w[run_123 session_123]])
+
+    counts_after_first = entry_write_counts
+    post "/v1/companies/#{run_company}/entries", params: JSON.generate(body), headers: headers
+
+    expect(response.status).to eq(201)
+    expect(response.parsed_body).to eq(answer)
+    expect(entry_write_counts).to eq(counts_after_first)
+    expect(OutboxSnapshot.where(id: entry_id).count).to eq(1)
   end
 end
 

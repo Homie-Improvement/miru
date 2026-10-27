@@ -147,6 +147,38 @@ RSpec.describe Timekeeping::ReferenceFacts, "agents" do
   end
 end
 
+RSpec.describe Timekeeping::ReferenceFacts, "agents under deletion", committed_data: true do
+  # Timekeeping tells a detach whose agent deletion rolled back from one that
+  # earlier facts missed only if facts never list an agent while its destroy
+  # holds the agent row lock (Gateway#detach_agent_entries locks it first).
+  it "leaves out, without waiting, an agent whose row another transaction holds FOR UPDATE, and lists it again once released" do
+    company = create(:company)
+    locked_agent = create(:agent, company:)
+    other_agent = create(:agent, company:)
+    locked = Queue.new
+    release = Queue.new
+    holder = committed_data_thread do
+      ActiveRecord::Base.transaction do
+        Agent.lock.find(locked_agent.id)
+        locked << true
+        release.pop
+      end
+    end
+
+    begin
+      expect(locked.pop(timeout: 10)).to be(true)
+      during = described_class.call(company:, project_ids: [])[:agents].pluck(:id)
+      expect(during).to eq([other_agent.id])
+    ensure
+      release << true
+      holder.join(10)
+    end
+
+    expect(described_class.call(company:, project_ids: [])[:agents].pluck(:id))
+      .to eq([locked_agent.id, other_agent.id].sort)
+  end
+end
+
 RSpec.describe Timekeeping::ReferenceFacts, "role selection" do
   # "Make `ReferenceFacts` serve each user's role with the same rule, so the token and the reference endpoint still agree on a user's role in a company."
   # "Fall back to the reference role when the user holds neither."
