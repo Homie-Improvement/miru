@@ -15,28 +15,17 @@ RSpec.describe "forwarded Timekeeping setup helpers" do
     create(:project, name: "Website", billable: true, client: create(:client, company: arrange_company, name: "Acme LLC"))
   end
   let(:arrange_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-  let(:arrange_import) { create(:data_import, company: arrange_company, user: arrange_actor) }
-
-  before do
-    create(:employment, company: arrange_company, user: arrange_actor)
-    arrange_actor.add_role :admin, arrange_company
-    create(:employment, company: arrange_company, user: arrange_paul)
-    arrange_import.file.attach(io: StringIO.new(<<~CSV), filename: "harvest.csv", content_type: "text/csv")
-      Date,Client,Project,Hours,First Name,Last Name
-      2026-01-05,Acme LLC,Website,1,Paul,Connors
-      2026-01-06,Acme LLC,Website,2,Paul,Connors
-    CSV
-  end
 
   # The copied setups every forwarded group used set the ownership singleton to owner
   # "timekeeping" at generation 2, gave the fake the same generation, registered the company,
   # the admin actor, paul and the project, and routed HTTP to the fake. The shared helper must
   # keep all of them, or forwarded imports in the migrated groups stop reaching the fake.
   # What a forwarded import then sends is checked by the importer and job specs, not here.
-  it "arrange_forwarded_timekeeping hands ownership to the fake at generation 2 and routes a forwarded import's creates to it" do
+  it "arrange_forwarded_timekeeping hands ownership to the fake at generation 2 and routes Timekeeping HTTP to it" do
     %i[register_company register_user register_project].each do |method|
       allow(arrange_fake).to receive(method).and_call_original
     end
+    allow(self).to receive(:route_timekeeping_to_fake).and_call_original
 
     arrange_forwarded_timekeeping(arrange_fake, company: arrange_company,
                                                 users: { arrange_actor => "admin", arrange_paul => "employee" },
@@ -51,12 +40,7 @@ RSpec.describe "forwarded Timekeeping setup helpers" do
     expect(arrange_fake).to have_received(:register_user).with(id: arrange_actor.id, company_id: arrange_company.id, role: "admin")
     expect(arrange_fake).to have_received(:register_user).with(id: arrange_paul.id, company_id: arrange_company.id, role: "employee")
     expect(arrange_fake).to have_received(:register_project).once.with(id: arrange_project.id, company_id: arrange_company.id)
-
-    with_forwarded_timekeeping_env { Imports::HarvestTimeEntriesImporter.new(arrange_import).process }
-
-    creates = arrange_fake.requests.select { |request| request[:method] == "POST" }
-    expect(creates).not_to be_empty
-    expect(creates.pluck(:path)).to all(eq("/v1/companies/#{arrange_company.id}/entries"))
+    expect(self).to have_received(:route_timekeeping_to_fake).once.with(arrange_fake, base_url: FORWARDED_TIMEKEEPING_BASE_URL)
   end
 
   # Every copied setup this helper replaces set owner "timekeeping" with generation 2 on the ownership row

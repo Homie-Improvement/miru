@@ -619,6 +619,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
 
     # Counts every entry for the user, not only the matching note, so a stray extra write also fails.
     expect(TimesheetEntry.where(user: fold_gen_paul).count).to eq(1)
+    expect(TimesheetEntry.where(user: fold_gen_paul, note: "same work").count).to eq(1)
     expect(fold_gen_import.reload).to have_attributes(status: "failed", imported_rows: 1, failed_rows: 0, skipped_rows: 0)
     expect(fold_gen_import.row_errors).to eq([])
 
