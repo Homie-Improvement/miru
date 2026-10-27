@@ -5,121 +5,7 @@
 require "rails_helper"
 require "tmpdir"
 
-# Timekeeping's side of the handoff, held in memory at the store's client
-# boundary. It keeps the version guards the real load applies: every entry
-# version is a positive Integer, and a load never replaces an entry with an
-# older version of it. Corrections replace any
-# earlier correction of the same entry and raise the stored version, as the
-# service's correction writer does.
-class RunnerLegacyHandoffSpecTimekeeping
-  attr_reader :rows, :corrections, :calls
-
-  def initialize
-    @rows = Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }
-    @corrections = []
-    @calls = []
-    @next_id = 1
-  end
-
-  def enforces_fence? = true
-
-  def fence_admission
-    @calls << [:fence]
-    nil
-  end
-
-  def admit(generation:)
-    @calls << [:admit, generation]
-    nil
-  end
-
-  def export_checkpoint = Timekeeping::Handoff::Checkpoint.build(tables: @rows)
-
-  def highest_outbox_position = 0
-
-  def load_checkpoint(checkpoint)
-    not_positive = checkpoint.rows.fetch("entries").reject { |row| row["version"].is_a?(Integer) && row["version"].positive? }
-    raise Timekeeping::Handoff::Store::Error, "entries #{not_positive.pluck('id')} have a version below 1" if not_positive.any?
-
-    stored = @rows.fetch("entries").to_h { |row| [row["id"], row["version"]] }
-    older = checkpoint.rows.fetch("entries").any? { |row| stored.fetch(row["id"], -1) > row["version"] }
-    raise Timekeeping::Handoff::Store::Error, "the store holds newer entry versions than the checkpoint" if older
-
-    @rows = checkpoint.rows.transform_values { |rows| rows.map(&:dup) }
-    checkpoint
-  end
-
-  def advance_entry_id_sequence(above:)
-    @next_id = [@next_id, Integer(above) + 1].max
-  end
-
-  def write_correction_snapshots(snapshots:, version:, generation:)
-    snapshots.each do |snapshot|
-      entry_id = self.class.entry_id_of(snapshot)
-      @corrections.reject! { |stored| self.class.entry_id_of(stored) == entry_id }
-      @corrections << snapshot.merge("version" => version, "generation" => generation)
-      entry = @rows.fetch("entries").find { |row| row["id"] == entry_id }
-      entry["version"] = version if entry && entry["version"] < version
-    end
-    snapshots.size
-  end
-
-  # An entry edit admitted while Timekeeping owns the entries.
-  def edit_entry!(id)
-    entry = @rows.fetch("entries").find { |row| row["id"] == id }
-    entry["version"] += 1
-    entry["note"] = "edited in Timekeeping"
-  end
-
-  def self.entry_id_of(snapshot)
-    snapshot["entry_id"] || snapshot.dig("snapshot", "id") || snapshot["id"]
-  end
-end
-
-class RunnerLegacyHandoffSpecAdmission
-  attr_reader :calls
-
-  def initialize
-    @calls = []
-  end
-
-  def enforces_fence? = true
-
-  def fence_admission
-    @calls << [:fence]
-    nil
-  end
-
-  def admit(generation:)
-    @calls << [:admit, generation]
-    nil
-  end
-end
-
-class RunnerLegacyHandoffSpecSettle
-  def settle!(generation:) = nil
-  def settled? = true
-  def stop_applying! = nil
-end
-
 module RunnerLegacyHandoffSpecSupport
-  # Each owner's drain relays that owner's entries into the projection, as the
-  # real outbox relay would, so reconcile sees the projection the drain left.
-  def handoff_owners(timekeeping)
-    monolith_store = Timekeeping::Handoff::MonolithStore.new(connection: ActiveRecord::Base.connection)
-    {
-      monolith: Timekeeping::Handoff::Owner.new(
-        name: :monolith, store: monolith_store,
-        admission: RunnerLegacyHandoffSpecAdmission.new, settle: RunnerLegacyHandoffSpecSettle.new,
-        drain: TimekeepingHandoffFakeRelay.new(store: monolith_store)
-      ),
-      timekeeping: Timekeeping::Handoff::Owner.new(
-        name: :timekeeping, store: timekeeping, admission: timekeeping,
-        settle: RunnerLegacyHandoffSpecSettle.new, drain: TimekeepingHandoffFakeRelay.new(store: timekeeping)
-      )
-    }
-  end
-
   def recorded_unlocked_entry_ids
     YAML.load_file(Timekeeping::SeedDispositionRecorder::DEFAULT_PATH).fetch("companies").values
       .flat_map { |invoices| invoices.values.flat_map { |listing| listing.fetch("entry_ids") } }
@@ -140,7 +26,7 @@ module RunnerLegacyHandoffSpecSupport
   end
 
   def correction_entry_ids(timekeeping)
-    timekeeping.corrections.map { |snapshot| RunnerLegacyHandoffSpecTimekeeping.entry_id_of(snapshot) }
+    timekeeping.corrections.map { |snapshot| TimekeepingHandoffFakes::InMemoryTimekeepingStore.entry_id_of(snapshot) }
   end
 end
 
@@ -149,11 +35,12 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
 
   # "The first cutover turns each recorded unlocked link into a committed reservation with one correction snapshot"
   it "first cutover turns each recorded unlocked link into one committed reservation with exactly one correction snapshot" do
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
     entry_ids = recorded_unlocked_entry_ids
     expect(entry_ids).not_to be_empty
 
-    described_class.run(direction: :cutover, owners: handoff_owners(timekeeping), report_root: Dir.mktmpdir("handoff-report"))
+    described_class.run(direction: :cutover, owners: TimekeepingHandoffFakes.owners(timekeeping:),
+                        report_root: Dir.mktmpdir("handoff-report"))
 
     expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
     reservations = timekeeping.rows.fetch("reservations")
@@ -168,22 +55,21 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   end
 end
 
-# Uses RunnerLegacyHandoffSpecTimekeeping and RunnerLegacyHandoffSpecSupport,
-# defined at the top of this file.
+# Uses RunnerLegacyHandoffSpecSupport, defined at the top of this file.
 RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
   include RunnerLegacyHandoffSpecSupport
 
   # "An aborted first cutover retried at a later generation still runs the pre-flight, copies legacy entries and derives every reservation and correction"
   it "a first cutover aborted before the checkpoint load and retried at generation 3 runs the pre-flight and copies the changed legacy entry" do
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+    owners = TimekeepingHandoffFakes.owners(timekeeping:)
     report_root = Dir.mktmpdir("handoff-report")
     entry_ids = recorded_unlocked_entry_ids
 
     expect do
       described_class.run(direction: :cutover, owners:, report_root:,
                           observer: TimekeepingHandoffHooks::Interrupt.new(at: :during_checkpoint))
-    end.to raise_error(StandardError)
+    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
     described_class.run(direction: :cutover, abort: true, owners:, report_root:)
     expect(TimekeepingOwnership.current)
       .to have_attributes(owner: "monolith", generation: 2, handoff_step: nil, legacy_retired_at: nil)
@@ -206,8 +92,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   end
 end
 
-# Uses RunnerLegacyHandoffSpecTimekeeping and RunnerLegacyHandoffSpecSupport,
-# defined at the top of this file.
+# Uses RunnerLegacyHandoffSpecSupport, defined at the top of this file.
 RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
   include RunnerLegacyHandoffSpecSupport
 
@@ -216,15 +101,15 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   # while the legacy rows are still version 0, so the retry must not load anything
   # older than what Timekeeping stores.
   it "a first cutover aborted after corrections were written retries at generation 3 without a version refusal and rederives every correction" do
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+    owners = TimekeepingHandoffFakes.owners(timekeeping:)
     report_root = Dir.mktmpdir("handoff-report")
     entry_ids = recorded_unlocked_entry_ids
 
     expect do
       described_class.run(direction: :cutover, owners:, report_root:,
                           observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_corrections))
-    end.to raise_error(StandardError)
+    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
     expect(correction_entry_ids(timekeeping)).to match_array(entry_ids)
     described_class.run(direction: :cutover, abort: true, owners:, report_root:)
 
@@ -247,8 +132,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   end
 end
 
-# Uses RunnerLegacyHandoffSpecTimekeeping and RunnerLegacyHandoffSpecSupport,
-# defined at the top of this file.
+# Uses RunnerLegacyHandoffSpecSupport, defined at the top of this file.
 RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
   include RunnerLegacyHandoffSpecSupport
 
@@ -258,8 +142,8 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
 
   # "Versions continue from the checkpoint and never go backwards across cutover, rollback and re-cutover"
   it "entry versions never go backwards across cutover, rollback and re-cutover with an edit under each owner" do
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+    owners = TimekeepingHandoffFakes.owners(timekeeping:)
     report_root = Dir.mktmpdir("handoff-report")
     monolith_store = Timekeeping::Handoff::MonolithStore.new(connection: ActiveRecord::Base.connection)
     legacy = TimesheetEntry.unscoped.pluck(:id, :version).to_h
@@ -291,8 +175,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   end
 end
 
-# Uses RunnerLegacyHandoffSpecTimekeeping and RunnerLegacyHandoffSpecSupport,
-# defined at the top of this file.
+# Uses RunnerLegacyHandoffSpecSupport, defined at the top of this file.
 RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
   include RunnerLegacyHandoffSpecSupport
 
@@ -300,8 +183,8 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
 
   # "No handoff step writes a billing table."
   it "no statement during cutover, rollback or re-cutover inserts, updates or deletes invoices, invoice_line_items, invoice_taxes or payments" do
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+    owners = TimekeepingHandoffFakes.owners(timekeeping:)
     report_root = Dir.mktmpdir("handoff-report")
     writes = []
     # The notification fires for every connection class, InvoiceOperationsRecord included.
@@ -327,17 +210,16 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   end
 end
 
-# Uses RunnerLegacyHandoffSpecTimekeeping and RunnerLegacyHandoffSpecSupport,
-# defined at the top of this file. The seed loads once per example group, so
-# each case gets a group of its own.
+# Uses RunnerLegacyHandoffSpecSupport, defined at the top of this file. The
+# seed loads once per example group, so each case gets a group of its own.
 [[:uncorrected, 99], [:corrected, 0]].each do |kind, changed_version|
   RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
     include RunnerLegacyHandoffSpecSupport
 
     # "Versions continue from the checkpoint and never go backwards across cutover, rollback and re-cutover"
     it "refuses a restart after the recorded checkpoint when an #{kind} entry's version drifted to #{changed_version}" do
-      timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-      owners = handoff_owners(timekeeping)
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
       report_root = Dir.mktmpdir("handoff-report")
 
       expect do
@@ -609,8 +491,8 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   it "a fresh runner restarted a day later after the recorded checkpoint ends with the uninterrupted control's full per-company digest and keeps the saved capture time" do
     captured_at = Time.utc(2026, 10, 27, 12)
     later = captured_at + 1.day
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+    owners = TimekeepingHandoffFakes.owners(timekeeping:)
     report_root = Dir.mktmpdir("handoff-report")
 
     expect do
@@ -620,7 +502,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     expect(TimekeepingOwnership.current.handoff_step).to eq("checkpoint")
 
     expect do
-      described_class.run(direction: :cutover, owners: handoff_owners(timekeeping), report_root:,
+      described_class.run(direction: :cutover, owners: TimekeepingHandoffFakes.owners(timekeeping:), report_root:,
                           clock: Struct.new(:now).new(later))
     end.not_to raise_error
     expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
@@ -634,7 +516,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     %w(entries reservations entry_audits).each { |table| expect(digest.fetch(table).keys).to match_array(seeded) }
     %w(invoice_operations idempotency_records).each { |table| expect(digest.fetch(table)).to eq({}) }
 
-    control_ids = control.fetch(:corrections).map { |snapshot| RunnerLegacyHandoffSpecTimekeeping.entry_id_of(snapshot) }
+    control_ids = control.fetch(:corrections).map { |snapshot| TimekeepingHandoffFakes::InMemoryTimekeepingStore.entry_id_of(snapshot) }
     expect(control_ids).not_to be_empty
     expect(correction_entry_ids(timekeeping)).to match_array(control_ids)
     expect(timekeeping.corrections.pluck("generation").uniq).to eq([2])
@@ -653,11 +535,11 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   it "a fresh runner restarted a day later after corrections were written ends with the uninterrupted control's full per-company digest and keeps the saved capture time" do
     captured_at = Time.utc(2026, 10, 27, 12)
     later = captured_at + 1.day
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
     report_root = Dir.mktmpdir("handoff-report")
 
     expect do
-      described_class.run(direction: :cutover, owners: handoff_owners(timekeeping), report_root:,
+      described_class.run(direction: :cutover, owners: TimekeepingHandoffFakes.owners(timekeeping:), report_root:,
                           clock: Struct.new(:now).new(captured_at),
                           observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_corrections))
     end.to raise_error(TimekeepingHandoffHooks::Interrupted)
@@ -665,7 +547,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     expect(timekeeping.corrections).not_to be_empty
 
     expect do
-      described_class.run(direction: :cutover, owners: handoff_owners(timekeeping), report_root:,
+      described_class.run(direction: :cutover, owners: TimekeepingHandoffFakes.owners(timekeeping:), report_root:,
                           clock: Struct.new(:now).new(later))
     end.not_to raise_error
     expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
@@ -678,7 +560,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     %w(entries reservations entry_audits).each { |table| expect(digest.fetch(table).keys).to match_array(seeded) }
     %w(invoice_operations idempotency_records).each { |table| expect(digest.fetch(table)).to eq({}) }
 
-    control_ids = control.fetch(:corrections).map { |snapshot| RunnerLegacyHandoffSpecTimekeeping.entry_id_of(snapshot) }
+    control_ids = control.fetch(:corrections).map { |snapshot| TimekeepingHandoffFakes::InMemoryTimekeepingStore.entry_id_of(snapshot) }
     expect(control_ids).not_to be_empty
     expect(correction_entry_ids(timekeeping)).to match_array(control_ids)
     expect(timekeeping.corrections.pluck("generation").uniq).to eq([2])
@@ -698,10 +580,10 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   # for "an uninterrupted control run".
   it "an uninterrupted first cutover at a fixed capture time ends with the derived control's full per-company digest and corrections" do
     captured_at = Time.utc(2026, 10, 27, 12)
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
     report_root = Dir.mktmpdir("handoff-report")
 
-    described_class.run(direction: :cutover, owners: handoff_owners(timekeeping), report_root:,
+    described_class.run(direction: :cutover, owners: TimekeepingHandoffFakes.owners(timekeeping:), report_root:,
                         clock: Struct.new(:now).new(captured_at))
 
     expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
@@ -714,15 +596,15 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     expect(seeded).not_to be_empty
     %w(entries reservations entry_audits).each { |table| expect(digest.fetch(table).keys).to match_array(seeded) }
 
-    control_ids = control.fetch(:corrections).map { |snapshot| RunnerLegacyHandoffSpecTimekeeping.entry_id_of(snapshot) }
+    control_ids = control.fetch(:corrections).map { |snapshot| TimekeepingHandoffFakes::InMemoryTimekeepingStore.entry_id_of(snapshot) }
     expect(control_ids).not_to be_empty
     expect(control_ids).to match_array(recorded_unlocked_entry_ids)
     expect(correction_entry_ids(timekeeping)).to match_array(control_ids)
   end
 end
 
-# Uses RunnerLegacyHandoffSpecTimekeeping and RunnerLegacyHandoffSpecSupport,
-# defined at the top of this file. Two crashes in a row, with the clock moving
+# Uses RunnerLegacyHandoffSpecSupport, defined at the top of this file.
+# Two crashes in a row, with the clock moving
 # on before each restart. Rewriting the correction snapshots is harmless,
 # because the store keeps one correction per entry; what this checks is that
 # every restart reuses the first capture time and ends at the control's digest,
@@ -734,8 +616,8 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   it "a cutover interrupted after corrections and again after the recorded checkpoint finishes on a third runner with the uninterrupted digest and the first capture time" do
     first_time = Time.utc(2026, 10, 27, 12)
     clock_at = ->(time) { Struct.new(:now).new(time) }
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+    owners = TimekeepingHandoffFakes.owners(timekeeping:)
     report_root = Dir.mktmpdir("handoff-report")
 
     expect do
@@ -762,7 +644,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     expect(digest.fetch("invoice_operations")).to eq({})
     expect(digest.fetch("idempotency_records")).to eq({})
 
-    expected_ids = control.fetch(:corrections).map { |correction| RunnerLegacyHandoffSpecTimekeeping.entry_id_of(correction) }
+    expected_ids = control.fetch(:corrections).map { |correction| TimekeepingHandoffFakes::InMemoryTimekeepingStore.entry_id_of(correction) }
     expect(expected_ids).not_to be_empty
     expect(correction_entry_ids(timekeeping)).to match_array(expected_ids)
     expect(timekeeping.corrections.pluck("generation").uniq).to eq([2])

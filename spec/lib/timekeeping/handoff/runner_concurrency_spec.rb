@@ -7,36 +7,13 @@ require "tmpdir"
 
 RSpec.describe Timekeeping::Handoff::Runner, committed_data: true do
   it "close admission stops at the lock timeout with the generation unchanged and a later run raises it only once" do
-    admission_class = Class.new do
-      attr_reader :calls
-
-      def initialize
-        @calls = []
-      end
-
-      def enforces_fence? = true
-
-      def fence_admission
-        @calls << [:fence]
-        nil
-      end
-
-      def admit(generation:)
-        @calls << [:admit, generation]
-        nil
-      end
-    end
     store = Object.new
-    owners = {
-      monolith: Timekeeping::Handoff::Owner.new(name: "monolith", store:, admission: admission_class.new, settle: nil, drain: nil),
-      timekeeping: Timekeeping::Handoff::Owner.new(name: "timekeeping", store:, admission: admission_class.new,
-                                                   settle: nil, drain: nil)
-    }
-    stop_after_close = Class.new(StandardError)
-    observer = Object.new
-    observer.define_singleton_method(:call) do |event, step:|
-      raise stop_after_close if event == :after_step && step.to_s == "close_admission"
-    end
+    owners = TimekeepingHandoffFakes.owners(
+      timekeeping: store, timekeeping_admission: TimekeepingHandoffFakes::RecordingAdmission.new,
+      monolith_admission: TimekeepingHandoffFakes::RecordingAdmission.new, monolith_store: store,
+      settle: nil, relay: false
+    )
+    observer = TimekeepingHandoffHooks::Interrupt.new(at: :after_close_admission)
 
     # "Close admission waits at most 60 s for billing write transactions holding FOR SHARE on the ownership row, then stops resumable"
     expect(Timekeeping::Handoff::Runner::CLOSE_ADMISSION_LOCK_TIMEOUT).to eq(60.seconds)
@@ -71,7 +48,7 @@ RSpec.describe Timekeeping::Handoff::Runner, committed_data: true do
 
       expect do
         described_class.run(direction: :cutover, owners:, observer:, report_root:)
-      end.to raise_error(stop_after_close)
+      end.to raise_error(TimekeepingHandoffHooks::Interrupted)
     end
 
     resumed = TimekeepingOwnership.current
@@ -82,37 +59,15 @@ end
 
 RSpec.describe "Timekeeping::Handoff::Runner second concurrent run", committed_data: true do
   it "a second run on another connection fails fast while the first run holds the handoff lock" do
-    admission_class = Class.new do
-      attr_reader :calls
-
-      def initialize
-        @calls = []
-      end
-
-      def enforces_fence? = true
-
-      def fence_admission
-        @calls << [:fence]
-        nil
-      end
-
-      def admit(generation:)
-        @calls << [:admit, generation]
-        nil
-      end
-    end
     store = Object.new
     build_owners = lambda do |monolith_admission, timekeeping_admission|
-      {
-        monolith: Timekeeping::Handoff::Owner.new(name: "monolith", store:, admission: monolith_admission,
-                                                  settle: nil, drain: nil),
-        timekeeping: Timekeeping::Handoff::Owner.new(name: "timekeeping", store:, admission: timekeeping_admission,
-                                                     settle: nil, drain: nil)
-      }
+      TimekeepingHandoffFakes.owners(timekeeping: store, timekeeping_admission:, monolith_admission:,
+                                     monolith_store: store, settle: nil, relay: false)
     end
-    first_owners = build_owners.call(admission_class.new, admission_class.new)
-    second_monolith = admission_class.new
-    second_timekeeping = admission_class.new
+    first_owners = build_owners.call(TimekeepingHandoffFakes::RecordingAdmission.new,
+                                     TimekeepingHandoffFakes::RecordingAdmission.new)
+    second_monolith = TimekeepingHandoffFakes::RecordingAdmission.new
+    second_timekeeping = TimekeepingHandoffFakes::RecordingAdmission.new
     second_owners = build_owners.call(second_monolith, second_timekeeping)
 
     stop_first_run = Class.new(StandardError)
