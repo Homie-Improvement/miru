@@ -58,9 +58,19 @@ RSpec.describe Invoices::PreparedReservations, "with competing writers", committ
     release << true
   end
 
+  # Runs before the committed-data cleanup. A writer still running after the
+  # bounded join is killed, which rolls back its transaction and returns its
+  # connection, so the cleanup never deletes rows under a live transaction.
+  # join re-raises a writer's own error; the writer has stopped by then, so
+  # the hook ignores it and leaves the failure to the example's assertions.
   after do
     release.push(true)
-    [@holder, @waiter].compact.each { |thread| thread.join(5) }
+    [@holder, @waiter].compact.each do |thread|
+      thread.kill unless thread.join(5)
+      thread.join
+    rescue StandardError
+      nil
+    end
   end
 
   # Shared lock: the entry row FOR UPDATE in lock_entries. The abort takes it
