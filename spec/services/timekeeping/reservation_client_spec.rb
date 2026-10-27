@@ -714,15 +714,40 @@ RSpec.describe Timekeeping::ReservationClient, "answer mapping and local claims"
     expect(http.paths).to eq([])
   end
 
-  it "posts mark_billed for an invoice with no holding and no line entries" do
+  # Timekeeping could hold reservations for the invoice the monolith does not
+  # know of, and would bill them, so nothing is sent.
+  it "bills nothing and sends no request for an invoice with no holding and no line entries" do
     empty_request = Invoices::ReservationRequest.new(
       company_id: 611, invoice_id: 12, operation_id: SecureRandom.uuid,
       generation: TimekeepingOwnership.current.generation, disposition: "active", entries: []
     )
-    http = scripted_http_class.new([[200, { "billed" => 0 }]])
+    http = scripted_http_class.new([[200, { "billed" => 3 }]])
 
-    expect(scripted_reservation_client(http).mark_billed(empty_request).state).to eq("committed")
-    expect(http.paths).to eq(["/v1/companies/611/invoices/12/mark-billed"])
+    outcome = scripted_reservation_client(http).mark_billed(empty_request)
+
+    expect(outcome.state).to eq("committed")
+    expect(outcome.counts).to eq(billed: 0)
+    expect(http.paths).to eq([])
+  end
+
+  it "leaves Timekeeping's reservations for an invoice with no holding and no lines unbilled" do
+    fake = TimekeepingContract::FakeTimekeeping.new
+    fake.generation = TimekeepingOwnership.current.generation
+    credential = fake.add_service(company_id: 611, name: "monolith-invoices", operations: %w[prepare commit abort mark_billed])
+    fake.add_entry(company_id: 611, user_id: 1, project_id: 1, id: 4001)
+    fake.add_reservation(entry_id: 4001, invoice_id: 12, state: "committed", disposition: "active")
+    client = described_class.new(
+      http: TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil),
+      credential: ->(company_id:, operation:) { credential }
+    )
+    empty_request = Invoices::ReservationRequest.new(
+      company_id: 611, invoice_id: 12, operation_id: SecureRandom.uuid,
+      generation: fake.generation, disposition: "active", entries: []
+    )
+
+    expect(client.mark_billed(empty_request).state).to eq("committed")
+    expect(fake.stored_entry(4001)["bill_status"]).not_to eq("billed")
+    expect(fake.requests).to be_empty
   end
 
   # Commit and abort answer only counts, so an abort that drops nothing must

@@ -162,10 +162,13 @@ module Timekeeping
     # removed line's entry, or gained a line that reserved nothing), because
     # Timekeeping would then bill the wrong entries. An invoice with no
     # holding has no settled reservation set the monolith knows of, so what
-    # Timekeeping would bill is unknown: every line entry is refused, and only
-    # an invoice with no line entries bills with no holding.
+    # Timekeeping would bill is unknown and nothing is sent: every line entry
+    # is refused, and an invoice with no line entries has nothing to bill.
     def mark_billed(request)
-      held_ids = InvoiceEntryHolding.find_by(company_id: request.company_id, invoice_id: request.invoice_id)&.entry_ids || []
+      held_ids = InvoiceEntryHolding.find_by(company_id: request.company_id, invoice_id: request.invoice_id)&.entry_ids
+      return outcome("committed", counts: { billed: 0 }) if held_ids.nil? && request.entries.empty?
+
+      held_ids ||= []
       mismatched_ids = (held_ids | request.entries) - (held_ids & request.entries)
       if mismatched_ids.any?
         return outcome("refused", conflicts: mismatched_ids.sort.map { |entry_id| { entry_id:, reason: BILLING_MISMATCH_REASON } })
