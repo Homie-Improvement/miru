@@ -9,7 +9,7 @@ module Timekeeping
   # actor is the user the write acts for, and the user a forwarded write's
   # token is minted for. agent is set only when an agent acts for that user.
   class WriteContext < Data.define(:company, :actor, :actor_kind, :request_id, :agent)
-    ACTOR_KINDS = %w[user agent service].freeze
+    ACTOR_KINDS = %w[user agent service import].freeze
 
     def initialize(company:, actor:, actor_kind:, request_id:, agent: nil)
       actor_kind = actor_kind.to_s

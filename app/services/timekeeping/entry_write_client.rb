@@ -77,6 +77,16 @@ module Timekeeping
         .merge(CREATE_SOURCE.deep_dup)
     end
 
+    # The create body for an imported entry. Unlike create_body, it records
+    # the import's own source ("source" and "source_metadata" of source), so
+    # the entry keeps its origin, and bill_status is sent as given, billed
+    # included, because an import writes each row's final status at once.
+    def self.import_create_body(user:, project:, attributes:, source:)
+      edit_fields(attributes)
+        .merge("project_id" => project.id, "user_id" => user.id)
+        .merge(source.to_h.deep_stringify_keys.slice("source", "source_metadata"))
+    end
+
     # The EDIT_FIELDS of attributes, as sent. A form post carries every value
     # as a string, and Timekeeping takes duration only as a JSON number, so a
     # numeric string is sent as the Float the duration column would store. Any
@@ -88,10 +98,13 @@ module Timekeeping
       number.nil? ? fields : fields.merge("duration" => number)
     end
 
-    # Returns the created entry Hash.
-    def create_entry(context:, generation:, body:)
+    # Returns the created entry Hash. idempotency_key replaces the key derived
+    # from the request id, for a caller whose retries run under a new request
+    # id, such as an import rerun, and must still be recognised as the same
+    # create.
+    def create_entry(context:, generation:, body:, idempotency_key: nil)
       path = format(ENTRIES_PATH, company_id: context.company.id)
-      forward(Net::HTTP::Post, path, operation: "create", context:, generation:, body:)
+      forward(Net::HTTP::Post, path, operation: "create", context:, generation:, body:, idempotency_key:)
     end
 
     # Returns the updated entry Hash. Only EDIT_FIELDS of body are sent.
@@ -109,13 +122,15 @@ module Timekeeping
 
     private
 
-      def forward(request_class, path, operation:, context:, generation:, entry_id: nil, version: nil, body: nil)
+      def forward(request_class, path, operation:, context:, generation:, entry_id: nil, version: nil, body: nil,
+                  idempotency_key: nil)
         raise Error, "#{EntryApiClient::BASE_URL_ENV} is not set" if @base_url.blank?
 
         request = request_class.new(URI.join(@base_url, path))
         request["Authorization"] = "Bearer #{token_for(context, body)}"
         request["Ownership-Generation"] = generation.to_s
-        request["Idempotency-Key"] = self.class.idempotency_key(request_id: context.request_id, operation:, entry_id:)
+        request["Idempotency-Key"] = idempotency_key ||
+                                     self.class.idempotency_key(request_id: context.request_id, operation:, entry_id:)
         request["X-Request-Id"] = context.request_id.to_s
         request["If-Match"] = version.to_s unless version.nil?
         unless body.nil?
