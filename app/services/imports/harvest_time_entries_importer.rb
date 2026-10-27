@@ -533,11 +533,13 @@ module Imports
       end
 
       def create_entry(gateway, row, expected_generation)
-        record_attempted_row(row)
+        newly_recorded = record_attempted_row(row)
         begin
           gateway.import(**import_arguments(row, expected_generation))
         rescue *CERTAIN_REFUSALS
-          forget_attempted_row(row)
+          # Only this call's own record is taken back: a line an earlier run
+          # recorded may stand for a write that run made.
+          forget_attempted_row(row) if newly_recorded
           raise
         end
         @imported_rows += 1
@@ -563,11 +565,13 @@ module Imports
       # Saved before the write, and kept across runs, so no failure between the
       # write and this record (a crash, a lost answer from Timekeeping) can
       # leave a written row unrecorded. A recorded row whose write never
-      # happened has no stored match to take, so the rerun writes it.
+      # happened has no stored match to take, so the rerun writes it. Returns
+      # whether this call added the line, rather than finding it recorded.
       def record_attempted_row(row)
         DataImport.where(id: data_import.id)
           .where.not("? = ANY(attempted_rows)", row[:row])
           .update_all(["attempted_rows = array_append(attempted_rows, ?)", row[:row]])
+          .positive?
       end
 
       # A refused row was certainly not written, so it must not take another

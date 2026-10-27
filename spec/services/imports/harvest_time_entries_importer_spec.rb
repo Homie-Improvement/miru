@@ -1035,6 +1035,40 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     expect(rerun_keys.uniq.size).to eq(2)
     expect(rerun_import.reload).to have_attributes(status: "completed", imported_rows: 2, failed_rows: 0)
   end
+
+  it "keeps an earlier write's record through a refused retry, so the identical row is written once the local copy arrives" do
+    calls = 0
+    allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_wrap_original do |original, *args, **kwargs|
+      result = original.call(*args, **kwargs)
+      calls += 1
+      if calls == 1
+        TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(generation: 3)
+        rerun_fake.generation = 3
+      end
+      result
+    end
+    rerun_with_timekeeping do
+      expect { described_class.new(rerun_import).process }.to raise_error(Timekeeping::Gateway::StaleGeneration)
+    end
+    expect(rerun_import.reload.attempted_rows).to include(2)
+
+    # A handoff refuses the retry before the first row's local copy has arrived.
+    ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+    ownership.update_columns(handoff_step: "close_admission")
+    allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_call_original
+    rerun_with_timekeeping do
+      expect { described_class.new(rerun_import.reload).process }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
+    end
+    expect(rerun_import.reload.attempted_rows).to include(2)
+
+    ownership.update_columns(handoff_step: nil)
+    create(:timesheet_entry, project: rerun_project, user: rerun_paul, work_date: Date.new(2026, 1, 5), duration: 60,
+                             note: "", bill_status: "unbilled", source: "import")
+    rerun_with_timekeeping { described_class.new(rerun_import.reload).process }
+
+    expect(rerun_fake.outbox.map { |event| event["entry"]["id"] }.uniq.size).to eq(2)
+    expect(rerun_import.reload).to have_attributes(status: "completed", imported_rows: 1, skipped_rows: 1)
+  end
 end
 
 RSpec.describe Imports::HarvestTimeEntriesImporter do
