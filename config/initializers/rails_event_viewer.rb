@@ -4,8 +4,16 @@ require "rails_event_viewer/adapters/active_record"
 
 class RailsEventViewer::TransactionalAdapter < RailsEventViewer::Adapters::ActiveRecord
   # Isolate event insert failures so they cannot poison the business transaction.
+  # Events are written synchronously (config.async = false), so the write
+  # happens when the event does. occurred_at is taken from the application
+  # clock, as created_at is, instead of the event's raw system-clock stamp, so
+  # readers that compare it with Time.current (the timekeeping:alerts lookback)
+  # use one clock.
   def write_events(events)
-    RailsEventViewer::Entry.transaction(requires_new: true) { super }
+    occurred_at = Time.current
+    RailsEventViewer::Entry.transaction(requires_new: true) do
+      super(events.map { |event| event.merge(occurred_at:) })
+    end
   end
 
   # Remove the viewer's default sort before PostgreSQL aggregate queries.

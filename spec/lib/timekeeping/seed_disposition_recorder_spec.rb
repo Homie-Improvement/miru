@@ -136,7 +136,10 @@ RSpec.describe Timekeeping::SeedDispositionRecorder do
       contested_entry = recorder_spec_entry(locked: true)
       invoices = %w[RC-0005 RC-0006].map do |number|
         invoice = recorder_spec_sent_invoice(number)
-        recorder_spec_aggregate_line(invoice, [contested_entry])
+        line = create(:invoice_line_item, invoice:, timesheet_entry: nil, rate: 100, quantity: 120)
+        # Inserted without callbacks: two kept invoices on one entry is a legacy
+        # state that invoice saves now refuse, so it is written directly.
+        InvoiceLineItemTimeEntry.insert_all!([{ invoice_line_item_id: line.id, timesheet_entry_id: contested_entry.id }])
         invoice
       end
       invoices.each { |invoice| invoice.update_columns(discarded_at: Time.current) }

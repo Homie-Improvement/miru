@@ -166,4 +166,23 @@ RSpec.describe InvoiceMailer, type: :mailer do
     expect(invoice.status).to eq("sending")
     expect(ActionMailer::Base.deliveries).to be_empty
   end
+
+  # "`InvoiceMailer#update_status` calls `Invoices::ReservationBoundary.mark_billed(invoice)` in place of `update_timesheet_entry_status!`"
+  it "sending an invoice mail marks its entries billed through the reservation boundary" do
+    company = create(:company)
+    client = create(:client, company:)
+    project = create(:project, client:, billable: true)
+    owner = create(:user, current_workspace_id: company.id)
+    entry = create(:timesheet_entry, user: owner, project:, bill_status: "unbilled")
+    invoice = create(:invoice, client:, company:, status: :sending)
+    create(:invoice_line_item, invoice:, timesheet_entry: entry, rate: 100, quantity: 60)
+    allow(InvoicePayment::PdfGeneration).to receive(:process).and_return("%PDF-1.4 invoice")
+    allow(Invoices::ReservationBoundary).to receive(:mark_billed).and_call_original
+
+    InvoiceMailer.with(invoice_id: invoice.id, subject: "Invoice", recipients: [client.email]).invoice.deliver_now
+
+    expect(Invoices::ReservationBoundary).to have_received(:mark_billed).once
+    expect(entry.reload.bill_status).to eq("billed")
+    expect(Invoice.method_defined?(:update_timesheet_entry_status!)).to be(false)
+  end
 end

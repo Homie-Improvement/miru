@@ -12,6 +12,11 @@ namespace :timekeeping do
     end
     gathered[:unavailable].each { |name| puts Timekeeping::AlertLog.unavailable_line(name) }
 
-    abort Timekeeping::AlertLog.metrics_error_line(gathered[:metrics_error]) if gathered[:metrics_error]
+    failures = []
+    failures << Timekeeping::AlertLog.metrics_error_line(gathered[:metrics_error]) if gathered[:metrics_error]
+    if gathered[:failed_local_reads].any?
+      failures << Timekeeping::AlertLog.failed_local_reads_line(gathered[:failed_local_reads])
+    end
+    abort failures.join("\n") if failures.any?
   end
 end

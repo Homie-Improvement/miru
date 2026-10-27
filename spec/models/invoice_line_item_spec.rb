@@ -276,7 +276,7 @@ RSpec.describe InvoiceLineItem, type: :model do
   end
 
   describe "callbacks" do
-    it { is_expected.to callback(:unlock_timesheet_entries).before(:destroy) }
+    it { is_expected.to callback(:register_reservation_change).before(:destroy) }
   end
 
   describe "Associations" do

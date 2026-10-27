@@ -64,3 +64,42 @@ RSpec.describe "Api::V1::Invoices#destroy", type: :request do
     end
   end
 end
+
+RSpec.describe "Api::V1::Invoices#destroy", type: :request do
+  let(:takeover_company) { create(:company, base_currency: "USD") }
+  let(:takeover_client) { create(:client, company: takeover_company) }
+  let(:takeover_admin) { create(:user, current_workspace_id: takeover_company.id) }
+  let(:takeover_project) { create(:project, client: takeover_client, billable: true) }
+
+  before do
+    create(:employment, company: takeover_company, user: takeover_admin)
+    takeover_admin.add_role :admin, takeover_company
+    sign_in takeover_admin
+  end
+
+  # "A discarded draft (L2): \"Its reservations are released.\""
+  # "a locked entry on a discarded non-draft can be taken by a new invoice"
+  # Scenario: the old sent invoice keeps a retained claim after the draft takes its entry. If the
+  # takeover does not drop that claim, the draft's later discard leaves the entry locked forever.
+  it "unlocks an entry a discarded draft took from a discarded sent invoice" do
+    entry = create(:timesheet_entry, user: takeover_admin, project: takeover_project,
+      bill_status: :unbilled, locked: false, work_date: Date.current, duration: 60)
+    sent = create(:invoice, company: takeover_company, client: takeover_client, status: :sent)
+    create(:invoice_line_item, invoice: sent, timesheet_entry: entry, rate: 100, quantity: 60)
+    entry.update_columns(locked: true)
+
+    send_request :delete, api_v1_invoice_path(sent), headers: auth_headers(takeover_admin)
+    expect(response).to have_http_status(:success)
+    expect(entry.reload.locked).to be(true)
+
+    draft = create(:invoice, company: takeover_company, client: takeover_client)
+    create(:invoice_line_item, invoice: draft, timesheet_entry: entry, rate: 100, quantity: 60)
+    expect(entry.reload.locked).to be(true)
+
+    send_request :delete, api_v1_invoice_path(draft), headers: auth_headers(takeover_admin)
+
+    expect(response).to have_http_status(:success)
+    expect(draft.reload).to be_discarded
+    expect(entry.reload.locked).to be(false)
+  end
+end

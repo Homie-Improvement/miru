@@ -11,7 +11,8 @@ module Timekeeping
   #
   # route is one of :create, :update, :destroy, :bulk_move, :bulk_delete.
   class EntryCommand < Data.define(:route, :company_id, :actor_id, :role, :primary_role, :entry_id, :operation, :key,
-                                   :fingerprint, :body, :project_id, :generation, :if_match, :facts, :today)
+                                   :fingerprint, :body, :project_id, :generation, :if_match, :facts, :today,
+                                   :replay_only)
     ID = /\A[0-9]{1,19}\z/
     ACTOR_TYPE = "user"
     UNBILLED = "unbilled"
@@ -40,6 +41,15 @@ module Timekeeping
     PROJECT_ROUTES = { create: :required, update: :optional, bulk_move: :required }.freeze
     ENTRY_ROUTES = %i[update destroy].freeze
     BULK_ROUTES = %i[bulk_move bulk_delete].freeze
+
+    # A DELETE carrying this header and value is answered only from its stored
+    # receipt (contracts/timekeeping/entry_api.yml rules.replay_only). It lets a
+    # caller whose own lookup no longer finds the entry reach the answer of a
+    # delete that already committed, without ever running a new delete. Every
+    # other route, and any other value, is an ordinary write.
+    REPLAY_HEADER = "Idempotency-Replay"
+    REPLAY_ONLY_VALUE = "only"
+    REPLAY_ROUTES = %i[destroy].freeze
 
     # Returns an EntryCommand, or the Timekeeping::WriteOutcome that refuses
     # the request. Raises ActionController::BadRequest for a body that is not
@@ -71,7 +81,8 @@ module Timekeeping
         route:, company_id:, actor_id: identity.user_id, role: identity.role, primary_role: identity.primary_role,
         entry_id: target_id,
         operation: "#{route} #{target_id}", key:, fingerprint: Digest::SHA256.hexdigest(JSON.generate(body)),
-        body:, project_id:, generation: headers["Ownership-Generation"], if_match: headers["If-Match"], facts:, today:
+        body:, project_id:, generation: headers["Ownership-Generation"], if_match: headers["If-Match"], facts:, today:,
+        replay_only: replay_only?(route, headers)
       )
     rescue ReferenceClient::Unavailable
       WriteOutcome.refusal(:reference_unavailable)
@@ -121,6 +132,10 @@ module Timekeeping
       :invalid
     end
 
+    def self.replay_only?(route, headers)
+      REPLAY_ROUTES.include?(route) && headers[REPLAY_HEADER].to_s == REPLAY_ONLY_VALUE
+    end
+
     def self.check_fields!(route, body)
       if route == :create && !CREATE_REQUIRED_FIELDS.all? { |field| body.key?(field) }
         raise ActionController::BadRequest, "a create needs #{CREATE_REQUIRED_FIELDS.join(" and ")}"
@@ -133,6 +148,6 @@ module Timekeeping
       raise ActionController::BadRequest, "invalid #{invalid.join(", ")}" unless invalid.empty?
     end
 
-    private_class_method :parse_entry_id, :parse_project_id, :check_fields!
+    private_class_method :parse_entry_id, :parse_project_id, :replay_only?, :check_fields!
   end
 end
