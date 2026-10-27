@@ -73,6 +73,11 @@ module Timekeeping
       raise unless receipt
 
       replay(receipt)
+    rescue WriteSteps::UnpublishableRows => error
+      # A stored row the projection would refuse. The transaction has rolled
+      # back the entry changes, their audit rows and the receipt, so a retry
+      # is checked again against what is stored then.
+      error.outcome
     end
 
     private

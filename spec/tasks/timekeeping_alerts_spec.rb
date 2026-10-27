@@ -4,53 +4,265 @@
 
 require "rails_helper"
 require "rake"
+require "webmock/rspec"
 
-RSpec.describe "timekeeping:alerts" do
-  # A leaked service token grants every service-only Timekeeping endpoint, so
-  # the task must keep it out of its output and logs even on a failed read.
-  it "alerts task never prints or logs the service token when Timekeeping refuses the metrics read" do
-    Rails.application.load_tasks unless Rake::Task.task_defined?("timekeeping:alerts")
-    Rake::Task["timekeeping:alerts"].reenable
+RSpec.describe "timekeeping:alerts", "shared task runner" do
+  # The task aborts with SystemExit when the metrics read fails. If the shared
+  # runner swallowed that status, or left ENV, $stdout, $stderr or the loggers
+  # swapped after the abort, every later example would pass or fail by run order.
+  it "shared runner reports the non-zero exit and stderr of a failed metrics read and restores ENV, streams and loggers" do
     TimekeepingOwnership.ensure_initial!
-    env_before = ENV.to_h.slice("TIMEKEEPING_BASE_URL", "TIMEKEEPING_SERVICE_TOKEN")
+    base_url = "http://timekeeping.runner.test"
     token = "service-#{SecureRandom.hex(24)}"
-    ENV["TIMEKEEPING_BASE_URL"] = "http://timekeeping.test"
-    ENV["TIMEKEEPING_SERVICE_TOKEN"] = token
-    WebMock.stub_request(:get, "http://timekeeping.test/internal/v1/metrics")
-           .to_return(status: 401, body: JSON.generate("reason" => "unauthorized"),
-                      headers: { "Content-Type" => "application/json" })
-
-    log = StringIO.new
-    capture_logger = ActiveSupport::Logger.new(log).tap { |logger| logger.level = Logger::DEBUG }
-    loggers_before = [Rails.logger, ActionController::Base.logger, ActionController::API.logger]
-    Rails.logger = ActionController::Base.logger = ActionController::API.logger = capture_logger
-    stdout = StringIO.new
-    stderr = StringIO.new
+    stub_request(:get, "#{base_url}/internal/v1/metrics").to_return(status: 500, body: "boom")
+    env_names = [Timekeeping::EntryApiClient::BASE_URL_ENV, Internal::V1::BaseController::SERVICE_TOKEN_ENV]
+    env_before = env_names.index_with { |name| ENV.fetch(name, nil) }
     stdout_before = $stdout
     stderr_before = $stderr
-    $stdout = stdout
-    $stderr = stderr
-    marker = "control-#{SecureRandom.hex(8)}"
-    Rails.logger.info(marker)
+    loggers_before = [Rails.logger, ActionController::Base.logger, ActionController::API.logger]
 
-    exited = nil
-    begin
-      Rake::Task["timekeeping:alerts"].invoke
-    rescue SystemExit => e
-      exited = e
+    run = run_timekeeping_alerts_task(base_url:, token:)
+
+    expect(run.exit_status).not_to be_nil
+    expect(run.exit_status).not_to eq(0)
+    expect(run.stderr).to include("timekeeping alerts: the Timekeeping metrics read failed")
+    expect(run.stdout + run.stderr + run.log).not_to include(token)
+    expect(env_names.index_with { |name| ENV.fetch(name, nil) }).to eq(env_before)
+    expect(ENV.to_h.values).not_to include(token)
+    expect($stdout).to equal(stdout_before)
+    expect($stderr).to equal(stderr_before)
+    expect([Rails.logger, ActionController::Base.logger, ActionController::API.logger]).to eq(loggers_before)
+  end
+
+  # Rake runs an invoked task only once unless it is reenabled. A runner that
+  # skipped reenable, or kept output or the exit status from an earlier run,
+  # would let a second run report nothing or a stale failure. No code records
+  # ownership pauses yet, so a successful run reports that signal as unavailable.
+  it "runs the alerts task again on a second call and reports only that run's own output and exit status" do
+    TimekeepingOwnership.ensure_initial!
+    base_url = "http://timekeeping.rerun.test"
+    token = "service-#{SecureRandom.hex(24)}"
+    stub_request(:get, "#{base_url}/internal/v1/metrics").to_return(status: 500, body: "boom")
+
+    failed = run_timekeeping_alerts_task(base_url:, token:)
+
+    stub_request(:get, "#{base_url}/internal/v1/metrics")
+      .with(headers: { "Authorization" => "Bearer #{token}" })
+      .to_return(status: 200, headers: { "Content-Type" => "application/json" }, body: JSON.generate(
+        "window_seconds" => 300, "latency_bucket_bounds_ms" => [25, 50, 100, 200, 300, 500, 1000, 2500, 5000],
+        "overflow_bucket" => "inf", "total_field" => "writes + reference_unavailable",
+        "companies" => [], "outbox_lag" => []
+      ))
+
+    succeeded = run_timekeeping_alerts_task(base_url:, token:)
+
+    expect(failed.exit_status).not_to be_nil
+    expect(failed.exit_status).not_to eq(0)
+    expect(succeeded.exit_status).to be_nil
+    unavailable = Timekeeping::AlertLog.unavailable_line("ownership_moving")
+    expect(succeeded.stdout.lines.map(&:chomp).count(unavailable)).to eq(1)
+    expect(succeeded.stdout + succeeded.stderr).not_to include("metrics read failed")
+  end
+end
+
+RSpec.describe "timekeeping:alerts", "section 11.3 alerts on the task output" do
+  include ActiveSupport::Testing::TimeHelpers
+
+  let(:alerts_rules_base_url) { "http://timekeeping.alerts.test" }
+  let(:alerts_rules_token) { "service-#{SecureRandom.hex(24)}" }
+
+  def stub_timekeeping_alerts_metrics(base_url, body:, status: 200, token: nil)
+    request = stub_request(:get, "#{base_url}/internal/v1/metrics")
+    request = request.with(headers: { "Authorization" => "Bearer #{token}" }) if token
+    request.to_return(status:, body: JSON.generate(body), headers: { "Content-Type" => "application/json" })
+  end
+
+  def alerts_rules_metrics_body(companies: [], outbox_lag: [])
+    { "window_seconds" => 300, "latency_bucket_bounds_ms" => [25, 50, 100, 200, 300, 500, 1000, 2500, 5000],
+      "overflow_bucket" => "inf", "total_field" => "writes + reference_unavailable",
+      "companies" => companies, "outbox_lag" => outbox_lag }
+  end
+
+  def alerts_rules_run(at:)
+    travel_to(at) { run_timekeeping_alerts_task(base_url: alerts_rules_base_url, token: alerts_rules_token) }
+  end
+
+  # The company_id of every alert line with this name, parsed from the
+  # Timekeeping::AlertLog.alert_line format.
+  def alerts_rules_companies(run, name)
+    run.stdout.lines.filter_map { |line| line[/\Atimekeeping alert name=#{name} company_id=(\S+) /, 1] }
+  end
+
+  # A leaked service token grants every service-only Timekeeping endpoint, so
+  # the task must keep it out of its output and logs even on a failed read. The
+  # pending intent alert comes from the monolith's own records, so a failed
+  # Timekeeping read must not hide it or put it under another company. The INFO
+  # marker logged during the run shows the capture records INFO lines too, so
+  # the token check would see a token logged at that level.
+  it "shared runner keeps the service token out of stdout, stderr and logs on a 401 or 500 metrics read and still reports the pending intent" do
+    TimekeepingOwnership.ensure_initial!
+    late_company = create(:company)
+    quiet_company = create(:company)
+    InvoiceOperationIntent.create!(company_id: late_company.id, invoice_id: 1, operation_id: SecureRandom.uuid,
+                                   generation: 1, state: "pending", created_at: 11.minutes.ago)
+    InvoiceOperationIntent.create!(company_id: quiet_company.id, invoice_id: 2, operation_id: SecureRandom.uuid,
+                                   generation: 1, state: "pending", created_at: 9.minutes.ago)
+    marker = "control-#{SecureRandom.hex(8)}"
+    allow(Timekeeping::AlertSignals).to receive(:gather).and_wrap_original do |gather, **options|
+      Rails.logger.info(marker)
+      gather.call(**options)
     end
 
-    expect(log.string).to include(marker)
-    expect(exited).not_to be_nil
-    expect(exited.success?).to be(false)
-    expect(stdout.string + stderr.string).not_to be_empty
-    expect(stdout.string).not_to include(token)
-    expect(stderr.string).not_to include(token)
-    expect(log.string).not_to include(token)
-  ensure
-    $stdout = stdout_before if stdout_before
-    $stderr = stderr_before if stderr_before
-    Rails.logger, ActionController::Base.logger, ActionController::API.logger = loggers_before if loggers_before
-    %w[TIMEKEEPING_BASE_URL TIMEKEEPING_SERVICE_TOKEN].each { |key| ENV[key] = env_before[key] } if env_before
+    [401, 500].each do |status|
+      token = "service-#{SecureRandom.hex(24)}"
+      stub_timekeeping_alerts_metrics(alerts_rules_base_url, status:, body: { "reason" => "unauthorized" })
+
+      run = run_timekeeping_alerts_task(base_url: alerts_rules_base_url, token:)
+
+      expect(run.exit_status).not_to be_nil
+      expect(run.exit_status).not_to eq(0)
+      expect(alerts_rules_companies(run, "pending_invoice_operation_intent")).to eq([late_company.id.to_s])
+      expect(run.stdout).not_to include("company_id=#{quiet_company.id} ")
+      expect(run.log).to include(marker)
+      expect(run.log).to include("name=pending_invoice_operation_intent company_id=#{late_company.id} ")
+      expect(run.stdout).not_to include(token)
+      expect(run.stderr).not_to include(token)
+      expect(run.log).not_to include(token)
+    end
+  end
+
+  it "judges reference_unavailable per company so a healthy company never borrows a failing one's alert" do
+    TimekeepingOwnership.ensure_initial!
+    window = lambda do |writes, refused|
+      { "window_start" => "2026-03-03T12:00:00Z", "writes" => writes, "reference_unavailable" => refused,
+        "latency_ms_sum" => 0, "latency_ms_buckets" => { "25" => writes + refused } }
+    end
+    # Pooled, the three companies refuse 3 of 2100 requests, under 1%; only
+    # company 101's own completed window (2 of 100) is over it, and 102 sits at exactly 1%.
+    companies = [
+      { "company_id" => 101, "windows" => [window.call(98, 2)] },
+      { "company_id" => 102, "windows" => [window.call(99, 1)] },
+      { "company_id" => 103, "windows" => [window.call(1900, 0)] }
+    ]
+    stub_timekeeping_alerts_metrics(alerts_rules_base_url, token: alerts_rules_token,
+                                                           body: alerts_rules_metrics_body(companies:))
+
+    run = alerts_rules_run(at: Time.utc(2026, 3, 3, 12, 7))
+
+    expect(alerts_rules_companies(run, "reference_unavailable_rate")).to eq(["101"])
+    expect(run.stdout.lines.grep(/company_id=10[23] /)).to be_empty
+    expect(run.exit_status).to be_nil
+  end
+
+  it "still prints the pending intent alert and exits non-zero when Timekeeping answers a body without window_seconds" do
+    TimekeepingOwnership.ensure_initial!
+    now = Time.utc(2026, 3, 3, 12, 30)
+    company = create(:company)
+    InvoiceOperationIntent.create!(company_id: company.id, invoice_id: 3, operation_id: SecureRandom.uuid,
+                                   generation: 1, state: "pending", created_at: now - 11.minutes)
+    stub_timekeeping_alerts_metrics(alerts_rules_base_url, body: alerts_rules_metrics_body.except("window_seconds"))
+
+    run = alerts_rules_run(at: now)
+
+    expect(run.exit_status).not_to be_nil
+    expect(run.exit_status).not_to eq(0)
+    expect(alerts_rules_companies(run, "pending_invoice_operation_intent")).to eq([company.id.to_s])
+  end
+
+  # "`503 reference_unavailable` over 1% of writes for 5 minutes;"
+  it "does not alert on reference_unavailable failures in a window that has not yet lasted 5 minutes" do
+    TimekeepingOwnership.ensure_initial!
+    # Half the requests refused, but the window opened at 12:05 and the task runs at 12:06.
+    open_window = { "window_start" => "2026-03-03T12:05:00Z", "writes" => 10, "reference_unavailable" => 10,
+                    "latency_ms_sum" => 0, "latency_ms_buckets" => { "25" => 20 } }
+    companies = [{ "company_id" => 101, "windows" => [open_window] }]
+    stub_timekeeping_alerts_metrics(alerts_rules_base_url, token: alerts_rules_token,
+                                                           body: alerts_rules_metrics_body(companies:))
+
+    run = alerts_rules_run(at: Time.utc(2026, 3, 3, 12, 6))
+
+    expect(alerts_rules_companies(run, "reference_unavailable_rate")).to be_empty
+    expect(run.exit_status).to be_nil
+  end
+
+  # "Timekeeping p95 latency for entry writes over 300 ms."
+  it "alerts on p95 latency over 300 ms per company, including the overflow bucket, and stays quiet at exactly 5% above 300 ms" do
+    TimekeepingOwnership.ensure_initial!
+    company = lambda do |company_id, buckets|
+      { "company_id" => company_id, "windows" => [
+        { "window_start" => "2026-03-03T12:00:00Z", "writes" => buckets.values.sum, "reference_unavailable" => 0,
+          "latency_ms_sum" => 0, "latency_ms_buckets" => buckets }
+      ] }
+    end
+    companies = [
+      # Every write slower than 5000 ms, so only the overflow bucket reaches 95%.
+      company.call(201, { "inf" => 20 }),
+      # 2 of 20 above 300 ms: 10%, so the p95 is above 300 ms.
+      company.call(202, { "300" => 18, "500" => 2 }),
+      # 1 of 20 above 300 ms: exactly 5%, so the p95 is 300 ms, which is not over 300 ms.
+      company.call(203, { "300" => 19, "500" => 1 }),
+      # A large fast company: pooled with it, the slow writes above stay under 5%.
+      company.call(204, { "25" => 1000 })
+    ]
+    stub_timekeeping_alerts_metrics(alerts_rules_base_url, token: alerts_rules_token,
+                                                           body: alerts_rules_metrics_body(companies:))
+
+    run = alerts_rules_run(at: Time.utc(2026, 3, 3, 12, 7))
+
+    expect(alerts_rules_companies(run, "entry_write_p95_latency")).to eq(%w[201 202])
+  end
+
+  # "invoice operation intents still `pending` older than 10 minutes;"
+  it "alerts on an invoice operation intent still pending past 10 minutes and not on one at exactly 10 minutes" do
+    TimekeepingOwnership.ensure_initial!
+    now = Time.utc(2026, 3, 3, 12, 30)
+    late_company = create(:company)
+    on_time_company = create(:company)
+    committed_company = create(:company)
+    [[late_company, "pending", 601], [on_time_company, "pending", 600], [committed_company, "committed", 3600]]
+      .each do |company, state, age_seconds|
+        InvoiceOperationIntent.create!(company_id: company.id, invoice_id: 1, operation_id: SecureRandom.uuid,
+                                       generation: 1, state:, created_at: now - age_seconds)
+      end
+    stub_timekeeping_alerts_metrics(alerts_rules_base_url, token: alerts_rules_token, body: alerts_rules_metrics_body)
+
+    run = alerts_rules_run(at: now)
+
+    expect(alerts_rules_companies(run, "pending_invoice_operation_intent")).to eq([late_company.id.to_s])
+  end
+
+  # "outbox lag (oldest unsent row age) of the current owner over 5 minutes;"
+  it "alerts on outbox lag over 5 minutes per company only when Timekeeping is the current owner" do
+    TimekeepingOwnership.ensure_initial!
+    outbox_lag = [
+      { "company_id" => 301, "oldest_unsent_age_seconds" => 301 },
+      { "company_id" => 302, "oldest_unsent_age_seconds" => 300 }
+    ]
+    stub_timekeeping_alerts_metrics(alerts_rules_base_url, token: alerts_rules_token,
+                                                           body: alerts_rules_metrics_body(outbox_lag:))
+    now = Time.utc(2026, 3, 3, 12, 7)
+
+    monolith_owned = alerts_rules_run(at: now)
+    TimekeepingOwnership.current.update_columns(owner: "timekeeping")
+    timekeeping_owned = alerts_rules_run(at: now)
+
+    expect(alerts_rules_companies(monolith_owned, "outbox_lag")).to be_empty
+    expect(alerts_rules_companies(timekeeping_owned, "outbox_lag")).to eq(["301"])
+  end
+
+  # "any `409 stale_generation` outside a handoff;"
+  it "prints a stale_generation alert for a refusal outside a handoff and none for a refusal during a handoff" do
+    TimekeepingOwnership.ensure_initial!
+    outside = create(:company)
+    during = create(:company)
+    TimekeepingStaleGenerationRefusal.create!(company_id: outside.id, handoff_step: nil)
+    TimekeepingStaleGenerationRefusal.create!(company_id: during.id, handoff_step: "freeze")
+    stub_timekeeping_alerts_metrics(alerts_rules_base_url, token: alerts_rules_token, body: alerts_rules_metrics_body)
+
+    # Refusals are counted over a recent period ending now, so this run keeps the real clock.
+    run = run_timekeeping_alerts_task(base_url: alerts_rules_base_url, token: alerts_rules_token)
+
+    expect(alerts_rules_companies(run, "stale_generation")).to eq([outside.id.to_s])
+    expect(run.stdout).not_to include("company_id=#{during.id} ")
   end
 end
