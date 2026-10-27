@@ -15,8 +15,35 @@ module Timekeeping
       # inserts and holds until commit, so outbox positions commit in the order
       # they were drawn and the relay never passes a position still uncommitted.
       OUTBOX_LOCK_KEY = 2_026_034_001
+      # The largest value a PostgreSQL bigint column holds, so a larger id is a
+      # bad request rather than a failure inside the write.
+      MAX_ID = (2**63) - 1
 
       module_function
+
+      # An id a bigint column can hold, sent as an Integer.
+      def id?(value)
+        value.is_a?(Integer) && value.between?(1, MAX_ID)
+      end
+
+      # True when the body holds the service token this owner holds, or a user
+      # or service token signed with the key it signs user tokens with, so no
+      # row or receipt can carry a credential.
+      def credential_in_body?(body)
+        TimekeepingRules::CredentialScan.found?(
+          body,
+          held_token: ENV.fetch(Internal::V1::BaseController::SERVICE_TOKEN_ENV, nil),
+          public_key: token_public_key
+        )
+      end
+
+      # The public half of the key the monolith signs user tokens with. An
+      # unset or unreadable key is not held, so it matches nothing.
+      def token_public_key
+        UserToken.private_key_from_env.public_key
+      rescue UserToken::MissingKeyError
+        nil
+      end
 
       # Takes a transaction-scoped advisory lock on two signed 32-bit keys from
       # a digest of parts, so only writers naming the same parts wait on each
@@ -96,7 +123,7 @@ module Timekeeping
           ApplicationRecord.sanitize_sql_array(["SELECT pg_advisory_xact_lock(#{placeholders})", *keys])
         )
       end
-      private_class_method :advisory_lock
+      private_class_method :advisory_lock, :token_public_key
     end
   end
 end

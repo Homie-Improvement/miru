@@ -138,14 +138,13 @@ module Timekeeping
         end
 
         def valid_request?
-          return false unless body.is_a?(Hash) && positive_id?(invoice_id) && UUID.match?(operation_id.to_s)
+          return false unless body.is_a?(Hash) && WriteSteps.id?(invoice_id) && UUID.match?(operation_id.to_s)
           return true unless route == :prepare
 
-          DISPOSITIONS.include?(disposition) && entry_ids.is_a?(Array) && entry_ids.all? { |id| positive_id?(id) }
-        end
-
-        def positive_id?(value)
-          value.is_a?(Integer) && value.positive?
+          # An entry listed twice is refused, as the service refuses it, so the
+          # stored desired set a replay compares has one spelling per set.
+          DISPOSITIONS.include?(disposition) && entry_ids.is_a?(Array) &&
+            entry_ids.all? { |id| WriteSteps.id?(id) } && entry_ids.uniq.size == entry_ids.size
         end
 
         # Stored answers

@@ -135,6 +135,11 @@ module Timekeeping
       access = ServiceAccess.decide(actor:, company_id:, route:)
       return Outcome.refusal(access) unless access == :allowed
 
+      # As the service does, a body holding a credential is refused before any
+      # other check, so no operation row or receipt can store one.
+      body = params.fetch("body", nil)
+      return Outcome.refusal(:credential_in_body) if body.is_a?(Hash) && WriteSteps.credential_in_body?(body)
+
       writer = RESERVATION_ROUTES.include?(route) ? ReservationOperations : ServiceCommands
       writer.call(route:, company_id:, generation:, actor:, params:, checkpoint:)
     end
@@ -293,19 +298,7 @@ module Timekeeping
       end
 
       def credential_in_body?
-        TimekeepingRules::CredentialScan.found?(
-          body,
-          held_token: ENV.fetch(Internal::V1::BaseController::SERVICE_TOKEN_ENV, nil),
-          public_key: token_public_key
-        )
-      end
-
-      # The public half of the key the monolith signs user tokens with. An
-      # unset or unreadable key is not held, so it matches nothing.
-      def token_public_key
-        UserToken.private_key_from_env.public_key
-      rescue UserToken::MissingKeyError
-        nil
+        WriteSteps.credential_in_body?(body)
       end
 
       # A field is checked only when the body sends it: an absent field keeps

@@ -47,6 +47,51 @@ RSpec.describe "Timekeeping::LocalOwner service callers" do
   end
 end
 
+RSpec.describe "Timekeeping::LocalOwner service request shapes" do
+  # The local owner answers these bodies as Timekeeping's ReservationRequest does: a credential in the body is
+  # credential_in_body, a duplicate entry or an id beyond bigint is invalid_request, and a command path id that
+  # cannot name a row is not_found. None of them writes a row.
+  around { |example| with_timekeeping_service_token { example.run } }
+
+  it "refuses a credential in the body, a repeated entry, an over-range id and an unusable command path id" do
+    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
+    company = create(:company)
+    project = create(:project, client: create(:client, company_id: company.id))
+    user = create(:user)
+    entry = Timekeeping::LocalEntry.create!(company_id: company.id, project_id: project.id, user_id: user.id,
+                                            work_date: Date.new(2026, 3, 2), duration: 60.0, bill_status: "unbilled")
+    service = Timekeeping::LocalOwner::Actor.service(
+      name: "invoice-boundary", company_id: company.id, operations: TimekeepingRules::EntryRules::BACKGROUND_OPERATIONS
+    )
+    generation = TimekeepingOwnership.current.generation.to_s
+    tables = %w[reservations invoice_operations service_idempotency_receipts entry_audits entry_outbox_items]
+    counts = -> { tables.index_with { |table| ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM #{table}").to_i } }
+    prepare_body = lambda do |overrides|
+      { "invoice_id" => 501, "operation_id" => SecureRandom.uuid, "disposition" => "active",
+        "entries" => [entry.id] }.merge(overrides)
+    end
+    over_range = 2**63
+    before = counts.call
+
+    cases = [
+      [:prepare, { "body" => prepare_body.call("note" => ENV.fetch(Internal::V1::BaseController::SERVICE_TOKEN_ENV)) },
+       422, "credential_in_body"],
+      [:prepare, { "body" => prepare_body.call("entries" => [entry.id, entry.id]) }, 400, "invalid_request"],
+      [:prepare, { "body" => prepare_body.call("entries" => [over_range]) }, 400, "invalid_request"],
+      [:commit, { "body" => { "invoice_id" => over_range, "operation_id" => SecureRandom.uuid } }, 400, "invalid_request"],
+      [:mark_billed, { "invoice_id" => over_range.to_s, "body" => { "operation_id" => SecureRandom.uuid } }, 404, "not_found"],
+      [:detach_entries, { "agent_id" => "abc", "body" => { "operation_id" => SecureRandom.uuid } }, 404, "not_found"]
+    ]
+
+    cases.each do |operation, params, status, reason|
+      outcome = Timekeeping::LocalOwner.call(operation:, company_id: company.id, generation:, actor: service, params:)
+
+      expect([operation, outcome.status, outcome.body]).to eq([operation, status, { "reason" => reason }])
+    end
+    expect(counts.call).to eq(before)
+  end
+end
+
 require "rails_helper"
 
 RSpec.describe "Timekeeping::LocalOwner service callers across companies" do
