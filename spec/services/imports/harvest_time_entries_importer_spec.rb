@@ -510,6 +510,30 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     expect(stored_entry_ids.size).to eq(2)
     expect(fwd_import.reload).to have_attributes(status: "completed", failed_rows: 0)
   end
+
+  # The file has no Currency column, so the row's currency falls back to the company's base currency.
+  it "keeps a forwarded row's Idempotency-Key when the company's base currency changes before a rerun" do
+    calls = 0
+    allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_wrap_original do |original, *args, **kwargs|
+      result = original.call(*args, **kwargs)
+      calls += 1
+      if calls == 1
+        TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(generation: 3)
+        fwd_fake.generation = 3
+      end
+      result
+    end
+
+    expect { described_class.new(fwd_import).process }.to raise_error(Timekeeping::Gateway::StaleGeneration)
+    fwd_company.update!(base_currency: "USD")
+    described_class.new(DataImport.find(fwd_import.id)).process
+
+    first_row_keys = fwd_fake.requests
+      .filter_map { |request| request[:headers]["Idempotency-Key"] if request[:body]&.dig("note") == "first row" }
+    expect(first_row_keys.size).to eq(2)
+    expect(first_row_keys.uniq.size).to eq(1)
+    expect(fwd_fake.outbox.map { |row| row["entry"]["id"] }.uniq.size).to eq(2)
+  end
 end
 
 RSpec.describe Imports::HarvestTimeEntriesImporter do
@@ -1059,5 +1083,89 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     expect(posts.map { |request| request[:headers]["Idempotency-Key"] }).to eq([first_key, first_key])
     expect(drift_fake.outbox.map { |row| row["entry"]["id"] }.uniq.size).to eq(1)
     expect(drift_import.reload).to have_attributes(status: "failed", failed_rows: 0)
+  end
+end
+
+RSpec.describe Imports::HarvestTimeEntriesImporter do
+  let(:rerun_dup_company) { create(:company) }
+  let(:rerun_dup_actor) { create(:user, current_workspace_id: rerun_dup_company.id) }
+  let(:rerun_dup_paul) do
+    create(:user, first_name: "Paul", last_name: "Connors", email: "rerun-dup-paul@example.com",
+                  current_workspace_id: rerun_dup_company.id)
+  end
+  let(:rerun_dup_project) do
+    create(:project, name: "Website", billable: true, client: create(:client, company: rerun_dup_company, name: "Acme LLC"))
+  end
+
+  before do
+    create(:employment, company: rerun_dup_company, user: rerun_dup_actor)
+    create(:employment, company: rerun_dup_company, user: rerun_dup_paul)
+    rerun_dup_project
+  end
+
+  def rerun_dup_import_with(csv)
+    create(:data_import, company: rerun_dup_company, user: rerun_dup_actor).tap do |import|
+      import.file.attach(io: StringIO.new(csv), filename: "harvest.csv", content_type: "text/csv")
+    end
+  end
+
+  def rerun_dup_refuse_import_call(number)
+    calls = 0
+    allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_wrap_original do |original, *args, **kwargs|
+      calls += 1
+      raise Timekeeping::Gateway::OwnershipMoving if calls == number
+
+      original.call(*args, **kwargs)
+    end
+  end
+
+  def rerun_dup_entries(note)
+    TimesheetEntry.where(user: rerun_dup_paul, note:, source: "import").count
+  end
+
+  it "writes a skipped identical row on the third run when the second run failed before writing anything" do
+    import = rerun_dup_import_with(<<~CSV)
+      Date,Client,Project,Hours,First Name,Last Name,Billable?,Notes
+      2026-01-05,Acme LLC,Website,1,Paul,Connors,Yes,same work
+      2026-01-05,Acme LLC,Website,1,Paul,Connors,Yes,same work
+    CSV
+
+    rerun_dup_refuse_import_call(2)
+    expect { described_class.new(import).process }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
+    expect(rerun_dup_entries("same work")).to eq(1)
+
+    rerun_dup_refuse_import_call(1)
+    expect { described_class.new(import.reload).process }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
+    expect(import.reload).to have_attributes(status: "failed", imported_rows: 0)
+
+    allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_call_original
+    described_class.new(import.reload).process
+
+    expect(rerun_dup_entries("same work")).to eq(2)
+    expect(import.reload).to have_attributes(status: "completed", imported_rows: 1, skipped_rows: 1)
+  end
+
+  it "keeps skipping rows an earlier import already stored when a failed import is rerun" do
+    create(:timesheet_entry, project: rerun_dup_project, user: rerun_dup_paul, work_date: Date.new(2026, 1, 5),
+                             duration: 60, note: "earlier", bill_status: "unbilled", source: "import")
+    import = rerun_dup_import_with(<<~CSV)
+      Date,Client,Project,Hours,First Name,Last Name,Billable?,Notes
+      2026-01-05,Acme LLC,Website,1,Paul,Connors,Yes,earlier
+      2026-01-05,Acme LLC,Website,1,Paul,Connors,Yes,earlier
+      2026-01-06,Acme LLC,Website,1,Paul,Connors,Yes,second
+      2026-01-07,Acme LLC,Website,1,Paul,Connors,Yes,third
+    CSV
+
+    rerun_dup_refuse_import_call(2)
+    expect { described_class.new(import).process }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
+    expect(rerun_dup_entries("second")).to eq(1)
+
+    allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_call_original
+    described_class.new(import.reload).process
+
+    expect(rerun_dup_entries("earlier")).to eq(1)
+    expect(rerun_dup_entries("second")).to eq(1)
+    expect(rerun_dup_entries("third")).to eq(1)
+    expect(import.reload).to have_attributes(status: "completed", imported_rows: 1, skipped_rows: 3)
   end
 end

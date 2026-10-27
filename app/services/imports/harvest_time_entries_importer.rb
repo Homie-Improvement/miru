@@ -23,11 +23,12 @@ module Imports
 
     # The values a row's Idempotency-Key is derived from: the row as read from
     # the uploaded file, line number included, so two identical lines stay two
-    # entries. Values resolved from the workspace (user, project, bill status)
-    # are left out because they can change before a rerun, which would give a
-    # row already written a new key.
+    # entries. Values resolved from the workspace (user, project, bill status,
+    # and the currency, which falls back to the company's base currency) are
+    # left out because they can change before a rerun, which would give a row
+    # already written a new key.
     ROW_KEY_FIELDS = %i[
-      row date client_name project_name project_code user_name hours billable invoiced note currency hourly_rate
+      row date client_name project_name project_code user_name hours billable invoiced note hourly_rate
     ].freeze
 
     attr_reader :data_import, :company
@@ -52,7 +53,6 @@ module Imports
     def process
       previous_context = Rails.event.context.dup
       Rails.event.set_context(source: "harvest_import", data_import_id: data_import.id.to_s)
-      @recovering = recovering_failed_import?
       data_import.update!(
         status: "processing",
         started_at: Time.current,
@@ -93,12 +93,6 @@ module Imports
         # stay stored and are reported.
         data_import.update!(status: "failed", error_message: message, finished_at: Time.current,
                             imported_rows: @imported_rows.to_i)
-      end
-
-      # A rerun of a failed import that already stored rows. Only then is a
-      # stored entry evidence that exactly one matching row was written.
-      def recovering_failed_import?
-        data_import.status == "failed" && !data_import.dry_run? && data_import.imported_rows.to_i.positive?
       end
 
       def load_rows
@@ -183,17 +177,21 @@ module Imports
       def load_database_duplicates
         project_ids = @project_plans.values.filter_map { |plan| plan[:existing]&.id }.uniq
         work_dates = @rows.filter_map { |row| parse_date(row[:date]) }
-        @database_duplicates = if project_ids.empty? || work_dates.empty?
-          {}
+        stored = if project_ids.empty? || work_dates.empty?
+          []
         else
           TimesheetEntry.kept.joins(project: :client)
             .merge(Project.kept)
             .merge(Client.kept)
             .where(project_id: project_ids, work_date: work_dates.min..work_dates.max, source: "import")
-            .pluck(:user_id, :project_id, :work_date, :duration, :note)
-            .map { |values| duplicate_key(*values) }
-            .tally
+            .pluck(:user_id, :project_id, :work_date, :duration, :note, :created_at)
         end
+        # Entries stored before this data import existed came from earlier
+        # imports; entries stored after it are rows an earlier run of this same
+        # import already wrote before it failed.
+        earlier, own = stored.partition { |values| values.last < data_import.created_at }
+        @earlier_import_duplicates = earlier.to_set { |values| duplicate_key(*values.first(5)) }
+        @own_stored_rows = own.map { |values| duplicate_key(*values.first(5)) }.tally
       end
 
       def build_entity_plans
@@ -307,16 +305,19 @@ module Imports
         )
       end
 
-      # A fresh import skips every row matching a stored entry. A rerun of a
-      # failed import skips one row per stored match, so an identical row the
-      # failed run never reached is still written.
+      # A row matching an earlier import's entry is skipped, however many times
+      # it repeats. An entry this import already wrote accounts for one
+      # matching row only, so an identical row a failed run never reached is
+      # still written on the rerun.
       def duplicate_row?(row, user, project, work_date, duration)
         return false unless project
 
         key = duplicate_key(user.id, project.id, work_date, duration, row[:note])
-        return false unless @database_duplicates.fetch(key, 0).positive?
+        if @earlier_import_duplicates.exclude?(key)
+          return false unless @own_stored_rows.fetch(key, 0).positive?
 
-        @database_duplicates[key] -= 1 if @recovering
+          @own_stored_rows[key] -= 1
+        end
         @duplicate_rows += 1
         true
       end
