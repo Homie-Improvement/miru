@@ -125,7 +125,8 @@ module Timekeeping
     # same company, actor and key it answers 404, raised as RecordNotFound.
     def replay_destroy_entry(context:, generation:, entry_id:)
       path = format(ENTRY_PATH, company_id: context.company.id, entry_id:)
-      forward(Net::HTTP::Delete, path, operation: "destroy", context:, generation:, entry_id:, replay_only: true)
+      forward(Net::HTTP::Delete, path, operation: "destroy", context:, generation:, entry_id:,
+                                       version: REPLAY_ONLY_IF_MATCH, replay_only: true)
     end
 
     private
@@ -140,10 +141,7 @@ module Timekeeping
         request["Idempotency-Key"] = self.class.idempotency_key(request_id: context.request_id, operation:, entry_id:)
         request["X-Request-Id"] = context.request_id.to_s
         request["If-Match"] = version.to_s unless version.nil?
-        if replay_only
-          request[REPLAY_ONLY_HEADER] = REPLAY_ONLY_VALUE
-          request["If-Match"] = REPLAY_ONLY_IF_MATCH
-        end
+        request[REPLAY_ONLY_HEADER] = REPLAY_ONLY_VALUE if replay_only
         unless body.nil?
           request["Content-Type"] = "application/json"
           request.body = JSON.generate(body)
