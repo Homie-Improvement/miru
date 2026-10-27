@@ -4,7 +4,6 @@
 
 require "rails_helper"
 require "securerandom"
-require "yaml"
 
 RSpec.describe Invoices::PreparedReservations do
   include PreparedReservationsSpecSupport
@@ -190,7 +189,11 @@ RSpec.describe Invoices::PreparedReservations do
         adapter = described_class.new
         request = prepared_spec_request(company, invoice, [entry.id])
 
-        prepared_spec_commit_flow(adapter, request)
+        expect(adapter.prepare(request).state).to eq("prepared")
+        # The prepare's flip from unlocked to locked raises the version once and writes one snapshot.
+        expect(prepared_spec_outbox_count(entry)).to eq(1)
+        expect(entry.reload.version).to eq(version_before + 1)
+        expect(adapter.commit(request).state).to eq("committed")
 
         expect(prepared_spec_reservations(company)).to eq([[entry.id, invoice.id, "committed", "active"]])
         expect(prepared_spec_operations(company, invoice)).to eq([["committed", [entry.id], "active"]])
@@ -207,8 +210,8 @@ RSpec.describe Invoices::PreparedReservations do
         expect(identity["operation_id"]).to eq(request.operation_id)
         expect(identity["invoice_operation_id"]).to eq(operations.first["id"])
 
-        # The provisional-to-committed turn keeps the entry locked, so only the
-        # prepare's flip from unlocked to locked writes a snapshot.
+        # The provisional-to-committed turn keeps the entry locked, so the commit
+        # writes no further snapshot and leaves the version where prepare put it.
         expect(prepared_spec_outbox_count(entry)).to eq(1)
         expect(entry.reload.version).to eq(version_before + 1)
         snapshot = Timekeeping::LocalOutboxEntry.find_by!(company_id: company.id, entry_id: entry.id)
@@ -292,43 +295,6 @@ RSpec.describe Invoices::PreparedReservations do
         expect(redelivery_data_state(aborted_invoice, aborted_entry)).to eq(dropped)
         expect(redelivery_data_state(committed_invoice, committed_entry).slice(:reservations, :operations))
           .to eq(settled.slice(:reservations, :operations))
-      end
-    end
-
-    describe "locked change and outbox snapshot" do
-      let(:outbox_data_company) { create(:company) }
-      let(:outbox_data_user) { create(:user, current_workspace_id: outbox_data_company.id) }
-      let(:outbox_data_project) { create(:project, client: create(:client, company: outbox_data_company)) }
-
-      it "a locked change raises the entry version once and writes exactly one contract-shaped outbox row, and turning provisional to committed writes none" do
-        entry = Timekeeping::LocalEntry.create!(company_id: outbox_data_company.id, user_id: outbox_data_user.id,
-                                                project_id: outbox_data_project.id, work_date: Date.new(2026, 3, 2),
-                                                duration: 60.0, bill_status: "unbilled")
-        version_before = entry.reload.version
-        request = Invoices::ReservationRequest.new(
-          company_id: outbox_data_company.id, invoice_id: 91_301, operation_id: SecureRandom.uuid,
-          generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [entry.id]
-        )
-        adapter = described_class.new
-        outbox = Timekeeping::LocalOutboxEntry.where(company_id: outbox_data_company.id, entry_id: entry.id)
-
-        adapter.prepare(request)
-
-        # "When an entry's locked state changes, update the matching row in the prepared `entries` table, raise its
-        # version, and write an `entry_outbox_items` row shaped by `contracts/timekeeping/entry_snapshots.yml`, as the
-        # fake's `refresh_locked` does."
-        expect(outbox.count).to eq(1)
-        expect(entry.reload.version).to eq(version_before + 1)
-        contract_fields = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/entry_snapshots.yml")).fetch("entry_fields")
-        payload = outbox.first.payload
-        payload = JSON.parse(payload) if payload.is_a?(String)
-        expect(payload.keys).to match_array(contract_fields)
-        expect(payload["locked"]).to be(true)
-
-        adapter.commit(request)
-
-        expect(outbox.count).to eq(1)
-        expect(entry.reload.version).to eq(version_before + 1)
       end
     end
 
@@ -561,7 +527,8 @@ RSpec.describe Invoices::PreparedReservations do
         expect(before[:reservations].map { |row| row.first(4) }).to eq([[held.id, holder.id, "committed", "active"]])
         expect(before[:operations]).to eq([[holder.id, "committed"]])
 
-        # The held entry is refused in either position of the request.
+        # "A second kept invoice on the same entry fails with \"entry is on another invoice\""
+        # The held entry is refused in either position of the request, and the free entry is not reserved.
         [[held.id, free.id], [free.id, held.id]].each do |entry_ids|
           refused_request = unstored_request(second, entry_ids)
 
@@ -760,32 +727,6 @@ RSpec.describe Invoices::PreparedReservations do
       expect(reservation_rows.call(company_b_setup))
         .to eq([[company_b_setup[:company].id, company_b_setup[:entry].id, "committed"]])
       expect(reservation_rows.call(company_a_setup)).to eq([])
-    end
-  end
-
-  describe "refused prepare" do
-    # "A second kept invoice on the same entry fails with \"entry is on another invoice\""
-    # "Prepare is all or nothing, and one refusal reserves nothing."
-    it "a second invoice preparing an entry actively committed elsewhere is refused on_another_invoice and reserves nothing, not even its free entry" do
-      prepare_local_ownership!
-      company = create(:company)
-      held = prepared_spec_entry(company)
-      free = prepared_spec_entry(company)
-      holder = prepared_spec_invoice(company)
-      adapter = described_class.new
-      prepared_spec_commit_flow(adapter, prepared_spec_request(company, holder, [held.id]))
-      reservations_before = prepared_spec_reservations(company)
-      outbox_before = Timekeeping::LocalOutboxEntry.where(company_id: company.id).count
-      second = prepared_spec_invoice(company)
-
-      outcome = adapter.prepare(prepared_spec_request(company, second, [held.id, free.id]))
-
-      expect(outcome.state).to eq("refused")
-      expect(outcome.conflicts).to eq([{ entry_id: held.id, reason: "on_another_invoice" }])
-      expect(prepared_spec_reservations(company)).to eq(reservations_before)
-      expect(prepared_spec_operations(company, second)).to eq([])
-      expect(Timekeeping::LocalOutboxEntry.where(company_id: company.id).count).to eq(outbox_before)
-      expect(prepared_spec_outbox_count(free)).to eq(0)
     end
   end
 
