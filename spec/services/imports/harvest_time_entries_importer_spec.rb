@@ -1242,6 +1242,27 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     expect(import.reload).to have_attributes(status: "completed", imported_rows: 1, skipped_rows: 1)
   end
 
+  it "skips both identical rows on a rerun when the first was refused and another import then stored a match" do
+    import = rerun_dup_import_with(<<~CSV)
+      Date,Client,Project,Hours,First Name,Last Name,Billable?,Notes
+      2026-01-05,Acme LLC,Website,1,Paul,Connors,Yes,same work
+      2026-01-05,Acme LLC,Website,1,Paul,Connors,Yes,same work
+    CSV
+
+    rerun_dup_refuse_import_call(1)
+    expect { described_class.new(import).process }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
+    expect(rerun_dup_entries("same work")).to eq(0)
+    expect(import.reload.attempted_rows).to be_empty
+
+    create(:timesheet_entry, project: rerun_dup_project, user: rerun_dup_paul, work_date: Date.new(2026, 1, 5),
+                             duration: 60, note: "same work", bill_status: "unbilled", source: "import")
+    allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_call_original
+    described_class.new(import.reload).process
+
+    expect(rerun_dup_entries("same work")).to eq(1)
+    expect(import.reload).to have_attributes(status: "completed", imported_rows: 0, skipped_rows: 2)
+  end
+
   it "skips every matching row of an upload queued before an earlier upload stored its entry" do
     first_import = rerun_dup_import_with(<<~CSV)
       Date,Client,Project,Hours,First Name,Last Name,Billable?,Notes

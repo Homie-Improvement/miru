@@ -31,6 +31,18 @@ module Imports
       row date client_name project_name project_code user_name hours billable invoiced note hourly_rate
     ].freeze
 
+    # Errors raised only when a row was certainly not written: the model or the
+    # gateway refused it before the write, or Timekeeping refused the actor or
+    # the generation, which its contract says changes nothing. A timeout, an
+    # unreadable answer or a reused-key rejection is not here, because
+    # Timekeeping may have stored the entry.
+    CERTAIN_REFUSALS = [
+      ActiveRecord::RecordInvalid,
+      Timekeeping::Gateway::OwnershipMoving,
+      Timekeeping::Gateway::StaleGeneration,
+      Timekeeping::EntryWriteClient::Forbidden
+    ].freeze
+
     attr_reader :data_import, :company
 
     def initialize(data_import)
@@ -522,7 +534,17 @@ module Imports
 
       def create_entry(gateway, row, expected_generation)
         record_attempted_row(row)
-        gateway.import(
+        begin
+          gateway.import(**import_arguments(row, expected_generation))
+        rescue *CERTAIN_REFUSALS
+          forget_attempted_row(row)
+          raise
+        end
+        @imported_rows += 1
+      end
+
+      def import_arguments(row, expected_generation)
+        {
           user: row[:user],
           project: row[:project_plan][:record],
           attributes: {
@@ -535,8 +557,7 @@ module Imports
           },
           idempotency_key: row_idempotency_key(row),
           expected_generation:
-        )
-        @imported_rows += 1
+        }
       end
 
       # Saved before the write, and kept across runs, so no failure between the
@@ -547,6 +568,13 @@ module Imports
         DataImport.where(id: data_import.id)
           .where.not("? = ANY(attempted_rows)", row[:row])
           .update_all(["attempted_rows = array_append(attempted_rows, ?)", row[:row]])
+      end
+
+      # A refused row was certainly not written, so it must not take another
+      # import's matching entry as its own on the rerun.
+      def forget_attempted_row(row)
+        DataImport.where(id: data_import.id)
+          .update_all(["attempted_rows = array_remove(attempted_rows, ?)", row[:row]])
       end
 
       # The same row of the same data import always gives the same key, so a
