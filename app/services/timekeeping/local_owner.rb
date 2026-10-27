@@ -380,7 +380,8 @@ module Timekeeping
 
         checkpoint.call(:rules_checked)
         entry = LocalEntry.create!(entry_fields.merge(
-          "company_id" => company_id, "user_id" => user_id, "bill_status" => body["bill_status"] || UNBILLED
+          "company_id" => company_id, "user_id" => user_id, "bill_status" => body["bill_status"] || UNBILLED,
+          "review_status" => TimekeepingRules::EntryRules.created_review_status(agent_id: body["agent_id"])
         ))
         Written.new(status: 201, changes: [Change.new(entry_id: entry.id, before: nil)],
                     payload: ->(rows) { response_body(rows.fetch(entry.id)) })

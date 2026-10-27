@@ -94,6 +94,35 @@ RSpec.describe TimekeepingContract::FakeTimekeeping, "in token mode" do
     expect(create_with.call("agent_id" => agent_id + 2).status).to eq(404)
   end
 
+  it "stores an agent create as pending_review and refuses a later create naming an agent it detached" do
+    admin = token_mode_member(:admin)
+    agent_id = 7101
+    token_mode_fake.register_agent(id: agent_id, company_id: token_mode_company.id, user_id: admin.id)
+    create_with = lambda do |fields|
+      token_mode_fake.call("POST", token_mode_entries_path, headers: token_mode_headers(token_mode_token(admin)),
+                                                            body: token_mode_create_body.merge(fields))
+    end
+
+    agent_entry = create_with.call("agent_id" => agent_id, "review_status" => "approved")
+    plain_entry = create_with.call("review_status" => "approved")
+
+    expect([agent_entry.status, plain_entry.status]).to eq([201, 201])
+    expect(agent_entry.body["review_status"]).to eq("pending_review")
+    expect(plain_entry.body["review_status"]).to eq("not_required")
+    expect(token_mode_fake.stored_entry(agent_entry.body.fetch("id"))["review_status"]).to eq("pending_review")
+
+    credential = token_mode_fake.add_service(company_id: token_mode_company.id, name: "agent-boundary",
+                                             operations: ["detach_entries"])
+    detach = token_mode_fake.call(
+      "POST", "/v1/companies/#{token_mode_company.id}/agents/#{agent_id}/detach-entries",
+      headers: { "Authorization" => "Bearer #{credential}" },
+      body: { "operation_id" => SecureRandom.uuid, "generation" => token_mode_fake.generation }
+    )
+
+    expect([detach.status, detach.body]).to eq([200, { "detached" => 1 }])
+    expect(create_with.call("agent_id" => agent_id).status).to eq(404)
+  end
+
   it "answers 401 for a token signed with another key, an expired token and a read token on a write" do
     admin = token_mode_member(:admin)
     tokens = [

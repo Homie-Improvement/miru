@@ -63,6 +63,24 @@ module Timekeeping
       @checkpoint = checkpoint
     end
 
+    # Takes the lock a detach-entries command of this agent takes, so an entry
+    # write naming the agent and the detach run one after the other.
+    def self.lock_agent(company_id, agent_id)
+      WriteSteps.lock_key(company_id, COMMANDS.fetch(:detach_entries).fetch(:lock), agent_id)
+    end
+
+    # Whether a detach-entries command of this agent has committed. Agent ids
+    # are never reused, so its stored receipt marks the agent as deleted.
+    def self.agent_detached?(company_id, agent_id)
+      ServiceIdempotencyReceipt.exists?(company_id:, operation: operation_name(:detach_entries, agent_id))
+    end
+
+    # The target is part of the receipt's operation, so one operation id
+    # used for two invoices or two agents is two commands, not a reuse.
+    def self.operation_name(route, target_id)
+      "#{route} #{target_id}"
+    end
+
     def call(request)
       ApplicationRecord.transaction { run(request) }
     rescue ActiveRecord::RecordNotUnique
@@ -143,10 +161,8 @@ module Timekeeping
         outcome
       end
 
-      # The target is part of the receipt's operation, so one operation id
-      # used for two invoices or two agents is two commands, not a reuse.
       def operation(request)
-        "#{request.route} #{request.target_id}"
+        self.class.operation_name(request.route, request.target_id)
       end
 
       def find_receipt(request)

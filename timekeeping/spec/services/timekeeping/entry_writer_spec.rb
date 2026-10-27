@@ -298,6 +298,51 @@ RSpec.describe Timekeeping::EntryWriter, "agent ownership" do
       .to include("id" => entry.id, "agent_id" => owners_agent, "user_id" => agent_owner_user)
   end
 
+  it "stores an agent create as pending_review and a create without an agent as not_required, whatever the body sends" do
+    agent_create = described_class.new.call(build_entry_command(
+      :create, token: agent_owner_token, body: agent_create_body(owners_agent).merge("review_status" => "approved")
+    ))
+    plain_create = described_class.new.call(build_entry_command(
+      :create, token: agent_owner_token, body: agent_create_body(nil).merge("review_status" => "approved")
+    ))
+
+    expect([agent_create.status, plain_create.status]).to eq([201, 201])
+    expect(JSON.parse(agent_create.body)["review_status"]).to eq("pending_review")
+    expect(JSON.parse(plain_create.body)["review_status"]).to eq("not_required")
+    expect(Entry.order(:id).pluck(:agent_id, :review_status))
+      .to eq([[owners_agent, "pending_review"], [nil, "not_required"]])
+  end
+
+  describe "a create after a detach of its agent committed" do
+    def detach_agent_in_provider(agent_id)
+      Timekeeping::ServiceCommands.new.call(Timekeeping::ServiceCommands::Request.new(
+        route: :detach_entries, company_id: agent_company, actor_name: "agent-boundary", target_id: agent_id,
+        operation_id: SecureRandom.uuid, generation: timekeeping_arrange.current_generation
+      ))
+    end
+
+    it "refuses a create naming the detached agent with not_found and writes nothing" do
+      expect(detach_agent_in_provider(owners_agent).status).to eq(200)
+      before = entry_write_counts
+
+      outcome = described_class.new.call(build_entry_command(:create, token: agent_owner_token,
+                                                                      body: agent_create_body(owners_agent)))
+
+      expect([outcome.status, JSON.parse(outcome.body)]).to eq([404, { "reason" => "not_found" }])
+      expect(entry_write_counts).to eq(before)
+    end
+
+    it "still commits a create naming no agent" do
+      expect(detach_agent_in_provider(owners_agent).status).to eq(200)
+
+      outcome = described_class.new.call(build_entry_command(:create, token: agent_owner_token,
+                                                                      body: agent_create_body(nil)))
+
+      expect(outcome.status).to eq(201)
+      expect(Entry.sole.agent_id).to be_nil
+    end
+  end
+
   it "commits an update that keeps the stored agent, checked against the stored user" do
     entry_id = timekeeping_arrange.entry(company: agent_company, user: agent_owner_user, project: agent_project,
                                          agent_id: owners_agent)
