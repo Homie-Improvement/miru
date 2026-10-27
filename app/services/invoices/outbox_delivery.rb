@@ -27,17 +27,14 @@ module Invoices
   # the next sweep; delivery never raises to its caller, because by the time
   # it runs the invoice change is already committed or rolled back.
   #
-  # A backstop stops the retries of an abort whose prepare replay Timekeeping
-  # keeps refusing, as it does for a save it refused while another invoice
-  # holds the entry: no operation is stored, so nothing is left to release.
-  # Once such a row has used MAX_DELIVERY_ATTEMPTS it is marked undeliverable
-  # and logged the same way. Transient failures, such as a timeout or a 503,
-  # are never cut off, so a row still settles once Timekeeping is back.
+  # Retries have no limit. An abort whose prepare replay Timekeeping refuses
+  # has stored no operation yet, so a delayed copy of the original prepare
+  # could still reserve once the conflicting entry is released; only a later
+  # replay that stores the operation, followed by the abort, makes it
+  # terminal. Giving up on such a row would leave that copy able to reserve.
   class OutboxDelivery
     STALE_GENERATION_REASON = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/reservations.yml"))
       .dig("errors", "stale_generation", "body", "reason").freeze
-    # About one day of the once-a-minute recovery sweep.
-    MAX_DELIVERY_ATTEMPTS = 1440
 
     def initialize(adapter_source:)
       @adapter_source = adapter_source
@@ -105,13 +102,7 @@ module Invoices
           mark_undeliverable(item, "stale_generation")
         else
           InvoiceOperationOutboxItem.where(id: item.id).update_all("attempts = attempts + 1")
-          mark_undeliverable(item, "refused replay retry limit reached") if refused_replay_exhausted?(item, outcome)
         end
-      end
-
-      def refused_replay_exhausted?(item, outcome)
-        outcome&.reason == Timekeeping::ReservationClient::REFUSED_REPLAY_REASON &&
-          item.attempts + 1 >= MAX_DELIVERY_ATTEMPTS
       end
 
       def result(intent, outcome)
