@@ -14,9 +14,13 @@ module Timekeeping
     # the stored text with exact decimals instead.
     JSON_FIELDS = %w[source_metadata proof_metadata].freeze
 
+    # Rows of the held generation are a first cutover's correction snapshots,
+    # offered only once the flip admits that generation (Admission.hold_generation!).
     def unsent_after(position, limit)
-      OutboxSnapshot.where(sent_at: nil).where("outbox_position > ?", position)
-                    .order(:outbox_position).limit(limit).map { |row| relay_row(row) }
+      rows = OutboxSnapshot.where(sent_at: nil).where("outbox_position > ?", position)
+      held = Admission.held_generation
+      rows = rows.where.not(generation: held) unless held.nil?
+      rows.order(:outbox_position).limit(limit).map { |row| relay_row(row) }
     end
 
     # Marks by outbox_position only: one entry can have several snapshot rows,

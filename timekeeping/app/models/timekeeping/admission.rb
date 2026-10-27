@@ -49,10 +49,39 @@ module Timekeeping
     # Admits writes at generation only. Only a positive Integer can ever match
     # an Ownership-Generation header, and a nil here would fence unannounced,
     # so anything else is refused before the row is touched.
+    #
+    # Admitting the held generation releases its correction snapshots to the
+    # relay. Admitting any other generation means the handoff that wrote them
+    # was abandoned, so its undelivered snapshots are removed: the projection
+    # would refuse them, and one refused batch stops the relay.
     def self.admit!(generation:)
       raise ArgumentError, "generation must be a positive Integer" unless generation.is_a?(Integer) && generation.positive?
 
-      transaction { set_generation(generation) }
+      transaction do
+        set_generation(generation)
+        held = where(id: SINGLETON_ID).pick(:held_generation)
+        next if held.nil?
+
+        OutboxSnapshot.where(generation: held, sent_at: nil).delete_all unless held == generation
+        where(id: SINGLETON_ID).update_all(held_generation: nil)
+      end
+    end
+
+    # The generation whose outbox rows the relay holds back, or nil.
+    def self.held_generation
+      where(id: SINGLETON_ID).pick(:held_generation)
+    end
+
+    # Holds back the outbox rows of generation until it is admitted. A first
+    # cutover calls this as it writes its correction snapshots. An earlier
+    # held generation belongs to an attempt that was aborted before its flip,
+    # so its undelivered snapshots are removed: nothing else is ever written
+    # at a held generation, and the projection would refuse them once this
+    # generation flips. Call it inside the transaction that writes the rows.
+    def self.hold_generation!(generation)
+      previous = lock.where(id: SINGLETON_ID).pick(:held_generation)
+      OutboxSnapshot.where(generation: previous, sent_at: nil).delete_all if previous && previous != generation
+      where(id: SINGLETON_ID).update_all(held_generation: generation)
     end
 
     def self.set_generation(generation)
