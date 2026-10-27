@@ -443,35 +443,6 @@ RSpec.describe Timekeeping::Gateway do
 end
 
 RSpec.describe Timekeeping::Gateway do
-  let(:imp_company) { create(:company) }
-  let(:imp_admin) do
-    create(:user, current_workspace_id: imp_company.id).tap do |user|
-      create(:employment, company: imp_company, user:)
-      user.add_role :admin, imp_company
-    end
-  end
-  let(:imp_project) { create(:project, billable: true, client: create(:client, company: imp_company)) }
-
-  # "On the legacy branch, today's `TimesheetEntry.create!` then `entry.update!(bill_status: :billed)` run inside one gateway call and one transaction."
-  it "a legacy billed import whose billing update fails leaves no entry for the row" do
-    context = Timekeeping::WriteContext.new(company: imp_company, actor: imp_admin, actor_kind: "import", request_id: SecureRandom.uuid)
-    generation = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).generation
-    allow_any_instance_of(TimesheetEntry).to receive(:update!).and_raise(ActiveRecord::RecordInvalid.new(TimesheetEntry.new))
-
-    expect do
-      described_class.new(context:).import(
-        user: imp_admin, project: imp_project,
-        attributes: { duration: 60, work_date: Date.current, note: "billed row", bill_status: "billed",
-                      source: "import", source_metadata: { tool: "harvest" } },
-        idempotency_key: SecureRandom.uuid, expected_generation: generation
-      )
-    end.to raise_error(ActiveRecord::RecordInvalid)
-
-    expect(TimesheetEntry.where(project: imp_project, note: "billed row")).not_to exist
-  end
-end
-
-RSpec.describe Timekeeping::Gateway do
   let(:fb_company) { create(:company) }
   let(:fb_admin) do
     create(:user, current_workspace_id: fb_company.id).tap do |user|

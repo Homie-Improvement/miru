@@ -439,8 +439,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
       described_class.new(departed_import).process
     end.to raise_error(StandardError)
 
-    expect(departed_import.reload.status).to eq("failed")
-    expect(departed_import.failed_rows).to eq(0)
+    expect(departed_import.reload).to have_attributes(status: "failed", failed_rows: 0, imported_rows: 0)
     expect(TimesheetEntry.where(user: departed_paul)).not_to exist
   end
 end
@@ -778,34 +777,6 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
 end
 
 RSpec.describe Imports::HarvestTimeEntriesImporter do
-  let(:left_company) { create(:company) }
-  let(:left_actor) { create(:user, current_workspace_id: left_company.id) }
-  let(:left_paul) do
-    create(:user, first_name: "Paul", last_name: "Connors", email: "left-paul@example.com", current_workspace_id: left_company.id)
-  end
-  let(:left_import) { create(:data_import, company: left_company, user: left_actor) }
-
-  before do
-    create(:employment, company: left_company, user: left_actor)
-    create(:employment, company: left_company, user: left_paul)
-    left_import.file.attach(io: StringIO.new(<<~CSV), filename: "harvest.csv", content_type: "text/csv")
-      Date,Client,Project,Hours,First Name,Last Name
-      2026-01-05,Acme LLC,Website,1,Paul,Connors
-    CSV
-  end
-
-  # "A data import whose user has left the company fails the job."
-  it "fails a legacy import whose data import user has left the company without writing entries" do
-    Employment.find_by!(company: left_company, user: left_actor).discard!
-
-    expect { described_class.new(left_import).process }.to raise_error(StandardError)
-
-    expect(left_import.reload).to have_attributes(status: "failed", imported_rows: 0)
-    expect(TimesheetEntry.where(user: left_paul)).not_to exist
-  end
-end
-
-RSpec.describe Imports::HarvestTimeEntriesImporter do
   let(:company) { create(:company, base_currency: "INR", date_format: "MM-DD-YYYY") }
   let(:actor) { create(:user, current_workspace_id: company.id) }
   let(:paul) { create(:user, first_name: "Paul", last_name: "Connors", email: "paul@example.com", current_workspace_id: company.id) }
@@ -992,33 +963,6 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     expect(rerun_keys.first).to eq(first_run_keys.first)
     expect(rerun_keys.uniq.size).to eq(2)
     expect(rerun_import.reload).to have_attributes(status: "completed", imported_rows: 2, failed_rows: 0)
-  end
-end
-
-RSpec.describe Imports::HarvestTimeEntriesImporter do
-  let(:departed_company) { create(:company, base_currency: "INR", date_format: "MM-DD-YYYY") }
-  let(:departed_actor) { create(:user, current_workspace_id: departed_company.id) }
-  let(:departed_paul) do
-    create(:user, first_name: "Paul", last_name: "Connors", email: "paul@example.com", current_workspace_id: departed_company.id)
-  end
-  let(:departed_import) { create(:data_import, company: departed_company, user: departed_actor, options: {}) }
-
-  before do
-    create(:employment, company: departed_company, user: departed_paul)
-    create(:employment, company: departed_company, user: departed_actor).discard!
-    departed_import.file.attach(io: StringIO.new(<<~CSV), filename: "harvest.csv", content_type: "text/csv")
-      Date,Client,Project,Hours,First Name,Last Name
-      2026-01-05,Acme LLC,Website,1,Paul,Connors
-    CSV
-  end
-
-  # "A data import whose user has left the company fails the job."
-  # The legacy store mints no token, so only the importer's own check can stop this write.
-  it "fails a legacy import whose data import user has left the company and writes no entries" do
-    expect { described_class.new(departed_import).process }.to raise_error(StandardError)
-
-    expect(departed_import.reload.status).to eq("failed")
-    expect(TimesheetEntry.where(user: departed_paul).count).to eq(0)
   end
 end
 
