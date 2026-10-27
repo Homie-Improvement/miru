@@ -18,6 +18,13 @@ module TimekeepingContract
   # Every rule the contract examples check is a named policy passed in at
   # construction, so spec/contracts/timekeeping/mutation_spec.rb can break one
   # rule at a time and show the examples catch it. All state is per instance.
+  #
+  # Built with token_public_key:, the fake runs in token mode: it accepts only
+  # Timekeeping::UserToken JWTs the monolith signed, takes the acting user,
+  # company and roles from their verified claims, and applies the shared entry
+  # change rules, so specs drive it with the monolith's own ids and real
+  # tokens instead of stubbing the token check. Without it, the fake accepts
+  # the opaque tokens issue_token hands out, as the contract examples use.
   class FakeTimekeeping
     INITIAL_GENERATION = 1
     FIRST_ID = 1000
@@ -93,10 +100,11 @@ module TimekeepingContract
 
     ENTRY_WRITE_ROUTES = %w[create update destroy bulk_move bulk_delete].freeze
 
-    attr_reader :generation, :outbox
+    attr_reader :generation, :outbox, :requests
 
-    def initialize(policies: POLICIES)
+    def initialize(policies: POLICIES, token_public_key: nil)
       @policies = POLICIES.merge(policies)
+      @token_public_key = token_public_key
       @entry_contract = TimekeepingContract.load(:entry_api)
       @reservation_contract = TimekeepingContract.load(:reservations)
       @idempotency_contract = TimekeepingContract.load(:idempotency)
@@ -116,11 +124,14 @@ module TimekeepingContract
       @reservations = []
       @operations = {}
       @outbox = []
+      @companies = {}
+      @requests = []
     end
 
     def call(method, path, headers: {}, body: nil)
       headers = headers.to_h
       body = Wire.copy(body) || {}
+      @requests += [{ method: method.to_s.upcase, path:, headers: Wire.copy(headers), body: Wire.copy(body) }]
       if (match = @entry_router.match(method, path))
         entry_request(*match, headers, body)
       elsif (match = @reservation_router.match(method, path))
@@ -160,6 +171,22 @@ module TimekeepingContract
 
     def add_project(company_id:)
       next_id.tap { |id| @projects[id] = company_id }
+    end
+
+    # Token-mode setup: records under the monolith's own ids, which the tokens
+    # it signs and the bodies it forwards name. edit_days is the company's
+    # timesheet edit window, which the change rules read.
+
+    def register_company(id:, edit_days:)
+      @companies[id] = { "edit_days" => edit_days }
+    end
+
+    def register_user(id:, company_id:, role:)
+      @users[id] = { "id" => id, "company_id" => company_id, "role" => role }
+    end
+
+    def register_project(id:, company_id:)
+      @projects[id] = company_id
     end
 
     def add_agent(company_id:, user_id:)
@@ -231,12 +258,16 @@ module TimekeepingContract
 
       def entry_request(route, params, headers, body)
         company_id = integer(params["company_id"])
-        acting = @users[@tokens[Wire.bearer(headers)]]
+        acting = acting_user(route, headers)
         return Wire.error(@entry_contract, "unauthorized") unless acting
         return Wire.error(@entry_contract, "not_found") unless acting.fetch("company_id") == company_id
         return entry_route(route, company_id, acting, params, headers, body) unless ENTRY_WRITE_ROUTES.include?(route)
         return Wire.error(@entry_contract, "stale_generation") unless generation_current?(headers["Ownership-Generation"])
-        return Wire.error(@entry_contract, "credential_in_body") if @policies[:credential_in_body].call(body:, credentials:)
+        # The request's own bearer counts too: in token mode a signed token is
+        # never stored in credentials, and the real service refuses it as well.
+        held = (credentials + [Wire.bearer(headers)]).compact.reject(&:empty?).uniq
+        return Wire.error(@entry_contract, "credential_in_body") if @policies[:credential_in_body].call(body:, credentials: held)
+        return respond(400, "reason" => "bad_request") if malformed_duration?(body)
 
         @receipts.answer(company_scope: company_id, actor: ["user", acting["id"]], operation: "#{route} #{params["entry_id"]}",
                          key: headers["Idempotency-Key"], body:) do
@@ -244,11 +275,33 @@ module TimekeepingContract
         end
       end
 
+      # In token mode, which stands in for the real service, a duration must be
+      # a JSON number, as Timekeeping::EntryCommand requires. Opaque-token mode
+      # keeps the contract fake's looser input.
+      def malformed_duration?(body)
+        !@token_public_key.nil? && body.key?("duration") && !body["duration"].is_a?(Numeric)
+      end
+
+      # The acting user Hash for the request's bearer, or nil when it is not
+      # accepted. In token mode a read token is refused on every write route,
+      # as Timekeeping refuses it.
+      def acting_user(route, headers)
+        return @users[@tokens[Wire.bearer(headers)]] unless @token_public_key
+
+        claims = Timekeeping::UserToken.verify(Wire.bearer(headers), public_key: @token_public_key)
+        return nil if ENTRY_WRITE_ROUTES.include?(route) && claims.purpose != "write"
+
+        { "id" => claims.user_id, "company_id" => claims.company_id, "role" => claims.role,
+          "primary_role" => claims.primary_role }
+      rescue Timekeeping::UserToken::InvalidTokenError
+        nil
+      end
+
       def entry_route(route, company_id, acting, params, headers, body)
         case route
         when "create" then create_entry(company_id, acting, body)
         when "update" then update_entry(company_id, acting, params, headers, body)
-        when "destroy" then destroy_entry(company_id, params)
+        when "destroy" then destroy_entry(company_id, acting, params, headers)
         when "show" then show_entry(company_id, params)
         when "index" then list_entries(company_id, params)
         when "bulk_move" then bulk_change(company_id, body, "moved") { |entry| entry.merge("project_id" => body["project_id"]) }
@@ -272,8 +325,10 @@ module TimekeepingContract
         entry = visible_entry(params["entry_id"], company_id)
         return Wire.error(@entry_contract, "not_found") unless entry
 
-        if_match = headers["If-Match"]
-        return Wire.error(@entry_contract, "version_conflict") if if_match && integer(if_match) != entry["version"]
+        return Wire.error(@entry_contract, "version_conflict") if stale_if_match?(headers, entry)
+
+        refusal = change_refusal(company_id, acting, entry, action: :update, bill_status: body["bill_status"])
+        return refusal if refusal
 
         changes = entry_fields(body)
         if body.key?("user_id")
@@ -299,11 +354,39 @@ module TimekeepingContract
         @policies[:agent_owner].call(agent_id:, agent: @agents[agent_id], user_id: fields["user_id"], company_id:) == :ok
       end
 
-      def destroy_entry(company_id, params)
+      def destroy_entry(company_id, acting, params, headers)
         entry = visible_entry(params["entry_id"], company_id)
         return Wire.error(@entry_contract, "not_found") unless entry
+        return Wire.error(@entry_contract, "version_conflict") if stale_if_match?(headers, entry)
+
+        refusal = change_refusal(company_id, acting, entry, action: :delete, bill_status: nil)
+        return refusal if refusal
 
         respond(200, present(write_entry(entry.merge("discarded_at" => now))))
+      end
+
+      # A missing If-Match leaves the version unchecked, as Timekeeping does.
+      def stale_if_match?(headers, entry)
+        if_match = headers["If-Match"]
+        !if_match.nil? && integer(if_match) != entry["version"]
+      end
+
+      # The shared entry change rules (A2 to A7) Timekeeping applies to a
+      # user's update or delete, decided on the token's role and primary role.
+      # Only token mode applies them: an opaque token carries no primary role.
+      def change_refusal(company_id, acting, entry, action:, bill_status:)
+        return nil unless @token_public_key
+
+        decision = TimekeepingRules::EntryRules.change_decision(
+          caller: TimekeepingRules::EntryRules::USER_DELEGATED, change: { action:, bill_status: },
+          role: acting["role"], primary_role: acting["primary_role"], acting_user_id: acting["id"],
+          entry: {
+            id: entry["id"], user_id: entry["user_id"], bill_status: entry["bill_status"], locked: entry["locked"],
+            work_date: entry["work_date"].nil? ? nil : Date.iso8601(entry["work_date"].to_s)
+          },
+          edit_days: @companies.fetch(company_id).fetch("edit_days"), today: Date.current
+        )
+        Wire.error(@entry_contract, decision.to_s) unless decision == :ok
       end
 
       def show_entry(company_id, params)

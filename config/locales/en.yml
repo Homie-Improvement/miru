@@ -55,7 +55,11 @@ en:
   application_controller:
     not_found: Route not found
   errors:
+    entry_ownership_moving: Time entries are paused for a moment while timesheet data moves. Please try again shortly.
+    entry_version_conflict: This entry changed while you were editing it. Please reload and try again.
+    entry_write_rejected: This time entry could not be saved. Please check it and try again.
     ownership_moving: Billing is paused for a moment while timesheet data moves. Please try again shortly.
+    stale_generation: Timesheet data moved while this change was being saved. Please reload and try again.
     stripe:
       connect_not_enabled: Stripe Connect is not enabled for this Stripe account. Enable Connect in Stripe Dashboard and try again.
       generic: "%{message}"
