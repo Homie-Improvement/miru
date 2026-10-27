@@ -231,8 +231,10 @@ RSpec.describe "Reports Currency Calculations", type: :model do
     let!(:multi_currency_invoices) do
       [
         # EUR client with multiple invoices
-        create(:invoice, client: eur_client, company: company, currency: "EUR", amount: 1000.00, status: :paid),
-        create(:invoice, client: eur_client, company: company, currency: "EUR", amount: 2000.00, status: :paid),
+        # The factory picks a random past issue date, which can land on
+        # historical_payment_date and convert at its 1.16 rate instead of 1.18.
+        create(:invoice, client: eur_client, company: company, currency: "EUR", amount: 1000.00, status: :paid, issue_date: Date.current),
+        create(:invoice, client: eur_client, company: company, currency: "EUR", amount: 2000.00, status: :paid, issue_date: Date.current),
         create(:invoice, client: eur_client, company: company, currency: "EUR", amount: 1500.00, status: :sent),
 
         # GBP client
