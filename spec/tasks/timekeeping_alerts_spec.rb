@@ -335,25 +335,6 @@ RSpec.describe "timekeeping:alerts", "shared runner repeated with metrics keywor
   end
 end
 
-RSpec.describe "timekeeping:alerts", "shared metrics body" do
-  # The default is the union of every pasted copy; an override replaces one field and drops none,
-  # and must not change the default that later examples read.
-  it "shared metrics body keeps every default field when one is overridden and an override does not leak into the next call" do
-    default_body = {
-      "window_seconds" => 300, "latency_bucket_bounds_ms" => [25, 50, 100, 200, 300, 500, 1000, 2500, 5000],
-      "overflow_bucket" => "inf", "total_field" => "writes + reference_unavailable",
-      "companies" => [], "outbox_lag" => []
-    }
-    lag = [{ "company_id" => 11, "oldest_unsent_age_seconds" => 400 }]
-
-    overridden = timekeeping_alerts_metrics_body(outbox_lag: lag)
-    overridden["companies"] << { "company_id" => 1 } unless overridden["companies"].frozen?
-
-    expect(overridden.except("companies")).to eq(default_body.merge("outbox_lag" => lag).except("companies"))
-    expect(timekeeping_alerts_metrics_body).to eq(default_body)
-  end
-end
-
 RSpec.describe "timekeeping:alerts", "shared runner metrics keyword" do
   # "It should stub metrics, use the existing with_timekeeping_env, optionally travel_to, rescue SystemExit, and return the output and exit status."
   # No other stub is registered, so a runner that ignored metrics: would hit an unregistered request and fail the read.
@@ -400,6 +381,7 @@ end
 
 RSpec.describe "timekeeping:alerts", "shared metrics body" do
   # The default is the body every pasted copy sent, so a default with fewer fields would change what those copies tested.
+  # A caller that changes the Hash it got back must not change what the next example receives.
   it "shared metrics body holds every field the copies sent and overrides one field without changing the default" do
     full_default = {
       "window_seconds" => 300, "latency_bucket_bounds_ms" => [25, 50, 100, 200, 300, 500, 1000, 2500, 5000],
@@ -411,6 +393,7 @@ RSpec.describe "timekeeping:alerts", "shared metrics body" do
     overridden = timekeeping_alerts_metrics_body(outbox_lag: lag)
     overridden["latency_bucket_bounds_ms"] << 9999
     overridden["companies"] << { "company_id" => 1 }
+    timekeeping_alerts_metrics_body["companies"] << { "company_id" => 999, "windows" => [] }
 
     expect(overridden.except("latency_bucket_bounds_ms", "companies")).to eq(full_default.merge("outbox_lag" => lag)
       .except("latency_bucket_bounds_ms", "companies"))
@@ -475,28 +458,6 @@ RSpec.describe "timekeeping:alerts", "shared runner clock after an abort" do
     expect(run.exit_status).not_to be_nil
     expect(run.exit_status).not_to eq(0)
     expect((Time.current - Time.now).abs).to be < 60
-  end
-end
-
-RSpec.describe "timekeeping:alerts", "shared metrics body isolation" do
-  # One shared default replaces every pasted copy, so a caller that overrides a
-  # field, or changes the Hash it got back, must not change what the next
-  # example receives; otherwise examples pass or fail by run order.
-  it "shared metrics body keeps its default fields when an earlier caller overrides or changes the body it got" do
-    overridden = timekeeping_alerts_metrics_body(outbox_lag: [{ "company_id" => 11, "oldest_unsent_age_seconds" => 400 }])
-    changed = timekeeping_alerts_metrics_body
-    begin
-      changed["companies"] << { "company_id" => 999, "windows" => [] }
-    rescue FrozenError
-      nil
-    end
-
-    expect(overridden["outbox_lag"]).to eq([{ "company_id" => 11, "oldest_unsent_age_seconds" => 400 }])
-    expect(timekeeping_alerts_metrics_body).to eq(
-      "window_seconds" => 300, "latency_bucket_bounds_ms" => [25, 50, 100, 200, 300, 500, 1000, 2500, 5000],
-      "overflow_bucket" => "inf", "total_field" => "writes + reference_unavailable",
-      "companies" => [], "outbox_lag" => []
-    )
   end
 end
 
