@@ -30,7 +30,6 @@ module Timekeeping
       # admission stays closed from step 1 until that flip, so no intent is
       # created between the last legacy write and the retirement.
       #
-      #
       # A correction explains any "state" difference on its intent, so one is
       # listed only for an intent committed both at the checkpoint and now:
       # listing from either side alone would explain a state change made
