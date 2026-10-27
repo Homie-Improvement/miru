@@ -572,6 +572,8 @@ RSpec.describe Timekeeping::Handoff::Runner, "failed rollback admit", :two_tenan
     expect(TimekeepingOwnership.current.attributes.slice("generation", "owner", "handoff_step"))
       .to eq("generation" => 3, "owner" => "monolith", "handoff_step" => nil)
     expect(admit_calls).to eq([[:monolith, :admit, 3], [:monolith, :admit, 3]])
+    # The rollback fenced Timekeeping, and no admit at any generation reopened it afterwards.
+    expect(calls).to include([:timekeeping, :fence])
     expect(calls.select { |call| call[0..1] == [:timekeeping, :admit] }).to be_empty
     expect(Dir.glob(File.join(report_root, "generation-4"))).to be_empty
   end
