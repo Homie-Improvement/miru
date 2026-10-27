@@ -26,16 +26,21 @@ RSpec.describe "prepared reservations spec layout" do
   end
 
   # "Keep one example per contract and merge every distinct assertion from its copies into it, using the same or a
-  # stricter input" and "Then delete the copies." The owner groups below keep the description strings that the
-  # repository's docs/solutions learnings cite, so each must appear once and hold exactly one example.
+  # stricter input" and "Then delete the copies." Each owner group below must appear once and hold exactly one
+  # example. Most keep description strings that the repository's docs/solutions learnings cite; the redelivery
+  # group is counted here so a near-copy of its example cannot come back.
   it "prepared reservations spec keeps each cited contract group exactly once" do
     source = prepared_layout_source
 
-    ["reclaiming a retained entry", "operation never stored", "unresolved operation", "mark_billed"].each do |group|
+    [
+      "reclaiming a retained entry", "operation never stored", "unresolved operation", "mark_billed",
+      "redelivered commit and late abort"
+    ].each do |group|
       openings = source.scan(/^\s+describe "#{Regexp.escape(group)}" do$/)
       expect(openings.size).to eq(1), "expected one nested describe \"#{group}\", found #{openings.size}"
 
-      indent = source[/^(\s+)describe "#{Regexp.escape(group)}" do$/, 1]
+      # Spaces only: `\s` would also take the blank line above the describe, and the body would then run past its end.
+      indent = source[/^( +)describe "#{Regexp.escape(group)}" do$/, 1]
       body = source.split(/^#{indent}describe "#{Regexp.escape(group)}" do$/, 2).last.split(/^#{indent}end$/, 2).first
       expect(body.scan(/^\s+it ["']/).size).to eq(1), "expected one example in \"#{group}\""
     end
