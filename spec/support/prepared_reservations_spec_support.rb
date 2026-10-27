@@ -39,6 +39,27 @@ module PreparedReservationsSpecSupport
     ActiveRecord::Base.connection.select_all(sql).cast_values
   end
 
+  # Every row a prepare, commit, abort or mark_billed could write or change:
+  # the company's reservations with their operation identity, its
+  # operations, the entries' versions, and the outbox of the company and of
+  # every company. A refused or repeated call must leave all of it as it was.
+  def prepared_spec_snapshot(company, entries)
+    reservations_sql = ActiveRecord::Base.sanitize_sql_array([<<~SQL.squish, company.id])
+      SELECT entry_id, invoice_id, state, disposition, operation_id, invoice_operation_id FROM reservations
+      WHERE company_id = ? ORDER BY entry_id, invoice_id, state
+    SQL
+    operations_sql = ActiveRecord::Base.sanitize_sql_array([<<~SQL.squish, company.id])
+      SELECT invoice_id, operation_id, state FROM invoice_operations WHERE company_id = ? ORDER BY id
+    SQL
+    {
+      reservations: ActiveRecord::Base.connection.select_rows(reservations_sql),
+      operations: ActiveRecord::Base.connection.select_rows(operations_sql),
+      versions: Timekeeping::LocalEntry.where(id: entries.map(&:id)).order(:id).pluck(:id, :version),
+      company_outbox: Timekeeping::LocalOutboxEntry.where(company_id: company.id).count,
+      outbox: Timekeeping::LocalOutboxEntry.count
+    }
+  end
+
   def prepared_spec_outbox_count(entry)
     Timekeeping::LocalOutboxEntry.where(company_id: entry.company_id, entry_id: entry.id).count
   end
