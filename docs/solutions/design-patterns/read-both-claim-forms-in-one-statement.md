@@ -35,7 +35,7 @@ When such a sent invoice loses a line, the boundary deletes the line and seeds a
 
 ## Solution
 
-`Invoices::LegacyReservations::EntryClaims` reads holdings, whether each holding's invoice is kept, and the direct and grouped line references in one `UNION ALL` statement (`CLAIMS_SQL`). One statement sees one snapshot, so the claim appears in one form or the other.
+`Invoices::EntryClaims` (app/services/invoices/entry_claims.rb, used by both the legacy and the prepared reservation adapters) reads holdings, whether each holding's invoice is kept, and the direct and grouped line references in one `UNION ALL` statement (`CLAIMS_SQL`). One statement sees one snapshot, so the claim appears in one form or the other.
 
 The same reader serves `commit`'s release check, so a late release never unlocks an entry whose claim was mid-move.
 

@@ -9,7 +9,7 @@ module Invoices
 
     TABLE = {
       legacy: -> { LegacyReservations.new },
-      prepared: NOT_AVAILABLE,
+      prepared: -> { PreparedReservations.new },
       timekeeping: NOT_AVAILABLE
     }.freeze
 

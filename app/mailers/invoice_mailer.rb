@@ -67,9 +67,10 @@ class InvoiceMailer < ApplicationMailer
       @invoice.sending? && @invoice.recently_sent_mail?
     end
 
-    # Records sent_at and the sent status in one billing transaction, so a
-    # refusal during a Timekeeping handoff leaves neither written. Both run
-    # before delivery, so a refused mail is not sent.
+    # Records sent_at, the sent status and the billed entries in one billing
+    # transaction, so a refusal during a Timekeeping handoff, or a refused
+    # billing, leaves none of them written. All run before delivery, so a
+    # refused mail is not sent.
     def update_status
       record_sent_at = @invoice_mail_built
       mark_sent = @invoice.draft? || @invoice.viewed? || @invoice.declined? || @invoice.sending?

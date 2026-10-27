@@ -234,6 +234,20 @@ RSpec.describe Invoices::OperationCoordinator, committed_data: true do
     expect(coordinator_rows(request).first.delivered_at).to be_present
   end
 
+  it "raises the retryable answer's reason as the error message, and prepare_retryable when it has none" do
+    named = coordinator_request(create(:invoice))
+    unresolved = Invoices::ReservationOutcome.new(state: "retryable", conflicts: [], counts: {}, reason: "unresolved_operation")
+
+    expect { coordinator_save(coordinator_adapter(prepare: unresolved), named) }
+      .to raise_error(Invoices::OperationErrors::PrepareRetryable, "unresolved_operation")
+    expect(coordinator_intent(named).state).to eq("failed")
+    expect(coordinator_rows(named).pluck(:kind)).to eq(["abort"])
+
+    plain = coordinator_request(create(:invoice))
+    expect { coordinator_save(coordinator_adapter(prepare: coordinator_outcome("retryable")), plain) }
+      .to raise_error(Invoices::OperationErrors::PrepareRetryable, "prepare_retryable")
+  end
+
   it "records failed with one abort row when prepare raises" do
     request = coordinator_request(create(:invoice))
     adapter = coordinator_adapter(prepare: ->(_received) { raise IOError, "store unreachable" })
