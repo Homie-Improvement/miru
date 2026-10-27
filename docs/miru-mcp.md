@@ -6,7 +6,7 @@ sidebar_position: 6
 
 # Miru MCP Server and Client
 
-Miru ships an MCP implementation built on the Ruby SDK (`mcp` gem, `~> 0.13.0`) with both server and client integration points inside this repository.
+Miru ships an MCP implementation built on the Ruby SDK (`mcp` gem, `~> 1.2`) with both server and client integration points inside this repository.
 
 ## What Ships In This Repo
 
@@ -19,8 +19,8 @@ All tools are namespaced under `miru.*`.
 
 ## SDK Version Policy
 
-- Current SDK pin: `mcp ~> 0.13.0` (Ruby SDK)
-- Supported range in this repo: `0.13.x`
+- Current SDK pin: `mcp ~> 1.2` (Ruby SDK)
+- Supported range in this repo: `1.x`, at or above `1.2.0` (the release that fixes GHSA-4m5j-jjfc-97gx)
 - Why pinned:
   - we avoid unnecessary package churn and keep server/client behavior stable for shipped tool schemas
   - we do not publish a separate `miru-mcp` gem today; compatibility is enforced in-repo
@@ -30,7 +30,7 @@ All tools are namespaced under `miru.*`.
   - CI compatibility job for MCP-focused specs
 - Upgrade checklist:
   - bump `Gemfile` and `Gemfile.lock`
-    - `gem "mcp", "~> 0.13.0"` (or next approved target)
+    - `gem "mcp", "~> 1.2"` (or next approved target)
   - run focused MCP specs and route/RuboCop checks
   - update this document if protocol/tool behavior changes
 - Rollback path:
@@ -273,7 +273,7 @@ Minimal external-consumer path (when not running inside `miru-web`):
 
 ```ruby
 # Gemfile (external Ruby consumer)
-gem "mcp", "~> 0.13.0"
+gem "mcp", "~> 1.2"
 ```
 
 Then connect to Miru over HTTP MCP (no local Miru server code required).
