@@ -39,7 +39,9 @@ module Invoices
 
     # Bills the entries the invoice's lines reference. An entry its holding
     # still lists after a line was removed stays reserved, but it is no longer
-    # on the invoice, so it is not billed.
+    # on the invoice, so it is not billed. A refused billing raises, so the
+    # caller's transaction rolls back the sent status with it and the invoice
+    # is never sent with its entries left unbilled.
     def mark_billed(invoice)
       holding = InvoiceEntryHolding.find_by(company_id: invoice.company_id, invoice_id: invoice.id)
       ownership = TimekeepingOwnership.current
@@ -51,7 +53,10 @@ module Invoices
         disposition: holding&.disposition || ACTIVE,
         entries: CompanyEntries.on_lines(invoice.id, invoice.company_id)
       )
-      ReservationAdapters.for(ownership).mark_billed(request)
+      outcome = ReservationAdapters.for(ownership).mark_billed(request)
+      raise OperationErrors::Refused.new(outcome) if outcome.state == "refused"
+
+      outcome
     end
 
     # Commit callbacks fire only on the transaction whose parent is not

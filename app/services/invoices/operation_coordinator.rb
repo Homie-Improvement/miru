@@ -86,9 +86,12 @@ module Invoices
         end
       end
 
+      # A retryable answer that names its reason, such as
+      # "unresolved_operation", raises with that reason as the message.
       def raise_unless_prepared!(outcome)
         route = PREPARE_ROUTES.fetch(outcome.state)
         raise route.new(outcome) if route == OperationErrors::Refused
+        raise route.new(outcome.reason) if route == OperationErrors::PrepareRetryable && outcome.reason
         raise route unless route == :settle
       end
 
