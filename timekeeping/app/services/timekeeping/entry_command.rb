@@ -12,7 +12,7 @@ module Timekeeping
   # route is one of :create, :update, :destroy, :bulk_move, :bulk_delete.
   class EntryCommand < Data.define(:route, :company_id, :actor_id, :role, :primary_role, :entry_id, :operation, :key,
                                    :fingerprint, :body, :project_id, :generation, :if_match, :facts, :today,
-                                   :replay_only)
+                                   :replay_only, :detach_fence)
     ID = /\A[0-9]{1,19}\z/
     ACTOR_TYPE = "user"
     UNBILLED = "unbilled"
@@ -21,7 +21,7 @@ module Timekeeping
     # entry_optional_fields of contracts/timekeeping/entry_api.yml, less
     # user_id, which names the target user and is decided by the writer.
     WRITABLE_FIELDS = %w[project_id work_date duration note source source_metadata bill_status agent_id proof_url
-                         proof_metadata].freeze
+                         proof_metadata external_run_id external_session_id].freeze
 
     # The shape each field must have when the body sends it, so a value the
     # entries table or the projection cannot store is refused as a bad request
@@ -29,7 +29,8 @@ module Timekeeping
     # delivery. project_id is not here: parse_project_id reads it, and accepts
     # a decimal string the snapshot rule would refuse.
     FIELD_SHAPES = SnapshotValues::RULES.slice(
-      *%w[work_date duration note source source_metadata bill_status agent_id proof_url proof_metadata]
+      *%w[work_date duration note source source_metadata bill_status agent_id proof_url proof_metadata external_run_id
+          external_session_id]
     ).freeze
     CREATE_REQUIRED_FIELDS = %w[work_date duration].freeze
 
@@ -75,6 +76,9 @@ module Timekeeping
 
       check_fields!(route, body)
       project_ids = [project_id].compact
+      # Read before the facts, so a detach that commits after them has a
+      # higher receipt id (Timekeeping::ServiceCommands.agent_detached?).
+      detach_fence = ServiceCommands.detach_fence
       facts = reference_client.fetch(company_id:, project_ids:)
 
       new(
@@ -82,7 +86,7 @@ module Timekeeping
         entry_id: target_id,
         operation: "#{route} #{target_id}", key:, fingerprint: Digest::SHA256.hexdigest(JSON.generate(body)),
         body:, project_id:, generation: headers["Ownership-Generation"], if_match: headers["If-Match"], facts:, today:,
-        replay_only: replay_only?(route, headers)
+        replay_only: replay_only?(route, headers), detach_fence:
       )
     rescue ReferenceClient::Unavailable
       WriteOutcome.refusal(:reference_unavailable)

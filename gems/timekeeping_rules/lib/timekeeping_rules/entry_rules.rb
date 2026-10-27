@@ -32,6 +32,11 @@ module TimekeepingRules
       agents.detach_entries
     ].freeze
 
+    # The review status a new entry starts with: an entry an agent recorded
+    # waits for a person to review it, as TimesheetEntry gives it on save.
+    PENDING_REVIEW = "pending_review"
+    REVIEW_NOT_REQUIRED = "not_required"
+
     CHANGE_ACTIONS = %i[update delete].freeze
     BULK_ACTIONS = %i[move delete].freeze
     ACTIONS = (CHANGE_ACTIONS | BULK_ACTIONS).freeze
@@ -98,6 +103,12 @@ module TimekeepingRules
     def agent_owner(agent_id:, user_id:, company_agents:)
       request = { agent_id:, user_id:, company_agents: }
       AGENT_OWNER_TABLE.find { |condition, _outcome| condition.call(request) }.last
+    end
+
+    # The review status every owning store gives a created entry. It is never
+    # read from the request, so no caller can mark its own entry reviewed.
+    def created_review_status(agent_id:)
+      agent_id.nil? ? REVIEW_NOT_REQUIRED : PENDING_REVIEW
     end
 
     # A1: :company when the caller sees every kept entry of the company,

@@ -11,7 +11,7 @@ module Timekeeping
   # An agent_destroy write detaches a deleted agent's entries; its actor is
   # the agent's backing user, and a forwarded detach uses a service token.
   class WriteContext < Data.define(:company, :actor, :actor_kind, :request_id, :agent)
-    ACTOR_KINDS = %w[user agent service import agent_destroy].freeze
+    ACTOR_KINDS = %w[user cli agent service import agent_destroy].freeze
 
     def initialize(company:, actor:, actor_kind:, request_id:, agent: nil)
       actor_kind = actor_kind.to_s
