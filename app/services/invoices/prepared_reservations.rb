@@ -14,14 +14,19 @@ module Invoices
   # its operation row and provisional reservations. commit and abort are
   # delivered later from the outbox; each locks the stored operation and acts
   # only while it is still prepared, so the first of them wins and a repeat
-  # changes nothing. Their writes select reservation rows by the operation's
-  # own id, never by invoice or entry alone, so another operation's rows are
-  # never touched.
+  # changes nothing. Provisional rows are selected by the operation's own id,
+  # so another operation's provisional rows are never promoted or dropped.
+  # Commit also replaces retained rows on the entries it claims and releases
+  # the invoice's committed rows absent from the desired set, which earlier
+  # operations may have written.
   #
   # An entry is locked exactly when a reservation row exists for it
-  # (Timekeeping::LocalEntry::RESERVED). Each entry whose locked flag flips
-  # gets version + 1 and one snapshot in entry_outbox_items. Every query is
-  # limited to the request's company.
+  # (Timekeeping::LocalEntry::RESERVED). Each entry whose locked flag flips,
+  # or that mark_billed bills, gets version + 1 and one snapshot in
+  # entry_outbox_items. A stored entry the projection would refuse is never
+  # published: the call rolls back and answers refused (prepare, mark_billed)
+  # or retryable (commit, abort). Every query is limited to the request's
+  # company.
   class PreparedReservations
     # The actor every invoice_operations row of this adapter carries; the
     # operation key is (company_id, actor_name, operation_id).
@@ -46,6 +51,20 @@ module Invoices
 
     UNRESOLVED_REASON = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/reservations.yml"))
       .dig("errors", "unresolved_operation", "reason").freeze
+    # The reason the Timekeeping service gives for the same refusal.
+    UNPUBLISHABLE_REASON = "unpublishable_entry"
+
+    # Raised inside a call's savepoint when an entry it changed would publish
+    # a snapshot the projection refuses, so every row the call wrote rolls
+    # back; rescued after the savepoint. Carries entry ids only.
+    class UnpublishableEntries < StandardError
+      attr_reader :entry_ids
+
+      def initialize(entry_ids)
+        @entry_ids = entry_ids
+        super("unpublishable entries: #{entry_ids.join(', ')}")
+      end
+    end
 
     # The two tables have no other model in the monolith.
     class Reservation < ApplicationRecord
@@ -56,7 +75,7 @@ module Invoices
       self.table_name = "invoice_operations"
     end
 
-    private_constant :Reservation, :Operation
+    private_constant :Reservation, :Operation, :UnpublishableEntries
 
     def prepare(request)
       ApplicationRecord.transaction(requires_new: true) do
@@ -84,6 +103,8 @@ module Invoices
       # second provisional row on one entry. The savepoint has rolled back
       # every row this prepare wrote.
       unresolved
+    rescue UnpublishableEntries => error
+      unpublishable(error)
     end
 
     # The same check as prepare, for a sent invoice whose lines gain entries:
@@ -146,6 +167,8 @@ module Invoices
         end
         outcome(COMMITTED, counts: { billed: billable_ids.size })
       end
+    rescue UnpublishableEntries => error
+      unpublishable(error)
     end
 
     private
@@ -157,7 +180,10 @@ module Invoices
 
       # Locks the stored operation and, while it is still prepared, runs the
       # block and moves the operation to settled_state in the same
-      # transaction. The block returns the counts to answer with.
+      # transaction. The block returns the counts to answer with. An entry
+      # it would publish unpublishably leaves the operation prepared and
+      # answers retryable, so the outbox row is delivered again once the
+      # stored entry is repaired.
       def finish(request, settled_state)
         ApplicationRecord.transaction(requires_new: true) do
           operation = find_operation(request).lock.first
@@ -167,6 +193,8 @@ module Invoices
           operation.update!(state: settled_state, finished_at: Time.current)
           outcome(settled_state, counts:)
         end
+      rescue UnpublishableEntries
+        outcome("retryable", reason: UNPUBLISHABLE_REASON)
       end
 
       # The company's entries with these ids, discarded ones included, locked
@@ -195,7 +223,7 @@ module Invoices
           committed = rows.fetch(entry_id, []).find { |row| row.state == COMMITTED }
           result = Timekeeping::ReservationRules.prepare_outcome({
             in_company: kept_ids.include?(entry_id),
-            committed: committed_claim(committed, request.invoice_id) { claims.other_active_claim(entry_id, request.invoice_id) },
+            committed: committed_claim(committed) { claims.other_active_claim(entry_id, request.invoice_id) },
             provisional: rows.fetch(entry_id, []).any? { |row| row.state == PROVISIONAL },
             invoice_id: request.invoice_id
           })
@@ -203,15 +231,15 @@ module Invoices
         end
       end
 
-      # The claim the rules see for one entry, in the order the legacy
-      # adapter's EntryClaims#committed_claim uses: this invoice's own row or
-      # any active row first, then another kept invoice's active claim through
-      # its lines or holding, then another invoice's retained row. A sent
-      # invoice's added line passes admit and reserves nothing, so a row that
-      # only retains the entry must not hide that line's claim.
-      def committed_claim(committed, invoice_id)
+      # The claim the rules see for one entry: an active committed row first,
+      # then another kept invoice's active claim through its lines or holding,
+      # then a retained row, this invoice's own included. A sent invoice's
+      # added line passes admit and reserves nothing, so a row that only
+      # retains the entry must not hide that line's claim, or a restored
+      # invoice could take the entry back while the sent invoice holds it.
+      def committed_claim(committed)
         row_claim = committed && { invoice_id: committed.invoice_id, disposition: committed.disposition }
-        return row_claim if committed && (committed.invoice_id == invoice_id || committed.disposition == ACTIVE)
+        return row_claim if committed&.disposition == ACTIVE
 
         yield || row_claim
       end
@@ -293,8 +321,16 @@ module Invoices
       end
 
       def write_snapshots(company_id, entry_ids, generation)
-        rows = reserved_rows(company_id, entry_ids)
-        Timekeeping::EntryOutbox.write(entry_ids.map { |id| rows.fetch(id) }, generation:)
+        stored = reserved_rows(company_id, entry_ids)
+        rows = entry_ids.map { |id| stored.fetch(id) }
+        invalid = Timekeeping::EntryOutbox.invalid_fields(rows)
+        raise UnpublishableEntries, invalid.keys if invalid.any?
+
+        Timekeeping::EntryOutbox.write(rows, generation:)
+      end
+
+      def unpublishable(error)
+        outcome("refused", conflicts: error.entry_ids.map { |entry_id| { entry_id:, reason: UNPUBLISHABLE_REASON } })
       end
 
       def unresolved

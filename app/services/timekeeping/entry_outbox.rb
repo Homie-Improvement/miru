@@ -28,6 +28,24 @@ module Timekeeping
       end)
     end
 
+    # Maps the id of each row whose snapshot the projection would refuse to
+    # the names of its refused fields, checked with the same casts
+    # SnapshotBatch applies on the consumer side. The relay delivers in
+    # order, so one refused snapshot would hold back every later one. Only
+    # field names are returned: a bad stored value can hold anything.
+    def invalid_fields(rows)
+      rows.to_h { |row| [row.id, refused_fields(snapshot(row))] }.reject { |_id, fields| fields.empty? }
+    end
+
+    def refused_fields(payload)
+      SnapshotBatch::FIELD_CASTS.filter_map do |field, cast|
+        cast.call(payload[field])
+        nil
+      rescue SnapshotBatch::InvalidValue
+        field
+      end
+    end
+
     # The contract snapshot of one entry.
     def snapshot(row)
       json_fields(row, SnapshotBatch::ENTRY_FIELDS)

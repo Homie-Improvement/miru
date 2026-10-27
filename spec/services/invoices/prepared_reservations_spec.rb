@@ -1472,6 +1472,139 @@ RSpec.describe Invoices::PreparedReservations, "retained row beside another kept
   end
 end
 
+RSpec.describe Invoices::PreparedReservations, "own retained row beside another kept invoice's line" do
+  let(:own_retained_company) { create(:company) }
+  let(:own_retained_client) { create(:client, company: own_retained_company) }
+  let(:own_retained_project) { create(:project, client: own_retained_client, billable: true) }
+  let(:own_retained_user) { create(:user, current_workspace_id: own_retained_company.id) }
+
+  # A restored invoice still retains its entries while a sent invoice has
+  # since claimed them through a direct and a grouped line its admit let
+  # through. Taking them back would put each entry on two kept invoices.
+  it "refuses a restored invoice's prepare for its own retained entries another kept invoice claims through lines" do
+    direct = create(:timesheet_entry, user: own_retained_user, project: own_retained_project, bill_status: "unbilled")
+    sent = create(:invoice, company: own_retained_company, client: own_retained_client, status: :sent)
+    line = create(:invoice_line_item, invoice: sent, timesheet_entry: direct, rate: 100, quantity: 60)
+    grouped = create(:invoice_line_item_time_entry, invoice_line_item: line).timesheet_entry
+    InvoiceEntryHolding.where(company_id: own_retained_company.id, invoice_id: sent.id).delete_all
+    restored = create(:invoice, company: own_retained_company, client: own_retained_client, status: :draft)
+    connection = ApplicationRecord.connection
+    [direct, grouped].each do |entry|
+      Timekeeping::LocalEntry.create!(id: entry.id, company_id: own_retained_company.id, user_id: own_retained_user.id,
+                                      project_id: own_retained_project.id, work_date: Date.current, duration: 60.0,
+                                      bill_status: "unbilled")
+      connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, own_retained_company.id, entry.id, restored.id, SecureRandom.uuid, Time.current]))
+        INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
+        VALUES (?, ?, ?, ?, 'committed', 'retained', ?)
+      SQL
+    end
+    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
+    rows = lambda do
+      connection.select_rows(ApplicationRecord.sanitize_sql_array([
+        "SELECT entry_id, invoice_id, state, disposition FROM reservations WHERE company_id = ? ORDER BY entry_id",
+        own_retained_company.id
+      ]))
+    end
+    rows_before = rows.call
+    request = Invoices::ReservationRequest.new(
+      company_id: own_retained_company.id, invoice_id: restored.id, operation_id: SecureRandom.uuid,
+      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [direct.id, grouped.id]
+    )
+
+    # "A second kept invoice on the same entry fails with \"entry is on another invoice\""
+    outcome = described_class.new.prepare(request)
+
+    expect(outcome.state).to eq("refused")
+    expect(outcome.conflicts).to contain_exactly(
+      { entry_id: direct.id, reason: "on_another_invoice" }, { entry_id: grouped.id, reason: "on_another_invoice" }
+    )
+    expect(rows.call).to eq(rows_before)
+  end
+end
+
+RSpec.describe Invoices::PreparedReservations, "stored entry the projection would refuse" do
+  include PreparedReservationsSpecSupport
+
+  before { prepare_local_ownership! }
+
+  let(:unpublishable_company) { create(:company) }
+  let(:unpublishable_invoice) { prepared_spec_invoice(unpublishable_company) }
+
+  # A source outside the snapshot contract's list makes the projection
+  # refuse the whole batch, and the relay delivers in order.
+  def unpublishable_spec_break(entry)
+    entry.update_columns(source: "legacy")
+  end
+
+  it "refuses a prepare that would publish the entry and writes nothing" do
+    entry = prepared_spec_entry(unpublishable_company)
+    unpublishable_spec_break(entry)
+    version_before = entry.reload.version
+
+    outcome = described_class.new.prepare(prepared_spec_request(unpublishable_company, unpublishable_invoice, [entry.id]))
+
+    expect(outcome.state).to eq("refused")
+    expect(outcome.conflicts).to eq([{ entry_id: entry.id, reason: "unpublishable_entry" }])
+    expect(prepared_spec_reservations(unpublishable_company)).to eq([])
+    expect(prepared_spec_operations(unpublishable_company, unpublishable_invoice)).to eq([])
+    expect(prepared_spec_outbox_count(entry)).to eq(0)
+    expect(entry.reload.version).to eq(version_before)
+  end
+
+  it "answers a commit that would release the entry retryable and leaves the operation prepared" do
+    adapter = described_class.new
+    entry = prepared_spec_entry(unpublishable_company)
+    prepared_spec_commit_flow(adapter, prepared_spec_request(unpublishable_company, unpublishable_invoice, [entry.id]))
+    unpublishable_spec_break(entry)
+    version_before = entry.reload.version
+    outbox_before = prepared_spec_outbox_count(entry)
+    release = prepared_spec_request(unpublishable_company, unpublishable_invoice, [])
+    expect(adapter.prepare(release).state).to eq("prepared")
+
+    outcome = adapter.commit(release)
+
+    expect(outcome.state).to eq("retryable")
+    expect(outcome.reason).to eq("unpublishable_entry")
+    expect(prepared_spec_reservations(unpublishable_company))
+      .to eq([[entry.id, unpublishable_invoice.id, "committed", "active"]])
+    expect(prepared_spec_operations(unpublishable_company, unpublishable_invoice).map(&:first))
+      .to eq(%w[committed prepared])
+    expect(entry.reload.version).to eq(version_before)
+    expect(prepared_spec_outbox_count(entry)).to eq(outbox_before)
+  end
+
+  it "answers an abort that would unlock the entry retryable and keeps its provisional row" do
+    adapter = described_class.new
+    entry = prepared_spec_entry(unpublishable_company)
+    request = prepared_spec_request(unpublishable_company, unpublishable_invoice, [entry.id])
+    expect(adapter.prepare(request).state).to eq("prepared")
+    unpublishable_spec_break(entry)
+    version_before = entry.reload.version
+
+    outcome = adapter.abort(request)
+
+    expect(outcome.state).to eq("retryable")
+    expect(prepared_spec_reservations(unpublishable_company))
+      .to eq([[entry.id, unpublishable_invoice.id, "provisional", "active"]])
+    expect(prepared_spec_operations(unpublishable_company, unpublishable_invoice).map(&:first)).to eq(["prepared"])
+    expect(entry.reload.version).to eq(version_before)
+  end
+
+  it "refuses mark_billed for the entry and leaves it unbilled with no snapshot" do
+    entry = prepared_spec_entry(unpublishable_company)
+    unpublishable_spec_break(entry)
+    version_before = entry.reload.version
+
+    outcome = described_class.new.mark_billed(prepared_spec_request(unpublishable_company, unpublishable_invoice, [entry.id]))
+
+    expect(outcome.state).to eq("refused")
+    expect(outcome.conflicts).to eq([{ entry_id: entry.id, reason: "unpublishable_entry" }])
+    expect(entry.reload.bill_status).to eq("unbilled")
+    expect(entry.version).to eq(version_before)
+    expect(prepared_spec_outbox_count(entry)).to eq(0)
+  end
+end
+
 RSpec.describe Invoices::PreparedReservations, "prepare and commit" do
   include PreparedReservationsSpecSupport
 
