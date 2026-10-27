@@ -89,26 +89,28 @@ class TimekeepingOwnership < ApplicationRecord
       monolith_store != INITIAL_MONOLITH_STORE
   end
 
+  # Whether the handoff source is the legacy timesheet_entries table, which is
+  # what makes a handoff run the pre-flight and derive reservations. Only the
+  # flip of a handoff from the legacy source sets legacy_retired_at. The
+  # generation cannot answer this: an aborted first cutover keeps the raised
+  # generation while the legacy table is still the source.
+  def source_legacy?
+    legacy_retired_at.nil?
+  end
+
   # Whether the projection consumer may apply a snapshot of this generation
   # (section 5.4). The current generation is always accepted. The previous
   # one is accepted only during a handoff, and only up to the final outbox
-  # position captured at the freeze. Before this handoff reaches the freeze
-  # step, a position left from an earlier handoff is not this handoff's P, so
-  # nothing of the previous generation is accepted; nor is it without a
-  # captured position. The flip, which clears handoff_step, ends the permission.
+  # position P. The freeze step stores P before it drains the outbox and
+  # records 'freeze' only after the drain, so the stored P, not the recorded
+  # step, opens the permission. Closing admission clears P, so a position
+  # left from an earlier handoff never counts as this handoff's. The flip and
+  # an abort, which clear handoff_step, end the permission.
   def snapshot_generation_accepted?(generation:, outbox_position:)
     return true if generation == self.generation
     return false unless generation == self.generation - 1
-    return false unless frozen_for_handoff? && !final_outbox_position.nil?
+    return false if handoff_step.nil? || final_outbox_position.nil?
 
     outbox_position.is_a?(Integer) && outbox_position <= final_outbox_position
   end
-
-  private
-
-    # Whether the current handoff has reached the freeze step or a later one.
-    def frozen_for_handoff?
-      step_index = HANDOFF_STEPS.index(handoff_step)
-      !step_index.nil? && step_index >= HANDOFF_STEPS.index("freeze")
-    end
 end
