@@ -175,6 +175,44 @@ RSpec.describe TimekeepingContract::FakeTimekeeping, "in token mode" do
     expect(entries.pluck("id")).to eq([entry.fetch("id")])
     expect(token_mode_fake.requests.first[:headers]["Authorization"]).to start_with("Bearer ")
   end
+
+  # The shared replay contract runs the fake without tokens and as an owner, so
+  # this example keeps replay-only deletes covered for a verified write token
+  # and an admin. The receipt is read before the generation check, and a
+  # replay with no receipt never runs the delete itself.
+  it "replays an admin's committed delete after the generation advances and refuses a replay with no receipt" do
+    admin = token_mode_member(:admin)
+    token = token_mode_token(admin)
+    deleted = token_mode_fake.add_entry(company_id: token_mode_company.id, user_id: admin.id,
+                                        project_id: token_mode_project.id, work_date: Date.current.iso8601)
+    kept = token_mode_fake.add_entry(company_id: token_mode_company.id, user_id: admin.id,
+                                     project_id: token_mode_project.id, work_date: Date.current.iso8601)
+    path = ->(entry) { "#{token_mode_entries_path}/#{entry.fetch("id")}" }
+    replay_only = { "Idempotency-Replay" => "only", "If-Match" => "replay-only" }
+    key = SecureRandom.uuid
+
+    first = token_mode_fake.call("DELETE", path.call(deleted),
+                                 headers: token_mode_headers(token, "Idempotency-Key" => key,
+                                                                    "If-Match" => deleted.fetch("version").to_s))
+    expect(first.status).to eq(200)
+    after_first = { entry: token_mode_fake.stored_entry(deleted.fetch("id")), outbox_size: token_mode_fake.outbox.size }
+    stale_generation = token_mode_fake.generation
+    token_mode_fake.generation = stale_generation + 1
+
+    replay = token_mode_fake.call("DELETE", path.call(deleted),
+                                  headers: token_mode_headers(token, "Idempotency-Key" => key,
+                                                                     "Ownership-Generation" => stale_generation.to_s,
+                                                                     **replay_only))
+    expect([replay.status, replay.body]).to eq([first.status, first.body])
+    expect({ entry: token_mode_fake.stored_entry(deleted.fetch("id")), outbox_size: token_mode_fake.outbox.size })
+      .to eq(after_first)
+
+    missing = token_mode_fake.call("DELETE", path.call(kept), headers: token_mode_headers(token, **replay_only))
+    expect([missing.status, missing.body]).to eq([404, { "reason" => "not_found" }])
+    expect(token_mode_fake.stored_entry(kept.fetch("id"))).to include("discarded_at" => nil,
+                                                                      "version" => kept.fetch("version"))
+    expect(token_mode_fake.outbox.size).to eq(after_first[:outbox_size])
+  end
 end
 
 RSpec.describe Timekeeping::FakeLocalOwner do
@@ -237,140 +275,5 @@ RSpec.describe TimekeepingContract::FakeTimekeeping, "in token mode with a detac
     expect(granted_answer.status).to eq(200)
     expect(granted_answer.body["detached"]).to eq(1)
     expect(fake.stored_entry(entry["id"])["agent_id"]).to be_nil
-  end
-end
-
-RSpec.describe TimekeepingContract::FakeTimekeeping, "replaying deletes" do
-  let(:replay_company) { create(:company) }
-  let(:replay_project) { create(:project, billable: true, client: create(:client, company: replay_company)) }
-  let(:replay_fake) { described_class.new(token_public_key: timekeeping_key_pair.public_key) }
-  let(:replay_admin) do
-    create(:user, current_workspace_id: replay_company.id).tap do |user|
-      create(:employment, company: replay_company, user:)
-      user.add_role :admin, replay_company
-      replay_fake.register_user(id: user.id, company_id: replay_company.id, role: "admin")
-    end
-  end
-
-  before do
-    replay_fake.register_company(id: replay_company.id, edit_days: replay_company.timesheet_edit_days)
-    replay_fake.register_project(id: replay_project.id, company_id: replay_company.id)
-  end
-
-  def replay_entry
-    replay_fake.add_entry(company_id: replay_company.id, user_id: replay_admin.id, project_id: replay_project.id,
-                          work_date: Date.current.iso8601)
-  end
-
-  def replay_headers(key, generation, **extra)
-    token = Timekeeping::UserToken.mint(user: replay_admin, company: replay_company, private_key: timekeeping_key_pair)
-    { "Authorization" => "Bearer #{token}", "Ownership-Generation" => generation.to_s, "Idempotency-Key" => key }
-      .merge(extra)
-  end
-
-  # "Replaying it needs a separate design that keeps the lookup-then-authorize order, and nothing is deleted twice meanwhile."
-  it "replays a committed delete after the generation moves and refuses a replay-only delete with no receipt without discarding" do
-    deleted = replay_entry
-    kept = replay_entry
-    key = SecureRandom.uuid
-    first_generation = replay_fake.generation
-    path = ->(entry) { "/v1/companies/#{replay_company.id}/entries/#{entry.fetch("id")}" }
-    replay_only = { "Idempotency-Replay" => "only", "If-Match" => "replay-only" }
-
-    first = replay_fake.call("DELETE", path.call(deleted), headers: replay_headers(key, first_generation))
-    outbox_after_first = replay_fake.outbox.size
-    replay_fake.generation = first_generation + 1
-
-    replay = replay_fake.call("DELETE", path.call(deleted), headers: replay_headers(key, first_generation, **replay_only))
-    missing = replay_fake.call("DELETE", path.call(kept),
-                               headers: replay_headers(SecureRandom.uuid, replay_fake.generation, **replay_only))
-
-    expect(first.status).to eq(200)
-    expect([replay.status, replay.body]).to eq([first.status, first.body])
-    expect([missing.status, missing.body]).to eq([404, { "reason" => "not_found" }])
-    expect(replay_fake.outbox.size).to eq(outbox_after_first)
-    expect(replay_fake.stored_entry(kept.fetch("id"))["discarded_at"]).to be_nil
-  end
-end
-
-RSpec.describe TimekeepingContract::FakeTimekeeping, "replay-only deletes without a receipt" do
-  let(:replay_miss_company) { create(:company) }
-  let(:replay_miss_project) { create(:project, billable: true, client: create(:client, company: replay_miss_company)) }
-  let(:replay_miss_fake) { described_class.new(token_public_key: timekeeping_key_pair.public_key) }
-  let(:replay_miss_admin) do
-    create(:user, current_workspace_id: replay_miss_company.id).tap do |user|
-      create(:employment, company: replay_miss_company, user:)
-      user.add_role :admin, replay_miss_company
-      replay_miss_fake.register_user(id: user.id, company_id: replay_miss_company.id, role: "admin")
-    end
-  end
-
-  before do
-    replay_miss_fake.register_company(id: replay_miss_company.id, edit_days: replay_miss_company.timesheet_edit_days)
-    replay_miss_fake.register_project(id: replay_miss_project.id, company_id: replay_miss_company.id)
-  end
-
-  # "do not treat every missing entry as a successful delete" - and a replay-only
-  # request must never run the delete itself, even for a kept entry.
-  it "answers a replay-only DELETE with no stored answer as not found and keeps the entry" do
-    entry = replay_miss_fake.add_entry(company_id: replay_miss_company.id, user_id: replay_miss_admin.id,
-                                       project_id: replay_miss_project.id, work_date: Date.current.iso8601)
-    token = Timekeeping::UserToken.mint(user: replay_miss_admin, company: replay_miss_company,
-                                        private_key: timekeeping_key_pair)
-    headers = { "Authorization" => "Bearer #{token}", "Ownership-Generation" => replay_miss_fake.generation.to_s,
-                "Idempotency-Key" => SecureRandom.uuid, "Idempotency-Replay" => "only", "If-Match" => "replay-only" }
-
-    response = replay_miss_fake.call("DELETE", "/v1/companies/#{replay_miss_company.id}/entries/#{entry.fetch("id")}",
-                                     headers:)
-
-    expect([response.status, response.body]).to eq([404, { "reason" => "not_found" }])
-    expect(replay_miss_fake.stored_entry(entry.fetch("id"))["discarded_at"]).to be_nil
-    expect(replay_miss_fake.stored_entry(entry.fetch("id"))["version"]).to eq(entry.fetch("version"))
-  end
-end
-
-RSpec.describe TimekeepingContract::FakeTimekeeping, "replay-only deletes with a receipt" do
-  let(:replay_hit_company) { create(:company) }
-  let(:replay_hit_project) { create(:project, billable: true, client: create(:client, company: replay_hit_company)) }
-  let(:replay_hit_fake) { described_class.new(token_public_key: timekeeping_key_pair.public_key) }
-  let(:replay_hit_admin) do
-    create(:user, current_workspace_id: replay_hit_company.id).tap do |user|
-      create(:employment, company: replay_hit_company, user:)
-      user.add_role :admin, replay_hit_company
-      replay_hit_fake.register_user(id: user.id, company_id: replay_hit_company.id, role: "admin")
-    end
-  end
-
-  before do
-    replay_hit_fake.register_company(id: replay_hit_company.id, edit_days: replay_hit_company.timesheet_edit_days)
-    replay_hit_fake.register_project(id: replay_hit_project.id, company_id: replay_hit_company.id)
-  end
-
-  # "Allow delete retries to reach the stored answer." The receipt is read before
-  # the generation check, as the real service does, so a moved generation cannot
-  # turn a committed delete into a refusal.
-  it "replays the stored delete answer for a replay-only DELETE sent after the generation advanced" do
-    entry = replay_hit_fake.add_entry(company_id: replay_hit_company.id, user_id: replay_hit_admin.id,
-                                      project_id: replay_hit_project.id, work_date: Date.current.iso8601)
-    path = "/v1/companies/#{replay_hit_company.id}/entries/#{entry.fetch("id")}"
-    token = Timekeeping::UserToken.mint(user: replay_hit_admin, company: replay_hit_company,
-                                        private_key: timekeeping_key_pair)
-    key = SecureRandom.uuid
-    first = replay_hit_fake.call("DELETE", path, headers: {
-      "Authorization" => "Bearer #{token}", "Ownership-Generation" => replay_hit_fake.generation.to_s,
-      "Idempotency-Key" => key, "If-Match" => entry.fetch("version").to_s
-    })
-    discarded = replay_hit_fake.stored_entry(entry.fetch("id"))
-    stale_generation = replay_hit_fake.generation
-    replay_hit_fake.generation = stale_generation + 1
-
-    replay = replay_hit_fake.call("DELETE", path, headers: {
-      "Authorization" => "Bearer #{token}", "Ownership-Generation" => stale_generation.to_s,
-      "Idempotency-Key" => key, "Idempotency-Replay" => "only", "If-Match" => "replay-only"
-    })
-
-    expect(first.status).to eq(200)
-    expect([replay.status, replay.body]).to eq([first.status, first.body])
-    expect(replay_hit_fake.stored_entry(entry.fetch("id"))).to eq(discarded)
   end
 end
