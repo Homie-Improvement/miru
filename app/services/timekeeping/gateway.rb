@@ -113,30 +113,15 @@ module Timekeeping
     # row is replayed rather than written twice.
     def import(user:, project:, attributes:, idempotency_key:, expected_generation: nil)
       final = attributes.to_h.stringify_keys
-      billed = final["bill_status"].to_s == "billed"
-      # The legacy model refuses a create already marked billed, so a billed
-      # row is created unbilled and billed in the same transaction.
-      create_time = billed ? final.merge("bill_status" => "unbilled") : final
 
       perform(expected_generation) do |ownership, owner|
         case owner
         when :legacy
-          project.timesheet_entries.new(create_time).tap do |entry|
-            entry.user = user
-            # The project was resolved inside the context's company, so the
-            # entry's company is known without a query per imported row.
-            entry.association(:company).target = context.company
-            entry.save!
-            entry.update!(bill_status: :billed) if billed
-          end
+          import_legacy(user:, project:, final:)
         when :prepared
           local_owner.create_entry(context:, user:, project:, attributes: final)
         when :timekeeping
-          checked = checked_create_attributes(user:, project:, attributes: create_time)
-          checked = checked.merge("bill_status" => "billed") if billed
-          body = EntryWriteClient.import_create_body(user:, project:, attributes: checked, source: final)
-          row = write_client.create_entry(context:, generation: ownership.generation, body:, idempotency_key:)
-          hydrate(row, user_id: user.id)
+          import_forwarded(ownership:, user:, project:, final:, idempotency_key:)
         end
       end
     end
@@ -184,6 +169,38 @@ module Timekeeping
     end
 
     private
+
+      # The legacy model refuses a create already marked billed, so a billed
+      # row is created unbilled and billed in the same transaction.
+      def import_legacy(user:, project:, final:)
+        billed = billed?(final)
+        project.timesheet_entries.new(create_time_attributes(final)).tap do |entry|
+          entry.user = user
+          # The project was resolved inside the context's company, so the
+          # entry's company is known without a query per imported row.
+          entry.association(:company).target = context.company
+          entry.save!
+          entry.update!(bill_status: :billed) if billed
+        end
+      end
+
+      # The draft is validated with the status the legacy store would create
+      # it with, and the one create sent carries the row's final status.
+      def import_forwarded(ownership:, user:, project:, final:, idempotency_key:)
+        checked = checked_create_attributes(user:, project:, attributes: create_time_attributes(final))
+        checked = checked.merge("bill_status" => "billed") if billed?(final)
+        body = EntryWriteClient.import_create_body(user:, project:, attributes: checked, source: final)
+        row = write_client.create_entry(context:, generation: ownership.generation, body:, idempotency_key:)
+        hydrate(row, user_id: user.id)
+      end
+
+      def billed?(attributes)
+        attributes["bill_status"].to_s == "billed"
+      end
+
+      def create_time_attributes(final)
+        billed?(final) ? final.merge("bill_status" => "unbilled") : final
+      end
 
       # The one place a refusal is counted, so each refused write emits exactly
       # one event whether the fence, the local owner or Timekeeping refused it.
