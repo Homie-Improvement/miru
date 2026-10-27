@@ -30,12 +30,26 @@ module Timekeeping
       # admission stays closed from step 1 until that flip, so no intent is
       # created between the last legacy write and the retirement.
       #
-      # intents: invoice_operation_intents rows as read for reconciliation.
+      # A correction explains any "state" difference on its intent, so one is
+      # listed only for an intent committed both at the checkpoint and now:
+      # listing from either side alone would explain a state change made
+      # after the checkpoint, which reconcile must report.
+      #
+      # source_intents: the invoice_operation_intents rows frozen at the checkpoint.
+      # intents: the same table as read for reconciliation.
       # legacy_retired_at: the ownership row's value, nil while legacy.
       # Returns { company_id => [Reconciliation::Correction] }.
-      def self.listed_receipts(intents, legacy_retired_at:)
+      def self.listed_receipts(source_intents:, intents:, legacy_retired_at:)
+        # An intent is unique per company, invoice and operation, so the
+        # company is part of the match: another company's committed intent
+        # with the same invoice and operation ids must not vouch for this one.
+        company_receipt_key = ->(intent) { [intent["company_id"], *Reconciliation::RECEIPT_LINK_KEY.call(intent)] }
+        committed_at_checkpoint = source_intents
+          .select { |intent| intent["state"] == "committed" }
+          .to_set(&company_receipt_key)
         intents
           .select { |intent| intent["state"] == "committed" }
+          .select { |intent| committed_at_checkpoint.include?(company_receipt_key.call(intent)) }
           .select { |intent| legacy_retired_at.nil? || intent["created_at"] < legacy_retired_at }
           .group_by { |intent| intent["company_id"] }
           .transform_values do |committed|
