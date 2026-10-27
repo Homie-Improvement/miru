@@ -17,6 +17,7 @@ module ErrorHandler
     rescue_from Timekeeping::EntryWriteClient::Conflict, with: :render_entry_version_conflict
     rescue_from Timekeeping::EntryWriteClient::Rejected, with: :render_entry_write_rejected
     rescue_from Invoices::OperationErrors::Refused, with: :reservation_refused
+    rescue_from Invoices::OperationErrors::Retryable, with: :reservation_retryable
   end
 
   STALE_GENERATION_REASON = "stale_generation"
@@ -30,6 +31,7 @@ module ErrorHandler
     "not_found" => "entry not found"
   }.freeze
   DEFAULT_RESERVATION_REFUSAL_MESSAGE = "entry cannot be added to this invoice"
+  RESERVATION_RETRYABLE_MESSAGE = "invoice could not be saved right now, please try again"
 
   private
 
@@ -42,6 +44,19 @@ module ErrorHandler
         format.html do
           flash.now[:alert] = message
           render file: "public/422.html", status: 422, layout: false
+        end
+      end
+    end
+
+    # The reservation store did not settle the save, for example when its
+    # answer was lost. Nothing was saved and the save may be sent again. The
+    # error's own message is an internal reason, so it is not shown.
+    def reservation_retryable(_exception)
+      respond_to do |format|
+        format.json { render json: { errors: RESERVATION_RETRYABLE_MESSAGE }, status: 503 }
+        format.html do
+          flash.now[:alert] = RESERVATION_RETRYABLE_MESSAGE
+          render file: "public/500.html", status: 503, layout: false
         end
       end
     end

@@ -6,7 +6,8 @@
 # prepare. If the process dies before the intent is settled, the store may
 # hold entries no invoice owns. Once an intent has been pending longer than
 # the pickup age, this sweep marks it failed and writes its abort row, then
-# delivers every outbox row that is still undelivered.
+# delivers every outbox row that is still undelivered and not marked
+# undeliverable.
 #
 # Each intent is resolved under the same (company_id, invoice_id) advisory
 # lock the save holds, so a save that is still running (a slow prepare) makes
@@ -76,7 +77,7 @@ class RecoverInvoiceOperationIntentsJob < ApplicationJob
     end
 
     def deliver_undelivered(reservations)
-      InvoiceOperationOutboxItem.where(delivered_at: nil).order(:id).pluck(:id).each do |outbox_item_id|
+      InvoiceOperationOutboxItem.where(delivered_at: nil, undeliverable_at: nil).order(:id).pluck(:id).each do |outbox_item_id|
         DeliverInvoiceOperationJob.perform_now(outbox_item_id, reservations:)
       end
     end

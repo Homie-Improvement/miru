@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
 module Invoices
-  # Errors raised by the invoice operation coordinator, its delivery and its
-  # adapter selection. Every one raised inside an invoice transaction unwinds
+  # Errors raised by the invoice operation coordinator, the reservation
+  # boundary and their adapters. Every one raised inside an invoice transaction unwinds
   # it, so the invoice change never commits after a failed reservation.
   module OperationErrors
     # The caller may try the same save again later and expect it to work.
@@ -16,16 +16,18 @@ module Invoices
       end
     end
 
-    # No reservation adapter is registered for the current entry owner yet.
-    class AdapterNotAvailable < Retryable
-      def initialize(message = "adapter_not_available")
+    # The adapter answered `retryable` to prepare.
+    class PrepareRetryable < Retryable
+      def initialize(message = "prepare_retryable")
         super
       end
     end
 
-    # The adapter answered `retryable` to prepare.
-    class PrepareRetryable < Retryable
-      def initialize(message = "prepare_retryable")
+    # The adapter answered mark_billed with neither `committed` nor
+    # `refused`, so the entries may still be unbilled and the invoice must
+    # not be sent.
+    class BillingRetryable < Retryable
+      def initialize(message = "billing_retryable")
         super
       end
     end

@@ -219,3 +219,103 @@ RSpec.describe InvoiceMailer, "refused billing under the prepared owner", type: 
     expect(ActionMailer::Base.deliveries).to be_empty
   end
 end
+
+RSpec.describe InvoiceMailer, "unsettled billing under the timekeeping owner", type: :mailer do
+  # A Timekeeping outage while billing must keep the invoice unsent, so the
+  # client is never mailed an invoice whose work is still open for billing.
+  it "leaves the invoice unsent with no mail when mark_billed gets a 503, and a retried send bills the entry once" do
+    company = create(:company)
+    client = create(:client, company:)
+    project = create(:project, client:, billable: true)
+    owner = create(:user, current_workspace_id: company.id)
+    entry = create(:timesheet_entry, user: owner, project:, bill_status: "unbilled")
+    invoice = create(:invoice, client:, company:, status: :sending)
+    create(:invoice_line_item, invoice:, timesheet_entry: entry, rate: 100, quantity: 60)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", handoff_step: nil)
+
+    fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
+    fake.generation = TimekeepingOwnership.current.generation
+    fake.add_entry(company_id: company.id, user_id: owner.id, project_id: project.id, id: entry.id)
+    fake.add_reservation(entry_id: entry.id, invoice_id: invoice.id, state: "committed", disposition: "active")
+    # The monolith's record of that settled reservation.
+    InvoiceEntryHolding.create!(company_id: company.id, invoice_id: invoice.id, entry_ids: [entry.id], disposition: "active")
+    forward = TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil)
+    outage = { mark_billed: true }
+    http = Object.new
+    http.define_singleton_method(:call) do |method, path, headers: {}, body: nil|
+      if outage[:mark_billed] && path.end_with?("/mark-billed")
+        next TimekeepingContract::Response.new(status: 503, body: { "reason" => "unavailable" })
+      end
+
+      forward.call(method, path, headers:, body:)
+    end
+    use_fake_timekeeping_reservations(fake, http:)
+    allow(InvoicePayment::PdfGeneration).to receive(:process).and_return("%PDF-1.4 invoice")
+    ActionMailer::Base.deliveries.clear
+    send_mail = -> { InvoiceMailer.with(invoice_id: invoice.id, subject: "Invoice", recipients: [client.email]).invoice.deliver_now }
+
+    expect(&send_mail).to raise_error(Invoices::OperationErrors::BillingRetryable)
+
+    invoice.reload
+    expect(invoice.status).to eq("sending")
+    expect(invoice.sent_at).to be_nil
+    expect(ActionMailer::Base.deliveries).to be_empty
+    expect(fake.stored_entry(entry.id)["bill_status"]).to eq("unbilled")
+
+    outage[:mark_billed] = false
+    send_mail.call
+
+    expect(invoice.reload.status).to eq("sent")
+    expect(ActionMailer::Base.deliveries.size).to eq(1)
+    expect(fake.stored_entry(entry.id)["bill_status"]).to eq("billed")
+    expect(fake.requests.count { |request| request[:path].end_with?("/mark-billed") }).to eq(1)
+  end
+
+  # A sending invoice that gains an entry under the timekeeping owner gets no
+  # holding and no remote reservation, so Timekeeping would bill nothing.
+  it "refuses to send, with no mail and nothing billed, an invoice whose entry was added without a holding" do
+    company = create(:company)
+    client = create(:client, company:)
+    project = create(:project, client:, billable: true)
+    owner = create(:user, current_workspace_id: company.id)
+    entry = create(:timesheet_entry, user: owner, project:, bill_status: "unbilled")
+    invoice = create(:invoice, client:, company:, status: :sending)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", handoff_step: nil)
+
+    fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
+    fake.generation = TimekeepingOwnership.current.generation
+    fake.add_entry(company_id: company.id, user_id: owner.id, project_id: project.id, id: entry.id)
+    use_fake_timekeeping_reservations(fake)
+    create(:invoice_line_item, invoice:, timesheet_entry: entry, rate: 100, quantity: 60)
+    expect(InvoiceEntryHolding.where(company_id: company.id, invoice_id: invoice.id)).to be_empty
+    allow(InvoicePayment::PdfGeneration).to receive(:process).and_return("%PDF-1.4 invoice")
+    ActionMailer::Base.deliveries.clear
+
+    expect do
+      InvoiceMailer.with(invoice_id: invoice.id, subject: "Invoice", recipients: [client.email]).invoice.deliver_now
+    end.to raise_error(Invoices::OperationErrors::Refused)
+
+    expect(invoice.reload.status).to eq("sending")
+    expect(ActionMailer::Base.deliveries).to be_empty
+    expect(fake.stored_entry(entry.id)["bill_status"]).to eq("unbilled")
+    expect(fake.requests.count { |request| request[:path].end_with?("/mark-billed") }).to eq(0)
+  end
+
+  it "keeps sending unchanged under the legacy owner" do
+    company = create(:company)
+    client = create(:client, company:)
+    project = create(:project, client:, billable: true)
+    owner = create(:user, current_workspace_id: company.id)
+    entry = create(:timesheet_entry, user: owner, project:, bill_status: "unbilled")
+    invoice = create(:invoice, client:, company:, status: :sending)
+    create(:invoice_line_item, invoice:, timesheet_entry: entry, rate: 100, quantity: 60)
+    allow(InvoicePayment::PdfGeneration).to receive(:process).and_return("%PDF-1.4 invoice")
+    ActionMailer::Base.deliveries.clear
+
+    InvoiceMailer.with(invoice_id: invoice.id, subject: "Invoice", recipients: [client.email]).invoice.deliver_now
+
+    expect(invoice.reload.status).to eq("sent")
+    expect(entry.reload.bill_status).to eq("billed")
+    expect(ActionMailer::Base.deliveries.size).to eq(1)
+  end
+end
