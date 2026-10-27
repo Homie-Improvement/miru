@@ -6,7 +6,8 @@ module Timekeeping
     # (docs/architecture/timekeeping-soa.md section 10.4): one outbox snapshot
     # per corrected entry, at the given version and generation. Writing the
     # same corrections again replaces them, so an entry never has a second
-    # correction snapshot at one generation.
+    # correction snapshot at one generation. The relay holds them back until
+    # Timekeeping admits their generation at the flip (Admission.hold_generation!).
     #
     # A snapshot is an outbox row without version and generation, which come
     # from the call. Shape problems raise Checkpoint::ShapeError; a refusal
@@ -23,6 +24,10 @@ module Timekeeping
         keys = snapshots.map { |snapshot| snapshot.values_at("company_id", "id") }
 
         ApplicationRecord.transaction do
+          # The admission row is locked for update before the fence check reads
+          # it, so two concurrent writes queue here instead of each holding a
+          # share lock and then deadlocking on the upgrade.
+          Admission.hold_generation!(generation)
           FenceCheck.require_fenced!(ApplicationRecord.connection, "write correction snapshots")
           lock_entries!(keys)
           OutboxSnapshot.lock_for_insert!

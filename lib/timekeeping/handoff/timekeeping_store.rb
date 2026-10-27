@@ -69,6 +69,13 @@ module Timekeeping
         integer_field(request(:put, CORRECTION_SNAPSHOTS_PATH, body), "written")
       end
 
+      # Timekeeping::Admission refuses every entry write that does not carry
+      # the admitted generation, so its fence holds against Timekeeping's
+      # writers.
+      def enforces_fence?
+        true
+      end
+
       def fence_admission
         request(:post, FENCE_PATH, "{}")
         nil

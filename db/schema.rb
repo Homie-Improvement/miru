@@ -1252,6 +1252,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_27_164215) do
     t.bigint "final_outbox_position"
     t.bigint "generation", default: 1, null: false
     t.string "handoff_step"
+    t.datetime "legacy_retired_at"
     t.string "monolith_store", default: "legacy", null: false
     t.string "owner", default: "monolith", null: false
     t.check_constraint "handoff_step IS NULL OR (handoff_step::text = ANY (ARRAY['close_admission'::character varying, 'settle'::character varying, 'freeze'::character varying, 'checkpoint'::character varying, 'sequence'::character varying, 'reconcile'::character varying]::text[]))", name: "timekeeping_ownership_handoff_step_check"
