@@ -51,6 +51,39 @@ RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "held until the flip" 
     expect(offered_generations).to eq([3])
   end
 
+  # The concurrent write commits on another connection after the relay has
+  # built its query but before the query runs, which is where a separately
+  # read hold would already be out of date.
+  [[nil, 2], [2, 3]].each do |previous_generation, next_generation|
+    it "never offers generation #{next_generation} when its hold commits while the relay reads " \
+       "(previous hold #{previous_generation.inspect})" do
+      snapshot = handoff_correction_snapshot(held_snapshot_entry, locked: true)
+      Timekeeping::Admission.fence!
+      if previous_generation
+        described_class.write!(snapshots: [snapshot], version: 1, generation: previous_generation)
+      end
+
+      concurrent_write_done = false
+      allow_any_instance_of(ActiveRecord::Relation).to receive(:limit).and_wrap_original do |original, *args|
+        if original.receiver.klass == OutboxSnapshot && !concurrent_write_done
+          concurrent_write_done = true
+          Thread.new do
+            ApplicationRecord.connection_pool.with_connection do
+              described_class.write!(snapshots: [snapshot], version: 1, generation: next_generation)
+            end
+          end.value
+        end
+        original.call(*args)
+      end
+
+      offered = offered_generations
+
+      expect(concurrent_write_done).to be(true)
+      expect(Timekeeping::Admission.current.held_generation).to eq(next_generation)
+      expect(offered).not_to include(next_generation)
+    end
+  end
+
   it "removes held snapshots when a different generation is admitted, and leaves other rows alone" do
     entry = held_snapshot_entry
     snapshot = handoff_correction_snapshot(entry, locked: true)

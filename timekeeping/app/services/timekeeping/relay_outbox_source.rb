@@ -16,11 +16,19 @@ module Timekeeping
 
     # Rows of the held generation are a first cutover's correction snapshots,
     # offered only once the flip admits that generation (Admission.hold_generation!).
+    # The held generation is read by a subquery in the same statement as the
+    # rows: a correction write sets the hold and inserts its rows in one
+    # transaction, so one statement sees both or neither. A separate read of
+    # the hold could miss a write that commits between the two reads.
+    HELD_GENERATION_EXCLUSION = <<~SQL.squish
+      outbox_snapshots.generation IS DISTINCT FROM
+        (SELECT held_generation FROM admission WHERE id = #{Admission::SINGLETON_ID})
+    SQL
+
     def unsent_after(position, limit)
-      rows = OutboxSnapshot.where(sent_at: nil).where("outbox_position > ?", position)
-      held = Admission.held_generation
-      rows = rows.where.not(generation: held) unless held.nil?
-      rows.order(:outbox_position).limit(limit).map { |row| relay_row(row) }
+      OutboxSnapshot.where(sent_at: nil).where("outbox_position > ?", position)
+                    .where(HELD_GENERATION_EXCLUSION)
+                    .order(:outbox_position).limit(limit).map { |row| relay_row(row) }
     end
 
     # Marks by outbox_position only: one entry can have several snapshot rows,
