@@ -58,7 +58,7 @@ RSpec.describe "prepared reservations spec layout" do
     expect(owners.size).to eq(1)
     owner = owners.first
     # The stricter input: one request that carries the own entry beside the foreign one.
-    expect(owner).to match(/entries: \[\s*own_\w*\.id,\s*foreign_\w*\.id\s*\]/)
+    expect(owner).to match(/prepared_spec_request\([^)]*\[\s*own_\w*\.id,\s*foreign_\w*\.id\s*\]/)
     # Rows are counted by SQL across every table any copy counted.
     expect(owner).to include("reservations", "invoice_operations", "entry_outbox_items")
   end
