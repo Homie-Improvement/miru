@@ -42,10 +42,12 @@ module Timekeeping
     # The fields each writer may forward, by WriteContext actor kind and
     # operation. Anything else a caller passes, such as user_id or
     # review_status, is never sent. A kind with no row (a service or an agent
-    # destroy) forwards no entry write at all. An import creates through
-    # import_create_body instead and never updates.
+    # destroy) forwards no entry write at all. An import never updates; its
+    # create body comes from import_create_body, which adds the import's own
+    # source to these fields.
     FORWARDED_FIELDS = {
       "user" => { create: EDIT_FIELDS, update: EDIT_FIELDS },
+      "import" => { create: EDIT_FIELDS },
       "cli" => { create: EDIT_FIELDS + SOURCE_FIELDS, update: EDIT_FIELDS + SOURCE_FIELDS },
       "agent" => { create: EDIT_FIELDS + SOURCE_FIELDS + AGENT_FIELDS, update: EDIT_FIELDS }
     }.transform_values(&:freeze).freeze

@@ -1181,10 +1181,9 @@ RSpec.describe Timekeeping::Gateway do
 
   # "Replaying it needs a separate design that keeps the lookup-then-authorize order, and nothing is deleted twice meanwhile."
   # "do not treat every missing entry as a successful delete"
-  # The lookup hides a colleague's kept entry from scope :actor. Timekeeping's own destroy would let an admin delete it
-  # without the gateway's scope or policy, so any DELETE sent after the lookup must be one only a stored receipt answers,
-  # and one an older service refuses on If-Match.
-  it "sends only a replay-only DELETE for a kept colleague entry outside the actor scope and leaves that entry kept" do
+  # The lookup finds a colleague's kept entry and scope :actor refuses it. The entry is still live, so no committed
+  # delete of it can exist to replay, and the gateway sends Timekeeping no DELETE at all.
+  it "sends no DELETE for a kept colleague entry outside the actor scope and leaves that entry kept" do
     admin = replay_admin_of(replay_company)
     colleague = create(:user, current_workspace_id: replay_company.id).tap do |user|
       create(:employment, company: replay_company, user:)
@@ -1198,8 +1197,7 @@ RSpec.describe Timekeeping::Gateway do
     expect { replay_gateway(actor: admin).destroy(entry_id:, authorize: replay_allow_all, scope: :actor) }
       .to raise_error(ActiveRecord::RecordNotFound)
 
-    expect(replay_deletes.map { |request| [request[:headers]["Idempotency-Replay"], request[:headers]["If-Match"]] })
-      .to eq([["only", "replay-only"]])
+    expect(replay_deletes).to be_empty
     expect(replay_fake.stored_entry(entry_id)).to eq(before_entry)
     expect(replay_fake.stored_entry(entry_id)["discarded_at"]).to be_nil
     expect(replay_fake.stored_entry(entry_id)["version"]).to eq(1)
