@@ -104,6 +104,40 @@ module Timekeeping
       end
     end
 
+    # Writes one imported row with its final bill status in a single gateway
+    # call, so no refusal can leave a billed row stored as unbilled. Unlike
+    # create, a billed status is allowed here: create takes bill_status from a
+    # web or mobile form, where billed must stay refused. attributes carry the
+    # import's source and source_metadata. idempotency_key is sent on a
+    # forwarded create in place of the request-id key, so a rerun of the same
+    # row is replayed rather than written twice.
+    def import(user:, project:, attributes:, idempotency_key:, expected_generation: nil)
+      final = attributes.to_h.stringify_keys
+      billed = final["bill_status"].to_s == "billed"
+      # The legacy model refuses a create already marked billed, so a billed
+      # row is created unbilled and billed in the same transaction.
+      create_time = billed ? final.merge("bill_status" => "unbilled") : final
+
+      perform(expected_generation) do |ownership, owner|
+        case owner
+        when :legacy
+          project.timesheet_entries.new(create_time).tap do |entry|
+            entry.user = user
+            entry.save!
+            entry.update!(bill_status: :billed) if billed
+          end
+        when :prepared
+          local_owner.create_entry(context:, user:, project:, attributes: final)
+        when :timekeeping
+          checked = checked_create_attributes(user:, project:, attributes: create_time)
+          checked = checked.merge("bill_status" => "billed") if billed
+          body = EntryWriteClient.import_create_body(user:, project:, attributes: checked, source: final)
+          row = write_client.create_entry(context:, generation: ownership.generation, body:, idempotency_key:)
+          hydrate(row, user_id: user.id)
+        end
+      end
+    end
+
     # authorize is called with the entry found in the owning store, inside the
     # transaction and before the write, so the policy decides on the copy the
     # write will change.
