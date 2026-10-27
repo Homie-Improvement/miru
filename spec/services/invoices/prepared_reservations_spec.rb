@@ -36,6 +36,7 @@ RSpec.describe Invoices::PreparedReservations do
       generation: TimekeepingOwnership.current.generation, disposition: "active",
       entries: [own_entry.id, foreign_entry.id]
     )
+    foreign_version_before = foreign_entry.reload.version
 
     # "Prepare is all or nothing, and one refusal reserves nothing."
     outcome = described_class.new.prepare(request)
@@ -47,7 +48,7 @@ RSpec.describe Invoices::PreparedReservations do
     expect(tenant_spec_count("SELECT COUNT(*) FROM invoice_operations WHERE invoice_id = ?", invoice.id)).to eq(0)
     expect(tenant_spec_count("SELECT COUNT(*) FROM entry_outbox_items WHERE entry_id IN (?)",
                              [own_entry.id, foreign_entry.id])).to eq(0)
-    expect(foreign_entry.reload.version).to eq(Timekeeping::LocalEntry.find(foreign_entry.id).version)
+    expect(foreign_entry.reload.version).to eq(foreign_version_before)
   end
 end
 
@@ -1228,6 +1229,7 @@ RSpec.describe Invoices::PreparedReservations do
                                                operation_id: SecureRandom.uuid,
                                                generation: TimekeepingOwnership.current.generation,
                                                disposition: "active", entries: [own_entry.id, foreign_entry.id])
+    versions_before = [own_entry.reload.version, foreign_entry.reload.version]
 
     # "Prepare is all or nothing, and one refusal reserves nothing."
     outcome = adapter.prepare(request)
@@ -1241,7 +1243,7 @@ RSpec.describe Invoices::PreparedReservations do
       "SELECT COUNT(*) FROM invoice_operations WHERE company_id = ? AND invoice_id = ?", company.id, invoice.id
     ])).to_i).to eq(0)
     expect(ApplicationRecord.connection.select_value("SELECT COUNT(*) FROM entry_outbox_items").to_i).to eq(outbox_before)
-    expect([own_entry.reload.version, foreign_entry.reload.version]).to eq([own_entry.version, foreign_entry.version])
+    expect([own_entry.reload.version, foreign_entry.reload.version]).to eq(versions_before)
   end
 end
 
@@ -1357,6 +1359,7 @@ RSpec.describe Invoices::PreparedReservations do
       company_id: line_claim_company.id, invoice_id: second.id, operation_id: SecureRandom.uuid,
       generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [entry.id]
     )
+    version_before = prepared_entry.reload.version
 
     outcome = described_class.new.admit(request)
 
@@ -1364,7 +1367,7 @@ RSpec.describe Invoices::PreparedReservations do
     expect(outcome.conflicts).to contain_exactly(hash_including(entry_id: entry.id, reason: "on_another_invoice"))
     expect(reservation_count.call).to eq(reservations_before)
     expect(outbox_count.call).to eq(outbox_before)
-    expect(prepared_entry.reload.version).to eq(prepared_entry.version)
+    expect(prepared_entry.reload.version).to eq(version_before)
   end
 end
 
