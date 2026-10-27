@@ -30,6 +30,15 @@ module Invoices
       end
     end
 
+    # The adapter answered mark_billed with neither `committed` nor
+    # `refused`, so the entries may still be unbilled and the invoice must
+    # not be sent.
+    class BillingRetryable < Retryable
+      def initialize(message = "billing_retryable")
+        super
+      end
+    end
+
     # The adapter answered prepare with a terminal state (`committed` or
     # `aborted`); the save never re-runs the change on such an answer.
     class ReconciliationRequired < Retryable
