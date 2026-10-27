@@ -2,13 +2,13 @@
 
 module Invoices
   # Chooses the reservation adapter for the store that owns entries now.
-  # No owner has an adapter registered yet, so each one answers with a
-  # retryable error until its adapter is added to the table.
+  # An owner with no adapter registered yet answers with a retryable error
+  # until its adapter is added to the table.
   module ReservationAdapters
     NOT_AVAILABLE = -> { raise OperationErrors::AdapterNotAvailable }
 
     TABLE = {
-      legacy: NOT_AVAILABLE,
+      legacy: -> { LegacyReservations.new },
       prepared: NOT_AVAILABLE,
       timekeeping: NOT_AVAILABLE
     }.freeze

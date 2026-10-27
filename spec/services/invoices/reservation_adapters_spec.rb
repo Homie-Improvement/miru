@@ -5,15 +5,21 @@
 require "rails_helper"
 
 RSpec.describe Invoices::ReservationAdapters do
+  it "answers the legacy owner with the legacy reservations adapter" do
+    ownership = TimekeepingOwnership.new(owner: "monolith", monolith_store: "legacy")
+    expect(Timekeeping::EntryOwner.for(ownership)).to eq(:legacy)
+
+    expect(described_class.for(ownership)).to be_a(Invoices::LegacyReservations)
+  end
+
   # "Until later issues register their adapters, every owner maps to a retryable \"adapter not available\" error."
-  it "answers every owner with a retryable adapter not available error" do
+  it "answers every owner without a registered adapter with a retryable adapter not available error" do
     ownerships = [
-      TimekeepingOwnership.new(owner: "monolith", monolith_store: "legacy"),
       TimekeepingOwnership.new(owner: "monolith", monolith_store: "prepared"),
       TimekeepingOwnership.new(owner: "timekeeping", monolith_store: "prepared")
     ]
     expect(ownerships.map { |ownership| Timekeeping::EntryOwner.for(ownership) })
-      .to contain_exactly(:legacy, :prepared, :timekeeping)
+      .to contain_exactly(:prepared, :timekeeping)
 
     ownerships.each do |ownership|
       expect { described_class.for(ownership) }.to raise_error(Invoices::OperationErrors::AdapterNotAvailable) do |error|

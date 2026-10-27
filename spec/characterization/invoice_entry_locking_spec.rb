@@ -83,24 +83,28 @@ RSpec.describe "Characterization: invoice timesheet entry locking", type: :reque
   end
 
   describe "draft line item edit that re-saves the invoice" do
-    it "locks the draft's entries again when the edit changes the invoice totals" do
+    # Deliberate change: the per-save re-lock is retired. A totals-only re-save
+    # changes no entry set, so it sends no reservation operation.
+    it "keeps the draft's entries locked and writes no intent when the edit changes only the invoice totals" do
       invoice = create(:invoice, company:, client:)
       line = locking_spec_direct_line(invoice)
       aggregate_entries = [locking_spec_entry, locking_spec_entry]
       locking_spec_aggregate_line(invoice, aggregate_entries)
       entries = [line.timesheet_entry] + aggregate_entries
-      force_locked(entries, locked: false)
+      expect_entries_state(entries, locked: true)
       amount_before = invoice.reload.amount
+      intents_before = InvoiceOperationIntent.where(invoice_id: invoice.id).count
 
       InvoiceLineItem.find(line.id).update!(quantity: line.quantity + 60)
 
       expect(invoice.reload.amount).not_to eq(amount_before)
       expect_entries_state(entries, locked: true)
+      expect(InvoiceOperationIntent.where(invoice_id: invoice.id).count).to eq(intents_before)
     end
   end
 
-  describe "L4: aggregate line removed from a draft (deliberate fix pending: may change)" do
-    it "leaves the linked entries locked when the line item is loaded fresh before destroy" do
+  describe "L4: aggregate line removed from a draft (deliberate fix: entries no remaining line references are released)" do
+    it "unlocks the linked entries when the line item is loaded fresh before destroy" do
       invoice = create(:invoice, company:, client:)
       linked_entries = [locking_spec_entry, locking_spec_entry]
       line = locking_spec_aggregate_line(invoice, linked_entries)
@@ -109,7 +113,7 @@ RSpec.describe "Characterization: invoice timesheet entry locking", type: :reque
       InvoiceLineItem.find(line.id).destroy!
 
       expect(InvoiceLineItem.exists?(line.id)).to be(false)
-      expect_entries_state(linked_entries, locked: true)
+      expect_entries_state(linked_entries, locked: false)
     end
 
     it "unlocks the linked entries when linked_timesheet_entries is already loaded before destroy" do
@@ -126,7 +130,7 @@ RSpec.describe "Characterization: invoice timesheet entry locking", type: :reque
       expect_entries_state(linked_entries, locked: false)
     end
 
-    it "leaves the linked entries locked when the line is removed with nested _destroy through the invoice update" do
+    it "unlocks the linked entries when the line is removed with nested _destroy through the invoice update" do
       invoice = create(:invoice, company:, client:)
       linked_entries = [locking_spec_entry, locking_spec_entry]
       line = locking_spec_aggregate_line(invoice, linked_entries)
@@ -138,10 +142,10 @@ RSpec.describe "Characterization: invoice timesheet entry locking", type: :reque
 
       expect(response).to have_http_status(:ok)
       expect(InvoiceLineItem.exists?(line.id)).to be(false)
-      expect_entries_state(linked_entries, locked: true)
+      expect_entries_state(linked_entries, locked: false)
     end
 
-    it "leaves the linked entries locked when the draft is bulk deleted" do
+    it "unlocks the linked entries when the draft is bulk deleted" do
       invoice = create(:invoice, company:, client:)
       linked_entries = [locking_spec_entry, locking_spec_entry]
       locking_spec_aggregate_line(invoice, linked_entries)
@@ -153,7 +157,7 @@ RSpec.describe "Characterization: invoice timesheet entry locking", type: :reque
 
       expect(response).to have_http_status(:no_content)
       expect(Invoice.exists?(invoice.id)).to be(false)
-      expect_entries_state(linked_entries, locked: true)
+      expect_entries_state(linked_entries, locked: false)
     end
   end
 
@@ -170,17 +174,20 @@ RSpec.describe "Characterization: invoice timesheet entry locking", type: :reque
     end
   end
 
-  describe "L2: discarding a draft (deliberate fix pending: may change)" do
-    it "ends with the draft's entries locked again" do
+  describe "L2: discarding a draft (deliberate fix: its reservations are released)" do
+    it "ends with the draft's entries unlocked, and the invoice-number rename does not lock them again" do
       invoice = create(:invoice, company:, client:)
       entries = locking_spec_mixed_line_entries(invoice)
       force_locked(entries)
+      intents_before = InvoiceOperationIntent.where(invoice_id: invoice.id).count
 
       send_request :delete, api_v1_invoice_path(invoice), headers: auth_headers(admin)
 
       expect(response).to have_http_status(:success)
       expect(invoice.reload).to be_discarded
-      expect_entries_state(entries, locked: true)
+      expect_entries_state(entries, locked: false)
+      # One operation for the discard; the rename save that follows sends none.
+      expect(InvoiceOperationIntent.where(invoice_id: invoice.id).count).to eq(intents_before + 1)
     end
   end
 
@@ -269,6 +276,36 @@ RSpec.describe "Characterization: invoice timesheet entry locking", type: :reque
       expect(InvoiceLineItem.where(timesheet_entry_id: entries.map(&:id))).to be_empty
       expect(InvoiceLineItemTimeEntry.where(timesheet_entry_id: entries.map(&:id))).to be_empty
       expect_entries_state(entries, locked: true)
+    end
+  end
+
+  describe "an entry already on a kept invoice put on a second one (deliberate fix)" do
+    it "refuses the second invoice with entry is on another invoice and leaves the entry on the first" do
+      holder = create(:invoice, company:, client:)
+      line = locking_spec_direct_line(holder)
+      entry = line.timesheet_entry
+      expect_entries_state([entry], locked: true)
+
+      expect {
+        send_request :post, api_v1_invoices_path, params: {
+          invoice: {
+            client_id: client.id,
+            invoice_number: "LOCK-SECOND-1",
+            issue_date: Date.current.iso8601,
+            due_date: (Date.current + 30).iso8601,
+            status: "draft",
+            currency: company.base_currency,
+            invoice_line_items_attributes: [
+              { name: "Second", date: entry.work_date.iso8601, rate: 100, quantity: 60, timesheet_entry_id: entry.id }
+            ]
+          }
+        }, headers: auth_headers(admin)
+      }.not_to change(Invoice, :count)
+
+      expect(response).to have_http_status(:unprocessable_entity)
+      expect(response.parsed_body["errors"]).to eq("entry is on another invoice")
+      expect(InvoiceLineItem.where(timesheet_entry_id: entry.id).pluck(:invoice_id)).to eq([holder.id])
+      expect_entries_state([entry], locked: true)
     end
   end
 end
