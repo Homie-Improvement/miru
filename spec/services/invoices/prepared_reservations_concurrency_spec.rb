@@ -53,7 +53,7 @@ RSpec.describe Invoices::PreparedReservations, "with competing writers", committ
   # leave it holding locks.
   def blocked_while_held
     blocked = blocked_by?(waiter_pids.pop(timeout: 5), holder_pids.pop(timeout: 5))
-    [blocked, (yield if block_given?)]
+    [blocked, yield]
   ensure
     release << true
   end
@@ -233,9 +233,10 @@ RSpec.describe Invoices::PreparedReservations, "with competing writers", committ
 
     @holder = hold_writer(roll_back: true) { adapter.prepare(first_request) }
     @waiter = start_waiter { adapter.prepare(second_request) }
-    blocked, = blocked_while_held
+    blocked, reservations_while_held = blocked_while_held { prepared_spec_reservations(company) }
 
     expect(blocked).to be(true), "the second prepare never waited on the first prepare"
+    expect(reservations_while_held).to eq([])
     expect(@holder.join(5)&.value&.state).to eq("prepared")
     expect(@waiter.join(5)&.value&.state).to eq("prepared")
     expect(prepared_spec_operations(company, first_invoice)).to eq([])
