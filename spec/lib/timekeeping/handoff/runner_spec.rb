@@ -184,7 +184,9 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     reserved_ids = YAML.load_file(Timekeeping::SeedDispositionRecorder::DEFAULT_PATH).fetch("companies").values
       .flat_map { |invoices| invoices.values.flat_map { |invoice| invoice["entry_ids"] } }
     # "The first cutover turns each recorded unlocked link into a committed reservation with one correction snapshot"
-    corrected = timekeeping_store.corrections.pluck("id")
+    # correction_writes keeps every snapshot sent, so a duplicate the store's
+    # replace-by-entry would absorb still shows up here.
+    corrected = timekeeping_store.correction_writes.pluck("id")
     expect(corrected.tally.values.uniq).to eq([1])
     expect(corrected.sort).to eq(reserved_ids.sort)
     expect(timekeeping_store.rows.fetch("entries").size).to eq(TimesheetEntry.unscoped.count)

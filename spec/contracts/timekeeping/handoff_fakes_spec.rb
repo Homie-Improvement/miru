@@ -70,9 +70,9 @@ RSpec.describe TimekeepingHandoffFakes::InMemoryTimekeepingStore do
     expect(store.export_checkpoint.digest).to eq(same.digest)
   end
 
-  # A resumed checkpoint step re-sends corrections it already wrote; the
-  # service replaces the earlier correction of an entry rather than adding a
-  # second one, so a fake that appends would hide a duplicated write.
+  # The service replaces the earlier correction of an entry rather than adding a
+  # second one, so corrections keeps one per entry. That replacement hides a
+  # duplicated write, so correction_writes keeps every snapshot as sent.
   it "a second correction of the same entry replaces the first and raises the stored entry version" do
     store = described_class.new
     store.load_checkpoint(handoff_fakes_checkpoint(handoff_fakes_entry_row(id: 5, version: 1)))
@@ -83,6 +83,7 @@ RSpec.describe TimekeepingHandoffFakes::InMemoryTimekeepingStore do
     expect([first, second]).to eq([1, 1])
     expect(store.corrections).to eq([{ "id" => 5, "note" => "second", "version" => 3, "generation" => 3 }])
     expect(described_class.entry_id_of(store.corrections.first)).to eq(5)
+    expect(store.correction_writes.pluck("note")).to eq(%w[first second])
     expect(store.rows.fetch("entries").first["version"]).to eq(3)
   end
 

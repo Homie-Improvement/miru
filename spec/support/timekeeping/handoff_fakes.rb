@@ -96,12 +96,16 @@ module TimekeepingHandoffFakes
   # earlier correction of the same entry and raise the stored version, as the
   # service's correction writer does.
   class InMemoryTimekeepingStore < RecordingAdmission
-    attr_reader :rows, :corrections
+    # corrections holds what the service keeps, one per entry; correction_writes
+    # holds every snapshot as sent, so a spec can catch a duplicated write that
+    # the replacement would otherwise absorb.
+    attr_reader :rows, :corrections, :correction_writes
 
     def initialize(log: nil, tag: nil)
       super
       @rows = Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }
       @corrections = []
+      @correction_writes = []
       @next_id = 1
     end
 
@@ -127,6 +131,7 @@ module TimekeepingHandoffFakes
 
     def write_correction_snapshots(snapshots:, version:, generation:)
       snapshots.each do |snapshot|
+        @correction_writes << snapshot
         entry_id = self.class.entry_id_of(snapshot)
         @corrections.reject! { |stored| self.class.entry_id_of(stored) == entry_id }
         @corrections << snapshot.merge("version" => version, "generation" => generation)
