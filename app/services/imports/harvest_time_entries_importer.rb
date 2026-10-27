@@ -8,6 +8,11 @@ module Imports
   class HarvestTimeEntriesImporter
     class InvalidFileError < StandardError; end
 
+    # Raised when the user who started the import no longer works in the
+    # company. A forwarded write is refused by the token check; this stops a
+    # legacy write, which mints no token, the same way.
+    class ImportUserNotInCompany < StandardError; end
+
     REQUIRED_HEADERS = %w[date client project hours first\ name last\ name].freeze
     HEADER_CONVERTER = -> (header) { header.to_s.delete_prefix("\uFEFF").strip.downcase }
     DATE_FORMATS = {
@@ -15,6 +20,15 @@ module Imports
       "MM-DD-YYYY" => "%m-%d-%Y",
       "YYYY-MM-DD" => "%Y-%m-%d"
     }.freeze
+
+    # The values a row's Idempotency-Key is derived from: the row as read from
+    # the uploaded file, line number included, so two identical lines stay two
+    # entries. Values resolved from the workspace (user, project, bill status)
+    # are left out because they can change before a rerun, which would give a
+    # row already written a new key.
+    ROW_KEY_FIELDS = %i[
+      row date client_name project_name project_code user_name hours billable invoiced note currency hourly_rate
+    ].freeze
 
     attr_reader :data_import, :company
 
@@ -38,6 +52,7 @@ module Imports
     def process
       previous_context = Rails.event.context.dup
       Rails.event.set_context(source: "harvest_import", data_import_id: data_import.id.to_s)
+      @recovering = recovering_failed_import?
       data_import.update!(
         status: "processing",
         started_at: Time.current,
@@ -74,7 +89,16 @@ module Imports
           Rails.logger.error("Data import ##{data_import.id} failed: #{message}")
           message = I18n.t("imports.errors.unexpected")
         end
-        data_import.update!(status: "failed", error_message: message, finished_at: Time.current)
+        # Each entry commits on its own, so the rows written before the failure
+        # stay stored and are reported.
+        data_import.update!(status: "failed", error_message: message, finished_at: Time.current,
+                            imported_rows: @imported_rows.to_i)
+      end
+
+      # A rerun of a failed import that already stored rows. Only then is a
+      # stored entry evidence that exactly one matching row was written.
+      def recovering_failed_import?
+        data_import.status == "failed" && !data_import.dry_run? && data_import.imported_rows.to_i.positive?
       end
 
       def load_rows
@@ -160,7 +184,7 @@ module Imports
         project_ids = @project_plans.values.filter_map { |plan| plan[:existing]&.id }.uniq
         work_dates = @rows.filter_map { |row| parse_date(row[:date]) }
         @database_duplicates = if project_ids.empty? || work_dates.empty?
-          Set.new
+          {}
         else
           TimesheetEntry.kept.joins(project: :client)
             .merge(Project.kept)
@@ -168,7 +192,7 @@ module Imports
             .where(project_id: project_ids, work_date: work_dates.min..work_dates.max, source: "import")
             .pluck(:user_id, :project_id, :work_date, :duration, :note)
             .map { |values| duplicate_key(*values) }
-            .to_set
+            .tally
         end
       end
 
@@ -283,9 +307,16 @@ module Imports
         )
       end
 
+      # A fresh import skips every row matching a stored entry. A rerun of a
+      # failed import skips one row per stored match, so an identical row the
+      # failed run never reached is still written.
       def duplicate_row?(row, user, project, work_date, duration)
-        return false unless project && @database_duplicates.include?(duplicate_key(user.id, project.id, work_date, duration, row[:note]))
+        return false unless project
 
+        key = duplicate_key(user.id, project.id, work_date, duration, row[:note])
+        return false unless @database_duplicates.fetch(key, 0).positive?
+
+        @database_duplicates[key] -= 1 if @recovering
         @duplicate_rows += 1
         true
       end
@@ -385,23 +416,26 @@ module Imports
         { "matched" => matched, "unmatched" => unmatched.first(200) }
       end
 
+      # The generation is read once, before anything is written, and every row
+      # is written against it, so an ownership change at any point stops the
+      # import instead of letting later rows follow the new owner. Each row is
+      # its own gateway transaction: a batch transaction would hold the
+      # ownership lock across forwarded calls and block a handoff, and its
+      # rollback could not undo rows Timekeeping already stored. Refusals other
+      # than an invalid row escape and fail the import.
       def persist_entries
+        expected_generation = current_generation
+        gateway = entry_gateway(import_user)
         create_clients_and_projects
         create_project_members
 
-        processed_rows = 0
-        @planned_rows.each_slice(500) do |rows|
-          ActiveRecord::Base.transaction do
-            rows.each do |row|
-              begin
-                ActiveRecord::Base.transaction(requires_new: true) { create_entry(row) }
-              rescue ActiveRecord::RecordInvalid => error
-                add_row_error(row, error.record.errors.full_messages.to_sentence)
-              end
-              processed_rows += 1
-              persist_progress if (processed_rows % 200).zero?
-            end
+        @planned_rows.each_with_index do |row, index|
+          begin
+            create_entry(gateway, row, expected_generation)
+          rescue ActiveRecord::RecordInvalid => error
+            add_row_error(row, error.record.errors.full_messages.to_sentence)
           end
+          persist_progress if ((index + 1) % 200).zero?
         end
 
         @summary["entries_created"] = @imported_rows
@@ -458,22 +492,54 @@ module Imports
         end
       end
 
-      def create_entry(row)
-        project = row[:project_plan][:record]
-        entry = TimesheetEntry.create!(
-          project:,
+      # A missing ownership row is refused the way the gateway refuses it.
+      def current_generation
+        ownership = TimekeepingOwnership.find_by(id: TimekeepingOwnership::SINGLETON_ID)
+        raise Timekeeping::Gateway::OwnershipMoving if ownership.nil?
+
+        ownership.generation
+      end
+
+      # @users holds the company's employed users, read when the job started.
+      def import_user
+        @users.find { |user| user.id == data_import.user_id } ||
+          raise(ImportUserNotInCompany, "Data import ##{data_import.id} user is not employed in the company")
+      end
+
+      # The job has no request, so identity comes from the data import alone.
+      def entry_gateway(actor)
+        Timekeeping::Gateway.new(
+          context: Timekeeping::WriteContext.new(
+            company:, actor:, actor_kind: "import", request_id: SecureRandom.uuid
+          )
+        )
+      end
+
+      def create_entry(gateway, row, expected_generation)
+        gateway.import(
           user: row[:user],
-          duration: row[:duration],
-          work_date: row[:work_date],
-          note: row[:note],
-          bill_status: row[:bill_status] == "billed" ? "unbilled" : row[:bill_status],
-          source: "import",
-          source_metadata: { tool: "harvest" }
-        ) do |timesheet_entry|
-          timesheet_entry.association(:company).target = company
-        end
-        entry.update!(bill_status: :billed) if row[:bill_status] == "billed"
+          project: row[:project_plan][:record],
+          attributes: {
+            duration: row[:duration],
+            work_date: row[:work_date],
+            note: row[:note],
+            bill_status: row[:bill_status],
+            source: "import",
+            source_metadata: { tool: "harvest" }
+          },
+          idempotency_key: row_idempotency_key(row),
+          expected_generation:
+        )
         @imported_rows += 1
+      end
+
+      # The same row of the same data import always gives the same key, so a
+      # rerun replays a create Timekeeping already stored instead of writing it
+      # twice.
+      def row_idempotency_key(row)
+        digest = Digest::SHA256.hexdigest(JSON.generate(row.slice(*ROW_KEY_FIELDS).transform_values(&:to_s)))
+        Digest::UUID.uuid_v5(Timekeeping::EntryWriteClient::IDEMPOTENCY_NAMESPACE,
+                             "harvest-import/#{data_import.id}/#{digest}")
       end
 
       def persist_progress

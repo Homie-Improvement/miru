@@ -123,6 +123,9 @@ module Timekeeping
         when :legacy
           project.timesheet_entries.new(create_time).tap do |entry|
             entry.user = user
+            # The project was resolved inside the context's company, so the
+            # entry's company is known without a query per imported row.
+            entry.association(:company).target = context.company
             entry.save!
             entry.update!(bill_status: :billed) if billed
           end
