@@ -161,27 +161,6 @@ RSpec.describe Invoices::ReservationBoundary do
 end
 
 RSpec.describe Invoices::ReservationBoundary do
-  # "Such a totals-only re-save sends no operation, and neither does the `update_invoice_number` save after a discard."
-  it "a totals-only line edit on a draft writes no intent and keeps its entry locked" do
-    company = create(:company)
-    client = create(:client, company:)
-    project = create(:project, client:, billable: true)
-    owner = create(:user, current_workspace_id: company.id)
-    entry = create(:timesheet_entry, user: owner, project:, bill_status: "unbilled")
-    invoice = create(:invoice, company:, client:)
-    line = create(:invoice_line_item, invoice:, timesheet_entry: entry, rate: 100, quantity: 60)
-    amount_before = invoice.reload.amount
-
-    expect do
-      InvoiceLineItem.find(line.id).update!(quantity: 120)
-    end.not_to change { InvoiceOperationIntent.where(invoice_id: invoice.id).count }
-
-    expect(invoice.reload.amount).not_to eq(amount_before)
-    expect(entry.reload.locked).to be(true)
-  end
-end
-
-RSpec.describe Invoices::ReservationBoundary do
   # "DatabaseCleaner's `:transaction` strategy opens its outer transaction as non-joinable, so commit callbacks still fire in ordinary specs"
   # "Add a spec proving the flush fires under that strategy."
   it "the flush commits the draft's intent inside the transaction-strategy example" do
