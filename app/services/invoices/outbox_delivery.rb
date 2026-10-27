@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "yaml"
+
 module Invoices
   # Delivers one commit or abort outbox row to the reservation adapter.
   #
@@ -8,15 +10,25 @@ module Invoices
   # or was never committed. The intent is looked up under the row's own
   # company, so a row can never settle another company's reservation.
   #
+  # A row is delivered only when the adapter's answer, read as the
+  # operation's remote state, and the intent's current state form a pair the
+  # contract's save_reconciliation table settles (Invoices::SaveReconciliation),
+  # so an answer alone never settles a row.
+  #
+  # A stale_generation answer marks the row undeliverable: the operation was
+  # prepared under a generation the store no longer accepts, so resending it
+  # can never succeed. The row and its intent are kept, delivered_at stays
+  # empty, and a warning is logged for operators.
+  #
   # The row is locked for the whole delivery and skipped when another
   # deliverer holds it, so inline delivery and the worker never both call the
-  # adapter for one row. Every result that is not settled, including a failed
-  # adapter lookup or a raised error, is counted as an attempt and leaves the
-  # row for the next sweep; delivery never raises to its caller, because by
-  # the time it runs the invoice change is already committed or rolled back.
+  # adapter for one row. Every other result, including a failed adapter
+  # lookup or a raised error, is counted as an attempt and leaves the row for
+  # the next sweep; delivery never raises to its caller, because by the time
+  # it runs the invoice change is already committed or rolled back.
   class OutboxDelivery
-    # The adapter answer that settles each kind of row.
-    SETTLED_STATE = { "commit" => "committed", "abort" => "aborted" }.freeze
+    STALE_GENERATION_REASON = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/reservations.yml"))
+      .dig("errors", "stale_generation", "body", "reason").freeze
 
     def initialize(adapter_source:)
       @adapter_source = adapter_source
@@ -27,8 +39,9 @@ module Invoices
         item = InvoiceOperationOutboxItem.lock("FOR UPDATE SKIP LOCKED").find_by(id: outbox_item_id)
         next if item.nil? || item.delivered_at.present? || item.undeliverable_at.present?
 
-        outcome = settle(item)
-        record(item, outcome)
+        intent = intent_for(item)
+        outcome = settle(item, intent)
+        record(item, intent, outcome)
         outcome
       end
     rescue StandardError => error
@@ -43,9 +56,10 @@ module Invoices
 
       attr_reader :adapter_source
 
-      def settle(item)
-        request = request_for(item)
-        return if request.nil?
+      def settle(item, intent)
+        return if intent.nil?
+
+        request = request_for(item, intent)
 
         # A savepoint keeps a database error raised by the adapter from
         # aborting the transaction that must still record the attempt.
@@ -57,10 +71,7 @@ module Invoices
         nil
       end
 
-      def request_for(item)
-        intent = intent_for(item)
-        return if intent.nil?
-
+      def request_for(item, intent)
         ReservationRequest.new(
           company_id: item.company_id,
           invoice_id: item.invoice_id,
@@ -77,12 +88,27 @@ module Invoices
         scope.first
       end
 
-      def record(item, outcome)
-        if outcome&.state == SETTLED_STATE.fetch(item.kind)
+      def record(item, intent, outcome)
+        case result(intent, outcome)
+        when :delivered
           InvoiceOperationOutboxItem.where(id: item.id, delivered_at: nil).update_all(delivered_at: Time.current)
+        when :undeliverable
+          InvoiceOperationOutboxItem.where(id: item.id, undeliverable_at: nil).update_all(undeliverable_at: Time.current)
+          Rails.logger.warn(
+            "invoice operation outbox row undeliverable: stale_generation " \
+            "outbox_item_id=#{item.id} company_id=#{item.company_id} operation_id=#{item.operation_id} kind=#{item.kind}"
+          )
         else
           InvoiceOperationOutboxItem.where(id: item.id).update_all("attempts = attempts + 1")
         end
+      end
+
+      def result(intent, outcome)
+        return :retry if intent.nil? || outcome.nil?
+        return :undeliverable if outcome.state == "retryable" && outcome.reason == STALE_GENERATION_REASON
+
+        settled = !SaveReconciliation.call(remote_state: outcome.state, intent_state: intent.state).fetch("retryable")
+        settled ? :delivered : :retry
       end
   end
 end

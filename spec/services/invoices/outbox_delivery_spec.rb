@@ -232,4 +232,22 @@ RSpec.describe Invoices::OutboxDelivery do
     expect { expect(delivery.deliver(item.id)).to be_nil }.not_to raise_error
     expect(item.reload.delivered_at).to be_nil
   end
+
+  it "calls no adapter and changes nothing for a row already marked undeliverable" do
+    operation_id = SecureRandom.uuid
+    InvoiceOperationIntent.create!(
+      company_id: 7601, invoice_id: 9601, operation_id:, state: "failed", generation: 1,
+      disposition: "active", desired_entry_ids: [61]
+    )
+    item = InvoiceOperationOutboxItem.create!(
+      company_id: 7601, invoice_id: 9601, operation_id:, kind: "abort", undeliverable_at: 1.minute.ago,
+      payload: { company_id: 7601, invoice_id: 9601, operation_id:, generation: 1, disposition: "active", desired_entry_ids: [61] }
+    )
+    adapter = outbox_delivery_settled_adapter("aborted")
+
+    expect(described_class.new(adapter_source: -> { adapter }).deliver(item.id)).to be_nil
+
+    expect(adapter.requests).to be_empty
+    expect(item.reload.attributes.slice("delivered_at", "attempts")).to eq("delivered_at" => nil, "attempts" => 0)
+  end
 end
