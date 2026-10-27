@@ -33,21 +33,25 @@ RSpec.describe Invoices::LocalClaimCheck, committed_data: true do
         release_first.pop
       end
     end
-    expect(first_checked.pop).to eq([])
-
     second_result = nil
-    second_thread = committed_data_thread(second_pids) do
-      ApplicationRecord.transaction do
-        second_result = described_class.call(request_for.call(second))
-        raise ActiveRecord::Rollback
-      end
-    end
-    first_pid = first_pids.pop
-    expect(blocked_by?(second_pids.pop, first_pid)).to be(true)
+    second_thread = nil
+    begin
+      expect(first_checked.pop).to eq([])
 
-    release_first << true
-    first_thread.join
-    second_thread.join
+      second_thread = committed_data_thread(second_pids) do
+        ApplicationRecord.transaction do
+          second_result = described_class.call(request_for.call(second))
+          raise ActiveRecord::Rollback
+        end
+      end
+      first_pid = first_pids.pop
+      expect(blocked_by?(second_pids.pop, first_pid)).to be(true)
+    ensure
+      # Released even when an expectation above fails, so no writer is left
+      # holding its lock while the database is cleaned.
+      release_first << true
+      [first_thread, second_thread].compact.each(&:join)
+    end
 
     expect(second_result).to eq([{ entry_id: entry.id, reason: "on_another_invoice" }])
   end

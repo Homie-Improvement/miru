@@ -86,6 +86,12 @@ module Timekeeping
     }.freeze
 
     CONFLICT_STATUS = 409
+    # Why an abort stays retryable when Timekeeping refuses its prepare
+    # replay: no operation is stored, so nothing can be made terminal yet.
+    REFUSED_REPLAY_REASON = "abort_replay_refused"
+    # Why billing is refused when the entries Timekeeping would bill are not
+    # the entries on the invoice's lines.
+    BILLING_MISMATCH_REASON = "billing_entries_mismatch"
 
     # Builds the client production uses: Net::HTTP to TIMEKEEPING_BASE_URL
     # and a fresh ServiceToken per call.
@@ -139,7 +145,8 @@ module Timekeeping
     def abort(request)
       replay = remote_prepare(request)
       return replay if TERMINAL_STATES.include?(replay.state)
-      return outcome("retryable", reason: replay.reason || "abort_replay_#{replay.state}") unless replay.state == "prepared"
+      return outcome("retryable", reason: REFUSED_REPLAY_REASON) if replay.state == "refused"
+      return replay unless replay.state == "prepared"
 
       answer = exchange("abort", request)
       return answer if answer.is_a?(Invoices::ReservationOutcome)
@@ -148,7 +155,20 @@ module Timekeeping
       stored_state(request)
     end
 
+    # The mark_billed route carries no entry list: Timekeeping bills the
+    # reservations it holds as committed for the invoice, which are the
+    # entries of the invoice's holding. Billing is refused when those differ
+    # from the entries on the invoice's lines (a sent invoice that kept a
+    # removed line's entry, or gained a line that reserved nothing), because
+    # Timekeeping would then bill the wrong entries. An invoice with no
+    # holding has never sent an operation, so its lines are what it holds.
     def mark_billed(request)
+      held_ids = InvoiceEntryHolding.find_by(company_id: request.company_id, invoice_id: request.invoice_id)&.entry_ids
+      mismatched_ids = held_ids ? (held_ids | request.entries) - (held_ids & request.entries) : []
+      if mismatched_ids.any?
+        return outcome("refused", conflicts: mismatched_ids.sort.map { |entry_id| { entry_id:, reason: BILLING_MISMATCH_REASON } })
+      end
+
       answer = exchange("mark_billed", request)
       return answer if answer.is_a?(Invoices::ReservationOutcome)
 

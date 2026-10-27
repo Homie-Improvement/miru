@@ -689,4 +689,62 @@ RSpec.describe Timekeeping::ReservationClient, "answer mapping and local claims"
       expect(http.paths).to eq([])
     end
   end
+
+  # The mark_billed route bills the invoice's committed reservations, not the
+  # entries sent, so billing is refused when those are not the invoice's lines.
+  it "refuses mark_billed and sends nothing when the invoice's holding lists other entries than its lines" do
+    InvoiceEntryHolding.create!(company_id: 611, invoice_id: 12, entry_ids: [4000, 4001], disposition: "active")
+    http = scripted_http_class.new([[200, { "billed" => 2 }]])
+
+    outcome = scripted_reservation_client(http).mark_billed(reservation_request)
+
+    expect(outcome.state).to eq("refused")
+    expect(outcome.conflicts).to eq([{ entry_id: 4000, reason: described_class::BILLING_MISMATCH_REASON }])
+    expect(http.paths).to eq([])
+  end
+
+  it "posts mark_billed when the invoice's holding lists exactly its lines" do
+    InvoiceEntryHolding.create!(company_id: 611, invoice_id: 12, entry_ids: [4001], disposition: "active")
+    http = scripted_http_class.new([[200, { "billed" => 1 }]])
+
+    outcome = scripted_reservation_client(http).mark_billed(reservation_request)
+
+    expect(outcome.state).to eq("committed")
+    expect(http.paths).to eq(["/v1/companies/611/invoices/12/mark-billed"])
+  end
+
+  # Commit and abort answer only counts, so an abort that drops nothing must
+  # read the stored state instead of reporting aborted.
+  it "reports committed, and delivery keeps the failed intent's abort row, when the operation commits between the replay and the abort" do
+    fake = TimekeepingContract::FakeTimekeeping.new
+    fake.generation = TimekeepingOwnership.current.generation
+    credential = fake.add_service(company_id: 611, name: "monolith-invoices", operations: %w[prepare commit abort mark_billed])
+    fake_client = TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil)
+    fake.add_entry(company_id: 611, user_id: 1, project_id: 1, id: 4001)
+    committing_http = Object.new
+    committing_http.define_singleton_method(:call) do |method, path, headers: {}, body: nil|
+      if path.end_with?("/reservations/abort")
+        fake_client.call(method, path.sub("/abort", "/commit"), headers:, body:)
+      end
+      fake_client.call(method, path, headers:, body:)
+    end
+    client = described_class.new(http: committing_http, credential: ->(company_id:, operation:) { credential })
+    expect(client.prepare(reservation_request).state).to eq("prepared")
+
+    expect(client.abort(reservation_request).state).to eq("committed")
+    expect(fake.reservations_for(4001)).to eq([{ "invoice_id" => 12, "state" => "committed" }])
+
+    InvoiceOperationIntent.create!(
+      company_id: 611, invoice_id: 12, operation_id: reservation_request.operation_id, state: "failed",
+      generation: reservation_request.generation, disposition: "active", desired_entry_ids: [4001]
+    )
+    row = InvoiceOperationOutboxItem.create!(
+      company_id: 611, invoice_id: 12, operation_id: reservation_request.operation_id, kind: "abort",
+      payload: { company_id: 611, invoice_id: 12, operation_id: reservation_request.operation_id }
+    )
+    DeliverInvoiceOperationJob.perform_now(row.id, reservations: client)
+
+    expect(row.reload.delivered_at).to be_nil
+    expect(row.attempts).to eq(1)
+  end
 end

@@ -251,18 +251,27 @@ RSpec.describe Invoices::OutboxDelivery do
     expect(item.reload.attributes.slice("delivered_at", "attempts")).to eq("delivered_at" => nil, "attempts" => 0)
   end
 
-  it "marks a row that never settles undeliverable once it has used the last delivery attempt" do
-    limit = described_class::MAX_DELIVERY_ATTEMPTS
+  def outbox_delivery_abort_row_at(attempts:, company_id:)
     operation_id = SecureRandom.uuid
     InvoiceOperationIntent.create!(
-      company_id: 7701, invoice_id: 9701, operation_id:, state: "failed", generation: 1,
+      company_id:, invoice_id: 9701, operation_id:, state: "failed", generation: 1,
       disposition: "active", desired_entry_ids: [71]
     )
-    item = InvoiceOperationOutboxItem.create!(
-      company_id: 7701, invoice_id: 9701, operation_id:, kind: "abort", attempts: limit - 2,
-      payload: { company_id: 7701, invoice_id: 9701, operation_id:, generation: 1, disposition: "active", desired_entry_ids: [71] }
+    InvoiceOperationOutboxItem.create!(
+      company_id:, invoice_id: 9701, operation_id:, kind: "abort", attempts:,
+      payload: { company_id:, invoice_id: 9701, operation_id:, generation: 1, disposition: "active", desired_entry_ids: [71] }
     )
-    adapter = outbox_delivery_settled_adapter("retryable")
+  end
+
+  def outbox_delivery_retryable_adapter(reason)
+    outcome = Invoices::ReservationOutcome.new(state: "retryable", conflicts: [], counts: {}, reason:)
+    RecordingReservationAdapter.new(prepare: outcome, commit: outcome, abort: outcome)
+  end
+
+  it "marks an abort whose prepare replay keeps being refused undeliverable once it has used the last delivery attempt" do
+    limit = described_class::MAX_DELIVERY_ATTEMPTS
+    item = outbox_delivery_abort_row_at(attempts: limit - 2, company_id: 7701)
+    adapter = outbox_delivery_retryable_adapter(Timekeeping::ReservationClient::REFUSED_REPLAY_REASON)
     delivery = described_class.new(adapter_source: -> { adapter })
 
     delivery.deliver(item.id)
@@ -275,5 +284,21 @@ RSpec.describe Invoices::OutboxDelivery do
     expect(item.delivered_at).to be_nil
     expect(described_class.new(adapter_source: -> { adapter }).deliver(item.id)).to be_nil
     expect(adapter.requests.size).to eq(2)
+  end
+
+  it "keeps retrying a transient failure past the attempt limit and delivers the row once the store is back" do
+    limit = described_class::MAX_DELIVERY_ATTEMPTS
+    item = outbox_delivery_abort_row_at(attempts: limit, company_id: 7702)
+    unavailable = outbox_delivery_retryable_adapter("unavailable")
+
+    described_class.new(adapter_source: -> { unavailable }).deliver(item.id)
+    expect(item.reload.attributes.slice("attempts", "undeliverable_at", "delivered_at"))
+      .to eq("attempts" => limit + 1, "undeliverable_at" => nil, "delivered_at" => nil)
+
+    recovered = outbox_delivery_settled_adapter("aborted")
+    described_class.new(adapter_source: -> { recovered }).deliver(item.id)
+
+    expect(item.reload.delivered_at).to be_present
+    expect(item.undeliverable_at).to be_nil
   end
 end

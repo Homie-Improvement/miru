@@ -65,6 +65,14 @@ RSpec.describe "Invoice saves under the Timekeeping owner", committed_data: true
     end
   end
 
+  # Releases every held save and waits for its thread, also when an
+  # expectation failed while they were held, so no save keeps its
+  # connection and locks while the database is cleaned.
+  def tk_save_release_all(threads, release)
+    threads.size.times { release << true }
+    threads.each(&:join)
+  end
+
   def tk_save_prepares
     tk_save_fake.requests.count { |request| request[:path].end_with?("/reservations/prepare") }
   end
@@ -88,12 +96,14 @@ RSpec.describe "Invoice saves under the Timekeeping owner", committed_data: true
         create(:invoice_line_item, invoice: Invoice.find(invoice.id), timesheet_entry: entry, rate: 100, quantity: 60)
       end
     end
-    expect([arrived.pop, arrived.pop]).to contain_exactly(first.id, second.id)
-    # Both pending intents are committed before either save asks to prepare.
-    expect(InvoiceOperationIntent.where(company_id: tk_save_company.id, state: "pending").pluck(:invoice_id))
-      .to contain_exactly(first.id, second.id)
-    2.times { release << true }
-    threads.each(&:join)
+    begin
+      expect([arrived.pop, arrived.pop]).to contain_exactly(first.id, second.id)
+      # Both pending intents are committed before either save asks to prepare.
+      expect(InvoiceOperationIntent.where(company_id: tk_save_company.id, state: "pending").pluck(:invoice_id))
+        .to contain_exactly(first.id, second.id)
+    ensure
+      tk_save_release_all(threads, release)
+    end
 
     errors = threads.pluck(:tk_save_error)
     winner, loser = errors.first.nil? ? [first, second] : [second, first]
@@ -130,9 +140,11 @@ RSpec.describe "Invoice saves under the Timekeeping owner", committed_data: true
         create(:invoice_line_item, invoice: Invoice.find(invoice.id), timesheet_entry: entry, rate: 100, quantity: 60)
       end
     end
-    expect([arrived.pop, arrived.pop]).to contain_exactly(first.id, second.id)
-    2.times { release << true }
-    threads.each(&:join)
+    begin
+      expect([arrived.pop, arrived.pop]).to contain_exactly(first.id, second.id)
+    ensure
+      tk_save_release_all(threads, release)
+    end
 
     errors = threads.pluck(:tk_save_error)
     expect(errors.compact.size).to eq(1)
@@ -166,6 +178,52 @@ RSpec.describe "Invoice saves under the Timekeeping owner", committed_data: true
       .to eq(["failed"])
     expect(tk_save_fake.reservations_for(entry.id)).to eq([])
     expect(tk_save_fake.entry_locked?(entry.id)).to be(false)
+  end
+
+  # "a crash between prepare and step 3 leaves the intent pending, and `RecoverInvoiceOperationIntentsJob` fails it and aborts;"
+  it "a save interrupted right after Timekeeping prepared leaves a pending intent that recovery fails and aborts" do
+    entry = tk_save_entry
+    draft = tk_save_invoice("TK-CRASH")
+    before_save = [tk_save_fake.entry_locked?(entry.id), tk_save_fake.reservations_for(entry.id)]
+    # Stands in for the process dying: it is not a StandardError, so nothing
+    # on the save path rescues it.
+    process_died = Class.new(Exception) # rubocop:disable Lint/InheritException
+    fake_client = TimekeepingContract::FakeClient.new(timekeeping: tk_save_fake, relay: nil)
+    crashing_http = Object.new
+    crashing_http.define_singleton_method(:call) do |method, path, headers: {}, body: nil|
+      response = fake_client.call(method, path, headers:, body:)
+      raise process_died if path.end_with?("/reservations/prepare")
+
+      response
+    end
+    use_fake_timekeeping_reservations(tk_save_fake, http: crashing_http)
+    # A dead process never runs the failure settlement after the rollback.
+    allow_any_instance_of(Invoices::OperationCoordinator).to receive(:record_failure) # rubocop:disable RSpec/AnyInstance
+
+    expect do
+      ApplicationRecord.transaction do
+        create(:invoice_line_item, invoice: Invoice.find(draft.id), timesheet_entry: entry, rate: 100, quantity: 60)
+      end
+    end.to raise_error(process_died)
+
+    expect(InvoiceLineItem.where(invoice_id: draft.id)).to be_empty
+    intent = InvoiceOperationIntent.find_by!(company_id: tk_save_company.id, invoice_id: draft.id)
+    expect(intent.state).to eq("pending")
+    expect(InvoiceOperationOutboxItem.where(company_id: tk_save_company.id, invoice_id: draft.id)).to be_empty
+    expect(tk_save_fake.reservations_for(entry.id)).to eq([{ "invoice_id" => draft.id, "state" => "provisional" }])
+
+    recovery_client = Timekeeping::ReservationClient.new(
+      http: fake_client,
+      credential: lambda do |company_id:, operation:|
+        Timekeeping::ServiceToken.mint(company_id:, operations: [operation], private_key: timekeeping_key_pair)
+      end
+    )
+    RecoverInvoiceOperationIntentsJob.perform_now(pickup_age: 0.seconds, reservations: recovery_client)
+
+    expect(intent.reload.state).to eq("failed")
+    abort_row = InvoiceOperationOutboxItem.find_by!(company_id: tk_save_company.id, invoice_id: draft.id, kind: "abort")
+    expect(abort_row.delivered_at).to be_present
+    expect([tk_save_fake.entry_locked?(entry.id), tk_save_fake.reservations_for(entry.id)]).to eq(before_save)
   end
 
   # "a step-3 guarded update matching no row rolls back the invoice change and writes no commit row;"
