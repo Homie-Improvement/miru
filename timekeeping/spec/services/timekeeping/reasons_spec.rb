@@ -7,7 +7,7 @@ require "rails_helper"
 RSpec.describe Timekeeping::Reasons do
   service_only_reasons = {
     reference_unavailable: 503, idempotency_key_required: 422, invalid_request: 400,
-    handoff_refused: 409, fence_timeout: 503, admission_missing: 409
+    handoff_refused: 409, fence_timeout: 503, admission_missing: 409, unpublishable_entry: 409
   }.freeze
 
   def contract_errors(name)

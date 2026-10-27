@@ -11,6 +11,8 @@ module Timekeeping
   # internal handoff routes' handoff_refused (a store refused to export, load
   # or write corrections), fence_timeout (a fence waited past its lock
   # timeout; retryable) and admission_missing (the admission row is gone).
+  # unpublishable_entry is also the service's own: a write would republish a
+  # stored entry holding a value the snapshot rules refuse.
   module Reasons
     STATUS = {
       unauthorized: 401,
@@ -27,7 +29,9 @@ module Timekeeping
       fence_timeout: 503,
       admission_missing: 409,
       conflict: 409,
-      unresolved_operation: 409    }.freeze
+      unresolved_operation: 409,
+      unpublishable_entry: 409
+    }.freeze
 
     module_function
 

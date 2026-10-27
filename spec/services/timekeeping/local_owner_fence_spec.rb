@@ -4,146 +4,232 @@
 
 require "rails_helper"
 
-RSpec.describe Timekeeping::LocalOwner do
-  # "The generation check runs before receipt replay, so a retry at an old generation gets 409 even when its earlier answer is stored."
-  it "a retry at the old generation after a committed write answers 409 stale_generation instead of the stored receipt" do
-    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
-    old_generation = TimekeepingOwnership.current.generation
-    company = create(:company)
-    user = create(:user)
-    create(:employment, company:, user:)
-    user.add_role("employee", company)
-    project = create(:project, client: create(:client, company:))
-    count = ->(table) { ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM #{table}").to_i }
-    request = lambda do
-      described_class.call(
-        operation: :create, company_id: company.id, generation: old_generation.to_s,
-        actor: described_class::Actor.user(user_id: user.id, role: "employee"),
-        params: {
-          "idempotency_key" => "lost-response",
-          "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 45.0,
-                      "note" => "kept", "source" => "manual", "source_metadata" => {} }
-        }
-      )
-    end
-
-    expect(request.call.status).to eq(201)
-    TimekeepingOwnership.current.update!(generation: old_generation + 1)
-
-    retried = request.call
-
-    expect(retried.status).to eq(409)
-    expect(retried.body.with_indifferent_access[:reason]).to eq("stale_generation")
-    expect(count.call("entries")).to eq(1)
-    expect(count.call("entry_audits")).to eq(1)
-    expect(count.call("entry_outbox_items")).to eq(1)
-    expect(count.call("idempotency_records")).to eq(1)
-  end
-end
-
-
-RSpec.describe Timekeeping::LocalOwner do
+RSpec.describe Timekeeping::LocalOwner, "stale refusal then fresh write, merged" do
   # "A stale generation, or any generation while ownership is not prepared or a handoff step is set, gives 409 stale_generation and writes nothing, including a retry whose earlier answer is stored"
-  it "a stale-generation refusal stores no receipt, so the same key at the current generation is written" do
-    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
-    current = TimekeepingOwnership.current.generation
+  it "a stale-generation refusal stores nothing, so a retry of the same key at the current generation writes once" do
+    current = prepare_local_ownership!.generation
     company = create(:company)
-    user = create(:user)
-    create(:employment, company:, user:)
-    user.add_role("employee", company)
+    user = timekeeping_member(company, "employee")
     project = create(:project, client: create(:client, company:))
-    count = ->(table) { ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM #{table}").to_i }
     request_at = lambda do |generation|
       described_class.call(
         operation: :create, company_id: company.id, generation: generation.to_s,
         actor: described_class::Actor.user(user_id: user.id, role: "employee"),
-        params: {
-          "idempotency_key" => "stale-then-fresh",
-          "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 15.0,
-                      "note" => "fresh", "source" => "manual", "source_metadata" => {} }
-        }
+        params: { "idempotency_key" => "merged-stale-then-fresh",
+                  "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 15.0,
+                              "note" => "fresh", "source" => "manual", "source_metadata" => {} } }
       )
     end
+    empty = { "entries" => 0, "entry_audits" => 0, "idempotency_records" => 0, "entry_outbox_items" => 0 }
+    expect(timekeeping_row_counts).to eq(empty)
 
     stale = request_at.call(current + 1)
 
     expect(stale.status).to eq(409)
-    expect(count.call("entries")).to eq(0)
-    expect(count.call("entry_audits")).to eq(0)
-    expect(count.call("entry_outbox_items")).to eq(0)
-    expect(count.call("idempotency_records")).to eq(0)
-
+    expect(stale.body.with_indifferent_access[:reason]).to eq("stale_generation")
+    expect(timekeeping_row_counts).to eq(empty)
     expect(request_at.call(current).status).to eq(201)
-    expect(count.call("entries")).to eq(1)
-    expect(count.call("idempotency_records")).to eq(1)
+    expect(timekeeping_row_counts).to eq(empty.transform_values { 1 })
   end
 end
 
-RSpec.describe Timekeeping::LocalOwner, "generation fence" do
-  let(:company) { create(:company) }
-  let(:user) { create(:user) }
-  let(:project) { create(:project, client: create(:client, company:)) }
-  let(:written_tables) { %w[entries entry_audits entry_outbox_items idempotency_records] }
+RSpec.describe Timekeeping::LocalOwner do
+  # "The generation check runs before receipt replay, so a retry at an old generation gets 409 even when its earlier answer is stored."
+  %w[employee owner].each do |role|
+    it "a stale retry for an #{role} answers 409 stale_generation instead of the stored receipt and leaves every write table as the first write left it" do
+      old_generation = prepare_local_ownership!.generation
+      company = create(:company)
+      user = timekeeping_member(company, role)
+      project = create(:project, client: create(:client, company:))
+      params = { "idempotency_key" => "merged-stale-retry-#{role}",
+                 "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 1.5,
+                             "note" => "retry", "source" => TimesheetEntry::SOURCES.first, "source_metadata" => {} } }
+      request = lambda do
+        described_class.call(operation: :create, company_id: company.id, generation: old_generation.to_s,
+                             actor: described_class::Actor.user(user_id: user.id, role:), params:)
+      end
 
-  before do
-    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
-    create(:employment, company:, user:)
-    user.add_role("employee", company)
-  end
+      first = request.call
+      expect(first.status).to eq(201)
+      TimekeepingOwnership.current.update!(generation: old_generation + 1)
+      before_retry = timekeeping_row_counts
+      # The baseline must hold the first write, or an unchanged count proves nothing.
+      expect(before_retry).to eq("entries" => 1, "entry_audits" => 1, "idempotency_records" => 1, "entry_outbox_items" => 1)
 
-  def row_counts
-    written_tables.index_with do |table|
-      ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM #{table}").to_i
+      retried = request.call
+
+      expect(retried.status).to eq(409)
+      expect(retried.status).not_to eq(first.status)
+      expect(retried.body.to_h.stringify_keys["reason"].to_s).to eq("stale_generation")
+      expect(timekeeping_row_counts).to eq(before_retry)
+      expect(Timekeeping::LocalEntry.where(company_id: company.id).count).to eq(1)
     end
   end
+end
 
-  def create_at(generation, key)
-    described_class.call(
-      operation: :create, company_id: company.id, generation:,
-      actor: described_class::Actor.user(user_id: user.id, role: "employee"),
-      params: { "idempotency_key" => key,
-                "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 10.0,
-                            "note" => "fenced", "source" => "manual", "source_metadata" => {} } }
+RSpec.describe Timekeeping::LocalOwner, "malformed generation union" do
+  # Merges the malformed inputs of the fence spec with those of local_owner_4
+  # (nil and a 20-digit value that overflows a bigint), so the merge drops neither set.
+  it "a malformed or overflowing generation is refused with 409 and leaves its idempotency key free for the current generation" do
+    stored = prepare_local_ownership!.generation
+    company = create(:company)
+    user = timekeeping_member(company, "employee")
+    project = create(:project, client: create(:client, company:))
+    create_at = lambda do |generation, key|
+      described_class.call(
+        operation: :create, company_id: company.id, generation:,
+        actor: described_class::Actor.user(user_id: user.id, role: "employee"),
+        params: { "idempotency_key" => key,
+                  "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 10.0,
+                              "note" => "fenced", "source" => "manual", "source_metadata" => {} } }
+      )
+    end
+    sent_values = [nil, "", "abc", "1" * 20, " #{stored}", "#{stored}abc", "0#{'0' * 19}#{stored}", "-#{stored}"]
+    before_counts = timekeeping_row_counts
+    expect(before_counts.values).to all(eq(0))
+
+    outcomes = sent_values.each_with_index.map { |sent, index| create_at.call(sent, "fence-union-#{index}") }
+
+    expect(outcomes.map { |outcome| [outcome.status, outcome.body] })
+      .to all(eq([409, { "reason" => "stale_generation" }]))
+    expect(timekeeping_row_counts).to eq(before_counts)
+
+    # A refused attempt must store no receipt, so the same key is written at the stored generation.
+    retried = create_at.call(stored.to_s, "fence-union-0")
+
+    expect(retried.status).to eq(201)
+    expect(timekeeping_row_counts).to eq(
+      "entries" => 1, "entry_audits" => 1, "idempotency_records" => 1, "entry_outbox_items" => 1
     )
   end
+end
 
-  # Each state is sent the generation the row holds, so only the state check
-  # can refuse it.
-  {
-    "the monolith store is legacy" => { owner: "monolith", monolith_store: "legacy", handoff_step: nil },
-    "Timekeeping owns the entries" => { owner: "timekeeping", monolith_store: "prepared", handoff_step: nil },
-    "a handoff step is set" => { owner: "monolith", monolith_store: "prepared", handoff_step: "close_admission" }
-  }.each do |state, attributes|
-    it "answers 409 stale_generation at the stored generation when #{state}" do
-      TimekeepingOwnership.current.update!(attributes)
-      before_counts = row_counts
+RSpec.describe Timekeeping::LocalOwner, "ownership states that admit no generation" do
+  # "It counts only when `Timekeeping::EntryOwner.for(ownership)` returns `:prepared` and `handoff_step` is nil. Any other state, or a missing row, reads as nil, and nil matches no request."
+  # "A stale generation, or any generation while ownership is not prepared or a handoff step is set, gives 409 stale_generation and writes nothing, including a retry whose earlier answer is stored"
+  let(:company) { create(:company) }
+  let(:owner) { timekeeping_member(company, "owner") }
+  let(:project) { create(:project, client: create(:client, company:)) }
+  let(:entry_body) do
+    { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 10.0,
+      "note" => "fenced", "source" => TimesheetEntry::SOURCES.first, "source_metadata" => {} }
+  end
 
-      outcome = create_at(TimekeepingOwnership.current.generation.to_s, "fence-#{state.parameterize}")
+  def create_as_owner(generation, params)
+    described_class.call(operation: :create, company_id: company.id, generation:,
+                         actor: described_class::Actor.user(user_id: owner.id, role: "owner"), params:)
+  end
 
-      expect([outcome.status, outcome.body]).to eq([409, { "reason" => "stale_generation" }])
-      expect(row_counts).to eq(before_counts)
+  # A stored entry, so the counts compared before and after the call are not all zero.
+  def seed_entry
+    Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
+                                    work_date: Date.current, duration: 5.0, note: "seeded", bill_status: "unbilled")
+  end
+
+  states = {
+    "the freeze handoff step" => { owner: "monolith", monolith_store: "prepared", handoff_step: "freeze" },
+    "the close_admission handoff step" => { owner: "monolith", monolith_store: "prepared", handoff_step: "close_admission" },
+    "the legacy monolith store" => { owner: "monolith", monolith_store: "legacy", handoff_step: nil },
+    "the timekeeping owner" => { owner: "timekeeping", monolith_store: "prepared", handoff_step: nil }
+  }
+
+  states.each do |label, state|
+    it "refuses the current generation with 409 stale_generation under #{label} and writes nothing" do
+      seed_entry
+      generation = TimekeepingOwnership.current.generation
+      TimekeepingOwnership.current.update!(state)
+      expect(TimekeepingOwnership.current.reload.attributes.symbolize_keys.slice(*state.keys)).to eq(state)
+      before = timekeeping_row_counts
+      expect(before["entries"]).to eq(1)
+
+      outcome = create_as_owner(generation.to_s, { "idempotency_key" => "fenced-state", "body" => entry_body })
+
+      expect(outcome.status).to eq(409)
+      expect(outcome.body).to eq("reason" => "stale_generation")
+      expect(timekeeping_row_counts).to eq(before)
     end
   end
 
-  it "answers 409 stale_generation when the ownership row is missing, whatever generation is sent" do
-    stored = TimekeepingOwnership.current.generation
-    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).delete_all
-    before_counts = row_counts
+  it "answers stale_generation during a handoff before it judges a missing key or an invalid body" do
+    seed_entry
+    generation = prepare_local_ownership!.generation
+    TimekeepingOwnership.current.update!(handoff_step: "freeze")
+    expect(TimekeepingOwnership.current.reload.handoff_step).to eq("freeze")
+    before = timekeeping_row_counts
+    invalid_requests = [
+      { "body" => { "source" => "not-a-source-#{SecureRandom.hex(4)}" } },
+      { "idempotency_key" => "fenced-key", "body" => { "bill_status" => "not-a-status-#{SecureRandom.hex(4)}" } }
+    ]
 
-    outcomes = [stored.to_s, nil].each_with_index.map { |sent, index| create_at(sent, "fence-missing-#{index}") }
+    outcomes = invalid_requests.map { |params| create_as_owner(generation.to_s, params) }
 
-    expect(outcomes.map(&:status)).to eq([409, 409])
-    expect(row_counts).to eq(before_counts)
+    expect(outcomes.map { |outcome| [outcome.status, outcome.body] })
+      .to all(eq([409, { "reason" => "stale_generation" }]))
+    expect(timekeeping_row_counts).to eq(before)
   end
 
-  it "never admits a generation that is not a plain integer of at most 19 digits" do
-    stored = TimekeepingOwnership.current.generation
-    sent_values = ["", " #{stored}", "#{stored}abc", "0#{'0' * 19}#{stored}", "-#{stored}", "abc"]
-    before_counts = row_counts
+  context "when the ownership row is missing" do
+    sent_generations = {
+      "no generation" => nil, "an empty generation" => "", "a non-numeric generation" => "abc",
+      "a 20-digit generation" => "1" * 20, "the generation stored before the row was deleted" => :stored
+    }
 
-    outcomes = sent_values.each_with_index.map { |sent, index| create_at(sent, "fence-malformed-#{index}") }
+    sent_generations.each do |label, sent|
+      it "refuses #{label} with 409 stale_generation instead of treating the missing row as a match" do
+        seed_entry
+        stored = prepare_local_ownership!.generation
+        TimekeepingOwnership.delete_all
+        expect(TimekeepingOwnership.count).to eq(0)
+        before = timekeeping_row_counts
+        expect(before["entries"]).to eq(1)
 
-    expect(outcomes.map(&:status)).to all(eq(409))
-    expect(row_counts).to eq(before_counts)
+        outcome = create_as_owner(sent == :stored ? stored.to_s : sent,
+                                  { "idempotency_key" => "missing-row", "body" => entry_body })
+
+        expect(outcome.status).to eq(409)
+        expect(outcome.body).to eq("reason" => "stale_generation")
+        expect(timekeeping_row_counts).to eq(before)
+      end
+    end
+  end
+end
+
+RSpec.describe Timekeeping::LocalOwner, "stale generation on bulk routes" do
+  # "On bulk routes a stale generation fails the whole request."
+  let(:company) { create(:company) }
+  let(:owner) { timekeeping_member(company, "owner") }
+  let(:project) { create(:project, client: create(:client, company:)) }
+  let(:other_project) { create(:project, client: create(:client, company:)) }
+
+  # Each row sends a generation one away from the stored one, newer or older.
+  routes = {
+    bulk_delete: { offset: 1, body: ->(_spec) { {} } },
+    bulk_move: { offset: -1, body: ->(spec) { { "project_id" => spec.other_project.id } } }
+  }
+
+  routes.each do |operation, route|
+    it "fails a whole #{operation} at a stale generation and changes none of the listed entries" do
+      stored = prepare_local_ownership!.generation
+      entries = Array.new(2) do |index|
+        Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
+                                        work_date: Date.current, duration: 1.0 + index, note: "bulk", bill_status: "unbilled")
+      end
+      attributes_before = entries.map { |entry| entry.reload.attributes }
+      before = timekeeping_row_counts
+      expect(before["entries"]).to eq(2)
+
+      outcome = described_class.call(
+        operation:, company_id: company.id, generation: (stored + route[:offset]).to_s,
+        actor: described_class::Actor.user(user_id: owner.id, role: "owner"),
+        params: { "idempotency_key" => "stale-#{operation}",
+                  "body" => route[:body].call(self).merge("entry_ids" => entries.map(&:id)) }
+      )
+
+      expect(outcome.status).to eq(409)
+      expect(outcome.body.with_indifferent_access[:reason].to_s).to eq("stale_generation")
+      expect(entries.map { |entry| entry.reload.attributes }).to eq(attributes_before)
+      expect(entries.map(&:discarded_at)).to all(be_nil)
+      expect(timekeeping_row_counts).to eq(before)
+    end
   end
 end
