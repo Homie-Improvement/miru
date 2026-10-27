@@ -270,6 +270,8 @@ RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "stored data" do
     proof_metadata = { "scores" => [BigDecimal("0.30000000000000000004")] }
     snapshot = correction_snapshot_for(entry_id).merge("source_metadata" => source_metadata, "proof_metadata" => proof_metadata)
     described_class.write!(snapshots: [snapshot], version: 1, generation: 2)
+    # The relay offers correction snapshots once the handoff flip admits their generation.
+    Timekeeping::Admission.admit!(generation: 2)
 
     position = OutboxSnapshot.where(id: entry_id, generation: 2).sole.outbox_position
     row = Timekeeping::RelayOutboxSource.new.unsent_after(position - 1, 1).sole
@@ -416,6 +418,8 @@ RSpec.describe Timekeeping::Handoff::CorrectionSnapshots, "stored data" do
     snapshot = correction_snapshot_for(entry_id).merge("source_metadata" => deepest)
 
     expect(described_class.write!(snapshots: [snapshot], version: 1, generation: 2)).to eq(1)
+    # The relay offers correction snapshots once the handoff flip admits their generation.
+    Timekeeping::Admission.admit!(generation: 2)
 
     parsed = []
     result = TimekeepingRelay::Relay.new(source: Timekeeping::RelayOutboxSource.new,
