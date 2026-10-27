@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "rails_helper"
 require_relative "../../../../../support/timekeeping/fake_timekeeping"
 
@@ -406,7 +408,7 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkAction forwarded stale move", type:
 
     # "A forwarded stale bulk move gives 409, and the fake shows no moves."
     send_request :patch, api_v1_bulk_action_path,
-      params: { ids: entries.map { |entry| entry["id"] }, project_id: stale_target_project.id },
+      params: { ids: entries.pluck("id"), project_id: stale_target_project.id },
       headers: auth_headers(stale_admin)
 
     expect(response).to have_http_status(:conflict)
@@ -463,7 +465,7 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkAction handoff refusal", type: :req
     expect(response).to have_http_status(:service_unavailable)
     expect(json_response["reason"]).to eq("ownership_moving")
     expect(handoff_fake.stored_entry(forwarded_entry["id"])["discarded_at"]).to be_nil
-    expect(handoff_fake.requests.map { |request| request[:path] }).not_to include(a_string_ending_with("/bulk-delete"))
+    expect(handoff_fake.requests.pluck(:path)).not_to include(a_string_ending_with("/bulk-delete"))
   end
 end
 
