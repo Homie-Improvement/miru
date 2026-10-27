@@ -70,37 +70,6 @@ RSpec.describe Timekeeping::ServiceCommandClient do
 end
 
 RSpec.describe Timekeeping::ServiceCommandClient do
-  let(:detach_route_base_url) { "http://timekeeping.test" }
-
-  it "detach-entries route accepts the client's service token only for the company it was minted for" do
-    fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
-    route_timekeeping_to_fake(fake, base_url: detach_route_base_url)
-    own_token = nil
-    stub_request(:post, %r{/v1/companies/555/agents/9/detach-entries}).to_return do |request|
-      own_token = request.headers["Authorization"].to_s
-      { status: 200, body: { detached: 0 }.to_json, headers: { "Content-Type" => "application/json" } }
-    end
-
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
-      detached = described_class.new(base_url: detach_route_base_url).detach_agent_entries(
-        company_id: 4242, agent_id: 9, generation: 1, operation_id: SecureRandom.uuid, request_id: "req-route-1"
-      )
-      expect(detached).to eq(0)
-
-      described_class.new(base_url: detach_route_base_url).detach_agent_entries(
-        company_id: 555, agent_id: 9, generation: 1, operation_id: SecureRandom.uuid, request_id: "req-route-2"
-      )
-    end
-
-    # "The forwarded call uses a token bound to the agent's company that grants only agents.detach_entries, never TIMEKEEPING_SERVICE_TOKEN"
-    # A token minted for company 555 must not open company 4242's detach route.
-    answer = fake.call("POST", "/v1/companies/4242/agents/9/detach-entries",
-                       headers: { "Authorization" => own_token }, body: { "operation_id" => SecureRandom.uuid, "generation" => 1 })
-    expect(answer.status).to eq(404)
-  end
-end
-
-RSpec.describe Timekeeping::ServiceCommandClient do
   # "A refusal or failure raises, which aborts the agent destroy and the user or company destroy that cascades into it"
   it "returns zero for a detach that found no entries and raises for a success answer without a detached count" do
     base_url = "http://timekeeping-commands.test"

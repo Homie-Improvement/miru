@@ -21,6 +21,16 @@ module Timekeeping
     SUBJECT = "miru-monolith"
     REQUIRED_CLAIMS = %w[typ sub company_id operations exp jti].freeze
 
+    # The claim shapes Timekeeping's own verifier
+    # (timekeeping/lib/timekeeping/service_token_verifier.rb) accepts, so a
+    # token it would refuse is refused here too.
+    CLAIM_RULES = {
+      "typ" => ->(value) { value == TYPE },
+      "sub" => ->(value) { value.is_a?(String) && !value.empty? },
+      "company_id" => ->(value) { value.is_a?(Integer) },
+      "operations" => ->(value) { value.is_a?(Array) && value.all?(String) }
+    }.freeze
+
     # The operation name Timekeeping requires on the detach-entries route.
     DETACH_ENTRIES = "agents.detach_entries"
 
@@ -57,7 +67,9 @@ module Timekeeping
         verify_expiration: true,
         leeway: 0
       )
-      raise InvalidTokenError, "invalid Timekeeping service token" unless payload["typ"] == TYPE
+      unless CLAIM_RULES.all? { |claim, valid| valid.call(payload[claim]) }
+        raise InvalidTokenError, "invalid Timekeeping service token"
+      end
 
       claims_from(payload)
     rescue JWT::DecodeError, OpenSSL::PKey::PKeyError
@@ -74,7 +86,7 @@ module Timekeeping
       Claims.new(
         subject: payload.fetch("sub"),
         company_id: payload.fetch("company_id"),
-        operations: Array(payload.fetch("operations")),
+        operations: payload.fetch("operations"),
         jti: payload.fetch("jti"),
         expires_at: Time.zone.at(payload.fetch("exp"))
       )

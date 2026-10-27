@@ -8,8 +8,9 @@ RSpec.describe Timekeeping::ServiceToken do
   # "It carries `typ: \"timekeeping_service\"`, a string `sub`, the agent's integer `company_id`, and `operations: [\"agents.detach_entries\"]`."
   # "The token's operations are exactly `[\"agents.detach_entries\"]`, each one is in `BACKGROUND_OPERATIONS`, and the fake refuses a token naming `detach_entries`."
   it "mints a detach token whose operations are exactly agents.detach_entries and all background operations" do
+    now = Time.current
     token = described_class.mint(company_id: 7, operations: [described_class::DETACH_ENTRIES],
-                                 private_key: timekeeping_key_pair)
+                                 private_key: timekeeping_key_pair, now:)
 
     payload, header = JWT.decode(token, timekeeping_key_pair.public_key, true, algorithm: "RS256")
 
@@ -21,6 +22,7 @@ RSpec.describe Timekeeping::ServiceToken do
     expect(payload["operations"]).to eq(["agents.detach_entries"])
     expect(payload["operations"] - TimekeepingRules::EntryRules::BACKGROUND_OPERATIONS).to be_empty
     expect(payload["exp"] - payload["iat"]).to be <= Timekeeping::UserToken::TTL.to_i
+    expect(payload["exp"] - now.to_i).to be_between(1, 60)
     expect(payload["jti"]).to be_present
     expect(payload).not_to have_key("role")
   end
@@ -42,28 +44,6 @@ RSpec.describe Timekeeping::ServiceToken do
 
     expect { described_class.verify(forged, public_key: timekeeping_key_pair.public_key) }.to raise_error(StandardError)
     expect(described_class.verify(genuine, public_key: timekeeping_key_pair.public_key).company_id).to eq(7)
-  end
-end
-
-RSpec.describe Timekeeping::ServiceToken do
-  # "It carries `typ: \"timekeeping_service\"`, a string `sub`, the agent's integer `company_id`, and `operations: [\"agents.detach_entries\"]`."
-  # "The token's operations are exactly `[\"agents.detach_entries\"]`, each one is in `BACKGROUND_OPERATIONS`, and the fake refuses a token naming `detach_entries`."
-  it "mints an RS256 timekeeping_service token whose detach operations are exactly agents.detach_entries and all background operations" do
-    now = Time.zone.parse("2026-03-01 10:00:00")
-    token = described_class.mint(company_id: 7, operations: [described_class::DETACH_ENTRIES],
-                                 private_key: timekeeping_key_pair, now:)
-
-    claims, header = JWT.decode(token, timekeeping_key_pair.public_key, false)
-
-    expect(header["alg"]).to eq("RS256")
-    expect(claims["typ"]).to eq("timekeeping_service")
-    expect(claims["company_id"]).to eq(7)
-    expect(claims["company_id"]).to be_a(Integer)
-    expect(claims["sub"]).to be_a(String).and(be_present)
-    expect(claims["operations"]).to eq(["agents.detach_entries"])
-    expect(claims["operations"] - TimekeepingRules::EntryRules::BACKGROUND_OPERATIONS).to be_empty
-    expect(claims["jti"]).to be_present
-    expect(claims["exp"] - now.to_i).to be_between(1, 60)
   end
 end
 
@@ -107,6 +87,25 @@ RSpec.describe Timekeeping::ServiceToken do
 
       expect { described_class.verify(user_typed, public_key: timekeeping_key_pair.public_key) }
         .to raise_error(described_class::InvalidTokenError)
+    end
+
+    it "refuses a signed token whose claims have a shape Timekeeping's verifier rejects" do
+      now = Time.current.to_i
+      valid = { typ: "timekeeping_service", sub: "miru-monolith", company_id: 7,
+                operations: [described_class::DETACH_ENTRIES], iat: now, exp: now + 60, jti: SecureRandom.uuid }
+      malformed = [
+        valid.merge(operations: described_class::DETACH_ENTRIES),
+        valid.merge(operations: [described_class::DETACH_ENTRIES, 1]),
+        valid.merge(sub: ""),
+        valid.merge(sub: 1),
+        valid.merge(company_id: "7")
+      ]
+
+      malformed.each do |payload|
+        token = JWT.encode(payload, timekeeping_key_pair, "RS256")
+        expect { described_class.verify(token, public_key: timekeeping_key_pair.public_key) }
+          .to raise_error(described_class::InvalidTokenError)
+      end
     end
 
     it "returns the company and operations that a genuine token names" do

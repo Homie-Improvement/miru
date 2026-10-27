@@ -174,59 +174,6 @@ RSpec.describe Agent, type: :model do
   end
 end
 
-RSpec.describe Agent, "forwarded detach company binding" do
-  let(:tenant_base_url) { "http://timekeeping.test" }
-  let(:tenant_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-
-  around do |example|
-    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, tenant_base_url) do
-      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
-    end
-  end
-
-  it "forwards the detach with a token and path bound to the agent's company when its user also works at another company" do
-    agent_company = create(:company)
-    other_company = create(:company)
-    user = create(:user, current_workspace_id: other_company.id)
-    create(:employment, company: agent_company, user:)
-    create(:employment, company: other_company, user:)
-    agent = create(:agent, company: agent_company, user:)
-    route_timekeeping_to_fake(tenant_fake, base_url: tenant_base_url)
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2,
-                                                                                handoff_step: nil)
-    tenant_fake.generation = 2
-
-    agent.destroy!
-
-    detach = tenant_fake.requests.find { |request| request[:method] == "POST" }
-    # "The forwarded call uses a token bound to the agent's company that grants only agents.detach_entries, never TIMEKEEPING_SERVICE_TOKEN"
-    expect(detach[:path]).to eq("/v1/companies/#{agent_company.id}/agents/#{agent.id}/detach-entries")
-    claims = Timekeeping::ServiceToken.verify(detach[:headers]["Authorization"].delete_prefix("Bearer "),
-                                              public_key: timekeeping_key_pair.public_key)
-    expect(claims.company_id).to eq(agent_company.id)
-    expect(claims.company_id).not_to eq(other_company.id)
-    expect(claims.operations).to eq(["agents.detach_entries"])
-    expect(Agent.where(id: agent.id)).not_to exist
-  end
-end
-
-RSpec.describe Agent, "legacy detach scope" do
-  it "a legacy detach clears only the destroyed agent's entries and leaves another company's agent entries attached" do
-    agent = create(:agent)
-    other_agent = create(:agent)
-    project = create(:project, client: create(:client, company: agent.company))
-    other_project = create(:project, client: create(:client, company: other_agent.company))
-    entry = create(:timesheet_entry, project:, user: agent.user, agent:)
-    other_entry = create(:timesheet_entry, project: other_project, user: other_agent.user, agent: other_agent)
-
-    agent.destroy!
-
-    # "The legacy branch nullifies `agent_id` on the agent's entries under `SET LOCAL miru.writer = 'legacy_gateway'`."
-    expect(entry.reload.agent_id).to be_nil
-    expect(other_entry.reload.agent_id).to eq(other_agent.id)
-  end
-end
-
 RSpec.describe Agent, "destroy while Timekeeping owns entries" do
   let(:forwarded_base_url) { "http://timekeeping-detach.test" }
   let(:shared_service_token) { "shared-service-token-#{SecureRandom.hex(8)}" }
@@ -307,10 +254,14 @@ RSpec.describe Agent, "legacy destroy scope" do
     agent = create(:agent)
     company = agent.company
     sibling = create(:agent, company:, user: agent.user, name: "Sibling Agent")
+    other_company_agent = create(:agent)
     key = create(:agent_key, agent:)
     project = create(:project, client: create(:client, company:))
+    other_project = create(:project, client: create(:client, company: other_company_agent.company))
     detached = create(:timesheet_entry, project:, user: agent.user, agent:)
     kept = create(:timesheet_entry, project:, user: agent.user, agent: sibling)
+    other_company_entry = create(:timesheet_entry, project: other_project, user: other_company_agent.user,
+                                                   agent: other_company_agent)
 
     agent.destroy!
 
@@ -318,6 +269,7 @@ RSpec.describe Agent, "legacy destroy scope" do
     expect(AgentKey.exists?(key.id)).to be(false)
     expect(TimesheetEntry.unscoped.find(detached.id).agent_id).to be_nil
     expect(TimesheetEntry.unscoped.find(kept.id).agent_id).to eq(sibling.id)
+    expect(TimesheetEntry.unscoped.find(other_company_entry.id).agent_id).to eq(other_company_agent.id)
     expect(Agent.exists?(sibling.id)).to be(true)
   end
 end
