@@ -366,127 +366,6 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   include RunnerLegacyHandoffSpecSupport
 
   # "A fresh-runner restart after corrections and after checkpoint is recorded, with the clock advanced, ends with per-company counts and checksums equal to an uninterrupted control run and keeps the saved capture time."
-  it "a fresh runner restarted a day later after the recorded checkpoint ends with the uninterrupted control's full digest and keeps the saved capture time" do
-    captured_at = Time.utc(2026, 10, 27, 12)
-    later = captured_at + 1.day
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
-    report_root = Dir.mktmpdir("handoff-resume-after-checkpoint")
-
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:, clock: Struct.new(:now).new(captured_at),
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    expect(TimekeepingOwnership.current.handoff_step).to eq("checkpoint")
-
-    described_class.run(direction: :cutover, owners: handoff_owners(timekeeping), report_root:,
-                        clock: Struct.new(:now).new(later))
-
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
-    saved = Timekeeping::Handoff::ReportDirectory.new(root: report_root, generation: 2).read_checkpoint
-    expect(saved.fetch(:captured_at)).to eq(captured_at)
-    expect(saved.fetch(:captured_at)).not_to eq(later)
-
-    control = uninterrupted_control(captured_at:)
-    digest = timekeeping.export_checkpoint.digest
-    expect(digest).to eq(control.fetch(:load).digest)
-    seeded = Company.pluck(:id).map(&:to_s)
-    expect(seeded).not_to be_empty
-    %w[entries reservations entry_audits].each do |table|
-      expect(digest.fetch(table).keys.map(&:to_s)).to match_array(seeded), "#{table} misses a seeded company"
-    end
-    %w[invoice_operations idempotency_records].each { |table| expect(digest.fetch(table)).to eq({}) }
-
-    control_ids = control.fetch(:corrections).map { |correction| RunnerLegacyHandoffSpecTimekeeping.entry_id_of(correction) }
-    expect(control_ids).not_to be_empty
-    expect(correction_entry_ids(timekeeping)).to match_array(control_ids)
-    expect(timekeeping.corrections.pluck("generation").uniq).to eq([2])
-    expect(timekeeping.corrections.pluck("version").uniq).to eq([1])
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-
-  # "A fresh-runner restart after corrections and after checkpoint is recorded, with the clock advanced, ends with per-company counts and checksums equal to an uninterrupted control run and keeps the saved capture time."
-  it "a fresh runner restarted a day later after corrections were written ends with the uninterrupted control's full digest and keeps the saved capture time" do
-    captured_at = Time.utc(2026, 10, 27, 12)
-    later = captured_at + 1.day
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
-    report_root = Dir.mktmpdir("handoff-resume-after-corrections")
-
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:, clock: Struct.new(:now).new(captured_at),
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_corrections))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    expect(TimekeepingOwnership.current.handoff_step).to eq("freeze")
-
-    described_class.run(direction: :cutover, owners: handoff_owners(timekeeping), report_root:,
-                        clock: Struct.new(:now).new(later))
-
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
-    saved = Timekeeping::Handoff::ReportDirectory.new(root: report_root, generation: 2).read_checkpoint
-    expect(saved.fetch(:captured_at)).to eq(captured_at)
-    expect(saved.fetch(:captured_at)).not_to eq(later)
-
-    control = uninterrupted_control(captured_at:)
-    digest = timekeeping.export_checkpoint.digest
-    expect(digest).to eq(control.fetch(:load).digest)
-    seeded = Company.pluck(:id).map(&:to_s)
-    expect(seeded).not_to be_empty
-    %w[entries reservations entry_audits].each do |table|
-      expect(digest.fetch(table).keys.map(&:to_s)).to match_array(seeded), "#{table} misses a seeded company"
-    end
-    %w[invoice_operations idempotency_records].each { |table| expect(digest.fetch(table)).to eq({}) }
-
-    # The restart re-runs the checkpoint step and writes the corrections again;
-    # each corrected entry must still hold exactly one correction.
-    control_ids = control.fetch(:corrections).map { |correction| RunnerLegacyHandoffSpecTimekeeping.entry_id_of(correction) }
-    expect(control_ids).not_to be_empty
-    expect(correction_entry_ids(timekeeping)).to match_array(control_ids)
-    expect(timekeeping.corrections.pluck("generation").uniq).to eq([2])
-    expect(timekeeping.corrections.pluck("version").uniq).to eq([1])
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-
-  # "A fresh-runner restart after corrections and after checkpoint is recorded, with the clock advanced, ends with per-company counts and checksums equal to an uninterrupted control run and keeps the saved capture time."
-  # The restart examples compare against the derived control; this example ties
-  # that control to a real run that was never interrupted.
-  it "an uninterrupted first cutover at a fixed capture time ends with the derived control's full digest and corrections" do
-    captured_at = Time.utc(2026, 10, 27, 12)
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    report_root = Dir.mktmpdir("handoff-uninterrupted-control")
-
-    described_class.run(direction: :cutover, owners: handoff_owners(timekeeping), report_root:,
-                        clock: Struct.new(:now).new(captured_at))
-
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
-    expect(Timekeeping::Handoff::ReportDirectory.new(root: report_root, generation: 2).read_checkpoint.fetch(:captured_at))
-      .to eq(captured_at)
-
-    control = uninterrupted_control(captured_at:)
-    digest = timekeeping.export_checkpoint.digest
-    expect(digest).to eq(control.fetch(:load).digest)
-    seeded = Company.pluck(:id).map(&:to_s)
-    expect(seeded).not_to be_empty
-    %w[entries reservations entry_audits].each do |table|
-      expect(digest.fetch(table).keys.map(&:to_s)).to match_array(seeded), "#{table} misses a seeded company"
-    end
-
-    control_ids = control.fetch(:corrections).map { |correction| RunnerLegacyHandoffSpecTimekeeping.entry_id_of(correction) }
-    expect(control_ids).not_to be_empty
-    expect(correction_entry_ids(timekeeping)).to match_array(control_ids)
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-
-  # "A fresh-runner restart after corrections and after checkpoint is recorded, with the clock advanced, ends with per-company counts and checksums equal to an uninterrupted control run and keeps the saved capture time."
   it "a fresh runner restarted a day later after the recorded checkpoint ends with the uninterrupted control's full per-company digest and keeps the saved capture time" do
     captured_at = Time.utc(2026, 10, 27, 12)
     later = captured_at + 1.day
@@ -519,6 +398,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     expect(control_ids).not_to be_empty
     expect(correction_entry_ids(timekeeping)).to match_array(control_ids)
     expect(timekeeping.corrections.pluck("generation").uniq).to eq([2])
+    expect(timekeeping.corrections.pluck("version").uniq).to eq([1])
 
     saved = Timekeeping::Handoff::ReportDirectory.new(root: report_root, generation: 2).read_checkpoint
     expect(saved.fetch(:captured_at)).to eq(captured_at)
@@ -564,6 +444,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     expect(correction_entry_ids(timekeeping)).to match_array(control_ids)
     expect(correction_entry_ids(timekeeping).tally.values.uniq).to eq([1])
     expect(timekeeping.corrections.pluck("generation").uniq).to eq([2])
+    expect(timekeeping.corrections.pluck("version").uniq).to eq([1])
 
     saved = Timekeeping::Handoff::ReportDirectory.new(root: report_root, generation: 2).read_checkpoint
     expect(saved.fetch(:captured_at)).to eq(captured_at)
@@ -580,18 +461,23 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   it "an uninterrupted first cutover at a fixed capture time ends with the derived control's full per-company digest and corrections" do
     captured_at = Time.utc(2026, 10, 27, 12)
     timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
+    report_root = Dir.mktmpdir("handoff-report")
 
-    described_class.run(direction: :cutover, owners: handoff_owners(timekeeping), report_root: Dir.mktmpdir("handoff-report"),
+    described_class.run(direction: :cutover, owners: handoff_owners(timekeeping), report_root:,
                         clock: Struct.new(:now).new(captured_at))
 
     expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
+    expect(Timekeeping::Handoff::ReportDirectory.new(root: report_root, generation: 2).read_checkpoint.fetch(:captured_at))
+      .to eq(captured_at)
     control = uninterrupted_control(captured_at:)
     digest = timekeeping.export_checkpoint.digest
     expect(digest).to eq(control.fetch(:load).digest)
-    expect(digest.fetch("entries").keys).to match_array(Company.pluck(:id))
-    expect(digest.fetch("entries")).not_to be_empty
+    seeded = Company.pluck(:id)
+    expect(seeded).not_to be_empty
+    %w(entries reservations entry_audits).each { |table| expect(digest.fetch(table).keys).to match_array(seeded) }
 
     control_ids = control.fetch(:corrections).map { |snapshot| RunnerLegacyHandoffSpecTimekeeping.entry_id_of(snapshot) }
+    expect(control_ids).not_to be_empty
     expect(control_ids).to match_array(recorded_unlocked_entry_ids)
     expect(correction_entry_ids(timekeeping)).to match_array(control_ids)
   end
