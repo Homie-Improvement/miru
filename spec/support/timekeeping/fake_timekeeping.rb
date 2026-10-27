@@ -333,8 +333,10 @@ module TimekeepingContract
         when "destroy" then destroy_entry(company_id, acting, params, headers)
         when "show" then show_entry(company_id, params)
         when "index" then list_entries(company_id, params)
-        when "bulk_move" then bulk_change(company_id, body, "moved") { |entry| entry.merge("project_id" => body["project_id"]) }
-        when "bulk_delete" then bulk_change(company_id, body, "deleted") { |entry| entry.merge("discarded_at" => now) }
+        when "bulk_move"
+          bulk_change(company_id, acting, body, action: :move, result: "moved") { |entry| entry.merge("project_id" => body["project_id"]) }
+        when "bulk_delete"
+          bulk_change(company_id, acting, body, action: :delete, result: "deleted") { |entry| entry.merge("discarded_at" => now) }
         end
       end
 
@@ -410,10 +412,7 @@ module TimekeepingContract
         decision = TimekeepingRules::EntryRules.change_decision(
           caller: TimekeepingRules::EntryRules::USER_DELEGATED, change: { action:, bill_status: },
           role: acting["role"], primary_role: acting["primary_role"], acting_user_id: acting["id"],
-          entry: {
-            id: entry["id"], user_id: entry["user_id"], bill_status: entry["bill_status"], locked: entry["locked"],
-            work_date: entry["work_date"].nil? ? nil : Date.iso8601(entry["work_date"].to_s)
-          },
+          entry: entry_rule_facts(entry),
           edit_days: @companies.fetch(company_id).fetch("edit_days"), today: Date.current
         )
         Wire.error(@entry_contract, decision.to_s) unless decision == :ok
@@ -436,17 +435,49 @@ module TimekeepingContract
         respond(200, "entries" => entries.map { |entry| present(entry) })
       end
 
-      def bulk_change(company_id, body, result)
+      # Every visible entry is decided before any is written, as
+      # Timekeeping::EntryWriter#bulk_change does, so a refused request writes
+      # nothing. A skipped entry is reported as not_found, the contract having
+      # no other result for it.
+      def bulk_change(company_id, acting, body, action:, result:)
         if body.key?("project_id") && @projects[integer(body["project_id"])] != company_id
           return Wire.error(@entry_contract, "not_found")
         end
 
+        entries = Array(body["entry_ids"]).filter_map { |entry_id| visible_entry(entry_id, company_id) }.uniq { |entry| entry["id"] }
+        decision = bulk_rules_decision(company_id, acting, entries, action:)
+        return Wire.error(@entry_contract, "forbidden") if decision == :forbidden
+
+        applied = entries.select { |entry| decision.fetch(entry["id"]) == :apply }
+        applied.each { |entry| write_entry(yield(entry)) }
+        applied_ids = applied.pluck("id")
         results = Array(body["entry_ids"]).map do |entry_id|
-          entry = visible_entry(entry_id, company_id)
-          write_entry(yield(entry)) if entry
-          { "entry_id" => entry_id, "result" => entry ? result : "not_found" }
+          { "entry_id" => entry_id, "result" => applied_ids.include?(integer(entry_id)) ? result : "not_found" }
         end
         respond(200, "results" => results)
+      end
+
+      # The shared bulk rules (A9) Timekeeping applies, decided on the token's
+      # role and primary role. Only token mode applies them, as change_refusal
+      # does: an opaque token carries no primary role, so every visible entry
+      # is applied.
+      def bulk_rules_decision(company_id, acting, entries, action:)
+        return entries.to_h { |entry| [entry["id"], :apply] } unless @token_public_key
+
+        TimekeepingRules::EntryRules.bulk_decision(
+          caller: TimekeepingRules::EntryRules::USER_DELEGATED, change: { action: },
+          role: acting["role"], primary_role: acting["primary_role"], acting_user_id: acting["id"],
+          entries: entries.map { |entry| entry_rule_facts(entry) },
+          edit_days: @companies.fetch(company_id).fetch("edit_days"), today: Date.current
+        )
+      end
+
+      # The entry facts the shared rules read, from a stored entry.
+      def entry_rule_facts(entry)
+        {
+          id: entry["id"], user_id: entry["user_id"], bill_status: entry["bill_status"], locked: entry["locked"],
+          work_date: entry["work_date"].nil? ? nil : Date.iso8601(entry["work_date"].to_s)
+        }
       end
 
       # Returns [user id] or [nil, error response] for the body's user_id.
