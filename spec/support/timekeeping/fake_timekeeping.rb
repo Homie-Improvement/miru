@@ -203,6 +203,10 @@ module TimekeepingContract
       @projects[id] = company_id
     end
 
+    def register_agent(id:, company_id:, user_id:)
+      @agents[id] = { "company_id" => company_id, "user_id" => user_id }
+    end
+
     def add_agent(company_id:, user_id:)
       next_id.tap { |id| @agents[id] = { "company_id" => company_id, "user_id" => user_id } }
     end
@@ -342,7 +346,8 @@ module TimekeepingContract
         fields = entry_fields(body).merge("user_id" => user_id)
         return Wire.error(@entry_contract, "not_found") unless agent_owned?(company_id, fields)
 
-        entry = write_entry(new_entry(company_id, fields))
+        review_status = TimekeepingRules::EntryRules.created_review_status(agent_id: fields["agent_id"])
+        entry = write_entry(new_entry(company_id, fields).merge("review_status" => review_status))
         respond(201, present(entry))
       end
 
@@ -717,6 +722,10 @@ module TimekeepingContract
           end
           if @policies[:service_command_writes].call(route: "detach_entries")
             entries.each { |entry| write_entry(entry.merge("agent_id" => nil)) }
+            # The agent is being deleted, so a create that arrives after the
+            # detach, such as one whose caller timed out, answers not_found
+            # through the agent_owner rule, as Timekeeping refuses it.
+            @agents.delete(agent_id) if @agents[agent_id]&.fetch("company_id") == company_id
           end
           respond(200, "detached" => entries.size)
         end

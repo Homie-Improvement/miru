@@ -77,6 +77,34 @@ class TimesheetEntry < ApplicationRecord
   scope :search_import, -> { includes(:project, :client, :user) }
 
 
+  # The source and source_metadata a save stores for the given values: the
+  # metadata sliced to SOURCE_METADATA_KEYS with blank values dropped, and the
+  # source inferred from it. A write forwarded to another store sends these,
+  # so it records the same origin a save would.
+  def self.normalized_source_fields(source:, source_metadata:)
+    metadata = normalized_source_metadata(source_metadata)
+    { "source" => inferred_source(source, metadata), "source_metadata" => metadata }
+  end
+
+  def self.normalized_source_metadata(source_metadata)
+    return {} unless source_metadata.is_a?(Hash)
+
+    source_metadata.deep_stringify_keys
+      .slice(*SOURCE_METADATA_KEYS)
+      .transform_values { |value| value.to_s.strip.presence&.slice(0, SOURCE_METADATA_MAX_LENGTH) }
+      .compact_blank
+  end
+
+  def self.inferred_source(source, metadata)
+    return "import" if source.to_s.downcase == "import"
+    return "mcp" if metadata["mcp_server"].present?
+    return "automation" if metadata["tool"].present?
+
+    normalized_source = (source.to_s.presence || "manual").downcase
+    SOURCES.include?(normalized_source) ? normalized_source : "manual"
+  end
+  private_class_method :normalized_source_metadata, :inferred_source
+
   def snippet
     {
       id:,
@@ -205,25 +233,13 @@ class TimesheetEntry < ApplicationRecord
     end
 
     def normalize_source_fields
-      self.source_metadata = normalized_source_metadata
-      self.source = inferred_source
+      fields = self.class.normalized_source_fields(source:, source_metadata:)
+      self.source_metadata = fields["source_metadata"]
+      self.source = fields["source"]
     end
 
     def normalize_proof_metadata
       self.proof_metadata = normalized_proof_metadata
-    end
-
-    def normalized_source_metadata
-      return {} unless source_metadata.is_a?(Hash)
-
-      source_metadata.deep_stringify_keys
-        .slice(*SOURCE_METADATA_KEYS)
-        .transform_values { |value| normalized_source_metadata_value(value) }
-        .compact_blank
-    end
-
-    def normalized_source_metadata_value(value)
-      value.to_s.strip.presence&.slice(0, SOURCE_METADATA_MAX_LENGTH)
     end
 
     def normalized_proof_metadata
@@ -246,15 +262,5 @@ class TimesheetEntry < ApplicationRecord
       else
         value.to_s.strip.presence&.slice(0, PROOF_METADATA_MAX_LENGTH)
       end
-    end
-
-    def inferred_source
-      return "import" if source.to_s.downcase == "import"
-      return "mcp" if source_metadata["mcp_server"].present?
-      return "automation" if source_metadata["tool"].present?
-
-      normalized_source = source.to_s.presence || "manual"
-      normalized_source = normalized_source.downcase
-      SOURCES.include?(normalized_source) ? normalized_source : "manual"
     end
 end
