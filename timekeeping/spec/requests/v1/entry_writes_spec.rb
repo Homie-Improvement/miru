@@ -474,3 +474,145 @@ RSpec.describe "Entry write routes", "agent ownership" do
     expect(Entry.find(deleted).discarded_at).not_to be_nil
   end
 end
+
+RSpec.describe "Entry write routes, replay-only delete" do
+  include_context "timekeeping entry writes"
+  include_context "timekeeping entry writes without transactional fixtures"
+
+  let(:company) { timekeeping_arrange.company }
+  let(:project) { timekeeping_arrange.project(company:) }
+  let(:owner) { timekeeping_arrange.user(company:, role: "owner") }
+  let(:admin) { timekeeping_arrange.user(company:, role: "admin") }
+  let(:employee) { timekeeping_arrange.user(company:, role: "employee") }
+  let(:replay_not_found) { [404, { "reason" => "not_found" }] }
+
+  # company_id lets a caller of another company send its own token to its own
+  # company's URL; a token whose company differs from the URL is refused
+  # before the receipt lookup runs, so that request would prove nothing.
+  def replay_only_delete_request(entry_id, token, key:, company_id: company, replay_only: true, if_match: "replay-only")
+    headers = { "Authorization" => "Bearer #{token}", "Idempotency-Key" => key,
+                "Ownership-Generation" => timekeeping_arrange.current_generation.to_s, "If-Match" => if_match }
+    headers["Idempotency-Replay"] = "only" if replay_only
+    delete "/v1/companies/#{company_id}/entries/#{entry_id}", headers: headers.compact
+    response
+  end
+
+  # "Address this in follow-up design work with an authenticated replay path; do not treat every missing entry as a successful delete."
+  # "Replaying it needs a separate design that keeps the lookup-then-authorize order, and nothing is deleted twice meanwhile."
+  it "answers an admin's replay-only DELETE of a colleague's kept entry with no receipt as not found and writes nothing" do
+    entry_id = timekeeping_arrange.entry(company:, user: employee, project:)
+    before = entry_write_counts
+
+    answer = replay_only_delete_request(entry_id, timekeeping_arrange.token_for(admin), key: SecureRandom.uuid,
+                                                                                       if_match: nil)
+
+    expect([answer.status, answer.parsed_body]).to eq(replay_not_found)
+    expect(Entry.find(entry_id).discarded_at).to be_nil
+    expect(entry_write_counts).to eq(before)
+  end
+
+  it "answers a replay-only delete with no stored receipt with not_found and changes no entry, audit, outbox or receipt row" do
+    entry_id = timekeeping_arrange.entry(company:, user: employee, project:)
+    token = timekeeping_arrange.token_for(owner)
+    before = entry_write_counts
+    expect(before).to include(entries: 1, idempotency_receipts: 0)
+
+    ["replay-only", nil].each do |if_match|
+      answer = replay_only_delete_request(entry_id, token, key: SecureRandom.uuid, if_match:)
+
+      expect([answer.status, answer.parsed_body]).to eq(replay_not_found), "If-Match #{if_match.inspect}"
+      expect(entry_write_counts).to eq(before)
+      expect(Entry.find(entry_id).discarded_at).to be_nil
+    end
+  end
+
+  # "Allow delete retries to reach the stored answer."
+  it "answers an owner's replay-only delete retry with the first delete's stored answer and writes nothing more" do
+    entry_id = timekeeping_arrange.entry(company:, user: employee, project:)
+    token = timekeeping_arrange.token_for(owner)
+    key = SecureRandom.uuid
+    first = replay_only_delete_request(entry_id, token, key:, replay_only: false, if_match: nil)
+    first_status = first.status
+    first_body = first.parsed_body
+    after_first = entry_write_counts
+
+    replay = replay_only_delete_request(entry_id, token, key:)
+
+    expect(first_status).to eq(200)
+    expect([replay.status, replay.parsed_body]).to eq([first_status, first_body])
+    expect(entry_write_counts).to eq(after_first)
+  end
+
+  it "answers a replay-only DELETE with not_found for another company reusing the key and for a key with no receipt, discarding nothing" do
+    deleted_id = timekeeping_arrange.entry(company:, user: employee, project:)
+    kept_id = timekeeping_arrange.entry(company:, user: employee, project:)
+    key = SecureRandom.uuid
+    first = replay_only_delete_request(deleted_id, timekeeping_arrange.token_for(employee), key:, replay_only: false,
+                                                                                              if_match: nil)
+    expect(first.status).to eq(200)
+    after_first = entry_write_counts
+
+    # Another company's owner, sending the same key for the same entry id, must not reach the stored answer.
+    foreign_company = timekeeping_arrange.company
+    foreign_owner = timekeeping_arrange.user(company: foreign_company, role: "owner")
+    foreign = replay_only_delete_request(deleted_id, timekeeping_arrange.token_for(foreign_owner), key:,
+                                                                                                  company_id: foreign_company)
+    expect([foreign.status, foreign.parsed_body]).to eq(replay_not_found)
+    expect(entry_write_counts).to eq(after_first)
+
+    # A replay-only DELETE with no receipt behind it is answered from nothing and discards nothing, even for a kept entry.
+    no_receipt = replay_only_delete_request(kept_id, timekeeping_arrange.token_for(owner), key: SecureRandom.uuid)
+    expect([no_receipt.status, no_receipt.parsed_body]).to eq(replay_not_found)
+    expect(Entry.find(kept_id).discarded_at).to be_nil
+    expect(entry_write_counts).to eq(after_first)
+  end
+
+  # A provider that does not read Idempotency-Replay sees an ordinary DELETE;
+  # the If-Match value never matches a version, so it refuses without writing.
+  it "refuses a DELETE whose If-Match is replay-only with version_conflict and discards nothing" do
+    entry_id = timekeeping_arrange.entry(company:, user: employee, project:)
+    before = entry_write_counts
+
+    answer = replay_only_delete_request(entry_id, timekeeping_arrange.token_for(admin), key: SecureRandom.uuid,
+                                                                                       replay_only: false)
+
+    expect([answer.status, answer.parsed_body]).to eq([409, { "reason" => "version_conflict" }])
+    expect(Entry.find(entry_id).discarded_at).to be_nil
+    expect(entry_write_counts).to eq(before)
+  end
+
+  it "replays a committed delete after the generation advanced, writing nothing more" do
+    entry_id = timekeeping_arrange.entry(company:, user: employee, project:)
+    token = timekeeping_arrange.token_for(admin)
+    key = SecureRandom.uuid
+    first = replay_only_delete_request(entry_id, token, key:, replay_only: false, if_match: nil)
+    first_body = first.parsed_body
+    expect(first.status).to eq(200)
+    discarded_at = Entry.find(entry_id).discarded_at
+    after_first = entry_write_counts
+
+    timekeeping_arrange.set_generation(timekeeping_arrange.current_generation + 1)
+    replay = replay_only_delete_request(entry_id, token, key:)
+
+    expect([replay.status, replay.parsed_body]).to eq([200, first_body])
+    expect(Entry.find(entry_id).discarded_at).to eq(discarded_at)
+    expect(entry_write_counts).to eq(after_first)
+  end
+
+  it "answers not_found to another actor's replay and to a replay of another entry under the same key" do
+    deleted_id = timekeeping_arrange.entry(company:, user: employee, project:)
+    other_id = timekeeping_arrange.entry(company:, user: employee, project:)
+    key = SecureRandom.uuid
+    replay_only_delete_request(deleted_id, timekeeping_arrange.token_for(admin), key:, replay_only: false, if_match: nil)
+    after_first = entry_write_counts
+
+    colleague_admin = timekeeping_arrange.user(company:, role: "admin")
+    other_actor = replay_only_delete_request(deleted_id, timekeeping_arrange.token_for(colleague_admin), key:)
+    expect([other_actor.status, other_actor.parsed_body]).to eq([404, { "reason" => "not_found" }])
+
+    other_entry = replay_only_delete_request(other_id, timekeeping_arrange.token_for(admin), key:)
+    expect([other_entry.status, other_entry.parsed_body]).to eq([404, { "reason" => "not_found" }])
+    expect(Entry.find(other_id).discarded_at).to be_nil
+    expect(entry_write_counts).to eq(after_first)
+  end
+end

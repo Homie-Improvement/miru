@@ -45,16 +45,7 @@ RSpec.describe "timekeeping:alerts", "shared task runner" do
     stub_request(:get, "#{base_url}/internal/v1/metrics").to_return(status: 500, body: "boom")
 
     failed = run_timekeeping_alerts_task(base_url:, token:)
-
-    stub_request(:get, "#{base_url}/internal/v1/metrics")
-      .with(headers: { "Authorization" => "Bearer #{token}" })
-      .to_return(status: 200, headers: { "Content-Type" => "application/json" }, body: JSON.generate(
-        "window_seconds" => 300, "latency_bucket_bounds_ms" => [25, 50, 100, 200, 300, 500, 1000, 2500, 5000],
-        "overflow_bucket" => "inf", "total_field" => "writes + reference_unavailable",
-        "companies" => [], "outbox_lag" => []
-      ))
-
-    succeeded = run_timekeeping_alerts_task(base_url:, token:)
+    succeeded = run_timekeeping_alerts_task(base_url:, token:, metrics: timekeeping_alerts_metrics_body)
 
     expect(failed.exit_status).not_to be_nil
     expect(failed.exit_status).not_to eq(0)
@@ -66,32 +57,8 @@ RSpec.describe "timekeeping:alerts", "shared task runner" do
 end
 
 RSpec.describe "timekeeping:alerts", "section 11.3 alerts on the task output" do
-  include ActiveSupport::Testing::TimeHelpers
-
   let(:alerts_rules_base_url) { "http://timekeeping.alerts.test" }
   let(:alerts_rules_token) { "service-#{SecureRandom.hex(24)}" }
-
-  def stub_timekeeping_alerts_metrics(base_url, body:, status: 200, token: nil)
-    request = stub_request(:get, "#{base_url}/internal/v1/metrics")
-    request = request.with(headers: { "Authorization" => "Bearer #{token}" }) if token
-    request.to_return(status:, body: JSON.generate(body), headers: { "Content-Type" => "application/json" })
-  end
-
-  def alerts_rules_metrics_body(companies: [], outbox_lag: [])
-    { "window_seconds" => 300, "latency_bucket_bounds_ms" => [25, 50, 100, 200, 300, 500, 1000, 2500, 5000],
-      "overflow_bucket" => "inf", "total_field" => "writes + reference_unavailable",
-      "companies" => companies, "outbox_lag" => outbox_lag }
-  end
-
-  def alerts_rules_run(at:)
-    travel_to(at) { run_timekeeping_alerts_task(base_url: alerts_rules_base_url, token: alerts_rules_token) }
-  end
-
-  # The company_id of every alert line with this name, parsed from the
-  # Timekeeping::AlertLog.alert_line format.
-  def alerts_rules_companies(run, name)
-    run.stdout.lines.filter_map { |line| line[/\Atimekeeping alert name=#{name} company_id=(\S+) /, 1] }
-  end
 
   # A leaked service token grants every service-only Timekeeping endpoint, so
   # the task must keep it out of its output and logs even on a failed read. The
@@ -115,13 +82,15 @@ RSpec.describe "timekeeping:alerts", "section 11.3 alerts on the task output" do
 
     [401, 500].each do |status|
       token = "service-#{SecureRandom.hex(24)}"
-      stub_timekeeping_alerts_metrics(alerts_rules_base_url, status:, body: { "reason" => "unauthorized" })
+      stub_request(:get, "#{alerts_rules_base_url}/internal/v1/metrics")
+        .to_return(status:, body: JSON.generate("reason" => "unauthorized"),
+                   headers: { "Content-Type" => "application/json" })
 
       run = run_timekeeping_alerts_task(base_url: alerts_rules_base_url, token:)
 
       expect(run.exit_status).not_to be_nil
       expect(run.exit_status).not_to eq(0)
-      expect(alerts_rules_companies(run, "pending_invoice_operation_intent")).to eq([late_company.id.to_s])
+      expect(run.alert_company_ids("pending_invoice_operation_intent")).to eq([late_company.id.to_s])
       expect(run.stdout).not_to include("company_id=#{quiet_company.id} ")
       expect(run.log).to include(marker)
       expect(run.log).to include("name=pending_invoice_operation_intent company_id=#{late_company.id} ")
@@ -144,12 +113,12 @@ RSpec.describe "timekeeping:alerts", "section 11.3 alerts on the task output" do
       { "company_id" => 102, "windows" => [window.call(99, 1)] },
       { "company_id" => 103, "windows" => [window.call(1900, 0)] }
     ]
-    stub_timekeeping_alerts_metrics(alerts_rules_base_url, token: alerts_rules_token,
-                                                           body: alerts_rules_metrics_body(companies:))
 
-    run = alerts_rules_run(at: Time.utc(2026, 3, 3, 12, 7))
+    run = run_timekeeping_alerts_task(base_url: alerts_rules_base_url, token: alerts_rules_token,
+                                      now: Time.utc(2026, 3, 3, 12, 7),
+                                      metrics: timekeeping_alerts_metrics_body(companies:))
 
-    expect(alerts_rules_companies(run, "reference_unavailable_rate")).to eq(["101"])
+    expect(run.alert_company_ids("reference_unavailable_rate")).to eq(["101"])
     expect(run.stdout.lines.grep(/company_id=10[23] /)).to be_empty
     expect(run.exit_status).to be_nil
   end
@@ -160,13 +129,13 @@ RSpec.describe "timekeeping:alerts", "section 11.3 alerts on the task output" do
     company = create(:company)
     InvoiceOperationIntent.create!(company_id: company.id, invoice_id: 3, operation_id: SecureRandom.uuid,
                                    generation: 1, state: "pending", created_at: now - 11.minutes)
-    stub_timekeeping_alerts_metrics(alerts_rules_base_url, body: alerts_rules_metrics_body.except("window_seconds"))
 
-    run = alerts_rules_run(at: now)
+    run = run_timekeeping_alerts_task(base_url: alerts_rules_base_url, token: alerts_rules_token, now:,
+                                      metrics: timekeeping_alerts_metrics_body.except("window_seconds"))
 
     expect(run.exit_status).not_to be_nil
     expect(run.exit_status).not_to eq(0)
-    expect(alerts_rules_companies(run, "pending_invoice_operation_intent")).to eq([company.id.to_s])
+    expect(run.alert_company_ids("pending_invoice_operation_intent")).to eq([company.id.to_s])
   end
 
   # "`503 reference_unavailable` over 1% of writes for 5 minutes;"
@@ -176,12 +145,12 @@ RSpec.describe "timekeeping:alerts", "section 11.3 alerts on the task output" do
     open_window = { "window_start" => "2026-03-03T12:05:00Z", "writes" => 10, "reference_unavailable" => 10,
                     "latency_ms_sum" => 0, "latency_ms_buckets" => { "25" => 20 } }
     companies = [{ "company_id" => 101, "windows" => [open_window] }]
-    stub_timekeeping_alerts_metrics(alerts_rules_base_url, token: alerts_rules_token,
-                                                           body: alerts_rules_metrics_body(companies:))
 
-    run = alerts_rules_run(at: Time.utc(2026, 3, 3, 12, 6))
+    run = run_timekeeping_alerts_task(base_url: alerts_rules_base_url, token: alerts_rules_token,
+                                      now: Time.utc(2026, 3, 3, 12, 6),
+                                      metrics: timekeeping_alerts_metrics_body(companies:))
 
-    expect(alerts_rules_companies(run, "reference_unavailable_rate")).to be_empty
+    expect(run.alert_company_ids("reference_unavailable_rate")).to be_empty
     expect(run.exit_status).to be_nil
   end
 
@@ -204,12 +173,12 @@ RSpec.describe "timekeeping:alerts", "section 11.3 alerts on the task output" do
       # A large fast company: pooled with it, the slow writes above stay under 5%.
       company.call(204, { "25" => 1000 })
     ]
-    stub_timekeeping_alerts_metrics(alerts_rules_base_url, token: alerts_rules_token,
-                                                           body: alerts_rules_metrics_body(companies:))
 
-    run = alerts_rules_run(at: Time.utc(2026, 3, 3, 12, 7))
+    run = run_timekeeping_alerts_task(base_url: alerts_rules_base_url, token: alerts_rules_token,
+                                      now: Time.utc(2026, 3, 3, 12, 7),
+                                      metrics: timekeeping_alerts_metrics_body(companies:))
 
-    expect(alerts_rules_companies(run, "entry_write_p95_latency")).to eq(%w[201 202])
+    expect(run.alert_company_ids("entry_write_p95_latency")).to eq(%w[201 202])
   end
 
   # "invoice operation intents still `pending` older than 10 minutes;"
@@ -224,11 +193,11 @@ RSpec.describe "timekeeping:alerts", "section 11.3 alerts on the task output" do
         InvoiceOperationIntent.create!(company_id: company.id, invoice_id: 1, operation_id: SecureRandom.uuid,
                                        generation: 1, state:, created_at: now - age_seconds)
       end
-    stub_timekeeping_alerts_metrics(alerts_rules_base_url, token: alerts_rules_token, body: alerts_rules_metrics_body)
 
-    run = alerts_rules_run(at: now)
+    run = run_timekeeping_alerts_task(base_url: alerts_rules_base_url, token: alerts_rules_token, now:,
+                                      metrics: timekeeping_alerts_metrics_body)
 
-    expect(alerts_rules_companies(run, "pending_invoice_operation_intent")).to eq([late_company.id.to_s])
+    expect(run.alert_company_ids("pending_invoice_operation_intent")).to eq([late_company.id.to_s])
   end
 
   # "outbox lag (oldest unsent row age) of the current owner over 5 minutes;"
@@ -238,16 +207,15 @@ RSpec.describe "timekeeping:alerts", "section 11.3 alerts on the task output" do
       { "company_id" => 301, "oldest_unsent_age_seconds" => 301 },
       { "company_id" => 302, "oldest_unsent_age_seconds" => 300 }
     ]
-    stub_timekeeping_alerts_metrics(alerts_rules_base_url, token: alerts_rules_token,
-                                                           body: alerts_rules_metrics_body(outbox_lag:))
-    now = Time.utc(2026, 3, 3, 12, 7)
+    run_options = { base_url: alerts_rules_base_url, token: alerts_rules_token, now: Time.utc(2026, 3, 3, 12, 7),
+                    metrics: timekeeping_alerts_metrics_body(outbox_lag:) }
 
-    monolith_owned = alerts_rules_run(at: now)
+    monolith_owned = run_timekeeping_alerts_task(**run_options)
     TimekeepingOwnership.current.update_columns(owner: "timekeeping")
-    timekeeping_owned = alerts_rules_run(at: now)
+    timekeeping_owned = run_timekeeping_alerts_task(**run_options)
 
-    expect(alerts_rules_companies(monolith_owned, "outbox_lag")).to be_empty
-    expect(alerts_rules_companies(timekeeping_owned, "outbox_lag")).to eq(["301"])
+    expect(monolith_owned.alert_company_ids("outbox_lag")).to be_empty
+    expect(timekeeping_owned.alert_company_ids("outbox_lag")).to eq(["301"])
   end
 
   # "any `409 stale_generation` outside a handoff;"
@@ -257,45 +225,26 @@ RSpec.describe "timekeeping:alerts", "section 11.3 alerts on the task output" do
     during = create(:company)
     TimekeepingStaleGenerationRefusal.create!(company_id: outside.id, handoff_step: nil)
     TimekeepingStaleGenerationRefusal.create!(company_id: during.id, handoff_step: "freeze")
-    stub_timekeeping_alerts_metrics(alerts_rules_base_url, token: alerts_rules_token, body: alerts_rules_metrics_body)
 
     # Refusals are counted over a recent period ending now, so this run keeps the real clock.
-    run = run_timekeeping_alerts_task(base_url: alerts_rules_base_url, token: alerts_rules_token)
+    run = run_timekeeping_alerts_task(base_url: alerts_rules_base_url, token: alerts_rules_token,
+                                      metrics: timekeeping_alerts_metrics_body)
 
-    expect(alerts_rules_companies(run, "stale_generation")).to eq([outside.id.to_s])
+    expect(run.alert_company_ids("stale_generation")).to eq([outside.id.to_s])
     expect(run.stdout).not_to include("company_id=#{during.id} ")
   end
 end
 
-# Generated by Descant: acceptance tests below.
 RSpec.describe "timekeeping:alerts", "signals gathered from real records" do
   include ActiveSupport::Testing::TimeHelpers
 
-  let(:gathered_signals_base_url) { "http://timekeeping.gathered-signals.test" }
   let(:gathered_signals_token) { "service-#{SecureRandom.hex(24)}" }
-
-  before do
-    TimekeepingOwnership.ensure_initial!
-    stub_request(:get, "#{gathered_signals_base_url}/internal/v1/metrics")
-      .with(headers: { "Authorization" => "Bearer #{gathered_signals_token}" })
-      .to_return(status: 200, headers: { "Content-Type" => "application/json" }, body: JSON.generate(
-        "window_seconds" => 300, "latency_bucket_bounds_ms" => [25, 50, 100, 200, 300, 500, 1000, 2500, 5000],
-        "overflow_bucket" => "inf", "total_field" => "writes + reference_unavailable",
-        "companies" => [], "outbox_lag" => []
-      ))
+  let(:gathered_signals_run_options) do
+    { base_url: "http://timekeeping.gathered-signals.test", token: gathered_signals_token,
+      metrics: timekeeping_alerts_metrics_body }
   end
 
-  def gathered_signals_run(at: nil)
-    return run_timekeeping_alerts_task(base_url: gathered_signals_base_url, token: gathered_signals_token) unless at
-
-    travel_to(at) { run_timekeeping_alerts_task(base_url: gathered_signals_base_url, token: gathered_signals_token) }
-  end
-
-  # The company_id of every alert line with this name, parsed from the
-  # Timekeeping::AlertLog.alert_line format.
-  def gathered_signals_companies(run, name)
-    run.stdout.lines.filter_map { |line| line[/\Atimekeeping alert name=#{name} company_id=(\S+) /, 1] }
-  end
+  before { TimekeepingOwnership.ensure_initial! }
 
   def gathered_signals_snapshot_change(company_id, old_value: nil, new_value: nil)
     Timekeeping::FinancialSnapshot.report([
@@ -376,11 +325,9 @@ RSpec.describe "timekeeping:alerts", "signals gathered from real records" do
     end.to raise_error(Invoices::OperationErrors::Refused)
   end
 
-  # "Where an upstream source truly does not exist, identify that dependency as a delivery blocker
-  # rather than declaring all requirements complete."
   # Nothing records when an ownership pause starts or how long it is planned to last, so it stays unavailable.
   it "prints ownership_moving as the only sourceless signal unavailable line and exits zero" do
-    run = gathered_signals_run(at: Time.utc(2026, 3, 3, 12, 7))
+    run = run_timekeeping_alerts_task(**gathered_signals_run_options, now: Time.utc(2026, 3, 3, 12, 7))
     unavailable_lines = run.stdout.lines.grep(/unavailable/i)
 
     expect(unavailable_lines.count { |line| line.include?("ownership_moving") }).to eq(1)
@@ -391,27 +338,6 @@ RSpec.describe "timekeeping:alerts", "signals gathered from real records" do
     expect(run.exit_status).to be_nil
   end
 
-  # Section 11.3: "any change in the financial snapshot pages at once". Event history is readable
-  # across every workspace, so the alert names the company but never the money values or the credential.
-  it "reports a financial snapshot change only under its company without printing money values or the service token" do
-    now = Time.utc(2026, 3, 3, 12, 7)
-    changed = create(:company)
-    untouched = create(:company)
-    travel_to(now - 1.minute) do
-      gathered_signals_snapshot_change(changed.id, old_value: BigDecimal("731.19"), new_value: BigDecimal("917.53"))
-    end
-
-    run = gathered_signals_run(at: now)
-    output = run.stdout + run.stderr + run.log
-
-    expect(gathered_signals_companies(run, "financial_snapshot_change")).to eq([changed.id.to_s])
-    expect(run.stdout).not_to include("company_id=#{untouched.id} ")
-    expect(output).not_to include("731.19")
-    expect(output).not_to include("917.53")
-    expect(output).not_to include(gathered_signals_token)
-  end
-
-  # "Add units that gather the required real signals and prove the command reports them."
   # The command only reads the event history: a second run inside the lookback window sees the
   # same change, and the rows other readers of the history rely on are not consumed.
   it "reports the same financial_snapshot_change alert on two runs and leaves the stored events in place" do
@@ -421,8 +347,8 @@ RSpec.describe "timekeeping:alerts", "signals gathered from real records" do
     stored_ids = stored.pluck(:id)
     expect(stored_ids.size).to eq(1)
 
-    first = gathered_signals_companies(gathered_signals_run, "financial_snapshot_change")
-    second = gathered_signals_companies(gathered_signals_run, "financial_snapshot_change")
+    first = run_timekeeping_alerts_task(**gathered_signals_run_options).alert_company_ids("financial_snapshot_change")
+    second = run_timekeeping_alerts_task(**gathered_signals_run_options).alert_company_ids("financial_snapshot_change")
 
     expect(first).to eq([company.id.to_s])
     expect(second).to eq(first)
@@ -436,7 +362,9 @@ RSpec.describe "timekeeping:alerts", "signals gathered from real records" do
     travel_to(now - lookback - 1.second) { gathered_signals_snapshot_change(301) }
     travel_to(now - lookback + 1.second) { gathered_signals_snapshot_change(302) }
 
-    expect(gathered_signals_companies(gathered_signals_run(at: now), "financial_snapshot_change")).to eq(["302"])
+    run = run_timekeeping_alerts_task(**gathered_signals_run_options, now:)
+
+    expect(run.alert_company_ids("financial_snapshot_change")).to eq(["302"])
   end
 
   # Section 11.3: "Any unexplained difference". A difference the pre-flight listed is explained.
@@ -445,10 +373,11 @@ RSpec.describe "timekeeping:alerts", "signals gathered from real records" do
     correction = Timekeeping::Handoff::Reconciliation::Correction.new(check: :entries, row_key: [7], field: "note")
     gathered_signals_reconcile_note_change(202, listed_corrections: { 202 => [correction] })
 
-    expect(gathered_signals_companies(gathered_signals_run, "reconciliation_difference")).to eq(["101"])
+    run = run_timekeeping_alerts_task(**gathered_signals_run_options)
+
+    expect(run.alert_company_ids("reconciliation_difference")).to eq(["101"])
   end
 
-  # "Add units that gather the required real signals and prove the command reports them."
   it "counts a reported unexplained reconciliation difference just inside SIGNAL_LOOKBACK and not one just outside it" do
     now = Time.utc(2026, 3, 3, 12, 7)
     lookback = Timekeeping::AlertSignals::SIGNAL_LOOKBACK
@@ -457,8 +386,9 @@ RSpec.describe "timekeeping:alerts", "signals gathered from real records" do
     travel_to(now - lookback - 1.second) { gathered_signals_reconcile_missing_snapshot(outside.id) }
     travel_to(now - lookback + 1.second) { gathered_signals_reconcile_missing_snapshot(inside.id) }
 
-    expect(gathered_signals_companies(gathered_signals_run(at: now), "reconciliation_difference"))
-      .to eq([inside.id.to_s])
+    run = run_timekeeping_alerts_task(**gathered_signals_run_options, now:)
+
+    expect(run.alert_company_ids("reconciliation_difference")).to eq([inside.id.to_s])
   end
 
   # Event history rows are free-form JSON captured by name pattern, so a row with no company_id
@@ -473,14 +403,13 @@ RSpec.describe "timekeeping:alerts", "signals gathered from real records" do
       name: "Timekeeping::FinancialSnapshotChanged", occurred_at: now - 1.minute, payload: { "data" => {} }
     )
 
-    run = gathered_signals_run(at: now)
+    run = run_timekeeping_alerts_task(**gathered_signals_run_options, now:)
 
-    expect(gathered_signals_companies(run, "reconciliation_difference")).to eq(["all"])
-    expect(gathered_signals_companies(run, "financial_snapshot_change")).to eq(["all"])
+    expect(run.alert_company_ids("reconciliation_difference")).to eq(["all"])
+    expect(run.alert_company_ids("financial_snapshot_change")).to eq(["all"])
     expect(run.exit_status).to be_nil
   end
 
-  # "Printing unavailable is honest, but it does not deliver the requested local alerts."
   # A broken event-history read must never look like a healthy zero, and a database fault that
   # hides local alerts must not look like a successful run to the scheduler.
   it "prints unavailable lines and exits non-zero when the event history cannot be read, and still prints the stale_generation alert" do
@@ -488,17 +417,17 @@ RSpec.describe "timekeeping:alerts", "signals gathered from real records" do
     TimekeepingStaleGenerationRefusal.create!(company_id: company.id, handoff_step: nil)
     allow(RailsEventViewer::Entry).to receive(:where).and_raise(ActiveRecord::StatementInvalid, "relation missing")
 
-    run = gathered_signals_run
+    run = run_timekeeping_alerts_task(**gathered_signals_run_options)
 
     expect(run.exit_status).not_to be_nil
     expect(run.exit_status).not_to eq(0)
     expect(run.stderr).to include("reconciliation_difference", "financial_snapshot_change")
     %w[reconciliation_difference financial_snapshot_change].each do |signal|
       expect(run.stdout.lines.map(&:chomp).count(Timekeeping::AlertLog.unavailable_line(signal))).to eq(1)
-      expect(gathered_signals_companies(run, signal)).to be_empty
+      expect(run.alert_company_ids(signal)).to be_empty
     end
     # One failed read must not stop the command from reporting the other signals.
-    expect(gathered_signals_companies(run, "stale_generation")).to eq([company.id.to_s])
+    expect(run.alert_company_ids("stale_generation")).to eq([company.id.to_s])
   end
 
   # Refusals are counted per company: two refusals for one company give one alert line for it,
@@ -508,10 +437,11 @@ RSpec.describe "timekeeping:alerts", "signals gathered from real records" do
     create(:company)
     2.times { TimekeepingPrepareRefusal.create!(company_id: refused.id, reason: "on_another_invoice") }
 
-    expect(gathered_signals_companies(gathered_signals_run, "prepare_refusal")).to eq([refused.id.to_s])
+    run = run_timekeeping_alerts_task(**gathered_signals_run_options)
+
+    expect(run.alert_company_ids("prepare_refusal")).to eq([refused.id.to_s])
   end
 
-  # "Add units that gather the required real signals and prove the command reports them."
   it "counts an on_another_invoice prepare refusal just inside SIGNAL_LOOKBACK and not one just outside it" do
     now = Time.utc(2026, 3, 3, 12, 7)
     lookback = Timekeeping::AlertSignals::SIGNAL_LOOKBACK
@@ -522,7 +452,9 @@ RSpec.describe "timekeeping:alerts", "signals gathered from real records" do
     TimekeepingPrepareRefusal.create!(company_id: outside.id, reason: "on_another_invoice",
                                       created_at: now - lookback - 1.second)
 
-    expect(gathered_signals_companies(gathered_signals_run(at: now), "prepare_refusal")).to eq([inside.id.to_s])
+    run = run_timekeeping_alerts_task(**gathered_signals_run_options, now:)
+
+    expect(run.alert_company_ids("prepare_refusal")).to eq([inside.id.to_s])
   end
 
   # The refusal happened when prepare answered, so it must be recorded even though the caller commits.
@@ -544,7 +476,9 @@ RSpec.describe "timekeeping:alerts", "signals gathered from real records" do
       nil
     end
 
-    expect(gathered_signals_companies(gathered_signals_run, "prepare_refusal")).to include(invoice.company_id.to_s)
+    run = run_timekeeping_alerts_task(**gathered_signals_run_options)
+
+    expect(run.alert_company_ids("prepare_refusal")).to include(invoice.company_id.to_s)
   end
 
   # Section 11.3: "Prepare refusals (`on_another_invoice`)".
@@ -554,9 +488,167 @@ RSpec.describe "timekeeping:alerts", "signals gathered from real records" do
     gathered_signals_refuse_prepare(on_another, "on_another_invoice")
     gathered_signals_refuse_prepare(elsewhere, "provisional_elsewhere")
 
-    companies = gathered_signals_companies(gathered_signals_run, "prepare_refusal")
+    companies = run_timekeeping_alerts_task(**gathered_signals_run_options).alert_company_ids("prepare_refusal")
 
     expect(companies).to include(on_another.company_id.to_s)
     expect(companies).not_to include(elsewhere.company_id.to_s)
+  end
+
+  # Section 11.3: "any change in the financial snapshot pages at once". Event history is readable
+  # across every workspace, so the alert names the company but never the money values or the credential.
+  # The money values are seeded here and the company's alert line is asserted, so the absence
+  # checks can only pass because the output really leaves them out.
+  it "reports a financial snapshot change only under its company without printing money values or the service token" do
+    now = Time.utc(2026, 3, 3, 12, 7)
+    changed = create(:company)
+    untouched = create(:company)
+    travel_to(now - 1.minute) do
+      gathered_signals_snapshot_change(changed.id, old_value: BigDecimal("731.19"), new_value: BigDecimal("917.53"))
+    end
+
+    run = run_timekeeping_alerts_task(**gathered_signals_run_options, now:)
+    output = run.stdout + run.stderr + run.log
+
+    expect(run.exit_status).to be_nil
+    expect(run.alert_company_ids("financial_snapshot_change")).to eq([changed.id.to_s])
+    expect(run.stdout).not_to include("company_id=#{untouched.id} ")
+    expect(output).not_to include("731.19")
+    expect(output).not_to include("917.53")
+    expect(output).not_to include(gathered_signals_token)
+  end
+end
+
+# Generated by Descant: acceptance tests below.
+RSpec.describe "timekeeping:alerts", "shared runner keywords, metrics body and alert lines" do
+  let(:runner_keywords_base_url) { "http://timekeeping.runner-keywords.test" }
+  let(:runner_keywords_token) { "service-#{SecureRandom.hex(24)}" }
+  # Company 101 refuses 2 of 100 writes in the window that opened at 12:00, so a
+  # run at 12:07 alerts on it.
+  let(:runner_keywords_failing_metrics) do
+    failing_window = { "window_start" => "2026-03-03T12:00:00Z", "writes" => 98, "reference_unavailable" => 2,
+                       "latency_ms_sum" => 0, "latency_ms_buckets" => { "25" => 100 } }
+    timekeeping_alerts_metrics_body(companies: [{ "company_id" => 101, "windows" => [failing_window] }])
+  end
+
+  before { TimekeepingOwnership.ensure_initial! }
+
+  # "It should stub metrics, use the existing with_timekeeping_env, optionally travel_to, rescue SystemExit, and return the output and exit status."
+  # No other stub is registered, so a runner that ignored metrics: would hit an unregistered request.
+  # A leaked service token grants every service-only Timekeeping endpoint, so it must stay out of
+  # every captured stream and must not be left behind in ENV.
+  it "shared runner stubs the metrics read with the service token and keeps the token out of output, logs and ENV after a clean run" do
+    base_url = runner_keywords_base_url
+    token = runner_keywords_token
+    env_names = [Timekeeping::EntryApiClient::BASE_URL_ENV, Internal::V1::BaseController::SERVICE_TOKEN_ENV]
+    env_before = env_names.index_with { |name| ENV.fetch(name, nil) }
+
+    run = run_timekeeping_alerts_task(base_url:, token:, now: Time.utc(2026, 3, 3, 12, 7),
+                                      metrics: timekeeping_alerts_metrics_body)
+
+    expect(run.exit_status).to be_nil
+    expect(run.stdout + run.stderr).not_to include("metrics read failed")
+    expect(run.stdout + run.stderr + run.log).not_to include(token)
+    expect(env_names.index_with { |name| ENV.fetch(name, nil) }).to eq(env_before)
+    expect(ENV.to_h.values).not_to include(token)
+    expect(a_request(:get, "#{base_url}/internal/v1/metrics")
+      .with(headers: { "Authorization" => "Bearer #{token}" })).to have_been_made.once
+  end
+
+  # Each call must stub its own body: a runner that stubbed only once, or kept the first
+  # body, would report stale alerts, and a run must not carry an earlier run's buffered output.
+  it "shared runner answers each call with that call's own metrics body and carries no output between runs" do
+    base_url = runner_keywords_base_url
+    token = runner_keywords_token
+    now = Time.utc(2026, 3, 3, 12, 7)
+
+    first = run_timekeeping_alerts_task(base_url:, token:, now:, metrics: runner_keywords_failing_metrics)
+    second = run_timekeeping_alerts_task(base_url:, token:, now:, metrics: timekeeping_alerts_metrics_body)
+    third = run_timekeeping_alerts_task(base_url:, token:, now:, metrics: runner_keywords_failing_metrics)
+
+    expect(first.alert_company_ids("reference_unavailable_rate")).to eq(["101"])
+    expect(second.alert_company_ids("reference_unavailable_rate")).to be_empty
+    expect(third.alert_company_ids("reference_unavailable_rate")).to eq(["101"])
+    expect(third.stdout).to eq(first.stdout)
+    expect([first, second, third].map(&:exit_status)).to eq([nil, nil, nil])
+  end
+
+  # The intent is 9 minutes old at the first now and 11 minutes old at the second, so only the second run
+  # may alert. A runner that ignored now: would use the real clock and alert on both runs.
+  it "shared runner runs the task at the given now and puts the clock back afterwards" do
+    base_url = runner_keywords_base_url
+    token = runner_keywords_token
+    clock_before = Time.now
+    created_at = Time.utc(2026, 3, 3, 12, 0)
+    company = create(:company)
+    InvoiceOperationIntent.create!(company_id: company.id, invoice_id: 4, operation_id: SecureRandom.uuid,
+                                   generation: 1, state: "pending", created_at:)
+
+    early = run_timekeeping_alerts_task(base_url:, token:, now: created_at + 9.minutes,
+                                        metrics: timekeeping_alerts_metrics_body)
+    late = run_timekeeping_alerts_task(base_url:, token:, now: created_at + 11.minutes,
+                                       metrics: timekeeping_alerts_metrics_body)
+
+    expect(early.stdout).not_to include("name=pending_invoice_operation_intent company_id=#{company.id} ")
+    expect(late.stdout).to include("name=pending_invoice_operation_intent company_id=#{company.id} ")
+    expect(early.exit_status).to be_nil
+    expect(late.exit_status).to be_nil
+    expect((Time.current - clock_before).abs).to be < 1.minute
+  end
+
+  # The task aborts with SystemExit on a failed read. If the clock change were
+  # undone only on a clean finish, every later example would run in 2026-03-03.
+  it "shared runner given now: puts the real clock back after a run that aborts on a failed metrics read" do
+    base_url = runner_keywords_base_url
+    stub_request(:get, "#{base_url}/internal/v1/metrics").to_return(status: 500, body: "boom")
+    clock_before = Time.now
+
+    run = run_timekeeping_alerts_task(base_url:, token: runner_keywords_token, now: Time.utc(2026, 3, 3, 12, 7))
+
+    expect(run.exit_status).not_to be_nil
+    expect(run.exit_status).not_to eq(0)
+    expect((Time.current - clock_before).abs).to be < 1.minute
+  end
+
+  # The default is the body every pasted copy sent, so a default with fewer fields would change what those copies tested.
+  # A caller that changes the Hash it got back must not change what the next example receives.
+  it "shared metrics body holds every field the copies sent and overrides one field without changing the default" do
+    full_default = {
+      "window_seconds" => 300, "latency_bucket_bounds_ms" => [25, 50, 100, 200, 300, 500, 1000, 2500, 5000],
+      "overflow_bucket" => "inf", "total_field" => "writes + reference_unavailable",
+      "companies" => [], "outbox_lag" => []
+    }
+    lag = [{ "company_id" => 11, "oldest_unsent_age_seconds" => 400 }]
+
+    overridden = timekeeping_alerts_metrics_body(outbox_lag: lag)
+    overridden["latency_bucket_bounds_ms"] << 9999
+    overridden["companies"] << { "company_id" => 1 }
+    timekeeping_alerts_metrics_body["companies"] << { "company_id" => 999, "windows" => [] }
+
+    expect(overridden.except("latency_bucket_bounds_ms", "companies")).to eq(full_default.merge("outbox_lag" => lag)
+      .except("latency_bucket_bounds_ms", "companies"))
+    expect(timekeeping_alerts_metrics_body).to eq(full_default)
+    expect(timekeeping_alerts_metrics_body.except("window_seconds").keys).to eq(full_default.keys - ["window_seconds"])
+  end
+
+  # The parser replaces two describe-local copies; a looser match would count a
+  # line for another alert whose name starts the same, or a non-alert line that
+  # mentions the name, and the examples using it would pass on wrong output.
+  it "alert_company_ids lists, in order, the company ids of only the alert lines for exactly that name" do
+    stdout = [
+      "timekeeping alert name=outbox_lag company_id=301 oldest_unsent_age_seconds=301",
+      "timekeeping alert name=outbox_lag_extra company_id=302 oldest_unsent_age_seconds=900",
+      "timekeeping alert name=stale_generation company_id=55 count=1",
+      "timekeeping alerts: outbox_lag company_id=303 unavailable",
+      "  timekeeping alert name=outbox_lag company_id=304 indented",
+      "note name=outbox_lag company_id=77 count=1",
+      "timekeeping alert name=outbox_lag company_id=all count=1"
+    ].join("\n") + "\n"
+    run = TimekeepingAlertsTaskHelpers::TimekeepingAlertsTaskRun.new(stdout:, stderr: "", log: "", exit_status: nil)
+    empty = TimekeepingAlertsTaskHelpers::TimekeepingAlertsTaskRun.new(stdout: "", stderr: "", log: "", exit_status: nil)
+
+    expect(run.alert_company_ids("outbox_lag")).to eq(%w[301 all])
+    expect(run.alert_company_ids("stale_generation")).to eq(["55"])
+    expect(run.alert_company_ids("prepare_refusal")).to eq([])
+    expect(empty.alert_company_ids("outbox_lag")).to eq([])
   end
 end

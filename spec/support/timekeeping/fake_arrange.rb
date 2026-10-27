@@ -78,6 +78,12 @@ module TimekeepingContract
       @relay.next_batch
     end
 
+    # How many outbox rows the provider holds, sent or not, so an example can
+    # show a request wrote none.
+    def outbox_size
+      @timekeeping.outbox.size
+    end
+
     def entry_locked(entry_id)
       @timekeeping.entry_locked?(entry_id)
     end

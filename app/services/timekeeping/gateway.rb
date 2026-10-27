@@ -52,6 +52,10 @@ module Timekeeping
       def destroy_entry(**)
         raise OwnershipMoving
       end
+
+      def detach_agent_entries(**)
+        raise OwnershipMoving
+      end
     end
 
     # Reads the ownership row under a share lock, or nil when it is missing.
@@ -72,15 +76,53 @@ module Timekeeping
 
     REFUSAL_REASONS = { OwnershipMoving => "ownership_moving", StaleGeneration => "stale_generation" }.freeze
 
-    attr_reader :context, :local_owner, :write_client, :read_client, :ownership_reader
+    # Fixed namespace for the version 5 UUIDs used as detach operation ids.
+    DETACH_OPERATION_NAMESPACE = "3d0f7a52-8c1e-4b6a-9f2d-5e7c1a9b4d60"
 
+    attr_reader :context, :local_owner, :write_client, :read_client, :service_client, :ownership_reader
+
+    # :reek:LongParameterList
     def initialize(context:, local_owner: UnavailableLocalOwner.new, write_client: EntryWriteClient.new,
-                   read_client: EntryApiClient.new, ownership_reader: LockedOwnership)
+                   read_client: EntryApiClient.new, service_client: ServiceCommandClient.new,
+                   ownership_reader: LockedOwnership)
       @context = context
       @local_owner = local_owner
       @write_client = write_client
       @read_client = read_client
+      @service_client = service_client
       @ownership_reader = ownership_reader
+    end
+
+    # Pure: the operation id of one detach attempt. The context's request_id
+    # is new for every destroy attempt, so a later attempt makes Timekeeping
+    # select the agent's entries again instead of replaying an earlier
+    # receipt, which would skip entries that named the agent after an earlier
+    # attempt rolled back. A resend within one attempt keeps the same id.
+    def self.detach_operation_id(request_id:, agent_id:)
+      Digest::UUID.uuid_v5(DETACH_OPERATION_NAMESPACE, "#{request_id}/detach_entries/#{agent_id}")
+    end
+
+    # Clears agent_id on every entry that names the agent, in the store that
+    # owns the entries. The agent row is locked after the ownership row and
+    # before the detach, so a concurrent entry save that names the agent
+    # either finishes first, and is detached too, or waits and then fails its
+    # agent existence check. Returns the number of entries detached.
+    def detach_agent_entries(agent:)
+      perform(nil) do |ownership, owner|
+        agent.lock!
+        case owner
+        when :legacy
+          agent.timesheet_entries.update_all(agent_id: nil)
+        when :prepared
+          local_owner.detach_agent_entries(context:, agent:)
+        when :timekeeping
+          service_client.detach_agent_entries(
+            company_id: agent.company_id, agent_id: agent.id, generation: ownership.generation,
+            operation_id: self.class.detach_operation_id(request_id: context.request_id, agent_id: agent.id),
+            request_id: context.request_id
+          )
+        end
+      end
     end
 
     # user and project are records the caller already resolved inside the
@@ -100,6 +142,28 @@ module Timekeeping
           body = EntryWriteClient.create_body(user:, project:, attributes: checked_create_attributes(user:, project:,
                                                                                                     attributes:))
           hydrate(write_client.create_entry(context:, generation: ownership.generation, body:), user_id: user.id)
+        end
+      end
+    end
+
+    # Writes one imported row with its final bill status in a single gateway
+    # call, so no refusal can leave a billed row stored as unbilled. Unlike
+    # create, a billed status is allowed here: create takes bill_status from a
+    # web or mobile form, where billed must stay refused. attributes carry the
+    # import's source and source_metadata. idempotency_key is sent on a
+    # forwarded create in place of the request-id key, so a rerun of the same
+    # row is replayed rather than written twice.
+    def import(user:, project:, attributes:, idempotency_key:, expected_generation: nil)
+      final = attributes.to_h.stringify_keys
+
+      perform(expected_generation) do |ownership, owner|
+        case owner
+        when :legacy
+          import_legacy(user:, project:, final:)
+        when :prepared
+          local_owner.create_entry(context:, user:, project:, attributes: final)
+        when :timekeeping
+          import_forwarded(ownership:, user:, project:, final:, idempotency_key:)
         end
       end
     end
@@ -130,9 +194,21 @@ module Timekeeping
     # Returns true once the owning store has discarded the entry. A forwarded
     # destroy that Timekeeping answered with success is a success, whatever
     # the answer holds: the entry is already gone there.
+    #
+    # Timekeeping's lookup no longer finds an entry this actor already
+    # deleted, so when the answer to that delete was lost, its retry would
+    # otherwise end at the lookup. A lookup that finds nothing is therefore
+    # followed by a DELETE that Timekeeping answers only from its stored
+    # receipt for the same actor and key (see replay_timekeeping_destroy).
     def destroy(entry_id:, authorize:, expected_generation: nil, scope: :company)
       perform(expected_generation) do |ownership, owner|
-        found = find_authorized(ownership:, entry_id:, authorize:, scope:)
+        found = begin
+          find_authorized(ownership:, entry_id:, authorize:, scope:)
+        rescue ActiveRecord::RecordNotFound
+          raise unless owner == :timekeeping
+
+          next replay_timekeeping_destroy(ownership:, entry_id:, authorize:, scope:)
+        end
         case owner
         when :legacy
           found.entry.discard!
@@ -147,6 +223,38 @@ module Timekeeping
     end
 
     private
+
+      # The legacy model refuses a create already marked billed, so a billed
+      # row is created unbilled and billed in the same transaction.
+      def import_legacy(user:, project:, final:)
+        billed = billed?(final)
+        project.timesheet_entries.new(create_time_attributes(final)).tap do |entry|
+          entry.user = user
+          # The project was resolved inside the context's company, so the
+          # entry's company is known without a query per imported row.
+          entry.association(:company).target = context.company
+          entry.save!
+          entry.update!(bill_status: :billed) if billed
+        end
+      end
+
+      # The draft is validated with the status the legacy store would create
+      # it with, and the one create sent carries the row's final status.
+      def import_forwarded(ownership:, user:, project:, final:, idempotency_key:)
+        checked = checked_create_attributes(user:, project:, attributes: create_time_attributes(final))
+        checked = checked.merge("bill_status" => "billed") if billed?(final)
+        body = EntryWriteClient.import_create_body(user:, project:, attributes: checked, source: final)
+        row = write_client.create_entry(context:, generation: ownership.generation, body:, idempotency_key:)
+        hydrate(row, user_id: user.id)
+      end
+
+      def billed?(attributes)
+        attributes["bill_status"].to_s == "billed"
+      end
+
+      def create_time_attributes(final)
+        billed?(final) ? final.merge("bill_status" => "unbilled") : final
+      end
 
       # The one place a refusal is counted, so each refused write emits exactly
       # one event whether the fence, the local owner or Timekeeping refused it.
@@ -198,6 +306,23 @@ module Timekeeping
         EntryLookup.find(ownership:, context:, entry_id:, local_owner:, read_client:, scope:).tap do |found|
           authorize.call(found.entry)
         end
+      end
+
+      # The replay can only return a delete this actor already committed: with
+      # no stored receipt Timekeeping answers not found and writes nothing. A
+      # service that predates the replay header refuses the request's fixed
+      # If-Match as a version conflict, which is answered as the same not
+      # found, so every miss looks alike whatever the entry's state. The
+      # replayed entry passes the lookup's own checks and the policy before
+      # the delete is reported as done.
+      def replay_timekeeping_destroy(ownership:, entry_id:, authorize:, scope:)
+        row = begin
+          write_client.replay_destroy_entry(context:, generation: ownership.generation, entry_id:)
+        rescue EntryWriteClient::Conflict
+          raise EntryLookup.not_found
+        end
+        authorize.call(EntryLookup.replayed(context:, row:, entry_id:, scope:))
+        true
       end
 
       # SET LOCAL lasts until the outermost transaction ends. When the gateway
