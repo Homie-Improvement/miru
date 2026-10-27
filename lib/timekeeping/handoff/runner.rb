@@ -257,6 +257,12 @@ module Timekeeping
           next_entry_id = incoming.store.advance_entry_id_sequence(above: report.read_checkpoint.fetch(:highest_entry_id))
           intents = read_intents
           loaded = incoming.store.export_checkpoint
+          # A restart after the checkpoint step skips its completion check, so
+          # what the incoming owner holds is compared with the planned copy
+          # again here, before anything can flip ownership to it.
+          unless loaded&.digest == source_copy.fetch(:load).digest
+            raise Refused, "The incoming owner no longer holds the checkpoint this handoff loaded"
+          end
           @reconciliation = Reconciliation.run(
             source: source_copy.fetch(:source), checkpoint: loaded, projection: read_projection,
             source_intents: intents, intents:, next_entry_id:,
@@ -346,7 +352,8 @@ module Timekeeping
         # The frozen source and the copy loaded from it, built once per run.
         # The first build in a generation stores the capture time and digests;
         # every later build, after an interrupt or a restart, reuses that
-        # capture time and must reproduce the stored source digest.
+        # capture time and must reproduce both stored digests, so a version
+        # changed in the incoming owner meanwhile cannot reshape the plan.
         def source_copy
           @source_copy ||= begin
             stored = report.read_checkpoint if report.checkpoint?
@@ -359,6 +366,8 @@ module Timekeeping
               )
             elsif digest_text(copy.fetch(:source)) != stored.fetch(:source_digest)
               raise Refused, "The frozen source no longer matches the checkpoint taken at #{captured_at.iso8601(6)}"
+            elsif digest_text(copy.fetch(:load)) != stored.fetch(:loaded_digest)
+              raise Refused, "The incoming owner's entries changed since the checkpoint taken at #{captured_at.iso8601(6)}"
             end
             copy
           end

@@ -308,3 +308,37 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     expect(writes).to eq([])
   end
 end
+
+# Uses RunnerLegacyHandoffSpecTimekeeping and RunnerLegacyHandoffSpecSupport,
+# defined at the top of this file. The seed loads once per example group, so
+# each case gets a group of its own.
+[[:uncorrected, 99], [:corrected, 0]].each do |kind, changed_version|
+  RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
+    include RunnerLegacyHandoffSpecSupport
+
+    # "Versions continue from the checkpoint and never go backwards across cutover, rollback and re-cutover"
+    it "refuses a restart after the recorded checkpoint when an #{kind} entry's version drifted to #{changed_version}" do
+      timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
+      owners = handoff_owners(timekeeping)
+      report_root = Dir.mktmpdir("handoff-report")
+
+      expect do
+        described_class.run(direction: :cutover, owners:, report_root:,
+                            observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
+      end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+      expect(TimekeepingOwnership.current.handoff_step).to eq("checkpoint")
+
+      corrected_ids = correction_entry_ids(timekeeping)
+      row = timekeeping.rows.fetch("entries").find { |entry| corrected_ids.include?(entry["id"]) == (kind == :corrected) }
+      row["version"] = changed_version
+
+      expect { described_class.run(direction: :cutover, owners:, report_root:) }
+        .to raise_error(Timekeeping::Handoff::Runner::Refused)
+      # The restart stops before the flip: ownership stays with the monolith,
+      # the legacy source is not retired, and Timekeeping is not admitted.
+      expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", legacy_retired_at: nil)
+      expect(TimekeepingOwnership.current.handoff_step).not_to be_nil
+      expect(timekeeping.calls).not_to include([:admit, 2])
+    end
+  end
+end
