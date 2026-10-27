@@ -6,12 +6,26 @@ require "rake"
 # Timekeeping base URL and service token set, and with stdout, stderr and the
 # Rails loggers captured, so a spec can assert on each and on the exit status.
 module TimekeepingAlertsTaskHelpers
+  include ActiveSupport::Testing::TimeHelpers
+
   ALERTS_TASK_NAME = "timekeeping:alerts"
 
   # exit_status is nil when the task finished without calling exit or abort.
-  TimekeepingAlertsTaskRun = Data.define(:stdout, :stderr, :log, :exit_status)
+  TimekeepingAlertsTaskRun = Data.define(:stdout, :stderr, :log, :exit_status) do
+    # The company_id of every alert line with this name, parsed from the
+    # Timekeeping::AlertLog.alert_line format.
+    def alert_company_ids(name)
+      stdout.lines.filter_map { |line| line[/\Atimekeeping alert name=#{name} company_id=(\S+) /, 1] }
+    end
+  end
 
-  def run_timekeeping_alerts_task(base_url:, token:)
+  # metrics: a Hash is answered as the 200 body of the metrics read for this
+  # token; nil stubs nothing, so the caller stubs the read or a real server
+  # answers it. now: runs the task at that time; nil keeps the real clock.
+  def run_timekeeping_alerts_task(base_url:, token:, now: nil, metrics: nil)
+    stub_timekeeping_alerts_task_metrics(base_url:, token:, body: metrics) if metrics
+    return travel_to(now) { run_timekeeping_alerts_task(base_url:, token:) } if now
+
     Rails.application.load_tasks unless Rake::Task.task_defined?(ALERTS_TASK_NAME)
     # Rake runs an invoked task only once until it is reenabled.
     Rake::Task[ALERTS_TASK_NAME].reenable
@@ -37,6 +51,12 @@ module TimekeepingAlertsTaskHelpers
   end
 
   private
+
+    def stub_timekeeping_alerts_task_metrics(base_url:, token:, body:)
+      stub_request(:get, "#{base_url}/internal/v1/metrics")
+        .with(headers: { "Authorization" => "Bearer #{token}" })
+        .to_return(status: 200, body: JSON.generate(body), headers: { "Content-Type" => "application/json" })
+    end
 
     # The task aborts with SystemExit on a failed metrics read, so every stream
     # and logger is put back in ensure; otherwise later examples would write into
