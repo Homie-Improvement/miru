@@ -8,9 +8,13 @@ class InvoiceLineItem < ApplicationRecord
   has_many :invoice_line_item_time_entries, dependent: :destroy
   has_many :linked_timesheet_entries, through: :invoice_line_item_time_entries, source: :timesheet_entry
 
+  # Registered before the links are replaced and before the dependent join
+  # rows are destroyed, so the reservation boundary captures the entries the
+  # invoice referenced before this change.
+  before_save :register_reservation_change
+  before_destroy :register_reservation_change, prepend: true
   before_save :link_pending_linked_timesheet_entries
   before_update :capture_previous_invoice_id, if: :will_save_change_to_invoice_id?
-  before_destroy :unlock_timesheet_entries
   after_save :sync_invoice_totals
   after_destroy :sync_invoice_totals
 
@@ -132,14 +136,17 @@ class InvoiceLineItem < ApplicationRecord
       errors.add(:linked_timesheet_entries, :not_found) unless found
     end
 
-    def unlock_timesheet_entries
-      return unless invoice.draft?
-
-      TimesheetEntry.where(id: associated_timesheet_entry_ids).update!(locked: false)
-    end
-
     def associated_timesheet_entry_ids
       ([timesheet_entry_id] + linked_timesheet_entry_ids).compact.uniq
+    end
+
+    # A line moved to another invoice changes the entries of both.
+    def register_reservation_change
+      Invoices::ReservationBoundary.register(invoice) if invoice
+      return unless will_save_change_to_invoice_id? && invoice_id_in_database
+
+      previous_invoice = Invoice.find_by(id: invoice_id_in_database)
+      Invoices::ReservationBoundary.register(previous_invoice) if previous_invoice
     end
 
     def capture_previous_invoice_id
