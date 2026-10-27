@@ -28,25 +28,23 @@ class Api::V1::TimesheetEntryController < Api::V1::ApplicationController
 
   def create
     authorize TimesheetEntry
-    timesheet_entry = current_project.timesheet_entries.new(timesheet_entry_params)
-    timesheet_entry.user = timesheet_entry_user
-    render json: {
-      notice: I18n.t("timesheet_entry.create.message"),
-      entry: timesheet_entry.snippet
-    } if timesheet_entry.save!
+    timesheet_entry = entry_gateway.create(
+      user: timesheet_entry_user, project: current_project, attributes: timesheet_entry_params.to_h
+    )
+    render json: { notice: I18n.t("timesheet_entry.create.message"), entry: timesheet_entry.snippet }
   end
 
   def update
-    authorize current_timesheet_entry
-    current_timesheet_entry.project = current_project
-    current_timesheet_entry.update!(timesheet_entry_params)
-    render json: { notice: I18n.t("timesheet_entry.update.message"), entry: current_timesheet_entry.snippet },
-      status: 200
+    timesheet_entry = entry_gateway.update(
+      entry_id: params[:id], project: current_project, attributes: timesheet_entry_params.to_h,
+      authorize: method(:authorize)
+    )
+    render json: { notice: I18n.t("timesheet_entry.update.message"), entry: timesheet_entry.snippet }, status: 200
   end
 
   def destroy
-    authorize current_timesheet_entry
-    render json: { notice: I18n.t("timesheet_entry.destroy.message") } if current_timesheet_entry.discard!
+    entry_gateway.destroy(entry_id: params[:id], authorize: method(:authorize))
+    render json: { notice: I18n.t("timesheet_entry.destroy.message") }
   end
 
   private
@@ -61,8 +59,14 @@ class Api::V1::TimesheetEntryController < Api::V1::ApplicationController
       @_current_project ||= current_company.projects.kept.find(params[:project_id])
     end
 
-    def current_timesheet_entry
-      @_current_timesheet_entry ||= current_company.timesheet_entries.kept.find(params[:id])
+    # The gateway writes to whichever store owns the entries; the controller
+    # only resolves the target user and project inside the current company.
+    def entry_gateway
+      Timekeeping::Gateway.new(
+        context: Timekeeping::WriteContext.new(
+          company: current_company, actor: current_user, actor_kind: "user", request_id: request.request_id
+        )
+      )
     end
 
     def timesheet_entry_user

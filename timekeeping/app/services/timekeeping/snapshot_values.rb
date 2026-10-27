@@ -4,10 +4,11 @@ module Timekeeping
   # The values an entry snapshot may carry, field by field. The projection
   # (the monolith's Timekeeping::SnapshotBatch) refuses a whole batch when one
   # snapshot holds a value it cannot store, and the relay delivers in outbox
-  # order, so one refused snapshot holds back every later one. EntryCommand and
-  # Handoff::CorrectionSnapshots check their values against these rules before
-  # they write; each rule is at least as strict as the projection's check on the
-  # same field. WriteSteps.write_outbox republishes stored rows without them.
+  # order, so one refused snapshot holds back every later one. EntryCommand,
+  # Handoff::CorrectionSnapshots and the checkpoint load (Handoff::ServiceStore,
+  # through Handoff::CheckpointEntryValues) check their values against these
+  # rules before they write; each rule is at least as strict as the
+  # projection's check on the same field. WriteSteps.write_outbox republishes stored rows without them.
   #
   # The lists are written out here because the app deploys without the
   # contracts directory; spec/services/timekeeping/snapshot_values_spec.rb
@@ -89,9 +90,10 @@ module Timekeeping
     }.freeze
 
     # The names of the snapshot's fields whose value breaks its rule, in
-    # RULES order; [] when every value is valid.
-    def self.invalid_fields(snapshot)
-      RULES.reject { |field, valid| valid.call(snapshot[field]) }.keys
+    # rules order; [] when every value is valid. A caller whose input does not
+    # carry every field as a snapshot does passes the subset that applies.
+    def self.invalid_fields(snapshot, rules: RULES)
+      rules.reject { |field, valid| valid.call(snapshot[field]) }.keys
     end
   end
 end
