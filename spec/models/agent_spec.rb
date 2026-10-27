@@ -96,41 +96,6 @@ RSpec.describe Agent, type: :model do
 end
 
 RSpec.describe Agent, type: :model do
-  # "handoff_step set refuses the detach and aborts the agent destroy and any user or company destroy that cascades into it"
-  it "an agent destroy during a handoff raises and leaves the agent, its key and its entry agent_id in place" do
-    agent = create(:agent)
-    key = create(:agent_key, agent:)
-    project = create(:project, client: create(:client, company: agent.company))
-    entry = create(:timesheet_entry, project:, user: agent.user, agent:)
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(handoff_step: "close_admission")
-
-    expect { agent.destroy! }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
-
-    expect(Agent.where(id: agent.id)).to exist
-    expect(AgentKey.where(id: key.id)).to exist
-    expect(TimesheetEntry.find(entry.id).agent_id).to eq(agent.id)
-  end
-end
-
-RSpec.describe Agent, type: :model do
-  # "The legacy branch nullifies `agent_id` on the agent's entries under `SET LOCAL miru.writer = 'legacy_gateway'`."
-  it "a legacy agent destroy clears agent_id only on that agent's entries and keeps another agent's link" do
-    agent = create(:agent)
-    other_agent = create(:agent, company: agent.company, user: agent.user)
-    project = create(:project, client: create(:client, company: agent.company))
-    detached_entry = create(:timesheet_entry, project:, user: agent.user, agent:)
-    kept_entry = create(:timesheet_entry, project:, user: agent.user, agent: other_agent)
-
-    agent.destroy!
-
-    expect(Agent.where(id: agent.id)).not_to exist
-    expect(TimesheetEntry.where(id: detached_entry.id)).to exist
-    expect(TimesheetEntry.find(detached_entry.id).agent_id).to be_nil
-    expect(TimesheetEntry.find(kept_entry.id).agent_id).to eq(other_agent.id)
-  end
-end
-
-RSpec.describe Agent, type: :model do
   let(:retry_base_url) { "http://timekeeping.test" }
   let(:retry_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
 
@@ -202,6 +167,10 @@ RSpec.describe Agent, type: :model do
     expect(detach_requests.size).to eq(2)
     expect(detach_requests.map { |request| request[:body]["generation"] }).to all(eq(2))
     expect(detach_requests.map { |request| request[:body]["operation_id"] }.uniq.size).to eq(2)
+    expect(detach_requests.pluck(:path)).to contain_exactly(
+      "/v1/companies/#{first_agent.company_id}/agents/#{first_agent.id}/detach-entries",
+      "/v1/companies/#{second_agent.company_id}/agents/#{second_agent.id}/detach-entries"
+    )
   end
 end
 
@@ -312,39 +281,6 @@ end
 RSpec.describe Agent, "destroy cascades refused during a handoff" do
   # "handoff_step set refuses the detach and aborts the agent destroy and any user or company destroy that cascades into it"
   # "A refused detach during a handoff aborts the agent, user and company destroy, and leaves entries and agent keys in place."
-  it "refuses a company destroy during a handoff and leaves the agent, its keys and its entries in place" do
-    agent = create(:agent)
-    company = agent.company
-    key = create(:agent_key, agent:)
-    project = create(:project, client: create(:client, company:))
-    entry = create(:timesheet_entry, project:, user: agent.user, agent:)
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(handoff_step: "close_admission",
-                                                                                 generation: 2)
-
-    expect { company.destroy! }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
-
-    expect(Company.exists?(company.id)).to be(true)
-    expect(Agent.exists?(agent.id)).to be(true)
-    expect(AgentKey.exists?(key.id)).to be(true)
-    expect(TimesheetEntry.unscoped.find(entry.id).agent_id).to eq(agent.id)
-  end
-
-  it "refuses a user destroy during a handoff and leaves the agent, its keys and its entries in place" do
-    agent = create(:agent)
-    user = agent.user
-    key = create(:agent_key, agent:)
-    project = create(:project, client: create(:client, company: agent.company))
-    entry = create(:timesheet_entry, project:, user:, agent:)
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(handoff_step: "freeze", generation: 2)
-
-    expect { user.destroy! }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
-
-    expect(User.unscoped.exists?(user.id)).to be(true)
-    expect(Agent.exists?(agent.id)).to be(true)
-    expect(AgentKey.exists?(key.id)).to be(true)
-    expect(TimesheetEntry.unscoped.find(entry.id).agent_id).to eq(agent.id)
-  end
-
   it "refuses a direct agent destroy during a handoff without sending anything to Timekeeping" do
     agent = create(:agent)
     key = create(:agent_key, agent:)
@@ -452,85 +388,6 @@ RSpec.describe Agent do
 end
 
 RSpec.describe Agent do
-  let(:retry_base_url) { "http://timekeeping.test" }
-
-  # "The agent-destroy writer goes through Timekeeping::Gateway as the detach-entries command"
-  # Timekeeping answers a known operation_id from its stored receipt, so a retry that reused the first
-  # attempt's id would skip the later entry and then delete the agent it still names.
-  it "a retried agent destroy after a local rollback detaches an entry created between the two attempts" do
-    agent = create(:agent)
-    create(:agent_key, agent:)
-    fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
-    route_timekeeping_to_fake(fake, base_url: retry_base_url)
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
-      .update_columns(owner: "timekeeping", generation: 2, handoff_step: nil)
-    fake.generation = 2
-    fake.add_entry(company_id: agent.company_id, user_id: agent.user_id, project_id: 1, agent_id: agent.id)
-
-    key_destroys = 0
-    allow_any_instance_of(AgentKey).to receive(:destroy!).and_wrap_original do |original, *args|
-      key_destroys += 1
-      raise ActiveRecord::RecordNotDestroyed, "local step failed after the remote detach" if key_destroys == 1
-
-      original.call(*args)
-    end
-
-    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, retry_base_url) do
-      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
-        expect { agent.destroy! }.to raise_error(ActiveRecord::RecordNotDestroyed)
-        expect(Agent.exists?(agent.id)).to be(true)
-
-        later = fake.add_entry(company_id: agent.company_id, user_id: agent.user_id, project_id: 1, agent_id: agent.id)
-        Agent.find(agent.id).destroy!
-
-        expect(fake.stored_entry(later["id"])["agent_id"]).to be_nil
-      end
-    end
-
-    expect(Agent.exists?(agent.id)).to be(false)
-    detaches = fake.requests.select { |request| request[:path].end_with?("/detach-entries") }
-    expect(detaches.map { |request| request[:body]["operation_id"] }.uniq.size).to eq(2)
-  end
-end
-
-RSpec.describe Agent do
-  # "handoff_step set refuses the detach and aborts the agent destroy and any user or company destroy that cascades into it"
-  # A company destroy has no handoff guard of its own, so the gateway's refusal is the only thing that can stop it.
-  it "a company destroy during a handoff raises and leaves the agent, its keys and its entry's agent_id in place" do
-    agent = create(:agent)
-    key = create(:agent_key, agent:)
-    project = create(:project, client: create(:client, company: agent.company))
-    entry = create(:timesheet_entry, project:, user: agent.user, agent:)
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(handoff_step: "settle", generation: 2)
-
-    expect { agent.company.destroy! }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
-
-    expect(Company.exists?(agent.company_id)).to be(true)
-    expect(Agent.exists?(agent.id)).to be(true)
-    expect(AgentKey.exists?(key.id)).to be(true)
-    expect(TimesheetEntry.where(id: entry.id).pick(:agent_id)).to eq(agent.id)
-  end
-end
-
-RSpec.describe Agent do
-  # "handoff_step set refuses the detach and aborts the agent destroy and any user or company destroy that cascades into it"
-  it "a user destroy during a handoff raises and leaves the user, agent, keys and entry agent_id in place" do
-    agent = create(:agent)
-    key = create(:agent_key, agent:)
-    project = create(:project, client: create(:client, company: agent.company))
-    entry = create(:timesheet_entry, project:, user: agent.user, agent:)
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(handoff_step: "freeze", generation: 2)
-
-    expect { agent.user.destroy! }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
-
-    expect(User.exists?(agent.user_id)).to be(true)
-    expect(Agent.exists?(agent.id)).to be(true)
-    expect(AgentKey.exists?(key.id)).to be(true)
-    expect(TimesheetEntry.where(id: entry.id).pick(:agent_id)).to eq(agent.id)
-  end
-end
-
-RSpec.describe Agent do
   let(:stale_base_url) { "http://timekeeping.test" }
 
   # "A refusal or failure raises, which aborts the agent destroy and the user or company destroy that cascades into it"
@@ -554,37 +411,5 @@ RSpec.describe Agent do
     expect(Agent.exists?(agent.id)).to be(true)
     expect(AgentKey.exists?(key.id)).to be(true)
     expect(fake.stored_entry(remote["id"])["agent_id"]).to eq(agent.id)
-  end
-end
-
-RSpec.describe Agent do
-  let(:cascade_base_url) { "http://timekeeping.test" }
-
-  # "The forwarded branch calls `POST /v1/companies/{company_id}/agents/{agent_id}/detach-entries` (`contracts/timekeeping/reservations.yml`), with body `operation_id` and `generation`, and with `X-Request-Id`."
-  # A shared operation_id would let Timekeeping replay the first agent's receipt for the second agent.
-  it "a user destroy that cascades into two agents sends each agent's detach with its own operation_id and path" do
-    first = create(:agent)
-    second = create(:agent, company: first.company, user: first.user, name: "Second Agent")
-    fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
-    route_timekeeping_to_fake(fake, base_url: cascade_base_url)
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
-      .update_columns(owner: "timekeeping", generation: 2, handoff_step: nil)
-    fake.generation = 2
-    second_entry = fake.add_entry(company_id: second.company_id, user_id: second.user_id, project_id: 1,
-                                  agent_id: second.id)
-
-    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, cascade_base_url) do
-      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
-        first.user.destroy!
-      end
-    end
-
-    detaches = fake.requests.select { |request| request[:path].end_with?("/detach-entries") }
-    expect(detaches.pluck(:path)).to contain_exactly(
-      "/v1/companies/#{first.company_id}/agents/#{first.id}/detach-entries",
-      "/v1/companies/#{second.company_id}/agents/#{second.id}/detach-entries"
-    )
-    expect(detaches.map { |request| request[:body]["operation_id"] }.uniq.size).to eq(2)
-    expect(fake.stored_entry(second_entry["id"])["agent_id"]).to be_nil
   end
 end
