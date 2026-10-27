@@ -72,6 +72,28 @@ RSpec.describe TimekeepingContract::FakeTimekeeping, "in token mode" do
     expect(token_mode_fake.stored_entry(response.body.fetch("id"))["user_id"]).to eq(admin.id)
   end
 
+  it "accepts a create naming a registered monolith agent with its run ids and refuses unregistered agents" do
+    admin = token_mode_member(:admin)
+    agent_id = 7001
+    token_mode_fake.register_agent(id: agent_id, company_id: token_mode_company.id, user_id: admin.id)
+    token_mode_fake.register_agent(id: agent_id + 1, company_id: token_mode_company.id + 1, user_id: admin.id)
+    create_with = lambda do |fields|
+      token_mode_fake.call("POST", token_mode_entries_path, headers: token_mode_headers(token_mode_token(admin)),
+                                                            body: token_mode_create_body.merge(fields))
+    end
+
+    created = create_with.call("agent_id" => agent_id, "external_run_id" => "run_123",
+                               "external_session_id" => "session_123")
+
+    expect(created.status).to eq(201)
+    expect(created.body).to include("agent_id" => agent_id, "external_run_id" => "run_123",
+                                    "external_session_id" => "session_123")
+    expect(token_mode_fake.outbox.last.fetch("entry"))
+      .to include("agent_id" => agent_id, "external_run_id" => "run_123", "external_session_id" => "session_123")
+    expect(create_with.call("agent_id" => agent_id + 1).status).to eq(404)
+    expect(create_with.call("agent_id" => agent_id + 2).status).to eq(404)
+  end
+
   it "answers 401 for a token signed with another key, an expired token and a read token on a write" do
     admin = token_mode_member(:admin)
     tokens = [

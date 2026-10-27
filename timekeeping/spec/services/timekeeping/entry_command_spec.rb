@@ -103,9 +103,10 @@ RSpec.describe Timekeeping::EntryCommand do
     end
   end
 
-  it "checks the body against the shared snapshot rules for the same nine fields, leaving project_id out" do
+  it "checks the body against the shared snapshot rules for the same eleven fields, leaving project_id out" do
     expect(described_class::FIELD_SHAPES.keys).to eq(
-      %w[work_date duration note source source_metadata bill_status agent_id proof_url proof_metadata]
+      %w[work_date duration note source source_metadata bill_status agent_id proof_url proof_metadata external_run_id
+         external_session_id]
     )
     expect(described_class::FIELD_SHAPES).to all(satisfy { |field, rule| rule == Timekeeping::SnapshotValues::RULES[field] })
   end
@@ -164,6 +165,72 @@ RSpec.describe Timekeeping::EntryCommand do
       expect(command).to have_attributes(actor_id: 7, company_id: 3, operation: "destroy 42", key: "key-1"),
                          "#{row[:name]}: wrong receipt identity in #{command.inspect}"
       expect(command.fingerprint).to eq(plain_destroy.fingerprint), "#{row[:name]}: fingerprint differs from a plain destroy"
+    end
+  end
+end
+
+RSpec.describe Timekeeping::EntryCommand do
+  let(:facts) do
+    Timekeeping::ReferenceClient::Facts.new(
+      company_id: 3, edit_days: 30, users: [Timekeeping::ReferenceClient::User.new(id: 7, role: "owner")],
+      projects: [Timekeeping::ReferenceClient::Project.new(id: 11, company_id: 3, billable: true, member_user_ids: [])],
+      missing_project_ids: [], agents: []
+    )
+  end
+  let(:reference_client) { instance_double(Timekeeping::ReferenceClient, fetch: facts) }
+  let(:identity) { Timekeeping::Identity.new(kind: :user, status: :verified, user_id: 7, company_id: 3, role: "owner") }
+
+  def build_agent_run_create(fields)
+    body = { "project_id" => 11, "work_date" => "2026-03-02", "duration" => 30.0 }.merge(fields)
+    described_class.build(route: :create, identity:, bearer: "caller-token", company_id: 3, entry_id: nil,
+                          headers: { "Idempotency-Key" => "key-run", "Ownership-Generation" => "1" },
+                          raw_body: JSON.generate(body), reference_client:, today: Date.new(2026, 3, 3))
+  end
+
+  # "Add them to `WRITABLE_FIELDS` and `FIELD_SHAPES` (each nil or a String) in `timekeeping/app/services/timekeeping/entry_command.rb`, and to the presenter in `timekeeping/app/presenters/timekeeping/entry_presenter.rb`."
+  it "accepts agent run and session ids only as nil or a String and refuses any other shape as a bad request" do
+    command = build_agent_run_create("external_run_id" => "run_123", "external_session_id" => nil)
+    expect(command.entry_fields).to include("external_run_id" => "run_123", "external_session_id" => nil)
+
+    [1, ["run_123"], { "id" => "run_123" }, true].each do |bad|
+      expect { build_agent_run_create("external_run_id" => bad) }.to raise_error(ActionController::BadRequest)
+      expect { build_agent_run_create("external_session_id" => bad) }.to raise_error(ActionController::BadRequest)
+    end
+  end
+end
+
+RSpec.describe Timekeeping::EntryCommand do
+  let(:run_fields_facts) do
+    Timekeeping::ReferenceClient::Facts.new(
+      company_id: 3, edit_days: 30, users: [Timekeeping::ReferenceClient::User.new(id: 7, role: "owner")],
+      projects: [Timekeeping::ReferenceClient::Project.new(id: 11, company_id: 3, billable: true, member_user_ids: [])],
+      missing_project_ids: [], agents: []
+    )
+  end
+  let(:run_fields_reference_client) { instance_double(Timekeeping::ReferenceClient, fetch: run_fields_facts) }
+  let(:run_fields_identity) do
+    Timekeeping::Identity.new(kind: :user, status: :verified, user_id: 7, company_id: 3, role: "owner")
+  end
+
+  def build_with_run_fields(fields)
+    body = { "project_id" => 11, "work_date" => "2026-03-02", "duration" => 30.0 }.merge(fields)
+    described_class.build(route: :create, identity: run_fields_identity, bearer: "caller-token", company_id: 3,
+                          entry_id: nil, headers: { "Idempotency-Key" => "key-1", "Ownership-Generation" => "1" },
+                          raw_body: JSON.generate(body), reference_client: run_fields_reference_client,
+                          today: Date.new(2026, 3, 3))
+  end
+
+  it "accepts external_run_id and external_session_id as a String or nil and refuses any other type as a bad request" do
+    # "Add them to `WRITABLE_FIELDS` and `FIELD_SHAPES` (each nil or a String)"
+    command = build_with_run_fields("external_run_id" => "run_123", "external_session_id" => "session_123")
+    expect(command.entry_fields).to include("external_run_id" => "run_123", "external_session_id" => "session_123")
+
+    with_nil = build_with_run_fields("external_run_id" => nil, "external_session_id" => nil)
+    expect(with_nil.entry_fields).to include("external_run_id" => nil, "external_session_id" => nil)
+
+    [123, ["run_123"], { "id" => "run_123" }, true].each do |bad|
+      expect { build_with_run_fields("external_run_id" => bad) }.to raise_error(ActionController::BadRequest)
+      expect { build_with_run_fields("external_session_id" => bad) }.to raise_error(ActionController::BadRequest)
     end
   end
 end

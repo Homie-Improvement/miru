@@ -8,6 +8,7 @@ module Timekeeping
     STORED_FIELDS = %w[
       id company_id version project_id user_id work_date duration note
       bill_status review_status source source_metadata agent_id proof_url proof_metadata
+      external_run_id external_session_id
     ].freeze
 
     module_function

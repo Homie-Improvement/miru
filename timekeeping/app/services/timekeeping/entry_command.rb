@@ -21,7 +21,7 @@ module Timekeeping
     # entry_optional_fields of contracts/timekeeping/entry_api.yml, less
     # user_id, which names the target user and is decided by the writer.
     WRITABLE_FIELDS = %w[project_id work_date duration note source source_metadata bill_status agent_id proof_url
-                         proof_metadata].freeze
+                         proof_metadata external_run_id external_session_id].freeze
 
     # The shape each field must have when the body sends it, so a value the
     # entries table or the projection cannot store is refused as a bad request
@@ -29,7 +29,8 @@ module Timekeeping
     # delivery. project_id is not here: parse_project_id reads it, and accepts
     # a decimal string the snapshot rule would refuse.
     FIELD_SHAPES = SnapshotValues::RULES.slice(
-      *%w[work_date duration note source source_metadata bill_status agent_id proof_url proof_metadata]
+      *%w[work_date duration note source source_metadata bill_status agent_id proof_url proof_metadata external_run_id
+          external_session_id]
     ).freeze
     CREATE_REQUIRED_FIELDS = %w[work_date duration].freeze
 

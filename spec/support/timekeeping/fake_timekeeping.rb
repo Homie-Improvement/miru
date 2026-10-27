@@ -203,6 +203,10 @@ module TimekeepingContract
       @projects[id] = company_id
     end
 
+    def register_agent(id:, company_id:, user_id:)
+      @agents[id] = { "company_id" => company_id, "user_id" => user_id }
+    end
+
     def add_agent(company_id:, user_id:)
       next_id.tap { |id| @agents[id] = { "company_id" => company_id, "user_id" => user_id } }
     end
