@@ -22,11 +22,6 @@ RSpec.describe Invoices::PreparedReservations do
       let(:foreign_project) { create(:project, client: create(:client, company: foreign_company)) }
       let(:entry_user) { create(:user) }
 
-      def tenant_spec_entry(company, project)
-        Timekeeping::LocalEntry.create!(company_id: company.id, user_id: entry_user.id, project_id: project.id,
-                                        work_date: Date.current, duration: 30.0, bill_status: "unbilled")
-      end
-
       def tenant_spec_count(sql, *binds)
         ApplicationRecord.connection.select_value(ApplicationRecord.sanitize_sql_array([sql, *binds])).to_i
       end
@@ -36,14 +31,10 @@ RSpec.describe Invoices::PreparedReservations do
       # check can refuse it.
       it "refuses another company's entry as not_found and reserves, records and publishes nothing for either entry" do
         [tenant_company, foreign_company].each { |company| create(:employment, company:, user: entry_user) }
-        own_entry = tenant_spec_entry(tenant_company, tenant_project)
-        foreign_entry = tenant_spec_entry(foreign_company, foreign_project)
+        own_entry = prepared_spec_entry(tenant_company, user: entry_user, project: tenant_project)
+        foreign_entry = prepared_spec_entry(foreign_company, user: entry_user, project: foreign_project)
         invoice = create(:invoice, company: tenant_company, client: tenant_client)
-        request = Invoices::ReservationRequest.new(
-          company_id: tenant_company.id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
-          generation: TimekeepingOwnership.current.generation, disposition: "active",
-          entries: [own_entry.id, foreign_entry.id]
-        )
+        request = prepared_spec_request(tenant_company, invoice, [own_entry.id, foreign_entry.id])
         entry_ids = [own_entry.id, foreign_entry.id]
         company_ids = [tenant_company.id, foreign_company.id]
         versions_before = [own_entry.reload.version, foreign_entry.reload.version]
@@ -88,26 +79,20 @@ RSpec.describe Invoices::PreparedReservations do
       end
 
       it "a commit or abort sent under another company never touches a prepared operation that shares its invoice and operation ids" do
-        entry = Timekeeping::LocalEntry.create!(company_id: owning_company.id, user_id: entry_user.id,
-                                                project_id: owning_project.id, work_date: Date.current,
-                                                duration: 30.0, bill_status: "unbilled")
+        entry = prepared_spec_entry(owning_company, user: entry_user, project: owning_project)
         invoice = create(:invoice, company: owning_company, client: owning_client)
         operation_id = SecureRandom.uuid
-        request_for = lambda do |company_id|
-          Invoices::ReservationRequest.new(
-            company_id:, invoice_id: invoice.id, operation_id:,
-            generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [entry.id]
-          )
-        end
+        # The intruding company's request carries the owning invoice and operation ids.
+        request_for = ->(company) { prepared_spec_request(company, invoice, [entry.id], operation_id:) }
         adapter = described_class.new
-        expect(adapter.prepare(request_for.call(owning_company.id)).state).to eq("prepared")
+        expect(adapter.prepare(request_for.call(owning_company)).state).to eq("prepared")
         rows_before = cross_company_rows(invoice.id)
         outbox_before = Timekeeping::LocalOutboxEntry.where(entry_id: entry.id).count
         version_before = entry.reload.version
 
         # "Store the operation identity on each reservation row, so commit and abort touch only their own rows"
-        adapter.commit(request_for.call(intruding_company.id))
-        adapter.abort(request_for.call(intruding_company.id))
+        adapter.commit(request_for.call(intruding_company))
+        adapter.abort(request_for.call(intruding_company))
 
         expect(cross_company_rows(invoice.id)).to eq(rows_before)
         expect(rows_before).to eq([[owning_company.id, entry.id, "provisional", "active"]])
@@ -115,7 +100,7 @@ RSpec.describe Invoices::PreparedReservations do
         expect(Timekeeping::LocalOutboxEntry.where(entry_id: entry.id).count).to eq(outbox_before)
         expect(entry.reload.version).to eq(version_before)
 
-        expect(adapter.commit(request_for.call(owning_company.id)).state).to eq("committed")
+        expect(adapter.commit(request_for.call(owning_company)).state).to eq("committed")
         expect(cross_company_rows(invoice.id)).to eq([[owning_company.id, entry.id, "committed", "active"]])
       end
     end
@@ -127,11 +112,6 @@ RSpec.describe Invoices::PreparedReservations do
       let(:billing_project) { create(:project, client: billing_client) }
       let(:bystander_project) { create(:project, client: create(:client, company: bystander_company)) }
       let(:entry_user) { create(:user) }
-
-      def billing_spec_entry(company, project)
-        Timekeeping::LocalEntry.create!(company_id: company.id, user_id: entry_user.id, project_id: project.id,
-                                        work_date: Date.current, duration: 30.0, bill_status: "unbilled")
-      end
 
       # The company of every outbox row written for the entry, read by SQL.
       def billing_spec_outbox_companies(entry)
@@ -145,18 +125,12 @@ RSpec.describe Invoices::PreparedReservations do
       # entry is committed to the invoice first and the other is not.
       it "mark_billed bills only the request company's entries, committed or not, and publishes no snapshot for another company's entry" do
         [billing_company, bystander_company].each { |company| create(:employment, company:, user: entry_user) }
-        own_entry = billing_spec_entry(billing_company, billing_project)
-        committed_entry = billing_spec_entry(billing_company, billing_project)
-        bystander_entry = billing_spec_entry(bystander_company, bystander_project)
+        own_entry = prepared_spec_entry(billing_company, user: entry_user, project: billing_project)
+        committed_entry = prepared_spec_entry(billing_company, user: entry_user, project: billing_project)
+        bystander_entry = prepared_spec_entry(bystander_company, user: entry_user, project: bystander_project)
         invoice = create(:invoice, company: billing_company, client: billing_client)
-        request_for = lambda do |entries|
-          Invoices::ReservationRequest.new(
-            company_id: billing_company.id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
-            generation: TimekeepingOwnership.current.generation, disposition: "active", entries:
-          )
-        end
         adapter = described_class.new
-        reservation = request_for.call([committed_entry.id])
+        reservation = prepared_spec_request(billing_company, invoice, [committed_entry.id])
         expect(adapter.prepare(reservation).state).to eq("prepared")
         expect(adapter.commit(reservation).state).to eq("committed")
         own_entries = [own_entry, committed_entry]
@@ -166,7 +140,9 @@ RSpec.describe Invoices::PreparedReservations do
         expect(billing_spec_outbox_companies(bystander_entry)).to eq([])
 
         # "`mark_billed` sets `entries.bill_status` to billed for the invoice's entries."
-        outcome = adapter.mark_billed(request_for.call([own_entry.id, committed_entry.id, bystander_entry.id]))
+        outcome = adapter.mark_billed(
+          prepared_spec_request(billing_company, invoice, [own_entry.id, committed_entry.id, bystander_entry.id])
+        )
 
         expect(outcome).to be_a(Invoices::ReservationOutcome)
         expect(own_entries.map { |entry| entry.reload.bill_status }).to eq(%w[billed billed])
@@ -234,19 +210,6 @@ RSpec.describe Invoices::PreparedReservations do
       let(:redelivery_data_client) { create(:client, company: redelivery_data_company) }
       let(:redelivery_data_project) { create(:project, client: redelivery_data_client) }
 
-      def redelivery_data_entry
-        Timekeeping::LocalEntry.create!(company_id: redelivery_data_company.id, user_id: redelivery_data_user.id,
-                                        project_id: redelivery_data_project.id, work_date: Date.new(2026, 3, 2),
-                                        duration: 60.0, bill_status: "unbilled")
-      end
-
-      def redelivery_data_request(invoice, entry)
-        Invoices::ReservationRequest.new(company_id: redelivery_data_company.id, invoice_id: invoice.id,
-                                         operation_id: SecureRandom.uuid,
-                                         generation: TimekeepingOwnership.current.generation,
-                                         disposition: "active", entries: [entry.id])
-      end
-
       # What one invoice's operation can change, read by SQL. The outbox
       # counts cover the company and every company.
       def redelivery_data_state(invoice, entry)
@@ -275,8 +238,9 @@ RSpec.describe Invoices::PreparedReservations do
       it "a redelivered commit and a late abort after commit, and a commit after abort, answer their settled states and change nothing" do
         adapter = described_class.new
         committed_invoice = create(:invoice, company: redelivery_data_company, client: redelivery_data_client)
-        committed_entry = redelivery_data_entry
-        committed_request = redelivery_data_request(committed_invoice, committed_entry)
+        committed_entry = prepared_spec_entry(redelivery_data_company, user: redelivery_data_user,
+                                                                       project: redelivery_data_project)
+        committed_request = prepared_spec_request(redelivery_data_company, committed_invoice, [committed_entry.id])
         expect(adapter.prepare(committed_request).state).to eq("prepared")
         expect(adapter.commit(committed_request).state).to eq("committed")
         settled = redelivery_data_state(committed_invoice, committed_entry)
@@ -290,8 +254,9 @@ RSpec.describe Invoices::PreparedReservations do
         expect(redelivery_data_state(committed_invoice, committed_entry)).to eq(settled)
 
         aborted_invoice = create(:invoice, company: redelivery_data_company, client: redelivery_data_client)
-        aborted_entry = redelivery_data_entry
-        aborted_request = redelivery_data_request(aborted_invoice, aborted_entry)
+        aborted_entry = prepared_spec_entry(redelivery_data_company, user: redelivery_data_user,
+                                                                     project: redelivery_data_project)
+        aborted_request = prepared_spec_request(redelivery_data_company, aborted_invoice, [aborted_entry.id])
         expect(adapter.prepare(aborted_request).state).to eq("prepared")
         expect(adapter.abort(aborted_request).state).to eq("aborted")
         dropped = redelivery_data_state(aborted_invoice, aborted_entry)
@@ -312,12 +277,6 @@ RSpec.describe Invoices::PreparedReservations do
       let(:unresolved_user) { create(:user, current_workspace_id: unresolved_company.id) }
       let(:unresolved_client) { create(:client, company: unresolved_company) }
       let(:unresolved_project) { create(:project, client: unresolved_client, billable: true) }
-
-      def unresolved_entry
-        Timekeeping::LocalEntry.create!(company_id: unresolved_company.id, user_id: unresolved_user.id,
-                                        project_id: unresolved_project.id, work_date: Date.new(2026, 3, 2),
-                                        duration: 60.0, bill_status: "unbilled")
-      end
 
       # Every row a prepare could store, read by SQL: the company's rows and
       # counts, the invoice's operations, and the outbox across every company.
@@ -349,23 +308,17 @@ RSpec.describe Invoices::PreparedReservations do
 
       it "a second prepare while the invoice's operation is still prepared answers retryable unresolved_operation and stores nothing new" do
         invoice = create(:invoice, company: unresolved_company, client: unresolved_client)
-        first_entry = unresolved_entry
-        second_entry = unresolved_entry
+        first_entry = prepared_spec_entry(unresolved_company, user: unresolved_user, project: unresolved_project)
+        second_entry = prepared_spec_entry(unresolved_company, user: unresolved_user, project: unresolved_project)
         adapter = described_class.new
-        build = lambda do |entries|
-          Invoices::ReservationRequest.new(
-            company_id: unresolved_company.id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
-            generation: TimekeepingOwnership.current.generation, disposition: "active", entries:
-          )
-        end
-        expect(adapter.prepare(build.call([first_entry.id])).state).to eq("prepared")
+        expect(adapter.prepare(prepared_spec_request(unresolved_company, invoice, [first_entry.id])).state).to eq("prepared")
         before = unresolved_state(invoice, [first_entry, second_entry])
         expect(before[:reservations]).to eq([[first_entry.id, invoice.id, "provisional", "active"]])
         expect(before[:operations]).to eq(["prepared"])
         # The first prepare locked only the first entry, so the second has no snapshot.
         expect(before[:entry_outbox]).to eq([1, 0])
 
-        outcome = adapter.prepare(build.call([first_entry.id, second_entry.id]))
+        outcome = adapter.prepare(prepared_spec_request(unresolved_company, invoice, [first_entry.id, second_entry.id]))
 
         expect(outcome.state).to eq("retryable")
         expect(outcome.reason).to eq("unresolved_operation")
@@ -394,18 +347,10 @@ RSpec.describe Invoices::PreparedReservations do
       end
 
       it "mark_billed bills the invoice's entry once with one snapshot, and a redelivered or new repeated call writes nothing more" do
-        entry = Timekeeping::LocalEntry.create!(company_id: billing_data_company.id, user_id: billing_data_user.id,
-                                                project_id: billing_data_project.id, work_date: Date.new(2026, 3, 2),
-                                                duration: 60.0, bill_status: "unbilled")
+        entry = prepared_spec_entry(billing_data_company, user: billing_data_user, project: billing_data_project)
         invoice = create(:invoice, company: billing_data_company, client: billing_data_client)
         adapter = described_class.new
-        build = lambda do
-          Invoices::ReservationRequest.new(
-            company_id: billing_data_company.id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
-            generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [entry.id]
-          )
-        end
-        reservation = build.call
+        reservation = prepared_spec_request(billing_data_company, invoice, [entry.id])
         expect(adapter.prepare(reservation).state).to eq("prepared")
         expect(adapter.commit(reservation).state).to eq("committed")
         before = billing_data_state(entry)
@@ -418,7 +363,7 @@ RSpec.describe Invoices::PreparedReservations do
         expect(billed).to eq(bill_status: "billed", version: before[:version] + 1,
                              entry_outbox: before[:entry_outbox] + 1, outbox: before[:outbox] + 1)
 
-        [reservation, build.call].each do |repeat|
+        [reservation, prepared_spec_request(billing_data_company, invoice, [entry.id])].each do |repeat|
           expect(adapter.mark_billed(repeat)).to be_a(Invoices::ReservationOutcome)
           expect(billing_data_state(entry)).to eq(billed)
         end
@@ -432,25 +377,14 @@ RSpec.describe Invoices::PreparedReservations do
       let(:user) { create(:user, current_workspace_id: company.id) }
       let(:adapter) { described_class.new }
 
-      def stale_abort_entry
-        Timekeeping::LocalEntry.create!(company_id: company.id, user_id: user.id, project_id: project.id,
-                                        work_date: Date.new(2026, 3, 2), duration: 60.0, bill_status: "unbilled")
-      end
-
-      def stale_abort_request(invoice_id, entry_ids)
-        Invoices::ReservationRequest.new(company_id: company.id, invoice_id:, operation_id: SecureRandom.uuid,
-                                         generation: TimekeepingOwnership.current.generation, disposition: "active",
-                                         entries: entry_ids)
-      end
-
       it "a late abort for an invoice's earlier operation leaves the provisional rows of its newer operation in place" do
         invoice = create(:invoice, company:, client:)
-        first_entry = stale_abort_entry
-        added_entry = stale_abort_entry
-        earlier = stale_abort_request(invoice.id, [first_entry.id])
+        first_entry = prepared_spec_entry(company, user:, project:)
+        added_entry = prepared_spec_entry(company, user:, project:)
+        earlier = prepared_spec_request(company, invoice, [first_entry.id])
         adapter.prepare(earlier)
         adapter.commit(earlier)
-        newer = stale_abort_request(invoice.id, [first_entry.id, added_entry.id])
+        newer = prepared_spec_request(company, invoice, [first_entry.id, added_entry.id])
         expect(adapter.prepare(newer).state).to eq("prepared")
 
         # "Abort drops only this operation's provisional rows. Store the operation identity on each reservation row, so commit and abort touch only their own rows (docs/solutions/design-patterns/carry-scoped-operation-identity-into-owned-rows.md)."
@@ -478,19 +412,6 @@ RSpec.describe Invoices::PreparedReservations do
       let(:unstored_user) { create(:user, current_workspace_id: unstored_company.id) }
       let(:unstored_client) { create(:client, company: unstored_company) }
       let(:unstored_project) { create(:project, client: unstored_client, billable: true) }
-
-      def unstored_entry
-        Timekeeping::LocalEntry.create!(company_id: unstored_company.id, user_id: unstored_user.id,
-                                        project_id: unstored_project.id, work_date: Date.new(2026, 3, 2),
-                                        duration: 60.0, bill_status: "unbilled")
-      end
-
-      def unstored_request(invoice, entry_ids)
-        Invoices::ReservationRequest.new(company_id: unstored_company.id, invoice_id: invoice.id,
-                                         operation_id: SecureRandom.uuid,
-                                         generation: TimekeepingOwnership.current.generation,
-                                         disposition: "active", entries: entry_ids)
-      end
 
       # Every row the company holds, read by SQL, with the outbox counted for
       # each entry, for the company and across every company.
@@ -520,8 +441,9 @@ RSpec.describe Invoices::PreparedReservations do
 
       it "abort and commit for an operation never stored, alone or after a refused prepare, answer aborted and committed and write nothing" do
         adapter = described_class.new
-        lone_entry = unstored_entry
-        lone_request = unstored_request(create(:invoice, company: unstored_company, client: unstored_client), [lone_entry.id])
+        lone_entry = prepared_spec_entry(unstored_company, user: unstored_user, project: unstored_project)
+        lone_invoice = create(:invoice, company: unstored_company, client: unstored_client)
+        lone_request = prepared_spec_request(unstored_company, lone_invoice, [lone_entry.id])
         empty = unstored_state([lone_entry])
         expect(empty.slice(:reservations, :operations, :company_outbox)).to eq(reservations: [], operations: [], company_outbox: 0)
 
@@ -532,9 +454,9 @@ RSpec.describe Invoices::PreparedReservations do
 
         holder = create(:invoice, company: unstored_company, client: unstored_client)
         second = create(:invoice, company: unstored_company, client: unstored_client)
-        held = unstored_entry
-        free = unstored_entry
-        holder_request = unstored_request(holder, [held.id])
+        held = prepared_spec_entry(unstored_company, user: unstored_user, project: unstored_project)
+        free = prepared_spec_entry(unstored_company, user: unstored_user, project: unstored_project)
+        holder_request = prepared_spec_request(unstored_company, holder, [held.id])
         expect(adapter.prepare(holder_request).state).to eq("prepared")
         expect(adapter.commit(holder_request).state).to eq("committed")
         entries = [lone_entry, held, free]
@@ -547,7 +469,7 @@ RSpec.describe Invoices::PreparedReservations do
         # "A second kept invoice on the same entry fails with \"entry is on another invoice\""
         # The held entry is refused in either position of the request, and the free entry is not reserved.
         [[held.id, free.id], [free.id, held.id]].each do |entry_ids|
-          refused_request = unstored_request(second, entry_ids)
+          refused_request = prepared_spec_request(unstored_company, second, entry_ids)
 
           # "Prepare is all or nothing, and one refusal reserves nothing."
           outcome = adapter.prepare(refused_request)
@@ -704,22 +626,14 @@ RSpec.describe Invoices::PreparedReservations do
   describe "tenant boundary on abort and commit" do
     it "abort by one company with a shared operation id leaves another company's provisional reservation, which still commits" do
       TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
-      generation = TimekeepingOwnership.current.generation
       shared_operation_id = SecureRandom.uuid
       user = create(:user)
       setups = [create(:company), create(:company)].map do |company|
         create(:employment, company:, user:)
         client = create(:client, company:)
-        project = create(:project, client:)
-        entry = Timekeeping::LocalEntry.create!(
-          company_id: company.id, user_id: user.id, project_id: project.id,
-          work_date: Date.new(2026, 3, 2), duration: 60.0, bill_status: "unbilled"
-        )
+        entry = prepared_spec_entry(company, user:, project: create(:project, client:))
         invoice = create(:invoice, company:, client:)
-        request = Invoices::ReservationRequest.new(
-          company_id: company.id, invoice_id: invoice.id, operation_id: shared_operation_id,
-          generation:, disposition: "active", entries: [entry.id]
-        )
+        request = prepared_spec_request(company, invoice, [entry.id], operation_id: shared_operation_id)
         { company:, entry:, request: }
       end
       company_a_setup, company_b_setup = setups
@@ -834,23 +748,20 @@ RSpec.describe Invoices::PreparedReservations do
       user = create(:user)
       create(:employment, company:, user:)
       project = create(:project, client: create(:client, company:))
-      fields = { company_id: company.id, user_id: user.id, project_id: project.id,
-                 work_date: Date.new(2026, 3, 2), duration: 60.0, bill_status: "unbilled" }
-      held = Timekeeping::LocalEntry.create!(fields)
-      free = Timekeeping::LocalEntry.create!(fields)
+      held = prepared_spec_entry(company, user:, project:)
+      free = prepared_spec_entry(company, user:, project:)
       ActiveRecord::Base.connection.execute(ActiveRecord::Base.sanitize_sql_array([<<~SQL.squish, company.id, held.id]))
         INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
         VALUES (?, ?, 900, gen_random_uuid(), 'committed', 'active', now())
       SQL
       count = ->(table) { ActiveRecord::Base.connection.select_value("SELECT count(*) FROM #{table} WHERE company_id = #{company.id}").to_i }
       before = %w[reservations invoice_operations entry_outbox_items].map { |table| count.call(table) }
-      request = lambda do |entries|
-        Invoices::ReservationRequest.new(company_id: company.id, invoice_id: 901, operation_id: SecureRandom.uuid,
-                                         generation: TimekeepingOwnership.current.generation, disposition: "active", entries:)
-      end
+      # No invoice 901 is stored; the request carries only its id, beside the
+      # held entry's reservation on invoice 900.
+      unstored_invoice = Invoice.new(id: 901)
 
-      refused = described_class.new.admit(request.call([held.id]))
-      admitted = described_class.new.admit(request.call([free.id]))
+      refused = described_class.new.admit(prepared_spec_request(company, unstored_invoice, [held.id]))
+      admitted = described_class.new.admit(prepared_spec_request(company, unstored_invoice, [free.id]))
 
       expect(refused).to be_a(Invoices::ReservationOutcome)
       expect(refused.state).to eq("refused")
@@ -878,20 +789,15 @@ RSpec.describe Invoices::PreparedReservations do
       create(:invoice_line_item, invoice: sent, timesheet_entry: entry, rate: 100, quantity: 60)
       InvoiceEntryHolding.where(company_id: line_claim_company.id, invoice_id: sent.id).delete_all
       second = create(:invoice, company: line_claim_company, client: line_claim_client, status: :sent)
-      prepared_entry = Timekeeping::LocalEntry.create!(
-        id: entry.id, company_id: line_claim_company.id, user_id: line_claim_user.id,
-        project_id: line_claim_project.id, work_date: Date.current, duration: 60.0, bill_status: "unbilled"
-      )
+      prepared_entry = prepared_spec_entry(line_claim_company, user: line_claim_user, project: line_claim_project,
+                                                               id: entry.id)
       TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
       connection = ApplicationRecord.connection
       reservation_count = -> { connection.select_value("SELECT COUNT(*) FROM reservations WHERE company_id = #{line_claim_company.id}").to_i }
       outbox_count = -> { connection.select_value("SELECT COUNT(*) FROM entry_outbox_items WHERE company_id = #{line_claim_company.id}").to_i }
       reservations_before = reservation_count.call
       outbox_before = outbox_count.call
-      request = Invoices::ReservationRequest.new(
-        company_id: line_claim_company.id, invoice_id: second.id, operation_id: SecureRandom.uuid,
-        generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [entry.id]
-      )
+      request = prepared_spec_request(line_claim_company, second, [entry.id])
       version_before = prepared_entry.reload.version
 
       outcome = described_class.new.admit(request)
@@ -913,12 +819,6 @@ RSpec.describe Invoices::PreparedReservations do
     # Lines are written under the legacy owner, then ownership moves to the
     # prepared store with no reservation row for either entry, as after a sent
     # invoice's added lines pass admit.
-    def line_only_prepared_copy(entry)
-      Timekeeping::LocalEntry.create!(id: entry.id, company_id: line_only_company.id, user_id: line_only_user.id,
-                                      project_id: line_only_project.id, work_date: Date.current, duration: 60.0,
-                                      bill_status: "unbilled")
-    end
-
     it "refuses a draft's prepare for an entry on a sent invoice's direct line or grouped line and writes nothing" do
       direct = create(:timesheet_entry, user: line_only_user, project: line_only_project, bill_status: "unbilled")
       sent = create(:invoice, company: line_only_company, client: line_only_client, status: :sent)
@@ -927,7 +827,9 @@ RSpec.describe Invoices::PreparedReservations do
       InvoiceEntryHolding.where(company_id: line_only_company.id, invoice_id: sent.id).delete_all
       draft = create(:invoice, company: line_only_company, client: line_only_client, status: :draft)
       free = create(:timesheet_entry, user: line_only_user, project: line_only_project, bill_status: "unbilled")
-      [direct, grouped, free].each { |entry| line_only_prepared_copy(entry) }
+      [direct, grouped, free].each do |entry|
+        prepared_spec_entry(line_only_company, user: line_only_user, project: line_only_project, id: entry.id)
+      end
       TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
       company_id = line_only_company.id
       counts = lambda do
@@ -938,11 +840,7 @@ RSpec.describe Invoices::PreparedReservations do
         end
       end
       before = counts.call
-      request = Invoices::ReservationRequest.new(
-        company_id:, invoice_id: draft.id, operation_id: SecureRandom.uuid,
-        generation: TimekeepingOwnership.current.generation, disposition: "active",
-        entries: [direct.id, grouped.id, free.id]
-      )
+      request = prepared_spec_request(line_only_company, draft, [direct.id, grouped.id, free.id])
 
       # "A second kept invoice on the same entry fails with \"entry is on another invoice\""
       outcome = described_class.new.prepare(request)
@@ -972,9 +870,7 @@ RSpec.describe Invoices::PreparedReservations do
       create(:invoice_line_item, invoice: sent, timesheet_entry: entry, rate: 100, quantity: 60)
       InvoiceEntryHolding.where(company_id: retained_line_company.id, invoice_id: sent.id).delete_all
       draft = create(:invoice, company: retained_line_company, client: retained_line_client, status: :draft)
-      Timekeeping::LocalEntry.create!(id: entry.id, company_id: retained_line_company.id, user_id: retained_line_user.id,
-                                      project_id: retained_line_project.id, work_date: Date.current, duration: 60.0,
-                                      bill_status: "unbilled")
+      prepared_spec_entry(retained_line_company, user: retained_line_user, project: retained_line_project, id: entry.id)
       connection = ApplicationRecord.connection
       connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, retained_line_company.id, entry.id, discarded.id, SecureRandom.uuid, Time.current]))
         INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
@@ -988,10 +884,7 @@ RSpec.describe Invoices::PreparedReservations do
         ]))
       end
       rows_before = rows.call
-      request = Invoices::ReservationRequest.new(
-        company_id: retained_line_company.id, invoice_id: draft.id, operation_id: SecureRandom.uuid,
-        generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [entry.id]
-      )
+      request = prepared_spec_request(retained_line_company, draft, [entry.id])
 
       # "A second kept invoice on the same entry fails with \"entry is on another invoice\""
       outcome = described_class.new.prepare(request)
@@ -1023,9 +916,7 @@ RSpec.describe Invoices::PreparedReservations do
       restored = create(:invoice, company: own_retained_company, client: own_retained_client, status: :draft)
       connection = ApplicationRecord.connection
       [direct, grouped].each do |entry|
-        Timekeeping::LocalEntry.create!(id: entry.id, company_id: own_retained_company.id, user_id: own_retained_user.id,
-                                        project_id: own_retained_project.id, work_date: Date.current, duration: 60.0,
-                                        bill_status: "unbilled")
+        prepared_spec_entry(own_retained_company, user: own_retained_user, project: own_retained_project, id: entry.id)
         connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, own_retained_company.id, entry.id, restored.id, SecureRandom.uuid, Time.current]))
           INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
           VALUES (?, ?, ?, ?, 'committed', 'retained', ?)
@@ -1039,10 +930,7 @@ RSpec.describe Invoices::PreparedReservations do
         ]))
       end
       rows_before = rows.call
-      request = Invoices::ReservationRequest.new(
-        company_id: own_retained_company.id, invoice_id: restored.id, operation_id: SecureRandom.uuid,
-        generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [direct.id, grouped.id]
-      )
+      request = prepared_spec_request(own_retained_company, restored, [direct.id, grouped.id])
 
       # "A second kept invoice on the same entry fails with \"entry is on another invoice\""
       outcome = described_class.new.prepare(request)
