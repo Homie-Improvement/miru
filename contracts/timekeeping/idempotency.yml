@@ -9,6 +9,8 @@ name: idempotency
 source: docs/architecture/timekeeping-soa.md section 5.1
 
 receipt_scope: [company_scope, actor_type, actor_id, operation, key]
+# The least time a receipt is kept, not an expiry: a stored receipt keeps
+# answering replays until it is removed.
 retention_hours: 24
 # Only successful answers are stored, so a retry after an error, a 409
 # included, is evaluated again.
