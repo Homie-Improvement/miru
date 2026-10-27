@@ -645,6 +645,7 @@ RSpec.describe Timekeeping::ReservationClient, "answer mapping and local claims"
   end
 
   it "posts mark_billed to the contract's invoice route and answers committed with the billed count" do
+    InvoiceEntryHolding.create!(company_id: 611, invoice_id: 12, entry_ids: [4001], disposition: "active")
     http = scripted_http_class.new([[200, { "billed" => 2 }]])
 
     outcome = scripted_reservation_client(http).mark_billed(reservation_request)
@@ -703,13 +704,24 @@ RSpec.describe Timekeeping::ReservationClient, "answer mapping and local claims"
     expect(http.paths).to eq([])
   end
 
-  it "posts mark_billed when the invoice's holding lists exactly its lines" do
-    InvoiceEntryHolding.create!(company_id: 611, invoice_id: 12, entry_ids: [4001], disposition: "active")
-    http = scripted_http_class.new([[200, { "billed" => 1 }]])
+  it "refuses mark_billed and sends nothing when the invoice has line entries but no holding" do
+    http = scripted_http_class.new([[200, { "billed" => 0 }]])
 
     outcome = scripted_reservation_client(http).mark_billed(reservation_request)
 
-    expect(outcome.state).to eq("committed")
+    expect(outcome.state).to eq("refused")
+    expect(outcome.conflicts).to eq([{ entry_id: 4001, reason: described_class::BILLING_MISMATCH_REASON }])
+    expect(http.paths).to eq([])
+  end
+
+  it "posts mark_billed for an invoice with no holding and no line entries" do
+    empty_request = Invoices::ReservationRequest.new(
+      company_id: 611, invoice_id: 12, operation_id: SecureRandom.uuid,
+      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: []
+    )
+    http = scripted_http_class.new([[200, { "billed" => 0 }]])
+
+    expect(scripted_reservation_client(http).mark_billed(empty_request).state).to eq("committed")
     expect(http.paths).to eq(["/v1/companies/611/invoices/12/mark-billed"])
   end
 

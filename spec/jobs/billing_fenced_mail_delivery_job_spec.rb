@@ -82,6 +82,8 @@ RSpec.describe BillingFencedMailDeliveryJob, "for an invoice send whose billing 
     fake.generation = TimekeepingOwnership.current.generation
     fake.add_entry(company_id: company.id, user_id: owner.id, project_id: project.id, id: entry.id)
     fake.add_reservation(entry_id: entry.id, invoice_id: invoice.id, state: "committed", disposition: "active")
+    # The monolith's record of that settled reservation.
+    InvoiceEntryHolding.create!(company_id: company.id, invoice_id: invoice.id, entry_ids: [entry.id], disposition: "active")
     forward = TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil)
     outage = { mark_billed: true }
     billing_outage_http = Object.new
