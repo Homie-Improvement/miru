@@ -7,14 +7,17 @@ class Agent < ApplicationRecord
   belongs_to :user
   belongs_to :default_project, class_name: "Project", optional: true
 
-  # No database key ties entries to agents. Locking the agent row before the
-  # entries are detached makes a concurrent entry save that names this agent
-  # either finish first, so it is detached too, or wait and then fail its
-  # agent existence check.
-  before_destroy :lock!, prepend: true
+  # No database key ties entries to agents, so the entries are detached
+  # through the Timekeeping gateway before anything else is destroyed. The
+  # gateway locks the ownership row and then this agent's row before it
+  # detaches, so a concurrent entry save that names this agent either finishes
+  # first, and is detached too, or waits and then fails its agent existence
+  # check. A refused or failed detach raises, which rolls back this destroy and
+  # any user or company destroy that cascades into it, before the keys go.
+  before_destroy :detach_timesheet_entries, prepend: true
 
   has_many :agent_keys, dependent: :destroy
-  has_many :timesheet_entries, dependent: :nullify
+  has_many :timesheet_entries
 
   validates :name, presence: true, length: { maximum: 80 }, uniqueness: { scope: :company_id, case_sensitive: false }
   validates :provider, presence: true, length: { maximum: 50 }
@@ -35,6 +38,15 @@ class Agent < ApplicationRecord
   end
 
   private
+
+    # A destroy has no web request id, so each attempt gets a fresh one. The
+    # gateway derives the detach operation id from it, so a retried destroy
+    # is a new command that detaches entries created since the last attempt.
+    def detach_timesheet_entries
+      context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "agent_destroy",
+                                              request_id: SecureRandom.uuid)
+      Timekeeping::Gateway.new(context:).detach_agent_entries(agent: self)
+    end
 
     def default_project_belongs_to_company
       return if default_project.blank? || default_project.client.company_id == company_id
