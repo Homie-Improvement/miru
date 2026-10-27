@@ -63,6 +63,41 @@ module Timekeeping
       @checkpoint = checkpoint
     end
 
+    # Takes the lock a detach-entries command of this agent takes, so an entry
+    # write naming the agent and the detach run one after the other.
+    def self.lock_agent(company_id, agent_id)
+      WriteSteps.lock_key(company_id, COMMANDS.fetch(:detach_entries).fetch(:lock), agent_id)
+    end
+
+    # The highest service receipt id allocated so far, read before an entry
+    # write fetches its reference facts. A receipt id is taken when the
+    # command inserts it, so a later detach always gets a higher id. Ids are
+    # never reused and are allocated outside any transaction.
+    def self.detach_fence
+      ApplicationRecord.connection.select_value(
+        "SELECT COALESCE(pg_sequence_last_value('service_idempotency_receipts_id_seq'::regclass), 0)"
+      ).to_i
+    end
+
+    # Whether a detach-entries command of this agent committed after the
+    # write's fence was read, so the write's facts may still list an agent the
+    # monolith has since deleted. The monolith leaves an agent out of its
+    # facts while it is being deleted, so facts that list the agent were read
+    # either before the deletion began, and so before any such detach, or
+    # after a deletion rolled back. An older detach is therefore one whose
+    # deletion failed, and it does not refuse writes for the agent that
+    # survived it.
+    def self.agent_detached?(company_id, agent_id, after:)
+      ServiceIdempotencyReceipt.where(company_id:, operation: operation_name(:detach_entries, agent_id))
+        .where("id > ?", after).exists?
+    end
+
+    # The target is part of the receipt's operation, so one operation id
+    # used for two invoices or two agents is two commands, not a reuse.
+    def self.operation_name(route, target_id)
+      "#{route} #{target_id}"
+    end
+
     def call(request)
       ApplicationRecord.transaction { run(request) }
     rescue ActiveRecord::RecordNotUnique
@@ -143,10 +178,8 @@ module Timekeeping
         outcome
       end
 
-      # The target is part of the receipt's operation, so one operation id
-      # used for two invoices or two agents is two commands, not a reuse.
       def operation(request)
-        "#{request.route} #{request.target_id}"
+        self.class.operation_name(request.route, request.target_id)
       end
 
       def find_receipt(request)

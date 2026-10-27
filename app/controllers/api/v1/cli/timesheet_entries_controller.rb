@@ -4,16 +4,7 @@ class Api::V1::Cli::TimesheetEntriesController < Api::V1::Cli::BaseController
   def create
     authorize TimesheetEntry
 
-    timesheet_entry = project.timesheet_entries.new(
-      duration: cli_timesheet_entry_params[:duration_minutes],
-      work_date: cli_timesheet_entry_params[:work_date],
-      note: cli_timesheet_entry_params[:note],
-      bill_status: cli_timesheet_entry_params[:bill_status],
-      source: "cli",
-      source_metadata: cli_timesheet_entry_params[:source_metadata]
-    )
-    timesheet_entry.user = current_user
-    timesheet_entry.save!
+    timesheet_entry = entry_gateway.create(user: current_user, project:, attributes: create_attributes)
 
     render json: {
       notice: I18n.t("timesheet_entry.create.message"),
@@ -22,21 +13,18 @@ class Api::V1::Cli::TimesheetEntriesController < Api::V1::Cli::BaseController
   end
 
   def update
-    authorize current_timesheet_entry
-
-    current_timesheet_entry.project = project
-    current_timesheet_entry.update!(update_attributes)
+    timesheet_entry = entry_gateway.update(
+      entry_id: params[:id], project:, attributes: update_attributes, authorize: method(:authorize), scope: :actor
+    )
 
     render json: {
       notice: I18n.t("timesheet_entry.update.message"),
-      entry: current_timesheet_entry.snippet
+      entry: timesheet_entry.snippet
     }, status: 200
   end
 
   def destroy
-    authorize current_timesheet_entry
-
-    current_timesheet_entry.discard!
+    entry_gateway.destroy(entry_id: params[:id], authorize: method(:authorize), scope: :actor)
 
     render json: { notice: I18n.t("timesheet_entry.destroy.message") }, status: 200
   end
@@ -47,8 +35,15 @@ class Api::V1::Cli::TimesheetEntriesController < Api::V1::Cli::BaseController
       @_project ||= ProjectPolicy::Scope.new(current_user, current_company).resolve.find(cli_timesheet_entry_params[:project_id])
     end
 
-    def current_timesheet_entry
-      @_current_timesheet_entry ||= current_user.timesheet_entries.kept.in_workspace(current_company).find(params[:id])
+    # The gateway writes to whichever store owns the entries. The CLI, and MCP
+    # through it, may only change the signed-in user's own entries, so update
+    # and destroy look entries up with the :actor scope.
+    def entry_gateway
+      Timekeeping::Gateway.new(
+        context: Timekeeping::WriteContext.new(
+          company: current_company, actor: current_user, actor_kind: "cli", request_id: request.request_id
+        )
+      )
     end
 
     def cli_timesheet_entry_params
@@ -60,6 +55,17 @@ class Api::V1::Cli::TimesheetEntriesController < Api::V1::Cli::BaseController
         :bill_status,
         source_metadata: {}
       )
+    end
+
+    def create_attributes
+      {
+        duration: cli_timesheet_entry_params[:duration_minutes],
+        work_date: cli_timesheet_entry_params[:work_date],
+        note: cli_timesheet_entry_params[:note],
+        bill_status: cli_timesheet_entry_params[:bill_status],
+        source: "cli",
+        source_metadata: cli_timesheet_entry_params[:source_metadata]
+      }
     end
 
     def update_attributes
