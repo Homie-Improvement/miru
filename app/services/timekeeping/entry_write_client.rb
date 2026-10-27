@@ -1,0 +1,173 @@
+# frozen_string_literal: true
+
+require "net/http"
+
+module Timekeeping
+  # Forwards one entry create, update or destroy to the Timekeeping service's
+  # entry API (contracts/timekeeping/entry_api.yml) while Timekeeping owns the
+  # entries. Every HTTP call for these routes lives here, so callers see the
+  # answered entry Hash or one of the errors below, never a Net:: exception.
+  #
+  # The token is minted for the context's actor, never for the entry's target
+  # user, so Timekeeping decides with the signed-in user's own role. Error
+  # messages carry only the route and status or the exception class: the
+  # answer body may describe other users' data and is never passed on.
+  #
+  # It never retries. A call whose answer was lost may still have committed in
+  # Timekeeping; a resend within the same request carries the same
+  # Idempotency-Key, so Timekeeping replays its answer instead of writing twice.
+  class EntryWriteClient
+    ENTRIES_PATH = "/v1/companies/%<company_id>d/entries"
+    ENTRY_PATH = "/v1/companies/%<company_id>d/entries/%<entry_id>d"
+
+    # Fixed namespace for the version 5 UUIDs used as Idempotency-Key values.
+    IDEMPOTENCY_NAMESPACE = "6f1c2c1e-5d7a-4c55-9a0e-1b9e8f3d2a41"
+
+    # The fields a web or mobile write may set, the same fields the entry
+    # controller permits today. An update sends only these: source fields and
+    # user_id are left out so an edit never rewrites an entry's recorded
+    # origin or moves it to another user.
+    EDIT_FIELDS = %w[project_id duration work_date note bill_status].freeze
+
+    # A web or mobile create records a manual entry. The contract requires
+    # both fields on create.
+    CREATE_SOURCE = { "source" => "manual", "source_metadata" => {} }.freeze
+
+    # Timekeeping could not be reached, refused the monolith's own token, or
+    # answered something unexpected. A subclass of the read client's error, so
+    # it renders as the same retryable 503.
+    class Error < EntryApiClient::Error; end
+
+    # Timekeeping refused the actor, or the actor cannot be given a token for
+    # the company. Rendered as 403.
+    class Forbidden < StandardError; end
+
+    # The entry changed after it was looked up (If-Match no longer matches).
+    # Nothing was written. Rendered as 409 version_conflict.
+    class Conflict < StandardError; end
+
+    # Timekeeping refused the write as malformed, such as credential_in_body or
+    # a reused Idempotency-Key with a different body. Rendered as 422.
+    class Rejected < StandardError; end
+
+    # Errors raised by a 409 answer, by its reason. Any other 409 reason is a
+    # conflict too.
+    CONFLICT_ERRORS = { "stale_generation" => Gateway::StaleGeneration }.freeze
+
+    # Errors raised by every other non-2xx status. Any other 4xx is a
+    # rejection, and anything else is an unavailable service.
+    STATUS_ERRORS = { 401 => Error, 403 => Forbidden }.freeze
+
+    def initialize(base_url: ENV[EntryApiClient::BASE_URL_ENV])
+      @base_url = base_url.to_s
+    end
+
+    # Pure: the same request id, operation and entry id always give the same
+    # key, and any difference gives a different key. A create has no entry id
+    # yet and is keyed as "new".
+    def self.idempotency_key(request_id:, operation:, entry_id: nil)
+      Digest::UUID.uuid_v5(IDEMPOTENCY_NAMESPACE, "#{request_id}/#{operation}/#{entry_id || "new"}")
+    end
+
+    # The create body for a web or mobile entry. user and project are records
+    # the caller already resolved inside the company, never raw params.
+    def self.create_body(user:, project:, attributes:)
+      edit_fields(attributes)
+        .merge("project_id" => project.id, "user_id" => user.id)
+        .merge(CREATE_SOURCE.deep_dup)
+    end
+
+    # The EDIT_FIELDS of attributes, as sent. A form post carries every value
+    # as a string, and Timekeeping takes duration only as a JSON number, so a
+    # numeric string is sent as the Float the duration column would store. Any
+    # other duration is sent unchanged, and Timekeeping refuses it.
+    def self.edit_fields(attributes)
+      fields = attributes.to_h.stringify_keys.slice(*EDIT_FIELDS)
+      duration = fields["duration"]
+      number = Float(duration, exception: false) if duration.is_a?(String)
+      number.nil? ? fields : fields.merge("duration" => number)
+    end
+
+    # Returns the created entry Hash.
+    def create_entry(context:, generation:, body:)
+      path = format(ENTRIES_PATH, company_id: context.company.id)
+      forward(Net::HTTP::Post, path, operation: "create", context:, generation:, body:)
+    end
+
+    # Returns the updated entry Hash. Only EDIT_FIELDS of body are sent.
+    def update_entry(context:, generation:, entry_id:, version:, body:)
+      path = format(ENTRY_PATH, company_id: context.company.id, entry_id:)
+      forward(Net::HTTP::Patch, path, operation: "update", context:, generation:, entry_id:, version:,
+                                      body: self.class.edit_fields(body))
+    end
+
+    # Returns the discarded entry Hash.
+    def destroy_entry(context:, generation:, entry_id:, version:)
+      path = format(ENTRY_PATH, company_id: context.company.id, entry_id:)
+      forward(Net::HTTP::Delete, path, operation: "destroy", context:, generation:, entry_id:, version:)
+    end
+
+    private
+
+      def forward(request_class, path, operation:, context:, generation:, entry_id: nil, version: nil, body: nil)
+        raise Error, "#{EntryApiClient::BASE_URL_ENV} is not set" if @base_url.blank?
+
+        request = request_class.new(URI.join(@base_url, path))
+        request["Authorization"] = "Bearer #{token_for(context, body)}"
+        request["Ownership-Generation"] = generation.to_s
+        request["Idempotency-Key"] = self.class.idempotency_key(request_id: context.request_id, operation:, entry_id:)
+        request["X-Request-Id"] = context.request_id.to_s
+        request["If-Match"] = version.to_s unless version.nil?
+        unless body.nil?
+          request["Content-Type"] = "application/json"
+          request.body = JSON.generate(body)
+        end
+
+        response = send_request(request)
+        raise refusal_for(operation, response) unless response.is_a?(Net::HTTPSuccess)
+
+        JSON.parse(response.body)
+      rescue SystemCallError, IOError, Timeout::Error, SocketError, OpenSSL::SSL::SSLError, Net::ProtocolError,
+             JSON::ParserError => error
+        raise Error, "Timekeeping entry #{operation} failed: #{error.class}"
+      end
+
+      # The token carries project facts only for the project the body names.
+      def token_for(context, body)
+        project_ids = [body&.dig("project_id")].compact
+        UserToken.mint(user: context.actor, company: context.company, project_ids:, agent: context.agent)
+      rescue UserToken::NotInCompanyError, UserToken::AgentMismatchError => error
+        raise Forbidden, "Timekeeping entry token refused: #{error.class}"
+      rescue UserToken::MissingKeyError => error
+        raise Error, "Timekeeping entry token unavailable: #{error.class}"
+      end
+
+      def refusal_for(operation, response)
+        status = response.code.to_i
+        message = "Timekeeping entry #{operation} answered #{status}"
+        return ActiveRecord::RecordNotFound.new("Couldn't find TimesheetEntry", "TimesheetEntry") if status == 404
+        return CONFLICT_ERRORS.fetch(reason_of(response), Conflict).new if status == 409
+
+        error_class = STATUS_ERRORS.fetch(status) { (400..499).cover?(status) ? Rejected : Error }
+        error_class.new(message)
+      end
+
+      # The contract's error bodies carry only a reason. Anything unreadable
+      # counts as no reason.
+      def reason_of(response)
+        parsed = JSON.parse(response.body.to_s)
+        parsed["reason"] if parsed.is_a?(Hash)
+      rescue JSON::ParserError
+        nil
+      end
+
+      def send_request(request)
+        uri = request.uri
+        Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == "https",
+                                            open_timeout: EntryApiClient::TIMEOUT_SECONDS,
+                                            read_timeout: EntryApiClient::TIMEOUT_SECONDS) do |http|
+          http.request(request)
+        end
+      end
+  end
+end

@@ -20,6 +20,7 @@ module Timekeeping
     # section 6.2).
     READ_TOKENS_ENV = "TIMEKEEPING_READ_TOKENS_ENABLED"
     INDEX_PATH = "/v1/companies/%<company_id>d/entries"
+    SHOW_PATH = "/v1/companies/%<company_id>d/entries/%<entry_id>d"
     TIMEOUT_SECONDS = 5
 
     class Error < StandardError; end
@@ -50,7 +51,40 @@ module Timekeeping
       raise Error, "Timekeeping entry list failed: #{error.class}"
     end
 
+    # Returns the entry Hash of the show route, read for the acting user with
+    # a write token, because the caller is about to change the entry. The
+    # request carries request_id as X-Request-Id, so the lookup and the write
+    # that follows it trace to the same monolith request. A missing entry, or
+    # one of another company, raises ActiveRecord::RecordNotFound; a refused
+    # actor raises EntryWriteClient::Forbidden.
+    def show_entry(company_id:, entry_id:, acting_user_id:, request_id:)
+      raise Error, "#{BASE_URL_ENV} is not set" if @base_url.blank?
+
+      company = Company.find(company_id)
+      # Any user, so an actor outside the company reaches mint's
+      # NotInCompanyError (403) rather than a 404 for the entry.
+      token = UserToken.mint(user: User.find(acting_user_id), company:)
+      uri = URI.join(@base_url, format(SHOW_PATH, company_id:, entry_id:))
+      response = get(uri, token, request_id:)
+      raise show_refusal(response) unless response.is_a?(Net::HTTPOK)
+
+      JSON.parse(response.body)
+    rescue UserToken::NotInCompanyError => error
+      raise EntryWriteClient::Forbidden, "Timekeeping entry token refused: #{error.class}"
+    rescue UserToken::MissingKeyError, SystemCallError, IOError, Timeout::Error, SocketError, OpenSSL::SSL::SSLError,
+           Net::ProtocolError, JSON::ParserError => error
+      raise Error, "Timekeeping entry show failed: #{error.class}"
+    end
+
     private
+
+      def show_refusal(response)
+        case response.code.to_i
+        when 404 then ActiveRecord::RecordNotFound.new("Couldn't find TimesheetEntry", "TimesheetEntry")
+        when 403 then EntryWriteClient::Forbidden.new("Timekeeping entry show answered 403")
+        else Error.new("Timekeeping entry show answered #{response.code}")
+        end
+      end
 
       def token_purpose
         ENV[READ_TOKENS_ENV] == "true" ? :read : :write
@@ -62,9 +96,10 @@ module Timekeeping
         uri
       end
 
-      def get(uri, token)
+      def get(uri, token, request_id: nil)
         request = Net::HTTP::Get.new(uri)
         request["Authorization"] = "Bearer #{token}"
+        request["X-Request-Id"] = request_id.to_s unless request_id.nil?
         Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == "https",
                                             open_timeout: TIMEOUT_SECONDS, read_timeout: TIMEOUT_SECONDS) do |http|
           http.request(request)

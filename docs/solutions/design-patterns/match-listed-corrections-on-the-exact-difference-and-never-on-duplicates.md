@@ -5,7 +5,7 @@ problem_type: design_pattern
 component: timekeeping_handoff
 severity: high
 evidence_grounding: anchored
-grounding_evidence: lib/timekeeping/handoff/reconciliation.rb Correction#explains? compares check, row_key and field and returns false for :duplicate_key; specs in reconciliation_4_spec.rb and reconciliation_spec.rb prove a locked correction does not excuse a duration change, an operation-row correction does not excuse the intent-row change, and a listed added reservation does not excuse its duplicate
+grounding_evidence: lib/timekeeping/handoff/reconciliation.rb Correction#explains? compares check, row_key and field and returns false for :duplicate_key; specs in reconciliation_spec.rb prove a locked correction does not excuse a duration change, an operation-row correction does not excuse the intent-row change, and a listed added reservation does not excuse its duplicate
 audience: both
 related_components:
   - timekeeping_handoff
@@ -47,6 +47,6 @@ The narrow match has a cost: the pre-flight must list one correction per field. 
 PR #92, head commit 23fd205128e594c79c537a6f660c31934c92f3e2.
 
 - `lib/timekeeping/handoff/reconciliation.rb`: `Correction#explains?` returns false when `difference.reason == :duplicate_key`, and otherwise compares `check`, `row_key` and `field`. `compare_rows` builds the `duplicate` list before it returns on a missing side. `OPERATION_KEY` and `RECEIPT_LINK_KEY` give operation and intent rows different key shapes.
-- `spec/lib/timekeeping/handoff/reconciliation_4_spec.rb`, "lets a listed correction pass only for its own company, row and field": a `locked` correction passes, but a `duration` change on the same row still aborts.
-- `spec/lib/timekeeping/handoff/reconciliation_5_spec.rb`, "a correction listed for one field of an entry does not excuse a changed note on the same entry".
+- `spec/lib/timekeeping/handoff/reconciliation_spec.rb`, "lets a listed correction pass only for its own company, row and field": a `locked` correction passes, but a `duration` change on the same row still aborts.
+- `spec/lib/timekeeping/handoff/reconciliation_spec.rb`, "does not let an entries correction for one field excuse a changed note on the same entry".
 - `spec/lib/timekeeping/handoff/reconciliation_spec.rb`, "does not let an operation row correction explain the matching intent row change" and "still aborts on a duplicate committed reservation when the added row is listed".
