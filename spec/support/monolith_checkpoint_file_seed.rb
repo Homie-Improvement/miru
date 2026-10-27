@@ -21,7 +21,7 @@ module MonolithCheckpointFileSeed
       (101, 1, 3, 11, 21, NULL, '2026-03-02', '0.30000000000000004'::float8, 'Design review', 'billed',
        'approved', true, 'manual', '{"tags": ["a", "b"], "rate": 1.00000000000000000001}', NULL, NULL, NULL,
        '{}', NULL, '2026-03-02 09:15:30.123456', '2026-03-02 10:00:00.654321'),
-      (102, 1, 1, 11, 22, 31, '2026-03-03', '45.5'::float8, '', 'unbilled', 'not_required', false, 'agent',
+      (102, 1, 1, 11, 22, 31, '2026-03-03', '45.5'::float8, '', 'unbilled', 'not_required', false, 'cli',
        '{}', 'run-1', 'session-1', 'https://proof.test/1', '{"steps": {"count": 2}}', '2026-03-04 08:00:00',
        '2026-03-03 09:00:00', '2026-03-04 08:00:00'),
       (201, 2, 2, 12, 23, NULL, '2026-03-02', '60'::float8, 'Support', 'billed', 'not_required', true,

@@ -33,6 +33,9 @@ headers:
   idempotency_key: "Idempotency-Key: <uuid>"
   ownership_generation: "Ownership-Generation: <n>"
   if_match: "If-Match: <version>"
+  # Optional. The monolith request a call was made for, so a forwarded write
+  # and the lookup before it can be traced to the same monolith request.
+  x_request_id: "X-Request-Id: <monolith request id>"
 
 # Claims the provider reads from the signed bearer token. purpose is "read"
 # or "write"; a token signed for reads is refused on every write route.
