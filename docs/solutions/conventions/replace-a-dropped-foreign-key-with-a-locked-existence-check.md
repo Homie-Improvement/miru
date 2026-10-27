@@ -57,10 +57,10 @@ def validate_agent_exists
 end
 
 # app/models/agent.rb
-before_destroy :lock!, prepend: true
+before_destroy :detach_timesheet_entries, prepend: true
 ```
 
-`prepend: true` matters: the lock must run before `dependent: :nullify` detaches the entries. Then a concurrent entry save either commits first and gets detached, or waits and fails its check.
+`Agent#detach_timesheet_entries` calls `Timekeeping::Gateway#detach_agent_entries`, which locks the ownership row FOR SHARE, then runs `agent.lock!`, then detaches the entries. `prepend: true` matters: the lock and detach must run before any other destroy step, such as the agent key deletes. Then a concurrent entry save either commits first and gets detached, or waits and fails its check. (PR #44 first wrote this as `before_destroy :lock!, prepend: true` ahead of `dependent: :nullify`.)
 
 Add specs for an id of `0` and for a cached parent whose row was deleted. These are the cases the naive check lets through.
 
