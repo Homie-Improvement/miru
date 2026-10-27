@@ -146,6 +146,9 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     expect(loaded_ids.size).to eq(TimesheetEntry.unscoped.count)
     # Timekeeping's correction writer takes each corrected entry row without its version, and stores it with
     # the correction version and the handoff's generation.
+    # correction_writes holds the snapshots exactly as the runner sent them.
+    expect(timekeeping_store.correction_writes.sort_by { |c| c["id"] })
+      .to eq(uninterrupted[:corrections].map { |c| c.fetch("snapshot").except("version") }.sort_by { |c| c["id"] })
     corrections = timekeeping_store.corrections
     expect(corrections.map { |c| c.except("version", "generation") }.sort_by { |c| c["id"] })
       .to eq(uninterrupted[:corrections].map { |c| c.fetch("snapshot").except("version") }.sort_by { |c| c["id"] })
