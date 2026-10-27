@@ -7,6 +7,8 @@ module Timekeeping
   #
   # 1. Lock the receipt key and re-read the receipt: a stored answer for the
   #    same body is replayed, and a different body is idempotency_key_reused.
+  #    A replay-only command with no receipt answers not_found here, before
+  #    any later step, so it can never write.
   # 2. Read the admitted generation FOR SHARE; a header that is not that
   #    generation, or any header while fenced, is stale_generation. A project
   #    the reference facts do not hold for the company is not_found. Both come
@@ -75,6 +77,7 @@ module Timekeeping
         receipt = find_receipt(command)
         checkpoint.call(:receipt_checked)
         return answer_from(receipt, command) if receipt
+        return WriteOutcome.refusal(:not_found) if command.replay_only
 
         generation = locked_generation
         checkpoint.call(:generation_checked)

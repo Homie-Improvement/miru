@@ -276,17 +276,28 @@ module TimekeepingContract
         return Wire.error(@entry_contract, "unauthorized") unless acting
         return Wire.error(@entry_contract, "not_found") unless acting.fetch("company_id") == company_id
         return entry_route(route, company_id, acting, params, headers, body) unless ENTRY_WRITE_ROUTES.include?(route)
-        return Wire.error(@entry_contract, "stale_generation") unless generation_current?(headers["Ownership-Generation"])
         # The request's own bearer counts too: in token mode a signed token is
         # never stored in credentials, and the real service refuses it as well.
         held = (credentials + [Wire.bearer(headers)]).compact.reject(&:empty?).uniq
         return Wire.error(@entry_contract, "credential_in_body") if @policies[:credential_in_body].call(body:, credentials: held)
         return respond(400, "reason" => "bad_request") if malformed_duration?(body)
 
+        # The generation is checked after the receipt, as Timekeeping::EntryWriter
+        # does, so a retry of a committed write replays even after the
+        # generation has moved.
         @receipts.answer(company_scope: company_id, actor: ["user", acting["id"]], operation: "#{route} #{params["entry_id"]}",
                          key: headers["Idempotency-Key"], body:) do
+          next Wire.error(@entry_contract, "not_found") if replay_only?(route, headers)
+          next Wire.error(@entry_contract, "stale_generation") unless generation_current?(headers["Ownership-Generation"])
+
           entry_route(route, company_id, acting, params, headers, body)
         end
+      end
+
+      # A replay-only DELETE is answered only from a stored receipt; with none
+      # it is not_found and nothing is written (entry_api.yml headers).
+      def replay_only?(route, headers)
+        route == "destroy" && headers["Idempotency-Replay"] == "only"
       end
 
       # In token mode, which stands in for the real service, a duration must be

@@ -172,9 +172,21 @@ module Timekeeping
     # Returns true once the owning store has discarded the entry. A forwarded
     # destroy that Timekeeping answered with success is a success, whatever
     # the answer holds: the entry is already gone there.
+    #
+    # Timekeeping's lookup no longer finds an entry this actor already
+    # deleted, so when the answer to that delete was lost, its retry would
+    # otherwise end at the lookup. A lookup that finds nothing is therefore
+    # followed by a DELETE that Timekeeping answers only from its stored
+    # receipt for the same actor and key (see replay_timekeeping_destroy).
     def destroy(entry_id:, authorize:, expected_generation: nil, scope: :company)
       perform(expected_generation) do |ownership, owner|
-        found = find_authorized(ownership:, entry_id:, authorize:, scope:)
+        found = begin
+          find_authorized(ownership:, entry_id:, authorize:, scope:)
+        rescue ActiveRecord::RecordNotFound
+          raise unless owner == :timekeeping
+
+          next replay_timekeeping_destroy(ownership:, entry_id:, authorize:, scope:)
+        end
         case owner
         when :legacy
           found.entry.discard!
@@ -240,6 +252,23 @@ module Timekeeping
         EntryLookup.find(ownership:, context:, entry_id:, local_owner:, read_client:, scope:).tap do |found|
           authorize.call(found.entry)
         end
+      end
+
+      # The replay can only return a delete this actor already committed: with
+      # no stored receipt Timekeeping answers not found and writes nothing. A
+      # service that predates the replay header refuses the request's fixed
+      # If-Match as a version conflict, which is answered as the same not
+      # found, so every miss looks alike whatever the entry's state. The
+      # replayed entry passes the lookup's own checks and the policy before
+      # the delete is reported as done.
+      def replay_timekeeping_destroy(ownership:, entry_id:, authorize:, scope:)
+        row = begin
+          write_client.replay_destroy_entry(context:, generation: ownership.generation, entry_id:)
+        rescue EntryWriteClient::Conflict
+          raise EntryLookup.not_found
+        end
+        authorize.call(EntryLookup.replayed(context:, row:, entry_id:, scope:))
+        true
       end
 
       # SET LOCAL lasts until the outermost transaction ends. When the gateway
