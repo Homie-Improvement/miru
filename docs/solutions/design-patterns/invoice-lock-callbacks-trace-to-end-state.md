@@ -26,7 +26,9 @@ applies_when:
 
 ## Context
 
-The `locked` boolean on `timesheet_entries` is set and cleared by callbacks in `app/models/invoice.rb` and `app/models/invoice_line_item.rb`. Each unlock callback looks correct on its own. In two common cases, though, something else triggered by the same action undoes it, and the entry ends up locked. An earlier version of the Timekeeping design document said both cases unlock. That error would have led a team to preserve the wrong behaviour.
+The `locked` boolean on `timesheet_entries` was set and cleared by callbacks in `app/models/invoice.rb` and `app/models/invoice_line_item.rb`. Each unlock callback looked correct on its own.
+
+Those callbacks are gone. `Invoices::ReservationBoundary` (`app/services/invoices/reservation_boundary.rb`) now decides lock changes once per transaction, and `Invoices::LegacyReservations` applies them. A discarded draft now releases its entries, and a draft's removed or destroyed lines release every entry no remaining line references. A sent invoice still keeps its entries when a line is removed, discarded or destroyed. The cases below describe the old callbacks. They still explain the locked entries that no invoice references in existing data, and the rule of tracing to the end state still applies. In two common cases, though, something else triggered by the same action undoes it, and the entry ends up locked. An earlier version of the Timekeeping design document said both cases unlock. That error would have led a team to preserve the wrong behaviour.
 
 ## Solution
 

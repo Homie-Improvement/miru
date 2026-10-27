@@ -23,6 +23,10 @@ module Timekeeping
       "timekeeping alerts: the Timekeeping metrics read failed (#{message})"
     end
 
+    def failed_local_reads_line(names)
+      "timekeeping alerts: the local read failed for #{names.join(', ')}"
+    end
+
     # Rates arrive as Rationals and a p95 past every bucket bound as Infinity.
     def format_number(value)
       case value
