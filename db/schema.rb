@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_10_26_140000) do
+ActiveRecord::Schema[8.1].define(version: 2026_10_27_130000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pg_stat_statements"
@@ -460,6 +460,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_26_140000) do
     t.jsonb "payload", null: false
     t.datetime "sent_at"
     t.index ["company_id", "entry_id"], name: "index_entry_outbox_items_on_company_id_and_entry_id"
+    t.index ["company_id", "outbox_position"], name: "index_entry_outbox_items_unsent_by_company", where: "(sent_at IS NULL)"
   end
 
   create_table "entry_snapshot_receipts", force: :cascade do |t|
@@ -781,6 +782,16 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_26_140000) do
     t.index ["company_id"], name: "index_leaves_on_company_id"
     t.index ["discarded_at"], name: "index_leaves_on_discarded_at"
     t.index ["year", "company_id"], name: "index_leaves_on_year_and_company_id", unique: true
+  end
+
+  create_table "legacy_entry_releases", force: :cascade do |t|
+    t.datetime "applied_at"
+    t.bigint "company_id", null: false
+    t.datetime "created_at", null: false
+    t.bigint "entry_ids", default: [], null: false, array: true
+    t.bigint "invoice_id", null: false
+    t.uuid "operation_id", null: false
+    t.index ["company_id", "operation_id"], name: "index_legacy_entry_releases_on_company_operation", unique: true
   end
 
   create_table "mcp_idempotency_records", force: :cascade do |t|
@@ -1247,6 +1258,13 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_26_140000) do
     t.check_constraint "id = 1", name: "timekeeping_ownership_single_row_check"
     t.check_constraint "monolith_store::text = ANY (ARRAY['legacy'::character varying, 'prepared'::character varying]::text[])", name: "timekeeping_ownership_monolith_store_check"
     t.check_constraint "owner::text = ANY (ARRAY['monolith'::character varying, 'timekeeping'::character varying]::text[])", name: "timekeeping_ownership_owner_check"
+  end
+
+  create_table "timekeeping_prepare_refusals", force: :cascade do |t|
+    t.bigint "company_id", null: false
+    t.datetime "created_at", null: false
+    t.string "reason"
+    t.index ["created_at"], name: "index_timekeeping_prepare_refusals_on_created_at"
   end
 
   create_table "timekeeping_stale_generation_refusals", force: :cascade do |t|

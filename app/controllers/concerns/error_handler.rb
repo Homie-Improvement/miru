@@ -12,9 +12,39 @@ module ErrorHandler
     rescue_from Pagy::VariableError, with: :invalid_param_value
     rescue_from Timekeeping::EntryApiClient::Error, with: :timekeeping_unavailable
     rescue_from Timekeeping::BillingFence::OwnershipMoving, with: :render_ownership_moving
+    rescue_from Timekeeping::Gateway::StaleGeneration, with: :render_stale_generation
+    rescue_from Timekeeping::EntryWriteClient::Forbidden, with: :render_timekeeping_forbidden
+    rescue_from Timekeeping::EntryWriteClient::Conflict, with: :render_entry_version_conflict
+    rescue_from Timekeeping::EntryWriteClient::Rejected, with: :render_entry_write_rejected
+    rescue_from Invoices::OperationErrors::Refused, with: :reservation_refused
   end
 
+  STALE_GENERATION_REASON = "stale_generation"
+  VERSION_CONFLICT_REASON = "version_conflict"
+
+  # What a caller is told for each reason an invoice save was refused. The
+  # text never names the invoice that holds the entry.
+  RESERVATION_REFUSAL_MESSAGES = {
+    "on_another_invoice" => "entry is on another invoice",
+    "provisional_elsewhere" => "entry is being added to another invoice",
+    "not_found" => "entry not found"
+  }.freeze
+  DEFAULT_RESERVATION_REFUSAL_MESSAGE = "entry cannot be added to this invoice"
+
   private
+
+    def reservation_refused(exception)
+      reason = exception.outcome&.conflicts&.first&.fetch(:reason)
+      message = RESERVATION_REFUSAL_MESSAGES.fetch(reason, DEFAULT_RESERVATION_REFUSAL_MESSAGE)
+
+      respond_to do |format|
+        format.json { render json: { errors: message }, status: 422 }
+        format.html do
+          flash.now[:alert] = message
+          render file: "public/422.html", status: 422, layout: false
+        end
+      end
+    end
 
     def handle_not_found_error(exception)
       message = exception.message || I18n.t("errors.not_found")
@@ -71,6 +101,29 @@ module ErrorHandler
         format.json { render json: { errors: message }, status: 503 }
         format.html { render file: "public/500.html", status: 503, layout: false, alert: message }
       end
+    end
+
+    # The write expected an ownership generation that is no longer current, so
+    # it changed nothing. The client reloads and retries against the new owner.
+    def render_stale_generation(_exception)
+      render json: { errors: I18n.t("errors.stale_generation"), reason: STALE_GENERATION_REASON }, status: 409
+    end
+
+    # The answers below come from a forwarded Timekeeping entry write. Each
+    # renders a fixed monolith message, never the exception's message or
+    # Timekeeping's answer body.
+
+    def render_timekeeping_forbidden(_exception)
+      render json: { errors: I18n.t("pundit.default") }, status: 403
+    end
+
+    # The entry changed after it was checked, so nothing was written.
+    def render_entry_version_conflict(_exception)
+      render json: { errors: I18n.t("errors.entry_version_conflict"), reason: VERSION_CONFLICT_REASON }, status: 409
+    end
+
+    def render_entry_write_rejected(_exception)
+      render json: { errors: I18n.t("errors.entry_write_rejected") }, status: 422
     end
 
     def invalid_param_value(exception)

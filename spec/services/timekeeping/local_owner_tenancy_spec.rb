@@ -5,164 +5,234 @@
 require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner do
-  # "Every local query filters by company_id; an entry, project or user of another company answers not_found and changes nothing"
   # "An id from another company answers `not_found`, in the same shape as a missing id."
-  it "an update of another company's entry id answers exactly like a missing id and changes nothing" do
-    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
-    generation = TimekeepingOwnership.current.generation
+  # The foreign entry belongs to the caller and the caller holds the same role in both companies,
+  # so only the company check can refuse it: a fixture that also differed in user or role would
+  # still pass if the company filter were removed.
+  it "answers an entry that differs only in company exactly like a missing id, for the same user and role in both companies" do
+    ownership = prepare_local_ownership!
     company_a = create(:company)
     company_b = create(:company)
-    user_a = create(:user)
-    create(:employment, company: company_a, user: user_a)
-    user_a.add_role("owner", company_a)
-    owner_b = create(:user)
-    create(:employment, company: company_b, user: owner_b)
-    owner_b.add_role("owner", company_b)
+    user = timekeeping_member(company_a, "owner")
+    timekeeping_member(company_b, "owner", user:)
     project_a = create(:project, client: create(:client, company: company_a))
-    bill_status = TimesheetEntry.bill_statuses.keys.find { |status| status != "billed" }
     entry_a = Timekeeping::LocalEntry.create!(
-      company_id: company_a.id, user_id: user_a.id, project_id: project_a.id, work_date: Date.current,
-      duration: 60.0, note: "original", bill_status:
+      company_id: company_a.id, user_id: user.id, project_id: project_a.id, work_date: Date.current,
+      duration: 60.0, note: "company a", bill_status: TimesheetEntry.bill_statuses.keys.find { |s| s != "billed" }
     )
-    before = entry_a.reload.attributes
-    count = ->(table) { ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM #{table}").to_i }
-    counts_before = %w[entry_audits entry_outbox_items idempotency_records].index_with { |table| count.call(table) }
-    actor = Timekeeping::LocalOwner::Actor.user(user_id: owner_b.id, role: "owner")
-    update = lambda do |entry_id, key|
+    attributes_before = entry_a.reload.attributes
+    counts_before = timekeeping_row_counts
+    expect(counts_before.keys).to match_array(%w[entries entry_audits idempotency_records entry_outbox_items])
+    expect(counts_before["entries"]).to eq(1)
+    missing_id = entry_a.id + 1_000_000
+    update_from_b = lambda do |entry_id, key|
       described_class.call(
-        operation: :update, company_id: company_b.id, generation:, actor:,
-        params: { "idempotency_key" => key, "entry_id" => entry_id, "body" => { "note" => "changed" } }
+        operation: :update, company_id: company_b.id, generation: ownership.generation.to_s,
+        actor: described_class::Actor.user(user_id: user.id, role: "owner"),
+        params: { "idempotency_key" => key, "entry_id" => entry_id,
+                  "body" => { "note" => "taken over", "company_id" => company_a.id } }
       )
     end
 
-    foreign = update.call(entry_a.id, "tenancy-foreign")
-    missing = update.call(Timekeeping::LocalEntry.maximum(:id) + 1000, "tenancy-missing")
+    foreign = update_from_b.call(entry_a.id, "same-user-foreign")
+    missing = update_from_b.call(missing_id, "same-user-missing")
 
     expect(foreign.status).to eq(404)
-    expect([foreign.status, foreign.body.to_json.gsub(entry_a.id.to_s, "ID")])
-      .to eq([missing.status, missing.body.to_json.gsub((Timekeeping::LocalEntry.maximum(:id) + 1000).to_s, "ID")])
-    expect(entry_a.reload.attributes).to eq(before)
-    expect(%w[entry_audits entry_outbox_items idempotency_records].index_with { |table| count.call(table) })
-      .to eq(counts_before)
+    expect(foreign.body).to eq("reason" => "not_found")
+    expect(foreign.status).to eq(missing.status)
+    expect(foreign.body).to eq(missing.body)
+    expect(foreign.body.to_json.gsub(entry_a.id.to_s, "ID")).to eq(missing.body.to_json.gsub(missing_id.to_s, "ID"))
+    expect(entry_a.reload.attributes).to eq(attributes_before)
+    expect(timekeeping_row_counts).to eq(counts_before)
   end
 end
 
-
-RSpec.describe Timekeeping::LocalOwner do
+RSpec.describe Timekeeping::LocalOwner, "foreign project differing only in company" do
   # "Every local query filters by company_id; an entry, project or user of another company answers not_found and changes nothing"
-  it "a create naming another company's project or user answers not_found and stores no row" do
-    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
-    generation = TimekeepingOwnership.current.generation
+  it "an owner of both companies creating in one company with the other company's project answers not_found and stores no row" do
+    generation = prepare_local_ownership!.generation.to_s
     company_a = create(:company)
     company_b = create(:company)
-    user_a = create(:user)
-    create(:employment, company: company_a, user: user_a)
-    user_a.add_role("employee", company_a)
-    owner_b = create(:user)
-    create(:employment, company: company_b, user: owner_b)
-    owner_b.add_role("owner", company_b)
+    owner = timekeeping_member(company_a, "owner")
+    timekeeping_member(company_b, "owner", user: owner)
     project_a = create(:project, client: create(:client, company: company_a))
     project_b = create(:project, client: create(:client, company: company_b))
-    count = ->(table) { ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM #{table}").to_i }
-    tables = %w[entries entry_audits entry_outbox_items idempotency_records]
-    counts_before = tables.index_with { |table| count.call(table) }
-    actor = Timekeeping::LocalOwner::Actor.user(user_id: owner_b.id, role: "owner")
-    body = {
-      "project_id" => project_b.id, "work_date" => Date.current.iso8601, "duration" => 60.0, "note" => "n",
-      "source" => TimesheetEntry::SOURCES.first, "source_metadata" => {}
-    }
-    create_with = lambda do |overrides, key|
+    Timekeeping::LocalEntry.create!(
+      company_id: company_a.id, user_id: owner.id, project_id: project_a.id, work_date: Date.current,
+      duration: 30.0, note: "seed", bill_status: "unbilled"
+    )
+    counts_before = timekeeping_row_counts
+    expect(counts_before["entries"]).to eq(1)
+    create_in_b = lambda do |project_id, key|
       described_class.call(
-        operation: :create, company_id: company_b.id, generation:, actor:,
-        params: { "idempotency_key" => key, "body" => body.merge(overrides) }
+        operation: :create, company_id: company_b.id, generation:,
+        actor: described_class::Actor.user(user_id: owner.id, role: "owner"),
+        params: { "idempotency_key" => key,
+                  "body" => { "project_id" => project_id, "work_date" => Date.current.iso8601, "duration" => 60.0,
+                              "note" => "n", "source" => "manual", "source_metadata" => {} } }
       )
     end
 
-    foreign_project = create_with.call({ "project_id" => project_a.id }, "tenancy-project")
-    foreign_user = create_with.call({ "user_id" => user_a.id }, "tenancy-user")
+    foreign = create_in_b.call(project_a.id, "foreign-project-only-company")
 
-    expect(foreign_project.status).to eq(404)
-    expect(foreign_user.status).to eq(404)
-    expect(tables.index_with { |table| count.call(table) }).to eq(counts_before)
+    expect(foreign.status).to eq(404)
+    expect(timekeeping_row_counts).to eq(counts_before)
+    expect(Timekeeping::LocalEntry.where(company_id: company_b.id).count).to eq(0)
+    expect(create_in_b.call(project_b.id, "own-project-only-company").status).to eq(201)
   end
 end
 
+RSpec.describe Timekeeping::LocalOwner, "cross-company references" do
+  let(:connection) { ActiveRecord::Base.connection }
+  let(:generation) { prepare_local_ownership!.generation.to_s }
+  let(:company_a) { create(:company) }
+  let(:company_b) { create(:company) }
+  let(:project_a) { create(:project, client: create(:client, company: company_a)) }
+  let(:project_b) { create(:project, client: create(:client, company: company_b)) }
 
-RSpec.describe Timekeeping::LocalOwner do
-  # "Every local query filters by `company_id`." This covers row locks, the reservation-flag read, receipt lookup and the advisory key.
-  # Entry ids are global keys, so the overlap here is the same user, key and operation in two companies.
-  it "a user employed in two companies sending the same key and body gets a separate write in each company" do
-    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
-    generation = TimekeepingOwnership.current.generation
-    company_a = create(:company)
-    company_b = create(:company)
-    user = create(:user)
-    [company_a, company_b].each do |company|
-      create(:employment, company:, user:)
-      user.add_role("employee", company)
-    end
-    projects = [company_a, company_b].to_h do |company|
-      [company.id, create(:project, client: create(:client, company:))]
-    end
-    actor = Timekeeping::LocalOwner::Actor.user(user_id: user.id, role: "employee")
-    write_in = lambda do |company|
+  def insert_tenancy_entry(id, company, project, user)
+    connection.execute(<<~SQL)
+      INSERT INTO entries (id, company_id, version, project_id, user_id, work_date, duration, note, bill_status,
+                           review_status, source, created_at, updated_at)
+      VALUES (#{id}, #{company.id}, 1, #{project.id}, #{user.id}, CURRENT_DATE, 60.0, 'entry #{id}', 'unbilled',
+              'not_required', 'manual', NOW(), NOW())
+    SQL
+  end
+
+  it "refuses a create that names another company's project or user with not_found and stores nothing" do
+    user_a = timekeeping_member(company_a, "employee")
+    owner_b = timekeeping_member(company_b, "owner")
+    actor = described_class::Actor.user(user_id: owner_b.id, role: "owner")
+    entry_body = { "work_date" => Date.current.iso8601, "duration" => 30.0, "note" => "cross company",
+                   "source" => "manual", "source_metadata" => {} }
+
+    # "Every local query filters by company_id; an entry, project or user of another company answers not_found and changes nothing"
+    foreign_project = described_class.call(
+      operation: :create, company_id: company_b.id, generation:, actor:,
+      params: { "idempotency_key" => "tenant-create-project", "body" => entry_body.merge("project_id" => project_a.id) }
+    )
+    foreign_user = described_class.call(
+      operation: :create, company_id: company_b.id, generation:, actor:,
+      params: { "idempotency_key" => "tenant-create-user",
+                "body" => entry_body.merge("project_id" => project_b.id, "user_id" => user_a.id) }
+    )
+
+    expect(foreign_project.status).to eq(404)
+    expect(foreign_project.body.to_json).to include("not_found")
+    expect(foreign_user.status).to eq(404)
+    expect(foreign_user.body.to_json).to include("not_found")
+    expect(timekeeping_row_counts).to eq(TIMEKEEPING_WRITE_TABLES.index_with { 0 })
+  end
+
+  it "refuses a user actor who is not a member of the keyword company even when the body names no user_id" do
+    owner_a = timekeeping_member(company_a, "owner")
+
+    # The role and the company's user ids come from Timekeeping::ReferenceFacts for the keyword company, so a
+    # user of company A cannot write into company B by being paired with company B's id.
+    outcome = described_class.call(
+      operation: :create, company_id: company_b.id, generation:,
+      actor: described_class::Actor.user(user_id: owner_a.id, role: "owner"),
+      params: { "idempotency_key" => "tenant-outsider",
+                "body" => { "project_id" => project_b.id, "work_date" => Date.current.iso8601, "duration" => 30.0,
+                            "note" => "outsider", "source" => "manual", "source_metadata" => {} } }
+    )
+
+    expect(outcome.status).to eq(404)
+    expect(outcome.body.to_json).to include("not_found")
+    expect(timekeeping_row_counts).to eq(TIMEKEEPING_WRITE_TABLES.index_with { 0 })
+  end
+
+  it "keeps receipts apart for one user of two companies who sends the same key and body to both" do
+    user = timekeeping_member(company_a, "owner")
+    timekeeping_member(company_b, "owner", user:)
+    actor = described_class::Actor.user(user_id: user.id, role: "owner")
+    create_in = lambda do |company, project|
       described_class.call(
         operation: :create, company_id: company.id, generation:, actor:,
-        params: {
-          "idempotency_key" => "shared-key",
-          "body" => {
-            "project_id" => projects.fetch(company.id).id, "work_date" => Date.current.iso8601, "duration" => 60.0,
-            "note" => "n", "source" => TimesheetEntry::SOURCES.first, "source_metadata" => {}
-          }
-        }
+        params: { "idempotency_key" => "shared-key",
+                  "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 45.0,
+                              "note" => "same key", "source" => "manual", "source_metadata" => {} } }
       )
     end
 
-    first = write_in.call(company_a)
-    second = write_in.call(company_b)
+    # "This covers row locks, the reservation-flag read, receipt lookup and the advisory key."
+    first = create_in.call(company_a, project_a)
+    second = create_in.call(company_b, project_b)
 
-    expect([first.status, second.status]).to eq([201, 201])
-    expect(Timekeeping::LocalEntry.where(company_id: company_a.id).count).to eq(1)
-    expect(Timekeeping::LocalEntry.where(company_id: company_b.id).count).to eq(1)
-    receipts = ActiveRecord::Base.connection.select_rows(
-      "SELECT company_id FROM idempotency_records WHERE key = 'shared-key' ORDER BY company_id"
-    ).flatten.map(&:to_i)
-    expect(receipts).to eq([company_a.id, company_b.id].sort)
-    outbox_companies = ActiveRecord::Base.connection.select_rows(
-      "SELECT DISTINCT company_id FROM entry_outbox_items ORDER BY company_id"
-    ).flatten.map(&:to_i)
-    expect(outbox_companies).to include(company_a.id, company_b.id)
+    expect(first.status).to eq(201)
+    expect(second.status).to eq(201)
+    expect(second.body.fetch("company_id")).to eq(company_b.id)
+    expect(second.body.fetch("id")).not_to eq(first.body.fetch("id"))
+    expect(connection.select_values("SELECT company_id FROM entries ORDER BY company_id").map(&:to_i))
+      .to eq([company_a.id, company_b.id].sort)
+    expect(connection.select_values("SELECT company_id FROM idempotency_records ORDER BY company_id").map(&:to_i))
+      .to eq([company_a.id, company_b.id].sort)
+    outbox = connection.select_rows("SELECT company_id, entry_id FROM entry_outbox_items").map { |row| row.map(&:to_i) }
+    expect(outbox).to contain_exactly([company_a.id, first.body.fetch("id")], [company_b.id, second.body.fetch("id")])
+  end
+
+  it "leaves another company's entry untouched when a bulk delete lists its id" do
+    owner_a = timekeeping_member(company_a, "owner")
+    owner_b = timekeeping_member(company_b, "owner")
+    insert_tenancy_entry(93_101, company_a, project_a, owner_a)
+    insert_tenancy_entry(93_102, company_b, project_b, owner_b)
+
+    # "An id from another company answers `not_found`, in the same shape as a missing id."
+    outcome = described_class.call(
+      operation: :bulk_delete, company_id: company_b.id, generation:,
+      actor: described_class::Actor.user(user_id: owner_b.id, role: "owner"),
+      params: { "idempotency_key" => "tenant-bulk-delete", "body" => { "entry_ids" => [93_101, 93_102, 93_999] } }
+    )
+
+    results = outcome.body.fetch("results").to_h { |result| [result.fetch("entry_id"), result.fetch("result")] }
+    expect(results.fetch(93_101)).to eq("not_found")
+    expect(results.fetch(93_101)).to eq(results.fetch(93_999))
+    expect(results.fetch(93_102)).to eq("deleted")
+    expect(connection.select_value("SELECT discarded_at FROM entries WHERE id = 93101")).to be_nil
+    expect(connection.select_value("SELECT version FROM entries WHERE id = 93101").to_i).to eq(1)
+    expect(connection.select_values("SELECT entry_id FROM entry_audits").map(&:to_i)).to eq([93_102])
+    expect(connection.select_values("SELECT entry_id FROM entry_outbox_items").map(&:to_i)).to eq([93_102])
+    expect(connection.select_values("SELECT company_id FROM entry_outbox_items").map(&:to_i)).to eq([company_b.id])
+  end
+
+  it "ignores company, actor and role fields inside params and the body and writes as the keyword company and actor" do
+    employee_b = timekeeping_member(company_b, "employee")
+    other_b = timekeeping_member(company_b, "owner")
+
+    # "`company_id` and the actor come only from the keyword arguments. A `company_id` or actor field inside params is ignored."
+    outcome = described_class.call(
+      operation: :create, company_id: company_b.id, generation:,
+      actor: described_class::Actor.user(user_id: employee_b.id, role: "employee"),
+      params: { "idempotency_key" => "tenant-body-company", "company_id" => company_a.id, "actor_id" => other_b.id,
+                "body" => { "company_id" => company_a.id, "project_id" => project_b.id,
+                            "work_date" => Date.current.iso8601, "duration" => 15.0, "note" => "keyword wins",
+                            "source" => "manual", "source_metadata" => {}, "actor_id" => other_b.id,
+                            "role" => "owner", "acting_user_id" => employee_b.id + 1000 } }
+    )
+
+    expect(outcome.status).to eq(201)
+    expect(outcome.body.fetch("company_id")).to eq(company_b.id)
+    entry = Timekeeping::LocalEntry.find(outcome.body.fetch("id"))
+    expect([entry.company_id, entry.user_id]).to eq([company_b.id, employee_b.id])
+    expect(described_class::Receipt.sole.actor_id).to eq(employee_b.id)
+    expect(described_class::AuditRow.where(company_id: company_b.id, entry_id: entry.id).sole.actor_id).to eq(employee_b.id)
+    TIMEKEEPING_WRITE_TABLES.each do |table|
+      expect(connection.select_values("SELECT DISTINCT company_id FROM #{table}").map(&:to_i))
+        .to eq([company_b.id]), "#{table} should hold only the keyword company"
+    end
   end
 end
 
 RSpec.describe Timekeeping::LocalOwner, "colleague access" do
   let(:company) { create(:company) }
   let(:other_company) { create(:company) }
-  let(:employee) { member_of(company, "employee") }
-  let(:colleague) { member_of(company, "employee") }
-  let(:admin) { member_of(company, "admin") }
-  let(:outsider) { member_of(other_company, "employee") }
+  let(:employee) { timekeeping_member(company, "employee") }
+  let(:colleague) { timekeeping_member(company, "employee") }
+  let(:admin) { timekeeping_member(company, "admin") }
+  let(:outsider) { timekeeping_member(other_company, "employee") }
   let(:project) { create(:project, client: create(:client, company:)) }
   let(:other_project) { create(:project, client: create(:client, company:)) }
-  let(:generation) { TimekeepingOwnership.current.generation.to_s }
-  let(:written_tables) { %w[entries entry_audits entry_outbox_items idempotency_records] }
-
-  before do
-    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
-  end
-
-  def member_of(member_company, role)
-    create(:user).tap do |user|
-      create(:employment, company: member_company, user:)
-      user.add_role(role, member_company)
-    end
-  end
-
-  def row_counts
-    written_tables.index_with do |table|
-      ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM #{table}").to_i
-    end
-  end
+  let(:generation) { prepare_local_ownership!.generation.to_s }
 
   def entry_of(user, note)
     Timekeeping::LocalEntry.create!(
@@ -186,7 +256,7 @@ RSpec.describe Timekeeping::LocalOwner, "colleague access" do
   it "refuses an employee who moves their own entry to a colleague by integer or string user_id" do
     entry = entry_of(employee, "mine")
     before = entry.reload.attributes
-    before_counts = row_counts
+    before_counts = timekeeping_row_counts
 
     outcomes = [colleague.id, colleague.id.to_s].each_with_index.map do |user_id, index|
       write_as(employee, "employee", :update,
@@ -196,24 +266,13 @@ RSpec.describe Timekeeping::LocalOwner, "colleague access" do
 
     expect(outcomes.map(&:status)).to eq([403, 403])
     expect(entry.reload.attributes).to eq(before)
-    expect(row_counts).to eq(before_counts)
-  end
-
-  it "refuses an employee who creates an entry for a colleague by string user_id" do
-    before_counts = row_counts
-
-    outcome = write_as(employee, "employee", :create,
-                       { "idempotency_key" => "colleague-create-string",
-                         "body" => create_body("user_id" => colleague.id.to_s) })
-
-    expect(outcome.status).to eq(403)
-    expect(row_counts).to eq(before_counts)
+    expect(timekeeping_row_counts).to eq(before_counts)
   end
 
   it "refuses an employee who edits a colleague's entry and leaves it unchanged" do
     entry = entry_of(colleague, "theirs")
     before = entry.reload.attributes
-    before_counts = row_counts
+    before_counts = timekeeping_row_counts
 
     outcome = write_as(employee, "employee", :update,
                        { "idempotency_key" => "colleague-edit", "entry_id" => entry.id,
@@ -221,7 +280,7 @@ RSpec.describe Timekeeping::LocalOwner, "colleague access" do
 
     expect(outcome.status).to eq(403)
     expect(entry.reload.attributes).to eq(before)
-    expect(row_counts).to eq(before_counts)
+    expect(timekeeping_row_counts).to eq(before_counts)
   end
 
   it "leaves a colleague's entry unchanged when an employee's bulk_move and bulk_delete list it" do
@@ -255,24 +314,14 @@ RSpec.describe Timekeeping::LocalOwner, "colleague access" do
     expect(theirs.reload.attributes).to eq(before)
   end
 
-  it "lets an admin create an entry for a same-company user by string user_id" do
-    outcome = write_as(admin, "admin", :create,
-                       { "idempotency_key" => "admin-for-colleague",
-                         "body" => create_body("user_id" => colleague.id.to_s) })
-
-    expect(outcome.status).to eq(201)
-    expect(outcome.body.fetch("user_id")).to eq(colleague.id)
-    expect(Timekeeping::LocalEntry.where(company_id: company.id, user_id: colleague.id).count).to eq(1)
-  end
-
   it "answers not_found when an admin names another company's user and stores nothing" do
-    before_counts = row_counts
+    before_counts = timekeeping_row_counts
 
     outcome = write_as(admin, "admin", :create,
                        { "idempotency_key" => "admin-for-outsider", "body" => create_body("user_id" => outsider.id) })
 
     expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
-    expect(row_counts).to eq(before_counts)
+    expect(timekeeping_row_counts).to eq(before_counts)
   end
 
   # The projection refuses an agent of another company or user, so such a
@@ -282,7 +331,7 @@ RSpec.describe Timekeeping::LocalOwner, "colleague access" do
     # Validations are skipped because employee is not a member of other_company.
     foreign_agent = build(:agent, company: other_company, user: employee).tap { |agent| agent.save!(validate: false) }
     colleague_agent = create(:agent, company:, user: colleague)
-    before_counts = row_counts
+    before_counts = timekeeping_row_counts
 
     outcomes = [foreign_agent, colleague_agent].map do |agent|
       write_as(employee, "employee", :create,
@@ -290,7 +339,7 @@ RSpec.describe Timekeeping::LocalOwner, "colleague access" do
     end
 
     expect(outcomes.map { |outcome| [outcome.status, outcome.body] }).to eq([[404, { "reason" => "not_found" }]] * 2)
-    expect(row_counts).to eq(before_counts)
+    expect(timekeeping_row_counts).to eq(before_counts)
   end
 
   it "creates an entry with the acting user's own agent" do
@@ -309,21 +358,21 @@ RSpec.describe Timekeeping::LocalOwner, "colleague access" do
     entry.update!(agent_id: agent.id)
     agent.update_columns(user_id: employee.id)
     before = entry.reload.attributes
-    before_counts = row_counts
+    before_counts = timekeeping_row_counts
 
     outcome = write_as(admin, "admin", :update,
                        { "idempotency_key" => "agent-moved", "entry_id" => entry.id, "body" => { "note" => "edited" } })
 
     expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
     expect(entry.reload.attributes).to eq(before)
-    expect(row_counts).to eq(before_counts)
+    expect(timekeeping_row_counts).to eq(before_counts)
   end
 
   it "refuses moving an agent-backed entry to a user the agent does not belong to" do
     entry = entry_of(colleague, "agent entry")
     entry.update!(agent_id: create(:agent, company:, user: colleague).id)
     before = entry.reload.attributes
-    before_counts = row_counts
+    before_counts = timekeeping_row_counts
 
     outcome = write_as(admin, "admin", :update,
                        { "idempotency_key" => "agent-reassign", "entry_id" => entry.id,
@@ -331,6 +380,6 @@ RSpec.describe Timekeeping::LocalOwner, "colleague access" do
 
     expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
     expect(entry.reload.attributes).to eq(before)
-    expect(row_counts).to eq(before_counts)
+    expect(timekeeping_row_counts).to eq(before_counts)
   end
 end

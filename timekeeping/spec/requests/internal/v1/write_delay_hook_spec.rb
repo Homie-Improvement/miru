@@ -16,20 +16,17 @@ RSpec.describe "Timekeeping write delay test hook" do
       Timekeeping::TestHooks.clear_write_delay!
       user_token = mint_token({ sub: 7, company_id: 1, role: "owner" })
       body = JSON.generate("milliseconds" => 400)
-      json = { "Content-Type" => "application/json" }
 
-      post "/internal/v1/test-hooks/writes/delay", params: body, headers: json
-      expect([response.status, response.parsed_body]).to eq([401, { "reason" => "unauthorized" }])
+      # The delay persists in a file, so it is checked after every refusal: a
+      # refusal that set a delay could otherwise be hidden by a later one clearing it.
+      [nil, "Bearer #{user_token}", "Bearer #{service_token}x"].each do |authorization|
+        headers = { "Content-Type" => "application/json" }
+        headers["Authorization"] = authorization if authorization
+        post "/internal/v1/test-hooks/writes/delay", params: body, headers: headers
 
-      post "/internal/v1/test-hooks/writes/delay", params: body,
-                                                   headers: json.merge("Authorization" => "Bearer #{user_token}")
-      expect([response.status, response.parsed_body]).to eq([401, { "reason" => "unauthorized" }])
-
-      post "/internal/v1/test-hooks/writes/delay", params: body,
-                                                   headers: json.merge("Authorization" => "Bearer #{service_token}x")
-      expect([response.status, response.parsed_body]).to eq([401, { "reason" => "unauthorized" }])
-
-      expect(Timekeeping::TestHooks.write_delay_seconds.to_f).to eq(0.0)
+        expect([response.status, response.parsed_body]).to eq([401, { "reason" => "unauthorized" }])
+        expect(Timekeeping::TestHooks.write_delay_seconds.to_f).to eq(0.0)
+      end
     end
   ensure
     Timekeeping::TestHooks.clear_write_delay!

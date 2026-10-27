@@ -81,7 +81,7 @@ class InvoiceMailer < ApplicationMailer
         next unless mark_sent
 
         @invoice.sent!
-        @invoice.update_timesheet_entry_status!
+        Invoices::ReservationBoundary.mark_billed(@invoice)
       end
     end
 end

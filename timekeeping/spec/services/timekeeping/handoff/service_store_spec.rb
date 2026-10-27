@@ -222,5 +222,128 @@ RSpec.describe Timekeeping::Handoff::ServiceStore do
 
       expect { store.export_checkpoint }.to raise_error(Timekeeping::Handoff::Store::Error, /prepared operations/)
     end
+
+    # "Check entry values when loading the checkpoint"
+    # The error message can reach logs, so it names ids and fields, never the
+    # row's values such as a private note.
+    it "refuses an invalid entry value with a ShapeError that names the entry and field but not the stored values" do
+      Timekeeping::Admission.fence!
+
+      [["source", "agent-not-in-contract"], ["review_status", "private-review-text"]].each do |field, value|
+        tables = handoff_checkpoint_tables(company_id: 8, id: 900, overrides: {
+          "entries" => { field => value, "note" => "private-store-note" }
+        })
+
+        expect { store.load_checkpoint(Timekeeping::Handoff::Checkpoint.build(tables:)) }
+          .to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError) { |error|
+            expect(error.message).to include(field)
+            expect(error.message).to include("900")
+            expect(error.message).not_to include("private-store-note")
+            expect(error.message).not_to include(value)
+          }
+        expect([field, Entry.count]).to eq([field, 0])
+      end
+    end
+
+    # The checkpoint shape check requires an Integer company_id only, so an
+    # invalid id can carry any text; the message must not repeat it.
+    it "names an invalid entry id as invalid without repeating its text in the error message" do
+      Timekeeping::Admission.fence!
+      tables = handoff_checkpoint_tables(company_id: 8, id: 900,
+                                         overrides: { "entries" => { "id" => "private-id-text" } })
+
+      expect { store.load_checkpoint(Timekeeping::Handoff::Checkpoint.build(tables:)) }
+        .to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError) { |error|
+          expect(error.message).to include("company_id 8 id invalid (id)")
+          expect(error.message).not_to include("private-id-text")
+        }
+      expect(Entry.count).to eq(0)
+    end
+
+    # "A monolith row with a source such as "agent" is therefore stored in
+    # Timekeeping's entries table, and any later write republishes it to the
+    # outbox, where the projection refuses it and delivery stops."
+    # The bad row is last, so a check that stops after the first good row, or a
+    # load that stores the good rows and drops the bad one, fails here.
+    it "refuses a checkpoint whose last entry has a source outside SnapshotValues and leaves every stored table unchanged" do
+      expect(Timekeeping::SnapshotValues::SOURCES).not_to include("agent")
+      kept = service_store_seed_prior_rows
+      OutboxSnapshot.insert_all!([kept.reload.attributes.slice(*Timekeeping::OutboxFields::ENTRY_FIELDS)
+                                       .merge("locked" => false, "generation" => 1)])
+      Timekeeping::Admission.fence!
+      tables = merge_handoff_checkpoint_tables(
+        handoff_checkpoint_tables(company_id: 8, id: 900),
+        handoff_checkpoint_tables(company_id: 9, id: 901, overrides: { "entries" => { "source" => "agent" } })
+      )
+      checkpoint = Timekeeping::Handoff::Checkpoint.build(tables:)
+      before = handoff_stored_rows
+      entry_sequence_before = handoff_next_id("entries")
+
+      expect { store.load_checkpoint(checkpoint) }
+        .to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError, /901.*source|source.*901/)
+
+      expect(handoff_stored_rows).to eq(before)
+      expect(handoff_next_id("entries")).to eq(entry_sequence_before)
+      expect(Entry.pluck(:company_id, :note)).to eq([[7, "Kept"]])
+    end
+
+    # On an empty destination no stored version is compared, so the value
+    # check is what keeps a version the projection refuses out.
+    it "refuses a non-positive version, an unknown bill_status and an infinite duration on an empty destination and stores nothing" do
+      Timekeeping::Admission.fence!
+      before = handoff_stored_rows
+      expect(before.values).to all(be_empty)
+
+      [["version", 0], ["version", -1], ["bill_status", "paid"], ["duration", Float::INFINITY]].each do |field, value|
+        tables = handoff_checkpoint_tables(company_id: 8, id: 900, overrides: { "entries" => { field => value } })
+
+        expect { store.load_checkpoint(Timekeeping::Handoff::Checkpoint.build(tables:)) }
+          .to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError, /#{field}/)
+        expect([field, value, handoff_stored_rows]).to eq([field, value, before])
+      end
+    end
+
+    # A refusal must consume nothing a retry needs: no fence change, no
+    # recorded version and no partial row, so the corrected checkpoint loads
+    # and repeats cleanly.
+    it "loads the corrected checkpoint straight after an invalid-value refusal, and loading it again stores the same rows" do
+      Timekeeping::Admission.fence!
+      expect(Timekeeping::SnapshotValues::BILL_STATUSES).not_to include("invoiced")
+      bad = merge_handoff_checkpoint_tables(
+        handoff_checkpoint_tables(company_id: 8, id: 900),
+        handoff_checkpoint_tables(company_id: 9, id: 901, overrides: { "entries" => { "bill_status" => "invoiced" } })
+      )
+      corrected = Timekeeping::Handoff::Checkpoint.build(tables: merge_handoff_checkpoint_tables(
+        handoff_checkpoint_tables(company_id: 8, id: 900),
+        handoff_checkpoint_tables(company_id: 9, id: 901)
+      ))
+
+      expect { store.load_checkpoint(Timekeeping::Handoff::Checkpoint.build(tables: bad)) }
+        .to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError, /bill_status/)
+      expect(Entry.count).to eq(0)
+      expect(Timekeeping::Admission.current.generation).to be_nil
+
+      first = store.load_checkpoint(corrected)
+      rows_after_first = handoff_stored_rows
+      second = store.load_checkpoint(corrected)
+
+      expect([first.digest, second.digest]).to all(eq(corrected.digest))
+      expect(handoff_stored_rows).to eq(rows_after_first)
+      expect(Entry.order(:company_id).pluck(:company_id, :id, :bill_status)).to eq([[8, 900, "unbilled"], [9, 901, "unbilled"]])
+    end
+
+    # entries.locked is nullable and OutboxFields.row replaces it with the
+    # reservation flag, so a stored NULL must not block a valid load.
+    it "loads and stores an entry whose locked column is NULL, since locked never reaches a snapshot" do
+      Timekeeping::Admission.fence!
+      tables = handoff_checkpoint_tables(company_id: 8, id: 900, overrides: { "entries" => { "locked" => nil } })
+      checkpoint = Timekeeping::Handoff::Checkpoint.build(tables:)
+
+      loaded = store.load_checkpoint(checkpoint)
+
+      expect(loaded.digest).to eq(checkpoint.digest)
+      expect(Entry.pluck(:company_id, :id, :locked)).to eq([[8, 900, nil]])
+      expect(store.export_checkpoint.digest).to eq(checkpoint.digest)
+    end
   end
 end
