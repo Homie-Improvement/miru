@@ -53,6 +53,17 @@ RSpec.describe PreparedReservationsSpecSupport do
       expect(Timekeeping::LocalEntry.where(company_id: foreign_company.id).pluck(:id)).to eq([foreign_entry.id])
     end
 
+    # The projected entry copies its timesheet row's date and duration through
+    # these keywords, so values that differ from the defaults must be stored as given.
+    it "given a work_date and duration stores those values in place of the defaults" do
+      company = create(:company)
+
+      entry = prepared_spec_entry(company, work_date: Date.new(2026, 3, 2), duration: 480.0)
+
+      stored = Timekeeping::LocalEntry.find(entry.id)
+      expect([stored.work_date, stored.duration]).to eq([Date.new(2026, 3, 2), 480.0])
+    end
+
     # The line-claim examples copy a timesheet row into the prepared table, so an
     # id that is dropped or replaced would leave the line pointing at no entry.
     it "given an id stores the entry under exactly that id in the given company" do
