@@ -186,10 +186,7 @@ module Invoices
       end
 
       # Each requested entry with its prepare outcome and its committed
-      # reservation row. An entry with no committed row may still be claimed
-      # by another kept invoice's lines or active holding: a sent invoice's
-      # added line passes admit and reserves nothing, so the rules see that
-      # claim instead.
+      # reservation row.
       def decide(request, entries)
         kept_ids = entries.filter_map { |entry| entry.id if entry.discarded_at.nil? }
         rows = Reservation.where(company_id: request.company_id, entry_id: request.entries).group_by(&:entry_id)
@@ -198,13 +195,25 @@ module Invoices
           committed = rows.fetch(entry_id, []).find { |row| row.state == COMMITTED }
           result = Timekeeping::ReservationRules.prepare_outcome({
             in_company: kept_ids.include?(entry_id),
-            committed: committed ? { invoice_id: committed.invoice_id, disposition: committed.disposition } :
-              claims.other_active_claim(entry_id, request.invoice_id),
+            committed: committed_claim(committed, request.invoice_id) { claims.other_active_claim(entry_id, request.invoice_id) },
             provisional: rows.fetch(entry_id, []).any? { |row| row.state == PROVISIONAL },
             invoice_id: request.invoice_id
           })
           { entry_id:, result:, committed: }
         end
+      end
+
+      # The claim the rules see for one entry, in the order the legacy
+      # adapter's EntryClaims#committed_claim uses: this invoice's own row or
+      # any active row first, then another kept invoice's active claim through
+      # its lines or holding, then another invoice's retained row. A sent
+      # invoice's added line passes admit and reserves nothing, so a row that
+      # only retains the entry must not hide that line's claim.
+      def committed_claim(committed, invoice_id)
+        row_claim = committed && { invoice_id: committed.invoice_id, disposition: committed.disposition }
+        return row_claim if committed && (committed.invoice_id == invoice_id || committed.disposition == ACTIVE)
+
+        yield || row_claim
       end
 
       def conflicts_in(decisions)

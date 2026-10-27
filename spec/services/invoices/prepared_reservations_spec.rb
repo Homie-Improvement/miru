@@ -1422,6 +1422,56 @@ RSpec.describe Invoices::PreparedReservations, "entries claimed only through a s
   end
 end
 
+RSpec.describe Invoices::PreparedReservations, "retained row beside another kept invoice's line" do
+  let(:retained_line_company) { create(:company) }
+  let(:retained_line_client) { create(:client, company: retained_line_company) }
+  let(:retained_line_project) { create(:project, client: retained_line_client, billable: true) }
+  let(:retained_line_user) { create(:user, current_workspace_id: retained_line_company.id) }
+
+  # A discarded sent invoice keeps the entry as a retained row; a live sent
+  # invoice then claims it only through a line its admit let through. A
+  # third, draft invoice must still be refused.
+  it "refuses a draft's prepare for an entry another kept invoice claims through its line while a discarded invoice retains it" do
+    entry = create(:timesheet_entry, user: retained_line_user, project: retained_line_project, bill_status: "unbilled")
+    discarded = create(:invoice, company: retained_line_company, client: retained_line_client, status: :sent)
+    discarded.update_columns(discarded_at: Time.current)
+    sent = create(:invoice, company: retained_line_company, client: retained_line_client, status: :sent)
+    create(:invoice_line_item, invoice: sent, timesheet_entry: entry, rate: 100, quantity: 60)
+    InvoiceEntryHolding.where(company_id: retained_line_company.id, invoice_id: sent.id).delete_all
+    draft = create(:invoice, company: retained_line_company, client: retained_line_client, status: :draft)
+    Timekeeping::LocalEntry.create!(id: entry.id, company_id: retained_line_company.id, user_id: retained_line_user.id,
+                                    project_id: retained_line_project.id, work_date: Date.current, duration: 60.0,
+                                    bill_status: "unbilled")
+    connection = ApplicationRecord.connection
+    connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, retained_line_company.id, entry.id, discarded.id, SecureRandom.uuid, Time.current]))
+      INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
+      VALUES (?, ?, ?, ?, 'committed', 'retained', ?)
+    SQL
+    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
+    rows = lambda do
+      connection.select_rows(ApplicationRecord.sanitize_sql_array([
+        "SELECT entry_id, invoice_id, state, disposition FROM reservations WHERE company_id = ? ORDER BY invoice_id",
+        retained_line_company.id
+      ]))
+    end
+    rows_before = rows.call
+    request = Invoices::ReservationRequest.new(
+      company_id: retained_line_company.id, invoice_id: draft.id, operation_id: SecureRandom.uuid,
+      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [entry.id]
+    )
+
+    # "A second kept invoice on the same entry fails with \"entry is on another invoice\""
+    outcome = described_class.new.prepare(request)
+
+    expect(outcome.state).to eq("refused")
+    expect(outcome.conflicts).to eq([{ entry_id: entry.id, reason: "on_another_invoice" }])
+    expect(rows.call).to eq(rows_before)
+    expect(connection.select_value(ApplicationRecord.sanitize_sql_array([
+      "SELECT COUNT(*) FROM invoice_operations WHERE company_id = ? AND invoice_id = ?", retained_line_company.id, draft.id
+    ])).to_i).to eq(0)
+  end
+end
+
 RSpec.describe Invoices::PreparedReservations, "prepare and commit" do
   include PreparedReservationsSpecSupport
 
