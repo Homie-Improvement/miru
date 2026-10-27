@@ -56,7 +56,30 @@ module Timekeeping
       def detach_agent_entries(**)
         raise OwnershipMoving
       end
+
+      def bulk_move(**)
+        raise OwnershipMoving
+      end
+
+      def bulk_delete(**)
+        raise OwnershipMoving
+      end
     end
+
+    # What a bulk move or delete did. entries are the requested entries found
+    # inside the scope, in request order. refusal is what the caller's check
+    # answered; when it is set nothing was written. written is true once at
+    # least one entry was written (legacy) or reported changed (Timekeeping).
+    BulkResult = Data.define(:entries, :refusal, :written)
+
+    # Casts requested ids the way the legacy where(id:) query did, so an id
+    # that is not a number is dropped like a missing one instead of reaching
+    # a path format that would raise.
+    ENTRY_ID_TYPE = ActiveModel::Type::Integer.new
+
+    # The per-entry answers of contracts/timekeeping/entry_api.yml bulk routes.
+    MOVED_RESULT = "moved"
+    DELETED_RESULT = "deleted"
 
     # Reads the ownership row under a share lock, or nil when it is missing.
     # Never TimekeepingOwnership.current, whose RecordNotFound would answer a
@@ -100,6 +123,22 @@ module Timekeeping
     # attempt rolled back. A resend within one attempt keeps the same id.
     def self.detach_operation_id(request_id:, agent_id:)
       Digest::UUID.uuid_v5(DETACH_OPERATION_NAMESPACE, "#{request_id}/detach_entries/#{agent_id}")
+    end
+
+    # The generation a writer that makes many writes reads once, before its
+    # first write, and passes to each of them. A missing ownership row is
+    # refused the way a write is refused.
+    def self.current_generation
+      ownership = TimekeepingOwnership.find_by(id: TimekeepingOwnership::SINGLETON_ID)
+      raise OwnershipMoving if ownership.nil?
+
+      ownership.generation
+    end
+
+    # Pure: the requested ids as Integers, without duplicates or ids that are
+    # not numbers.
+    def self.requested_entry_ids(entry_ids)
+      Array(entry_ids).filter_map { |entry_id| ENTRY_ID_TYPE.cast(entry_id) }.uniq
     end
 
     # Clears agent_id on every entry that names the agent, in the store that
@@ -228,7 +267,110 @@ module Timekeeping
       end
     end
 
+    # Moves the requested entries to project, a record the caller already
+    # resolved inside the context's company. Ids that are missing, not
+    # numbers, or outside the scope are dropped silently. check is called with
+    # the found entries before any write; a non-nil answer is returned as the
+    # refusal and nothing is written.
+    #
+    # An entry that fails the legacy model's update validations, such as a
+    # locked entry an employee moves, is skipped silently on both branches.
+    # A generation or handoff refusal raises and leaves no entry moved.
+    def bulk_move(entry_ids:, project:, check:, expected_generation:, scope: :company)
+      bulk_write(entry_ids:, check:, expected_generation:, scope:) do |ownership, owner, entries|
+        case owner
+        when :legacy
+          write_each_admitted(entries, owner:, expected_generation:) { |entry| entry.update(project_id: project.id) }
+        when :prepared
+          local_owner.bulk_move(context:, entries:, project:)
+        when :timekeeping
+          forward_bulk_move(ownership:, entries:, project:)
+        end
+      end
+    end
+
+    # Discards the requested entries, under the same id, scope, check and
+    # refusal rules as bulk_move. Discarding runs no validations, as the
+    # legacy discard_all never did.
+    def bulk_delete(entry_ids:, check:, expected_generation:, scope: :company)
+      bulk_write(entry_ids:, check:, expected_generation:, scope:) do |ownership, owner, entries|
+        case owner
+        when :legacy
+          write_each_admitted(entries, owner:, expected_generation:, &:discard)
+        when :prepared
+          local_owner.bulk_delete(context:, entries:)
+        when :timekeeping
+          forward_bulk_delete(ownership:, entries:)
+        end
+      end
+    end
+
     private
+
+      # One gateway transaction for the whole request, so a refusal at any
+      # entry rolls back every write before it and is counted once. The block
+      # answers whether anything was written.
+      def bulk_write(entry_ids:, check:, expected_generation:, scope:)
+        perform(expected_generation) do |ownership, owner|
+          entries = bulk_entries(ownership:, entry_ids:, scope:)
+          refusal = check.call(entries)
+          next BulkResult.new(entries:, refusal:, written: false) unless refusal.nil?
+
+          BulkResult.new(entries:, refusal: nil, written: yield(ownership, owner, entries))
+        end
+      end
+
+      # Only a not-found answer drops an id, so a foreign id looks exactly like
+      # a missing one. Every other error, such as Timekeeping being
+      # unreachable, still fails the request.
+      def bulk_entries(ownership:, entry_ids:, scope:)
+        self.class.requested_entry_ids(entry_ids).filter_map do |entry_id|
+          EntryLookup.find(ownership:, context:, entry_id:, local_owner:, read_client:, scope:).entry
+        rescue ActiveRecord::RecordNotFound
+          nil
+        end
+      end
+
+      # Reads ownership again before every entry write, so a generation change
+      # or handoff that lands between two writes refuses the rest of the
+      # request, and the refusal rolls back the writes already made. Each write
+      # is the same non-raising call the relation-wide update and discard_all
+      # made per record, so a failing entry is skipped, not raised. Answers
+      # true when any entry was attempted, as discard_all.any? did.
+      def write_each_admitted(entries, owner:, expected_generation:)
+        entries.each do |entry|
+          raise OwnershipMoving unless EntryOwner.for(admitted_ownership(expected_generation)) == owner
+
+          yield entry
+        end
+        entries.any?
+      end
+
+      # Timekeeping's bulk rules do not run every legacy update validation (a
+      # non-billable target project, for one), so entries the legacy save
+      # would skip are left out of the call and skipped the same way. Every
+      # found entry keeps the target project in memory, as the legacy entries
+      # do after a skipped save, so both branches render the same rows.
+      def forward_bulk_move(ownership:, entries:, project:)
+        entries.each { |entry| entry.project = project }
+        movable_ids = entries.filter_map { |entry| entry.id if entry.valid?(:update) }
+        return false if movable_ids.empty?
+
+        answer = write_client.bulk_move(context:, generation: ownership.generation, entry_ids: movable_ids,
+                                        project_id: project.id)
+        reported?(answer, MOVED_RESULT)
+      end
+
+      def forward_bulk_delete(ownership:, entries:)
+        return false if entries.empty?
+
+        answer = write_client.bulk_delete(context:, generation: ownership.generation, entry_ids: entries.map(&:id))
+        reported?(answer, DELETED_RESULT)
+      end
+
+      def reported?(answer, result)
+        Array(answer["results"]).any? { |entry_result| entry_result["result"] == result }
+      end
 
       # The legacy model refuses a create already marked billed, so a billed
       # row is created unbilled and billed in the same transaction.
