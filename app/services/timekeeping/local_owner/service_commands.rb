@@ -77,6 +77,9 @@ module Timekeeping
       end
 
       def call
+        # A path id that cannot name a row is answered as not found, as a
+        # missing one is and as the service answers it.
+        return Outcome.refusal(:not_found) if target_id.nil?
         return Outcome.refusal(:invalid_request) unless valid_request?
 
         attempt
@@ -122,16 +125,16 @@ module Timekeeping
           body["operation_id"]
         end
 
-        # The target id from the path, as an Integer; nil when it is not one.
+        # The target id from the path, as an Integer; nil when it is not one a
+        # bigint column can hold.
         def target_id
           value = params[command.fetch(:target)]
-          return value if value.is_a?(Integer) && value.positive?
-
-          Integer(value, 10) if value.is_a?(String) && ID.match?(value)
+          value = Integer(value, 10) if value.is_a?(String) && ID.match?(value)
+          value if WriteSteps.id?(value)
         end
 
         def valid_request?
-          body.is_a?(Hash) && UUID.match?(operation_id.to_s) && !target_id.nil?
+          body.is_a?(Hash) && UUID.match?(operation_id.to_s)
         end
 
         # The target is part of the receipt's operation, so one operation id
