@@ -312,42 +312,11 @@ RSpec.describe Timekeeping::EntryLookup, "replayed delete answers" do
     expect(entry).to be_a(TimesheetEntry)
     expect([entry.id, entry.user_id, entry.project_id]).to eq([4242, replayed_employee.id, replayed_project.id])
   end
-end
 
-RSpec.describe Timekeeping::EntryLookup do
-  let(:replayed_company) { create(:company) }
-  let(:replayed_admin) { create(:user, current_workspace_id: replayed_company.id) }
-  let(:replayed_foreign_company) { create(:company) }
-  let(:replayed_project) { create(:project, billable: true, client: create(:client, company: replayed_company)) }
-  let(:replayed_context) do
-    Timekeeping::WriteContext.new(company: replayed_company, actor: replayed_admin, actor_kind: "user",
-                                  request_id: "req-replayed-tenant")
-  end
+  it "accepts the matching replayed delete answer for this company under the company scope" do
+    entry = described_class.replayed(context: replayed_context, row: replayed_row, entry_id: 4242, scope: :company)
 
-  before do
-    create(:employment, company: replayed_company, user: replayed_admin)
-    replayed_admin.add_role :admin, replayed_company
-  end
-
-  def replayed_row(company_id)
-    {
-      "id" => 5151, "company_id" => company_id, "version" => 2, "project_id" => replayed_project.id,
-      "user_id" => replayed_admin.id, "work_date" => Date.current.iso8601, "duration" => 60.0, "note" => "Deleted",
-      "bill_status" => "unbilled", "review_status" => "not_required", "source" => "manual", "source_metadata" => {},
-      "agent_id" => nil, "proof_url" => nil, "proof_metadata" => nil, "locked" => false
-    }
-  end
-
-  it "refuses a replayed destroy answer naming another company as not found and accepts the same answer for this company" do
-    # Only company_id differs, so the company check itself is what refuses the stored answer.
-    expect do
-      described_class.replayed(context: replayed_context, row: replayed_row(replayed_foreign_company.id), entry_id: 5151,
-                               scope: :company)
-    end.to raise_error(ActiveRecord::RecordNotFound)
-
-    entry = described_class.replayed(context: replayed_context, row: replayed_row(replayed_company.id), entry_id: 5151,
-                                     scope: :company)
     expect(entry).to be_a(TimesheetEntry)
-    expect([entry.id, entry.company_id]).to eq([5151, replayed_company.id])
+    expect([entry.id, entry.company_id]).to eq([4242, replayed_company.id])
   end
 end

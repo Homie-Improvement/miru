@@ -114,6 +114,10 @@ class TimekeepingProviderArrange
     Timekeeping::EntryPresenter.call(Entry.select("entries.*", Timekeeping::EntriesQuery::RESERVED).find(entry_id))
   end
 
+  def outbox_size
+    OutboxSnapshot.count
+  end
+
   def reservations_for(entry_id)
     Reservation.where(entry_id:).order(:created_at, :invoice_id).pluck(:invoice_id, :state).map do |invoice_id, state|
       { "invoice_id" => invoice_id, "state" => state }

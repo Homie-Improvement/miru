@@ -260,27 +260,30 @@ RSpec.describe Timekeeping::EntryWriteClient, "replay-only destroy" do
     end
   end
   let(:replay_entry_url) { "#{replay_base_url}/v1/companies/#{replay_company.id}/entries/41" }
-  let(:replay_context) do
-    Timekeeping::WriteContext.new(company: replay_company, actor: replay_admin, actor_kind: "user",
-                                  request_id: "req-replay-auth-1")
-  end
+  let(:replay_client) { described_class.new(base_url: replay_base_url) }
 
   around do |example|
     with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
   end
 
+  def replay_context(request_id)
+    Timekeeping::WriteContext.new(company: replay_company, actor: replay_admin, actor_kind: "user", request_id:)
+  end
+
   # "Address this in follow-up design work with an authenticated replay path; do not treat every missing entry as a successful delete."
+  # "Even with the same request id, the gateway never sends the second DELETE carrying the same idempotency key."
   it "sends the replay-only DELETE under the actor's own write token with the original destroy key and the refusing If-Match" do
     sent = []
     stub_request(:delete, replay_entry_url).to_return do |request|
       sent << request
-      { status: 200, body: { "id" => 41 }.to_json }
+      { status: 200, body: { "id" => 41, "company_id" => replay_company.id }.to_json }
     end
-    client = described_class.new(base_url: replay_base_url)
+    context = replay_context("req-replay-headers")
 
-    client.destroy_entry(context: replay_context, generation: 3, entry_id: 41, version: 5)
-    client.replay_destroy_entry(context: replay_context, generation: 3, entry_id: 41)
+    replay_client.destroy_entry(context:, generation: 3, entry_id: 41, version: 5)
+    answer = replay_client.replay_destroy_entry(context:, generation: 3, entry_id: 41)
 
+    expect(answer).to eq("id" => 41, "company_id" => replay_company.id)
     original, replay = sent
     claims = Timekeeping::UserToken.verify(replay.headers["Authorization"].delete_prefix("Bearer "),
                                            public_key: timekeeping_key_pair.public_key)
@@ -288,96 +291,37 @@ RSpec.describe Timekeeping::EntryWriteClient, "replay-only destroy" do
     expect(replay.headers["Idempotency-Key"]).to eq(original.headers["Idempotency-Key"])
     expect(replay.headers["Idempotency-Replay"]).to eq("only")
     expect(replay.headers["If-Match"]).to eq("replay-only")
-    expect(replay.body.to_s).to eq("")
-  end
-end
-
-RSpec.describe Timekeeping::EntryWriteClient do
-  let(:replay_base_url) { "http://timekeeping.test" }
-  let(:replay_company) { create(:company) }
-  let(:replay_admin) do
-    create(:user).tap do |admin|
-      create(:employment, company: replay_company, user: admin)
-      admin.add_role :admin, replay_company
-    end
-  end
-  let(:replay_entry_url) { "#{replay_base_url}/v1/companies/#{replay_company.id}/entries/41" }
-
-  around do |example|
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
-  end
-
-  # "Even with the same request id, the gateway never sends the second DELETE carrying the same idempotency key."
-  it "sends the replay DELETE with the destroy Idempotency-Key, Idempotency-Replay only and If-Match replay-only" do
-    sent = []
-    stub_request(:delete, replay_entry_url).to_return do |request|
-      sent << request
-      { status: 200, body: { "id" => 41, "company_id" => replay_company.id }.to_json }
-    end
-    context = Timekeeping::WriteContext.new(company: replay_company, actor: replay_admin, actor_kind: "user",
-                                            request_id: "req-replay-headers")
-    client = described_class.new(base_url: replay_base_url)
-
-    client.destroy_entry(context:, generation: 3, entry_id: 41, version: 5)
-    answer = client.replay_destroy_entry(context:, generation: 3, entry_id: 41)
-
-    expect(answer).to eq("id" => 41, "company_id" => replay_company.id)
-    original, replay = sent
-    expect(replay.headers["Idempotency-Key"]).to eq(original.headers["Idempotency-Key"])
-    expect(replay.headers["Idempotency-Replay"]).to eq("only")
-    expect(replay.headers["If-Match"]).to eq("replay-only")
     expect(original.headers["Idempotency-Replay"]).to be_nil
+    expect(replay.body.to_s).to eq("")
     expect(replay.body.to_s).to eq(original.body.to_s)
-  end
-end
-
-RSpec.describe Timekeeping::EntryWriteClient, "replay-only destroy answers" do
-  let(:replay_answer_base_url) { "http://timekeeping.test" }
-  let(:replay_answer_company) { create(:company) }
-  let(:replay_answer_admin) do
-    create(:user).tap do |admin|
-      create(:employment, company: replay_answer_company, user: admin)
-      admin.add_role :admin, replay_answer_company
-    end
-  end
-  let(:replay_answer_url) { "#{replay_answer_base_url}/v1/companies/#{replay_answer_company.id}/entries/41" }
-  let(:replay_answer_client) { described_class.new(base_url: replay_answer_base_url) }
-
-  around do |example|
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
-  end
-
-  def replay_answer_context(request_id)
-    Timekeeping::WriteContext.new(company: replay_answer_company, actor: replay_answer_admin, actor_kind: "user",
-                                  request_id:)
   end
 
   it "sends a different Idempotency-Key for a different request id" do
     sent = []
-    stub_request(:delete, replay_answer_url).to_return do |request|
+    stub_request(:delete, replay_entry_url).to_return do |request|
       sent << request
       { status: 200, body: { "id" => 41 }.to_json }
     end
 
-    replay_answer_client.destroy_entry(context: replay_answer_context("req-a"), generation: 3, entry_id: 41, version: 5)
-    replay_answer_client.replay_destroy_entry(context: replay_answer_context("req-b"), generation: 3, entry_id: 41)
+    replay_client.destroy_entry(context: replay_context("req-a"), generation: 3, entry_id: 41, version: 5)
+    replay_client.replay_destroy_entry(context: replay_context("req-b"), generation: 3, entry_id: 41)
 
     expect(sent.last.headers["Idempotency-Key"]).not_to eq(sent.first.headers["Idempotency-Key"])
   end
 
   it "raises RecordNotFound when Timekeeping holds no stored answer" do
-    stub_request(:delete, replay_answer_url).to_return(status: 404, body: { "reason" => "not_found" }.to_json)
+    stub_request(:delete, replay_entry_url).to_return(status: 404, body: { "reason" => "not_found" }.to_json)
 
     expect do
-      replay_answer_client.replay_destroy_entry(context: replay_answer_context("req-missing"), generation: 3, entry_id: 41)
+      replay_client.replay_destroy_entry(context: replay_context("req-missing"), generation: 3, entry_id: 41)
     end.to raise_error(ActiveRecord::RecordNotFound)
   end
 
   it "raises Conflict when a provider that ignores the header refuses the If-Match" do
-    stub_request(:delete, replay_answer_url).to_return(status: 409, body: { "reason" => "version_conflict" }.to_json)
+    stub_request(:delete, replay_entry_url).to_return(status: 409, body: { "reason" => "version_conflict" }.to_json)
 
     expect do
-      replay_answer_client.replay_destroy_entry(context: replay_answer_context("req-old"), generation: 3, entry_id: 41)
+      replay_client.replay_destroy_entry(context: replay_context("req-old"), generation: 3, entry_id: 41)
     end.to raise_error(Timekeeping::EntryWriteClient::Conflict)
   end
 end
