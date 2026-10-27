@@ -187,9 +187,10 @@ module Timekeeping
     # raw params. A stale generation refuses the whole call.
     def bulk_move(context:, generation:, entry_ids:, project_id:)
       path = format(BULK_MOVE_PATH, company_id: context.company.id)
+      ids = bulk_body_ids(entry_ids)
       forward(Net::HTTP::Post, path, operation: "bulk_move", context:, generation:,
-                                     idempotency_key: bulk_key(context, "bulk_move", entry_ids),
-                                     body: { "entry_ids" => entry_ids, "project_id" => project_id })
+                                     idempotency_key: bulk_key(context, "bulk_move", ids),
+                                     body: { "entry_ids" => ids, "project_id" => project_id })
     end
 
     # Discards the entries in one call and returns Timekeeping's answer, whose
@@ -197,9 +198,10 @@ module Timekeeping
     # rules as bulk_move apply to entry_ids and to a stale generation.
     def bulk_delete(context:, generation:, entry_ids:)
       path = format(BULK_DELETE_PATH, company_id: context.company.id)
+      ids = bulk_body_ids(entry_ids)
       forward(Net::HTTP::Post, path, operation: "bulk_delete", context:, generation:,
-                                     idempotency_key: bulk_key(context, "bulk_delete", entry_ids),
-                                     body: { "entry_ids" => entry_ids })
+                                     idempotency_key: bulk_key(context, "bulk_delete", ids),
+                                     body: { "entry_ids" => ids })
     end
 
     # Returns the stored answer of a destroy this request id already committed.
@@ -216,6 +218,13 @@ module Timekeeping
 
       def request_key(context, operation, entry_id = nil)
         self.class.idempotency_key(request_id: context.request_id, operation:, entry_id:)
+      end
+
+      # Timekeeping fingerprints the body as serialized, so the ids go in the
+      # same order the key reads them: a resend that names the same entries in
+      # another order then sends the same body and is replayed.
+      def bulk_body_ids(entry_ids)
+        entry_ids.sort_by(&:to_i)
       end
 
       def bulk_key(context, operation, entry_ids)
