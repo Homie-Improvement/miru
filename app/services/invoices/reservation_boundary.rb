@@ -44,7 +44,18 @@ module Invoices
     # unavailable) alike, so the caller's transaction rolls back the sent
     # status with it and the invoice is never sent with its entries left
     # unbilled. Billing again is safe: only entries not yet billed are billed.
+    #
+    # The store bills only reservations it holds as committed, so billing
+    # waits until every commit of the invoice's reservations is delivered:
+    # an undelivered one would make the store answer success with nothing
+    # billed. The invoice's operation lock is taken first, so a save still
+    # running finishes and writes its commit row before the check.
     def mark_billed(invoice)
+      OperationLock.acquire!(Invoice.connection, company_id: invoice.company_id, invoice_id: invoice.id)
+      if InvoiceOperationOutboxItem.exists?(company_id: invoice.company_id, invoice_id: invoice.id, kind: "commit", delivered_at: nil)
+        raise OperationErrors::BillingRetryable, "reservation_commit_pending"
+      end
+
       holding = InvoiceEntryHolding.find_by(company_id: invoice.company_id, invoice_id: invoice.id)
       ownership = TimekeepingOwnership.current
       request = ReservationRequest.new(

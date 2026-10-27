@@ -62,3 +62,54 @@ RSpec.describe BillingFencedMailDeliveryJob, "for a payment mail queued before a
     expect(enqueued_jobs).to be_empty
   end
 end
+
+RSpec.describe BillingFencedMailDeliveryJob, "for an invoice send whose billing Timekeeping did not settle", type: :job do
+  include ActiveJob::TestHelper
+
+  # A queued send must survive a brief Timekeeping outage while billing:
+  # the job is rescheduled, then bills and mails once the store answers.
+  it "reschedules the invoice mail when mark_billed gets a 503, then bills and sends it once" do
+    company = create(:company)
+    client = create(:client, company:)
+    project = create(:project, client:, billable: true)
+    owner = create(:user, current_workspace_id: company.id)
+    entry = create(:timesheet_entry, user: owner, project:, bill_status: "unbilled")
+    invoice = create(:invoice, client:, company:, status: :sending)
+    create(:invoice_line_item, invoice:, timesheet_entry: entry, rate: 100, quantity: 60)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", handoff_step: nil)
+
+    fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
+    fake.generation = TimekeepingOwnership.current.generation
+    fake.add_entry(company_id: company.id, user_id: owner.id, project_id: project.id, id: entry.id)
+    fake.add_reservation(entry_id: entry.id, invoice_id: invoice.id, state: "committed", disposition: "active")
+    forward = TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil)
+    outage = { mark_billed: true }
+    billing_outage_http = Object.new
+    billing_outage_http.define_singleton_method(:call) do |method, path, headers: {}, body: nil|
+      if outage[:mark_billed] && path.end_with?("/mark-billed")
+        next TimekeepingContract::Response.new(status: 503, body: { "reason" => "unavailable" })
+      end
+
+      forward.call(method, path, headers:, body:)
+    end
+    use_fake_timekeeping_reservations(fake, http: billing_outage_http)
+    allow(InvoicePayment::PdfGeneration).to receive(:process).and_return("%PDF-1.4 invoice")
+    clear_enqueued_jobs
+    ActionMailer::Base.deliveries.clear
+
+    InvoiceMailer.with(invoice_id: invoice.id, subject: "Invoice", recipients: [client.email]).invoice.deliver_later
+    perform_enqueued_jobs
+
+    expect(ActionMailer::Base.deliveries).to be_empty
+    expect(invoice.reload.status).to eq("sending")
+    expect(enqueued_jobs.map { |job| job["job_class"] || job[:job].to_s }).to eq(["BillingFencedMailDeliveryJob"])
+
+    outage[:mark_billed] = false
+    perform_enqueued_jobs
+
+    expect(ActionMailer::Base.deliveries.size).to eq(1)
+    expect(invoice.reload.status).to eq("sent")
+    expect(fake.stored_entry(entry.id)["bill_status"]).to eq("billed")
+    expect(enqueued_jobs).to be_empty
+  end
+end

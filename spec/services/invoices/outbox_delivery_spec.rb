@@ -250,4 +250,30 @@ RSpec.describe Invoices::OutboxDelivery do
     expect(adapter.requests).to be_empty
     expect(item.reload.attributes.slice("delivered_at", "attempts")).to eq("delivered_at" => nil, "attempts" => 0)
   end
+
+  it "marks a row that never settles undeliverable once it has used the last delivery attempt" do
+    limit = described_class::MAX_DELIVERY_ATTEMPTS
+    operation_id = SecureRandom.uuid
+    InvoiceOperationIntent.create!(
+      company_id: 7701, invoice_id: 9701, operation_id:, state: "failed", generation: 1,
+      disposition: "active", desired_entry_ids: [71]
+    )
+    item = InvoiceOperationOutboxItem.create!(
+      company_id: 7701, invoice_id: 9701, operation_id:, kind: "abort", attempts: limit - 2,
+      payload: { company_id: 7701, invoice_id: 9701, operation_id:, generation: 1, disposition: "active", desired_entry_ids: [71] }
+    )
+    adapter = outbox_delivery_settled_adapter("retryable")
+    delivery = described_class.new(adapter_source: -> { adapter })
+
+    delivery.deliver(item.id)
+    expect(item.reload.attributes.slice("attempts", "undeliverable_at")).to eq("attempts" => limit - 1, "undeliverable_at" => nil)
+
+    delivery.deliver(item.id)
+    item.reload
+    expect(item.attempts).to eq(limit)
+    expect(item.undeliverable_at).to be_present
+    expect(item.delivered_at).to be_nil
+    expect(described_class.new(adapter_source: -> { adapter }).deliver(item.id)).to be_nil
+    expect(adapter.requests.size).to eq(2)
+  end
 end

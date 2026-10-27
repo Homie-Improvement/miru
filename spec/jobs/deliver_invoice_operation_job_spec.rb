@@ -4,9 +4,9 @@
 
 require "rails_helper"
 
-# Request rebuilding and repeat delivery are checked in
-# spec/services/invoices/outbox_delivery_spec.rb; this spec checks only what
-# the job itself decides: its queue and where the adapter comes from.
+# Request rebuilding is checked in spec/services/invoices/outbox_delivery_spec.rb.
+# This spec checks the job's queue and where the adapter comes from, then
+# delivers rows end to end against each adapter, the remote one over the fake.
 RSpec.describe DeliverInvoiceOperationJob do
   def deliver_job_outbox_row(company_id:, kind:, intent_state:)
     operation_id = SecureRandom.uuid
@@ -38,32 +38,51 @@ RSpec.describe DeliverInvoiceOperationJob do
     expect(row.reload.delivered_at).to be_present
   end
 
-  # A refused prepare stores no operation, so the prepared adapter answers its
-  # abort as aborted and the failed intent settles the row as save_failed.
-  it "delivers a refused save's abort row to the prepared adapter on the first attempt, writing nothing" do
-    company_id = 9
-    row = deliver_job_outbox_row(company_id:, kind: "abort", intent_state: "failed")
-    reservation_rows = -> { ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM reservations WHERE company_id = #{company_id}") }
-    operation_rows = -> { ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM invoice_operations WHERE company_id = #{company_id}") }
-
-    described_class.perform_now(row.id, reservations: Invoices::PreparedReservations.new)
-
-    expect(row.reload.delivered_at).to be_present
-    expect(row.attempts).to eq(0)
-    expect([reservation_rows.call, operation_rows.call]).to eq([0, 0])
-  end
-
-  # "Until later issues register their adapters, every owner maps to a retryable \"adapter not available\" error."
   # "It calls the adapter's `commit` or `abort`, sets `delivered_at` only on a settled outcome, and otherwise keeps the row and increments `attempts`."
-  it "counts an attempt and keeps the row when no adapter is registered for the current owner" do
-    # The Timekeeping service owner has no adapter registered yet.
+  it "counts an attempt and keeps the row when the current owner's adapter answers retryable" do
     TimekeepingOwnership.current.update_columns(owner: "timekeeping", monolith_store: "prepared")
+    unavailable_http = Object.new
+    unavailable_http.define_singleton_method(:call) do |_method, _path, headers: {}, body: nil|
+      TimekeepingContract::Response.new(status: 503, body: {})
+    end
+    use_fake_timekeeping_reservations(TimekeepingContract::FakeTimekeeping.new, http: unavailable_http)
     row = deliver_job_outbox_row(company_id: 8, kind: "abort", intent_state: "failed")
 
     expect { described_class.perform_now(row.id) }.not_to raise_error
 
     expect(row.reload.delivered_at).to be_nil
     expect(row.attempts).to eq(1)
+  end
+end
+
+RSpec.describe DeliverInvoiceOperationJob, "prepared owner abort delivery" do
+  # "a refused prepare reserves nothing and leaves a failed intent with an abort row"
+  # A refused prepare stores no invoice_operations row, so the abort must still answer
+  # the settled state or the outbox row is retried forever.
+  it "delivers a refused save's abort row to the prepared adapter as settled, with no attempt counted and nothing reserved" do
+    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
+    company_id = 41
+    operation_id = SecureRandom.uuid
+    InvoiceOperationIntent.create!(
+      company_id:, invoice_id: 12, operation_id:, state: "failed",
+      generation: TimekeepingOwnership.current.generation, disposition: "active", desired_entry_ids: [5]
+    )
+    row = InvoiceOperationOutboxItem.create!(
+      company_id:, invoice_id: 12, operation_id:, kind: "abort",
+      payload: {
+        "company_id" => company_id, "invoice_id" => 12, "operation_id" => operation_id,
+        "generation" => TimekeepingOwnership.current.generation, "disposition" => "active", "desired_entry_ids" => [5]
+      }
+    )
+
+    described_class.perform_now(row.id, reservations: Invoices::PreparedReservations.new)
+
+    row.reload
+    expect(row.delivered_at).to be_present
+    expect(row.attempts).to eq(0)
+    connection = ApplicationRecord.connection
+    expect(connection.select_value("SELECT COUNT(*) FROM reservations WHERE company_id = #{company_id}").to_i).to eq(0)
+    expect(connection.select_value("SELECT COUNT(*) FROM invoice_operations WHERE company_id = #{company_id}").to_i).to eq(0)
   end
 end
 

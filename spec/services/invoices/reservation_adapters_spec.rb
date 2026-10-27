@@ -12,6 +12,7 @@ RSpec.describe Invoices::ReservationAdapters do
     expect(described_class.for(ownership)).to be_a(Invoices::LegacyReservations)
   end
 
+  # "Create `Invoices::PreparedReservations` in `app/services/invoices/prepared_reservations.rb` and register it for `:prepared` in `Invoices::ReservationAdapters`."
   it "answers the prepared monolith owner with the prepared reservations adapter" do
     ownership = TimekeepingOwnership.new(owner: "monolith", monolith_store: "prepared")
     expect(Timekeeping::EntryOwner.for(ownership)).to eq(:prepared)

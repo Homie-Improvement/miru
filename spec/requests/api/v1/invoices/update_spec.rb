@@ -544,11 +544,6 @@ RSpec.describe "Api::V1::Invoices#update timesheet entry company scope", type: :
   let(:other_company) { create(:company) }
   let(:other_user) { create(:user, current_workspace_id: other_company.id) }
   let(:other_project) { create(:project, client: create(:client, company: other_company), billable: true) }
-  let(:scope_invoice) { create(:invoice, company: scope_company, client: scope_client) }
-  # A manual line with no entry, which each request tries to point at an entry.
-  let!(:manual_line) do
-    create(:invoice_line_item, invoice: scope_invoice, timesheet_entry: nil, rate: 100, quantity: 60)
-  end
 
   before do
     create(:employment, company: scope_company, user: scope_admin)
@@ -574,18 +569,35 @@ RSpec.describe "Api::V1::Invoices#update timesheet entry company scope", type: :
   end
   let(:missing_id) { TimesheetEntry.maximum(:id).to_i + 1_000 }
 
+  let!(:scope_invoice) do
+    create(:invoice, company: scope_company, client: scope_client, invoice_number: "INV-COMPANY-SCOPE-UP-001")
+  end
+  # A line whose entries are linked through join rows, starting with the own entry.
+  let!(:aggregate_line) do
+    line = create(:invoice_line_item, invoice: scope_invoice, timesheet_entry: nil, name: "Aggregate",
+      description: "Aggregate", rate: 100, quantity: 60)
+    create(:invoice_line_item_time_entry, invoice_line_item: line, timesheet_entry: own_entry)
+    line
+  end
+  # A line with no direct entry, so a refused direct id must leave it at nil.
+  let!(:manual_line) do
+    create(:invoice_line_item, invoice: scope_invoice, timesheet_entry: nil, name: "Manual",
+      description: "Manual", rate: 100, quantity: 60)
+  end
+
   # Every example compares against this seeded state. If the setup drifts, the examples fail here
   # instead of passing on two trivially equal responses.
   before do
     expect(foreign_entry.reload.company_id).to eq(other_company.id)
     expect(null_company_entry.reload.company_id).to be_nil
     expect(TimesheetEntry.exists?(missing_id)).to be(false)
+    expect([foreign_entry.reload.locked, null_company_entry.reload.locked]).to eq([false, false])
+    expect(aggregate_line.reload.linked_timesheet_entry_ids).to eq([own_entry.id])
     expect(manual_line.reload.timesheet_entry_id).to be_nil
-    expect([own_entry.reload.locked, foreign_entry.reload.locked, null_company_entry.reload.locked])
-      .to eq([false, false, false])
   end
 
-  # entry_ref is the line's entry reference: { timesheet_entry_id: } or { linked_timesheet_entry_ids: }.
+  # Sends every scalar attribute of the line unchanged, so only the entry reference differs.
+  # entry_ref is { timesheet_entry_id: } or { linked_timesheet_entry_ids: }.
   def patch_company_scope_line(line, entry_ref)
     send_request :patch, api_v1_invoice_path(scope_invoice), params: {
       invoice: {
@@ -596,60 +608,93 @@ RSpec.describe "Api::V1::Invoices#update timesheet entry company scope", type: :
         status: "draft",
         currency: scope_company.base_currency,
         invoice_line_items_attributes: [
-          { id: line.id, name: line.name, description: "line", date: Date.current.iso8601, rate: 100, quantity: 60 }
-            .merge(entry_ref)
+          { id: line.id, name: line.name, description: line.description, date: line.date.iso8601,
+            rate: line.rate, quantity: line.quantity }.merge(entry_ref)
         ]
       }
     }, headers: auth_headers(scope_admin)
     [response.status, response.body]
   end
 
-  it "answers a foreign direct timesheet_entry_id exactly like a missing one and leaves the line unchanged" do
-    foreign_result = nil
-    expect do
-      foreign_result = patch_company_scope_line(manual_line, timesheet_entry_id: foreign_entry.id)
-    end.to not_change(InvoiceLineItem, :count)
-      .and not_change(InvoiceLineItemTimeEntry, :count)
-    missing_result = patch_company_scope_line(manual_line, timesheet_entry_id: missing_id)
+  it "refuses a link-only update naming a foreign entry exactly like a missing id and keeps the old links" do
+    join_row_ids = InvoiceLineItemTimeEntry.where(invoice_line_item_id: aggregate_line.id).pluck(:id)
+
+    # Each refused call is checked against the seeded state on its own, so a write by the first
+    # cannot hide behind the second.
+    results = [[foreign_entry.id], [missing_id]].map do |entry_ids|
+      result = nil
+      expect do
+        result = patch_company_scope_line(aggregate_line, linked_timesheet_entry_ids: entry_ids)
+      end.to not_change(Invoice, :count)
+        .and not_change(InvoiceLineItem, :count)
+        .and not_change(InvoiceLineItemTimeEntry, :count)
+      expect(aggregate_line.reload.linked_timesheet_entry_ids).to eq([own_entry.id])
+      expect(InvoiceLineItemTimeEntry.where(invoice_line_item_id: aggregate_line.id).pluck(:id)).to eq(join_row_ids)
+      expect(foreign_entry.reload.locked).to be(false)
+      result
+    end
+    foreign_result, missing_result = results
 
     expect(foreign_result.first).to eq(422)
     expect(foreign_result).to eq(missing_result)
     expect(JSON.parse(foreign_result.last)["errors"]).to include("not found")
     expect(foreign_result.last).not_to include(foreign_entry.id.to_s)
-    expect(manual_line.reload.timesheet_entry_id).to be_nil
-    expect(foreign_entry.reload.locked).to be(false)
   end
 
-  it "answers a foreign linked id beside an own entry exactly like a missing one, without echoing either id" do
-    foreign_result = nil
-    missing_result = nil
-    expect do
-      foreign_result = patch_company_scope_line(manual_line, linked_timesheet_entry_ids: [own_entry.id, foreign_entry.id])
-      missing_result = patch_company_scope_line(manual_line, linked_timesheet_entry_ids: [own_entry.id, missing_id])
-    end.to not_change(InvoiceLineItemTimeEntry, :count)
+  it "refuses a foreign direct timesheet_entry_id exactly like a missing one and leaves the line without an entry" do
+    results = [foreign_entry.id, missing_id].map do |entry_id|
+      result = nil
+      expect do
+        result = patch_company_scope_line(manual_line, timesheet_entry_id: entry_id)
+      end.to not_change(Invoice, :count)
+        .and not_change(InvoiceLineItem, :count)
+        .and not_change(InvoiceLineItemTimeEntry, :count)
+      expect(manual_line.reload.timesheet_entry_id).to be_nil
+      expect(foreign_entry.reload.locked).to be(false)
+      result
+    end
+    foreign_result, missing_result = results
 
     expect(foreign_result.first).to eq(422)
     expect(foreign_result).to eq(missing_result)
     expect(JSON.parse(foreign_result.last)["errors"]).to include("not found")
     expect(foreign_result.last).not_to include(foreign_entry.id.to_s)
-    expect(missing_result.last).not_to include(missing_id.to_s)
-    expect([own_entry.reload.locked, foreign_entry.reload.locked]).to eq([false, false])
   end
 
-  it "answers a NULL-company entry, direct or linked, exactly like a missing id and leaves it unlocked" do
+  it "refuses a NULL-company entry, direct or linked, exactly like a missing id and leaves it unlocked" do
     direct_result = nil
     linked_result = nil
     expect do
       direct_result = patch_company_scope_line(manual_line, timesheet_entry_id: null_company_entry.id)
-      linked_result = patch_company_scope_line(manual_line, linked_timesheet_entry_ids: [null_company_entry.id])
-    end.to not_change(InvoiceLineItemTimeEntry, :count)
+      linked_result = patch_company_scope_line(aggregate_line, linked_timesheet_entry_ids: [null_company_entry.id])
+    end.to not_change(Invoice, :count)
+      .and not_change(InvoiceLineItem, :count)
+      .and not_change(InvoiceLineItemTimeEntry, :count)
 
     expect(direct_result.first).to eq(422)
     expect(direct_result).to eq(patch_company_scope_line(manual_line, timesheet_entry_id: missing_id))
     expect(linked_result.first).to eq(422)
-    expect(linked_result).to eq(patch_company_scope_line(manual_line, linked_timesheet_entry_ids: [missing_id]))
+    expect(linked_result).to eq(patch_company_scope_line(aggregate_line, linked_timesheet_entry_ids: [missing_id]))
     expect(JSON.parse(direct_result.last)["errors"]).to include("not found")
     expect(manual_line.reload.timesheet_entry_id).to be_nil
+    expect(aggregate_line.reload.linked_timesheet_entry_ids).to eq([own_entry.id])
     expect(null_company_entry.reload.locked).to be(false)
+  end
+
+  it "applies a link-only replacement that adds no join rows when repeated, then a link-only clear" do
+    new_entries = create_list(:timesheet_entry, 2, user: scope_admin, project: scope_project, bill_status: :unbilled,
+      locked: false, work_date: Date.current, duration: 60)
+
+    2.times do
+      status, _body = patch_company_scope_line(aggregate_line, linked_timesheet_entry_ids: new_entries.map(&:id))
+      expect(status).to eq(200)
+      expect(InvoiceLineItemTimeEntry.where(invoice_line_item_id: aggregate_line.id).pluck(:timesheet_entry_id))
+        .to match_array(new_entries.map(&:id))
+    end
+
+    # A form-encoded empty list arrives as one blank value, and it must clear the links rather than be ignored.
+    status, _body = patch_company_scope_line(aggregate_line, linked_timesheet_entry_ids: [""])
+    expect(status).to eq(200)
+    expect(aggregate_line.reload.linked_timesheet_entry_ids).to eq([])
   end
 end

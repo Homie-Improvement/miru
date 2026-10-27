@@ -607,4 +607,37 @@ RSpec.describe Invoices::ReservationBoundary, "billing under the timekeeping own
       }
     expect(fake.stored_entry(row.id)["bill_status"]).to eq("unbilled")
   end
+
+  # Timekeeping bills only committed reservations, so billing before the
+  # invoice's commit is delivered would answer success with nothing billed.
+  it "refuses billing while the invoice's reservation commit is undelivered, and bills once it is delivered" do
+    company = create(:company)
+    client = create(:client, company:)
+    project = create(:project, client:, billable: true)
+    user = create(:user, current_workspace_id: company.id)
+    row = create(:timesheet_entry, user:, project:, bill_status: "unbilled")
+    invoice = create(:invoice, company:, client:, invoice_number: "TK-BILL-PENDING")
+    create(:invoice_line_item, invoice:, timesheet_entry: row, rate: 100, quantity: 60)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", handoff_step: nil)
+
+    fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
+    fake.generation = TimekeepingOwnership.current.generation
+    fake.add_entry(company_id: company.id, user_id: user.id, project_id: project.id, id: row.id)
+    fake.add_reservation(entry_id: row.id, invoice_id: invoice.id, state: "committed", disposition: "active")
+    use_fake_timekeeping_reservations(fake)
+    pending_commit = InvoiceOperationOutboxItem.create!(
+      company_id: company.id, invoice_id: invoice.id, operation_id: SecureRandom.uuid, kind: "commit",
+      payload: { company_id: company.id, invoice_id: invoice.id }
+    )
+
+    expect { ApplicationRecord.transaction { described_class.mark_billed(Invoice.find(invoice.id)) } }
+      .to raise_error(Invoices::OperationErrors::BillingRetryable, "reservation_commit_pending")
+    expect(fake.requests.count { |request| request[:path].end_with?("/mark-billed") }).to eq(0)
+
+    pending_commit.update!(delivered_at: Time.current)
+    outcome = ApplicationRecord.transaction { described_class.mark_billed(Invoice.find(invoice.id)) }
+
+    expect(outcome.state).to eq("committed")
+    expect(fake.stored_entry(row.id)["bill_status"]).to eq("billed")
+  end
 end
