@@ -5,20 +5,8 @@
 require "rails_helper"
 
 RSpec.describe Timekeeping::Handoff::Capabilities do
-  let(:enforcing_admission) do
-    Class.new do
-      def fence_admission = nil
-      def admit(generation:) = nil
-      def enforces_fence? = true
-    end.new
-  end
-  let(:non_enforcing_admission) do
-    Class.new do
-      def fence_admission = nil
-      def admit(generation:) = nil
-      def enforces_fence? = false
-    end.new
-  end
+  let(:enforcing_admission) { TimekeepingHandoffFakes::RecordingAdmission.new }
+  let(:non_enforcing_admission) { TimekeepingHandoffFakes::RecordingAdmission.new(enforces_fence: false) }
   # "Second, the outgoing owner has working settle and drain integrations configured."
   let(:settle) do
     Class.new do
@@ -66,11 +54,7 @@ end
 
 RSpec.describe Timekeeping::Handoff::Capabilities do
   def capabilities_admission(enforcing)
-    Class.new do
-      define_method(:fence_admission) { nil }
-      define_method(:admit) { |generation:| generation && nil }
-      define_method(:enforces_fence?) { enforcing }
-    end.new
+    TimekeepingHandoffFakes::RecordingAdmission.new(enforces_fence: enforcing)
   end
 
   # "First, each owner has a configured admission adapter that enforces its fence: Timekeeping's is `Timekeeping::Admission`; the monolith's is the gateway of section 10.1, supplied when it exists."
@@ -88,11 +72,7 @@ end
 
 RSpec.describe Timekeeping::Handoff::Capabilities do
   def capabilities_enforcing_admission
-    Class.new do
-      def fence_admission = nil
-      def admit(generation:) = generation && nil
-      def enforces_fence? = true
-    end.new
+    TimekeepingHandoffFakes::RecordingAdmission.new
   end
 
   def capabilities_settle
@@ -118,11 +98,7 @@ end
 RSpec.describe Timekeeping::Handoff::Capabilities do
   it "refuses a Timekeeping side without an enforcing admission adapter and accepts TimekeepingStore as one" do
     store = Timekeeping::Handoff::TimekeepingStore.new(base_url: "http://timekeeping.test", token: "token")
-    monolith_admission = Class.new do
-      def fence_admission = nil
-      def admit(generation:) = generation && nil
-      def enforces_fence? = true
-    end.new
+    monolith_admission = TimekeepingHandoffFakes::RecordingAdmission.new
     monolith = Timekeeping::Handoff::Owner.new(name: :monolith, store: Object.new, admission: monolith_admission,
                                                settle: nil, drain: nil)
     unfenced = Timekeeping::Handoff::Owner.new(name: :timekeeping, store:, admission: nil, settle: nil, drain: nil)
