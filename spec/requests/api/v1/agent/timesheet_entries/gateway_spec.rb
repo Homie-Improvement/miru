@@ -28,15 +28,6 @@ RSpec.describe "Api::V1::Agent::TimesheetEntries through the entry gateway", typ
     fake.register_agent(id: colleague_agent.id, company_id: company.id, user_id: colleague.id)
   end
 
-  def forwarded_create_request
-    fake.requests.find { |request| request[:method] == "POST" }
-  end
-
-  def forwarded_token_claims(request)
-    Timekeeping::UserToken.verify(request[:headers]["Authorization"].delete_prefix("Bearer "),
-                                  public_key: timekeeping_key_pair.public_key)
-  end
-
   # "The forwarded agent token names the authenticated agent and the agent's user as actor"
   # "The forwarded agent token carries `agent_id` equal to the current agent and `sub` equal to the agent's user."
   # "The agent writer's context carries the authenticated agent, so its token is minted with `agent:` set to it, and `UserToken`'s AgentMismatchError check applies."
@@ -52,13 +43,14 @@ RSpec.describe "Api::V1::Agent::TimesheetEntries through the entry gateway", typ
     }, headers: agent_headers
 
     expect(response).to have_http_status(:ok)
-    create_request = forwarded_create_request
+    create_request = fake.requests.find { |request| request[:method] == "POST" }
     expect(create_request).not_to be_nil
     expect(create_request[:path]).to eq("/v1/companies/#{company.id}/entries")
     expect(create_request[:body]).to include("agent_id" => agent.id, "user_id" => user.id)
     expect(create_request[:body]).not_to have_key("review_status")
 
-    claims = forwarded_token_claims(create_request)
+    claims = Timekeeping::UserToken.verify(create_request[:headers]["Authorization"].delete_prefix("Bearer "),
+                                           public_key: timekeeping_key_pair.public_key)
     expect(claims.agent_id).to eq(agent.id)
     expect(claims.user_id).to eq(user.id)
     expect(claims.company_id).to eq(company.id)

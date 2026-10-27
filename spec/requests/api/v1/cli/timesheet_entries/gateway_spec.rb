@@ -34,11 +34,6 @@ RSpec.describe "Api::V1::Cli::TimesheetEntries through the entry gateway", type:
       fake.requests.count { |request| request[:method] == method }
     end
 
-    # A DELETE marked `Idempotency-Replay: only` asks Timekeeping to replay an earlier receipt and writes nothing.
-    def cli_non_replay_delete_count
-      fake.requests.count { |request| request[:method] == "DELETE" && request[:headers]["Idempotency-Replay"] != "only" }
-    end
-
     # An admin would pass a company-wide lookup, so for that row only the own-entries scope can refuse the
     # colleague's entry. Each row first edits the caller's own entry, so the scope must tell the two apart
     # within one session.
@@ -72,12 +67,11 @@ RSpec.describe "Api::V1::Cli::TimesheetEntries through the entry gateway", type:
           expect(fake.outbox.size).to eq(outbox_before)
           expect(fake.stored_entry(colleague_entry_id)).to include("note" => "Colleague's work", "duration" => 60.0)
 
+          # Counting every DELETE also rules out a replay-only DELETE (`Idempotency-Replay: only`).
           deletes_before = cli_write_count("DELETE")
-          non_replay_deletes_before = cli_non_replay_delete_count
           send_request :delete, api_v1_cli_timesheet_entry_path(colleague_entry_id), headers: cli_headers
 
           expect(response).to have_http_status(:not_found)
-          expect(cli_non_replay_delete_count).to eq(non_replay_deletes_before)
           expect(cli_write_count("DELETE")).to eq(deletes_before)
           expect(fake.outbox.size).to eq(outbox_before)
           expect(fake.stored_entry(colleague_entry_id)).to include("note" => "Colleague's work", "duration" => 60.0,
