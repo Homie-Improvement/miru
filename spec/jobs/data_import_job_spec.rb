@@ -53,11 +53,11 @@ RSpec.describe DataImportJob, type: :job do
     end
   end
   let(:tenant_project) { create(:project, billable: true, client: create(:client, company: tenant_company, name: "Acme LLC"), name: "Website") }
-  let(:tenant_base_url) { "http://timekeeping.test" }
   let(:tenant_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
   let(:tenant_import) { create(:data_import, company: tenant_company, user: tenant_actor, dry_run: false) }
 
   # "A forwarded import run by DataImportJob with no request context writes under the data import's company and user"
+  # "A forwarded import through DataImportJob, with Current.user and Current.company unset, creates entries under the data import's company."
   it "a forwarded import run with no request context sends every entry create to the data import's own company" do
     # A second company with the same client, project and user names must never be addressed.
     other_client = create(:client, company: other_company, name: "Acme LLC")
@@ -66,13 +66,9 @@ RSpec.describe DataImportJob, type: :job do
                                current_workspace_id: other_company.id)
     create(:employment, company: other_company, user: other_paul)
 
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
-    tenant_fake.generation = 2
-    tenant_fake.register_company(id: tenant_company.id, edit_days: tenant_company.timesheet_edit_days)
-    tenant_fake.register_user(id: tenant_actor.id, company_id: tenant_company.id, role: "admin")
-    tenant_fake.register_user(id: tenant_paul.id, company_id: tenant_company.id, role: "employee")
-    tenant_fake.register_project(id: tenant_project.id, company_id: tenant_company.id)
-    route_timekeeping_to_fake(tenant_fake, base_url: tenant_base_url)
+    arrange_forwarded_timekeeping(tenant_fake, company: tenant_company,
+                                               users: { tenant_actor => "admin", tenant_paul => "employee" },
+                                               project: tenant_project)
 
     tenant_import.file.attach(io: StringIO.new(<<~CSV), filename: "harvest.csv", content_type: "text/csv")
       Date,Client,Project,Hours,First Name,Last Name
@@ -84,18 +80,17 @@ RSpec.describe DataImportJob, type: :job do
     expect(Current.user).to be_nil
     expect(Current.company).to be_nil
 
-    with_timekeeping_env(
-      Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem,
-      Timekeeping::EntryApiClient::BASE_URL_ENV => tenant_base_url
-    ) do
-      described_class.perform_now(tenant_import.id)
-    end
+    expect do
+      with_forwarded_timekeeping_env { described_class.perform_now(tenant_import.id) }
+    end.not_to change(TimesheetEntry, :count)
 
     creates = tenant_fake.requests.select { |request| request[:method] == "POST" }
     expect(creates.size).to eq(2)
     expect(creates.pluck(:path)).to all(eq("/v1/companies/#{tenant_company.id}/entries"))
     expect(creates.map { |request| request[:body]["user_id"] }).to all(eq(tenant_paul.id))
     expect(creates.map { |request| request[:body]["project_id"] }).to all(eq(tenant_project.id))
+    expect(creates.map { |request| request[:body]["source"] }).to all(eq("import"))
+    expect(creates.map { |request| request[:body]["source_metadata"] }).to all(eq("tool" => "harvest"))
     expect(tenant_fake.requests.pluck(:path)).not_to include(a_string_including("/companies/#{other_company.id}/"))
     expect(TimesheetEntry.where(company_id: other_company.id)).to be_empty
     expect(tenant_import.reload).to have_attributes(status: "completed", imported_rows: 2, failed_rows: 0)
@@ -137,100 +132,42 @@ RSpec.describe DataImportJob, type: :job do
 end
 
 RSpec.describe DataImportJob, type: :job do
-  let(:left_company) { create(:company) }
-  let(:left_actor) do
-    create(:user, current_workspace_id: left_company.id).tap do |user|
-      create(:employment, company: left_company, user:).discard!
+  let(:shared_left_company) { create(:company) }
+  let(:shared_left_actor) do
+    create(:user, current_workspace_id: shared_left_company.id).tap do |user|
+      create(:employment, company: shared_left_company, user:).discard!
     end
   end
-  let(:left_paul) do
-    create(:user, first_name: "Paul", last_name: "Connors", email: "left-paul@example.com",
-                  current_workspace_id: left_company.id).tap do |user|
-      create(:employment, company: left_company, user:)
+  let(:shared_left_paul) do
+    create(:user, first_name: "Paul", last_name: "Connors", email: "shared-left-paul@example.com",
+                  current_workspace_id: shared_left_company.id).tap do |user|
+      create(:employment, company: shared_left_company, user:)
     end
   end
-  let(:left_base_url) { "http://timekeeping.test" }
-  let(:left_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-  let(:left_import) { create(:data_import, company: left_company, user: left_actor, dry_run: false) }
+  let(:shared_left_project) do
+    create(:project, billable: true, client: create(:client, company: shared_left_company, name: "Acme LLC"), name: "Website")
+  end
+  let(:shared_left_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+  let(:shared_left_import) { create(:data_import, company: shared_left_company, user: shared_left_actor, dry_run: false) }
 
   # "`UserToken.mint` re-checks that this user is employed in the company when the job runs, and raises otherwise, which fails the job visibly."
-  it "a forwarded import whose user has left the company fails the job and sends no entry create" do
-    project = create(:project, billable: true, client: create(:client, company: left_company, name: "Acme LLC"), name: "Website")
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
-    left_fake.generation = 2
-    left_fake.register_company(id: left_company.id, edit_days: left_company.timesheet_edit_days)
-    left_fake.register_user(id: left_paul.id, company_id: left_company.id, role: "employee")
-    left_fake.register_project(id: project.id, company_id: left_company.id)
-    route_timekeeping_to_fake(left_fake, base_url: left_base_url)
-    left_import.file.attach(io: StringIO.new(<<~CSV), filename: "harvest.csv", content_type: "text/csv")
+  # The actor has left the company, so only paul is passed to the shared setup; the helper spec checks
+  # that it registers exactly the users it is given.
+  it "a forwarded job on the shared setup whose actor has left the company registers only paul, fails, and sends no entry create" do
+    arrange_forwarded_timekeeping(shared_left_fake, company: shared_left_company,
+                                                    users: { shared_left_paul => "employee" },
+                                                    project: shared_left_project)
+    shared_left_import.file.attach(io: StringIO.new(<<~CSV), filename: "harvest.csv", content_type: "text/csv")
       Date,Client,Project,Hours,First Name,Last Name
       2026-01-01,Acme LLC,Website,1,Paul,Connors
     CSV
 
-    with_timekeeping_env(
-      Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem,
-      Timekeeping::EntryApiClient::BASE_URL_ENV => left_base_url
-    ) do
-      expect { described_class.perform_now(left_import.id) }.to raise_error(StandardError)
+    with_forwarded_timekeeping_env do
+      expect { described_class.perform_now(shared_left_import.id) }.to raise_error(StandardError)
     end
 
-    expect(left_fake.requests.select { |request| request[:method] == "POST" }).to be_empty
-    expect(left_import.reload).to have_attributes(status: "failed", imported_rows: 0, failed_rows: 0)
-  end
-end
-
-RSpec.describe DataImportJob, type: :job do
-  let(:job_fwd_company) { create(:company) }
-  let(:job_fwd_actor) { create(:user, current_workspace_id: job_fwd_company.id) }
-  let(:job_fwd_paul) do
-    create(:user, first_name: "Paul", last_name: "Connors", email: "job-fwd-paul@example.com",
-                  current_workspace_id: job_fwd_company.id)
-  end
-  let(:job_fwd_project) do
-    create(:project, name: "Website", billable: true, client: create(:client, company: job_fwd_company, name: "Acme LLC"))
-  end
-  let(:job_fwd_base_url) { "http://timekeeping.test" }
-  let(:job_fwd_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-  let(:job_fwd_import) { create(:data_import, company: job_fwd_company, user: job_fwd_actor) }
-
-  before do
-    create(:employment, company: job_fwd_company, user: job_fwd_actor)
-    job_fwd_actor.add_role :admin, job_fwd_company
-    create(:employment, company: job_fwd_company, user: job_fwd_paul)
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
-    job_fwd_fake.generation = 2
-    job_fwd_fake.register_company(id: job_fwd_company.id, edit_days: job_fwd_company.timesheet_edit_days)
-    job_fwd_fake.register_user(id: job_fwd_actor.id, company_id: job_fwd_company.id, role: "admin")
-    job_fwd_fake.register_user(id: job_fwd_paul.id, company_id: job_fwd_company.id, role: "employee")
-    job_fwd_fake.register_project(id: job_fwd_project.id, company_id: job_fwd_company.id)
-    route_timekeeping_to_fake(job_fwd_fake, base_url: job_fwd_base_url)
-    job_fwd_import.file.attach(io: StringIO.new(<<~CSV), filename: "harvest.csv", content_type: "text/csv")
-      Date,Client,Project,Hours,First Name,Last Name,Billable?,Invoiced?
-      2026-01-05,Acme LLC,Website,1,Paul,Connors,Yes,No
-      2026-01-06,Acme LLC,Website,2,Paul,Connors,Yes,No
-    CSV
-  end
-
-  # "A forwarded import through DataImportJob, with Current.user and Current.company unset, creates entries under the data import's company."
-  it "forwards each imported row once under the data import's company with no request context" do
-    Current.reset
-    expect(Current.user).to be_nil
-    expect(Current.company).to be_nil
-
-    expect do
-      with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, job_fwd_base_url) do
-        with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
-          described_class.perform_now(job_fwd_import.id)
-        end
-      end
-    end.not_to change(TimesheetEntry, :count)
-
-    creates = job_fwd_fake.requests.select { |request| request[:method] == "POST" }
-    expect(creates.size).to eq(2)
-    expect(creates.pluck(:path).uniq).to eq(["/v1/companies/#{job_fwd_company.id}/entries"])
-    expect(creates.map { |request| request[:body]["user_id"] }).to all(eq(job_fwd_paul.id))
-    expect(creates.map { |request| request[:body]["source"] }).to all(eq("import"))
-    expect(creates.map { |request| request[:body]["source_metadata"] }).to all(eq("tool" => "harvest"))
-    expect(job_fwd_import.reload).to have_attributes(status: "completed", imported_rows: 2, failed_rows: 0)
+    expect(TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)).to have_attributes(owner: "timekeeping", generation: 2)
+    expect(shared_left_fake.requests.select { |request| request[:method] == "POST" }).to be_empty
+    expect(shared_left_import.reload).to have_attributes(status: "failed", imported_rows: 0, failed_rows: 0)
   end
 end

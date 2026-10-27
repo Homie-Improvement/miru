@@ -450,13 +450,10 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   let(:fwd_paul) { create(:user, first_name: "Paul", last_name: "Connors", email: "paul.fwd@example.com", current_workspace_id: fwd_company.id) }
   let(:fwd_project) { create(:project, name: "Website", billable: true, client: create(:client, company: fwd_company, name: "Acme LLC")) }
   let(:fwd_import) { create(:data_import, company: fwd_company, user: fwd_actor, options: {}) }
-  let(:fwd_base_url) { "http://timekeeping.test" }
   let(:fwd_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
 
   around do |example|
-    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, fwd_base_url) do
-      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
-    end
+    with_forwarded_timekeeping_env { example.run }
   end
 
   before do
@@ -464,13 +461,9 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     fwd_actor.add_role :admin, fwd_company
     create(:employment, company: fwd_company, user: fwd_paul)
     fwd_paul.add_role :employee, fwd_company
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
-    fwd_fake.generation = 2
-    fwd_fake.register_company(id: fwd_company.id, edit_days: fwd_company.timesheet_edit_days)
-    fwd_fake.register_user(id: fwd_actor.id, company_id: fwd_company.id, role: "admin")
-    fwd_fake.register_user(id: fwd_paul.id, company_id: fwd_company.id, role: "employee")
-    fwd_fake.register_project(id: fwd_project.id, company_id: fwd_company.id)
-    route_timekeeping_to_fake(fwd_fake, base_url: fwd_base_url)
+    arrange_forwarded_timekeeping(fwd_fake, company: fwd_company,
+                                            users: { fwd_actor => "admin", fwd_paul => "employee" },
+                                            project: fwd_project)
     fwd_import.file.attach(io: StringIO.new(<<~CSV), filename: "harvest.csv", content_type: "text/csv")
       Date,Client,Project,Hours,First Name,Last Name,Billable?,Invoiced?,Notes
       2026-01-05,Acme LLC,Website,1.5,Paul,Connors,Yes,No,first row
@@ -505,6 +498,14 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     expect(keys_by_note["first row"]).to eq(first_run_keys)
     expect(keys_by_note["second row"].size).to eq(1)
     expect(keys_by_note["second row"]).not_to eq(keys_by_note["first row"])
+
+    # Grouping by note hides how many creates the rerun sent and in what order, so check its own creates too.
+    rerun_posts = posts.drop(first_run_keys.size)
+    rerun_keys = rerun_posts.map { |request| request[:headers]["Idempotency-Key"] }
+    expect(rerun_keys.size).to eq(2)
+    expect(rerun_keys.uniq.size).to eq(2)
+    expect(rerun_keys.first).to eq(first_run_keys.first)
+    expect(rerun_posts.map { |request| request[:body]["note"] }).to eq(["first row", "second row"])
 
     stored_entry_ids = fwd_fake.outbox.map { |row| row["entry"]["id"] }.uniq
     expect(stored_entry_ids.size).to eq(2)
@@ -584,17 +585,20 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
 end
 
 RSpec.describe Imports::HarvestTimeEntriesImporter do
-  let(:legacy_company) { create(:company, base_currency: "INR", date_format: "MM-DD-YYYY") }
-  let(:legacy_actor) { create(:user, current_workspace_id: legacy_company.id) }
-  let(:legacy_paul) { create(:user, first_name: "Paul", last_name: "Connors", email: "paul.legacy@example.com", current_workspace_id: legacy_company.id) }
-  let(:legacy_import) { create(:data_import, company: legacy_company, user: legacy_actor, options: {}) }
+  let(:fold_gen_company) { create(:company, base_currency: "INR", date_format: "MM-DD-YYYY") }
+  let(:fold_gen_actor) { create(:user, current_workspace_id: fold_gen_company.id) }
+  let(:fold_gen_paul) do
+    create(:user, first_name: "Paul", last_name: "Connors", email: "fold-gen-paul@example.com",
+                  current_workspace_id: fold_gen_company.id)
+  end
+  let(:fold_gen_import) { create(:data_import, company: fold_gen_company, user: fold_gen_actor, options: {}) }
 
   before do
-    create(:employment, company: legacy_company, user: legacy_actor)
-    legacy_actor.add_role :admin, legacy_company
-    create(:employment, company: legacy_company, user: legacy_paul)
-    create(:project, name: "Website", billable: true, client: create(:client, company: legacy_company, name: "Acme LLC"))
-    legacy_import.file.attach(io: StringIO.new(<<~CSV), filename: "harvest.csv", content_type: "text/csv")
+    create(:employment, company: fold_gen_company, user: fold_gen_actor)
+    fold_gen_actor.add_role :admin, fold_gen_company
+    create(:employment, company: fold_gen_company, user: fold_gen_paul)
+    create(:project, name: "Website", billable: true, client: create(:client, company: fold_gen_company, name: "Acme LLC"))
+    fold_gen_import.file.attach(io: StringIO.new(<<~CSV), filename: "harvest.csv", content_type: "text/csv")
       Date,Client,Project,Hours,First Name,Last Name,Billable?,Invoiced?,Notes
       2026-01-05,Acme LLC,Website,1,Paul,Connors,Yes,No,same work
       2026-01-05,Acme LLC,Website,1,Paul,Connors,Yes,No,same work
@@ -602,7 +606,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   end
 
   # "A generation change or handoff partway through an import fails the job visibly and is not counted as a failed or skipped row"
-  it "a legacy import whose generation changes after its first row fails, stores one imported row, counts nothing failed or skipped, and a rerun writes only the second identical row" do
+  it "a legacy import of two identical rows whose generation changes after the first row fails, counts nothing failed or skipped, stores one entry for the user, and a rerun writes only the second identical row" do
     calls = 0
     allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_wrap_original do |original, *args, **kwargs|
       result = original.call(*args, **kwargs)
@@ -611,17 +615,19 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
       result
     end
 
-    expect { described_class.new(legacy_import).process }.to raise_error(Timekeeping::Gateway::StaleGeneration)
+    expect { described_class.new(fold_gen_import).process }.to raise_error(Timekeeping::Gateway::StaleGeneration)
 
-    expect(TimesheetEntry.where(user: legacy_paul, note: "same work").count).to eq(1)
-    expect(legacy_import.reload).to have_attributes(status: "failed", imported_rows: 1, failed_rows: 0, skipped_rows: 0)
-    expect(legacy_import.row_errors).to be_empty
+    # Counts every entry for the user, not only the matching note, so a stray extra write also fails.
+    expect(TimesheetEntry.where(user: fold_gen_paul).count).to eq(1)
+    expect(TimesheetEntry.where(user: fold_gen_paul, note: "same work").count).to eq(1)
+    expect(fold_gen_import.reload).to have_attributes(status: "failed", imported_rows: 1, failed_rows: 0, skipped_rows: 0)
+    expect(fold_gen_import.row_errors).to eq([])
 
-    described_class.new(legacy_import.reload).process
+    described_class.new(fold_gen_import.reload).process
 
     # Both identical rows end up stored once each: the rerun skips the row already written and writes the other.
-    expect(TimesheetEntry.where(user: legacy_paul, note: "same work", source: "import").count).to eq(2)
-    expect(legacy_import.reload).to have_attributes(status: "completed", failed_rows: 0)
+    expect(TimesheetEntry.where(user: fold_gen_paul, note: "same work", source: "import").count).to eq(2)
+    expect(fold_gen_import.reload).to have_attributes(status: "completed", failed_rows: 0)
   end
 end
 
@@ -635,7 +641,6 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   let(:billed_fwd_project) do
     create(:project, name: "Website", billable: true, client: create(:client, company: billed_fwd_company, name: "Acme LLC"))
   end
-  let(:billed_fwd_base_url) { "http://timekeeping.test" }
   let(:billed_fwd_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
   let(:billed_fwd_import) { create(:data_import, company: billed_fwd_company, user: billed_fwd_actor) }
 
@@ -643,13 +648,9 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     create(:employment, company: billed_fwd_company, user: billed_fwd_actor)
     billed_fwd_actor.add_role :admin, billed_fwd_company
     create(:employment, company: billed_fwd_company, user: billed_fwd_paul)
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
-    billed_fwd_fake.generation = 2
-    billed_fwd_fake.register_company(id: billed_fwd_company.id, edit_days: billed_fwd_company.timesheet_edit_days)
-    billed_fwd_fake.register_user(id: billed_fwd_actor.id, company_id: billed_fwd_company.id, role: "admin")
-    billed_fwd_fake.register_user(id: billed_fwd_paul.id, company_id: billed_fwd_company.id, role: "employee")
-    billed_fwd_fake.register_project(id: billed_fwd_project.id, company_id: billed_fwd_company.id)
-    route_timekeeping_to_fake(billed_fwd_fake, base_url: billed_fwd_base_url)
+    arrange_forwarded_timekeeping(billed_fwd_fake, company: billed_fwd_company,
+                                                   users: { billed_fwd_actor => "admin", billed_fwd_paul => "employee" },
+                                                   project: billed_fwd_project)
     billed_fwd_import.file.attach(io: StringIO.new(<<~CSV), filename: "harvest.csv", content_type: "text/csv")
       Date,Client,Project,Hours,First Name,Last Name,Billable?,Invoiced?
       2026-01-06,Acme LLC,Website,2,Paul,Connors,Yes,Yes
@@ -658,159 +659,12 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
 
   # "Forwarded, it is one create with `bill_status: "billed"`."
   it "forwards a billed Harvest row as exactly one create carrying billed" do
-    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, billed_fwd_base_url) do
-      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
-        described_class.new(billed_fwd_import).process
-      end
-    end
+    with_forwarded_timekeeping_env { described_class.new(billed_fwd_import).process }
 
     expect(billed_fwd_fake.requests.pluck(:method)).to eq(["POST"])
     expect(billed_fwd_fake.requests.first[:body]["bill_status"]).to eq("billed")
     expect(billed_fwd_import.reload).to have_attributes(status: "completed", imported_rows: 1, failed_rows: 0)
     expect(billed_fwd_import.row_errors).to eq([])
-  end
-end
-
-RSpec.describe Imports::HarvestTimeEntriesImporter do
-  let(:rerun_company) { create(:company) }
-  let(:rerun_actor) { create(:user, current_workspace_id: rerun_company.id) }
-  let(:rerun_paul) do
-    create(:user, first_name: "Paul", last_name: "Connors", email: "rerun-paul@example.com",
-                  current_workspace_id: rerun_company.id)
-  end
-  let(:rerun_project) do
-    create(:project, name: "Website", billable: true, client: create(:client, company: rerun_company, name: "Acme LLC"))
-  end
-  let(:rerun_base_url) { "http://timekeeping.test" }
-  let(:rerun_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-  let(:rerun_import) { create(:data_import, company: rerun_company, user: rerun_actor) }
-
-  before do
-    create(:employment, company: rerun_company, user: rerun_actor)
-    rerun_actor.add_role :admin, rerun_company
-    create(:employment, company: rerun_company, user: rerun_paul)
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
-    rerun_fake.generation = 2
-    rerun_fake.register_company(id: rerun_company.id, edit_days: rerun_company.timesheet_edit_days)
-    rerun_fake.register_user(id: rerun_actor.id, company_id: rerun_company.id, role: "admin")
-    rerun_fake.register_user(id: rerun_paul.id, company_id: rerun_company.id, role: "employee")
-    rerun_fake.register_project(id: rerun_project.id, company_id: rerun_company.id)
-    route_timekeeping_to_fake(rerun_fake, base_url: rerun_base_url)
-    rerun_import.file.attach(io: StringIO.new(<<~CSV), filename: "harvest.csv", content_type: "text/csv")
-      Date,Client,Project,Hours,First Name,Last Name,Billable?,Invoiced?
-      2026-01-05,Acme LLC,Website,1,Paul,Connors,Yes,No
-      2026-01-06,Acme LLC,Website,2,Paul,Connors,Yes,No
-    CSV
-  end
-
-  # "Forwarded writes use an `Idempotency-Key` built from the data import id and a digest of the row, so rerunning a failed import does not duplicate rows it already forwarded."
-  it "reruns a failed forwarded import with the same Idempotency-Key per row and distinct keys across rows" do
-    bumped = false
-    allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_wrap_original do |original, *args, **kwargs|
-      result = original.call(*args, **kwargs)
-      unless bumped
-        bumped = true
-        TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(generation: 3)
-        rerun_fake.generation = 3
-      end
-      result
-    end
-
-    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, rerun_base_url) do
-      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
-        expect { described_class.new(rerun_import).process }.to raise_error(Timekeeping::Gateway::StaleGeneration)
-        first_run_keys = rerun_fake.requests.filter_map { |r| r[:headers]["Idempotency-Key"] if r[:method] == "POST" }
-        expect(first_run_keys.size).to eq(1)
-
-        described_class.new(rerun_import.reload).process
-
-        all_keys = rerun_fake.requests.filter_map { |r| r[:headers]["Idempotency-Key"] if r[:method] == "POST" }
-        rerun_keys = all_keys.drop(first_run_keys.size)
-        expect(rerun_keys.size).to eq(2)
-        expect(rerun_keys.uniq.size).to eq(2)
-        expect(rerun_keys.first).to eq(first_run_keys.first)
-      end
-    end
-
-    expect(rerun_import.reload).to have_attributes(status: "completed", failed_rows: 0)
-  end
-end
-
-RSpec.describe Imports::HarvestTimeEntriesImporter do
-  let(:gen_company) { create(:company) }
-  let(:gen_actor) { create(:user, current_workspace_id: gen_company.id) }
-  let(:gen_paul) do
-    create(:user, first_name: "Paul", last_name: "Connors", email: "gen-paul@example.com", current_workspace_id: gen_company.id)
-  end
-  let(:gen_import) { create(:data_import, company: gen_company, user: gen_actor) }
-
-  before do
-    create(:employment, company: gen_company, user: gen_actor)
-    create(:employment, company: gen_company, user: gen_paul)
-    gen_import.file.attach(io: StringIO.new(<<~CSV), filename: "harvest.csv", content_type: "text/csv")
-      Date,Client,Project,Hours,First Name,Last Name
-      2026-01-05,Acme LLC,Website,1,Paul,Connors
-      2026-01-06,Acme LLC,Website,2,Paul,Connors
-    CSV
-  end
-
-  # "A generation change or handoff partway through an import fails the job visibly and is not counted as a failed or skipped row"
-  it "fails the import when the generation is bumped between two rows without counting a failed row" do
-    bumped = false
-    allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_wrap_original do |original, *args, **kwargs|
-      result = original.call(*args, **kwargs)
-      unless bumped
-        bumped = true
-        ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
-        ownership.update_columns(generation: ownership.generation + 1)
-      end
-      result
-    end
-
-    expect { described_class.new(gen_import).process }.to raise_error(Timekeeping::Gateway::StaleGeneration)
-
-    expect(gen_import.reload).to have_attributes(status: "failed", failed_rows: 0, skipped_rows: 0, imported_rows: 1)
-    expect(gen_import.row_errors).to eq([])
-    expect(TimesheetEntry.where(user: gen_paul).count).to eq(1)
-  end
-end
-
-RSpec.describe Imports::HarvestTimeEntriesImporter do
-  let(:handoff_company) { create(:company) }
-  let(:handoff_actor) { create(:user, current_workspace_id: handoff_company.id) }
-  let(:handoff_paul) do
-    create(:user, first_name: "Paul", last_name: "Connors", email: "handoff-paul@example.com",
-                  current_workspace_id: handoff_company.id)
-  end
-  let(:handoff_import) { create(:data_import, company: handoff_company, user: handoff_actor) }
-
-  before do
-    create(:employment, company: handoff_company, user: handoff_actor)
-    create(:employment, company: handoff_company, user: handoff_paul)
-    handoff_import.file.attach(io: StringIO.new(<<~CSV), filename: "harvest.csv", content_type: "text/csv")
-      Date,Client,Project,Hours,First Name,Last Name
-      2026-01-05,Acme LLC,Website,1,Paul,Connors
-      2026-01-06,Acme LLC,Website,2,Paul,Connors
-    CSV
-  end
-
-  # "handoff_step set partway through raises OwnershipMoving."
-  it "raises OwnershipMoving when handoff_step is set partway through an import" do
-    handed_off = false
-    allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_wrap_original do |original, *args, **kwargs|
-      result = original.call(*args, **kwargs)
-      unless handed_off
-        handed_off = true
-        TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(handoff_step: "close_admission")
-      end
-      result
-    end
-
-    expect { described_class.new(handoff_import).process }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
-
-    expect(handoff_import.reload).to have_attributes(status: "failed", failed_rows: 0, skipped_rows: 0)
-    expect(handoff_import.row_errors).to eq([])
-    expect(TimesheetEntry.where(user: handoff_paul).count).to eq(1)
   end
 end
 
@@ -929,39 +783,38 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
 end
 
 RSpec.describe Imports::HarvestTimeEntriesImporter do
-  let(:handoff_company) { create(:company, base_currency: "INR", date_format: "MM-DD-YYYY") }
-  let(:handoff_actor) { create(:user, current_workspace_id: handoff_company.id) }
-  let(:handoff_paul) do
-    create(:user, first_name: "Paul", last_name: "Connors", email: "paul@example.com", current_workspace_id: handoff_company.id)
+  let(:fold_handoff_company) { create(:company, base_currency: "INR", date_format: "MM-DD-YYYY") }
+  let(:fold_handoff_actor) { create(:user, current_workspace_id: fold_handoff_company.id) }
+  let(:fold_handoff_paul) do
+    create(:user, first_name: "Paul", last_name: "Connors", email: "paul@example.com", current_workspace_id: fold_handoff_company.id)
   end
-  let(:handoff_jane) do
-    create(:user, first_name: "Jane", last_name: "Doe", email: "jane@example.com", current_workspace_id: handoff_company.id)
+  let(:fold_handoff_jane) do
+    create(:user, first_name: "Jane", last_name: "Doe", email: "jane@example.com", current_workspace_id: fold_handoff_company.id)
   end
-  let(:handoff_import) { create(:data_import, company: handoff_company, user: handoff_actor, options: {}) }
+  let(:fold_handoff_import) { create(:data_import, company: fold_handoff_company, user: fold_handoff_actor, options: {}) }
 
   before do
-    [handoff_actor, handoff_paul, handoff_jane].each { |user| create(:employment, company: handoff_company, user:) }
+    [fold_handoff_actor, fold_handoff_paul, fold_handoff_jane].each { |user| create(:employment, company: fold_handoff_company, user:) }
     File.open(Rails.root.join("spec/fixtures/files/harvest_detailed_time.csv")) do |file|
-      handoff_import.file.attach(io: file, filename: "harvest.csv", content_type: "text/csv")
+      fold_handoff_import.file.attach(io: file, filename: "harvest.csv", content_type: "text/csv")
     end
   end
 
   # "A generation change or handoff partway through an import fails the job visibly and is not counted as a failed or skipped row"
-  it "fails the import with OwnershipMoving when a handoff starts after the first row, without counting the refused row as failed or skipped" do
+  it "a handoff after the first row of the detailed Harvest file raises OwnershipMoving, counts nothing failed, and stores one entry for the company" do
     writes = 0
     allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_wrap_original do |original, *args, **kwargs|
       result = original.call(*args, **kwargs)
       writes += 1
-      if writes == 1
-        TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(handoff_step: "close_admission")
-      end
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(handoff_step: "close_admission") if writes == 1
       result
     end
 
-    expect { described_class.new(handoff_import).process }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
+    expect { described_class.new(fold_handoff_import).process }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
 
-    expect(handoff_import.reload).to have_attributes(status: "failed", failed_rows: 0, skipped_rows: 1, imported_rows: 1)
-    expect(handoff_import.row_errors).to be_empty
+    expect(fold_handoff_import.reload).to have_attributes(status: "failed", failed_rows: 0, skipped_rows: 1, imported_rows: 1)
+    expect(fold_handoff_import.row_errors).to be_empty
+    expect(TimesheetEntry.joins(project: :client).where(clients: { company_id: fold_handoff_company.id }).count).to eq(1)
     expect(writes).to eq(1)
   end
 end
@@ -976,32 +829,21 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     create(:project, name: "Website", billable: true, client: create(:client, company: rerun_company, name: "Acme LLC"))
   end
   let(:rerun_import) { create(:data_import, company: rerun_company, user: rerun_actor, options: {}) }
-  let(:rerun_base_url) { "http://timekeeping.test" }
   let(:rerun_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
 
   before do
     create(:employment, company: rerun_company, user: rerun_actor)
     create(:employment, company: rerun_company, user: rerun_paul)
     rerun_actor.add_role :admin, rerun_company
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
-    rerun_fake.generation = 2
-    rerun_fake.register_company(id: rerun_company.id, edit_days: rerun_company.timesheet_edit_days)
-    rerun_fake.register_user(id: rerun_actor.id, company_id: rerun_company.id, role: "admin")
-    rerun_fake.register_user(id: rerun_paul.id, company_id: rerun_company.id, role: "employee")
-    rerun_fake.register_project(id: rerun_project.id, company_id: rerun_company.id)
-    route_timekeeping_to_fake(rerun_fake, base_url: rerun_base_url)
+    arrange_forwarded_timekeeping(rerun_fake, company: rerun_company,
+                                              users: { rerun_actor => "admin", rerun_paul => "employee" },
+                                              project: rerun_project)
     # Two identical Harvest rows: the importer keeps them as two entries, told apart by line number.
     rerun_import.file.attach(io: StringIO.new(<<~CSV), filename: "harvest.csv", content_type: "text/csv")
       Date,Client,Project,Hours,First Name,Last Name,Billable?
       2026-01-05,Acme LLC,Website,1,Paul,Connors,Yes
       2026-01-05,Acme LLC,Website,1,Paul,Connors,Yes
     CSV
-  end
-
-  def rerun_with_timekeeping(&block)
-    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, rerun_base_url) do
-      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem, &block)
-    end
   end
 
   def rerun_create_keys
@@ -1019,14 +861,14 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
       original.call(*args, **kwargs)
     end
 
-    rerun_with_timekeeping do
+    with_forwarded_timekeeping_env do
       expect { described_class.new(rerun_import).process }.to raise_error(Timekeeping::EntryWriteClient::Error)
     end
     first_run_keys = rerun_create_keys
     expect(rerun_import.reload).to have_attributes(status: "failed", failed_rows: 0)
 
     fail_second_write = false
-    rerun_with_timekeeping { described_class.new(rerun_import).process }
+    with_forwarded_timekeeping_env { described_class.new(rerun_import).process }
     rerun_keys = rerun_create_keys.drop(first_run_keys.size)
 
     expect(first_run_keys.size).to eq(1)
@@ -1047,7 +889,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
       end
       result
     end
-    rerun_with_timekeeping do
+    with_forwarded_timekeeping_env do
       expect { described_class.new(rerun_import).process }.to raise_error(Timekeeping::Gateway::StaleGeneration)
     end
     expect(rerun_import.reload.attempted_rows).to include(2)
@@ -1056,7 +898,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
     ownership.update_columns(handoff_step: "close_admission")
     allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_call_original
-    rerun_with_timekeeping do
+    with_forwarded_timekeeping_env do
       expect { described_class.new(rerun_import.reload).process }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
     end
     expect(rerun_import.reload.attempted_rows).to include(2)
@@ -1064,7 +906,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     ownership.update_columns(handoff_step: nil)
     create(:timesheet_entry, project: rerun_project, user: rerun_paul, work_date: Date.new(2026, 1, 5), duration: 60,
                              note: "", bill_status: "unbilled", source: "import")
-    rerun_with_timekeeping { described_class.new(rerun_import.reload).process }
+    with_forwarded_timekeeping_env { described_class.new(rerun_import.reload).process }
 
     expect(rerun_fake.outbox.map { |event| event["entry"]["id"] }.uniq.size).to eq(2)
     expect(rerun_import.reload).to have_attributes(status: "completed", imported_rows: 1, skipped_rows: 1)
@@ -1113,7 +955,6 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   let(:drift_project) do
     create(:project, name: "Website", billable: true, client: create(:client, company: drift_company, name: "Acme LLC"))
   end
-  let(:drift_base_url) { "http://timekeeping.test" }
   let(:drift_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
   let(:drift_import) { create(:data_import, company: drift_company, user: drift_actor) }
 
@@ -1121,24 +962,14 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     create(:employment, company: drift_company, user: drift_actor)
     drift_actor.add_role :admin, drift_company
     create(:employment, company: drift_company, user: drift_paul)
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
-    drift_fake.generation = 2
-    drift_fake.register_company(id: drift_company.id, edit_days: drift_company.timesheet_edit_days)
-    drift_fake.register_user(id: drift_actor.id, company_id: drift_company.id, role: "admin")
-    drift_fake.register_user(id: drift_paul.id, company_id: drift_company.id, role: "employee")
-    drift_fake.register_project(id: drift_project.id, company_id: drift_company.id)
-    route_timekeeping_to_fake(drift_fake, base_url: drift_base_url)
+    arrange_forwarded_timekeeping(drift_fake, company: drift_company,
+                                              users: { drift_actor => "admin", drift_paul => "employee" },
+                                              project: drift_project)
     drift_import.file.attach(io: StringIO.new(<<~CSV), filename: "harvest.csv", content_type: "text/csv")
       Date,Client,Project,Hours,First Name,Last Name,Billable?
       2026-01-05,Acme LLC,Website,1,Paul,Connors,Yes
       2026-01-06,Acme LLC,Website,2,Paul,Connors,Yes
     CSV
-  end
-
-  def with_drift_timekeeping(&block)
-    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, drift_base_url) do
-      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem, &block)
-    end
   end
 
   it "keeps a row's key when the project turns non-billable before a rerun, so Timekeeping refuses it instead of storing it twice" do
@@ -1150,13 +981,13 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
       original.call(*args, **kwargs)
     end
 
-    with_drift_timekeeping do
+    with_forwarded_timekeeping_env do
       expect { described_class.new(drift_import).process }.to raise_error(Timekeeping::EntryWriteClient::Error)
     end
     first_key = drift_fake.requests.find { |request| request[:method] == "POST" }[:headers]["Idempotency-Key"]
 
     drift_project.update!(billable: false)
-    with_drift_timekeeping do
+    with_forwarded_timekeeping_env do
       expect { described_class.new(drift_import.reload).process }.to raise_error(Timekeeping::EntryWriteClient::Rejected)
     end
 
