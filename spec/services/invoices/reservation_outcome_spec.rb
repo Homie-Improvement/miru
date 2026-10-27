@@ -24,17 +24,31 @@ RSpec.describe Invoices::ReservationOutcome do
     conflict = { entry_id: 4, reason: +"on_another_invoice" }
     conflicts = [conflict]
     counts = { "billed" => 2 }
+    reason = +"unresolved_operation"
 
-    outcome = described_class.new(state: "refused", conflicts:, counts:)
+    outcome = described_class.new(state: "refused", conflicts:, counts:, reason:)
     conflict[:reason] << "_changed"
     conflicts << { entry_id: 5, reason: "not_found" }
     counts["billed"] = 9
+    reason << "_changed"
 
     expect(outcome.conflicts).to eq([{ entry_id: 4, reason: "on_another_invoice" }])
     expect(outcome.counts).to eq("billed" => 2)
+    expect(outcome.reason).to eq("unresolved_operation")
     expect(outcome.conflicts).to be_frozen
     expect(outcome.conflicts).to all(be_frozen)
     expect(outcome.counts).to be_frozen
     expect(counts).not_to be_frozen
+  end
+
+  # "A second prepare while one is prepared is retryable (`unresolved_operation`)."
+  it "carries an optional retryable reason such as unresolved_operation and defaults it to nil" do
+    retryable = described_class.new(state: "retryable", conflicts: [], counts: {}, reason: "unresolved_operation")
+    plain = described_class.new(state: "prepared", conflicts: [], counts: {})
+
+    expect(retryable.state).to eq("retryable")
+    expect(retryable.reason).to eq("unresolved_operation")
+    expect(retryable.reason).to be_frozen
+    expect(plain.reason).to be_nil
   end
 end
