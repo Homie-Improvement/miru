@@ -738,7 +738,10 @@ RSpec.describe "Api::V1::TimesheetEntry gateway tenant boundary on forwarded des
     # "Another company's user or entry gets 404."
     expect(response).to have_http_status(:not_found)
     expect(destroy_tenant_fake.stored_entry(foreign_entry_id).fetch("discarded_at")).to be_nil
-    expect(destroy_tenant_fake.requests.pluck(:method)).not_to include("DELETE")
+    # After the lookup's 404 the gateway may only ask for a stored answer: any
+    # DELETE it sends is replay-only, which can never discard an entry.
+    deletes = destroy_tenant_fake.requests.select { |request| request[:method] == "DELETE" }
+    expect(deletes.map { |request| request[:headers]["Idempotency-Replay"] }).to all(eq("only"))
   end
 end
 

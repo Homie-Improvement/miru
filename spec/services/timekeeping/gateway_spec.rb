@@ -773,7 +773,7 @@ RSpec.describe Timekeeping::Gateway do
 
       foreign_requests = replay_fake.requests.drop(requests_before_foreign)
       expect(foreign_requests).not_to be_empty
-      expect(foreign_requests.map { |request| request[:path] })
+      expect(foreign_requests.pluck(:path))
         .to all(start_with("/v1/companies/#{replay_foreign_company.id}/"))
       expect(replay_fake.stored_entry(entry_id).fetch("version")).to eq(version_after_delete)
     end

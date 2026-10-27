@@ -437,7 +437,10 @@ RSpec.describe "Entry write routes" do
   def replay_delete(company_id, entry_id, token, key:, replay_only:)
     headers = { "Authorization" => "Bearer #{token}", "Idempotency-Key" => key,
                 "Ownership-Generation" => timekeeping_arrange.current_generation.to_s }
-    headers.merge!("Idempotency-Replay" => "only", "If-Match" => "replay-only") if replay_only
+    if replay_only
+      headers["Idempotency-Replay"] = "only"
+      headers["If-Match"] = "replay-only"
+    end
     delete "/v1/companies/#{company_id}/entries/#{entry_id}", headers: headers
     response
   end
