@@ -28,6 +28,15 @@ module Invoices
       Registry.on(transaction).register(invoice)
     end
 
+    # A destroyed invoice's row is gone when the flush runs, so its status is
+    # read here, as the row stands just before the delete. The status kept
+    # from an earlier save in the same transaction may be out of date.
+    def register_destruction(invoice)
+      register(invoice)
+      transaction = outermost_joinable_transaction(invoice.class.connection)
+      Registry.on(transaction).record_status(invoice.id, Invoice.where(id: invoice.id).pick(:status))
+    end
+
     # Bills the entries the invoice's lines reference. An entry its holding
     # still lists after a line was removed stays reserved, but it is no longer
     # on the invoice, so it is not billed.
@@ -108,6 +117,12 @@ module Invoices
           registration_for(invoice, CompanyEntries.on_lines(invoice.id, invoice.company_id))
       end
 
+      def record_status(invoice_id, status)
+        return if @flushing || status.nil?
+
+        @registrations[invoice_id] = @registrations.fetch(invoice_id).with(status:)
+      end
+
       def before_committed!
         @flushing = true
         Flush.new(@registrations.values.select(&:invoice_id)).call
@@ -131,8 +146,12 @@ module Invoices
 
     # Flushes every registered invoice of one transaction. All invoice locks
     # are taken first, in id order, so the facts each decision reads cannot
-    # change under it; invoices that add entries go before those that only
-    # release, so a moved entry is never held by neither invoice.
+    # change under it. Holdings are seeded for every invoice before any
+    # entry is checked: a sent invoice that loses a line to another invoice
+    # claims that entry only through its captured set, so its holding must
+    # exist when the receiving invoice is checked. Invoices that add entries
+    # then go before those that only release, so a moved entry is never held
+    # by neither invoice.
     class Flush
       def initialize(registrations)
         @registrations = registrations.sort_by(&:invoice_id)
@@ -145,6 +164,7 @@ module Invoices
         end
 
         changes = @registrations.map { |registration| InvoiceChange.read(registration) }
+        changes.each(&:seed_holding)
         changes.sort_by.with_index { |change, index| [change.adds_entries? ? 0 : 1, index] }.each(&:apply)
       end
     end
@@ -182,9 +202,22 @@ module Invoices
         admitted_entries.any? || (@decision.present? && (@decision.fetch(:entries) - held.fetch(:entries)).any?)
       end
 
+      # Records the held set of an invoice that has no holding yet (see
+      # `held`), so a sent invoice keeps an entry after its line is removed,
+      # and the adapter sees what an operation removes.
+      def seed_holding
+        return unless @holding.nil? && registration.captured_entries.any? &&
+          (@decision || @lines != registration.captured_entries)
+
+        InvoiceEntryHolding.insert(
+          { company_id: registration.company_id, invoice_id: registration.invoice_id,
+            entry_ids: registration.captured_entries, disposition: ACTIVE },
+          unique_by: %i[company_id invoice_id]
+        )
+      end
+
       def apply
         admit if admitted_entries.any?
-        seed_holding if seed_holding?
         send_operation if @decision
       rescue OperationErrors::Refused => refusal
         report_refusal(refusal)
@@ -216,21 +249,6 @@ module Invoices
         def admit
           outcome = adapter.admit(request(entries: admitted_entries, disposition: ACTIVE))
           raise OperationErrors::Refused.new(outcome) if outcome.state == "refused"
-        end
-
-        # Recording that set lets a sent invoice keep an entry after its line
-        # is removed, and lets the adapter see what an operation removes.
-        def seed_holding?
-          @holding.nil? && registration.captured_entries.any? &&
-            (@decision || @lines != registration.captured_entries)
-        end
-
-        def seed_holding
-          InvoiceEntryHolding.insert(
-            { company_id: registration.company_id, invoice_id: registration.invoice_id,
-              entry_ids: registration.captured_entries, disposition: ACTIVE },
-            unique_by: %i[company_id invoice_id]
-          )
         end
 
         def send_operation

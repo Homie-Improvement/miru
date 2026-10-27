@@ -186,7 +186,7 @@ RSpec.describe Invoice, type: :model do
   describe "callbacks" do
     it { is_expected.to callback(:set_external_view_key).before(:validation).on(:create) }
     it { is_expected.to callback(:register_reservation_change).before(:save) }
-    it { is_expected.to callback(:register_reservation_change).before(:destroy) }
+    it { is_expected.to callback(:register_reservation_destruction).before(:destroy) }
     it { is_expected.to callback(:update_invoice_number).after(:discard) }
   end
 

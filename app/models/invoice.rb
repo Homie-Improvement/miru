@@ -64,7 +64,7 @@ class Invoice < ApplicationRecord
   # the invoice referenced before this transaction changed them; prepended on
   # destroy so it runs before the line items are destroyed.
   before_save :register_reservation_change
-  before_destroy :register_reservation_change, prepend: true
+  before_destroy :register_reservation_destruction, prepend: true
   after_create :register_reservation_change
   after_discard :update_invoice_number
   after_commit :reset_skip_line_item_total_sync
@@ -200,6 +200,10 @@ class Invoice < ApplicationRecord
 
     def register_reservation_change
       Invoices::ReservationBoundary.register(self)
+    end
+
+    def register_reservation_destruction
+      Invoices::ReservationBoundary.register_destruction(self)
     end
 
     def same_currency?

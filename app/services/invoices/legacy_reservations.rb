@@ -147,18 +147,41 @@ module Invoices
       # What the invoices of one company claim on a set of entries: the
       # holdings that list them, and the lines of kept invoices that
       # reference them.
+      #
+      # Both are read in one statement, so they come from one snapshot. A
+      # sent invoice that loses a line moves its claim from the line to a new
+      # holding in one transaction, without the entry row lock; read in two
+      # statements, that commit could fall between them and the claim would
+      # be in neither read.
       class EntryClaims
-        Holding = Struct.new(:record, :kept) do
-          delegate :invoice_id, :entry_ids, :disposition, to: :record
-
+        Holding = Data.define(:id, :invoice_id, :entry_ids, :disposition, :kept) do
           def active_and_kept? = kept && disposition == ACTIVE
         end
+
+        CLAIMS_SQL = <<~SQL.squish
+          WITH kept_invoices AS (
+            SELECT id FROM invoices WHERE company_id = :company_id AND discarded_at IS NULL
+          )
+          SELECT holdings.id AS holding_id, holdings.invoice_id, holdings.entry_ids, holdings.disposition,
+            holdings.invoice_id IN (SELECT id FROM kept_invoices) AS kept
+          FROM invoice_entry_holdings AS holdings
+          WHERE holdings.company_id = :company_id AND holdings.entry_ids && ARRAY[:entry_ids]::bigint[]
+          UNION ALL
+          SELECT NULL::bigint, lines.invoice_id, ARRAY[lines.timesheet_entry_id], NULL::varchar, TRUE
+          FROM invoice_line_items AS lines
+          WHERE lines.invoice_id IN (SELECT id FROM kept_invoices) AND lines.timesheet_entry_id IN (:entry_ids)
+          UNION ALL
+          SELECT NULL::bigint, lines.invoice_id, ARRAY[links.timesheet_entry_id], NULL::varchar, TRUE
+          FROM invoice_line_item_time_entries AS links
+          JOIN invoice_line_items AS lines ON lines.id = links.invoice_line_item_id
+          WHERE lines.invoice_id IN (SELECT id FROM kept_invoices) AND links.timesheet_entry_id IN (:entry_ids)
+          ORDER BY invoice_id
+        SQL
 
         def initialize(company_id, entry_ids)
           @company_id = company_id
           @entry_ids = entry_ids
-          @holdings = read_holdings
-          @line_references = read_line_references
+          @holdings, @line_references = read_claims
         end
 
         def held_by(invoice_id)
@@ -194,7 +217,7 @@ module Invoices
           holdings.filter_map do |holding|
             next if holding.invoice_id == invoice_id || holding.active_and_kept?
 
-            holding.record if holding.entry_ids.intersect?(taken_ids)
+            holding if holding.entry_ids.intersect?(taken_ids)
           end
         end
 
@@ -206,38 +229,20 @@ module Invoices
 
           attr_reader :company_id, :entry_ids, :holdings, :line_references
 
-          def read_holdings
-            return [] if entry_ids.empty?
+          # Returns the holdings, and entry id => ids of kept invoices whose
+          # direct or grouped lines reference it. A line row has no holding id.
+          def read_claims
+            return [[], {}] if entry_ids.empty?
 
-            records = InvoiceEntryHolding.where(company_id:)
-              .where("entry_ids && ARRAY[?]::bigint[]", entry_ids).order(:invoice_id).to_a
-            kept_ids = kept_invoices.where(id: records.map(&:invoice_id)).pluck(:id)
-            records.map { |record| Holding.new(record, kept_ids.include?(record.invoice_id)) }
-          end
-
-          # entry id => ids of kept invoices whose direct or grouped lines
-          # reference it.
-          def read_line_references
-            return {} if entry_ids.empty?
-
-            (direct_references + grouped_references)
-              .group_by(&:first)
-              .transform_values { |pairs| pairs.map(&:last).uniq.sort }
-          end
-
-          def direct_references
-            InvoiceLineItem.where(invoice_id: kept_invoices.select(:id), timesheet_entry_id: entry_ids)
-              .pluck(:timesheet_entry_id, :invoice_id)
-          end
-
-          def grouped_references
-            InvoiceLineItemTimeEntry.joins(:invoice_line_item)
-              .where(invoice_line_items: { invoice_id: kept_invoices.select(:id) }, timesheet_entry_id: entry_ids)
-              .pluck(:timesheet_entry_id, "invoice_line_items.invoice_id")
-          end
-
-          def kept_invoices
-            Invoice.where(company_id:, discarded_at: nil)
+            sql = ApplicationRecord.sanitize_sql_array([CLAIMS_SQL, { company_id:, entry_ids: }])
+            rows = ApplicationRecord.connection.select_all(sql, "Invoice entry claims").cast_values
+            holding_rows, line_rows = rows.partition(&:first)
+            holdings = holding_rows.map do |id, invoice_id, ids, disposition, kept|
+              Holding.new(id:, invoice_id:, entry_ids: ids, disposition:, kept:)
+            end
+            references = line_rows.group_by { |row| row[2].first }
+              .transform_values { |rows_for_entry| rows_for_entry.map { |row| row[1] }.uniq.sort }
+            [holdings, references]
           end
       end
   end

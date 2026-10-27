@@ -363,8 +363,11 @@ RSpec.describe Invoices::ReservationBoundary do
       InvoiceLineItem.find(line.id).update!(linked_timesheet_entry_ids: [new_entry.id])
     end.to change { boundary_flush_intents(invoice).count }.by(1)
 
-    expect(boundary_flush_intents(invoice).order(:created_at).last.desired_entry_ids).to include(new_entry.id)
+    expect(boundary_flush_intents(invoice).order(:created_at).last.desired_entry_ids).to eq([new_entry.id])
+    expect(InvoiceEntryHolding.find_by!(company_id: boundary_flush_company.id, invoice_id: invoice.id).entry_ids)
+      .to eq([new_entry.id])
     expect(new_entry.reload.locked).to be(true)
+    expect(old_entry.reload.locked).to be(false)
   end
 
   it "rolls back the line and the seeded holding when the flush fails" do
@@ -497,5 +500,97 @@ RSpec.describe Invoices::ReservationBoundary do
       .to change { InvoiceOperationIntent.where(invoice_id: invoice.id).count }.by(1)
 
     expect([direct_entry.reload.locked, grouped_entry.reload.locked]).to eq([false, false])
+  end
+end
+
+RSpec.describe Invoices::ReservationBoundary do
+  let(:historical_move_company) { create(:company) }
+  let(:historical_move_client) { create(:client, company: historical_move_company) }
+  let(:historical_move_project) { create(:project, client: historical_move_client, billable: true) }
+  let(:historical_move_user) { create(:user, current_workspace_id: historical_move_company.id) }
+
+  def historical_move_entry
+    create(:timesheet_entry, user: historical_move_user, project: historical_move_project, bill_status: "unbilled")
+  end
+
+  # A sent invoice saved before the boundary has no holding and an unlocked entry.
+  def historical_move_sent_invoice
+    create(:invoice, company: historical_move_company, client: historical_move_client, status: :sent)
+  end
+
+  def historical_move_draft
+    create(:invoice, company: historical_move_company, client: historical_move_client)
+  end
+
+  def historical_move_holding(invoice)
+    InvoiceEntryHolding.where(company_id: historical_move_company.id, invoice_id: invoice.id)
+  end
+
+  # "moving an entry-bearing line to another kept invoice is refused."
+  # The source claims the entry only through the line being moved, so its
+  # holding must be seeded before the receiving draft is checked.
+  it "refuses moving a line from a sent invoice that has no holding to a draft" do
+    entry = historical_move_entry
+    source = historical_move_sent_invoice
+    line = create(:invoice_line_item, invoice: source, timesheet_entry: entry, rate: 100, quantity: 60)
+    target = historical_move_draft
+    expect(historical_move_holding(source)).to be_empty
+
+    expect do
+      InvoiceLineItem.find(line.id).update!(invoice_id: target.id)
+    end.to raise_error(Invoices::OperationErrors::Refused)
+
+    expect(line.reload.invoice_id).to eq(source.id)
+    expect(historical_move_holding(source)).to be_empty
+    expect(entry.reload.locked).to be(false)
+  end
+
+  it "refuses moving a grouped link from a sent invoice that has no holding to a draft's line" do
+    entry = historical_move_entry
+    source = historical_move_sent_invoice
+    source_line = create(:invoice_line_item, invoice: source, timesheet_entry: nil, rate: 100, quantity: 60)
+    link = create(:invoice_line_item_time_entry, invoice_line_item: source_line, timesheet_entry: entry)
+    target_line = create(:invoice_line_item, invoice: historical_move_draft, timesheet_entry: nil, rate: 100, quantity: 60)
+    expect(historical_move_holding(source)).to be_empty
+
+    expect do
+      InvoiceLineItemTimeEntry.find(link.id).update!(invoice_line_item_id: target_line.id)
+    end.to raise_error(Invoices::OperationErrors::Refused)
+
+    expect(link.reload.invoice_line_item_id).to eq(source_line.id)
+    expect(entry.reload.locked).to be(false)
+  end
+
+  # A destroyed invoice's row is gone at the flush, so the decision must use
+  # the status the row had when it was destroyed, not the one first captured.
+  it "retains the entries of a draft that is sent and then destroyed in one transaction" do
+    entry = historical_move_entry
+    invoice = historical_move_draft
+    create(:invoice_line_item, invoice:, timesheet_entry: entry, rate: 100, quantity: 60)
+    expect(entry.reload.locked).to be(true)
+
+    ApplicationRecord.transaction do
+      Invoice.find(invoice.id).update!(status: :sent)
+      Invoice.find(invoice.id).destroy!
+    end
+
+    expect(Invoice.exists?(invoice.id)).to be(false)
+    expect(entry.reload.locked).to be(true)
+    expect(historical_move_holding(invoice).pluck(:entry_ids, :disposition)).to eq([[[entry.id], "retained"]])
+  end
+
+  # A grouped link saved on its own takes part in reservations, so it must
+  # wait like every other billing write while ownership is moving.
+  it "refuses a grouped link saved on its own while a handoff is in progress" do
+    entry = historical_move_entry
+    line = create(:invoice_line_item, invoice: historical_move_draft, timesheet_entry: nil, rate: 100, quantity: 60)
+    TimekeepingOwnership.current.update_columns(handoff_step: "freeze")
+
+    expect do
+      create(:invoice_line_item_time_entry, invoice_line_item: line, timesheet_entry: entry)
+    end.to raise_error(Timekeeping::BillingFence::OwnershipMoving)
+
+    expect(InvoiceLineItemTimeEntry.where(invoice_line_item_id: line.id)).to be_empty
+    expect(entry.reload.locked).to be(false)
   end
 end

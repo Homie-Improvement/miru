@@ -4,6 +4,35 @@
 
 require "rails_helper"
 
+# Bounded waits for the examples that race two database connections, so a
+# worker that fails or never signals ends the example with its error instead
+# of stalling the suite.
+module LegacyReservationsRaceSupport
+  RACE_WAIT_SECONDS = 10
+
+  def race_wait_for(queue, worker)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + RACE_WAIT_SECONDS
+    loop do
+      signal = queue.pop(timeout: 0.1)
+      return signal unless signal.nil?
+
+      worker.value unless worker.alive?
+      raise "timed out waiting for a race worker" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+    end
+  end
+
+  # Runs in `ensure`, after the workers were released. It never raises, so it
+  # cannot hide the example's own failure; a worker's error is read through
+  # Thread#value in the example itself.
+  def race_finish(*workers)
+    workers.compact.each do |worker|
+      worker.join(RACE_WAIT_SECONDS) || worker.kill
+    rescue StandardError
+      nil
+    end
+  end
+end
+
 RSpec.describe Invoices::LegacyReservations, committed_data: true do
   let(:redelivery_company) { create(:company) }
   let(:redelivery_client) { create(:client, company: redelivery_company) }
@@ -404,6 +433,8 @@ RSpec.describe Invoices::LegacyReservations, committed_data: true do
 end
 
 RSpec.describe Invoices::LegacyReservations, committed_data: true do
+  include LegacyReservationsRaceSupport
+
   let(:race_company) { create(:company) }
   let(:race_client) { create(:client, company: race_company) }
   let(:race_project) { create(:project, client: race_client, billable: true) }
@@ -431,39 +462,44 @@ RSpec.describe Invoices::LegacyReservations, committed_data: true do
     release_first = Queue.new
     second_pid = Queue.new
 
-    first = Thread.new do
-      ActiveRecord::Base.connection_pool.with_connection do
-        ActiveRecord::Base.transaction do
-          outcome = described_class.new.prepare(first_request)
-          # What the coordinator's settle writes in the same invoice transaction.
-          InvoiceEntryHolding.upsert(
-            { company_id: race_company.id, invoice_id: first_invoice.id, entry_ids: [entry.id], disposition: "active" },
-            unique_by: %i[company_id invoice_id]
-          )
-          first_prepared << true
-          release_first.pop
-          outcome
+    begin
+      first = Thread.new do
+        ActiveRecord::Base.connection_pool.with_connection do
+          ActiveRecord::Base.transaction do
+            outcome = described_class.new.prepare(first_request)
+            # What the coordinator's settle writes in the same invoice transaction.
+            InvoiceEntryHolding.upsert(
+              { company_id: race_company.id, invoice_id: first_invoice.id, entry_ids: [entry.id], disposition: "active" },
+              unique_by: %i[company_id invoice_id]
+            )
+            first_prepared << true
+            release_first.pop
+            outcome
+          end
         end
       end
-    end
 
-    first_prepared.pop
-    second = Thread.new do
-      ActiveRecord::Base.connection_pool.with_connection do |connection|
-        second_pid << connection.raw_connection.backend_pid
-        ActiveRecord::Base.transaction { described_class.new.prepare(second_request) }
+      race_wait_for(first_prepared, first)
+      second = Thread.new do
+        ActiveRecord::Base.connection_pool.with_connection do |connection|
+          second_pid << connection.raw_connection.backend_pid
+          ActiveRecord::Base.transaction { described_class.new.prepare(second_request) }
+        end
       end
-    end
 
-    pid = second_pid.pop
-    waited = 50.times.any? do
-      blocked = ActiveRecord::Base.connection.select_value("SELECT cardinality(pg_blocking_pids(#{pid}))").to_i.positive?
-      blocked || (sleep(0.1) && false)
-    end
-    release_first << true
+      pid = race_wait_for(second_pid, second)
+      waited = 50.times.any? do
+        blocked = ActiveRecord::Base.connection.select_value("SELECT cardinality(pg_blocking_pids(#{pid}))").to_i.positive?
+        blocked || (sleep(0.1) && false)
+      end
+      release_first << true
 
-    first_outcome = first.value
-    second_outcome = second.value
+      first_outcome = first.value
+      second_outcome = second.value
+    ensure
+      release_first << true
+      race_finish(first, second)
+    end
 
     expect(waited).to be(true)
     expect(first_outcome.state).to eq("prepared")
@@ -515,6 +551,26 @@ RSpec.describe Invoices::LegacyReservations do
     expect(after_first.first(2)).to eq([false, true])
     expect(after_first.last["applied_at"]).to be_present
     expect([removed.reload.locked, kept.reload.locked, LegacyEntryRelease.sole.attributes]).to eq(after_first)
+  end
+
+  # A release first delivered after another invoice claimed one of its
+  # entries must free only the entry nothing claims, and still count as applied.
+  it "keeps an entry a newer holding claims locked when a release is delivered for the first time" do
+    reclaimed = adapter_unit_entry(locked: true)
+    unclaimed = adapter_unit_entry(locked: true)
+    request = adapter_unit_request(700_006, [])
+    LegacyEntryRelease.create!(
+      company_id: adapter_unit_company.id, invoice_id: 700_006, operation_id: request.operation_id,
+      entry_ids: [reclaimed.id, unclaimed.id]
+    )
+    adapter_unit_hold(700_007, [reclaimed])
+
+    outcome = described_class.new.commit(request)
+
+    expect(outcome.state).to eq("committed")
+    expect([reclaimed.reload.locked, unclaimed.reload.locked]).to eq([true, false])
+    expect(LegacyEntryRelease.find_by!(company_id: adapter_unit_company.id, operation_id: request.operation_id).applied_at)
+      .to be_present
   end
 
   it "admits an unclaimed entry without writing a lock, a holding or a release" do
@@ -571,6 +627,8 @@ RSpec.describe Invoices::LegacyReservations do
 end
 
 RSpec.describe Invoices::LegacyReservations, committed_data: true do
+  include LegacyReservationsRaceSupport
+
   let(:takeover_race_company) { create(:company) }
   let(:takeover_race_client) { create(:client, company: takeover_race_company) }
   let(:takeover_race_project) { create(:project, client: takeover_race_client, billable: true) }
@@ -604,36 +662,118 @@ RSpec.describe Invoices::LegacyReservations, committed_data: true do
     release_first = Queue.new
     second_pid = Queue.new
 
-    first = Thread.new do
-      ActiveRecord::Base.connection_pool.with_connection do
-        ActiveRecord::Base.transaction do
-          outcome = described_class.new.prepare(takeover_race_request(first_successor, first_entry))
-          first_prepared << true
-          release_first.pop
-          outcome
+    begin
+      first = Thread.new do
+        ActiveRecord::Base.connection_pool.with_connection do
+          ActiveRecord::Base.transaction do
+            outcome = described_class.new.prepare(takeover_race_request(first_successor, first_entry))
+            first_prepared << true
+            release_first.pop
+            outcome
+          end
         end
       end
-    end
 
-    first_prepared.pop
-    second = Thread.new do
-      ActiveRecord::Base.connection_pool.with_connection do |connection|
-        second_pid << connection.raw_connection.backend_pid
-        ActiveRecord::Base.transaction do
-          described_class.new.prepare(takeover_race_request(second_successor, second_entry))
+      race_wait_for(first_prepared, first)
+      second = Thread.new do
+        ActiveRecord::Base.connection_pool.with_connection do |connection|
+          second_pid << connection.raw_connection.backend_pid
+          ActiveRecord::Base.transaction do
+            described_class.new.prepare(takeover_race_request(second_successor, second_entry))
+          end
         end
       end
+
+      pid = race_wait_for(second_pid, second)
+      waited = 50.times.any? do
+        blocked = ActiveRecord::Base.connection.select_value("SELECT cardinality(pg_blocking_pids(#{pid}))").to_i.positive?
+        blocked || (sleep(0.1) && false)
+      end
+      release_first << true
+      states = [first.value.state, second.value.state]
+    ensure
+      release_first << true
+      race_finish(first, second)
     end
 
-    pid = second_pid.pop
-    waited = 50.times.any? do
-      blocked = ActiveRecord::Base.connection.select_value("SELECT cardinality(pg_blocking_pids(#{pid}))").to_i.positive?
-      blocked || (sleep(0.1) && false)
-    end
-    release_first << true
-
-    expect([first.value.state, second.value.state]).to eq(%w[prepared prepared])
+    expect(states).to eq(%w[prepared prepared])
     expect(waited).to be(true)
     expect(InvoiceEntryHolding.find_by!(company_id: takeover_race_company.id, invoice_id: retired.id).entry_ids).to eq([])
+  end
+end
+
+RSpec.describe Invoices::LegacyReservations, committed_data: true do
+  include LegacyReservationsRaceSupport
+
+  let(:snapshot_company) { create(:company) }
+  let(:snapshot_client) { create(:client, company: snapshot_company) }
+  let(:snapshot_project) { create(:project, client: snapshot_client, billable: true) }
+  let(:snapshot_user) { create(:user, current_workspace_id: snapshot_company.id) }
+
+  # "a second kept invoice on the same entry fails with \"entry is on another invoice\""
+  # A sent invoice with no holding loses a line: its claim moves from the line
+  # to a seeded holding in one transaction, without the entry row lock. That
+  # transaction commits while a prepare of the same entry is reading claims.
+  # The prepare must see the claim in one form or the other, never in neither.
+  it "refuses an entry whose claim moves from a line to a holding while prepare reads the claims" do
+    entry = create(:timesheet_entry, user: snapshot_user, project: snapshot_project, bill_status: "unbilled")
+    source = create(:invoice, company: snapshot_company, client: snapshot_client, status: :sent)
+    line = create(:invoice_line_item, invoice: source, timesheet_entry: entry, rate: 100, quantity: 60)
+    taker = create(:invoice, company: snapshot_company, client: snapshot_client)
+    request = Invoices::ReservationRequest.new(
+      company_id: snapshot_company.id, invoice_id: taker.id, operation_id: SecureRandom.uuid,
+      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [entry.id]
+    )
+    removal_written = Queue.new
+    commit_removal = Queue.new
+    preparing = Queue.new
+
+    begin
+      # The writes the boundary makes when the sent invoice loses its line.
+      removal = Thread.new do
+        ActiveRecord::Base.connection_pool.with_connection do
+          ActiveRecord::Base.transaction do
+            InvoiceLineItem.where(id: line.id).delete_all
+            InvoiceEntryHolding.insert(
+              { company_id: snapshot_company.id, invoice_id: source.id, entry_ids: [entry.id], disposition: "active" },
+              unique_by: %i[company_id invoice_id]
+            )
+            removal_written << true
+            commit_removal.pop
+          end
+        end
+      end
+      race_wait_for(removal_written, removal)
+
+      prepare = Thread.new do
+        ActiveRecord::Base.connection_pool.with_connection do |connection|
+          preparing << true
+          committed_once = false
+          # After the first statement that reads holdings, let the removal commit.
+          subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
+            next if committed_once || payload[:connection] != connection || !payload[:sql].include?("invoice_entry_holdings")
+
+            committed_once = true
+            commit_removal << true
+            removal.join(LegacyReservationsRaceSupport::RACE_WAIT_SECONDS)
+          end
+          begin
+            ActiveRecord::Base.transaction { described_class.new.prepare(request) }
+          ensure
+            ActiveSupport::Notifications.unsubscribe(subscriber)
+          end
+        end
+      end
+      race_wait_for(preparing, prepare)
+      outcome = prepare.value
+    ensure
+      commit_removal << true
+      race_finish(removal, prepare)
+    end
+
+    expect(removal.value).to be(true)
+    expect(outcome.state).to eq("refused")
+    expect(outcome.conflicts).to contain_exactly(hash_including(entry_id: entry.id, reason: "on_another_invoice"))
+    expect(entry.reload.locked).to be(false)
   end
 end
