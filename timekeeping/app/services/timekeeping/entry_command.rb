@@ -12,7 +12,7 @@ module Timekeeping
   # route is one of :create, :update, :destroy, :bulk_move, :bulk_delete.
   class EntryCommand < Data.define(:route, :company_id, :actor_id, :role, :primary_role, :entry_id, :operation, :key,
                                    :fingerprint, :body, :project_id, :generation, :if_match, :facts, :today,
-                                   :replay_only)
+                                   :replay_only, :detach_fence)
     ID = /\A[0-9]{1,19}\z/
     ACTOR_TYPE = "user"
     UNBILLED = "unbilled"
@@ -76,6 +76,9 @@ module Timekeeping
 
       check_fields!(route, body)
       project_ids = [project_id].compact
+      # Read before the facts, so a detach that commits after them has a
+      # higher receipt id (Timekeeping::ServiceCommands.agent_detached?).
+      detach_fence = ServiceCommands.detach_fence
       facts = reference_client.fetch(company_id:, project_ids:)
 
       new(
@@ -83,7 +86,7 @@ module Timekeeping
         entry_id: target_id,
         operation: "#{route} #{target_id}", key:, fingerprint: Digest::SHA256.hexdigest(JSON.generate(body)),
         body:, project_id:, generation: headers["Ownership-Generation"], if_match: headers["If-Match"], facts:, today:,
-        replay_only: replay_only?(route, headers)
+        replay_only: replay_only?(route, headers), detach_fence:
       )
     rescue ReferenceClient::Unavailable
       WriteOutcome.refusal(:reference_unavailable)

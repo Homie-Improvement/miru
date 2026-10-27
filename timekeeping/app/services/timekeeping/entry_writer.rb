@@ -118,15 +118,17 @@ module Timekeeping
       # caller that timed out no longer holds its agent lock, so a detach of
       # the agent may already have run. The write takes the lock the detach
       # takes, before the admission read as the detach does, so a fence cannot
-      # leave the two waiting on each other. A detach that committed first has
-      # stored its receipt, and the write is refused; one that starts later
-      # waits for this write and then detaches its entry.
+      # leave the two waiting on each other. A detach that committed after the
+      # write's facts were read refuses the write; one that starts later waits
+      # for this write and then detaches its entry. A detach whose agent
+      # deletion rolled back is older than any facts that list the agent
+      # again, so it no longer refuses the agent's writes.
       def names_detached_agent?(command)
         agent_id = command.body["agent_id"]
         return false if agent_id.nil?
 
         ServiceCommands.lock_agent(command.company_id, agent_id)
-        ServiceCommands.agent_detached?(command.company_id, agent_id)
+        ServiceCommands.agent_detached?(command.company_id, agent_id, after: command.detach_fence)
       end
 
       def find_receipt(command)

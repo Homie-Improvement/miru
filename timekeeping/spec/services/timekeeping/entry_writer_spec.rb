@@ -321,12 +321,12 @@ RSpec.describe Timekeeping::EntryWriter, "agent ownership" do
       ))
     end
 
-    it "refuses a create naming the detached agent with not_found and writes nothing" do
+    it "refuses a create built before the detach that names the detached agent with not_found and writes nothing" do
+      command = build_entry_command(:create, token: agent_owner_token, body: agent_create_body(owners_agent))
       expect(detach_agent_in_provider(owners_agent).status).to eq(200)
       before = entry_write_counts
 
-      outcome = described_class.new.call(build_entry_command(:create, token: agent_owner_token,
-                                                                      body: agent_create_body(owners_agent)))
+      outcome = described_class.new.call(command)
 
       expect([outcome.status, JSON.parse(outcome.body)]).to eq([404, { "reason" => "not_found" }])
       expect(entry_write_counts).to eq(before)

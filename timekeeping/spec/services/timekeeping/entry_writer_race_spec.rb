@@ -305,4 +305,23 @@ RSpec.describe Timekeeping::EntryWriter, "agent create against a detach of the s
     expect(Entry.where(company_id: company, agent_id: agent)).to be_empty
     expect(Entry.count).to eq(0)
   end
+
+  # A detach whose monolith deletion rolled back leaves the agent alive. The
+  # monolith lists the agent in its facts again only once that deletion has
+  # ended, so a write built afterwards reads its fence after the detach's
+  # receipt and must be accepted, while a write built before the detach stays
+  # refused.
+  it "accepts a create built after a committed detach whose agent still exists, and still refuses one built before it" do
+    built_before = agent_create
+    detached = Timekeeping::ServiceCommands.new.call(detach_request)
+    expect(detached.status).to eq(200)
+
+    built_after = agent_create
+    late = described_class.new.call(built_before)
+    fresh = described_class.new.call(built_after)
+
+    expect([late.status, JSON.parse(late.body)]).to eq([404, { "reason" => "not_found" }])
+    expect(fresh.status).to eq(201)
+    expect(Entry.sole.agent_id).to eq(agent)
+  end
 end
