@@ -7,22 +7,13 @@ require "rails_helper"
 # A refused save records its failed intent and abort row only after the
 # outermost transaction has ended, so these examples run on committed data.
 RSpec.describe "Invoice saves under the prepared monolith owner", committed_data: true do
-  # Lines reference the timesheet_entries projection while the adapter reads
-  # the prepared entries table, so each entry exists in both under one id.
-  def prepared_save_spec_entry(company)
-    project = create(:project, client: create(:client, company:), billable: true)
-    user = create(:user, current_workspace_id: company.id)
-    row = create(:timesheet_entry, user:, project:, bill_status: "unbilled")
-    Timekeeping::LocalEntry.create!(id: row.id, company_id: company.id, user_id: user.id, project_id: project.id,
-                                    work_date: row.work_date, duration: row.duration, bill_status: "unbilled")
-    row
-  end
+  include PreparedReservationsSpecSupport
 
   # "a draft adds an entry, leaving a committed reservation row and a committed intent; a second kept invoice on that entry is refused with \"entry is on another invoice\""
   # "a refused prepare reserves nothing and leaves a failed intent with an abort row"
   it "under the prepared owner a draft gaining a line commits a reservation and its intent, and a second kept invoice on that entry is refused with a failed intent and a delivered abort row" do
     company = create(:company)
-    entry = prepared_save_spec_entry(company)
+    entry = prepared_spec_projected_entry(company)
     TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
     client = create(:client, company:)
     draft = create(:invoice, company:, client:)
@@ -62,6 +53,8 @@ RSpec.describe "Invoice saves under the prepared monolith owner", committed_data
 end
 
 RSpec.describe Invoices::PreparedReservations, "invoice discards under the prepared owner", committed_data: true do
+  include PreparedReservationsSpecSupport
+
   # "A discarded draft releases; a discarded non-draft keeps its reservations as retained"
   it "under the prepared owner a discarded draft releases its entry while a discarded sent invoice keeps its entry committed as retained" do
     company = create(:company)
@@ -69,12 +62,7 @@ RSpec.describe Invoices::PreparedReservations, "invoice discards under the prepa
     project = create(:project, client:, billable: true)
     user = create(:user, current_workspace_id: company.id)
     create(:employment, company:, user:)
-    entries = Array.new(2) do
-      entry = create(:timesheet_entry, user:, project:, bill_status: "unbilled")
-      Timekeeping::LocalEntry.create!(id: entry.id, company_id: company.id, user_id: user.id, project_id: project.id,
-                                      work_date: entry.work_date, duration: entry.duration, bill_status: "unbilled")
-      entry
-    end
+    entries = Array.new(2) { prepared_spec_projected_entry(company, user:, project:) }
     TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
     rows = lambda do |entry|
       ActiveRecord::Base.connection.select_rows(ActiveRecord::Base.sanitize_sql_array([<<~SQL.squish, company.id, entry.id]))
@@ -98,23 +86,15 @@ RSpec.describe Invoices::PreparedReservations, "invoice discards under the prepa
 end
 
 RSpec.describe Invoices::PreparedReservations, "end-to-end saves under the prepared owner", committed_data: true do
+  include PreparedReservationsSpecSupport
+
   let(:prepared_e2e_company) { create(:company) }
   let(:prepared_e2e_client) { create(:client, company: prepared_e2e_company) }
+  # Entries sit under the invoices' own client, so their lines belong on those invoices.
+  let(:prepared_e2e_project) { create(:project, client: prepared_e2e_client, billable: true) }
 
   before do
     TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
-  end
-
-  # One entry present in both the timesheet_entries projection and the
-  # prepared entries table under the same id.
-  def prepared_e2e_entry
-    company = prepared_e2e_company
-    project = create(:project, client: prepared_e2e_client, billable: true)
-    user = create(:user, current_workspace_id: company.id)
-    row = create(:timesheet_entry, user:, project:, bill_status: "unbilled")
-    Timekeeping::LocalEntry.create!(id: row.id, company_id: company.id, user_id: user.id, project_id: project.id,
-                                    work_date: row.work_date, duration: row.duration, bill_status: "unbilled")
-    row
   end
 
   def prepared_e2e_reservations(entry)
@@ -137,7 +117,7 @@ RSpec.describe Invoices::PreparedReservations, "end-to-end saves under the prepa
 
   # "A second kept invoice on the same entry fails with \"entry is on another invoice\""
   it "refuses a draft taking an entry that a sent invoice holds only through its line, and reserves nothing" do
-    entry = prepared_e2e_entry
+    entry = prepared_spec_projected_entry(prepared_e2e_company, project: prepared_e2e_project)
     sent = prepared_e2e_invoice(status: :sent)
     create(:invoice_line_item, invoice: sent, timesheet_entry: entry, rate: 100, quantity: 60)
     expect(prepared_e2e_reservations(entry)).to eq([])
@@ -161,7 +141,7 @@ RSpec.describe Invoices::PreparedReservations, "end-to-end saves under the prepa
 
   # "drops another invoice's `retained` reservation on the same entry"
   it "lets a later kept invoice claim an entry a discarded sent invoice retains, replacing the retained row" do
-    entry = prepared_e2e_entry
+    entry = prepared_spec_projected_entry(prepared_e2e_company, project: prepared_e2e_project)
     old = prepared_e2e_invoice
     create(:invoice_line_item, invoice: old, timesheet_entry: entry, rate: 100, quantity: 60)
     old.update_columns(status: Invoice.statuses.fetch("sent"))
@@ -178,8 +158,8 @@ RSpec.describe Invoices::PreparedReservations, "end-to-end saves under the prepa
 
   # "a locked change writes exactly one `entry_outbox_items` row"
   it "publishes one snapshot and one version raise for the entry a save locks, and none for an entry it keeps locked" do
-    held = prepared_e2e_entry
-    added = prepared_e2e_entry
+    held = prepared_spec_projected_entry(prepared_e2e_company, project: prepared_e2e_project)
+    added = prepared_spec_projected_entry(prepared_e2e_company, project: prepared_e2e_project)
     draft = prepared_e2e_invoice
     create(:invoice_line_item, invoice: draft, timesheet_entry: held, rate: 100, quantity: 60)
     held_version = prepared_e2e_version(held)
