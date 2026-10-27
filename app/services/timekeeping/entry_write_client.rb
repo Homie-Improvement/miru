@@ -4,9 +4,8 @@ require "net/http"
 
 module Timekeeping
   # Forwards one entry create, update or destroy, or one bulk move or bulk
-  # delete, to the Timekeeping service's
-  # entry API (contracts/timekeeping/entry_api.yml) while Timekeeping owns the
-  # entries. Every HTTP call for these routes lives here, so callers see the
+  # delete, to the Timekeeping service's entry API
+  # (contracts/timekeeping/entry_api.yml) while Timekeeping owns the entries. Every HTTP call for these routes lives here, so callers see the
   # answered entry Hash or one of the errors below, never a Net:: exception.
   #
   # The token is minted for the context's actor, never for the entry's target
