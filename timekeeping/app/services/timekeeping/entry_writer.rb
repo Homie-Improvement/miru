@@ -8,7 +8,9 @@ module Timekeeping
   # 1. Lock the receipt key and re-read the receipt: a stored answer for the
   #    same body is replayed, and a different body is idempotency_key_reused.
   #    A replay-only command with no receipt answers not_found here, before
-  #    any later step, so it can never write.
+  #    any later step, so it can never write. A write whose body names an
+  #    agent then takes that agent's detach lock, and is not_found once a
+  #    detach of the agent has committed.
   # 2. Read the admitted generation FOR SHARE; a header that is not that
   #    generation, or any header while fenced, is stale_generation. A project
   #    the reference facts do not hold for the company is not_found. Both come
@@ -78,6 +80,7 @@ module Timekeeping
         checkpoint.call(:receipt_checked)
         return answer_from(receipt, command) if receipt
         return WriteOutcome.refusal(:not_found) if command.replay_only
+        return WriteOutcome.refusal(:not_found) if names_detached_agent?(command)
 
         generation = locked_generation
         checkpoint.call(:generation_checked)
@@ -111,6 +114,23 @@ module Timekeeping
         WriteSteps.lock_key(command.company_id, EntryCommand::ACTOR_TYPE, command.actor_id, command.operation, command.key)
       end
 
+      # The agent facts were read before this transaction, and a monolith
+      # caller that timed out no longer holds its agent lock, so a detach of
+      # the agent may already have run. The write takes the lock the detach
+      # takes, before the admission read as the detach does, so a fence cannot
+      # leave the two waiting on each other. A detach that committed after the
+      # write's facts were read refuses the write; one that starts later waits
+      # for this write and then detaches its entry. A detach whose agent
+      # deletion rolled back is older than any facts that list the agent
+      # again, so it no longer refuses the agent's writes.
+      def names_detached_agent?(command)
+        agent_id = command.body["agent_id"]
+        return false if agent_id.nil?
+
+        ServiceCommands.lock_agent(command.company_id, agent_id)
+        ServiceCommands.agent_detached?(command.company_id, agent_id, after: command.detach_fence)
+      end
+
       def find_receipt(command)
         IdempotencyReceipt.find_by(company_id: command.company_id, actor_type: EntryCommand::ACTOR_TYPE,
                                    actor_id: command.actor_id, operation: command.operation, key: command.key)
@@ -142,7 +162,8 @@ module Timekeeping
         return WriteOutcome.refusal(:not_found) unless agent_owned?(command, command.body["agent_id"], user_id)
 
         entry = Entry.create!(command.entry_fields.merge(
-          "company_id" => command.company_id, "user_id" => user_id, "bill_status" => command.bill_status_default
+          "company_id" => command.company_id, "user_id" => user_id, "bill_status" => command.bill_status_default,
+          "review_status" => TimekeepingRules::EntryRules.created_review_status(agent_id: command.body["agent_id"])
         ))
         Written.new(status: 201, changes: [Change.new(entry_id: entry.id, before: nil)],
                     payload: ->(rows) { EntryPresenter.call(rows.fetch(entry.id)) })

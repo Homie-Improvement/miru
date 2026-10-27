@@ -48,7 +48,7 @@ privileged_roles: [owner, admin]
 
 request:
   entry_required_fields: [project_id, work_date, duration, note, source, source_metadata]
-  entry_optional_fields: [user_id, bill_status, agent_id, proof_url, proof_metadata]
+  entry_optional_fields: [user_id, bill_status, agent_id, proof_url, proof_metadata, external_run_id, external_session_id]
   bulk_move_fields: [entry_ids, project_id]
   bulk_delete_fields: [entry_ids]
 
@@ -70,6 +70,8 @@ response:
     - agent_id
     - proof_url
     - proof_metadata
+    - external_run_id
+    - external_session_id
     - locked
   index_fields: [entries]
   bulk_fields: [results]

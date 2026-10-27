@@ -27,13 +27,33 @@ module Timekeeping
     IDEMPOTENCY_NAMESPACE = "6f1c2c1e-5d7a-4c55-9a0e-1b9e8f3d2a41"
 
     # The fields a web or mobile write may set, the same fields the entry
-    # controller permits today. An update sends only these: source fields and
-    # user_id are left out so an edit never rewrites an entry's recorded
-    # origin or moves it to another user.
+    # controller permits today. A web or mobile update sends only these:
+    # source fields and user_id are left out so an edit never rewrites an
+    # entry's recorded origin or moves it to another user.
     EDIT_FIELDS = %w[project_id duration work_date note bill_status].freeze
 
-    # A web or mobile create records a manual entry. The contract requires
-    # both fields on create.
+    # The entry's recorded origin. The CLI writes it on create and update, as
+    # its controller always has; the agent writes it on create.
+    SOURCE_FIELDS = %w[source source_metadata].freeze
+
+    # What an agent create records about the agent and its run.
+    AGENT_FIELDS = %w[agent_id proof_url proof_metadata external_run_id external_session_id].freeze
+
+    # The fields each writer may forward, by WriteContext actor kind and
+    # operation. Anything else a caller passes, such as user_id or
+    # review_status, is never sent. A kind with no row (a service or an agent
+    # destroy) forwards no entry write at all. An import never updates; its
+    # create body comes from import_create_body, which adds the import's own
+    # source to these fields.
+    FORWARDED_FIELDS = {
+      "user" => { create: EDIT_FIELDS, update: EDIT_FIELDS },
+      "import" => { create: EDIT_FIELDS },
+      "cli" => { create: EDIT_FIELDS + SOURCE_FIELDS, update: EDIT_FIELDS + SOURCE_FIELDS },
+      "agent" => { create: EDIT_FIELDS + SOURCE_FIELDS + AGENT_FIELDS, update: EDIT_FIELDS }
+    }.transform_values(&:freeze).freeze
+
+    # The contract requires both source fields on create. A writer that does
+    # not forward its own records a manual entry.
     CREATE_SOURCE = { "source" => "manual", "source_metadata" => {} }.freeze
 
     # Asks Timekeeping to answer a DELETE only from its stored receipt
@@ -82,12 +102,18 @@ module Timekeeping
       Digest::UUID.uuid_v5(IDEMPOTENCY_NAMESPACE, "#{request_id}/#{operation}/#{entry_id || "new"}")
     end
 
-    # The create body for a web or mobile entry. user and project are records
-    # the caller already resolved inside the company, never raw params.
-    def self.create_body(user:, project:, attributes:)
-      edit_fields(attributes)
+    # The create body for the writer of actor_kind. user and project are
+    # records the caller already resolved inside the company, never raw
+    # params.
+    #
+    # Timekeeping fingerprints the body as serialized, key order included, so
+    # a retry must send its keys in the order the first attempt did. The
+    # default source keys therefore come last, as they always have, and a
+    # writer's own source values keep their place and win.
+    def self.create_body(user:, project:, attributes:, actor_kind: "user")
+      forwarded_fields(attributes, actor_kind:, operation: :create)
         .merge("project_id" => project.id, "user_id" => user.id)
-        .merge(CREATE_SOURCE.deep_dup)
+        .merge(CREATE_SOURCE.deep_dup) { |_key, given, _default| given }
     end
 
     # The create body for an imported entry. Unlike create_body, it records
@@ -100,12 +126,18 @@ module Timekeeping
         .merge(source.to_h.deep_stringify_keys.slice("source", "source_metadata"))
     end
 
-    # The EDIT_FIELDS of attributes, as sent. A form post carries every value
-    # as a string, and Timekeeping takes duration only as a JSON number, so a
-    # numeric string is sent as the Float the duration column would store. Any
-    # other duration is sent unchanged, and Timekeeping refuses it.
+    # The EDIT_FIELDS of attributes, as sent.
     def self.edit_fields(attributes)
-      fields = attributes.to_h.stringify_keys.slice(*EDIT_FIELDS)
+      forwarded_fields(attributes, actor_kind: "user", operation: :update)
+    end
+
+    # The fields of attributes the writer may forward for operation, as sent.
+    # A form post carries every value as a string, and Timekeeping takes
+    # duration only as a JSON number, so a numeric string is sent as the Float
+    # the duration column would store. Any other duration is sent unchanged,
+    # and Timekeeping refuses it.
+    def self.forwarded_fields(attributes, actor_kind:, operation:)
+      fields = attributes.to_h.stringify_keys.slice(*FORWARDED_FIELDS.fetch(actor_kind.to_s).fetch(operation))
       duration = fields["duration"]
       number = Float(duration, exception: false) if duration.is_a?(String)
       number.nil? ? fields : fields.merge("duration" => number)
@@ -121,12 +153,13 @@ module Timekeeping
                                      idempotency_key: idempotency_key || request_key(context, "create"))
     end
 
-    # Returns the updated entry Hash. Only EDIT_FIELDS of body are sent.
+    # Returns the updated entry Hash. Only the fields the context's writer may
+    # forward on update are sent.
     def update_entry(context:, generation:, entry_id:, version:, body:)
       path = format(ENTRY_PATH, company_id: context.company.id, entry_id:)
+      fields = self.class.forwarded_fields(body, actor_kind: context.actor_kind, operation: :update)
       forward(Net::HTTP::Patch, path, operation: "update", context:, generation:, version:,
-                                      idempotency_key: request_key(context, "update", entry_id),
-                                      body: self.class.edit_fields(body))
+                                      idempotency_key: request_key(context, "update", entry_id), body: fields)
     end
 
     # Returns the discarded entry Hash.

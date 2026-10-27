@@ -441,3 +441,67 @@ RSpec.describe Timekeeping::EntryWriteClient, "replay-only destroy" do
     end.to raise_error(Timekeeping::EntryWriteClient::Conflict)
   end
 end
+
+RSpec.describe Timekeeping::EntryWriteClient do
+  let(:writer_body_company) { create(:company) }
+  let(:writer_body_user) { create(:user) }
+  let(:writer_body_project) { create(:project, billable: true, client: create(:client, company: writer_body_company)) }
+  let(:writer_body_attributes) do
+    {
+      "duration" => 60, "work_date" => "2026-03-02", "note" => "Agent run", "bill_status" => "unbilled",
+      "source" => "automation", "source_metadata" => { "tool" => "claude-code" }, "agent_id" => 77,
+      "proof_url" => "https://example.test/runs/123", "proof_metadata" => { "repo" => "saeloun/miru-web" },
+      "external_run_id" => "run_123", "external_session_id" => "session_123",
+      "review_status" => "approved", "user_id" => 999_999
+    }
+  end
+
+  it "builds the agent create body with agent, proof, source and run identifiers, while the web body keeps only its own fields" do
+    agent_body = described_class.create_body(user: writer_body_user, project: writer_body_project,
+                                             attributes: writer_body_attributes, actor_kind: "agent")
+
+    # "The agent controller stores `external_run_id` and `external_session_id` today, and a forwarded write must not drop them."
+    expect(agent_body).to include(
+      "project_id" => writer_body_project.id, "user_id" => writer_body_user.id, "duration" => 60.0,
+      "work_date" => "2026-03-02", "note" => "Agent run", "source" => "automation",
+      "source_metadata" => { "tool" => "claude-code" }, "agent_id" => 77,
+      "proof_url" => "https://example.test/runs/123", "proof_metadata" => { "repo" => "saeloun/miru-web" },
+      "external_run_id" => "run_123", "external_session_id" => "session_123"
+    )
+    expect(agent_body).not_to have_key("review_status")
+
+    web_body = described_class.create_body(user: writer_body_user, project: writer_body_project,
+                                           attributes: writer_body_attributes)
+
+    # "The CLI and MCP and agent writers go through Timekeeping::Gateway and keep their routes and JSON"
+    expect(web_body["user_id"]).to eq(writer_body_user.id)
+    expect(web_body.keys).not_to include("agent_id", "proof_url", "proof_metadata", "external_run_id",
+                                         "external_session_id", "review_status")
+  end
+end
+
+RSpec.describe Timekeeping::EntryWriteClient, "create body serialization" do
+  # Timekeeping fingerprints the serialized body, so a web create retried after
+  # this change must serialize exactly as before it, source keys last.
+  it "serializes a web create body with the default source keys after project_id and user_id" do
+    user = Struct.new(:id).new(7)
+    project = Struct.new(:id).new(11)
+    attributes = { "duration" => 30.0, "work_date" => "2026-03-02", "note" => "Retry", "bill_status" => "unbilled" }
+
+    body = described_class.create_body(user:, project:, attributes:)
+
+    expect(JSON.generate(body)).to eq(
+      '{"duration":30.0,"work_date":"2026-03-02","note":"Retry","bill_status":"unbilled",' \
+      '"project_id":11,"user_id":7,"source":"manual","source_metadata":{}}'
+    )
+  end
+
+  it "keeps a cli create's own source values over the defaults" do
+    body = described_class.create_body(user: Struct.new(:id).new(7), project: Struct.new(:id).new(11),
+                                       attributes: { "duration" => 30.0, "source" => "mcp",
+                                                     "source_metadata" => { "mcp_server" => "miru" } },
+                                       actor_kind: "cli")
+
+    expect(body).to include("source" => "mcp", "source_metadata" => { "mcp_server" => "miru" })
+  end
+end

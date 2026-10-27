@@ -495,6 +495,544 @@ RSpec.describe Timekeeping::Gateway, "agent entry detach routing" do
 end
 
 RSpec.describe Timekeeping::Gateway do
+  let(:replay_company) { create(:company) }
+  let(:replay_project) { create(:project, billable: true, client: create(:client, company: replay_company)) }
+  let(:replay_base_url) { "http://timekeeping.test" }
+  let(:replay_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+  let(:replay_allow_all) { ->(_entry) { } }
+
+  def replay_admin_of(company)
+    create(:user, current_workspace_id: company.id).tap do |user|
+      create(:employment, company:, user:)
+      user.add_role :admin, company
+      replay_fake.register_user(id: user.id, company_id: company.id, role: "admin")
+    end
+  end
+
+  def replay_gateway(actor:, company: replay_company, request_id: "req-replay-1")
+    context = Timekeeping::WriteContext.new(company:, actor:, actor_kind: "user", request_id:)
+    described_class.new(context:, write_client: Timekeeping::EntryWriteClient.new(base_url: replay_base_url),
+                        read_client: Timekeeping::EntryApiClient.new(base_url: replay_base_url))
+  end
+
+  before do
+    route_timekeeping_to_fake(replay_fake, base_url: replay_base_url)
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+    replay_fake.generation = 2
+    replay_fake.register_company(id: replay_company.id, edit_days: replay_company.timesheet_edit_days)
+    replay_fake.register_project(id: replay_project.id, company_id: replay_company.id)
+  end
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+  end
+
+  def replay_entry_for(user)
+    replay_fake.add_entry(company_id: replay_company.id, user_id: user.id, project_id: replay_project.id,
+                          "work_date" => Date.current.iso8601).fetch("id")
+  end
+
+  def replay_deletes
+    replay_fake.requests.select { |request| request[:method] == "DELETE" }
+  end
+
+  # "A retry of a committed delete cannot reach Timekeeping's stored answer."
+  # "Even with the same request id, the gateway never sends the second DELETE carrying the same idempotency key."
+  # "Replaying it needs a separate design that keeps the lookup-then-authorize order, and nothing is deleted twice meanwhile."
+  it "returns true for a retried timekeeping delete after a lost answer, resending the same Idempotency-Key and discarding once" do
+    admin = replay_admin_of(replay_company)
+    entry_id = replay_entry_for(admin)
+
+    # The first delete commits in Timekeeping; the caller never saw its answer.
+    expect(replay_gateway(actor: admin).destroy(entry_id:, authorize: replay_allow_all)).to be(true)
+    after_first = replay_fake.stored_entry(entry_id)
+    outbox_after_first = replay_fake.outbox.size
+
+    expect(replay_gateway(actor: admin).destroy(entry_id:, authorize: replay_allow_all)).to be(true)
+
+    deletes = replay_deletes
+    expect(deletes.size).to eq(2)
+    expect(deletes.map { |request| request[:headers]["Idempotency-Key"] }.uniq.size).to eq(1)
+    expect(after_first["discarded_at"]).not_to be_nil
+    expect(replay_fake.stored_entry(entry_id)).to eq(after_first)
+    # One discard only: added at version 1, discarded at version 2, never written again.
+    expect(replay_fake.stored_entry(entry_id)["version"]).to eq(2)
+    expect(replay_fake.outbox.size).to eq(outbox_after_first)
+  end
+
+  # "Address this in follow-up design work with an authenticated replay path; do not treat every missing entry as a successful delete."
+  it "answers a colleague who reuses the deleting admin's request id with not found while the deleting admin's retry gets the stored delete" do
+    admin = replay_admin_of(replay_company)
+    colleague = replay_admin_of(replay_company)
+    entry_id = replay_entry_for(admin)
+
+    replay_gateway(actor: admin).destroy(entry_id:, authorize: replay_allow_all)
+    version_after_delete = replay_fake.stored_entry(entry_id).fetch("version")
+
+    # The request id is client-chosen, so it must never be enough to reach another user's stored answer.
+    expect { replay_gateway(actor: colleague).destroy(entry_id:, authorize: replay_allow_all) }
+      .to raise_error(ActiveRecord::RecordNotFound)
+    replay = replay_fake.requests.last
+    expect([replay[:method], replay[:headers]["Idempotency-Replay"]]).to eq(["DELETE", "only"])
+    expect(replay_gateway(actor: admin).destroy(entry_id:, authorize: replay_allow_all)).to be(true)
+    expect(replay_fake.stored_entry(entry_id).fetch("version")).to eq(version_after_delete)
+  end
+
+  # "Address this in follow-up design work with an authenticated replay path; do not treat every missing entry as a successful delete."
+  it "answers another company's user who sends the same request id and entry id with not found, never the stored delete" do
+    admin = replay_admin_of(replay_company)
+    other_company = create(:company)
+    replay_fake.register_company(id: other_company.id, edit_days: other_company.timesheet_edit_days)
+    foreign_admin = replay_admin_of(other_company)
+    entry_id = replay_entry_for(admin)
+    replay_gateway(actor: admin).destroy(entry_id:, authorize: replay_allow_all)
+    version_after_delete = replay_fake.stored_entry(entry_id).fetch("version")
+    requests_before_foreign = replay_fake.requests.size
+
+    # The foreign user derives the same key, but every request goes out under the foreign company's own path.
+    expect { replay_gateway(actor: foreign_admin, company: other_company).destroy(entry_id:, authorize: replay_allow_all) }
+      .to raise_error(ActiveRecord::RecordNotFound)
+
+    foreign_requests = replay_fake.requests.drop(requests_before_foreign)
+    expect(foreign_requests).not_to be_empty
+    expect(foreign_requests.pluck(:path)).to all(start_with("/v1/companies/#{other_company.id}/"))
+    expect(replay_gateway(actor: admin).destroy(entry_id:, authorize: replay_allow_all)).to be(true)
+    expect(replay_fake.stored_entry(entry_id).fetch("version")).to eq(version_after_delete)
+  end
+
+  # "Replaying it needs a separate design that keeps the lookup-then-authorize order, and nothing is deleted twice meanwhile."
+  it "lets the authorize check refuse a replayed delete instead of reporting it as a success" do
+    admin = replay_admin_of(replay_company)
+    entry_id = replay_entry_for(admin)
+    replay_gateway(actor: admin).destroy(entry_id:, authorize: replay_allow_all)
+    checked = []
+    refuse = lambda do |entry|
+      checked << entry.id
+      raise Pundit::NotAuthorizedError
+    end
+
+    expect { replay_gateway(actor: admin).destroy(entry_id:, authorize: refuse) }
+      .to raise_error(Pundit::NotAuthorizedError)
+    expect(checked).to eq([entry_id])
+    expect(replay_fake.stored_entry(entry_id)["version"]).to eq(2)
+  end
+
+  # "Replaying it needs a separate design that keeps the lookup-then-authorize order, and nothing is deleted twice meanwhile."
+  # "do not treat every missing entry as a successful delete"
+  # The lookup finds a colleague's kept entry and scope :actor refuses it. The entry is still live, so no committed
+  # delete of it can exist to replay, and the gateway sends Timekeeping no DELETE at all.
+  it "sends no DELETE for a kept colleague entry outside the actor scope and leaves that entry kept" do
+    admin = replay_admin_of(replay_company)
+    colleague = create(:user, current_workspace_id: replay_company.id).tap do |user|
+      create(:employment, company: replay_company, user:)
+      user.add_role :employee, replay_company
+      replay_fake.register_user(id: user.id, company_id: replay_company.id, role: "employee")
+    end
+    entry_id = replay_entry_for(colleague)
+    before_entry = replay_fake.stored_entry(entry_id)
+    outbox_before = replay_fake.outbox.size
+
+    expect { replay_gateway(actor: admin).destroy(entry_id:, authorize: replay_allow_all, scope: :actor) }
+      .to raise_error(ActiveRecord::RecordNotFound)
+
+    expect(replay_deletes).to be_empty
+    expect(replay_fake.stored_entry(entry_id)).to eq(before_entry)
+    expect(replay_fake.stored_entry(entry_id)["discarded_at"]).to be_nil
+    expect(replay_fake.stored_entry(entry_id)["version"]).to eq(1)
+    expect(replay_fake.outbox.size).to eq(outbox_before)
+  end
+
+  # "Address this in follow-up design work with an authenticated replay path; do not treat every missing entry as a successful delete."
+  # A new request id derives a new Idempotency-Key, so no receipt matches and the entry being gone is not a success.
+  it "answers not found when a committed delete is retried under a new request id, sending a different key and discarding nothing more" do
+    admin = replay_admin_of(replay_company)
+    entry_id = replay_entry_for(admin)
+    replay_gateway(actor: admin, request_id: "req-first").destroy(entry_id:, authorize: replay_allow_all)
+
+    expect { replay_gateway(actor: admin, request_id: "req-other").destroy(entry_id:, authorize: replay_allow_all) }
+      .to raise_error(ActiveRecord::RecordNotFound)
+
+    deletes = replay_deletes
+    expect(deletes.size).to eq(2)
+    expect(replay_fake.requests.last).to eq(deletes.last)
+    expect(deletes.last[:headers]["Idempotency-Replay"]).to eq("only")
+    expect(deletes.last[:headers]["Idempotency-Key"]).to eq(
+      Timekeeping::EntryWriteClient.idempotency_key(request_id: "req-other", operation: "destroy", entry_id:)
+    )
+    expect(deletes.last[:headers]["Idempotency-Key"]).not_to eq(deletes.first[:headers]["Idempotency-Key"])
+    expect(replay_fake.stored_entry(entry_id)["version"]).to eq(2)
+  end
+
+  # "A retried delete after a lost answer now hits the lookup and gets 404, not the stored answer."
+  # Timekeeping reads the receipt before the generation, so a moved generation must not turn a committed delete into a refusal.
+  it "still returns the stored success when the ownership generation advanced between a committed delete and its retry" do
+    admin = replay_admin_of(replay_company)
+    entry_id = replay_entry_for(admin)
+    replay_gateway(actor: admin).destroy(entry_id:, authorize: replay_allow_all)
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(generation: 3)
+    replay_fake.generation = 3
+
+    expect(replay_gateway(actor: admin).destroy(entry_id:, authorize: replay_allow_all)).to be(true)
+
+    deletes = replay_deletes
+    expect(deletes.last[:headers]["Ownership-Generation"]).to eq("3")
+    expect(deletes.last[:headers]["Idempotency-Key"]).to eq(deletes.first[:headers]["Idempotency-Key"])
+    expect(replay_fake.stored_entry(entry_id)["version"]).to eq(2)
+  end
+end
+
+RSpec.describe Timekeeping::Gateway do
+  let(:fallback_company) { create(:company) }
+  let(:fallback_admin) do
+    create(:user, current_workspace_id: fallback_company.id).tap do |user|
+      create(:employment, company: fallback_company, user:)
+      user.add_role :admin, fallback_company
+    end
+  end
+  let(:fallback_project) { create(:project, billable: true, client: create(:client, company: fallback_company)) }
+  let(:fallback_context) do
+    Timekeeping::WriteContext.new(company: fallback_company, actor: fallback_admin, actor_kind: "user",
+                                  request_id: "req-replay-fallback")
+  end
+
+  # "do not treat every missing entry as a successful delete"
+  # A Timekeeping instance that predates the replay header answers the fixed If-Match with 409 version_conflict.
+  # The gateway must report that as the same not found every other miss gets, never as success or a new status.
+  it "answers not found when a provider that ignores the replay header refuses the replay as a version conflict" do
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+    read_client = instance_double(Timekeeping::EntryApiClient)
+    allow(read_client).to receive(:show_entry)
+      .and_raise(ActiveRecord::RecordNotFound.new("Couldn't find TimesheetEntry", "TimesheetEntry"))
+    write_client = instance_double(Timekeeping::EntryWriteClient)
+    allow(write_client).to receive(:replay_destroy_entry).and_raise(Timekeeping::EntryWriteClient::Conflict)
+    gateway = described_class.new(context: fallback_context, write_client:, read_client:)
+
+    expect { gateway.destroy(entry_id: 9_001, authorize: ->(_entry) { }) }.to raise_error(ActiveRecord::RecordNotFound)
+    expect(write_client).to have_received(:replay_destroy_entry)
+      .with(context: fallback_context, generation: 2, entry_id: 9_001)
+  end
+
+  # Only a lookup that found nothing may lead to a replay: an unavailable lookup must stay a retryable refusal.
+  it "sends no replay when the Timekeeping lookup is unavailable" do
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+    read_client = instance_double(Timekeeping::EntryApiClient)
+    allow(read_client).to receive(:show_entry).and_raise(Timekeeping::EntryApiClient::Error, "unavailable")
+    write_client = instance_double(Timekeeping::EntryWriteClient)
+    gateway = described_class.new(context: fallback_context, write_client:, read_client:)
+
+    expect { gateway.destroy(entry_id: 9_002, authorize: ->(_entry) { }) }
+      .to raise_error(Timekeeping::EntryApiClient::Error)
+  end
+
+  # The legacy store keeps no receipts, so a retried legacy delete still answers not found and never forwards.
+  it "answers not found for a retried legacy delete without sending anything to Timekeeping" do
+    entry = create(:timesheet_entry, user: fallback_admin, project: fallback_project, work_date: Date.current)
+    read_client = instance_double(Timekeeping::EntryApiClient)
+    write_client = instance_double(Timekeeping::EntryWriteClient)
+    gateway = described_class.new(context: fallback_context, write_client:, read_client:)
+
+    expect(gateway.destroy(entry_id: entry.id, authorize: ->(_entry) { })).to be(true)
+    expect { gateway.destroy(entry_id: entry.id, authorize: ->(_entry) { }) }
+      .to raise_error(ActiveRecord::RecordNotFound)
+    expect(entry.reload.discarded_at).to be_present
+  end
+end
+
+RSpec.describe Timekeeping::Gateway do
+  it "forwards an agent create with a token naming the agent and its user, and refuses an agent of another user with 403 before any request" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    agent_user = create(:user, current_workspace_id: company.id)
+    colleague = create(:user, current_workspace_id: company.id)
+    [agent_user, colleague].each do |member|
+      create(:employment, company:, user: member)
+      member.add_role :employee, company
+      create(:project_member, project:, user: member)
+    end
+    agent = create(:agent, company:, user: agent_user, default_project: project, provider: "codex")
+    colleague_agent = create(:agent, company:, user: colleague, default_project: project, provider: "codex")
+    base_url = "http://timekeeping.test"
+    fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: agent_user.id, company_id: company.id, role: "employee")
+    fake.register_project(id: project.id, company_id: company.id)
+    fake.register_agent(id: agent.id, company_id: company.id, user_id: agent_user.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+    attributes = { duration: 30, work_date: Date.current, note: "Agent run", source: "automation", agent_id: agent.id }
+    gateway_for = lambda do |acting_agent|
+      described_class.new(
+        context: Timekeeping::WriteContext.new(
+          company:, actor: agent_user, actor_kind: "agent", request_id: "req-agent-token-#{acting_agent.id}",
+          agent: acting_agent
+        ),
+        write_client: Timekeeping::EntryWriteClient.new(base_url:),
+        read_client: Timekeeping::EntryApiClient.new(base_url:)
+      )
+    end
+
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
+      gateway_for.call(agent).create(user: agent_user, project:, attributes:)
+
+      # "The forwarded agent token carries `agent_id` equal to the current agent and `sub` equal to the agent's user."
+      create_request = fake.requests.find { |request| request[:method] == "POST" }
+      bearer = create_request[:headers]["Authorization"].delete_prefix("Bearer ")
+      claims = Timekeeping::UserToken.verify(bearer, public_key: timekeeping_key_pair.public_key)
+      expect(claims.agent_id).to eq(agent.id)
+      expect(claims.user_id).to eq(agent_user.id)
+      expect(claims.company_id).to eq(company.id)
+
+      # "The agent writer's context carries the authenticated agent, so its token is minted with `agent:` set to it, and `UserToken`'s AgentMismatchError check applies."
+      requests_before = fake.requests.size
+      expect do
+        gateway_for.call(colleague_agent).create(
+          user: agent_user, project:, attributes: attributes.merge(agent_id: colleague_agent.id)
+        )
+      end.to raise_error(StandardError) { |error|
+        expect(error).to be_a(Timekeeping::EntryWriteClient::Forbidden).or be_a(ActiveRecord::RecordInvalid)
+      }
+      expect(fake.requests.size).to eq(requests_before)
+    end
+  end
+end
+
+RSpec.describe Timekeeping::Gateway, "writer-specific forwarded fields" do
+  let(:writer_company) { create(:company) }
+  let(:writer_project) { create(:project, billable: true, client: create(:client, company: writer_company)) }
+  let(:writer_user) do
+    create(:user, current_workspace_id: writer_company.id).tap do |user|
+      create(:employment, company: writer_company, user:)
+      user.add_role :employee, writer_company
+      create(:project_member, project: writer_project, user:)
+    end
+  end
+  let(:writer_agent) { create(:agent, company: writer_company, user: writer_user, default_project: writer_project) }
+  let(:writer_base_url) { "http://timekeeping.test" }
+  let(:writer_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  before do
+    writer_fake.register_company(id: writer_company.id, edit_days: writer_company.timesheet_edit_days)
+    writer_fake.register_user(id: writer_user.id, company_id: writer_company.id, role: "employee")
+    writer_fake.register_project(id: writer_project.id, company_id: writer_company.id)
+    route_timekeeping_to_fake(writer_fake, base_url: writer_base_url)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    writer_fake.generation = 2
+  end
+
+  def writer_gateway(actor_kind, agent: nil)
+    described_class.new(
+      context: Timekeeping::WriteContext.new(company: writer_company, actor: writer_user, actor_kind:,
+                                             request_id: "req-writer-#{actor_kind}", agent:),
+      write_client: Timekeeping::EntryWriteClient.new(base_url: writer_base_url),
+      read_client: Timekeeping::EntryApiClient.new(base_url: writer_base_url)
+    )
+  end
+
+  def writer_sent_bodies(method)
+    writer_fake.requests.filter_map { |request| request[:body] if request[:method] == method }
+  end
+
+  def writer_with_key(&block)
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem, &block)
+  end
+
+  it "refuses an agent create whose agent was deleted with a validation error and sends nothing" do
+    agent_id = writer_agent.id
+    writer_agent.delete
+
+    writer_with_key do
+      expect do
+        writer_gateway("agent").create(
+          user: writer_user, project: writer_project,
+          attributes: { duration: 30, work_date: Date.current, source: "automation", agent_id: }
+        )
+      end.to raise_error(ActiveRecord::RecordInvalid)
+    end
+    expect(writer_fake.requests).to be_empty
+  end
+
+  it "forwards an agent create with the agent, its normalized proof metadata and its run identifiers" do
+    writer_fake.register_agent(id: writer_agent.id, company_id: writer_company.id, user_id: writer_user.id)
+
+    writer_with_key do
+      writer_gateway("agent", agent: writer_agent).create(
+        user: writer_user, project: writer_project,
+        attributes: {
+          duration: 60, work_date: Date.current, note: "Agent run", source: "automation",
+          source_metadata: { tool: "claude-code", pii: "drop-me" }, agent_id: writer_agent.id,
+          proof_url: "https://example.test/runs/1", proof_metadata: { repo: "  saeloun/miru-web  ", empty: "" },
+          external_run_id: "run_123", external_session_id: "session_123", review_status: "approved", user_id: 0
+        }
+      )
+    end
+
+    body = writer_sent_bodies("POST").sole
+    expect(body).to include(
+      "source" => "automation", "source_metadata" => { "tool" => "claude-code" }, "agent_id" => writer_agent.id,
+      "proof_url" => "https://example.test/runs/1", "proof_metadata" => { "repo" => "saeloun/miru-web" },
+      "external_run_id" => "run_123", "external_session_id" => "session_123", "user_id" => writer_user.id
+    )
+    expect(body).not_to have_key("review_status")
+  end
+
+  it "forwards a cli create whose MCP metadata records the entry as an MCP entry" do
+    writer_with_key do
+      writer_gateway("cli").create(
+        user: writer_user, project: writer_project,
+        attributes: { duration: 30, work_date: Date.current, source: "cli",
+                      source_metadata: { "tool" => "codex", "mcp_server" => "miru", "secret" => "x" } }
+      )
+    end
+
+    body = writer_sent_bodies("POST").sole
+    expect(body).to include("source" => "mcp", "source_metadata" => { "tool" => "codex", "mcp_server" => "miru" })
+    expect(body.keys).not_to include("agent_id", "proof_url", "external_run_id")
+  end
+
+  it "forwards a cli update with its source fields normalized by the model's rule" do
+    entry_id = writer_fake.add_entry(company_id: writer_company.id, user_id: writer_user.id,
+                                     project_id: writer_project.id, "work_date" => Date.current.iso8601)["id"]
+
+    writer_with_key do
+      writer_gateway("cli").update(
+        entry_id:, project: writer_project, authorize: ->(_entry) { }, scope: :actor,
+        attributes: { duration: 45, work_date: Date.current, source: "cli",
+                      source_metadata: { skill: "review", mcp_server: "miru", other: "x" }, user_id: 0 }
+      )
+    end
+
+    body = writer_sent_bodies("PATCH").sole
+    expect(body).to include("source" => "mcp", "source_metadata" => { "skill" => "review", "mcp_server" => "miru" })
+    expect(body).not_to have_key("user_id")
+  end
+
+  # A legacy update! applies the source rule to the stored metadata when the
+  # request leaves it out, so the forwarded update must too.
+  it "forwards a cli update that omits source_metadata with the stored metadata and the source it implies" do
+    entry_id = writer_fake.add_entry(company_id: writer_company.id, user_id: writer_user.id,
+                                     project_id: writer_project.id, "work_date" => Date.current.iso8601,
+                                     "source" => "automation", "source_metadata" => { "tool" => "codex" })["id"]
+
+    writer_with_key do
+      writer_gateway("cli").update(
+        entry_id:, project: writer_project, authorize: ->(_entry) { }, scope: :actor,
+        attributes: { duration: 45, work_date: Date.current, source: "cli", note: "Edited" }
+      )
+    end
+
+    body = writer_sent_bodies("PATCH").sole
+    expect(body).to include("note" => "Edited", "source" => "automation", "source_metadata" => { "tool" => "codex" })
+    expect(writer_fake.stored_entry(entry_id)).to include("source" => "automation",
+                                                          "source_metadata" => { "tool" => "codex" })
+  end
+
+  it "reports a refused cli write with the cli actor kind" do
+    TimekeepingOwnership.current.update_columns(handoff_step: "close_admission")
+    events = []
+    subscriber = Object.new
+    subscriber.define_singleton_method(:emit) do |event|
+      events << event if event[:name] == "Timekeeping::EntryWriteRefused"
+    end
+    Rails.event.subscribe(subscriber)
+    begin
+      expect do
+        writer_gateway("cli").create(user: writer_user, project: writer_project,
+                                     attributes: { duration: 30, work_date: Date.current, source: "cli" })
+      end.to raise_error(Timekeeping::Gateway::OwnershipMoving)
+    ensure
+      Rails.event.unsubscribe(subscriber)
+    end
+
+    expect(events.sole[:payload].to_h[:data]).to include(reason: "ownership_moving", actor_kind: "cli")
+  end
+end
+
+RSpec.describe Timekeeping::Gateway do
+  # The context Agent#destroy builds for its detach: the agent's backing user
+  # acting as agent_destroy.
+  def detach_routing_context(agent, request_id)
+    Timekeeping::WriteContext.new(company: agent.company, actor: agent.user, actor_kind: "agent_destroy", request_id:)
+  end
+
+  # The EntryWriteRefused events emitted while the block runs.
+  def detach_routing_refusals
+    events = []
+    subscriber = Object.new
+    subscriber.define_singleton_method(:emit) do |event|
+      events << event if event[:name] == "Timekeeping::EntryWriteRefused"
+    end
+    Rails.event.subscribe(subscriber)
+    begin
+      yield
+    ensure
+      Rails.event.unsubscribe(subscriber)
+    end
+    events
+  end
+
+  # "When `handoff_step` is set, the gateway refuses entry writes, prepares and service commands with a retryable `503 ownership_moving`."
+  it "emits one ownership_moving refusal naming the agent_destroy actor and leaves the entry attached" do
+    agent = create(:agent)
+    project = create(:project, client: create(:client, company: agent.company))
+    entry = create(:timesheet_entry, project:, user: agent.user, agent:)
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(handoff_step: "freeze")
+    service_client = instance_double(Timekeeping::ServiceCommandClient)
+    gateway = described_class.new(context: detach_routing_context(agent, "req-detach-refused"), service_client:)
+
+    events = detach_routing_refusals do
+      expect { gateway.detach_agent_entries(agent:) }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
+    end
+
+    expect(events.size).to eq(1)
+    expect(events.first[:payload].to_h[:data]).to eq(
+      reason: "ownership_moving", company_id: agent.company_id, request_id: "req-detach-refused",
+      actor_kind: "agent_destroy"
+    )
+    expect(entry.reload.agent_id).to eq(agent.id)
+  end
+
+  it "refuses a detach in the prepared store and sends nothing to Timekeeping" do
+    agent = create(:agent)
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+    # A double with no allowed methods: any forwarded call fails the example.
+    service_client = instance_double(Timekeeping::ServiceCommandClient)
+    gateway = described_class.new(context: detach_routing_context(agent, "req-detach-prepared"), service_client:)
+
+    expect { gateway.detach_agent_entries(agent:) }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
+  end
+
+  it "forwards the generation it read and the attempt's operation id and request id" do
+    agent = create(:agent)
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 3)
+    service_client = instance_double(Timekeeping::ServiceCommandClient)
+    allow(service_client).to receive(:detach_agent_entries).and_return(2)
+    gateway = described_class.new(context: detach_routing_context(agent, "req-detach-forward"), service_client:)
+
+    expect(gateway.detach_agent_entries(agent:)).to eq(2)
+    expect(service_client).to have_received(:detach_agent_entries).with(
+      company_id: agent.company_id, agent_id: agent.id, generation: 3,
+      operation_id: described_class.detach_operation_id(request_id: "req-detach-forward", agent_id: agent.id),
+      request_id: "req-detach-forward"
+    )
+  end
+
+  # A retried destroy must select the agent's entries again rather than replay an earlier receipt.
+  it "gives each destroy attempt its own operation id and keeps it within one attempt" do
+    first = described_class.detach_operation_id(request_id: "attempt-1", agent_id: 9)
+
+    expect(described_class.detach_operation_id(request_id: "attempt-1", agent_id: 9)).to eq(first)
+    expect(described_class.detach_operation_id(request_id: "attempt-2", agent_id: 9)).not_to eq(first)
+    expect(described_class.detach_operation_id(request_id: "attempt-1", agent_id: 10)).not_to eq(first)
+  end
+
+  it "refuses every local-owner detach by default as a retryable ownership move" do
+    expect { Timekeeping::Gateway::UnavailableLocalOwner.new.detach_agent_entries(context: nil, agent: nil) }
+      .to raise_error(Timekeeping::Gateway::OwnershipMoving)
+  end
+end
+
+RSpec.describe Timekeeping::Gateway do
   let(:imp_company) { create(:company) }
   let(:imp_admin) do
     create(:user, current_workspace_id: imp_company.id).tap do |user|
@@ -663,10 +1201,9 @@ RSpec.describe Timekeeping::Gateway do
 
   # "Replaying it needs a separate design that keeps the lookup-then-authorize order, and nothing is deleted twice meanwhile."
   # "do not treat every missing entry as a successful delete"
-  # The lookup hides a colleague's kept entry from scope :actor. Timekeeping's own destroy would let an admin delete it
-  # without the gateway's scope or policy, so any DELETE sent after the lookup must be one only a stored receipt answers,
-  # and one an older service refuses on If-Match.
-  it "sends only a replay-only DELETE for a kept colleague entry outside the actor scope and leaves that entry kept" do
+  # The lookup finds a colleague's kept entry and scope :actor refuses it. The entry is still live, so no committed
+  # delete of it can exist to replay, and the gateway sends Timekeeping no DELETE at all.
+  it "sends no DELETE for a kept colleague entry outside the actor scope and leaves that entry kept" do
     admin = replay_admin_of(replay_company)
     colleague = create(:user, current_workspace_id: replay_company.id).tap do |user|
       create(:employment, company: replay_company, user:)
@@ -680,8 +1217,7 @@ RSpec.describe Timekeeping::Gateway do
     expect { replay_gateway(actor: admin).destroy(entry_id:, authorize: replay_allow_all, scope: :actor) }
       .to raise_error(ActiveRecord::RecordNotFound)
 
-    expect(replay_deletes.map { |request| [request[:headers]["Idempotency-Replay"], request[:headers]["If-Match"]] })
-      .to eq([["only", "replay-only"]])
+    expect(replay_deletes).to be_empty
     expect(replay_fake.stored_entry(entry_id)).to eq(before_entry)
     expect(replay_fake.stored_entry(entry_id)["discarded_at"]).to be_nil
     expect(replay_fake.stored_entry(entry_id)["version"]).to eq(1)

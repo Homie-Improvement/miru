@@ -49,8 +49,16 @@ module Timekeeping
       # Every agent of the company, active or not: design rule S7 and the
       # projection ignore active, so an inactive agent still owns its entries.
       # Only id and user_id leave the monolith.
+      #
+      # An agent whose destroy holds its row lock (Gateway#detach_agent_entries
+      # takes it before Timekeeping detaches its entries) is left out without
+      # waiting, so facts never list an agent while its deletion may still
+      # commit. Timekeeping relies on this to tell a detach whose deletion
+      # rolled back from one that facts read earlier have not seen. KEY SHARE
+      # does not conflict with ordinary agent updates or entry saves.
       def agents
-        company.agents.order(:id).pluck(:id, :user_id).map { |id, user_id| { id:, user_id: } }
+        company.agents.order(:id).lock("FOR KEY SHARE SKIP LOCKED").pluck(:id, :user_id)
+          .map { |id, user_id| { id:, user_id: } }
       end
 
       def projects
