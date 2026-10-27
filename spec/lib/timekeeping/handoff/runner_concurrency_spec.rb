@@ -211,7 +211,8 @@ RSpec.describe Timekeeping::Handoff::Runner, "abort after close admission timeou
         end.to raise_error(Timekeeping::Handoff::Runner::Refused)
       ensure
         release << true
-        billing_write.join(5)
+        # A join that times out leaves the thread alive with its transaction open, so stop it before going on.
+        billing_write.join(5) || billing_write.kill.join
       end
 
       # The lock holder has finished, so the abort below does not depend on thread timing.
