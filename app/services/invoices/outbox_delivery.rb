@@ -25,7 +25,7 @@ module Invoices
     def deliver(outbox_item_id)
       InvoiceOperationOutboxItem.transaction do
         item = InvoiceOperationOutboxItem.lock("FOR UPDATE SKIP LOCKED").find_by(id: outbox_item_id)
-        next if item.nil? || item.delivered_at.present?
+        next if item.nil? || item.delivered_at.present? || item.undeliverable_at.present?
 
         outcome = settle(item)
         record(item, outcome)

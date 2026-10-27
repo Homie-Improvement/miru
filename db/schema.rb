@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_10_27_164215) do
+ActiveRecord::Schema[8.1].define(version: 2026_10_27_170000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pg_stat_statements"
@@ -679,6 +679,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_27_164215) do
     t.string "kind", null: false
     t.uuid "operation_id", null: false
     t.jsonb "payload", null: false
+    t.datetime "undeliverable_at"
     t.index ["company_id", "operation_id", "kind"], name: "index_invoice_operation_outbox_items_on_company_operation_kind", unique: true
     t.check_constraint "kind::text = ANY (ARRAY['commit'::character varying, 'abort'::character varying]::text[])", name: "invoice_operation_outbox_items_kind_check"
   end
