@@ -74,6 +74,12 @@ module Timekeeping
       raise unless stored
 
       stored
+    rescue WriteSteps::UnpublishableRows => error
+      # A flipped entry's stored row the projection would refuse. The
+      # transaction has rolled back the reservation change, the operation row,
+      # the flips and the receipt, so a retry is checked again against what is
+      # stored then.
+      error.outcome
     end
 
     private
