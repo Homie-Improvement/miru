@@ -34,6 +34,10 @@ class Company < ApplicationRecord
   }.freeze
 
   # Associations
+  # Agents go first: destroying one detaches its entries through the
+  # Timekeeping gateway, and a refused detach must abort the company destroy
+  # before any other dependent row is deleted.
+  has_many :agents, dependent: :destroy
   has_many :employments, dependent: :destroy
   has_many :users, -> { kept }, through: :employments
   has_many :clients, dependent: :destroy
@@ -46,7 +50,6 @@ class Company < ApplicationRecord
   has_many :tax_configurations, dependent: :destroy
   has_many :payments, through: :invoices
   has_many :razorpay_payouts, through: :payments
-  has_many :agents, dependent: :destroy
   has_one :stripe_connected_account, dependent: :destroy
   has_many :payments_providers, dependent: :destroy
   has_many :quickbooks_connections, dependent: :destroy
