@@ -202,45 +202,73 @@ RSpec.describe Timekeeping::EntryWriter, "agent create against a detach of the s
   let(:owner) { timekeeping_arrange.user(company:, role: "owner") }
   let(:agent) { timekeeping_arrange.agent(company:, user: owner) }
 
-  # "A forwarded agent create racing an agent destroy never leaves an entry naming a deleted agent"
-  # The create's facts are read before it is held, as they are for a create whose monolith caller timed
-  # out and released its agent lock. The detach then runs while the create waits. Either the detach waits
-  # for the create and detaches it, or it finishes first and the create must then be refused.
-  it "never commits an agent create that resumes after a detach of the same agent ran while it was held" do
-    body = { "project_id" => project, "work_date" => "2026-03-02", "duration" => 60.0, "note" => "Late agent create",
-             "source" => "automation", "source_metadata" => {}, "agent_id" => agent }
-    create_command = build_entry_command(:create, token: timekeeping_arrange.token_for(owner), body:)
-    detach_request = Timekeeping::ServiceCommands::Request.new(
+  def agent_create
+    build_entry_command(:create, token: timekeeping_arrange.token_for(owner), body: {
+                          "project_id" => project, "work_date" => "2026-03-02", "duration" => 60.0,
+                          "note" => "Agent create", "source" => "automation", "source_metadata" => {},
+                          "agent_id" => agent
+                        })
+  end
+
+  def detach_request
+    Timekeeping::ServiceCommands::Request.new(
       route: :detach_entries, company_id: company, actor_name: "agent-boundary", target_id: agent,
       operation_id: SecureRandom.uuid, generation: timekeeping_arrange.current_generation
     )
+  end
+
+  def on_own_connection(&block)
+    Thread.new { ApplicationRecord.connection_pool.with_connection { block.call } }
+  end
+
+  # Runs the create until it reaches hold_at, then starts the detach on
+  # another connection and lets the create go on after detach_wait seconds.
+  # Returns the create's outcome, the detach's outcome and whether the detach
+  # finished while the create was held.
+  def run_create_held_at(hold_at, detach_wait:)
+    command = agent_create
+    request = detach_request
     reached = Queue.new
     release = Queue.new
     checkpoint = lambda do |step|
-      next unless step == :receipt_checked
+      next unless step == hold_at
 
       reached << true
       release.pop
     end
-    writer = Thread.new do
-      ApplicationRecord.connection_pool.with_connection { described_class.new(checkpoint:).call(create_command) }
-    end
-    detach = nil
-    detach_finished_first = false
+    creator = on_own_connection { described_class.new(checkpoint:).call(command) }
+    detacher = nil
+    detach_finished_while_held = false
     begin
       expect(reached.pop(timeout: wait_seconds)).to be(true)
-      detach = Thread.new do
-        ApplicationRecord.connection_pool.with_connection { Timekeeping::ServiceCommands.new.call(detach_request) }
-      end
-      detach_finished_first = !detach.join(2).nil?
+      detacher = on_own_connection { Timekeeping::ServiceCommands.new.call(request) }
+      detach_finished_while_held = !detacher.join(detach_wait).nil?
     ensure
       release << true
     end
-    created = writer.join(wait_seconds)&.value
-    detached = detach&.join(wait_seconds)&.value
+    [creator.join(wait_seconds)&.value, detacher&.join(wait_seconds)&.value, detach_finished_while_held]
+  end
 
-    expect(detached.status).to eq(200)
+  it "makes a detach wait for a create that holds the agent lock, then detaches the committed entry" do
+    created, detached, detach_finished_while_held = run_create_held_at(:generation_checked, detach_wait: 1)
+
+    expect(detach_finished_while_held).to be(false)
+    expect(created.status).to eq(201)
+    expect([detached.status, JSON.parse(detached.body)]).to eq([200, { "detached" => 1 }])
+    expect(Entry.sole.agent_id).to be_nil
+  end
+
+  # "A forwarded agent create racing an agent destroy never leaves an entry naming a deleted agent"
+  # The create's facts are read before it is held, as they are for a create whose monolith caller timed
+  # out and released its agent lock. Held before the agent lock, it lets the detach finish first, so the
+  # create must then be refused.
+  it "refuses a create held before the agent lock once a detach of the agent committed meanwhile" do
+    created, detached, detach_finished_while_held = run_create_held_at(:receipt_checked, detach_wait: wait_seconds)
+
+    expect(detach_finished_while_held).to be(true)
+    expect([detached.status, JSON.parse(detached.body)]).to eq([200, { "detached" => 0 }])
+    expect([created.status, JSON.parse(created.body)]).to eq([404, { "reason" => "not_found" }])
     expect(Entry.where(company_id: company, agent_id: agent)).to be_empty
-    expect([created.status, JSON.parse(created.body)]).to eq([404, { "reason" => "not_found" }]) if detach_finished_first
+    expect(Entry.count).to eq(0)
   end
 end
