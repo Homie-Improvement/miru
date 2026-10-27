@@ -42,3 +42,18 @@ RSpec.describe Timekeeping::WriteContext do
     expect(context.request_id).to eq(request_id)
   end
 end
+
+RSpec.describe Timekeeping::WriteContext do
+  let(:cli_context_company) { create(:company) }
+  let(:cli_context_actor) { create(:user) }
+
+  it "accepts the cli actor kind for CLI and MCP writes" do
+    # "Build a `Timekeeping::WriteContext` with actor kind `cli` or `agent` and `request.request_id`."
+    context = described_class.new(
+      company: cli_context_company, actor: cli_context_actor, actor_kind: "cli", request_id: "req-cli-1"
+    )
+
+    expect(context.actor_kind).to eq("cli")
+    expect(context.agent).to be_nil
+  end
+end

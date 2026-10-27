@@ -140,7 +140,8 @@ module Timekeeping
           local_owner.create_entry(context:, user:, project:, attributes:)
         when :timekeeping
           body = EntryWriteClient.create_body(user:, project:, attributes: checked_create_attributes(user:, project:,
-                                                                                                    attributes:))
+                                                                                                    attributes:),
+                                              actor_kind: context.actor_kind)
           hydrate(write_client.create_entry(context:, generation: ownership.generation, body:), user_id: user.id)
         end
       end
@@ -174,19 +175,19 @@ module Timekeeping
     def update(entry_id:, project:, attributes:, authorize:, expected_generation: nil, scope: :company)
       perform(expected_generation) do |ownership, owner|
         found = find_authorized(ownership:, entry_id:, authorize:, scope:)
+        entry = found.entry
         case owner
         when :legacy
-          found.entry.tap do |entry|
-            entry.project = project
-            entry.update!(attributes)
-          end
+          entry.project = project
+          entry.update!(attributes)
+          entry
         when :prepared
-          local_owner.update_entry(context:, entry: found.entry, project:, attributes:)
+          local_owner.update_entry(context:, entry:, project:, attributes:)
         when :timekeeping
-          body = attributes.to_h.stringify_keys.merge("project_id" => project.id)
-          row = write_client.update_entry(context:, generation: ownership.generation, entry_id: found.entry.id,
+          body = normalized_update_attributes(entry, attributes).merge("project_id" => project.id)
+          row = write_client.update_entry(context:, generation: ownership.generation, entry_id: entry.id,
                                           version: found.version, body:)
-          hydrate(row, user_id: found.entry.user_id)
+          hydrate(row, user_id: entry.user_id)
         end
       end
     end
@@ -295,11 +296,34 @@ module Timekeeping
       # Timekeeping. The draft also fills bill_status from the project when the
       # request leaves it out (non_billable for a non-billable project), which
       # Timekeeping's own default (unbilled) would get wrong.
+      #
+      # Every field the writer forwards beyond the web form's own is copied
+      # from the draft too, so the body carries what a save would store: the
+      # source inferred from its metadata, the metadata sliced, the proof
+      # metadata trimmed. For an agent create the validation also runs
+      # TimesheetEntry#validate_agent_exists, whose share lock on the agent row,
+      # taken after the ownership row, holds until this transaction ends, after
+      # the forwarded call. An agent destroy that locks the row first makes the
+      # create fail validation (422); one that waits detaches the new entry.
       def checked_create_attributes(user:, project:, attributes:)
         draft = project.timesheet_entries.new(attributes)
         draft.user = user
         draft.validate!
-        attributes.to_h.stringify_keys.merge("bill_status" => draft.bill_status)
+        copied = ["bill_status"] + (EntryWriteClient::FORWARDED_FIELDS.fetch(context.actor_kind).fetch(:create) -
+                                    EntryWriteClient::EDIT_FIELDS)
+        attributes.to_h.stringify_keys.merge(copied.index_with { |field| draft.read_attribute(field) })
+      end
+
+      # An update that sets either source field sends both as a save would
+      # store them, reading the one it leaves out from the entry as it is.
+      def normalized_update_attributes(entry, attributes)
+        fields = attributes.to_h.stringify_keys
+        return fields unless fields.keys.intersect?(EntryWriteClient::SOURCE_FIELDS)
+
+        fields.merge(TimesheetEntry.normalized_source_fields(
+          source: fields.fetch("source", entry.source),
+          source_metadata: fields.fetch("source_metadata", entry.source_metadata)
+        ))
       end
 
       def find_authorized(ownership:, entry_id:, authorize:, scope:)
