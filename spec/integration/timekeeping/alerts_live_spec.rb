@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require "rails_helper"
-require "rake"
 
 # Drives the timekeeping:alerts task against a real Timekeeping server: real
 # entry writes over HTTP, the service's own write metrics, and the task's real
@@ -9,8 +8,6 @@ require "rake"
 # test database (TIMEKEEPING_DATABASE_URL), so it runs only when
 # TIMEKEEPING_LIVE=1; then a server that cannot boot fails the run.
 RSpec.describe "timekeeping:alerts against a live Timekeeping server", :without_transaction do
-  include ActiveSupport::Testing::TimeHelpers
-
   # Puts every write in the 500 ms bucket, past the 300 ms alert.
   let(:live_write_delay_ms) { 400 }
   # A window must have this long left before a spec writes into it, so all of
@@ -73,19 +70,12 @@ RSpec.describe "timekeeping:alerts against a live Timekeeping server", :without_
     Time.iso8601(windows.first.fetch("window_start")) + body.fetch("window_seconds")
   end
 
-  def run_alerts_task
-    Rails.application.load_tasks unless Rake::Task.task_defined?("timekeeping:alerts")
-    Rake::Task["timekeeping:alerts"].reenable
-    output = StringIO.new
-    stdout_before = $stdout
-    with_timekeeping_env("TIMEKEEPING_BASE_URL" => @timekeeping.base_url,
-                         "TIMEKEEPING_SERVICE_TOKEN" => @timekeeping.service_token) do
-      $stdout = output
-      Rake::Task["timekeeping:alerts"].invoke
-    end
-    output.string
-  ensure
-    $stdout = stdout_before
+  # The shared runner turns an abort into an exit status, so a failed live run
+  # is checked here; otherwise the example would read the output of a failed run.
+  def run_alerts_task(now: nil)
+    run = run_timekeeping_alerts_task(base_url: @timekeeping.base_url, token: @timekeeping.service_token, now:)
+    expect(run.exit_status).to be_nil, "timekeeping:alerts exited #{run.exit_status}: #{run.stderr}"
+    run.stdout
   end
 
   def alert_lines(output, name, company)
@@ -109,7 +99,7 @@ RSpec.describe "timekeeping:alerts against a live Timekeeping server", :without_
     before_window_end = run_alerts_task
     expect(before_window_end.lines.grep(/name=reference_unavailable_rate /)).to be_empty
 
-    after_window_end = travel_to(window_end_for(failing[:company]) + 1) { run_alerts_task }
+    after_window_end = run_alerts_task(now: window_end_for(failing[:company]) + 1)
     expect(alert_lines(after_window_end, "reference_unavailable_rate", failing[:company]).size).to eq(1)
     expect(alert_lines(after_window_end, "reference_unavailable_rate", healthy[:company])).to be_empty
   end
@@ -126,7 +116,7 @@ RSpec.describe "timekeeping:alerts against a live Timekeeping server", :without_
       @timekeeping.service_post("/internal/v1/test-hooks/writes/clear")
     end
 
-    output = travel_to(window_end_for(slowed[:company]) + 1) { run_alerts_task }
+    output = run_alerts_task(now: window_end_for(slowed[:company]) + 1)
     expect(alert_lines(output, "entry_write_p95_latency", slowed[:company]).size).to eq(1)
   end
 
@@ -139,7 +129,7 @@ RSpec.describe "timekeeping:alerts against a live Timekeeping server", :without_
 
     expect(write_entries(unslowed, 40).tally).to eq(201 => 40)
 
-    output = travel_to(window_end_for(unslowed[:company]) + 1) { run_alerts_task }
+    output = run_alerts_task(now: window_end_for(unslowed[:company]) + 1)
     expect(alert_lines(output, "entry_write_p95_latency", unslowed[:company])).to be_empty
   end
 end
