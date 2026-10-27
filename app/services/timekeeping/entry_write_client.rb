@@ -14,8 +14,11 @@ module Timekeeping
   # answer body may describe other users' data and is never passed on.
   #
   # It never retries. A call whose answer was lost may still have committed in
-  # Timekeeping; a resend within the same request carries the same
+  # Timekeeping; a resend under the same request id carries the same
   # Idempotency-Key, so Timekeeping replays its answer instead of writing twice.
+  # A committed destroy hides its entry from the lookup before the write, so its
+  # resend goes through replay_destroy_entry, which only ever reads the stored
+  # answer.
   class EntryWriteClient
     ENTRIES_PATH = "/v1/companies/%<company_id>d/entries"
     ENTRY_PATH = "/v1/companies/%<company_id>d/entries/%<entry_id>d"
@@ -32,6 +35,16 @@ module Timekeeping
     # A web or mobile create records a manual entry. The contract requires
     # both fields on create.
     CREATE_SOURCE = { "source" => "manual", "source_metadata" => {} }.freeze
+
+    # Asks Timekeeping to answer a DELETE only from its stored receipt
+    # (contracts/timekeeping/entry_api.yml headers.idempotency_replay).
+    REPLAY_ONLY_HEADER = "Idempotency-Replay"
+    REPLAY_ONLY_VALUE = "only"
+
+    # Sent as If-Match on a replay-only DELETE. It is never a version, so a
+    # Timekeeping instance that predates the replay header refuses the delete
+    # as version_conflict instead of discarding an entry the lookup hid.
+    REPLAY_ONLY_IF_MATCH = "replay-only"
 
     # Timekeeping could not be reached, refused the monolith's own token, or
     # answered something unexpected. A subclass of the read client's error, so
@@ -107,9 +120,19 @@ module Timekeeping
       forward(Net::HTTP::Delete, path, operation: "destroy", context:, generation:, entry_id:, version:)
     end
 
+    # Returns the stored answer of a destroy this request id already committed.
+    # Timekeeping never deletes on this call: with no stored answer for the
+    # same company, actor and key it answers 404, raised as RecordNotFound.
+    def replay_destroy_entry(context:, generation:, entry_id:)
+      path = format(ENTRY_PATH, company_id: context.company.id, entry_id:)
+      forward(Net::HTTP::Delete, path, operation: "destroy", context:, generation:, entry_id:,
+                                       version: REPLAY_ONLY_IF_MATCH, replay_only: true)
+    end
+
     private
 
-      def forward(request_class, path, operation:, context:, generation:, entry_id: nil, version: nil, body: nil)
+      def forward(request_class, path, operation:, context:, generation:, entry_id: nil, version: nil, body: nil,
+                  replay_only: false)
         raise Error, "#{EntryApiClient::BASE_URL_ENV} is not set" if @base_url.blank?
 
         request = request_class.new(URI.join(@base_url, path))
@@ -118,6 +141,7 @@ module Timekeeping
         request["Idempotency-Key"] = self.class.idempotency_key(request_id: context.request_id, operation:, entry_id:)
         request["X-Request-Id"] = context.request_id.to_s
         request["If-Match"] = version.to_s unless version.nil?
+        request[REPLAY_ONLY_HEADER] = REPLAY_ONLY_VALUE if replay_only
         unless body.nil?
           request["Content-Type"] = "application/json"
           request.body = JSON.generate(body)

@@ -30,16 +30,29 @@ module Timekeeping
     module_function
 
     def find(ownership:, context:, entry_id:, local_owner:, read_client:, scope: :company)
-      in_scope = SCOPES.fetch(scope)
       found = find_in_owner(ownership:, context:, entry_id:, local_owner:, read_client:)
-      # The write that follows targets found.entry.id, so an answer for any
-      # other id must not stand in for the requested one.
-      unless found.entry.id.to_s == entry_id.to_s && found.entry.company_id == context.company.id &&
-             in_scope.call(found.entry, context)
-        raise not_found
-      end
-
+      check_target(found.entry, context:, entry_id:, scope:)
       found
+    end
+
+    # The entry in Timekeeping's stored answer to an earlier destroy, held to
+    # the same company, id and scope rules as a live lookup, so a replayed
+    # answer never shows an entry the lookup itself would have hidden.
+    def replayed(context:, row:, entry_id:, scope: :company)
+      entry = EntryReader.hydrate([row], company: context.company, user_id: row["user_id"]).first
+      raise not_found if entry.nil?
+
+      check_target(entry, context:, entry_id:, scope:)
+      entry
+    end
+
+    # The write that follows targets entry.id, so an answer for any other id
+    # must not stand in for the requested one.
+    def check_target(entry, context:, entry_id:, scope:)
+      in_scope = SCOPES.fetch(scope)
+      return if entry.id.to_s == entry_id.to_s && entry.company_id == context.company.id && in_scope.call(entry, context)
+
+      raise not_found
     end
 
     def find_in_owner(ownership:, context:, entry_id:, local_owner:, read_client:)

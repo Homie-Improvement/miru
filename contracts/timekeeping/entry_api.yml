@@ -36,6 +36,8 @@ headers:
   # Optional. The monolith request a call was made for, so a forwarded write
   # and the lookup before it can be traced to the same monolith request.
   x_request_id: "X-Request-Id: <monolith request id>"
+  # Optional, DELETE only. See rules.replay_only.
+  idempotency_replay: "Idempotency-Replay: only"
 
 # Claims the provider reads from the signed bearer token. purpose is "read"
 # or "write"; a token signed for reads is refused on every write route.
@@ -91,6 +93,15 @@ rules:
     not_found, exactly as a missing id does, and changes nothing.
   stale_generation: A stale Ownership-Generation answers stale_generation and changes nothing; on a bulk route it fails the whole request.
   destroy: DELETE discards the entry and returns it; a later GET answers not_found.
+  replay_only: >-
+    A DELETE carrying Idempotency-Replay: only is answered only from the
+    receipt stored for the same company, acting user, entry and
+    Idempotency-Key: the stored answer is replayed. With no such receipt it
+    answers not_found and changes nothing; it never discards an entry. The
+    caller also sends If-Match: replay-only, a value that never matches a
+    version, so a provider that does not read the header still replays a
+    stored receipt or refuses with version_conflict, and never discards.
+    Every other route, and any other header value, ignores the header.
   credential_in_body: >-
     A write whose body holds, anywhere, a credential the provider issued or
     holds (a user token or a service identity) answers credential_in_body and
