@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_10_27_130000) do
+ActiveRecord::Schema[8.1].define(version: 2026_10_27_164215) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pg_stat_statements"
@@ -345,6 +345,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_27_130000) do
   end
 
   create_table "data_imports", force: :cascade do |t|
+    t.integer "attempted_rows", default: [], null: false, array: true
     t.bigint "company_id", null: false
     t.datetime "created_at", null: false
     t.boolean "dry_run", default: false, null: false
