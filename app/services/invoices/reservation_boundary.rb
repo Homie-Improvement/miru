@@ -51,20 +51,22 @@ module Invoices
     # billed. The invoice's operation lock is taken first, so a save still
     # running finishes and writes its commit row before the check.
     def mark_billed(invoice)
-      OperationLock.acquire!(Invoice.connection, company_id: invoice.company_id, invoice_id: invoice.id)
-      if InvoiceOperationOutboxItem.exists?(company_id: invoice.company_id, invoice_id: invoice.id, kind: "commit", delivered_at: nil)
+      company_id = invoice.company_id
+      invoice_id = invoice.id
+      OperationLock.acquire!(Invoice.connection, company_id:, invoice_id:)
+      if InvoiceOperationOutboxItem.exists?(company_id:, invoice_id:, kind: "commit", delivered_at: nil)
         raise OperationErrors::BillingRetryable, "reservation_commit_pending"
       end
 
-      holding = InvoiceEntryHolding.find_by(company_id: invoice.company_id, invoice_id: invoice.id)
+      holding = InvoiceEntryHolding.find_by(company_id:, invoice_id:)
       ownership = TimekeepingOwnership.current
       request = ReservationRequest.new(
-        company_id: invoice.company_id,
-        invoice_id: invoice.id,
+        company_id:,
+        invoice_id:,
         operation_id: SecureRandom.uuid,
         generation: ownership.generation,
         disposition: holding&.disposition || ACTIVE,
-        entries: CompanyEntries.on_lines(invoice.id, invoice.company_id)
+        entries: CompanyEntries.on_lines(invoice_id, company_id)
       )
       outcome = ReservationAdapters.for(ownership).mark_billed(request)
       raise OperationErrors::Refused.new(outcome) if outcome.state == "refused"
