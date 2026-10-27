@@ -29,4 +29,25 @@ RSpec.describe Timekeeping::Handoff::LegacyOperationsCheck do
     expect(row_keys).to contain_exactly(Timekeeping::Handoff::Reconciliation::RECEIPT_LINK_KEY.call(intent.call(1, "committed")))
     expect(listed.values.flatten).to all(have_attributes(check: :operation_receipts, field: "state"))
   end
+
+  # Intents are unique per company, invoice and operation, so another company's committed intent with the
+  # same invoice and operation ids must not explain a state change made after the checkpoint.
+  it "does not list a receipt for one company's intent because another company's matching intent was committed" do
+    intent = lambda do |company_id, state|
+      {
+        "id" => company_id, "company_id" => company_id, "invoice_id" => 21,
+        "operation_id" => "8f0c2a4e-1b2d-4c3e-9f00-000000000021", "generation" => 1,
+        "desired_entry_ids" => [], "disposition" => "active", "state" => state,
+        "created_at" => Time.utc(2026, 10, 1), "finished_at" => Time.utc(2026, 10, 1, 0, 1)
+      }
+    end
+
+    listed = described_class.listed_receipts(
+      source_intents: [intent.call(11, "failed"), intent.call(12, "committed")],
+      intents: [intent.call(11, "committed"), intent.call(12, "committed")],
+      legacy_retired_at: nil
+    )
+
+    expect(listed.keys).to eq([12])
+  end
 end

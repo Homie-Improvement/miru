@@ -40,12 +40,16 @@ module Timekeeping
       # legacy_retired_at: the ownership row's value, nil while legacy.
       # Returns { company_id => [Reconciliation::Correction] }.
       def self.listed_receipts(source_intents:, intents:, legacy_retired_at:)
+        # An intent is unique per company, invoice and operation, so the
+        # company is part of the match: another company's committed intent
+        # with the same invoice and operation ids must not vouch for this one.
+        company_receipt_key = ->(intent) { [intent["company_id"], *Reconciliation::RECEIPT_LINK_KEY.call(intent)] }
         committed_at_checkpoint = source_intents
           .select { |intent| intent["state"] == "committed" }
-          .to_set(&Reconciliation::RECEIPT_LINK_KEY)
+          .to_set(&company_receipt_key)
         intents
           .select { |intent| intent["state"] == "committed" }
-          .select { |intent| committed_at_checkpoint.include?(Reconciliation::RECEIPT_LINK_KEY.call(intent)) }
+          .select { |intent| committed_at_checkpoint.include?(company_receipt_key.call(intent)) }
           .select { |intent| legacy_retired_at.nil? || intent["created_at"] < legacy_retired_at }
           .group_by { |intent| intent["company_id"] }
           .transform_values do |committed|
