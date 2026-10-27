@@ -178,6 +178,7 @@ RSpec.describe "Characterization: invoice timesheet entry locking", type: :reque
     it "ends with the draft's entries unlocked, and the invoice-number rename does not lock them again" do
       invoice = create(:invoice, company:, client:)
       entries = locking_spec_mixed_line_entries(invoice)
+      # Reached through line creation, not force_locked, so the discard releases real reservations.
       expect_entries_state(entries, locked: true)
       number_before = invoice.reload.invoice_number
       intents_before = InvoiceOperationIntent.where(invoice_id: invoice.id).count
