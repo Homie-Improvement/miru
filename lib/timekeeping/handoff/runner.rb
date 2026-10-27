@@ -267,7 +267,7 @@ module Timekeeping
             source: source_copy.fetch(:source), checkpoint: loaded, projection: read_projection,
             source_intents: intents, intents:, next_entry_id:,
             money_before: report.read_money_before, money_after: take_money,
-            listed_corrections:,
+            listed_corrections: listed_corrections(intents),
             expected_reservations: source_legacy ? source_copy.fetch(:source).rows.fetch("reservations").group_by { |row| row["company_id"] } : nil
           )
           report.write_reconciliation(@reconciliation.to_h)
@@ -389,11 +389,17 @@ module Timekeeping
         # The differences the planned load copy makes on purpose, derived from
         # that copy rather than from what the incoming owner now holds, so a
         # wrong load can never list its own difference as expected.
-        def listed_corrections
+        def listed_corrections(intents)
           source, load = source_copy.values_at(:source, :load)
-          return ReservationLocks.listed_corrections(source:, loaded: load) unless source_legacy
-
-          LegacyLoadVersions.listed_corrections(source:, loaded: load, corrections: source_copy.fetch(:corrections))
+          planned = if source_legacy
+            LegacyLoadVersions.listed_corrections(source:, loaded: load, corrections: source_copy.fetch(:corrections))
+          else
+            ReservationLocks.listed_corrections(source:, loaded: load)
+          end
+          legacy_receipts = LegacyOperationsCheck.listed_receipts(
+            intents, legacy_retired_at: TimekeepingOwnership.current.legacy_retired_at
+          )
+          planned.merge(legacy_receipts) { |_company_id, differences, receipts| differences + receipts }
         end
 
         # The first cutover's corrections as the outbox rows Timekeeping's

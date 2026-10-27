@@ -18,6 +18,35 @@ module Timekeeping
           OR EXISTS (SELECT 1 FROM invoice_operations WHERE state = 'prepared')
       SQL
 
+      # The legacy reservation adapter (Invoices::LegacyReservations) settles
+      # an invoice save in the save's own transaction, so its intents reach
+      # 'committed' with no invoice_operations row behind them, and those
+      # intents stay in the monolith after the legacy source is retired.
+      # Reconciliation requires a committed operation for every committed
+      # intent, so each intent the legacy adapter committed is listed as an
+      # expected difference instead, keyed by the invoice and operation it
+      # names. The legacy adapter served every intent created while
+      # legacy_retired_at was null: it is set in the flip transaction, and
+      # admission stays closed from step 1 until that flip, so no intent is
+      # created between the last legacy write and the retirement.
+      #
+      # intents: invoice_operation_intents rows as read for reconciliation.
+      # legacy_retired_at: the ownership row's value, nil while legacy.
+      # Returns { company_id => [Reconciliation::Correction] }.
+      def self.listed_receipts(intents, legacy_retired_at:)
+        intents
+          .select { |intent| intent["state"] == "committed" }
+          .select { |intent| legacy_retired_at.nil? || intent["created_at"] < legacy_retired_at }
+          .group_by { |intent| intent["company_id"] }
+          .transform_values do |committed|
+            committed.map do |intent|
+              Reconciliation::Correction.new(
+                check: :operation_receipts, row_key: Reconciliation::RECEIPT_LINK_KEY.call(intent), field: "state"
+              )
+            end
+          end
+      end
+
       def initialize(connection: InvoiceOperationsRecord.connection)
         @connection = connection
       end
