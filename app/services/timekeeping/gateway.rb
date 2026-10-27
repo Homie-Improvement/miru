@@ -201,22 +201,27 @@ module Timekeeping
     # otherwise end at the lookup. A lookup that finds nothing is therefore
     # followed by a DELETE that Timekeeping answers only from its stored
     # receipt for the same actor and key (see replay_timekeeping_destroy).
+    # An entry the lookup finds but the scope refuses is still live, so no
+    # delete of it can have committed, and it is refused without a replay.
     def destroy(entry_id:, authorize:, expected_generation: nil, scope: :company)
       perform(expected_generation) do |ownership, owner|
         found = begin
-          find_authorized(ownership:, entry_id:, authorize:, scope:)
+          EntryLookup.find_in_owner(ownership:, context:, entry_id:, local_owner:, read_client:)
         rescue ActiveRecord::RecordNotFound
           raise unless owner == :timekeeping
 
           next replay_timekeeping_destroy(ownership:, entry_id:, authorize:, scope:)
         end
+        entry = found.entry
+        EntryLookup.check_target(entry, context:, entry_id:, scope:)
+        authorize.call(entry)
         case owner
         when :legacy
-          found.entry.discard!
+          entry.discard!
         when :prepared
-          local_owner.destroy_entry(context:, entry: found.entry)
+          local_owner.destroy_entry(context:, entry:)
         when :timekeeping
-          write_client.destroy_entry(context:, generation: ownership.generation, entry_id: found.entry.id,
+          write_client.destroy_entry(context:, generation: ownership.generation, entry_id: entry.id,
                                      version: found.version)
         end
         true
