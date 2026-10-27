@@ -81,6 +81,7 @@ module Timekeeping
 
     attr_reader :context, :local_owner, :write_client, :read_client, :service_client, :ownership_reader
 
+    # :reek:LongParameterList
     def initialize(context:, local_owner: UnavailableLocalOwner.new, write_client: EntryWriteClient.new,
                    read_client: EntryApiClient.new, service_client: ServiceCommandClient.new,
                    ownership_reader: LockedOwnership)
