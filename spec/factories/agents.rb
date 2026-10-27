@@ -8,7 +8,7 @@ FactoryBot.define do
         create(:employment, company:, user: agent_user)
       end
     end
-    name { "Delivery Agent" }
+    sequence(:name) { |n| "Delivery Agent #{n}" }
     provider { "custom" }
     active { true }
     metadata { {} }
