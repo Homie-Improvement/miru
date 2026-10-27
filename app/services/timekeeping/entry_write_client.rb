@@ -117,20 +117,23 @@ module Timekeeping
     # create.
     def create_entry(context:, generation:, body:, idempotency_key: nil)
       path = format(ENTRIES_PATH, company_id: context.company.id)
-      forward(Net::HTTP::Post, path, operation: "create", context:, generation:, body:, idempotency_key:)
+      forward(Net::HTTP::Post, path, operation: "create", context:, generation:, body:,
+                                     idempotency_key: idempotency_key || request_key(context, "create"))
     end
 
     # Returns the updated entry Hash. Only EDIT_FIELDS of body are sent.
     def update_entry(context:, generation:, entry_id:, version:, body:)
       path = format(ENTRY_PATH, company_id: context.company.id, entry_id:)
-      forward(Net::HTTP::Patch, path, operation: "update", context:, generation:, entry_id:, version:,
+      forward(Net::HTTP::Patch, path, operation: "update", context:, generation:, version:,
+                                      idempotency_key: request_key(context, "update", entry_id),
                                       body: self.class.edit_fields(body))
     end
 
     # Returns the discarded entry Hash.
     def destroy_entry(context:, generation:, entry_id:, version:)
       path = format(ENTRY_PATH, company_id: context.company.id, entry_id:)
-      forward(Net::HTTP::Delete, path, operation: "destroy", context:, generation:, entry_id:, version:)
+      forward(Net::HTTP::Delete, path, operation: "destroy", context:, generation:, version:,
+                                       idempotency_key: request_key(context, "destroy", entry_id))
     end
 
     # Returns the stored answer of a destroy this request id already committed.
@@ -138,21 +141,25 @@ module Timekeeping
     # same company, actor and key it answers 404, raised as RecordNotFound.
     def replay_destroy_entry(context:, generation:, entry_id:)
       path = format(ENTRY_PATH, company_id: context.company.id, entry_id:)
-      forward(Net::HTTP::Delete, path, operation: "destroy", context:, generation:, entry_id:,
+      forward(Net::HTTP::Delete, path, operation: "destroy", context:, generation:,
+                                       idempotency_key: request_key(context, "destroy", entry_id),
                                        version: REPLAY_ONLY_IF_MATCH, replay_only: true)
     end
 
     private
 
-      def forward(request_class, path, operation:, context:, generation:, entry_id: nil, version: nil, body: nil,
-                  idempotency_key: nil, replay_only: false)
+      def request_key(context, operation, entry_id = nil)
+        self.class.idempotency_key(request_id: context.request_id, operation:, entry_id:)
+      end
+
+      def forward(request_class, path, operation:, context:, generation:, idempotency_key:, version: nil, body: nil,
+                  replay_only: false)
         raise Error, "#{EntryApiClient::BASE_URL_ENV} is not set" if @base_url.blank?
 
         request = request_class.new(URI.join(@base_url, path))
         request["Authorization"] = "Bearer #{token_for(context, body)}"
         request["Ownership-Generation"] = generation.to_s
-        request["Idempotency-Key"] = idempotency_key ||
-                                     self.class.idempotency_key(request_id: context.request_id, operation:, entry_id:)
+        request["Idempotency-Key"] = idempotency_key
         request["X-Request-Id"] = context.request_id.to_s
         request["If-Match"] = version.to_s unless version.nil?
         request[REPLAY_ONLY_HEADER] = REPLAY_ONLY_VALUE if replay_only
