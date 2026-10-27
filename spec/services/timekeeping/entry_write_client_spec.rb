@@ -479,3 +479,29 @@ RSpec.describe Timekeeping::EntryWriteClient do
                                          "external_session_id", "review_status")
   end
 end
+
+RSpec.describe Timekeeping::EntryWriteClient, "create body serialization" do
+  # Timekeeping fingerprints the serialized body, so a web create retried after
+  # this change must serialize exactly as before it, source keys last.
+  it "serializes a web create body with the default source keys after project_id and user_id" do
+    user = Struct.new(:id).new(7)
+    project = Struct.new(:id).new(11)
+    attributes = { "duration" => 30.0, "work_date" => "2026-03-02", "note" => "Retry", "bill_status" => "unbilled" }
+
+    body = described_class.create_body(user:, project:, attributes:)
+
+    expect(JSON.generate(body)).to eq(
+      '{"duration":30.0,"work_date":"2026-03-02","note":"Retry","bill_status":"unbilled",' \
+      '"project_id":11,"user_id":7,"source":"manual","source_metadata":{}}'
+    )
+  end
+
+  it "keeps a cli create's own source values over the defaults" do
+    body = described_class.create_body(user: Struct.new(:id).new(7), project: Struct.new(:id).new(11),
+                                       attributes: { "duration" => 30.0, "source" => "mcp",
+                                                     "source_metadata" => { "mcp_server" => "miru" } },
+                                       actor_kind: "cli")
+
+    expect(body).to include("source" => "mcp", "source_metadata" => { "mcp_server" => "miru" })
+  end
+end

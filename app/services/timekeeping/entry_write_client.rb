@@ -105,10 +105,15 @@ module Timekeeping
     # The create body for the writer of actor_kind. user and project are
     # records the caller already resolved inside the company, never raw
     # params.
+    #
+    # Timekeeping fingerprints the body as serialized, key order included, so
+    # a retry must send its keys in the order the first attempt did. The
+    # default source keys therefore come last, as they always have, and a
+    # writer's own source values keep their place and win.
     def self.create_body(user:, project:, attributes:, actor_kind: "user")
-      CREATE_SOURCE.deep_dup
-        .merge(forwarded_fields(attributes, actor_kind:, operation: :create))
+      forwarded_fields(attributes, actor_kind:, operation: :create)
         .merge("project_id" => project.id, "user_id" => user.id)
+        .merge(CREATE_SOURCE.deep_dup) { |_key, given, _default| given }
     end
 
     # The create body for an imported entry. Unlike create_body, it records

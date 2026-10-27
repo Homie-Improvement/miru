@@ -217,42 +217,76 @@ RSpec.describe Timekeeping::EntryWriter, "agent create against a detach of the s
     )
   end
 
-  def on_own_connection(&block)
-    Thread.new { ApplicationRecord.connection_pool.with_connection { block.call } }
+  # Runs block on a connection of its own, first pushing that connection's
+  # server process id to backend_pids.
+  def on_own_agent_connection(backend_pids, &block)
+    Thread.new do
+      ApplicationRecord.connection_pool.with_connection do |connection|
+        backend_pids.push(connection.select_value("SELECT pg_backend_pid()"))
+        block.call
+      end
+    end
+  end
+
+  # Whether the database reports waiting_pid blocked by holding_pid within a
+  # few seconds. A thread that has not finished may simply not have started,
+  # so only the server's own lock graph shows a real wait.
+  def agent_detach_blocked_by?(waiting_pid, holding_pid)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 3
+    while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      blocked = ApplicationRecord.connection.select_value(
+        ApplicationRecord.sanitize_sql_array(["SELECT ? = ANY(pg_blocking_pids(?))", holding_pid, waiting_pid])
+      )
+      return true if blocked
+
+      sleep 0.02
+    end
+    false
   end
 
   # Runs the create until it reaches hold_at, then starts the detach on
   # another connection and lets the create go on after detach_wait seconds.
-  # Returns the create's outcome, the detach's outcome and whether the detach
-  # finished while the create was held.
+  # Returns the create's outcome, the detach's outcome, whether the detach
+  # finished while the create was held, and whether the database reported
+  # the detach waiting on the create.
   def run_create_held_at(hold_at, detach_wait:)
     command = agent_create
     request = detach_request
     reached = Queue.new
     release = Queue.new
+    creator_pids = Queue.new
+    detacher_pids = Queue.new
     checkpoint = lambda do |step|
       next unless step == hold_at
 
       reached << true
       release.pop
     end
-    creator = on_own_connection { described_class.new(checkpoint:).call(command) }
+    creator = on_own_agent_connection(creator_pids) { described_class.new(checkpoint:).call(command) }
     detacher = nil
     detach_finished_while_held = false
+    detach_blocked = false
     begin
       expect(reached.pop(timeout: wait_seconds)).to be(true)
-      detacher = on_own_connection { Timekeeping::ServiceCommands.new.call(request) }
+      detacher = on_own_agent_connection(detacher_pids) { Timekeeping::ServiceCommands.new.call(request) }
       detach_finished_while_held = !detacher.join(detach_wait).nil?
+      unless detach_finished_while_held
+        detach_blocked = agent_detach_blocked_by?(detacher_pids.pop(timeout: wait_seconds),
+                                                  creator_pids.pop(timeout: wait_seconds))
+      end
     ensure
       release << true
     end
-    [creator.join(wait_seconds)&.value, detacher&.join(wait_seconds)&.value, detach_finished_while_held]
+    [creator.join(wait_seconds)&.value, detacher&.join(wait_seconds)&.value, detach_finished_while_held,
+     detach_blocked]
   end
 
   it "makes a detach wait for a create that holds the agent lock, then detaches the committed entry" do
-    created, detached, detach_finished_while_held = run_create_held_at(:generation_checked, detach_wait: 1)
+    created, detached, detach_finished_while_held, detach_blocked =
+      run_create_held_at(:generation_checked, detach_wait: 1)
 
     expect(detach_finished_while_held).to be(false)
+    expect(detach_blocked).to be(true)
     expect(created.status).to eq(201)
     expect([detached.status, JSON.parse(detached.body)]).to eq([200, { "detached" => 1 }])
     expect(Entry.sole.agent_id).to be_nil

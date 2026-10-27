@@ -907,6 +907,26 @@ RSpec.describe Timekeeping::Gateway, "writer-specific forwarded fields" do
     expect(body).not_to have_key("user_id")
   end
 
+  # A legacy update! applies the source rule to the stored metadata when the
+  # request leaves it out, so the forwarded update must too.
+  it "forwards a cli update that omits source_metadata with the stored metadata and the source it implies" do
+    entry_id = writer_fake.add_entry(company_id: writer_company.id, user_id: writer_user.id,
+                                     project_id: writer_project.id, "work_date" => Date.current.iso8601,
+                                     "source" => "automation", "source_metadata" => { "tool" => "codex" })["id"]
+
+    writer_with_key do
+      writer_gateway("cli").update(
+        entry_id:, project: writer_project, authorize: ->(_entry) { }, scope: :actor,
+        attributes: { duration: 45, work_date: Date.current, source: "cli", note: "Edited" }
+      )
+    end
+
+    body = writer_sent_bodies("PATCH").sole
+    expect(body).to include("note" => "Edited", "source" => "automation", "source_metadata" => { "tool" => "codex" })
+    expect(writer_fake.stored_entry(entry_id)).to include("source" => "automation",
+                                                          "source_metadata" => { "tool" => "codex" })
+  end
+
   it "reports a refused cli write with the cli actor kind" do
     TimekeepingOwnership.current.update_columns(handoff_step: "close_admission")
     events = []
