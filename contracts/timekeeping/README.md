@@ -12,10 +12,10 @@ The files are data. `TimekeepingContract.load(name)` in `spec/support/timekeepin
 
 ## Running the examples against an implementation
 
-The shared groups are `"timekeeping entry API contract"`, `"timekeeping reservations contract"`, `"timekeeping idempotency contract"`, `"timekeeping entry snapshot shape"`, `"timekeeping entry snapshot endpoint"` and `"timekeeping prepare reconciliation"`. Each runs on its own, so a provider can include only the groups for the routes it already serves. Require the group file from `spec/contracts/timekeeping/` and define:
+The shared groups are `"timekeeping entry API contract"`, `"timekeeping reservations contract"`, `"timekeeping idempotency contract"`, `"timekeeping entry replay contract"`, `"timekeeping entry snapshot shape"`, `"timekeeping entry snapshot endpoint"` and `"timekeeping prepare reconciliation"`. Each runs on its own, so a provider can include only the groups for the routes it already serves. Require the group file from `spec/contracts/timekeeping/` and define:
 
 - `timekeeping_client`: responds to `call(method, path, headers: {}, body: nil)` and returns a `TimekeepingContract::Response` with the status and the JSON body parsed into string-keyed Hashes.
-- `timekeeping_arrange`: seeds companies, users, tokens, service identities, projects, entries and reserved entries, sets the ownership generation, and reads what the examples cannot reach through a route. `TimekeepingContract::FakeArrange` lists every method.
+- `timekeeping_arrange`: seeds companies, users, tokens, service identities, projects, entries and reserved entries, sets the ownership generation, and reads what the examples cannot reach through a route, such as a stored entry (`stored_entry`) and the number of outbox rows (`outbox_size`, which the replay group uses to show a replay wrote nothing). `TimekeepingContract::FakeArrange` lists every method.
 - `reconciler`, for the reconciliation group only: responds to `call(remote_state:, intent_state:)`.
 
 `spec/contracts/timekeeping/fake_timekeeping_spec.rb` and `fake_relay_spec.rb` run the groups against the in-memory fakes through the `"timekeeping contract fakes"` shared context. `mutation_spec.rb` breaks one rule of a fake at a time and checks that the matching group fails.

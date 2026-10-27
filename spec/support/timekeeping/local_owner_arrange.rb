@@ -164,6 +164,11 @@ module TimekeepingContract
       Timekeeping::LocalEntry.with_reserved.find(entry_id).reserved
     end
 
+    # Every outbox row, sent or not.
+    def outbox_size
+      Timekeeping::LocalOutboxEntry.count
+    end
+
     # The unsent outbox rows in position order, each with its snapshot.
     def published_snapshots
       Timekeeping::LocalOutboxEntry.where(sent_at: nil).order(:outbox_position).map do |row|
