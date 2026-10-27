@@ -291,7 +291,7 @@ RSpec.describe Timekeeping::EntryWriteClient, "import creates" do
                                              idempotency_key: SecureRandom.uuid)
 
     expect(entry["bill_status"]).to eq("billed")
-    expect(import_fake.requests.map { |request| request[:method] }).to eq(["POST"])
+    expect(import_fake.requests.pluck(:method)).to eq(["POST"])
     expect(import_fake.requests.first[:body]).to include("bill_status" => "billed", "source" => "import")
   end
 end

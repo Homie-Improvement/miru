@@ -442,8 +442,6 @@ RSpec.describe Timekeeping::Gateway do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::Gateway do
   let(:imp_company) { create(:company) }
   let(:imp_admin) do
@@ -472,8 +470,6 @@ RSpec.describe Timekeeping::Gateway do
     expect(TimesheetEntry.where(project: imp_project, note: "billed row")).not_to exist
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::Gateway do
   let(:fb_company) { create(:company) }
@@ -513,7 +509,7 @@ RSpec.describe Timekeeping::Gateway do
       end
     end.not_to change(TimesheetEntry, :count)
 
-    expect(fb_fake.requests.map { |request| request[:method] }).to eq(["POST"])
+    expect(fb_fake.requests.pluck(:method)).to eq(["POST"])
     sent = fb_fake.requests.first
     expect(sent[:headers]["Idempotency-Key"]).to eq(key)
     expect(sent[:body]).to include("bill_status" => "billed", "source" => "import", "source_metadata" => { "tool" => "harvest" })
@@ -577,8 +573,6 @@ RSpec.describe Timekeeping::Gateway do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::Gateway do
   # "A billed row is always one write that carries its final bill status, so no refusal can leave it unbilled."
   # The update to billed raises after the create has run, so a create that commits on its own leaves an unbilled entry.
@@ -604,8 +598,6 @@ RSpec.describe Timekeeping::Gateway do
     expect(TimesheetEntry.where(project:).count).to eq(0)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::Gateway do
   # "Forwarded writes use an `Idempotency-Key` built from the data import id and a digest of the row, so rerunning a failed import does not duplicate rows it already forwarded."

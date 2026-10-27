@@ -87,7 +87,7 @@ RSpec.describe DataImportJob, type: :job do
     expect(fwd_import.reload.status).to eq("completed")
     expect(creates.size).to eq(1)
     expect(creates.first[:path]).to include("/v1/companies/#{fwd_company.id}/entries")
-    expect(fwd_fake.requests.map { |request| request[:path] }).to all(satisfy { |path| path.exclude?("/v1/companies/#{fwd_other_company.id}/") })
+    expect(fwd_fake.requests.pluck(:path)).to all(satisfy { |path| path.exclude?("/v1/companies/#{fwd_other_company.id}/") })
     # The entry belongs to the employee named on the row, never to the admin who ran the import.
     expect(creates.first[:body]["user_id"]).to eq(fwd_paul.id)
     expect(creates.first[:body]["project_id"]).to eq(fwd_project.id)
@@ -142,8 +142,6 @@ RSpec.describe DataImportJob, type: :job do
     expect(left_fake.requests.select { |request| request[:method] == "POST" }).to be_empty
   end
 end
-
-require "rails_helper"
 
 RSpec.describe DataImportJob do
   let(:left_company) { create(:company, base_currency: "INR", date_format: "MM-DD-YYYY") }
@@ -311,8 +309,6 @@ RSpec.describe DataImportJob, type: :job do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe DataImportJob, type: :job do
   let(:job_fwd_company) { create(:company) }
   let(:job_fwd_actor) { create(:user, current_workspace_id: job_fwd_company.id) }
@@ -361,7 +357,7 @@ RSpec.describe DataImportJob, type: :job do
 
     creates = job_fwd_fake.requests.select { |request| request[:method] == "POST" }
     expect(creates.size).to eq(2)
-    expect(creates.map { |request| request[:path] }.uniq).to eq(["/v1/companies/#{job_fwd_company.id}/entries"])
+    expect(creates.pluck(:path).uniq).to eq(["/v1/companies/#{job_fwd_company.id}/entries"])
     expect(creates.map { |request| request[:body]["user_id"] }).to all(eq(job_fwd_paul.id))
     expect(creates.map { |request| request[:body]["source"] }).to all(eq("import"))
     expect(creates.map { |request| request[:body]["source_metadata"] }).to all(eq("tool" => "harvest"))

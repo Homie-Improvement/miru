@@ -445,8 +445,6 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Imports::HarvestTimeEntriesImporter do
   let(:fwd_company) { create(:company, base_currency: "INR", date_format: "MM-DD-YYYY") }
   let(:fwd_actor) { create(:user, current_workspace_id: fwd_company.id) }
@@ -495,8 +493,8 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     end
 
     expect { described_class.new(fwd_import).process }.to raise_error(Timekeeping::Gateway::StaleGeneration)
-    first_run_keys = fwd_fake.requests.select { |request| request[:method] == "POST" }
-      .map { |request| request[:headers]["Idempotency-Key"] }
+    first_run_keys = fwd_fake.requests
+      .filter_map { |request| request[:headers]["Idempotency-Key"] if request[:method] == "POST" }
     expect(first_run_keys.size).to eq(1)
 
     described_class.new(fwd_import.reload).process
@@ -514,8 +512,6 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     expect(fwd_import.reload).to have_attributes(status: "completed", failed_rows: 0)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Imports::HarvestTimeEntriesImporter do
   let(:legacy_company) { create(:company, base_currency: "INR", date_format: "MM-DD-YYYY") }
@@ -559,8 +555,6 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Imports::HarvestTimeEntriesImporter do
   let(:billed_fwd_company) { create(:company) }
   let(:billed_fwd_actor) { create(:user, current_workspace_id: billed_fwd_company.id) }
@@ -600,14 +594,12 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
       end
     end
 
-    expect(billed_fwd_fake.requests.map { |request| request[:method] }).to eq(["POST"])
+    expect(billed_fwd_fake.requests.pluck(:method)).to eq(["POST"])
     expect(billed_fwd_fake.requests.first[:body]["bill_status"]).to eq("billed")
     expect(billed_fwd_import.reload).to have_attributes(status: "completed", imported_rows: 1, failed_rows: 0)
     expect(billed_fwd_import.row_errors).to eq([])
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Imports::HarvestTimeEntriesImporter do
   let(:rerun_company) { create(:company) }
@@ -657,12 +649,12 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, rerun_base_url) do
       with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
         expect { described_class.new(rerun_import).process }.to raise_error(Timekeeping::Gateway::StaleGeneration)
-        first_run_keys = rerun_fake.requests.select { |r| r[:method] == "POST" }.map { |r| r[:headers]["Idempotency-Key"] }
+        first_run_keys = rerun_fake.requests.filter_map { |r| r[:headers]["Idempotency-Key"] if r[:method] == "POST" }
         expect(first_run_keys.size).to eq(1)
 
         described_class.new(rerun_import.reload).process
 
-        all_keys = rerun_fake.requests.select { |r| r[:method] == "POST" }.map { |r| r[:headers]["Idempotency-Key"] }
+        all_keys = rerun_fake.requests.filter_map { |r| r[:headers]["Idempotency-Key"] if r[:method] == "POST" }
         rerun_keys = all_keys.drop(first_run_keys.size)
         expect(rerun_keys.size).to eq(2)
         expect(rerun_keys.uniq.size).to eq(2)
@@ -673,8 +665,6 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     expect(rerun_import.reload).to have_attributes(status: "completed", failed_rows: 0)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Imports::HarvestTimeEntriesImporter do
   let(:gen_company) { create(:company) }
@@ -715,8 +705,6 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Imports::HarvestTimeEntriesImporter do
   let(:handoff_company) { create(:company) }
   let(:handoff_actor) { create(:user, current_workspace_id: handoff_company.id) }
@@ -756,8 +744,6 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Imports::HarvestTimeEntriesImporter do
   let(:legacy_billed_company) { create(:company) }
   let(:legacy_billed_actor) { create(:user, current_workspace_id: legacy_billed_company.id) }
@@ -790,8 +776,6 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     expect(legacy_billed_import.row_errors.size).to eq(1)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Imports::HarvestTimeEntriesImporter do
   let(:left_company) { create(:company) }
@@ -861,8 +845,6 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Imports::HarvestTimeEntriesImporter do
   let(:stale_company) { create(:company, base_currency: "INR", date_format: "MM-DD-YYYY") }
   let(:stale_actor) { create(:user, current_workspace_id: stale_company.id) }
@@ -904,8 +886,6 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Imports::HarvestTimeEntriesImporter do
   let(:handoff_company) { create(:company, base_currency: "INR", date_format: "MM-DD-YYYY") }
   let(:handoff_actor) { create(:user, current_workspace_id: handoff_company.id) }
@@ -943,8 +923,6 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     expect(writes).to eq(1)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Imports::HarvestTimeEntriesImporter do
   let(:rerun_company) { create(:company, base_currency: "INR", date_format: "MM-DD-YYYY") }
@@ -985,7 +963,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   end
 
   def rerun_create_keys
-    rerun_fake.requests.select { |request| request[:method] == "POST" }.map { |request| request[:headers]["Idempotency-Key"] }
+    rerun_fake.requests.filter_map { |request| request[:headers]["Idempotency-Key"] if request[:method] == "POST" }
   end
 
   # "Forwarded writes use an `Idempotency-Key` built from the data import id and a digest of the row, so rerunning a failed import does not duplicate rows it already forwarded."
@@ -1016,8 +994,6 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     expect(rerun_import.reload).to have_attributes(status: "completed", imported_rows: 2, failed_rows: 0)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Imports::HarvestTimeEntriesImporter do
   let(:departed_company) { create(:company, base_currency: "INR", date_format: "MM-DD-YYYY") }
