@@ -24,7 +24,7 @@ applies_when:
 
 ## Context
 
-Invoice saves record an intent, then an outbox row of kind `commit` or `abort`. A delivery job later calls the reservation adapter's `commit` or `abort` and marks the row delivered only when the answer is exactly `committed` (for a commit row) or `aborted` (for an abort row). Any other answer keeps the row and counts another attempt.
+Invoice saves record an intent, then an outbox row of kind `commit` or `abort`. A delivery job later calls the reservation adapter's `commit` or `abort`. `Invoices::OutboxDelivery` reads the answer as the operation's remote state and pairs it with the intent's state through the contract's `save_reconciliation` table (`Invoices::SaveReconciliation`). A commit row is written only beside a `committed` intent and an abort row only beside a `failed` one, so in practice the row is delivered only when the answer is `committed` (for a commit row) or `aborted` (for an abort row). Any other answer keeps the row and counts another attempt.
 
 A refused prepare stores no `invoice_operations` row, yet the coordinator still writes an abort row for it. The spec fake in `spec/support/timekeeping/fake_timekeeping.rb` answers `not_found` when the operation is missing. An adapter that copies that answer leaves the abort row undelivered forever.
 
