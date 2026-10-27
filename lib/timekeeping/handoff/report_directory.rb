@@ -39,6 +39,12 @@ module Timekeeping
         raise Unreadable, "#{path.join(MONEY_BEFORE_FILE)}: #{error.message}"
       end
 
+      # Whether settle has already stored the money baseline. A repeated settle
+      # keeps that file, so a value changed in between is still caught.
+      def money_before?
+        path.join(MONEY_BEFORE_FILE).file?
+      end
+
       # Whether the checkpoint step has already stored its capture time. With
       # no file the step has not started and may take a fresh capture time.
       def checkpoint?

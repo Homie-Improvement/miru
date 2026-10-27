@@ -279,8 +279,9 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     loaded_ids = timekeeping_store.loaded.rows.fetch("entries").pluck("id")
     expect(loaded_ids.sort).to eq(uninterrupted[:checkpoint].rows.fetch("entries").pluck("id").sort)
     expect(loaded_ids.size).to eq(TimesheetEntry.unscoped.count)
-    expect(timekeeping_store.corrections.sort_by { |c| c["entry_id"] })
-      .to eq(uninterrupted[:corrections].sort_by { |c| c["entry_id"] })
+    # Timekeeping's correction writer takes each corrected entry row without its version.
+    expect(timekeeping_store.corrections.sort_by { |c| c["id"] })
+      .to eq(uninterrupted[:corrections].map { |c| c.fetch("snapshot").except("version") }.sort_by { |c| c["id"] })
     expect(calls.count([:timekeeping, :admit, 2])).to eq(1)
   end
 end
@@ -348,7 +349,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     reserved_ids = YAML.load_file(Timekeeping::SeedDispositionRecorder::DEFAULT_PATH).fetch("companies").values
       .flat_map { |invoices| invoices.values.flat_map { |invoice| invoice["entry_ids"] } }
     # "The first cutover turns each recorded unlocked link into a committed reservation with one correction snapshot"
-    corrected = timekeeping_store.corrections.pluck("entry_id")
+    corrected = timekeeping_store.corrections.pluck("id")
     expect(corrected.tally.values.uniq).to eq([1])
     expect(corrected.sort).to eq(reserved_ids.sort)
     expect(timekeeping_store.loaded.rows.fetch("entries").size).to eq(TimesheetEntry.unscoped.count)

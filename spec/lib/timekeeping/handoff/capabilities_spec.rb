@@ -19,8 +19,20 @@ RSpec.describe Timekeeping::Handoff::Capabilities do
       def enforces_fence? = false
     end.new
   end
-  let(:settle) { Object.new }
-  let(:drain) { Object.new }
+  # "Second, the outgoing owner has working settle and drain integrations configured."
+  let(:settle) do
+    Class.new do
+      def settle!(generation:) = generation && nil
+      def settled? = true
+      def stop_applying! = nil
+    end.new
+  end
+  let(:drain) do
+    Class.new do
+      def drain!(through:) = through && nil
+      def drained?(through:) = through && true
+    end.new
+  end
 
   def owner(name, admission:, settle: nil, drain: nil)
     Timekeeping::Handoff::Owner.new(name: name, store: Object.new, admission:, settle:, drain:)
@@ -43,6 +55,12 @@ RSpec.describe Timekeeping::Handoff::Capabilities do
     expect(gate.refusal(source_legacy: true, outgoing: owner(:monolith, admission: enforcing_admission), incoming: timekeeping)).to be_nil
     expect(gate.refusal(source_legacy: false, outgoing: owner(:monolith, admission: enforcing_admission, settle:, drain:),
                         incoming: timekeeping)).to be_nil
+
+    # Objects that lack the settle or drain calls are not working integrations.
+    expect(gate.refusal(source_legacy: false, outgoing: owner(:monolith, admission: enforcing_admission, settle: Object.new, drain:),
+                        incoming: timekeeping)).to be_present
+    expect(gate.refusal(source_legacy: false, outgoing: owner(:monolith, admission: enforcing_admission, settle:, drain: Object.new),
+                        incoming: timekeeping)).to be_present
   end
 end
 

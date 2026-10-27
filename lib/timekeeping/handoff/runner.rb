@@ -189,10 +189,13 @@ module Timekeeping
 
         # Step 2. The money snapshot is taken once every operation admitted
         # before step 1 has settled; billing writes stay refused from here to
-        # the flip, so the snapshot after reconcile must equal it.
+        # the flip, so the snapshot after reconcile must equal it. A settle
+        # repeated after its file was stored keeps that baseline.
         def settle
           settle_integration.settle!(generation: @generation)
-          report.write_money_before(take_money) if settle_integration.settled?
+          return unless settle_integration.settled? && !report.money_before?
+
+          report.write_money_before(take_money)
         end
 
         def settled?
@@ -228,8 +231,7 @@ module Timekeeping
           incoming.store.load_checkpoint(source_copy.fetch(:load))
           if source_legacy
             incoming.store.write_correction_snapshots(
-              snapshots: source_copy.fetch(:corrections), version: ReservationDerivation::CORRECTION_VERSION,
-              generation: @generation
+              snapshots: correction_snapshots, version: ReservationDerivation::CORRECTION_VERSION, generation: @generation
             )
           end
           observer.call(:after_corrections, step: "checkpoint")
@@ -259,7 +261,7 @@ module Timekeeping
             source: source_copy.fetch(:source), checkpoint: loaded, projection: read_projection,
             source_intents: intents, intents:, next_entry_id:,
             money_before: report.read_money_before, money_after: take_money,
-            listed_corrections: listed_corrections(loaded),
+            listed_corrections:,
             expected_reservations: source_legacy ? source_copy.fetch(:source).rows.fetch("reservations").group_by { |row| row["company_id"] } : nil
           )
           report.write_reconciliation(@reconciliation.to_h)
@@ -365,7 +367,7 @@ module Timekeeping
         def export_source(captured_at)
           unless source_legacy
             exported = outgoing.store.export_checkpoint
-            return { source: exported, load: exported, corrections: [] }
+            return { source: exported, load: ReservationLocks.build(exported), corrections: [] }
           end
 
           exported = LegacySource.new(connection: ActiveRecord::Base.connection, recorded_disposition:)
@@ -375,11 +377,21 @@ module Timekeeping
           { source: exported.fetch(:checkpoint), load:, corrections: exported.fetch(:corrections) }
         end
 
-        def listed_corrections(loaded)
-          return {} unless source_legacy
+        # The differences the planned load copy makes on purpose, derived from
+        # that copy rather than from what the incoming owner now holds, so a
+        # wrong load can never list its own difference as expected.
+        def listed_corrections
+          source, load = source_copy.values_at(:source, :load)
+          return ReservationLocks.listed_corrections(source:, loaded: load) unless source_legacy
 
-          LegacyLoadVersions.listed_corrections(source: source_copy.fetch(:source), loaded:,
-                                                corrections: source_copy.fetch(:corrections))
+          LegacyLoadVersions.listed_corrections(source:, loaded: load, corrections: source_copy.fetch(:corrections))
+        end
+
+        # The first cutover's corrections as the outbox rows Timekeeping's
+        # correction writer takes: the corrected entry without its version,
+        # which travels as its own argument.
+        def correction_snapshots
+          source_copy.fetch(:corrections).map { |correction| correction.fetch("snapshot").except("version") }
         end
 
         def recorded_disposition

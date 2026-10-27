@@ -10,6 +10,10 @@ module Timekeeping
     # non-legacy source. Pure: it only inspects the configured objects.
     class Capabilities
       ADMISSION_METHODS = %i[fence_admission admit enforces_fence?].freeze
+      # The calls the runner makes on a non-legacy source's integrations, so
+      # one that lacks any is refused before admission closes.
+      SETTLE_METHODS = %i[settle! settled? stop_applying!].freeze
+      DRAIN_METHODS = %i[drain! drained?].freeze
 
       # Returns why the handoff cannot start, or nil when it can.
       def refusal(source_legacy:, outgoing:, incoming:)
@@ -19,8 +23,8 @@ module Timekeeping
         # The legacy monolith registers no invoice operations and has no entry
         # outbox, so the runner only checks that none remain unresolved.
         return if source_legacy
-        return "#{outgoing.name} has no settle integration configured" if outgoing.settle.nil?
-        return "#{outgoing.name} has no drain integration configured" if outgoing.drain.nil?
+        return "#{outgoing.name} has no working settle integration configured" unless responds?(outgoing.settle, SETTLE_METHODS)
+        return "#{outgoing.name} has no working drain integration configured" unless responds?(outgoing.drain, DRAIN_METHODS)
 
         nil
       end
@@ -28,7 +32,11 @@ module Timekeeping
       private
 
         def enforcing?(admission)
-          ADMISSION_METHODS.all? { |method| admission.respond_to?(method) } && admission.enforces_fence? == true
+          responds?(admission, ADMISSION_METHODS) && admission.enforces_fence? == true
+        end
+
+        def responds?(integration, methods)
+          methods.all? { |method| integration.respond_to?(method) }
         end
     end
   end
