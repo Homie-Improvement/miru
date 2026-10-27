@@ -78,4 +78,23 @@ RSpec.describe "Solid Queue schedule" do
       expect(task["schedule"]).to be_present
     end
   end
+
+  # "config/solid_queue.yml runs a timekeeping_relay worker with one thread and one process in every block that
+  # has billing_sync, and Timekeeping::RelayJob is queued on timekeeping_relay"
+  it "runs a single-thread single-process timekeeping_relay worker and a 10-second RelayJob task in every block with billing_sync" do
+    blocks = config.select do |_name, block|
+      block.is_a?(Hash) && Array(block["workers"]).any? { |worker| worker["queues"] == "billing_sync" }
+    end
+    expect(blocks.keys).to include("default", "production")
+
+    blocks.each do |name, block|
+      relay_workers = block["workers"].select { |worker| worker["queues"] == "timekeeping_relay" }
+      expect([name, relay_workers.size]).to eq([name, 1])
+      expect([name, relay_workers.first.slice("threads", "processes")])
+        .to eq([name, { "threads" => 1, "processes" => 1 }])
+
+      tasks = block.dig("dispatchers", 0, "recurring_tasks").values.select { |task| task["class"] == "Timekeeping::RelayJob" }
+      expect([name, tasks.map { |task| task["schedule"] }]).to eq([name, ["every 10 seconds"]])
+    end
+  end
 end

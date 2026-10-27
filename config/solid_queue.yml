@@ -33,6 +33,9 @@ default: &default
         recover_invoice_operation_intents:
           class: RecoverInvoiceOperationIntentsJob
           schedule: '* * * * *'  # Every minute, so a crashed invoice save converges soon after the 60 s pickup age
+        timekeeping_relay:
+          class: Timekeeping::RelayJob
+          schedule: every 10 seconds
   workers:
     - queues: default
       threads: 5
@@ -43,6 +46,10 @@ default: &default
       processes: 1
       polling_interval: 0.5
     - queues: invoice_operations
+      threads: 1
+      processes: 1
+      polling_interval: 0.5
+    - queues: timekeeping_relay
       threads: 1
       processes: 1
       polling_interval: 0.5
@@ -91,6 +98,9 @@ production:
         recover_invoice_operation_intents:
           class: RecoverInvoiceOperationIntentsJob
           schedule: '* * * * *'
+        timekeeping_relay:
+          class: Timekeeping::RelayJob
+          schedule: every 10 seconds
   workers:
     - queues: default
       threads: <%= ENV.fetch("SOLID_QUEUE_THREADS", "3").to_i %>
@@ -102,5 +112,10 @@ production:
       polling_interval: <%= ENV.fetch("SOLID_QUEUE_WORKER_POLLING_INTERVAL", "0.5").to_f %>
     - queues: invoice_operations
       threads: <%= ENV.fetch("SOLID_QUEUE_INVOICE_OPERATIONS_THREADS", "1").to_i %>
+      processes: 1
+      polling_interval: <%= ENV.fetch("SOLID_QUEUE_WORKER_POLLING_INTERVAL", "0.5").to_f %>
+    # One thread, so batches of one run are never posted out of position order.
+    - queues: timekeeping_relay
+      threads: 1
       processes: 1
       polling_interval: <%= ENV.fetch("SOLID_QUEUE_WORKER_POLLING_INTERVAL", "0.5").to_f %>
