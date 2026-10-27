@@ -365,6 +365,278 @@ end
 RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
   include RunnerLegacyHandoffSpecSupport
 
+  def insert_source_intent_for_deletion_spec(operation_id)
+    invoice = Invoice.unscoped.order(:id).first
+    InvoiceOperationsRecord.connection.execute(<<~SQL)
+      INSERT INTO invoice_operation_intents
+        (company_id, invoice_id, operation_id, generation, desired_entry_ids, disposition, state, created_at, finished_at)
+      VALUES (#{Integer(invoice.company_id)}, #{Integer(invoice.id)}, '#{operation_id}', 1, '{}', 'active',
+              'committed', now(), now())
+    SQL
+  end
+
+  # "Source intents are saved at the checkpoint and reused on resume, and deleting or changing a terminal
+  # intent after the checkpoint makes reconcile report a difference."
+  it "a terminal intent deleted after the checkpoint makes the resumed reconcile report it and keep the monolith as owner" do
+    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
+    owners = handoff_owners(timekeeping)
+    report_root = Dir.mktmpdir("handoff-report")
+    operation_id = "5d0b6a0e-1d7c-4f4e-9a52-6a1f1c0de001"
+    insert_source_intent_for_deletion_spec(operation_id)
+
+    expect do
+      described_class.run(direction: :cutover, owners:, report_root:,
+                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
+    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+    InvoiceOperationsRecord.connection.execute(
+      "DELETE FROM invoice_operation_intents WHERE operation_id = '#{operation_id}'"
+    )
+
+    expect { described_class.run(direction: :cutover, owners:, report_root:) }
+      .to raise_error(Timekeeping::Handoff::Runner::Refused)
+
+    report = Dir.glob(File.join(report_root, "generation-*", "reconciliation.json")).map { |path| File.read(path) }.join
+    expect(report).to include(operation_id)
+    expect(report).to include("missing_in_checkpoint")
+    expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", legacy_retired_at: nil)
+    expect(timekeeping.calls).not_to include([:admit, 2])
+  end
+end
+
+RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
+  include RunnerLegacyHandoffSpecSupport
+
+  def insert_source_intent_for_desired_ids_spec(operation_id)
+    invoice = Invoice.unscoped.order(:id).first
+    InvoiceOperationsRecord.connection.execute(<<~SQL)
+      INSERT INTO invoice_operation_intents
+        (company_id, invoice_id, operation_id, generation, desired_entry_ids, disposition, state, created_at, finished_at)
+      VALUES (#{Integer(invoice.company_id)}, #{Integer(invoice.id)}, '#{operation_id}', 1, '{}', 'active',
+              'committed', now(), now())
+    SQL
+  end
+
+  # "Source intents are saved at the checkpoint and reused on resume, and deleting or changing a terminal
+  # intent after the checkpoint makes reconcile report a difference."
+  it "a terminal intent whose desired_entry_ids change after the checkpoint makes the resumed reconcile report that field" do
+    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
+    owners = handoff_owners(timekeeping)
+    report_root = Dir.mktmpdir("handoff-report")
+    operation_id = "5d0b6a0e-1d7c-4f4e-9a52-6a1f1c0de002"
+    insert_source_intent_for_desired_ids_spec(operation_id)
+
+    expect do
+      described_class.run(direction: :cutover, owners:, report_root:,
+                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
+    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+    InvoiceOperationsRecord.connection.execute(
+      "UPDATE invoice_operation_intents SET desired_entry_ids = '{424242}' WHERE operation_id = '#{operation_id}'"
+    )
+
+    expect { described_class.run(direction: :cutover, owners:, report_root:) }
+      .to raise_error(Timekeeping::Handoff::Runner::Refused, /Reconciliation found unexplained differences/)
+
+    report = Dir.glob(File.join(report_root, "generation-*", "reconciliation.json")).map { |path| File.read(path) }.join
+    expect(report).to include(operation_id)
+    expect(report).to include("desired_entry_ids")
+    expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", legacy_retired_at: nil)
+  end
+end
+
+RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
+  include RunnerLegacyHandoffSpecSupport
+
+  def insert_source_intent_for_unchanged_spec(operation_id)
+    invoice = Invoice.unscoped.order(:id).first
+    InvoiceOperationsRecord.connection.execute(<<~SQL)
+      INSERT INTO invoice_operation_intents
+        (company_id, invoice_id, operation_id, generation, desired_entry_ids, disposition, state, created_at, finished_at)
+      VALUES (#{Integer(invoice.company_id)}, #{Integer(invoice.id)}, '#{operation_id}', 1, '{7,8}', 'active',
+              'committed', now(), now())
+    SQL
+  end
+
+  # "Source intents are saved at the checkpoint and reused on resume, and deleting or changing a terminal
+  # intent after the checkpoint makes reconcile report a difference."
+  # With nothing changed, the saved intents must read back equal to a fresh read, so the resume passes.
+  it "a resume with unchanged intents reuses the saved source intents and finishes the cutover" do
+    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
+    owners = handoff_owners(timekeeping)
+    report_root = Dir.mktmpdir("handoff-report")
+    insert_source_intent_for_unchanged_spec("5d0b6a0e-1d7c-4f4e-9a52-6a1f1c0de003")
+
+    expect do
+      described_class.run(direction: :cutover, owners:, report_root:,
+                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
+    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+    saved = Dir.glob(File.join(report_root, "generation-*", "source_intents.json"))
+    expect(saved.size).to eq(1)
+    saved_text = File.read(saved.first)
+
+    described_class.run(direction: :cutover, owners:, report_root:)
+
+    expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
+    expect(File.read(saved.first)).to eq(saved_text)
+  end
+end
+
+RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
+  include RunnerLegacyHandoffSpecSupport
+
+  # "Source intents are saved at the checkpoint and reused on resume, and deleting or changing a terminal
+  # intent after the checkpoint makes reconcile report a difference."
+  # Capturing again at reconcile would compare current intents with themselves and hide any change.
+  it "a resume whose saved source intents file is gone refuses instead of capturing the intents again" do
+    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
+    owners = handoff_owners(timekeeping)
+    report_root = Dir.mktmpdir("handoff-report")
+
+    expect do
+      described_class.run(direction: :cutover, owners:, report_root:,
+                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
+    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+    saved = Dir.glob(File.join(report_root, "generation-*", "source_intents.json"))
+    expect(saved.size).to eq(1)
+    expect(Dir.glob(File.join(report_root, "generation-*", "checkpoint.json")).size).to eq(1)
+    File.delete(saved.first)
+
+    expect { described_class.run(direction: :cutover, owners:, report_root:) }
+      .to raise_error(Timekeeping::Handoff::ReportDirectory::Unreadable)
+
+    expect(File.exist?(saved.first)).to be(false)
+    expect(Dir.glob(File.join(report_root, "generation-*", "reconciliation.json"))).to be_empty
+    expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", legacy_retired_at: nil)
+  end
+end
+
+# Uses RunnerLegacyHandoffSpecTimekeeping and RunnerLegacyHandoffSpecSupport,
+# defined at the top of this file.
+RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
+  include RunnerLegacyHandoffSpecSupport
+
+  # "Capture and persist the source intents at the frozen checkpoint boundary, reuse them after restart, and pass a separate current read to reconciliation."
+  it "an intent written after the checkpoint appears only in the current read and makes the resumed reconcile report it missing from the source" do
+    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
+    owners = handoff_owners(timekeeping)
+    report_root = Dir.mktmpdir("handoff-report")
+    operation_id = SecureRandom.uuid
+    company_id = Company.order(:id).first.id
+
+    expect do
+      described_class.run(direction: :cutover, owners:, report_root:,
+                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
+    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+    generation_dir = Pathname(report_root).join("generation-#{TimekeepingOwnership.current.generation}")
+    saved_intents = generation_dir.join("source_intents.json").read
+
+    InvoiceOperationsRecord.connection.execute(<<~SQL)
+      INSERT INTO invoice_operation_intents (company_id, invoice_id, operation_id, state, generation, created_at, finished_at)
+      VALUES (#{company_id}, 1, '#{operation_id}', 'committed', 1, now(), now())
+    SQL
+
+    expect { described_class.run(direction: :cutover, owners:, report_root:) }
+      .to raise_error(Timekeeping::Handoff::Runner::Refused)
+
+    expect(generation_dir.join("source_intents.json").read).to eq(saved_intents)
+    report = generation_dir.join("reconciliation.json").read
+    expect(report).to include(operation_id)
+    expect(report).to include("missing_in_source")
+    expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", legacy_retired_at: nil)
+  ensure
+    InvoiceOperationsRecord.connection.execute(
+      "DELETE FROM invoice_operation_intents WHERE operation_id = '#{operation_id}'"
+    ) if operation_id
+  end
+end
+
+# Uses RunnerLegacyHandoffSpecTimekeeping and RunnerLegacyHandoffSpecSupport,
+# defined at the top of this file.
+RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
+  include RunnerLegacyHandoffSpecSupport
+
+  # "Keep the existing checks for pending intents and operation states."
+  it "an intent committed at the checkpoint and pending on resume is still reported as a pending intent from the current read" do
+    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
+    owners = handoff_owners(timekeeping)
+    report_root = Dir.mktmpdir("handoff-report")
+    operation_id = SecureRandom.uuid
+    company_id = Company.order(:id).first.id
+    InvoiceOperationsRecord.connection.execute(<<~SQL)
+      INSERT INTO invoice_operation_intents (company_id, invoice_id, operation_id, state, generation, created_at, finished_at)
+      VALUES (#{company_id}, 1, '#{operation_id}', 'committed', 1, now(), now())
+    SQL
+
+    expect do
+      described_class.run(direction: :cutover, owners:, report_root:,
+                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
+    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+    generation_dir = Pathname(report_root).join("generation-#{TimekeepingOwnership.current.generation}")
+    expect(generation_dir.join("source_intents.json").read).to include(operation_id)
+
+    InvoiceOperationsRecord.connection.execute(
+      "UPDATE invoice_operation_intents SET state = 'pending', finished_at = NULL WHERE operation_id = '#{operation_id}'"
+    )
+
+    expect { described_class.run(direction: :cutover, owners:, report_root:) }
+      .to raise_error(Timekeeping::Handoff::Runner::Refused)
+
+    report = generation_dir.join("reconciliation.json").read
+    expect(report).to include(operation_id)
+    expect(report).to include("intent_pending")
+    expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", legacy_retired_at: nil)
+    expect(timekeeping.calls).not_to include([:admit, TimekeepingOwnership.current.generation])
+  ensure
+    InvoiceOperationsRecord.connection.execute(
+      "DELETE FROM invoice_operation_intents WHERE operation_id = '#{operation_id}'"
+    ) if operation_id
+  end
+end
+
+# Uses RunnerLegacyHandoffSpecTimekeeping and RunnerLegacyHandoffSpecSupport,
+# defined at the top of this file.
+RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
+  include RunnerLegacyHandoffSpecSupport
+
+  # A legacy intent committed at the checkpoint is listed as an expected
+  # receipt difference; once it fails after the checkpoint, that listing must
+  # not explain away its state change.
+  it "a legacy intent committed at the checkpoint and failed on resume is reported, not listed as expected" do
+    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
+    owners = handoff_owners(timekeeping)
+    report_root = Dir.mktmpdir("handoff-report")
+    operation_id = SecureRandom.uuid
+    invoice = Invoice.unscoped.order(:id).first
+    InvoiceOperationsRecord.connection.execute(<<~SQL)
+      INSERT INTO invoice_operation_intents (company_id, invoice_id, operation_id, state, generation, created_at, finished_at)
+      VALUES (#{Integer(invoice.company_id)}, #{Integer(invoice.id)}, '#{operation_id}', 'committed', 1, now(), now())
+    SQL
+
+    expect do
+      described_class.run(direction: :cutover, owners:, report_root:,
+                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
+    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+    InvoiceOperationsRecord.connection.execute(
+      "UPDATE invoice_operation_intents SET state = 'failed' WHERE operation_id = '#{operation_id}'"
+    )
+
+    expect { described_class.run(direction: :cutover, owners:, report_root:) }
+      .to raise_error(Timekeeping::Handoff::Runner::Refused, /Reconciliation found unexplained differences/)
+
+    generation_dir = Pathname(report_root).join("generation-#{TimekeepingOwnership.current.generation}")
+    expect(generation_dir.join("reconciliation.json").read).to include(operation_id)
+    expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", legacy_retired_at: nil)
+  ensure
+    InvoiceOperationsRecord.connection.execute(
+      "DELETE FROM invoice_operation_intents WHERE operation_id = '#{operation_id}'"
+    ) if operation_id
+  end
+end
+
+# Uses RunnerLegacyHandoffSpecTimekeeping and RunnerLegacyHandoffSpecSupport,
+# defined at the top of this file.
+RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
+  include RunnerLegacyHandoffSpecSupport
+
   # "A fresh-runner restart after corrections and after checkpoint is recorded, with the clock advanced, ends with per-company counts and checksums equal to an uninterrupted control run and keeps the saved capture time."
   it "a fresh runner restarted a day later after the recorded checkpoint ends with the uninterrupted control's full per-company digest and keeps the saved capture time" do
     captured_at = Time.utc(2026, 10, 27, 12)
