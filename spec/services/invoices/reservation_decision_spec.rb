@@ -5,6 +5,28 @@
 require "rails_helper"
 
 RSpec.describe Invoices::ReservationDecision do
+  # "On a draft, entries absent from the new set are released at commit, and a discarded or destroyed draft sends an empty set."
+  it "sends the new line set for a changed draft, releasing entries absent from it" do
+    result = described_class.call(status: "draft", discarded: false, destroyed: false,
+                                  held: { entries: [1, 2], disposition: "active" }, lines: [3, 1])
+
+    expect(result).to eq(entries: [1, 3], disposition: "active")
+  end
+
+  # A discarded draft still has its lines when the save runs; the named row must ignore them.
+  it "sends an empty active set for a discarded draft and for a destroyed draft" do
+    held = { entries: [4, 7], disposition: "active" }
+
+    discarded = described_class.call(status: "draft", discarded: true, destroyed: false, held:, lines: [4, 7])
+    discarded_with_extra_lines = described_class.call(status: "draft", discarded: true, destroyed: false,
+                                                      held: { entries: [1, 2], disposition: "active" }, lines: [1, 2, 3])
+    destroyed = described_class.call(status: "draft", discarded: false, destroyed: true, held:, lines: [4, 7])
+
+    expect(discarded).to eq(entries: [], disposition: "active")
+    expect(discarded_with_extra_lines).to eq(entries: [], disposition: "active")
+    expect(destroyed).to eq(entries: [], disposition: "active")
+  end
+
   # A live sent invoice never changes locks: saving one keeps today's behaviour, where only draft saves lock.
   it "sends nothing for a live non-draft whose lines gain an entry, with or without a holding" do
     with_holding = described_class.call(status: "sent", discarded: false, destroyed: false,
@@ -16,22 +38,93 @@ RSpec.describe Invoices::ReservationDecision do
     expect(without_holding).to be_nil
   end
 
-  # "A discarded draft (L2): \"Its reservations are released.\""
-  it "sends an empty active set for a discarded draft that holds entries" do
-    result = described_class.call(status: "draft", discarded: true, destroyed: false,
-                                  held: { entries: [1, 2], disposition: "active" }, lines: [1, 2])
+  # "On a non-draft, the boundary sends no removal." and "Send an operation only when that set changes, or on discard or destroy."
+  it "sends nothing when a non-draft only loses a line" do
+    result = described_class.call(status: "sent", discarded: false, destroyed: false,
+                                  held: { entries: [1, 2], disposition: "active" }, lines: [1])
 
-    expect(result).to eq(entries: [], disposition: "active")
+    expect(result).to be_nil
   end
 
-  # "The entries the removed line referenced are released at commit when no remaining direct or grouped line
-  # of the draft references them; a destroyed draft releases its whole set."
-  it "sends exactly a live draft's remaining lines and an empty active set for a destroyed draft" do
-    held = { entries: [1, 2, 3], disposition: "active" }
-    live = described_class.call(status: "draft", discarded: false, destroyed: false, held:, lines: [1, 3])
-    destroyed = described_class.call(status: "draft", discarded: false, destroyed: true, held:, lines: [])
+  # "A discarded or destroyed non-draft commits `disposition: \"retained\"`."
+  it "sends the held set as retained for a discarded or destroyed non-draft" do
+    held = { entries: [1, 2], disposition: "active" }
 
-    expect(live).to eq(entries: [1, 3], disposition: "active")
-    expect(destroyed).to eq(entries: [], disposition: "active")
+    discarded = described_class.call(status: "sent", discarded: true, destroyed: false, held:, lines: [])
+    destroyed = described_class.call(status: "paid", discarded: false, destroyed: true, held:, lines: [1])
+
+    expect(discarded).to eq(entries: [1, 2], disposition: "retained")
+    expect(destroyed).to eq(entries: [1, 2], disposition: "retained")
+  end
+
+  # The held set is sent, not held union lines, even when the lines carry an entry not yet held.
+  it "ignores added lines when a non-draft is discarded or destroyed" do
+    held = { entries: [1, 2], disposition: "active" }
+
+    discarded = described_class.call(status: "sent", discarded: true, destroyed: false, held:, lines: [2, 5])
+    destroyed = described_class.call(status: "sent", discarded: false, destroyed: true, held:, lines: [2, 5])
+
+    expect(discarded).to eq(entries: [1, 2], disposition: "retained")
+    expect(destroyed).to eq(entries: [1, 2], disposition: "retained")
+  end
+
+  # Both flags at once, with the lines already emptied, must still keep every held entry.
+  it "never drops a held entry when a sent invoice loses lines and is then discarded and destroyed together" do
+    result = described_class.call(
+      status: "paid", discarded: true, destroyed: true,
+      held: { entries: [7, 3], disposition: "active" },
+      lines: []
+    )
+
+    expect(result).to eq(entries: [3, 7], disposition: "retained")
+  end
+
+  # "Return `nil` when entries and disposition equal what is held."
+  it "returns nil when the entries and disposition equal what is held, whatever their order or duplicates" do
+    unchanged_draft = described_class.call(status: "draft", discarded: false, destroyed: false,
+                                           held: { entries: [3, 1], disposition: "active" }, lines: [1, 3, 3])
+    unchanged_sent = described_class.call(status: "sent", discarded: false, destroyed: false,
+                                          held: { entries: [5, 2, 9], disposition: "active" }, lines: [9, 2, 2, 5, 9])
+    empty_discarded_draft = described_class.call(status: "draft", discarded: true, destroyed: false,
+                                                 held: { entries: [], disposition: "active" }, lines: [])
+    retained_non_draft = described_class.call(status: "sent", discarded: true, destroyed: false,
+                                              held: { entries: [1, 2], disposition: "retained" }, lines: [])
+
+    expect([unchanged_draft, unchanged_sent, empty_discarded_draft, retained_non_draft]).to eq([nil, nil, nil, nil])
+  end
+
+  # A discard replayed after the holding is already retained must not send a duplicate operation.
+  it "sends nothing for a repeated non-draft discard whose holding is already retained" do
+    first = described_class.call(status: "sent", discarded: true, destroyed: false,
+                                 held: { entries: [4, 1], disposition: "active" }, lines: [1])
+    replayed = described_class.call(status: "sent", discarded: true, destroyed: false,
+                                    held: { entries: [4, 1], disposition: "retained" }, lines: [1])
+
+    expect(first).to eq(entries: [1, 4], disposition: "retained")
+    expect(replayed).to be_nil
+    expect(described_class.call(status: "sent", discarded: true, destroyed: false, held: first, lines: [])).to be_nil
+  end
+
+  # A live sent invoice sends nothing whatever its lines, so only the draft reads the nil holding here.
+  it "reads a nil holding as nothing held and returns sorted unique entries" do
+    draft = described_class.call(status: "draft", discarded: false, destroyed: false, held: nil, lines: [9, 2, 9])
+    sent = described_class.call(status: "sent", discarded: false, destroyed: false, held: nil, lines: [5])
+    nothing = described_class.call(status: "draft", discarded: false, destroyed: false, held: nil, lines: [])
+
+    expect(draft).to eq(entries: [2, 9], disposition: "active")
+    expect(sent).to be_nil
+    expect(nothing).to be_nil
+  end
+
+  # "Expose that row as a named table entry, so the flip is a one-row change."
+  it "has one frozen row for each draft state and lifecycle, with the discarded-draft row named" do
+    table = described_class::TABLE
+
+    expect(table.keys).to match_array([true, false].product(%i[live discarded destroyed]))
+    expect(table).to be_frozen
+    expect(table.keys).to all(be_frozen)
+    expect(table.values).to all(be_frozen)
+    expect(table.fetch([true, :discarded])).to equal(described_class::DISCARDED_DRAFT)
+    expect(described_class::DISCARDED_DRAFT).to be_frozen
   end
 end

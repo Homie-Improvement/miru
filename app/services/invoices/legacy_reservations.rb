@@ -106,11 +106,20 @@ module Invoices
 
       # A successor that takes an entry drops the other invoices' claims that
       # give way to it, in the same transaction, so a rolled-back save leaves
-      # those claims as they were.
+      # those claims as they were. The entries are removed from each row's
+      # current value in the database, not from the copy read earlier, so two
+      # successors taking different entries from one holding keep both removals.
       def take_over(request, claims, taken_ids)
-        claims.yielding_holdings(request.invoice_id, taken_ids).each do |holding|
-          holding.update_columns(entry_ids: holding.entry_ids - taken_ids, updated_at: Time.current)
-        end
+        holding_ids = claims.yielding_holdings(request.invoice_id, taken_ids).map(&:id)
+        return if holding_ids.empty?
+
+        InvoiceEntryHolding.where(company_id: request.company_id, id: holding_ids).update_all([<<~SQL.squish, taken_ids, Time.current])
+          entry_ids = ARRAY(
+            SELECT kept.entry_id FROM unnest(entry_ids) WITH ORDINALITY AS kept(entry_id, position)
+            WHERE kept.entry_id <> ALL(ARRAY[?]::bigint[]) ORDER BY kept.position
+          ),
+          updated_at = ?
+        SQL
       end
 
       def record_release(request, held_entry_ids)

@@ -109,3 +109,94 @@ RSpec.describe "Api::V1::Invoices::BulkDeletion#create releasing a draft's entri
     expect([direct_entry.reload.locked, grouped_entry.reload.locked]).to eq([false, false])
   end
 end
+
+RSpec.describe "Api::V1::Invoices::BulkDeletion#create through the bulk deletion service", type: :request do
+  let(:company) { create(:company) }
+  let(:user) { create(:user, current_workspace_id: company.id) }
+  let(:client) { create(:client, company:) }
+
+  before do
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    sign_in user
+  end
+
+  # "The controller then only authorizes, calls the service and renders."
+  it "hands the company-scoped invoices to Invoices::BulkDeletionService and renders the ids it returns" do
+    own_invoice = create(:invoice, company:, client:)
+    foreign_invoice = create(:invoice_with_invoice_line_items)
+    received_ids = nil
+    allow(Invoices::BulkDeletionService).to receive(:process) do |invoices|
+      received_ids = invoices.map(&:id)
+      [own_invoice.id]
+    end
+
+    send_request :post, api_v1_invoices_bulk_deletion_index_path,
+      params: { invoices_ids: [own_invoice.id, foreign_invoice.id] },
+      headers: auth_headers(user)
+
+    expect(Invoices::BulkDeletionService).to have_received(:process).once
+    expect(received_ids).to eq([own_invoice.id])
+    expect(response).to have_http_status(:unprocessable_content)
+    expect(json_response["undeletable_invoice_ids"]).to eq([own_invoice.id])
+    expect(Invoice.exists?(own_invoice.id)).to be(true)
+    expect(Invoice.exists?(foreign_invoice.id)).to be(true)
+  end
+end
+
+RSpec.describe "Api::V1::Invoices::BulkDeletion#create during a handoff", type: :request do
+  let(:company) { create(:company) }
+  let(:user) { create(:user, current_workspace_id: company.id) }
+  let(:client) { create(:client, company:) }
+
+  before do
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    sign_in user
+  end
+
+  it "refuses a bulk deletion during a handoff and removes none of the invoices or their children" do
+    invoices = create_list(:invoice, 3, company:, client:)
+    invoices.each do |invoice|
+      create(:invoice_line_item, invoice:)
+      create(:invoice_tax, invoice:)
+    end
+    ids = invoices.map(&:id)
+    line_item_ids = InvoiceLineItem.where(invoice_id: ids).pluck(:id)
+    tax_ids = InvoiceTax.where(invoice_id: ids).pluck(:id)
+    expect(line_item_ids.size).to eq(3)
+    expect(tax_ids.size).to eq(3)
+    TimekeepingOwnership.current.update!(handoff_step: "close_admission")
+
+    send_request :post, api_v1_invoices_bulk_deletion_index_path,
+      params: { invoices_ids: ids },
+      headers: auth_headers(user)
+
+    expect(response).to have_http_status(:service_unavailable)
+    expect(json_response["reason"]).to eq("ownership_moving")
+    expect(Invoice.where(id: ids).count).to eq(3)
+    expect(InvoiceLineItem.where(invoice_id: ids).pluck(:id)).to match_array(line_item_ids)
+    expect(InvoiceTax.where(invoice_id: ids).pluck(:id)).to match_array(tax_ids)
+  end
+
+  it "refuses a bulk deletion that names another company's invoice during a handoff and leaves both companies' invoices in place" do
+    own_invoice = create(:invoice, company:, client:)
+    create(:invoice_line_item, invoice: own_invoice)
+    foreign_invoice = create(:invoice_with_invoice_line_items)
+    expect(foreign_invoice.company_id).not_to eq(company.id)
+    ids = [own_invoice.id, foreign_invoice.id]
+    baseline_line_items = InvoiceLineItem.where(invoice_id: ids).order(:id).pluck(:id, :invoice_id)
+    expect(baseline_line_items.count { |_id, invoice_id| invoice_id == own_invoice.id }).to eq(1)
+    expect(baseline_line_items.count { |_id, invoice_id| invoice_id == foreign_invoice.id }).to be_positive
+    TimekeepingOwnership.current.update!(handoff_step: "close_admission")
+
+    send_request :post, api_v1_invoices_bulk_deletion_index_path,
+      params: { invoices_ids: ids },
+      headers: auth_headers(user)
+
+    expect(response).to have_http_status(:service_unavailable)
+    expect(json_response["reason"]).to eq("ownership_moving")
+    expect(Invoice.where(id: ids).count).to eq(2)
+    expect(InvoiceLineItem.where(invoice_id: ids).order(:id).pluck(:id, :invoice_id)).to eq(baseline_line_items)
+  end
+end

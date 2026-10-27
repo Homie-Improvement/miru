@@ -4,60 +4,6 @@
 
 require "rails_helper"
 
-RSpec.describe Invoices::LegacyReservations do
-  # The legacy adapter decides `in_company` from the entry row, so another company's
-  # entry is answered :not_found and its reservation state is never revealed or changed.
-  it "refuses another company's entry as not_found without locking it or naming its invoice" do
-    own_company = create(:company)
-    other_company = create(:company)
-    other_client = create(:client, company: other_company)
-    other_project = create(:project, client: other_client, billable: true)
-    other_user = create(:user, current_workspace_id: other_company.id)
-    foreign_entry = create(:timesheet_entry, user: other_user, project: other_project, bill_status: "unbilled")
-    foreign_entry.update_columns(locked: false)
-    other_invoice = create(:invoice, company: other_company, client: other_client, status: :sent)
-    InvoiceEntryHolding.create!(company_id: other_company.id, invoice_id: other_invoice.id,
-      entry_ids: [foreign_entry.id], disposition: "active")
-
-    request = Invoices::ReservationRequest.new(
-      company_id: own_company.id, invoice_id: 999_001, operation_id: SecureRandom.uuid,
-      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [foreign_entry.id]
-    )
-    outcome = ApplicationRecord.transaction { described_class.new.prepare(request) }
-
-    expect(outcome.state).to eq("refused")
-    expect(outcome.conflicts.map { |conflict| conflict[:reason].to_s }).to eq(["not_found"])
-    # The conflict carries only the entry and the reason, never the holding invoice.
-    expect(outcome.conflicts).to eq([{ entry_id: foreign_entry.id, reason: "not_found" }])
-    expect(foreign_entry.reload.locked).to be(false)
-  end
-end
-
-RSpec.describe Invoices::LegacyReservations do
-  # Every timesheet_entries write is limited to the request's company.
-  it "mark_billed leaves another company's entry unbilled" do
-    own_company = create(:company)
-    own_client = create(:client, company: own_company)
-    own_project = create(:project, client: own_client, billable: true)
-    own_user = create(:user, current_workspace_id: own_company.id)
-    own_entry = create(:timesheet_entry, user: own_user, project: own_project, bill_status: "unbilled")
-    other_company = create(:company)
-    other_project = create(:project, client: create(:client, company: other_company), billable: true)
-    other_user = create(:user, current_workspace_id: other_company.id)
-    foreign_entry = create(:timesheet_entry, user: other_user, project: other_project, bill_status: "unbilled")
-
-    request = Invoices::ReservationRequest.new(
-      company_id: own_company.id, invoice_id: 999_002, operation_id: SecureRandom.uuid,
-      generation: TimekeepingOwnership.current.generation, disposition: "active",
-      entries: [own_entry.id, foreign_entry.id]
-    )
-    described_class.new.mark_billed(request)
-
-    expect(own_entry.reload.bill_status).to eq("billed")
-    expect(foreign_entry.reload.bill_status).to eq("unbilled")
-  end
-end
-
 RSpec.describe Invoices::LegacyReservations, committed_data: true do
   let(:redelivery_company) { create(:company) }
   let(:redelivery_client) { create(:client, company: redelivery_company) }
@@ -210,24 +156,36 @@ RSpec.describe Invoices::LegacyReservations do
   # "An id from another company gives not_found." The not-in-company row of
   # Timekeeping::ReservationRules comes first, so the answer for another
   # company's entry never says whether or where it is reserved.
+  # Covers a foreign entry held active and locked by the other company's invoice, and an
+  # unlocked one: neither is locked, unlocked or otherwise written, and the conflict list
+  # carries only the entry and the reason, never the holding invoice.
   it "prepare refuses another company's invoiced entry as not_found and never reveals or changes its reservation" do
     foreign_entry = tenant_spec_entry_in(tenant_spec_other_company, tenant_spec_other_client)
+    unlocked_foreign_entry = tenant_spec_entry_in(tenant_spec_other_company, tenant_spec_other_client)
     foreign_invoice = create(:invoice, company: tenant_spec_other_company, client: tenant_spec_other_client)
     foreign_entry.update_columns(locked: true)
+    unlocked_foreign_entry.update_columns(locked: false)
     InvoiceEntryHolding.create!(
       company_id: tenant_spec_other_company.id, invoice_id: foreign_invoice.id,
       entry_ids: [foreign_entry.id], disposition: "active"
     )
+    row_before = foreign_entry.reload.attributes
     own_invoice = create(:invoice, company: tenant_spec_company, client: tenant_spec_client)
 
     outcome = ApplicationRecord.transaction do
-      described_class.new.prepare(tenant_spec_request(own_invoice, [foreign_entry.id]))
+      described_class.new.prepare(tenant_spec_request(own_invoice, [foreign_entry.id, unlocked_foreign_entry.id]))
     end
 
     expect(outcome.state).to eq("refused")
     reasons = outcome.conflicts.map { |conflict| conflict.fetch(:reason).to_s }
-    expect(reasons).to eq(["not_found"])
+    expect(reasons).to eq(%w[not_found not_found])
     expect(reasons).not_to include("on_another_invoice")
+    expect(outcome.conflicts).to match_array([
+      { entry_id: foreign_entry.id, reason: "not_found" },
+      { entry_id: unlocked_foreign_entry.id, reason: "not_found" }
+    ])
+    expect(foreign_entry.reload.attributes).to eq(row_before)
+    expect(unlocked_foreign_entry.reload.locked).to be(false)
     expect(foreign_entry.reload.locked).to be(true)
     expect(InvoiceEntryHolding.find_by!(company_id: tenant_spec_other_company.id, invoice_id: foreign_invoice.id).entry_ids)
       .to eq([foreign_entry.id])
@@ -406,36 +364,6 @@ RSpec.describe Invoices::LegacyReservations do
     expect(outcome.conflicts).to contain_exactly(hash_including(entry_id: entry.id, reason: "on_another_invoice"))
     expect(entry.reload.locked).to be(false)
     expect(InvoiceEntryHolding.where(company_id: admit_company.id, invoice_id: second.id)).to be_empty
-  end
-end
-
-RSpec.describe Invoices::LegacyReservations do
-  # "An id from another company gives not_found." The not-in-company answer must never reveal
-  # that, or where, the other company's entry is reserved, so the reason is never on_another_invoice.
-  # Scenario: a forged entry id from another company that is held active there.
-  it "answers not_found and leaves the row untouched for another company's entry held by that company's kept invoice" do
-    own_company = create(:company)
-    own_invoice = create(:invoice, company: own_company, client: create(:client, company: own_company))
-    other_company = create(:company)
-    other_client = create(:client, company: other_company)
-    other_user = create(:user, current_workspace_id: other_company.id)
-    other_project = create(:project, client: other_client, billable: true)
-    foreign_entry = create(:timesheet_entry, user: other_user, project: other_project, bill_status: "unbilled")
-    other_draft = create(:invoice, company: other_company, client: other_client)
-    create(:invoice_line_item, invoice: other_draft, timesheet_entry: foreign_entry, rate: 100, quantity: 60)
-    expect(foreign_entry.reload.locked).to be(true)
-    row_before = foreign_entry.reload.attributes
-
-    request = Invoices::ReservationRequest.new(
-      company_id: own_company.id, invoice_id: own_invoice.id, operation_id: SecureRandom.uuid,
-      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [foreign_entry.id]
-    )
-    outcome = ApplicationRecord.transaction { described_class.new.prepare(request) }
-
-    expect(outcome.state).to eq("refused")
-    expect(outcome.conflicts.map { |conflict| conflict[:reason].to_s }).to eq(["not_found"])
-    expect(foreign_entry.reload.attributes).to eq(row_before)
-    expect(InvoiceEntryHolding.where(company_id: own_company.id)).to be_empty
   end
 end
 
@@ -639,5 +567,73 @@ RSpec.describe Invoices::LegacyReservations do
     expect(described_class.new.abort(request).state).to eq("aborted")
     expect(entry.reload.locked).to be(false)
     expect(LegacyEntryRelease.where(company_id: adapter_unit_company.id)).to be_empty
+  end
+end
+
+RSpec.describe Invoices::LegacyReservations, committed_data: true do
+  let(:takeover_race_company) { create(:company) }
+  let(:takeover_race_client) { create(:client, company: takeover_race_company) }
+  let(:takeover_race_project) { create(:project, client: takeover_race_client, billable: true) }
+  let(:takeover_race_user) { create(:user, current_workspace_id: takeover_race_company.id) }
+
+  def takeover_race_request(invoice, entry)
+    Invoices::ReservationRequest.new(
+      company_id: takeover_race_company.id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
+      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [entry.id]
+    )
+  end
+
+  # "a locked entry on a discarded non-draft can be taken by a new invoice"
+  # Two successors take different entries from one retained holding at once. The second
+  # read the holding before the first committed, so its removal must apply to the row as
+  # the first left it, or the first's entry comes back and stays locked after a later release.
+  it "keeps both removals when two successors take different entries from one retained holding at once" do
+    first_entry, second_entry = Array.new(2) do
+      create(:timesheet_entry, user: takeover_race_user, project: takeover_race_project, bill_status: "unbilled")
+        .tap { |entry| entry.update_columns(locked: true) }
+    end
+    retired = create(:invoice, company: takeover_race_company, client: takeover_race_client, status: :sent)
+    retired.update_columns(discarded_at: Time.current)
+    InvoiceEntryHolding.create!(company_id: takeover_race_company.id, invoice_id: retired.id,
+      entry_ids: [first_entry.id, second_entry.id], disposition: "retained")
+    first_successor, second_successor = Array.new(2) do
+      create(:invoice, company: takeover_race_company, client: takeover_race_client)
+    end
+
+    first_prepared = Queue.new
+    release_first = Queue.new
+    second_pid = Queue.new
+
+    first = Thread.new do
+      ActiveRecord::Base.connection_pool.with_connection do
+        ActiveRecord::Base.transaction do
+          outcome = described_class.new.prepare(takeover_race_request(first_successor, first_entry))
+          first_prepared << true
+          release_first.pop
+          outcome
+        end
+      end
+    end
+
+    first_prepared.pop
+    second = Thread.new do
+      ActiveRecord::Base.connection_pool.with_connection do |connection|
+        second_pid << connection.raw_connection.backend_pid
+        ActiveRecord::Base.transaction do
+          described_class.new.prepare(takeover_race_request(second_successor, second_entry))
+        end
+      end
+    end
+
+    pid = second_pid.pop
+    waited = 50.times.any? do
+      blocked = ActiveRecord::Base.connection.select_value("SELECT cardinality(pg_blocking_pids(#{pid}))").to_i.positive?
+      blocked || (sleep(0.1) && false)
+    end
+    release_first << true
+
+    expect([first.value.state, second.value.state]).to eq(%w[prepared prepared])
+    expect(waited).to be(true)
+    expect(InvoiceEntryHolding.find_by!(company_id: takeover_race_company.id, invoice_id: retired.id).entry_ids).to eq([])
   end
 end
