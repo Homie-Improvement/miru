@@ -38,6 +38,21 @@ RSpec.describe DeliverInvoiceOperationJob do
     expect(row.reload.delivered_at).to be_present
   end
 
+  # A refused prepare stores no operation, so the prepared adapter answers its
+  # abort as aborted and the failed intent settles the row as save_failed.
+  it "delivers a refused save's abort row to the prepared adapter on the first attempt, writing nothing" do
+    company_id = 9
+    row = deliver_job_outbox_row(company_id:, kind: "abort", intent_state: "failed")
+    reservation_rows = -> { ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM reservations WHERE company_id = #{company_id}") }
+    operation_rows = -> { ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM invoice_operations WHERE company_id = #{company_id}") }
+
+    described_class.perform_now(row.id, reservations: Invoices::PreparedReservations.new)
+
+    expect(row.reload.delivered_at).to be_present
+    expect(row.attempts).to eq(0)
+    expect([reservation_rows.call, operation_rows.call]).to eq([0, 0])
+  end
+
   # "Until later issues register their adapters, every owner maps to a retryable \"adapter not available\" error."
   # "It calls the adapter's `commit` or `abort`, sets `delivered_at` only on a settled outcome, and otherwise keeps the row and increments `attempts`."
   it "counts an attempt and keeps the row when no adapter is registered for the current owner" do
