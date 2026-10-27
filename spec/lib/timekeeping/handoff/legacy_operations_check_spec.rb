@@ -7,36 +7,6 @@ require "rails_helper"
 RSpec.describe Timekeeping::Handoff::LegacyOperationsCheck do
   # "Source intents are saved at the checkpoint and reused on resume, and deleting or changing a terminal
   # intent after the checkpoint makes reconcile report a difference."
-  # An expected difference built from only one side would hide a state change made after the checkpoint.
-  it "lists a legacy receipt only for an intent committed both at the checkpoint and now" do
-    intent = lambda do |operation_id, state|
-      {
-        "id" => 1, "company_id" => 11, "invoice_id" => 21, "operation_id" => operation_id, "generation" => 1,
-        "desired_entry_ids" => [], "disposition" => "active", "state" => state,
-        "created_at" => Time.utc(2026, 10, 30), "finished_at" => Time.utc(2026, 10, 30)
-      }
-    end
-    kept = "00000000-0000-4000-8000-000000000001"
-    failed_later = "00000000-0000-4000-8000-000000000002"
-    committed_later = "00000000-0000-4000-8000-000000000003"
-    deleted_later = "00000000-0000-4000-8000-000000000004"
-
-    listed = described_class.listed_receipts(
-      source_intents: [intent.(kept, "committed"), intent.(failed_later, "committed"),
-                       intent.(committed_later, "failed"), intent.(deleted_later, "committed")],
-      intents: [intent.(kept, "committed"), intent.(failed_later, "failed"), intent.(committed_later, "committed")],
-      legacy_retired_at: nil
-    )
-
-    expect(listed.keys).to eq([11])
-    expect(listed.fetch(11).map(&:row_key)).to eq([[21, kept]])
-    expect(listed.fetch(11).map(&:field)).to eq(["state"])
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::LegacyOperationsCheck do
-  # "Source intents are saved at the checkpoint and reused on resume, and deleting or changing a terminal
-  # intent after the checkpoint makes reconcile report a difference."
   # An expected-difference list that names an edited intent would explain away the very state difference
   # reconcile must report, so a receipt is listed only for an intent committed on both sides.
   it "lists no expected receipt for an intent whose state changed or that was deleted after the checkpoint" do
@@ -55,6 +25,7 @@ RSpec.describe Timekeeping::Handoff::LegacyOperationsCheck do
     listed = described_class.listed_receipts(source_intents:, intents: current_intents, legacy_retired_at: nil)
     row_keys = listed.values.flatten.map(&:row_key)
 
+    expect(listed.keys).to eq([11])
     expect(row_keys).to contain_exactly(Timekeeping::Handoff::Reconciliation::RECEIPT_LINK_KEY.call(intent.call(1, "committed")))
     expect(listed.values.flatten).to all(have_attributes(check: :operation_receipts, field: "state"))
   end
