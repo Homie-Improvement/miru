@@ -151,15 +151,12 @@ RSpec.describe DataImportJob, type: :job do
   let(:shared_left_import) { create(:data_import, company: shared_left_company, user: shared_left_actor, dry_run: false) }
 
   # "`UserToken.mint` re-checks that this user is employed in the company when the job runs, and raises otherwise, which fails the job visibly."
-  # The actor has left the company, so only paul is registered with the fake; the helper must not add the actor.
+  # The actor has left the company, so only paul is passed to the shared setup; the helper spec checks
+  # that it registers exactly the users it is given.
   it "a forwarded job on the shared setup whose actor has left the company registers only paul, fails, and sends no entry create" do
-    allow(shared_left_fake).to receive(:register_user).and_call_original
     arrange_forwarded_timekeeping(shared_left_fake, company: shared_left_company,
                                                     users: { shared_left_paul => "employee" },
                                                     project: shared_left_project)
-    expect(shared_left_fake).to have_received(:register_user).once
-    expect(shared_left_fake).to have_received(:register_user)
-      .with(id: shared_left_paul.id, company_id: shared_left_company.id, role: "employee")
     shared_left_import.file.attach(io: StringIO.new(<<~CSV), filename: "harvest.csv", content_type: "text/csv")
       Date,Client,Project,Hours,First Name,Last Name
       2026-01-01,Acme LLC,Website,1,Paul,Connors

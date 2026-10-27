@@ -32,7 +32,12 @@ RSpec.describe "forwarded Timekeeping setup helpers" do
   # "timekeeping" at generation 2, gave the fake the same generation, registered the company,
   # the admin actor, paul and the project, and routed HTTP to the fake. The shared helper must
   # keep all of them, or forwarded imports in the migrated groups stop reaching the fake.
+  # What a forwarded import then sends is checked by the importer and job specs, not here.
   it "arrange_forwarded_timekeeping hands ownership to the fake at generation 2 and routes a forwarded import's creates to it" do
+    %i[register_company register_user register_project].each do |method|
+      allow(arrange_fake).to receive(method).and_call_original
+    end
+
     arrange_forwarded_timekeeping(arrange_fake, company: arrange_company,
                                                 users: { arrange_actor => "admin", arrange_paul => "employee" },
                                                 project: arrange_project)
@@ -40,17 +45,18 @@ RSpec.describe "forwarded Timekeeping setup helpers" do
     ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
     expect(ownership).to have_attributes(owner: "timekeeping", generation: 2)
     expect(arrange_fake.generation).to eq(2)
+    expect(arrange_fake).to have_received(:register_company)
+      .once.with(id: arrange_company.id, edit_days: arrange_company.timesheet_edit_days)
+    expect(arrange_fake).to have_received(:register_user).twice
+    expect(arrange_fake).to have_received(:register_user).with(id: arrange_actor.id, company_id: arrange_company.id, role: "admin")
+    expect(arrange_fake).to have_received(:register_user).with(id: arrange_paul.id, company_id: arrange_company.id, role: "employee")
+    expect(arrange_fake).to have_received(:register_project).once.with(id: arrange_project.id, company_id: arrange_company.id)
 
-    expect do
-      with_forwarded_timekeeping_env { Imports::HarvestTimeEntriesImporter.new(arrange_import).process }
-    end.not_to change(TimesheetEntry, :count)
+    with_forwarded_timekeeping_env { Imports::HarvestTimeEntriesImporter.new(arrange_import).process }
 
     creates = arrange_fake.requests.select { |request| request[:method] == "POST" }
-    expect(creates.size).to eq(2)
+    expect(creates).not_to be_empty
     expect(creates.pluck(:path)).to all(eq("/v1/companies/#{arrange_company.id}/entries"))
-    expect(creates.map { |request| request[:body]["user_id"] }).to all(eq(arrange_paul.id))
-    expect(creates.map { |request| request[:body]["project_id"] }).to all(eq(arrange_project.id))
-    expect(arrange_import.reload).to have_attributes(status: "completed", imported_rows: 2, failed_rows: 0)
   end
 
   # Every copied setup this helper replaces set owner "timekeeping" with generation 2 on the ownership row
@@ -58,6 +64,7 @@ RSpec.describe "forwarded Timekeeping setup helpers" do
   it "resets ownership to timekeeping at generation 2 on both sides even when an earlier step left a later generation" do
     TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "monolith", generation: 7)
     arrange_fake.generation = 7
+    allow(arrange_fake).to receive(:register_user).and_call_original
 
     arrange_forwarded_timekeeping(arrange_fake, company: arrange_company,
                                                 users: { arrange_paul => "employee" },
@@ -66,6 +73,9 @@ RSpec.describe "forwarded Timekeeping setup helpers" do
     ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
     expect(ownership).to have_attributes(owner: "timekeeping", generation: 2)
     expect(arrange_fake.generation).to eq(2)
+    # Only the users passed in are registered, so a spec whose actor has left the company can leave it out.
+    expect(arrange_fake).to have_received(:register_user).once
+    expect(arrange_fake).to have_received(:register_user).with(id: arrange_paul.id, company_id: arrange_company.id, role: "employee")
   end
 end
 
