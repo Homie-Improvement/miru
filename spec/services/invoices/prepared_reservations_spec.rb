@@ -8,8 +8,9 @@ require "securerandom"
 RSpec.describe Invoices::PreparedReservations do
   include PreparedReservationsSpecSupport
 
-  # Ownership is set before any fixture here. The groups after this context
-  # set it themselves, some only after building legacy-owner fixtures.
+  # Ownership is set before any fixture here. Groups after this context set it
+  # inline where they need it, the line-claim groups only after building
+  # legacy-owner fixtures; admit needs none.
   context "with the prepared store owning timekeeping" do
     before { prepare_local_ownership! }
 
