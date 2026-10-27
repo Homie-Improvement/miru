@@ -67,10 +67,7 @@ module Timekeeping
     UNBILLED = "unbilled"
     ID = TimekeepingRules::EntryDecision::ID
     KEY_SEPARATOR = "\u001F"
-    # The one key every writer of entry_outbox_items takes just before its
-    # inserts and holds until commit, so outbox positions commit in the order
-    # they were drawn and the relay never passes a position still uncommitted.
-    OUTBOX_LOCK_KEY = 2_026_034_001
+    OUTBOX_LOCK_KEY = EntryOutbox::LOCK_KEY
 
     ROUTE_WRITERS = {
       create: :create_entry,
@@ -549,38 +546,14 @@ module Timekeeping
         end
       end
 
+      # Rows are read with the reservation flag, so each snapshot's locked is
+      # that flag, never the stored entries.locked column.
       def write_outbox(rows, stored_generation)
-        return if rows.empty?
-
-        advisory_lock(OUTBOX_LOCK_KEY)
-        now = Time.current
-        LocalOutboxEntry.insert_all!(rows.map do |row|
-          { company_id:, entry_id: row.id, generation: stored_generation, payload: snapshot(row), created_at: now }
-        end)
-      end
-
-      # The contract snapshot of one entry, read with the reservation flag:
-      # locked is that flag, never the stored entries.locked column.
-      def snapshot(row)
-        json_fields(row, SnapshotBatch::ENTRY_FIELDS)
+        EntryOutbox.write(rows, generation: stored_generation)
       end
 
       def response_body(row)
-        json_fields(row, RESPONSE_FIELDS)
-      end
-
-      def json_fields(row, fields)
-        fields.index_with { |field| json_value(field == "locked" ? row.reserved : row[field]) }
-      end
-
-      # Times as UTC with microseconds, the precision the column stores, and
-      # dates as ISO 8601; every other value, a Float duration included, as is.
-      def json_value(value)
-        case value
-        when Time, ActiveSupport::TimeWithZone then value.utc.iso8601(6)
-        when Date then value.iso8601
-        else value
-        end
+        EntryOutbox.json_fields(row, RESPONSE_FIELDS)
       end
 
       def advisory_lock(*keys)
