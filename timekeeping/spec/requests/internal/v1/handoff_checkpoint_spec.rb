@@ -208,6 +208,11 @@ RSpec.describe "Timekeeping internal handoff checkpoint" do
       unknown_key = JSON.parse(exported)
       unknown_key.fetch("tables")["outbox_snapshots"] = []
 
+      agent_rows = Timekeeping::Handoff::Checkpoint.from_json(exported).rows.transform_values { |list| list.map(&:dup) }
+      agent_rows["entries"] = agent_rows["entries"].map do |row|
+        row.merge("source" => "agent", "note" => "private-load-note")
+      end
+
       [
         # "Recompute the digest inside the transaction and roll back on a mismatch."
         # The refusal answers with a reason only, so a row value never reaches a response.
@@ -232,7 +237,18 @@ RSpec.describe "Timekeeping internal handoff checkpoint" do
         # tables deletes every row the checkpoint lacks, such as an entry
         # written after the export.
         { name: "admission open", body: exported, answer: [409, { "reason" => "handoff_refused" }],
-          during: ->(&deliver) { open_admission_for_load_refusal(&deliver) } }
+          during: ->(&deliver) { open_admission_for_load_refusal(&deliver) } },
+        # "A monolith row with a source such as "agent" is therefore stored in
+        # Timekeeping's entries table, and any later write republishes it to the
+        # outbox, where the projection refuses it and delivery stops."
+        { name: "entry source outside the contract",
+          body: Timekeeping::Handoff::Checkpoint.build(tables: agent_rows).to_json,
+          answer: [400, { "reason" => "invalid_request" }],
+          extra: lambda {
+            expect(Timekeeping::SnapshotValues::SOURCES).not_to include("agent")
+            expect(response.body).not_to include("private-load-note")
+            expect(response.body).not_to include("agent")
+          } }
       ]
     end
 
@@ -278,6 +294,33 @@ RSpec.describe "Timekeeping internal handoff checkpoint" do
           .to eq([row.fetch(:name), before, nil])
         row[:extra]&.call
       end
+    end
+
+    # A refusal must consume nothing a retry needs, so the corrected
+    # checkpoint loads straight afterwards.
+    it "answers 400 invalid_request to a checkpoint whose second company's entry has source agent, keeps stored rows, then accepts the corrected load" do
+      checkpoint_spec_entry("Kept")
+      Timekeeping::Admission.fence!
+      bad = Timekeeping::Handoff::Checkpoint.build(tables: merge_handoff_checkpoint_tables(
+        handoff_checkpoint_tables(company_id: 1, id: 70),
+        handoff_checkpoint_tables(company_id: 2, id: 80, overrides: { "entries" => { "source" => "agent" } })
+      ))
+      corrected = Timekeeping::Handoff::Checkpoint.build(tables: merge_handoff_checkpoint_tables(
+        handoff_checkpoint_tables(company_id: 1, id: 70),
+        handoff_checkpoint_tables(company_id: 2, id: 80)
+      ))
+      before = handoff_stored_rows
+
+      handoff_request(:checkpoint_load, body: bad.to_json)
+
+      expect([response.status, response.parsed_body]).to eq([400, { "reason" => "invalid_request" }])
+      expect(handoff_stored_rows).to eq(before)
+      expect(Timekeeping::Admission.current.generation).to be_nil
+
+      handoff_request(:checkpoint_load, body: corrected.to_json)
+
+      expect(response.status).to eq(200)
+      expect(Entry.order(:company_id).pluck(:company_id, :id, :source)).to eq([[1, 70, "manual"], [2, 80, "manual"]])
     end
   end
 end

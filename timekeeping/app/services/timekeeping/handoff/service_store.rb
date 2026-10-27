@@ -21,6 +21,20 @@ module Timekeeping
         super(connection:, tables: TABLES)
       end
 
+      # Refuses the whole checkpoint, before anything is deleted, when an entry
+      # holds a value the projection would refuse: a later write would
+      # republish the stored row and hold back every snapshot after it. The
+      # message names entries and fields only, because row values can be private.
+      def load_checkpoint(checkpoint)
+        invalid = CheckpointEntryValues.invalid_entries(checkpoint.rows.fetch("entries", []))
+        if invalid.any?
+          raise Checkpoint::ShapeError,
+                "checkpoint entries: invalid values in #{invalid.map { |entry| describe_invalid_entry(entry) }.join('; ')}"
+        end
+
+        super
+      end
+
       def highest_outbox_position
         connection.select_value("SELECT COALESCE(MAX(outbox_position), 0) FROM outbox_snapshots").to_i
       end
@@ -32,6 +46,14 @@ module Timekeeping
         # admission is fenced.
         def check_load_allowed!
           FenceCheck.require_fenced!(connection, "load a checkpoint")
+        end
+
+        # An identifier is named only when it passed its own rule: an invalid
+        # id or company_id can hold any text, including private text.
+        def describe_invalid_entry(entry)
+          identifiers = { "company_id" => entry[:company_id], "id" => entry[:id] }
+                        .map { |field, value| entry[:fields].include?(field) ? "#{field} invalid" : "#{field} #{value}" }
+          "#{identifiers.join(' ')} (#{entry[:fields].join(', ')})"
         end
     end
   end
