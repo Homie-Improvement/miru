@@ -289,7 +289,12 @@ module Timekeeping
         # the incoming owner admit writes. A flip from the legacy source also
         # retires it: legacy_retired_at is set and the monolith's own store
         # becomes the prepared tables, so a later rollback lands there.
+        #
+        # A resume after reconcile was recorded starts here and skips that
+        # step, so reconcile runs first: the intents saved at the checkpoint
+        # are compared with a fresh read again before ownership moves.
         def flip
+          reconcile if @reconciliation.nil?
           update_row(expected_step: "reconcile") do |row|
             row.owner = @route.fetch(:to)
             row.handoff_step = nil
