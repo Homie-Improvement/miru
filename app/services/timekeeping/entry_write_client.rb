@@ -3,7 +3,8 @@
 require "net/http"
 
 module Timekeeping
-  # Forwards one entry create, update or destroy to the Timekeeping service's
+  # Forwards one entry create, update or destroy, or one bulk move or bulk
+  # delete, to the Timekeeping service's
   # entry API (contracts/timekeeping/entry_api.yml) while Timekeeping owns the
   # entries. Every HTTP call for these routes lives here, so callers see the
   # answered entry Hash or one of the errors below, never a Net:: exception.
@@ -22,6 +23,8 @@ module Timekeeping
   class EntryWriteClient
     ENTRIES_PATH = "/v1/companies/%<company_id>d/entries"
     ENTRY_PATH = "/v1/companies/%<company_id>d/entries/%<entry_id>d"
+    BULK_MOVE_PATH = "/v1/companies/%<company_id>d/entries/bulk-move"
+    BULK_DELETE_PATH = "/v1/companies/%<company_id>d/entries/bulk-delete"
 
     # Fixed namespace for the version 5 UUIDs used as Idempotency-Key values.
     IDEMPOTENCY_NAMESPACE = "6f1c2c1e-5d7a-4c55-9a0e-1b9e8f3d2a41"
@@ -102,6 +105,16 @@ module Timekeeping
       Digest::UUID.uuid_v5(IDEMPOTENCY_NAMESPACE, "#{request_id}/#{operation}/#{entry_id || "new"}")
     end
 
+    # Pure: the key of one bulk call, derived from the request id, the
+    # operation and the set of entry ids, whatever their order. A resend that
+    # names the same entries replays Timekeeping's stored answer. A resend
+    # that names fewer, because some were already deleted, gets a new key and
+    # writes the rest, instead of being refused as a reused key with a
+    # different body.
+    def self.bulk_idempotency_key(request_id:, operation:, entry_ids:)
+      idempotency_key(request_id:, operation:, entry_id: entry_ids.map(&:to_i).sort.join(","))
+    end
+
     # The create body for the writer of actor_kind. user and project are
     # records the caller already resolved inside the company, never raw
     # params.
@@ -169,6 +182,27 @@ module Timekeeping
                                        idempotency_key: request_key(context, "destroy", entry_id))
     end
 
+    # Moves the entries to the project in one call and returns Timekeeping's
+    # answer, whose "results" list each entry id as "moved" or "not_found".
+    # entry_ids are ids the caller already resolved inside the company, never
+    # raw params. A stale generation refuses the whole call.
+    def bulk_move(context:, generation:, entry_ids:, project_id:)
+      path = format(BULK_MOVE_PATH, company_id: context.company.id)
+      forward(Net::HTTP::Post, path, operation: "bulk_move", context:, generation:,
+                                     idempotency_key: bulk_key(context, "bulk_move", entry_ids),
+                                     body: { "entry_ids" => entry_ids, "project_id" => project_id })
+    end
+
+    # Discards the entries in one call and returns Timekeeping's answer, whose
+    # "results" list each entry id as "deleted" or "not_found". The same
+    # rules as bulk_move apply to entry_ids and to a stale generation.
+    def bulk_delete(context:, generation:, entry_ids:)
+      path = format(BULK_DELETE_PATH, company_id: context.company.id)
+      forward(Net::HTTP::Post, path, operation: "bulk_delete", context:, generation:,
+                                     idempotency_key: bulk_key(context, "bulk_delete", entry_ids),
+                                     body: { "entry_ids" => entry_ids })
+    end
+
     # Returns the stored answer of a destroy this request id already committed.
     # Timekeeping never deletes on this call: with no stored answer for the
     # same company, actor and key it answers 404, raised as RecordNotFound.
@@ -183,6 +217,10 @@ module Timekeeping
 
       def request_key(context, operation, entry_id = nil)
         self.class.idempotency_key(request_id: context.request_id, operation:, entry_id:)
+      end
+
+      def bulk_key(context, operation, entry_ids)
+        self.class.bulk_idempotency_key(request_id: context.request_id, operation:, entry_ids:)
       end
 
       def forward(request_class, path, operation:, context:, generation:, idempotency_key:, version: nil, body: nil,
