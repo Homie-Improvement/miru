@@ -385,7 +385,9 @@ RSpec.describe Invoices::ReservationBoundary do
   end
 
   # Moved from the model spec of the method mark_billed replaces.
-  it "mark_billed bills the entries the invoice holds and the entries its lines reference" do
+  # A held entry no line references (a removed line on a sent invoice) is
+  # still reserved, but it is not on the invoice, so it is not billed.
+  it "mark_billed bills the entries the invoice's lines reference and not an entry only its holding lists" do
     held_only_entry = boundary_flush_entry
     line_entry = boundary_flush_entry
     invoice = create(:invoice, company: boundary_flush_company, client: boundary_flush_client, status: :sent)
@@ -396,7 +398,7 @@ RSpec.describe Invoices::ReservationBoundary do
 
     described_class.mark_billed(invoice)
 
-    expect([held_only_entry, line_entry].map { |entry| entry.reload.bill_status }).to eq(%w[billed billed])
+    expect([held_only_entry, line_entry].map { |entry| entry.reload.bill_status }).to eq(%w[unbilled billed])
   end
 
   # "A discarded draft (L2): \"Its reservations are released.\""

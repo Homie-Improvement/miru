@@ -28,12 +28,11 @@ module Invoices
       Registry.on(transaction).register(invoice)
     end
 
-    # Bills the entries the invoice holds and the entries its lines reference.
-    # A sent invoice saved directly holds nothing, so its lines are what it
-    # bills, as before.
+    # Bills the entries the invoice's lines reference. An entry its holding
+    # still lists after a line was removed stays reserved, but it is no longer
+    # on the invoice, so it is not billed.
     def mark_billed(invoice)
       holding = InvoiceEntryHolding.find_by(company_id: invoice.company_id, invoice_id: invoice.id)
-      held = holding ? CompanyEntries.within(invoice.company_id, holding.entry_ids) : []
       ownership = TimekeepingOwnership.current
       request = ReservationRequest.new(
         company_id: invoice.company_id,
@@ -41,7 +40,7 @@ module Invoices
         operation_id: SecureRandom.uuid,
         generation: ownership.generation,
         disposition: holding&.disposition || ACTIVE,
-        entries: held | CompanyEntries.on_lines(invoice.id, invoice.company_id)
+        entries: CompanyEntries.on_lines(invoice.id, invoice.company_id)
       )
       ReservationAdapters.for(ownership).mark_billed(request)
     end

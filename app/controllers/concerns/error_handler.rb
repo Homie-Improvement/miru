@@ -39,7 +39,10 @@ module ErrorHandler
 
       respond_to do |format|
         format.json { render json: { errors: message }, status: 422 }
-        format.html { render file: "public/422.html", status: 422, layout: false, alert: message }
+        format.html do
+          flash.now[:alert] = message
+          render file: "public/422.html", status: 422, layout: false
+        end
       end
     end
 
