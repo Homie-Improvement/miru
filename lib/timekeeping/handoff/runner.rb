@@ -14,8 +14,9 @@ module Timekeeping
     # Progress lives on the ownership row, and a step is recorded there only
     # after its own work committed and its completion check passed, so any
     # interrupted run can be resumed or aborted by a fresh call. The step 2
-    # money snapshot and the checkpoint's capture time and digests are kept in
-    # a per-generation ReportDirectory, so a resumed run compares against the
+    # money snapshot, the checkpoint's capture time and digests, and the
+    # invoice operation intents frozen at the checkpoint are kept in a
+    # per-generation ReportDirectory, so a resumed run compares against the
     # same values as the run it continues.
     class Runner
       # A handoff that cannot start or go on. The row is left resumable or
@@ -252,9 +253,13 @@ module Timekeeping
 
         # Step 6. Every check of section 10.4, company by company. The report
         # is written and its signals sent whatever the verdict; any unlisted
-        # difference stops the handoff before reconcile is recorded.
+        # difference stops the handoff before reconcile is recorded. The intents
+        # frozen at the checkpoint are compared with a fresh read, so an intent
+        # deleted or edited since the checkpoint is a difference; the pending
+        # and operation-state checks run on the fresh read.
         def reconcile
           next_entry_id = incoming.store.advance_entry_id_sequence(above: report.read_checkpoint.fetch(:highest_entry_id))
+          source_intents = source_copy.fetch(:intents)
           intents = read_intents
           loaded = incoming.store.export_checkpoint
           # A restart after the checkpoint step skips its completion check, so
@@ -265,9 +270,9 @@ module Timekeeping
           end
           @reconciliation = Reconciliation.run(
             source: source_copy.fetch(:source), checkpoint: loaded, projection: read_projection,
-            source_intents: intents, intents:, next_entry_id:,
+            source_intents:, intents:, next_entry_id:,
             money_before: report.read_money_before, money_after: take_money,
-            listed_corrections: listed_corrections(intents),
+            listed_corrections: listed_corrections(source_intents:, intents:),
             expected_reservations: source_legacy ? source_copy.fetch(:source).rows.fetch("reservations").group_by { |row| row["company_id"] } : nil
           )
           report.write_reconciliation(@reconciliation.to_h)
@@ -349,27 +354,35 @@ module Timekeeping
           @report ||= ReportDirectory.new(root: @report_root, generation: @generation)
         end
 
-        # The frozen source and the copy loaded from it, built once per run.
-        # The first build in a generation stores the capture time and digests;
-        # every later build, after an interrupt or a restart, reuses that
-        # capture time and must reproduce both stored digests, so a version
-        # changed in the incoming owner meanwhile cannot reshape the plan.
+        # The frozen source, the copy loaded from it and the invoice operation
+        # intents, built once per run. The first build in a generation stores
+        # the intents, then the capture time and digests; every later build,
+        # after an interrupt or a restart, reuses that capture time, must
+        # reproduce both stored digests, and reads the stored intents back, so
+        # neither a version changed in the incoming owner nor an intent deleted
+        # or edited meanwhile can reshape the plan or the comparison. The
+        # intents file is written before checkpoint.json, so a stored
+        # checkpoint always has the intents it names.
         def source_copy
           @source_copy ||= begin
             stored = report.read_checkpoint if report.checkpoint?
             captured_at = stored ? stored.fetch(:captured_at) : clock.now.utc.floor(6)
             copy = export_source(captured_at)
             if stored.nil?
+              intents = read_intents
+              source_intents_digest = report.write_source_intents(intents)
               report.write_checkpoint(
                 captured_at:, source_digest: digest_text(copy.fetch(:source)), loaded_digest: digest_text(copy.fetch(:load)),
-                highest_entry_id: copy.fetch(:source).rows.fetch("entries").pluck("id").max || 0
+                highest_entry_id: copy.fetch(:source).rows.fetch("entries").pluck("id").max || 0, source_intents_digest:
               )
             elsif digest_text(copy.fetch(:source)) != stored.fetch(:source_digest)
               raise Refused, "The frozen source no longer matches the checkpoint taken at #{captured_at.iso8601(6)}"
             elsif digest_text(copy.fetch(:load)) != stored.fetch(:loaded_digest)
               raise Refused, "The incoming owner's entries changed since the checkpoint taken at #{captured_at.iso8601(6)}"
+            else
+              intents = report.read_source_intents(digest: stored.fetch(:source_intents_digest))
             end
-            copy
+            copy.merge(intents:)
           end
         end
 
@@ -389,7 +402,7 @@ module Timekeeping
         # The differences the planned load copy makes on purpose, derived from
         # that copy rather than from what the incoming owner now holds, so a
         # wrong load can never list its own difference as expected.
-        def listed_corrections(intents)
+        def listed_corrections(source_intents:, intents:)
           source, load = source_copy.values_at(:source, :load)
           planned = if source_legacy
             LegacyLoadVersions.listed_corrections(source:, loaded: load, corrections: source_copy.fetch(:corrections))
@@ -397,7 +410,7 @@ module Timekeeping
             ReservationLocks.listed_corrections(source:, loaded: load)
           end
           legacy_receipts = LegacyOperationsCheck.listed_receipts(
-            intents, legacy_retired_at: TimekeepingOwnership.current.legacy_retired_at
+            source_intents:, intents:, legacy_retired_at: TimekeepingOwnership.current.legacy_retired_at
           )
           planned.merge(legacy_receipts) { |_company_id, differences, receipts| differences + receipts }
         end
