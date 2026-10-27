@@ -50,10 +50,7 @@ RSpec.describe "timekeeping:alerts", "shared task runner" do
     expect(failed.exit_status).not_to be_nil
     expect(failed.exit_status).not_to eq(0)
     expect(succeeded.exit_status).to be_nil
-    # spec/meta/timekeeping_alerts_specs_spec.rb expects the literal call for this
-    # signal once in this file, and the clean-run token example below holds it.
-    sourceless_signal = "ownership_moving"
-    unavailable = Timekeeping::AlertLog.unavailable_line(sourceless_signal)
+    unavailable = Timekeeping::AlertLog.unavailable_line("ownership_moving")
     expect(succeeded.stdout.lines.map(&:chomp).count(unavailable)).to eq(1)
     expect(succeeded.stdout + succeeded.stderr).not_to include("metrics read failed")
   end
@@ -238,6 +235,266 @@ RSpec.describe "timekeeping:alerts", "section 11.3 alerts on the task output" do
   end
 end
 
+RSpec.describe "timekeeping:alerts", "signals gathered from real records" do
+  include ActiveSupport::Testing::TimeHelpers
+
+  let(:gathered_signals_token) { "service-#{SecureRandom.hex(24)}" }
+  let(:gathered_signals_run_options) do
+    { base_url: "http://timekeeping.gathered-signals.test", token: gathered_signals_token,
+      metrics: timekeeping_alerts_metrics_body }
+  end
+
+  before { TimekeepingOwnership.ensure_initial! }
+
+  def gathered_signals_snapshot_change(company_id, old_value: nil, new_value: nil)
+    Timekeeping::FinancialSnapshot.report([
+      Timekeeping::FinancialSnapshot::Difference.new(
+        company_id:, kind: :invoice, record_id: 9, field: :amount, old_value:, new_value:
+      )
+    ])
+  end
+
+  def gathered_signals_entry(company_id, note)
+    {
+      "id" => 7, "company_id" => company_id, "version" => 1, "project_id" => 1, "user_id" => 1, "agent_id" => nil,
+      "work_date" => Date.new(2026, 1, 5), "duration" => 60.0, "note" => note, "bill_status" => "unbilled",
+      "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
+      "external_run_id" => nil, "external_session_id" => nil, "proof_url" => nil, "proof_metadata" => {},
+      "discarded_at" => nil, "created_at" => Time.utc(2026, 1, 5, 9), "updated_at" => Time.utc(2026, 1, 5, 9)
+    }
+  end
+
+  def gathered_signals_checkpoint(entries)
+    tables = Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }
+    tables["entries"] = entries
+    Timekeeping::Handoff::Checkpoint.build(tables:)
+  end
+
+  # Runs and reports a reconciliation where one entry's note changed for the company.
+  def gathered_signals_reconcile_note_change(company_id, listed_corrections: {})
+    source_entry = gathered_signals_entry(company_id, "before")
+    loaded_entry = gathered_signals_entry(company_id, "after")
+    money = { company_id => { company_id:, values: { [:invoice, 9, :discount] => BigDecimal("5") } } }
+    result = Timekeeping::Handoff::Reconciliation.run(
+      source: gathered_signals_checkpoint([source_entry]),
+      checkpoint: gathered_signals_checkpoint([loaded_entry]),
+      projection: [loaded_entry.merge(
+        "bill_status" => TimesheetEntry.bill_statuses.fetch(loaded_entry["bill_status"]),
+        "review_status" => TimesheetEntry.review_statuses.fetch(loaded_entry["review_status"])
+      )],
+      source_intents: [], intents: [], next_entry_id: 1000,
+      money_before: money, money_after: money, listed_corrections:
+    )
+    Timekeeping::Handoff::Reconciliation.report(result)
+  end
+
+  # A company present in the before money snapshot but missing from the after
+  # one is reported by Reconciliation as an unlisted snapshot_missing difference.
+  def gathered_signals_reconcile_missing_snapshot(company_id)
+    empty_tables = Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }
+    result = Timekeeping::Handoff::Reconciliation.run(
+      source: Timekeeping::Handoff::Checkpoint.build(tables: empty_tables),
+      checkpoint: Timekeeping::Handoff::Checkpoint.build(tables: empty_tables),
+      projection: [], source_intents: [], intents: [], next_entry_id: 1,
+      money_before: { company_id => { company_id:, values: {} } }, money_after: {}
+    )
+    expect(result.companies.fetch(company_id).unlisted).not_to be_empty
+    Timekeeping::Handoff::Reconciliation.report(result)
+  end
+
+  def gathered_signals_outcome(state, conflicts: [])
+    Invoices::ReservationOutcome.new(state:, conflicts:, counts: {})
+  end
+
+  # Drives a prepare that the reservation port refuses with this reason through
+  # the coordinator, inside a transaction the caller lets roll back.
+  def gathered_signals_refuse_prepare(invoice, reason)
+    request = Invoices::ReservationRequest.new(
+      company_id: invoice.company_id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
+      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [601]
+    )
+    adapter = RecordingReservationAdapter.new(
+      prepare: gathered_signals_outcome("refused", conflicts: [{ entry_id: 601, reason: }]),
+      commit: gathered_signals_outcome("committed"), abort: gathered_signals_outcome("aborted")
+    )
+    expect do
+      ApplicationRecord.transaction do
+        Invoices::OperationCoordinator.new(reservations: adapter)
+                                      .call(request, holding: { entry_ids: [601], disposition: "active" })
+      end
+    end.to raise_error(Invoices::OperationErrors::Refused)
+  end
+
+  # Nothing records when an ownership pause starts or how long it is planned to last, so it stays unavailable.
+  it "prints ownership_moving as the only sourceless signal unavailable line and exits zero" do
+    run = run_timekeeping_alerts_task(**gathered_signals_run_options, now: Time.utc(2026, 3, 3, 12, 7))
+    unavailable_lines = run.stdout.lines.grep(/unavailable/i)
+
+    expect(unavailable_lines.count { |line| line.include?("ownership_moving") }).to eq(1)
+    # The three signals that now have a real source must not be reported as unavailable.
+    %w[prepare_refusal reconciliation_difference financial_snapshot_change].each do |name|
+      expect(unavailable_lines.none? { |line| line.include?(name) }).to be(true), "#{name} still printed unavailable"
+    end
+    expect(run.exit_status).to be_nil
+  end
+
+  # The command only reads the event history: a second run inside the lookback window sees the
+  # same change, and the rows other readers of the history rely on are not consumed.
+  it "reports the same financial_snapshot_change alert on two runs and leaves the stored events in place" do
+    company = create(:company)
+    gathered_signals_snapshot_change(company.id)
+    stored = RailsEventViewer::Entry.where(name: "Timekeeping::FinancialSnapshotChanged")
+    stored_ids = stored.pluck(:id)
+    expect(stored_ids.size).to eq(1)
+
+    first = run_timekeeping_alerts_task(**gathered_signals_run_options).alert_company_ids("financial_snapshot_change")
+    second = run_timekeeping_alerts_task(**gathered_signals_run_options).alert_company_ids("financial_snapshot_change")
+
+    expect(first).to eq([company.id.to_s])
+    expect(second).to eq(first)
+    expect(stored.pluck(:id)).to eq(stored_ids)
+  end
+
+  # Section 11.3: "any change in the financial snapshot pages at once".
+  it "prints a financial_snapshot_change alert for a reported snapshot change inside the lookback and none just outside it" do
+    now = Time.utc(2026, 3, 3, 12, 7)
+    lookback = Timekeeping::AlertSignals::SIGNAL_LOOKBACK
+    travel_to(now - lookback - 1.second) { gathered_signals_snapshot_change(301) }
+    travel_to(now - lookback + 1.second) { gathered_signals_snapshot_change(302) }
+
+    run = run_timekeeping_alerts_task(**gathered_signals_run_options, now:)
+
+    expect(run.alert_company_ids("financial_snapshot_change")).to eq(["302"])
+  end
+
+  # Section 11.3: "Any unexplained difference". A difference the pre-flight listed is explained.
+  it "prints a reconciliation_difference alert for an unexplained difference and none for a listed one" do
+    gathered_signals_reconcile_note_change(101)
+    correction = Timekeeping::Handoff::Reconciliation::Correction.new(check: :entries, row_key: [7], field: "note")
+    gathered_signals_reconcile_note_change(202, listed_corrections: { 202 => [correction] })
+
+    run = run_timekeeping_alerts_task(**gathered_signals_run_options)
+
+    expect(run.alert_company_ids("reconciliation_difference")).to eq(["101"])
+  end
+
+  it "counts a reported unexplained reconciliation difference just inside SIGNAL_LOOKBACK and not one just outside it" do
+    now = Time.utc(2026, 3, 3, 12, 7)
+    lookback = Timekeeping::AlertSignals::SIGNAL_LOOKBACK
+    inside = create(:company)
+    outside = create(:company)
+    travel_to(now - lookback - 1.second) { gathered_signals_reconcile_missing_snapshot(outside.id) }
+    travel_to(now - lookback + 1.second) { gathered_signals_reconcile_missing_snapshot(inside.id) }
+
+    run = run_timekeeping_alerts_task(**gathered_signals_run_options, now:)
+
+    expect(run.alert_company_ids("reconciliation_difference")).to eq([inside.id.to_s])
+  end
+
+  # Event history rows are free-form JSON captured by name pattern, so a row with no company_id
+  # must still raise the alert rather than vanish or crash the run.
+  it "alerts under company_id=all for stored reconciliation and snapshot events whose payload names no company" do
+    now = Time.utc(2026, 3, 3, 12, 7)
+    RailsEventViewer::Entry.create!(
+      name: "Timekeeping::ReconciliationDifferenceFound", occurred_at: now - 1.minute,
+      payload: { "data" => { "check" => "entries", "listed" => false } }
+    )
+    RailsEventViewer::Entry.create!(
+      name: "Timekeeping::FinancialSnapshotChanged", occurred_at: now - 1.minute, payload: { "data" => {} }
+    )
+
+    run = run_timekeeping_alerts_task(**gathered_signals_run_options, now:)
+
+    expect(run.alert_company_ids("reconciliation_difference")).to eq(["all"])
+    expect(run.alert_company_ids("financial_snapshot_change")).to eq(["all"])
+    expect(run.exit_status).to be_nil
+  end
+
+  # A broken event-history read must never look like a healthy zero, and a database fault that
+  # hides local alerts must not look like a successful run to the scheduler.
+  it "prints unavailable lines and exits non-zero when the event history cannot be read, and still prints the stale_generation alert" do
+    company = create(:company)
+    TimekeepingStaleGenerationRefusal.create!(company_id: company.id, handoff_step: nil)
+    allow(RailsEventViewer::Entry).to receive(:where).and_raise(ActiveRecord::StatementInvalid, "relation missing")
+
+    run = run_timekeeping_alerts_task(**gathered_signals_run_options)
+
+    expect(run.exit_status).not_to be_nil
+    expect(run.exit_status).not_to eq(0)
+    expect(run.stderr).to include("reconciliation_difference", "financial_snapshot_change")
+    %w[reconciliation_difference financial_snapshot_change].each do |signal|
+      expect(run.stdout.lines.map(&:chomp).count(Timekeeping::AlertLog.unavailable_line(signal))).to eq(1)
+      expect(run.alert_company_ids(signal)).to be_empty
+    end
+    # One failed read must not stop the command from reporting the other signals.
+    expect(run.alert_company_ids("stale_generation")).to eq([company.id.to_s])
+  end
+
+  # Refusals are counted per company: two refusals for one company give one alert line for it,
+  # and a company with no refusal gets no line, not a share of the other company's count.
+  it "prints a prepare_refusal alert only under the company whose prepare was refused" do
+    refused = create(:company)
+    create(:company)
+    2.times { TimekeepingPrepareRefusal.create!(company_id: refused.id, reason: "on_another_invoice") }
+
+    run = run_timekeeping_alerts_task(**gathered_signals_run_options)
+
+    expect(run.alert_company_ids("prepare_refusal")).to eq([refused.id.to_s])
+  end
+
+  it "counts an on_another_invoice prepare refusal just inside SIGNAL_LOOKBACK and not one just outside it" do
+    now = Time.utc(2026, 3, 3, 12, 7)
+    lookback = Timekeeping::AlertSignals::SIGNAL_LOOKBACK
+    inside = create(:company)
+    outside = create(:company)
+    TimekeepingPrepareRefusal.create!(company_id: inside.id, reason: "on_another_invoice",
+                                      created_at: now - lookback + 1.second)
+    TimekeepingPrepareRefusal.create!(company_id: outside.id, reason: "on_another_invoice",
+                                      created_at: now - lookback - 1.second)
+
+    run = run_timekeeping_alerts_task(**gathered_signals_run_options, now:)
+
+    expect(run.alert_company_ids("prepare_refusal")).to eq([inside.id.to_s])
+  end
+
+  # The refusal happened when prepare answered, so it must be recorded even though the caller commits.
+  it "prints a prepare_refusal alert when the caller rescues an on_another_invoice refusal and commits", committed_data: true do
+    invoice = create(:invoice)
+    request = Invoices::ReservationRequest.new(
+      company_id: invoice.company_id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
+      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [501]
+    )
+    adapter = RecordingReservationAdapter.new(
+      prepare: gathered_signals_outcome("refused", conflicts: [{ entry_id: 501, reason: "on_another_invoice" }]),
+      commit: gathered_signals_outcome("committed"), abort: gathered_signals_outcome("aborted")
+    )
+
+    ApplicationRecord.transaction do
+      Invoices::OperationCoordinator.new(reservations: adapter)
+                                    .call(request, holding: { entry_ids: [501], disposition: "active" })
+    rescue Invoices::OperationErrors::Refused
+      nil
+    end
+
+    run = run_timekeeping_alerts_task(**gathered_signals_run_options)
+
+    expect(run.alert_company_ids("prepare_refusal")).to include(invoice.company_id.to_s)
+  end
+
+  # Section 11.3: "Prepare refusals (`on_another_invoice`)".
+  it "prints a prepare_refusal alert for a rolled-back on_another_invoice refusal and none for provisional_elsewhere", committed_data: true do
+    on_another = create(:invoice)
+    elsewhere = create(:invoice)
+    gathered_signals_refuse_prepare(on_another, "on_another_invoice")
+    gathered_signals_refuse_prepare(elsewhere, "provisional_elsewhere")
+
+    companies = run_timekeeping_alerts_task(**gathered_signals_run_options).alert_company_ids("prepare_refusal")
+
+    expect(companies).to include(on_another.company_id.to_s)
+    expect(companies).not_to include(elsewhere.company_id.to_s)
+  end
+end
+
 # Generated by Descant: acceptance tests below.
 RSpec.describe "timekeeping:alerts", "shared runner with now and metrics keywords" do
   # A leaked service token grants every service-only Timekeeping endpoint, so a
@@ -254,7 +511,6 @@ RSpec.describe "timekeeping:alerts", "shared runner with now and metrics keyword
                                       metrics: timekeeping_alerts_metrics_body)
 
     expect(run.exit_status).to be_nil
-    expect(run.stdout.lines.map(&:chomp)).to include(Timekeeping::AlertLog.unavailable_line("ownership_moving"))
     expect(run.stdout + run.stderr + run.log).not_to include(token)
     expect(env_names.index_with { |name| ENV.fetch(name, nil) }).to eq(env_before)
     expect(ENV.to_h.values).not_to include(token)
@@ -273,6 +529,7 @@ RSpec.describe "timekeeping:alerts", "shared runner money and token output" do
     base_url = "http://timekeeping.money-check.test"
     token = "service-#{SecureRandom.hex(24)}"
     changed = create(:company)
+    untouched = create(:company)
     travel_to(now - 1.minute) do
       Timekeeping::FinancialSnapshot.report([
         Timekeeping::FinancialSnapshot::Difference.new(
@@ -287,6 +544,7 @@ RSpec.describe "timekeeping:alerts", "shared runner money and token output" do
 
     expect(run.exit_status).to be_nil
     expect(run.alert_company_ids("financial_snapshot_change")).to eq([changed.id.to_s])
+    expect(run.stdout).not_to include("company_id=#{untouched.id} ")
     expect(output).not_to include("731.19")
     expect(output).not_to include("917.53")
     expect(output).not_to include(token)
@@ -305,11 +563,13 @@ RSpec.describe "timekeeping:alerts", "shared runner now and metrics keywords" do
                        "latency_ms_sum" => 0, "latency_ms_buckets" => { "25" => 100 } }
     metrics = timekeeping_alerts_metrics_body(companies: [{ "company_id" => 101, "windows" => [failing_window] }])
 
+    clock_before = Time.now
+
     run = run_timekeeping_alerts_task(base_url:, token:, now: Time.utc(2026, 3, 3, 12, 7), metrics:)
 
     expect(run.exit_status).to be_nil
     expect(run.alert_company_ids("reference_unavailable_rate")).to eq(["101"])
-    expect(Time.current.to_date).not_to eq(Date.new(2026, 3, 3))
+    expect((Time.current - clock_before).abs).to be < 1.minute
   end
 end
 
@@ -453,11 +713,13 @@ RSpec.describe "timekeeping:alerts", "shared runner clock after an abort" do
     token = "service-#{SecureRandom.hex(24)}"
     stub_request(:get, "#{base_url}/internal/v1/metrics").to_return(status: 500, body: "boom")
 
+    clock_before = Time.now
+
     run = run_timekeeping_alerts_task(base_url:, token:, now: Time.utc(2026, 3, 3, 12, 7))
 
     expect(run.exit_status).not_to be_nil
     expect(run.exit_status).not_to eq(0)
-    expect((Time.current - Time.now).abs).to be < 60
+    expect((Time.current - clock_before).abs).to be < 1.minute
   end
 end
 
