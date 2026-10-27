@@ -161,7 +161,9 @@ RSpec.describe "Owner-aware reads across owner states", type: :request do
     let(:company) { create(:company, plan_tier: "paid") }
 
     it "reads the Timekeeping owner for the time-tracking index while the time entry report still reads timesheet_entries" do
-      projected = create(:timesheet_entry, user:, project:, work_date:, note: "projection only")
+      # The fake's first entry id is 1001 (FIRST_ID 1000 plus one). A sequence-assigned id can reach 1001
+      # too, so the projected row is pinned to an id the fake does not hand out in this example.
+      projected = create(:timesheet_entry, id: 1_000_000, user:, project:, work_date:, note: "projection only")
       owner_entry_id = owner_reads_create_timekeeping_entry(note: "owner only")
 
       send_request :get, api_v1_time_tracking_index_path, headers: auth_headers(user)
