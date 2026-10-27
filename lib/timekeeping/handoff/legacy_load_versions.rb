@@ -12,6 +12,12 @@ module Timekeeping
     # its legacy version, the correction version when it is corrected, and the
     # version Timekeeping already stores, so versions only rise.
     #
+    # Legacy entries default to version 0, but Timekeeping accepts only a
+    # positive version in a checkpoint (its CheckpointEntryValues rule, the
+    # projection's rule for version). So every entry is also raised to at
+    # least LOWEST_LOADABLE_VERSION; reconciliation lists that raise like any
+    # other.
+    #
     # A corrected entry also carries its correction's `locked` value, so the
     # entry Timekeeping stores equals the correction snapshot it relays to the
     # monolith's projection, and a later rollback reconciles the two.
@@ -22,6 +28,8 @@ module Timekeeping
     #
     # Pure: it reads checkpoints and correction lists and builds new ones.
     module LegacyLoadVersions
+      LOWEST_LOADABLE_VERSION = 1
+
       module_function
 
       # source: the legacy Checkpoint. corrections: LegacySource's correction
@@ -31,10 +39,11 @@ module Timekeeping
         stored_versions = stored ? stored.rows.fetch("entries").to_h { |row| [row["id"], row["version"]] } : {}
 
         entries = source.rows.fetch("entries").map do |row|
-          next with_version(row, stored_versions[row["id"]]) unless corrected_locked.key?(row["id"])
+          floors = [LOWEST_LOADABLE_VERSION, stored_versions[row["id"]]]
+          next with_version(row, floors.compact.max) unless corrected_locked.key?(row["id"])
 
           corrected = row.merge("locked" => corrected_locked.fetch(row["id"]))
-          with_version(corrected, [ReservationDerivation::CORRECTION_VERSION, stored_versions[row["id"]]].compact.max)
+          with_version(corrected, [ReservationDerivation::CORRECTION_VERSION, *floors].compact.max)
         end
         Checkpoint.build(tables: source.rows.merge("entries" => entries))
       end

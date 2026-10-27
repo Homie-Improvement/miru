@@ -6,8 +6,9 @@ require "rails_helper"
 require "tmpdir"
 
 # Timekeeping's side of the handoff, held in memory at the store's client
-# boundary. It keeps the version guard the real load applies: a load never
-# replaces an entry with an older version of it. Corrections replace any
+# boundary. It keeps the version guards the real load applies: every entry
+# version is a positive Integer, and a load never replaces an entry with an
+# older version of it. Corrections replace any
 # earlier correction of the same entry and raise the stored version, as the
 # service's correction writer does.
 class RunnerLegacyHandoffSpecTimekeeping
@@ -37,6 +38,9 @@ class RunnerLegacyHandoffSpecTimekeeping
   def highest_outbox_position = 0
 
   def load_checkpoint(checkpoint)
+    not_positive = checkpoint.rows.fetch("entries").reject { |row| row["version"].is_a?(Integer) && row["version"].positive? }
+    raise Timekeeping::Handoff::Store::Error, "entries #{not_positive.pluck('id')} have a version below 1" if not_positive.any?
+
     stored = @rows.fetch("entries").to_h { |row| [row["id"], row["version"]] }
     older = checkpoint.rows.fetch("entries").any? { |row| stored.fetch(row["id"], -1) > row["version"] }
     raise Timekeeping::Handoff::Store::Error, "the store holds newer entry versions than the checkpoint" if older
