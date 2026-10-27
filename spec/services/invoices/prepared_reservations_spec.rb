@@ -162,12 +162,15 @@ RSpec.describe Invoices::PreparedReservations do
         own_entries = [own_entry, committed_entry]
         bystander_version = bystander_entry.reload.version
         own_outbox_before = own_entries.map { |entry| billing_spec_outbox_companies(entry).size }
+        own_versions_before = own_entries.map { |entry| entry.reload.version }
         expect(billing_spec_outbox_companies(bystander_entry)).to eq([])
 
         # "`mark_billed` sets `entries.bill_status` to billed for the invoice's entries."
-        adapter.mark_billed(request_for.call([own_entry.id, committed_entry.id, bystander_entry.id]))
+        outcome = adapter.mark_billed(request_for.call([own_entry.id, committed_entry.id, bystander_entry.id]))
 
+        expect(outcome).to be_a(Invoices::ReservationOutcome)
         expect(own_entries.map { |entry| entry.reload.bill_status }).to eq(%w[billed billed])
+        expect(own_entries.map(&:version)).to eq(own_versions_before.map { |version| version + 1 })
         expect(bystander_entry.reload.bill_status).to eq("unbilled")
         expect(bystander_entry.version).to eq(bystander_version)
         expect(billing_spec_outbox_companies(bystander_entry)).to eq([])
@@ -194,6 +197,10 @@ RSpec.describe Invoices::PreparedReservations do
         # The prepare's flip from unlocked to locked raises the version once and writes one snapshot.
         expect(prepared_spec_outbox_count(entry)).to eq(1)
         expect(entry.reload.version).to eq(version_before + 1)
+        contract_fields = TimekeepingContract.load(:entry_snapshots).fetch("entry_fields")
+        prepare_snapshot = Timekeeping::LocalOutboxEntry.find_by!(company_id: company.id, entry_id: entry.id)
+        expect(prepare_snapshot.payload.keys).to match_array(contract_fields)
+        expect(prepare_snapshot.payload["locked"]).to be(true)
         expect(adapter.commit(request).state).to eq("committed")
 
         expect(prepared_spec_reservations(company)).to eq([[entry.id, invoice.id, "committed", "active"]])
@@ -216,7 +223,7 @@ RSpec.describe Invoices::PreparedReservations do
         expect(prepared_spec_outbox_count(entry)).to eq(1)
         expect(entry.reload.version).to eq(version_before + 1)
         snapshot = Timekeeping::LocalOutboxEntry.find_by!(company_id: company.id, entry_id: entry.id)
-        expect(snapshot.payload.keys).to match_array(TimekeepingContract.load(:entry_snapshots).fetch("entry_fields"))
+        expect(snapshot.payload.keys).to match_array(contract_fields)
         expect(snapshot.payload["locked"]).to be(true)
       end
     end
@@ -330,9 +337,11 @@ RSpec.describe Invoices::PreparedReservations do
               "SELECT COUNT(*) FROM #{table} WHERE company_id = ?", company_id
             ])).to_i
           end,
-          entry_outbox: connection.select_value(ApplicationRecord.sanitize_sql_array([
-            "SELECT COUNT(*) FROM entry_outbox_items WHERE entry_id IN (?)", entries.map(&:id)
-          ])).to_i,
+          entry_outbox: entries.map do |entry|
+            connection.select_value(ApplicationRecord.sanitize_sql_array([
+              "SELECT COUNT(*) FROM entry_outbox_items WHERE entry_id = ?", entry.id
+            ])).to_i
+          end,
           outbox: connection.select_value("SELECT COUNT(*) FROM entry_outbox_items").to_i,
           versions: entries.map { |entry| entry.reload.version }
         }
@@ -353,8 +362,8 @@ RSpec.describe Invoices::PreparedReservations do
         before = unresolved_state(invoice, [first_entry, second_entry])
         expect(before[:reservations]).to eq([[first_entry.id, invoice.id, "provisional", "active"]])
         expect(before[:operations]).to eq(["prepared"])
-        # The first prepare locked only the first entry.
-        expect(before[:entry_outbox]).to eq(1)
+        # The first prepare locked only the first entry, so the second has no snapshot.
+        expect(before[:entry_outbox]).to eq([1, 0])
 
         outcome = adapter.prepare(build.call([first_entry.id, second_entry.id]))
 
@@ -484,7 +493,7 @@ RSpec.describe Invoices::PreparedReservations do
       end
 
       # Every row the company holds, read by SQL, with the outbox counted for
-      # the company and across every company.
+      # each entry, for the company and across every company.
       def unstored_state(entries)
         company_id = unstored_company.id
         connection = ApplicationRecord.connection
@@ -497,6 +506,11 @@ RSpec.describe Invoices::PreparedReservations do
             "SELECT invoice_id, state FROM invoice_operations WHERE company_id = ? ORDER BY id", company_id
           ])),
           versions: entries.map { |entry| entry.reload.version },
+          entry_outbox: entries.map do |entry|
+            connection.select_value(ApplicationRecord.sanitize_sql_array([
+              "SELECT COUNT(*) FROM entry_outbox_items WHERE entry_id = ?", entry.id
+            ])).to_i
+          end,
           company_outbox: connection.select_value(ApplicationRecord.sanitize_sql_array([
             "SELECT COUNT(*) FROM entry_outbox_items WHERE company_id = ?", company_id
           ])).to_i,
@@ -526,6 +540,8 @@ RSpec.describe Invoices::PreparedReservations do
         entries = [lone_entry, held, free]
         before = unstored_state(entries)
         expect(before[:reservations].map { |row| row.first(4) }).to eq([[held.id, holder.id, "committed", "active"]])
+        # Only the held entry was locked, so the lone and free entries have no snapshot.
+        expect(before[:entry_outbox]).to eq([0, 1, 0])
         expect(before[:operations]).to eq([[holder.id, "committed"]])
 
         # "A second kept invoice on the same entry fails with \"entry is on another invoice\""
