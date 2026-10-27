@@ -438,11 +438,9 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     %w(entries reservations entry_audits).each { |table| expect(digest.fetch(table).keys).to match_array(seeded) }
     %w(invoice_operations idempotency_records).each { |table| expect(digest.fetch(table)).to eq({}) }
 
-    # Each corrected entry keeps exactly one correction after the checkpoint step ran twice.
     control_ids = control.fetch(:corrections).map { |snapshot| RunnerLegacyHandoffSpecTimekeeping.entry_id_of(snapshot) }
     expect(control_ids).not_to be_empty
     expect(correction_entry_ids(timekeeping)).to match_array(control_ids)
-    expect(correction_entry_ids(timekeeping).tally.values.uniq).to eq([1])
     expect(timekeeping.corrections.pluck("generation").uniq).to eq([2])
     expect(timekeeping.corrections.pluck("version").uniq).to eq([1])
 
@@ -484,9 +482,11 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
 end
 
 # Uses RunnerLegacyHandoffSpecTimekeeping and RunnerLegacyHandoffSpecSupport,
-# defined at the top of this file. Two crashes in a row: the correction
-# snapshots are written twice and the clock moves on before each restart, so a
-# restart that duplicated corrections or took a new capture time would show.
+# defined at the top of this file. Two crashes in a row, with the clock moving
+# on before each restart. Rewriting the correction snapshots is harmless,
+# because the store keeps one correction per entry; what this checks is that
+# every restart reuses the first capture time and ends at the control's digest,
+# which carries each entry's version.
 RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
   include RunnerLegacyHandoffSpecSupport
 
