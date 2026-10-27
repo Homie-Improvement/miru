@@ -52,6 +52,10 @@ module Timekeeping
       def destroy_entry(**)
         raise OwnershipMoving
       end
+
+      def detach_agent_entries(**)
+        raise OwnershipMoving
+      end
     end
 
     # Reads the ownership row under a share lock, or nil when it is missing.
@@ -72,15 +76,52 @@ module Timekeeping
 
     REFUSAL_REASONS = { OwnershipMoving => "ownership_moving", StaleGeneration => "stale_generation" }.freeze
 
-    attr_reader :context, :local_owner, :write_client, :read_client, :ownership_reader
+    # Fixed namespace for the version 5 UUIDs used as detach operation ids.
+    DETACH_OPERATION_NAMESPACE = "3d0f7a52-8c1e-4b6a-9f2d-5e7c1a9b4d60"
+
+    attr_reader :context, :local_owner, :write_client, :read_client, :service_client, :ownership_reader
 
     def initialize(context:, local_owner: UnavailableLocalOwner.new, write_client: EntryWriteClient.new,
-                   read_client: EntryApiClient.new, ownership_reader: LockedOwnership)
+                   read_client: EntryApiClient.new, service_client: ServiceCommandClient.new,
+                   ownership_reader: LockedOwnership)
       @context = context
       @local_owner = local_owner
       @write_client = write_client
       @read_client = read_client
+      @service_client = service_client
       @ownership_reader = ownership_reader
+    end
+
+    # Pure: the operation id of one detach attempt. The context's request_id
+    # is new for every destroy attempt, so a later attempt makes Timekeeping
+    # select the agent's entries again instead of replaying an earlier
+    # receipt, which would skip entries that named the agent after an earlier
+    # attempt rolled back. A resend within one attempt keeps the same id.
+    def self.detach_operation_id(request_id:, agent_id:)
+      Digest::UUID.uuid_v5(DETACH_OPERATION_NAMESPACE, "#{request_id}/detach_entries/#{agent_id}")
+    end
+
+    # Clears agent_id on every entry that names the agent, in the store that
+    # owns the entries. The agent row is locked after the ownership row and
+    # before the detach, so a concurrent entry save that names the agent
+    # either finishes first, and is detached too, or waits and then fails its
+    # agent existence check. Returns the number of entries detached.
+    def detach_agent_entries(agent:)
+      perform(nil) do |ownership, owner|
+        agent.lock!
+        case owner
+        when :legacy
+          agent.timesheet_entries.update_all(agent_id: nil)
+        when :prepared
+          local_owner.detach_agent_entries(context:, agent:)
+        when :timekeeping
+          service_client.detach_agent_entries(
+            company_id: agent.company_id, agent_id: agent.id, generation: ownership.generation,
+            operation_id: self.class.detach_operation_id(request_id: context.request_id, agent_id: agent.id),
+            request_id: context.request_id
+          )
+        end
+      end
     end
 
     # user and project are records the caller already resolved inside the
