@@ -186,3 +186,36 @@ RSpec.describe InvoiceMailer, type: :mailer do
     expect(Invoice.method_defined?(:update_timesheet_entry_status!)).to be(false)
   end
 end
+
+RSpec.describe InvoiceMailer, "refused billing under the prepared owner", type: :mailer do
+  # The prepared store refuses to bill an entry whose stored snapshot the
+  # projection would reject; the invoice must then stay unsent rather than go
+  # out with its work still showing as unbilled.
+  it "raises the refusal, leaves the invoice unsent and delivers no mail when its entry cannot be billed" do
+    company = create(:company)
+    client = create(:client, company:)
+    project = create(:project, client:, billable: true)
+    owner = create(:user, current_workspace_id: company.id)
+    entry = create(:timesheet_entry, user: owner, project:, bill_status: "unbilled")
+    invoice = create(:invoice, client:, company:, status: :sending)
+    create(:invoice_line_item, invoice:, timesheet_entry: entry, rate: 100, quantity: 60)
+    stored = Timekeeping::LocalEntry.create!(id: entry.id, company_id: company.id, user_id: owner.id, project_id: project.id,
+                                             work_date: entry.work_date, duration: 60.0, bill_status: "unbilled")
+    stored.update_columns(source: "legacy")
+    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
+    allow(InvoicePayment::PdfGeneration).to receive(:process).and_return("%PDF-1.4 invoice")
+    ActionMailer::Base.deliveries.clear
+
+    expect do
+      InvoiceMailer.with(invoice_id: invoice.id, subject: "Invoice", recipients: [client.email]).invoice.deliver_now
+    end.to raise_error(Invoices::OperationErrors::Refused) { |error|
+      expect(error.outcome.conflicts).to eq([{ entry_id: entry.id, reason: "unpublishable_entry" }])
+    }
+
+    invoice.reload
+    expect(invoice.status).to eq("sending")
+    expect(invoice.sent_at).to be_nil
+    expect(stored.reload.bill_status).to eq("unbilled")
+    expect(ActionMailer::Base.deliveries).to be_empty
+  end
+end

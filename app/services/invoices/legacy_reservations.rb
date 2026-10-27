@@ -74,7 +74,8 @@ module Invoices
         entry_ids = lock_entries(request.company_id, request.entries)
         # Selected again after the wait for the row locks, so an entry
         # discarded meanwhile is not billed.
-        TimesheetEntry.kept.where(id: entry_ids).update!(bill_status: :billed)
+        billed = TimesheetEntry.kept.where(id: entry_ids).update!(bill_status: :billed)
+        outcome("committed", counts: { billed: billed.size })
       end
     end
 
