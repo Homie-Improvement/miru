@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_10_27_120000) do
+ActiveRecord::Schema[8.1].define(version: 2026_10_27_130000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pg_stat_statements"
@@ -363,6 +363,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_27_120000) do
     t.integer "total_rows", default: 0, null: false
     t.datetime "updated_at", null: false
     t.bigint "user_id", null: false
+    t.integer "written_rows", default: [], null: false, array: true
     t.index ["company_id", "created_at"], name: "index_data_imports_on_company_id_and_created_at"
     t.index ["user_id"], name: "index_data_imports_on_user_id"
   end

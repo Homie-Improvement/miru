@@ -90,9 +90,10 @@ module Imports
           message = I18n.t("imports.errors.unexpected")
         end
         # Each entry commits on its own, so the rows written before the failure
-        # stay stored and are reported.
+        # stay stored and are reported, with the row errors met so far.
         data_import.update!(status: "failed", error_message: message, finished_at: Time.current,
-                            imported_rows: @imported_rows.to_i)
+                            imported_rows: @imported_rows.to_i, failed_rows: @failed_rows.to_i,
+                            row_errors: @row_errors.to_a)
       end
 
       def load_rows
@@ -159,6 +160,7 @@ module Imports
           end
         end
         @rows.each { |row| plan_row(row) }
+        skip_stored_duplicates
         @summary = build_summary
       end
 
@@ -177,21 +179,17 @@ module Imports
       def load_database_duplicates
         project_ids = @project_plans.values.filter_map { |plan| plan[:existing]&.id }.uniq
         work_dates = @rows.filter_map { |row| parse_date(row[:date]) }
-        stored = if project_ids.empty? || work_dates.empty?
-          []
+        @stored_duplicates = if project_ids.empty? || work_dates.empty?
+          {}
         else
           TimesheetEntry.kept.joins(project: :client)
             .merge(Project.kept)
             .merge(Client.kept)
             .where(project_id: project_ids, work_date: work_dates.min..work_dates.max, source: "import")
-            .pluck(:user_id, :project_id, :work_date, :duration, :note, :created_at)
+            .pluck(:user_id, :project_id, :work_date, :duration, :note)
+            .map { |values| duplicate_key(*values) }
+            .tally
         end
-        # Entries stored before this data import existed came from earlier
-        # imports; entries stored after it are rows an earlier run of this same
-        # import already wrote before it failed.
-        earlier, own = stored.partition { |values| values.last < data_import.created_at }
-        @earlier_import_duplicates = earlier.to_set { |values| duplicate_key(*values.first(5)) }
-        @own_stored_rows = own.map { |values| duplicate_key(*values.first(5)) }.tally
       end
 
       def build_entity_plans
@@ -294,31 +292,37 @@ module Imports
         project_plan = row[:project_plan]
         bill_status = bill_status(row, project_plan)
 
-        return if duplicate_row?(row, user, project_plan[:existing], work_date, duration)
-
+        project = project_plan[:existing]
         @planned_rows << row.merge(
           user:,
           project_plan:,
           work_date:,
           duration:,
-          bill_status:
+          bill_status:,
+          duplicate_key: project && duplicate_key(user.id, project.id, work_date, duration, row[:note])
         )
       end
 
-      # A row matching an earlier import's entry is skipped, however many times
-      # it repeats. An entry this import already wrote accounts for one
-      # matching row only, so an identical row a failed run never reached is
-      # still written on the rerun.
-      def duplicate_row?(row, user, project, work_date, duration)
-        return false unless project
+      # A row an earlier run of this import already wrote (its line is in
+      # written_rows) accounts for one stored match, and is skipped when that
+      # match is stored here. Every other row matching a stored entry is
+      # skipped however often it repeats, so a stored entry of another import
+      # still skips all of its matching rows, while an identical row a failed
+      # run never reached is written on the rerun.
+      def skip_stored_duplicates
+        written = data_import.written_rows.to_set
+        unmatched = @stored_duplicates.dup
+        own, others = @planned_rows.partition { |row| written.include?(row[:row]) }
+        skipped = own.select { |row| take_stored_match(unmatched, row[:duplicate_key]) }
+        skipped += others.select { |row| unmatched.fetch(row[:duplicate_key], 0).positive? }
+        @duplicate_rows = skipped.size
+        @planned_rows -= skipped
+      end
 
-        key = duplicate_key(user.id, project.id, work_date, duration, row[:note])
-        if @earlier_import_duplicates.exclude?(key)
-          return false unless @own_stored_rows.fetch(key, 0).positive?
+      def take_stored_match(unmatched, key)
+        return false unless unmatched.fetch(key, 0).positive?
 
-          @own_stored_rows[key] -= 1
-        end
-        @duplicate_rows += 1
+        unmatched[key] -= 1
         true
       end
 
@@ -531,7 +535,17 @@ module Imports
           idempotency_key: row_idempotency_key(row),
           expected_generation:
         )
+        record_written_row(row)
         @imported_rows += 1
+      end
+
+      # Kept across runs, and saved as each row is written, so a rerun after
+      # any failure, a crash included, knows which stored entries this import
+      # wrote itself.
+      def record_written_row(row)
+        DataImport.where(id: data_import.id)
+          .where.not("? = ANY(written_rows)", row[:row])
+          .update_all(["written_rows = array_append(written_rows, ?)", row[:row]])
       end
 
       # The same row of the same data import always gives the same key, so a

@@ -534,6 +534,30 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     expect(first_row_keys.uniq.size).to eq(1)
     expect(fwd_fake.outbox.map { |row| row["entry"]["id"] }.uniq.size).to eq(2)
   end
+
+  it "sends only the unwritten row on a rerun once the written row has reached the local projection" do
+    calls = 0
+    allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_wrap_original do |original, *args, **kwargs|
+      result = original.call(*args, **kwargs)
+      calls += 1
+      if calls == 1
+        TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(generation: 3)
+        fwd_fake.generation = 3
+      end
+      result
+    end
+
+    expect { described_class.new(fwd_import).process }.to raise_error(Timekeeping::Gateway::StaleGeneration)
+    # The local copy of the forwarded first row, as snapshot delivery would store it.
+    create(:timesheet_entry, project: fwd_project, user: fwd_paul, work_date: Date.new(2026, 1, 5), duration: 90,
+                             note: "first row", bill_status: "unbilled", source: "import")
+    described_class.new(fwd_import.reload).process
+
+    posted_notes = fwd_fake.requests.filter_map { |request| request[:body]&.dig("note") if request[:method] == "POST" }
+    expect(posted_notes).to eq(["first row", "second row"])
+    expect(fwd_fake.outbox.map { |row| row["entry"]["id"] }.uniq.size).to eq(2)
+    expect(fwd_import.reload).to have_attributes(status: "completed", imported_rows: 1, skipped_rows: 1)
+  end
 end
 
 RSpec.describe Imports::HarvestTimeEntriesImporter do
@@ -1167,5 +1191,54 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     expect(rerun_dup_entries("second")).to eq(1)
     expect(rerun_dup_entries("third")).to eq(1)
     expect(import.reload).to have_attributes(status: "completed", imported_rows: 1, skipped_rows: 3)
+  end
+
+  it "skips every matching row of an upload queued before an earlier upload stored its entry" do
+    first_import = rerun_dup_import_with(<<~CSV)
+      Date,Client,Project,Hours,First Name,Last Name,Billable?,Notes
+      2026-01-05,Acme LLC,Website,1,Paul,Connors,Yes,queued
+    CSV
+    second_import = rerun_dup_import_with(<<~CSV)
+      Date,Client,Project,Hours,First Name,Last Name,Billable?,Notes
+      2026-01-05,Acme LLC,Website,1,Paul,Connors,Yes,queued
+      2026-01-05,Acme LLC,Website,1,Paul,Connors,Yes,queued
+    CSV
+
+    described_class.new(first_import).process
+    described_class.new(second_import).process
+
+    expect(rerun_dup_entries("queued")).to eq(1)
+    expect(second_import.reload).to have_attributes(status: "completed", imported_rows: 0, skipped_rows: 2)
+  end
+
+  it "keeps the row errors met before an ownership refusal stops the import" do
+    import = rerun_dup_import_with(<<~CSV)
+      Date,Client,Project,Hours,First Name,Last Name,Billable?,Notes
+      2026-01-05,Acme LLC,Website,100001,Paul,Connors,Yes,too long
+      2026-01-06,Acme LLC,Website,1,Paul,Connors,Yes,refused
+    CSV
+
+    rerun_dup_refuse_import_call(2)
+    expect { described_class.new(import).process }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
+
+    expect(import.reload).to have_attributes(status: "failed", imported_rows: 0, failed_rows: 1, skipped_rows: 0)
+    expect(import.row_errors.pluck("row")).to eq([2])
+  end
+
+  it "writes the valid rows on both sides of a row the model rejects" do
+    import = rerun_dup_import_with(<<~CSV)
+      Date,Client,Project,Hours,First Name,Last Name,Billable?,Notes
+      2026-01-05,Acme LLC,Website,1,Paul,Connors,Yes,before
+      2026-01-06,Acme LLC,Website,100001,Paul,Connors,Yes,rejected
+      2026-01-07,Acme LLC,Website,1,Paul,Connors,Yes,after
+    CSV
+
+    described_class.new(import).process
+
+    expect(rerun_dup_entries("before")).to eq(1)
+    expect(rerun_dup_entries("after")).to eq(1)
+    expect(rerun_dup_entries("rejected")).to eq(0)
+    expect(import.reload).to have_attributes(status: "completed", imported_rows: 2, failed_rows: 1)
+    expect(import.row_errors.pluck("row")).to eq([3])
   end
 end
