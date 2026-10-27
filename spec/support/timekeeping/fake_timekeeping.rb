@@ -23,7 +23,9 @@ module TimekeepingContract
   # Timekeeping::UserToken JWTs the monolith signed, takes the acting user,
   # company and roles from their verified claims, and applies the shared entry
   # change rules, so specs drive it with the monolith's own ids and real
-  # tokens instead of stubbing the token check. Without it, the fake accepts
+  # tokens instead of stubbing the token check. On reservation routes it also
+  # accepts Timekeeping::ServiceToken JWTs, checked as the real service checks
+  # them. Without it, the fake accepts
   # the opaque tokens issue_token hands out, as the contract examples use.
   class FakeTimekeeping
     INITIAL_GENERATION = 1
@@ -61,6 +63,18 @@ module TimekeepingContract
       [->(access) { access[:service].fetch("company_id") != access[:company_id] }, :not_found],
       [->(_access) { true }, :ok]
     ].freeze
+
+    # The operation each reservation route runs, as a signed service token's
+    # operations claim spells it. A copy of
+    # timekeeping/app/services/timekeeping/reservation_access.rb
+    # ROUTE_OPERATIONS, which the monolith cannot load.
+    SERVICE_ROUTE_OPERATIONS = {
+      "prepare" => "reservations.prepare",
+      "commit" => "reservations.commit",
+      "abort" => "reservations.abort",
+      "mark_billed" => "invoices.mark_billed",
+      "detach_entries" => "agents.detach_entries"
+    }.freeze
 
     def self.first_match(table, facts)
       table.find { |condition, _result| condition.call(facts) }.last
@@ -491,13 +505,30 @@ module TimekeepingContract
       end
 
       # Returns [actor] or [nil, error response].
-      def authorize_service(credential, company_id, operation)
-        service = @services[credential]
+      def authorize_service(credential, company_id, route)
+        service, operation = @services[credential] ? [@services[credential], route] : signed_service(credential, route)
         kind = (:service if service) || (:user if user_token?(credential))
         decision = @policies[:service_access].call(kind:, service:, company_id:, operation:)
         return [nil, Wire.error(@reservation_contract, decision.to_s)] unless decision == :ok
 
         [service ? ["service", service["name"]] : ["user", @tokens[credential]]]
+      end
+
+      # In token mode, a Timekeeping::ServiceToken the monolith signed, as the
+      # service record and route operation SERVICE_ACCESS_TABLE reads, or
+      # [nil, route] when the credential is not one. Only operations the
+      # background allowlist also holds are granted, as
+      # Timekeeping::ReservationAccess grants them, so a token naming any
+      # other string, such as the bare route name, is refused.
+      def signed_service(credential, route)
+        return [nil, route] unless @token_public_key
+
+        claims = Timekeeping::ServiceToken.verify(credential, public_key: @token_public_key)
+        granted = claims.operations & TimekeepingRules::EntryRules::BACKGROUND_OPERATIONS
+        [{ "company_id" => claims.company_id, "name" => claims.subject, "operations" => granted },
+         SERVICE_ROUTE_OPERATIONS.fetch(route)]
+      rescue Timekeeping::ServiceToken::InvalidTokenError
+        [nil, route]
       end
 
       def operation(company_id, actor, operation_id)
