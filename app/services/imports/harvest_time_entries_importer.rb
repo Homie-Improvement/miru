@@ -441,7 +441,7 @@ module Imports
       # rollback could not undo rows Timekeeping already stored. Refusals other
       # than an invalid row escape and fail the import.
       def persist_entries
-        expected_generation = current_generation
+        expected_generation = Timekeeping::Gateway.current_generation
         gateway = entry_gateway(import_user)
         create_clients_and_projects
         create_project_members
@@ -507,14 +507,6 @@ module Imports
 
           ProjectMember.create!(project_id:, user_id:, hourly_rate: row[:hourly_rate])
         end
-      end
-
-      # A missing ownership row is refused the way the gateway refuses it.
-      def current_generation
-        ownership = TimekeepingOwnership.find_by(id: TimekeepingOwnership::SINGLETON_ID)
-        raise Timekeeping::Gateway::OwnershipMoving if ownership.nil?
-
-        ownership.generation
       end
 
       # @users holds the company's employed users, read when the job started.

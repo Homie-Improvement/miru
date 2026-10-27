@@ -949,90 +949,6 @@ RSpec.describe Timekeeping::Gateway, "writer-specific forwarded fields" do
 end
 
 RSpec.describe Timekeeping::Gateway do
-  # The context Agent#destroy builds for its detach: the agent's backing user
-  # acting as agent_destroy.
-  def detach_routing_context(agent, request_id)
-    Timekeeping::WriteContext.new(company: agent.company, actor: agent.user, actor_kind: "agent_destroy", request_id:)
-  end
-
-  # The EntryWriteRefused events emitted while the block runs.
-  def detach_routing_refusals
-    events = []
-    subscriber = Object.new
-    subscriber.define_singleton_method(:emit) do |event|
-      events << event if event[:name] == "Timekeeping::EntryWriteRefused"
-    end
-    Rails.event.subscribe(subscriber)
-    begin
-      yield
-    ensure
-      Rails.event.unsubscribe(subscriber)
-    end
-    events
-  end
-
-  # "When `handoff_step` is set, the gateway refuses entry writes, prepares and service commands with a retryable `503 ownership_moving`."
-  it "emits one ownership_moving refusal naming the agent_destroy actor and leaves the entry attached" do
-    agent = create(:agent)
-    project = create(:project, client: create(:client, company: agent.company))
-    entry = create(:timesheet_entry, project:, user: agent.user, agent:)
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(handoff_step: "freeze")
-    service_client = instance_double(Timekeeping::ServiceCommandClient)
-    gateway = described_class.new(context: detach_routing_context(agent, "req-detach-refused"), service_client:)
-
-    events = detach_routing_refusals do
-      expect { gateway.detach_agent_entries(agent:) }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
-    end
-
-    expect(events.size).to eq(1)
-    expect(events.first[:payload].to_h[:data]).to eq(
-      reason: "ownership_moving", company_id: agent.company_id, request_id: "req-detach-refused",
-      actor_kind: "agent_destroy"
-    )
-    expect(entry.reload.agent_id).to eq(agent.id)
-  end
-
-  it "refuses a detach in the prepared store and sends nothing to Timekeeping" do
-    agent = create(:agent)
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
-    # A double with no allowed methods: any forwarded call fails the example.
-    service_client = instance_double(Timekeeping::ServiceCommandClient)
-    gateway = described_class.new(context: detach_routing_context(agent, "req-detach-prepared"), service_client:)
-
-    expect { gateway.detach_agent_entries(agent:) }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
-  end
-
-  it "forwards the generation it read and the attempt's operation id and request id" do
-    agent = create(:agent)
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 3)
-    service_client = instance_double(Timekeeping::ServiceCommandClient)
-    allow(service_client).to receive(:detach_agent_entries).and_return(2)
-    gateway = described_class.new(context: detach_routing_context(agent, "req-detach-forward"), service_client:)
-
-    expect(gateway.detach_agent_entries(agent:)).to eq(2)
-    expect(service_client).to have_received(:detach_agent_entries).with(
-      company_id: agent.company_id, agent_id: agent.id, generation: 3,
-      operation_id: described_class.detach_operation_id(request_id: "req-detach-forward", agent_id: agent.id),
-      request_id: "req-detach-forward"
-    )
-  end
-
-  # A retried destroy must select the agent's entries again rather than replay an earlier receipt.
-  it "gives each destroy attempt its own operation id and keeps it within one attempt" do
-    first = described_class.detach_operation_id(request_id: "attempt-1", agent_id: 9)
-
-    expect(described_class.detach_operation_id(request_id: "attempt-1", agent_id: 9)).to eq(first)
-    expect(described_class.detach_operation_id(request_id: "attempt-2", agent_id: 9)).not_to eq(first)
-    expect(described_class.detach_operation_id(request_id: "attempt-1", agent_id: 10)).not_to eq(first)
-  end
-
-  it "refuses every local-owner detach by default as a retryable ownership move" do
-    expect { Timekeeping::Gateway::UnavailableLocalOwner.new.detach_agent_entries(context: nil, agent: nil) }
-      .to raise_error(Timekeeping::Gateway::OwnershipMoving)
-  end
-end
-
-RSpec.describe Timekeeping::Gateway do
   let(:imp_company) { create(:company) }
   let(:imp_admin) do
     create(:user, current_workspace_id: imp_company.id).tap do |user|
@@ -1073,193 +989,6 @@ RSpec.describe Timekeeping::Gateway do
     expect(events.first[:payload].to_h[:data]).to eq(
       reason: "stale_generation", company_id: imp_company.id, request_id: "req-import-1", actor_kind: "import"
     )
-  end
-end
-
-RSpec.describe Timekeeping::Gateway do
-  let(:replay_company) { create(:company) }
-  let(:replay_project) { create(:project, billable: true, client: create(:client, company: replay_company)) }
-  let(:replay_base_url) { "http://timekeeping.test" }
-  let(:replay_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-  let(:replay_allow_all) { ->(_entry) { } }
-
-  def replay_admin_of(company)
-    create(:user, current_workspace_id: company.id).tap do |user|
-      create(:employment, company:, user:)
-      user.add_role :admin, company
-      replay_fake.register_user(id: user.id, company_id: company.id, role: "admin")
-    end
-  end
-
-  def replay_gateway(actor:, company: replay_company, request_id: "req-replay-1")
-    context = Timekeeping::WriteContext.new(company:, actor:, actor_kind: "user", request_id:)
-    described_class.new(context:, write_client: Timekeeping::EntryWriteClient.new(base_url: replay_base_url),
-                        read_client: Timekeeping::EntryApiClient.new(base_url: replay_base_url))
-  end
-
-  before do
-    route_timekeeping_to_fake(replay_fake, base_url: replay_base_url)
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
-    replay_fake.generation = 2
-    replay_fake.register_company(id: replay_company.id, edit_days: replay_company.timesheet_edit_days)
-    replay_fake.register_project(id: replay_project.id, company_id: replay_company.id)
-  end
-
-  around do |example|
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
-  end
-
-  def replay_entry_for(user)
-    replay_fake.add_entry(company_id: replay_company.id, user_id: user.id, project_id: replay_project.id,
-                          "work_date" => Date.current.iso8601).fetch("id")
-  end
-
-  def replay_deletes
-    replay_fake.requests.select { |request| request[:method] == "DELETE" }
-  end
-
-  # "A retry of a committed delete cannot reach Timekeeping's stored answer."
-  # "Even with the same request id, the gateway never sends the second DELETE carrying the same idempotency key."
-  # "Replaying it needs a separate design that keeps the lookup-then-authorize order, and nothing is deleted twice meanwhile."
-  it "returns true for a retried timekeeping delete after a lost answer, resending the same Idempotency-Key and discarding once" do
-    admin = replay_admin_of(replay_company)
-    entry_id = replay_entry_for(admin)
-
-    # The first delete commits in Timekeeping; the caller never saw its answer.
-    expect(replay_gateway(actor: admin).destroy(entry_id:, authorize: replay_allow_all)).to be(true)
-    after_first = replay_fake.stored_entry(entry_id)
-    outbox_after_first = replay_fake.outbox.size
-
-    expect(replay_gateway(actor: admin).destroy(entry_id:, authorize: replay_allow_all)).to be(true)
-
-    deletes = replay_deletes
-    expect(deletes.size).to eq(2)
-    expect(deletes.map { |request| request[:headers]["Idempotency-Key"] }.uniq.size).to eq(1)
-    expect(after_first["discarded_at"]).not_to be_nil
-    expect(replay_fake.stored_entry(entry_id)).to eq(after_first)
-    # One discard only: added at version 1, discarded at version 2, never written again.
-    expect(replay_fake.stored_entry(entry_id)["version"]).to eq(2)
-    expect(replay_fake.outbox.size).to eq(outbox_after_first)
-  end
-
-  # "Address this in follow-up design work with an authenticated replay path; do not treat every missing entry as a successful delete."
-  it "answers a colleague who reuses the deleting admin's request id with not found while the deleting admin's retry gets the stored delete" do
-    admin = replay_admin_of(replay_company)
-    colleague = replay_admin_of(replay_company)
-    entry_id = replay_entry_for(admin)
-
-    replay_gateway(actor: admin).destroy(entry_id:, authorize: replay_allow_all)
-    version_after_delete = replay_fake.stored_entry(entry_id).fetch("version")
-
-    # The request id is client-chosen, so it must never be enough to reach another user's stored answer.
-    expect { replay_gateway(actor: colleague).destroy(entry_id:, authorize: replay_allow_all) }
-      .to raise_error(ActiveRecord::RecordNotFound)
-    replay = replay_fake.requests.last
-    expect([replay[:method], replay[:headers]["Idempotency-Replay"]]).to eq(["DELETE", "only"])
-    expect(replay_gateway(actor: admin).destroy(entry_id:, authorize: replay_allow_all)).to be(true)
-    expect(replay_fake.stored_entry(entry_id).fetch("version")).to eq(version_after_delete)
-  end
-
-  # "Address this in follow-up design work with an authenticated replay path; do not treat every missing entry as a successful delete."
-  it "answers another company's user who sends the same request id and entry id with not found, never the stored delete" do
-    admin = replay_admin_of(replay_company)
-    other_company = create(:company)
-    replay_fake.register_company(id: other_company.id, edit_days: other_company.timesheet_edit_days)
-    foreign_admin = replay_admin_of(other_company)
-    entry_id = replay_entry_for(admin)
-    replay_gateway(actor: admin).destroy(entry_id:, authorize: replay_allow_all)
-    version_after_delete = replay_fake.stored_entry(entry_id).fetch("version")
-    requests_before_foreign = replay_fake.requests.size
-
-    # The foreign user derives the same key, but every request goes out under the foreign company's own path.
-    expect { replay_gateway(actor: foreign_admin, company: other_company).destroy(entry_id:, authorize: replay_allow_all) }
-      .to raise_error(ActiveRecord::RecordNotFound)
-
-    foreign_requests = replay_fake.requests.drop(requests_before_foreign)
-    expect(foreign_requests).not_to be_empty
-    expect(foreign_requests.pluck(:path)).to all(start_with("/v1/companies/#{other_company.id}/"))
-    expect(replay_gateway(actor: admin).destroy(entry_id:, authorize: replay_allow_all)).to be(true)
-    expect(replay_fake.stored_entry(entry_id).fetch("version")).to eq(version_after_delete)
-  end
-
-  # "Replaying it needs a separate design that keeps the lookup-then-authorize order, and nothing is deleted twice meanwhile."
-  it "lets the authorize check refuse a replayed delete instead of reporting it as a success" do
-    admin = replay_admin_of(replay_company)
-    entry_id = replay_entry_for(admin)
-    replay_gateway(actor: admin).destroy(entry_id:, authorize: replay_allow_all)
-    checked = []
-    refuse = lambda do |entry|
-      checked << entry.id
-      raise Pundit::NotAuthorizedError
-    end
-
-    expect { replay_gateway(actor: admin).destroy(entry_id:, authorize: refuse) }
-      .to raise_error(Pundit::NotAuthorizedError)
-    expect(checked).to eq([entry_id])
-    expect(replay_fake.stored_entry(entry_id)["version"]).to eq(2)
-  end
-
-  # "Replaying it needs a separate design that keeps the lookup-then-authorize order, and nothing is deleted twice meanwhile."
-  # "do not treat every missing entry as a successful delete"
-  # The lookup finds a colleague's kept entry and scope :actor refuses it. The entry is still live, so no committed
-  # delete of it can exist to replay, and the gateway sends Timekeeping no DELETE at all.
-  it "sends no DELETE for a kept colleague entry outside the actor scope and leaves that entry kept" do
-    admin = replay_admin_of(replay_company)
-    colleague = create(:user, current_workspace_id: replay_company.id).tap do |user|
-      create(:employment, company: replay_company, user:)
-      user.add_role :employee, replay_company
-      replay_fake.register_user(id: user.id, company_id: replay_company.id, role: "employee")
-    end
-    entry_id = replay_entry_for(colleague)
-    before_entry = replay_fake.stored_entry(entry_id)
-    outbox_before = replay_fake.outbox.size
-
-    expect { replay_gateway(actor: admin).destroy(entry_id:, authorize: replay_allow_all, scope: :actor) }
-      .to raise_error(ActiveRecord::RecordNotFound)
-
-    expect(replay_deletes).to be_empty
-    expect(replay_fake.stored_entry(entry_id)).to eq(before_entry)
-    expect(replay_fake.stored_entry(entry_id)["discarded_at"]).to be_nil
-    expect(replay_fake.stored_entry(entry_id)["version"]).to eq(1)
-    expect(replay_fake.outbox.size).to eq(outbox_before)
-  end
-
-  # "Address this in follow-up design work with an authenticated replay path; do not treat every missing entry as a successful delete."
-  # A new request id derives a new Idempotency-Key, so no receipt matches and the entry being gone is not a success.
-  it "answers not found when a committed delete is retried under a new request id, sending a different key and discarding nothing more" do
-    admin = replay_admin_of(replay_company)
-    entry_id = replay_entry_for(admin)
-    replay_gateway(actor: admin, request_id: "req-first").destroy(entry_id:, authorize: replay_allow_all)
-
-    expect { replay_gateway(actor: admin, request_id: "req-other").destroy(entry_id:, authorize: replay_allow_all) }
-      .to raise_error(ActiveRecord::RecordNotFound)
-
-    deletes = replay_deletes
-    expect(deletes.size).to eq(2)
-    expect(replay_fake.requests.last).to eq(deletes.last)
-    expect(deletes.last[:headers]["Idempotency-Replay"]).to eq("only")
-    expect(deletes.last[:headers]["Idempotency-Key"]).to eq(
-      Timekeeping::EntryWriteClient.idempotency_key(request_id: "req-other", operation: "destroy", entry_id:)
-    )
-    expect(deletes.last[:headers]["Idempotency-Key"]).not_to eq(deletes.first[:headers]["Idempotency-Key"])
-    expect(replay_fake.stored_entry(entry_id)["version"]).to eq(2)
-  end
-
-  # "A retried delete after a lost answer now hits the lookup and gets 404, not the stored answer."
-  # Timekeeping reads the receipt before the generation, so a moved generation must not turn a committed delete into a refusal.
-  it "still returns the stored success when the ownership generation advanced between a committed delete and its retry" do
-    admin = replay_admin_of(replay_company)
-    entry_id = replay_entry_for(admin)
-    replay_gateway(actor: admin).destroy(entry_id:, authorize: replay_allow_all)
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(generation: 3)
-    replay_fake.generation = 3
-
-    expect(replay_gateway(actor: admin).destroy(entry_id:, authorize: replay_allow_all)).to be(true)
-
-    deletes = replay_deletes
-    expect(deletes.last[:headers]["Ownership-Generation"]).to eq("3")
-    expect(deletes.last[:headers]["Idempotency-Key"]).to eq(deletes.first[:headers]["Idempotency-Key"])
-    expect(replay_fake.stored_entry(entry_id)["version"]).to eq(2)
   end
 end
 
@@ -1495,59 +1224,530 @@ RSpec.describe Timekeeping::Gateway do
   end
 end
 
-RSpec.describe Timekeeping::Gateway do
-  let(:fallback_company) { create(:company) }
-  let(:fallback_admin) do
-    create(:user, current_workspace_id: fallback_company.id).tap do |user|
-      create(:employment, company: fallback_company, user:)
-      user.add_role :admin, fallback_company
+RSpec.describe Timekeeping::Gateway, committed_data: true do
+  let(:bulk_company) { create(:company) }
+  let(:bulk_client) { create(:client, company: bulk_company) }
+  let(:bulk_source_project) { create(:project, billable: true, client: bulk_client) }
+  let(:bulk_target_project) { create(:project, billable: true, client: bulk_client) }
+  let(:bulk_admin) do
+    create(:user, current_workspace_id: bulk_company.id).tap do |user|
+      create(:employment, company: bulk_company, user:)
+      user.add_role :admin, bulk_company
     end
   end
-  let(:fallback_project) { create(:project, billable: true, client: create(:client, company: fallback_company)) }
-  let(:fallback_context) do
-    Timekeeping::WriteContext.new(company: fallback_company, actor: fallback_admin, actor_kind: "user",
-                                  request_id: "req-replay-fallback")
+  let(:bulk_context) do
+    Timekeeping::WriteContext.new(company: bulk_company, actor: bulk_admin, actor_kind: "user",
+                                  request_id: "req-bulk-move-bump")
   end
 
-  # "do not treat every missing entry as a successful delete"
-  # A Timekeeping instance that predates the replay header answers the fixed If-Match with 409 version_conflict.
-  # The gateway must report that as the same not found every other miss gets, never as success or a new status.
-  it "answers not found when a provider that ignores the replay header refuses the replay as a version conflict" do
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
-    read_client = instance_double(Timekeeping::EntryApiClient)
-    allow(read_client).to receive(:show_entry)
-      .and_raise(ActiveRecord::RecordNotFound.new("Couldn't find TimesheetEntry", "TimesheetEntry"))
-    write_client = instance_double(Timekeeping::EntryWriteClient)
-    allow(write_client).to receive(:replay_destroy_entry).and_raise(Timekeeping::EntryWriteClient::Conflict)
-    gateway = described_class.new(context: fallback_context, write_client:, read_client:)
+  it "a legacy bulk move whose generation changes after the first entry write raises StaleGeneration and leaves every entry on its old project" do
+    entries = Array.new(2) do
+      create(:timesheet_entry, user: bulk_admin, project: bulk_source_project, work_date: Date.current,
+                               bill_status: "unbilled")
+    end
+    ids = entries.map(&:id)
+    expected_generation = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).generation
+    target_id = bulk_target_project.id
 
-    expect { gateway.destroy(entry_id: 9_001, authorize: ->(_entry) { }) }.to raise_error(ActiveRecord::RecordNotFound)
-    expect(write_client).to have_received(:replay_destroy_entry)
-      .with(context: fallback_context, generation: 2, entry_id: 9_001)
+    # Once any requested entry has been written inside the transaction, every later ownership read
+    # answers a raised generation, as a handoff that bumped the row between two writes would.
+    bumping_reader = lambda do
+      row = Timekeeping::Gateway::LockedOwnership.call
+      moved = TimesheetEntry.where(id: ids, project_id: target_id).exists?
+      moved ? row.dup.tap { |copy| copy.generation = row.generation + 1 } : row
+    end
+
+    gateway = described_class.new(context: bulk_context, ownership_reader: bumping_reader)
+
+    # "A writer that makes many writes checks the generation on each one, not once per job."
+    # "A generation refusal fails the whole bulk request with an error. It is not one of the silently skipped entries of A9."
+    expect do
+      gateway.bulk_move(entry_ids: ids, project: bulk_target_project, check: ->(_entries) { nil },
+                        expected_generation:)
+    end.to raise_error(Timekeeping::Gateway::StaleGeneration)
+
+    # "A generation or handoff refusal raises and rolls back every write in the request."
+    expect(TimesheetEntry.where(id: ids).pluck(:project_id)).to all(eq(bulk_source_project.id))
+  end
+end
+
+RSpec.describe Timekeeping::Gateway, committed_data: true do
+  let(:bulk_delete_company) { create(:company) }
+  let(:bulk_delete_project) { create(:project, billable: true, client: create(:client, company: bulk_delete_company)) }
+  let(:bulk_delete_admin) do
+    create(:user, current_workspace_id: bulk_delete_company.id).tap do |user|
+      create(:employment, company: bulk_delete_company, user:)
+      user.add_role :admin, bulk_delete_company
+    end
+  end
+  let(:bulk_delete_context) do
+    Timekeeping::WriteContext.new(company: bulk_delete_company, actor: bulk_delete_admin, actor_kind: "user",
+                                  request_id: "req-bulk-delete-bump")
   end
 
-  # Only a lookup that found nothing may lead to a replay: an unavailable lookup must stay a retryable refusal.
-  it "sends no replay when the Timekeeping lookup is unavailable" do
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
-    read_client = instance_double(Timekeeping::EntryApiClient)
-    allow(read_client).to receive(:show_entry).and_raise(Timekeeping::EntryApiClient::Error, "unavailable")
-    write_client = instance_double(Timekeeping::EntryWriteClient)
-    gateway = described_class.new(context: fallback_context, write_client:, read_client:)
+  it "a legacy bulk delete whose generation changes after the first discard raises StaleGeneration and leaves every entry kept" do
+    entries = Array.new(2) do
+      create(:timesheet_entry, user: bulk_delete_admin, project: bulk_delete_project, work_date: Date.current,
+                               bill_status: "unbilled")
+    end
+    ids = entries.map(&:id)
+    expected_generation = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).generation
 
-    expect { gateway.destroy(entry_id: 9_002, authorize: ->(_entry) { }) }
-      .to raise_error(Timekeeping::EntryApiClient::Error)
+    # After the first discard inside the transaction, later ownership reads answer a raised generation.
+    bumping_reader = lambda do
+      row = Timekeeping::Gateway::LockedOwnership.call
+      discarded = TimesheetEntry.where(id: ids).where.not(discarded_at: nil).exists?
+      discarded ? row.dup.tap { |copy| copy.generation = row.generation + 1 } : row
+    end
+
+    gateway = described_class.new(context: bulk_delete_context, ownership_reader: bumping_reader)
+
+    # "A generation refusal fails the whole bulk request with an error. It is not one of the silently skipped entries of A9."
+    expect do
+      gateway.bulk_delete(entry_ids: ids, check: ->(_entries) { nil }, expected_generation:)
+    end.to raise_error(Timekeeping::Gateway::StaleGeneration)
+
+    # "A generation or handoff refusal raises and rolls back every write in the request."
+    expect(TimesheetEntry.where(id: ids).pluck(:discarded_at)).to all(be_nil)
+  end
+end
+
+RSpec.describe Timekeeping::Gateway, "bulk move during a handoff", committed_data: true do
+  it "a legacy bulk move during a handoff raises OwnershipMoving and leaves every entry on its old project" do
+    company = create(:company)
+    client = create(:client, company:)
+    project = create(:project, billable: true, client:)
+    target = create(:project, billable: true, client:)
+    admin = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    entries = Array.new(2) do
+      create(:timesheet_entry, user: admin, project:, work_date: Date.current, bill_status: "unbilled")
+    end
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(handoff_step: "freeze")
+    generation = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).generation
+    gateway = described_class.new(
+      context: Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id: "req-bulk-move-handoff")
+    )
+
+    # "When `handoff_step` is set, the gateway refuses entry writes, prepares and service commands with a retryable `503 ownership_moving`."
+    expect do
+      gateway.bulk_move(entry_ids: entries.map(&:id), project: target, check: ->(_entries) { nil },
+                        expected_generation: generation)
+    end.to raise_error(Timekeeping::Gateway::OwnershipMoving)
+
+    entries.each { |entry| expect(entry.reload.project_id).to eq(project.id) }
+  ensure
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(handoff_step: nil)
+  end
+end
+
+RSpec.describe Timekeeping::Gateway, "forwarded bulk delete during a handoff" do
+  it "a forwarded bulk delete during a handoff raises OwnershipMoving and sends nothing to Timekeeping" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    admin = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    base_url = "http://timekeeping.test"
+    fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: admin.id, company_id: company.id, role: "admin")
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    entry = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                           work_date: Date.current.iso8601, duration: 30)
+    entry_id = entry.is_a?(Hash) ? entry["id"] : entry
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: "freeze")
+    fake.generation = 2
+    gateway = described_class.new(
+      context: Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id: "req-bulk-delete-handoff"),
+      write_client: Timekeeping::EntryWriteClient.new(base_url:),
+      read_client: Timekeeping::EntryApiClient.new(base_url:)
+    )
+
+    # "When `handoff_step` is set, the gateway refuses entry writes, prepares and service commands with a retryable `503 ownership_moving`."
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
+      expect do
+        gateway.bulk_delete(entry_ids: [entry_id], check: ->(_entries) { nil }, expected_generation: 2)
+      end.to raise_error(Timekeeping::Gateway::OwnershipMoving)
+    end
+
+    expect(fake.requests).to be_empty
+    expect(fake.stored_entry(entry_id)["discarded_at"]).to be_nil
+  end
+end
+
+RSpec.describe Timekeeping::Gateway, committed_data: true do
+  it "rolls back the first move and reports one refusal when the generation changes between two entry writes of a legacy bulk move" do
+    company = create(:company)
+    client = create(:client, company:)
+    from_project = create(:project, billable: true, client:)
+    to_project = create(:project, billable: true, client:)
+    admin = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    first = create(:timesheet_entry, user: admin, project: from_project, bill_status: "unbilled")
+    second = create(:timesheet_entry, user: admin, project: from_project, bill_status: "unbilled")
+    expected_generation = Timekeeping::Gateway.current_generation
+
+    # Another write bumps the generation right after the first entry is saved,
+    # so only a check made before every entry write can see it.
+    bumped = false
+    allow_any_instance_of(TimesheetEntry).to receive(:update).and_wrap_original do |original, *args, **kwargs|
+      result = original.call(*args, **kwargs)
+      unless bumped
+        bumped = true
+        TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).increment!(:generation)
+      end
+      result
+    end
+
+    events = []
+    subscriber = Object.new
+    subscriber.define_singleton_method(:emit) do |event|
+      events << event if event[:name] == "Timekeeping::EntryWriteRefused"
+    end
+    context = Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id: "req-bulk-move-bump")
+    Rails.event.subscribe(subscriber)
+    begin
+      # "A writer that makes many writes checks the generation on each one, not once per job."
+      # "A generation refusal fails the whole bulk request with an error. It is not one of the silently skipped entries of A9."
+      expect do
+        described_class.new(context:).bulk_move(
+          entry_ids: [first.id, second.id], project: to_project, check: ->(_entries) { nil },
+          expected_generation:
+        )
+      end.to raise_error(Timekeeping::Gateway::StaleGeneration)
+    ensure
+      Rails.event.unsubscribe(subscriber)
+    end
+
+    expect(bumped).to be(true)
+    expect(TimesheetEntry.find(first.id).project_id).to eq(from_project.id)
+    expect(TimesheetEntry.find(second.id).project_id).to eq(from_project.id)
+    expect(events.size).to eq(1)
+  end
+end
+
+RSpec.describe Timekeeping::Gateway, committed_data: true do
+  it "restores the first discarded entry when the generation changes between two entry writes of a legacy bulk delete" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    admin = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    first = create(:timesheet_entry, user: admin, project:, bill_status: "unbilled")
+    second = create(:timesheet_entry, user: admin, project:, bill_status: "unbilled")
+    expected_generation = Timekeeping::Gateway.current_generation
+
+    bumped = false
+    allow_any_instance_of(TimesheetEntry).to receive(:discard).and_wrap_original do |original, *args, **kwargs|
+      result = original.call(*args, **kwargs)
+      unless bumped
+        bumped = true
+        TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).increment!(:generation)
+      end
+      result
+    end
+    context = Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id: "req-bulk-delete-bump")
+
+    # "A generation refusal fails the whole bulk request with an error. It is not one of the silently skipped entries of A9."
+    expect do
+      described_class.new(context:).bulk_delete(
+        entry_ids: [first.id, second.id], check: ->(_entries) { nil }, expected_generation:
+      )
+    end.to raise_error(Timekeeping::Gateway::StaleGeneration)
+
+    expect(bumped).to be(true)
+    expect(TimesheetEntry.kept.where(id: [first.id, second.id]).count).to eq(2)
+  end
+end
+
+RSpec.describe Timekeeping::Gateway do
+  # "It reads the expected generation once and passes it to every write."
+  # A lost ownership row must refuse the bulk request as a retryable move, never
+  # give the controller a generation (or nil) that every later write would compare against.
+  it "current_generation refuses as ownership_moving when the ownership row is missing instead of answering a generation" do
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(generation: 7, handoff_step: nil)
+    expect(described_class.current_generation).to eq(7)
+
+    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).delete_all
+
+    expect { described_class.current_generation }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
+  end
+end
+
+RSpec.describe Timekeeping::Gateway, "legacy bulk writes" do
+  let(:company) { create(:company) }
+  let(:client) { create(:client, company:) }
+  let(:source_project) { create(:project, billable: true, client:) }
+  let(:target_project) { create(:project, billable: true, client:) }
+
+  def legacy_bulk_member(role)
+    create(:user, current_workspace_id: company.id).tap do |user|
+      create(:employment, company:, user:)
+      user.add_role role, company
+    end
   end
 
-  # The legacy store keeps no receipts, so a retried legacy delete still answers not found and never forwards.
-  it "answers not found for a retried legacy delete without sending anything to Timekeeping" do
-    entry = create(:timesheet_entry, user: fallback_admin, project: fallback_project, work_date: Date.current)
-    read_client = instance_double(Timekeeping::EntryApiClient)
-    write_client = instance_double(Timekeeping::EntryWriteClient)
-    gateway = described_class.new(context: fallback_context, write_client:, read_client:)
+  def legacy_bulk_gateway(actor, request_id: "req-legacy-bulk")
+    described_class.new(context: Timekeeping::WriteContext.new(company:, actor:, actor_kind: "user", request_id:))
+  end
 
-    expect(gateway.destroy(entry_id: entry.id, authorize: ->(_entry) { })).to be(true)
-    expect { gateway.destroy(entry_id: entry.id, authorize: ->(_entry) { }) }
-      .to raise_error(ActiveRecord::RecordNotFound)
-    expect(entry.reload.discarded_at).to be_present
+  def legacy_bulk_entry(user, **attributes)
+    create(:timesheet_entry, user:, project: source_project, work_date: Date.current, bill_status: "unbilled", **attributes)
+  end
+
+  it "skips a locked entry an employee moves, moves the unlocked one and reports both as found" do
+    employee = legacy_bulk_member(:employee)
+    locked = legacy_bulk_entry(employee).tap { |entry| entry.update_columns(locked: true) }
+    unlocked = legacy_bulk_entry(employee)
+    Current.user = employee
+    Current.company = company
+
+    result = legacy_bulk_gateway(employee).bulk_move(
+      entry_ids: [locked.id, unlocked.id], project: target_project, check: ->(_entries) { nil },
+      expected_generation: described_class.current_generation, scope: :actor
+    )
+
+    expect(result.refusal).to be_nil
+    expect(result.entries.map(&:id)).to contain_exactly(locked.id, unlocked.id)
+    expect(locked.reload.project_id).to eq(source_project.id)
+    expect(unlocked.reload.project_id).to eq(target_project.id)
+  ensure
+    Current.reset
+  end
+
+  it "drops an id that is not a number and a duplicate, and moves the valid entry once" do
+    admin = legacy_bulk_member(:admin)
+    entry = legacy_bulk_entry(admin)
+
+    result = legacy_bulk_gateway(admin).bulk_move(
+      entry_ids: ["not-an-id", entry.id, entry.id.to_s], project: target_project, check: ->(_entries) { nil },
+      expected_generation: described_class.current_generation
+    )
+
+    expect(result.entries.map(&:id)).to eq([entry.id])
+    expect(entry.reload.project_id).to eq(target_project.id)
+  end
+
+  it "drops another user's entry for the actor scope, as a missing id is dropped" do
+    employee = legacy_bulk_member(:employee)
+    colleague_entry = legacy_bulk_entry(legacy_bulk_member(:employee))
+
+    result = legacy_bulk_gateway(employee).bulk_move(
+      entry_ids: [colleague_entry.id, 0], project: target_project, check: ->(_entries) { nil },
+      expected_generation: described_class.current_generation, scope: :actor
+    )
+
+    expect(result.entries).to be_empty
+    expect(colleague_entry.reload.project_id).to eq(source_project.id)
+  end
+
+  it "writes nothing and returns the refusal when the check refuses the found entries" do
+    admin = legacy_bulk_member(:admin)
+    entries = Array.new(2) { legacy_bulk_entry(admin) }
+    seen = nil
+
+    result = legacy_bulk_gateway(admin).bulk_move(
+      entry_ids: entries.map(&:id), project: target_project,
+      check: ->(found) { seen = found.map(&:id); :locked }, expected_generation: described_class.current_generation
+    )
+
+    expect(seen).to contain_exactly(*entries.map(&:id))
+    expect(result.refusal).to eq(:locked)
+    expect(result.written).to be(false)
+    entries.each { |entry| expect(entry.reload.project_id).to eq(source_project.id) }
+  end
+
+  it "reports a legacy bulk delete as written when every discard returns false, as discard_all.any? did" do
+    admin = legacy_bulk_member(:admin)
+    entry = legacy_bulk_entry(admin)
+    allow_any_instance_of(TimesheetEntry).to receive(:discard).and_return(false)
+
+    result = legacy_bulk_gateway(admin).bulk_delete(
+      entry_ids: [entry.id], check: ->(_entries) { nil }, expected_generation: described_class.current_generation
+    )
+
+    expect(result.written).to be(true)
+    expect(entry.reload.discarded_at).to be_nil
+  end
+
+  it "reports a legacy bulk delete of no found entries as not written" do
+    admin = legacy_bulk_member(:admin)
+
+    result = legacy_bulk_gateway(admin).bulk_delete(
+      entry_ids: [0], check: ->(_entries) { nil }, expected_generation: described_class.current_generation
+    )
+
+    expect(result.entries).to be_empty
+    expect(result.written).to be(false)
+  end
+
+  it "refuses a bulk move as ownership_moving while the monolith's prepared store owns the entries" do
+    admin = legacy_bulk_member(:admin)
+    entry = legacy_bulk_entry(admin)
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared")
+
+    expect do
+      legacy_bulk_gateway(admin).bulk_move(
+        entry_ids: [entry.id], project: target_project, check: ->(_entries) { nil },
+        expected_generation: described_class.current_generation
+      )
+    end.to raise_error(Timekeeping::Gateway::OwnershipMoving)
+    expect(entry.reload.project_id).to eq(source_project.id)
+  end
+
+  it "refuses every bulk call of the default local owner as a retryable ownership move" do
+    local_owner = Timekeeping::Gateway::UnavailableLocalOwner.new
+
+    %i[bulk_move bulk_delete].each do |method|
+      expect { local_owner.public_send(method, context: nil) }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
+    end
+  end
+end
+
+RSpec.describe Timekeeping::Gateway, "bulk refusal during a handoff", committed_data: true do
+  it "emits exactly one refusal event for a bulk delete refused during a handoff and discards nothing" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    admin = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    entries = Array.new(2) { create(:timesheet_entry, user: admin, project:, bill_status: "unbilled") }
+    generation = described_class.current_generation
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(handoff_step: "freeze")
+    events = []
+    subscriber = Object.new
+    subscriber.define_singleton_method(:emit) do |event|
+      events << event if event[:name] == "Timekeeping::EntryWriteRefused"
+    end
+    context = Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id: "req-bulk-handoff-count")
+
+    Rails.event.subscribe(subscriber)
+    begin
+      expect do
+        described_class.new(context:).bulk_delete(entry_ids: entries.map(&:id), check: ->(_entries) { nil },
+                                                  expected_generation: generation)
+      end.to raise_error(Timekeeping::Gateway::OwnershipMoving)
+    ensure
+      Rails.event.unsubscribe(subscriber)
+    end
+
+    expect(events.size).to eq(1)
+    expect(TimesheetEntry.kept.where(id: entries.map(&:id)).count).to eq(2)
+  ensure
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(handoff_step: nil)
+  end
+end
+
+RSpec.describe Timekeeping::Gateway, "forwarded bulk writes" do
+  let(:company) { create(:company) }
+  let(:client) { create(:client, company:) }
+  let(:source_project) { create(:project, billable: true, client:) }
+  let(:target_project) { create(:project, billable: true, client:) }
+  let(:non_billable_project) { create(:project, billable: false, client:) }
+  let(:admin) do
+    create(:user, current_workspace_id: company.id).tap do |user|
+      create(:employment, company:, user:)
+      user.add_role :admin, company
+    end
+  end
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+  let(:context) do
+    Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id: "req-forwarded-bulk")
+  end
+  let(:gateway) do
+    described_class.new(context:, write_client: Timekeeping::EntryWriteClient.new(base_url:),
+                                  read_client: Timekeeping::EntryApiClient.new(base_url:))
+  end
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+  end
+
+  before do
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: admin.id, company_id: company.id, role: "admin")
+    [source_project, target_project, non_billable_project].each do |project|
+      fake.register_project(id: project.id, company_id: company.id)
+    end
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+  end
+
+  def forwarded_bulk_entry(**attributes)
+    fake.add_entry(company_id: company.id, user_id: admin.id, project_id: source_project.id,
+                   work_date: Date.current.iso8601, duration: 30, **attributes)["id"]
+  end
+
+  def forwarded_bulk_requests(path_suffix)
+    fake.requests.select { |request| request[:method] == "POST" && request[:path].end_with?(path_suffix) }
+  end
+
+  it "sends one bulk move naming only the found ids, without duplicates or ids that are not numbers" do
+    first = forwarded_bulk_entry
+    second = forwarded_bulk_entry
+
+    result = gateway.bulk_move(entry_ids: [first, first.to_s, "not-an-id", second], project: target_project,
+                               check: ->(_entries) { nil }, expected_generation: 2)
+
+    calls = forwarded_bulk_requests("/bulk-move")
+    expect(calls.size).to eq(1)
+    expect(calls.first[:body]["entry_ids"]).to contain_exactly(first, second)
+    expect(calls.first[:headers]["Ownership-Generation"]).to eq("2")
+    expect(result.entries.map(&:id)).to contain_exactly(first, second)
+    expect(result.entries.map(&:project_id)).to all(eq(target_project.id))
+    expect(result.written).to be(true)
+    expect([first, second].map { |id| fake.stored_entry(id)["project_id"] }).to all(eq(target_project.id))
+  end
+
+  it "leaves an unbilled entry out of a move to a non-billable project, as the legacy save skips it" do
+    unbilled = forwarded_bulk_entry(bill_status: "unbilled")
+    non_billable = forwarded_bulk_entry(bill_status: "non_billable")
+
+    gateway.bulk_move(entry_ids: [unbilled, non_billable], project: non_billable_project,
+                      check: ->(_entries) { nil }, expected_generation: 2)
+
+    expect(forwarded_bulk_requests("/bulk-move").first[:body]["entry_ids"]).to eq([non_billable])
+    expect(fake.stored_entry(unbilled)["project_id"]).to eq(source_project.id)
+    expect(fake.stored_entry(non_billable)["project_id"]).to eq(non_billable_project.id)
+  end
+
+  it "sends no bulk move when every found entry fails the legacy validations" do
+    unbilled = forwarded_bulk_entry(bill_status: "unbilled")
+
+    result = gateway.bulk_move(entry_ids: [unbilled], project: non_billable_project, check: ->(_entries) { nil },
+                               expected_generation: 2)
+
+    expect(forwarded_bulk_requests("/bulk-move")).to be_empty
+    expect(result.written).to be(false)
+  end
+
+  it "sends one bulk delete naming the found ids and reports it written" do
+    entry = forwarded_bulk_entry
+
+    result = gateway.bulk_delete(entry_ids: [entry, 0], check: ->(_entries) { nil }, expected_generation: 2)
+
+    expect(forwarded_bulk_requests("/bulk-delete").map { |request| request[:body]["entry_ids"] }).to eq([[entry]])
+    expect(result.written).to be(true)
+    expect(fake.stored_entry(entry)["discarded_at"]).not_to be_nil
+  end
+
+  it "fails the request when a lookup is refused rather than dropping the id" do
+    entry = forwarded_bulk_entry
+    refusing_reader = instance_double(Timekeeping::EntryApiClient)
+    allow(refusing_reader).to receive(:show_entry).and_raise(Timekeeping::EntryWriteClient::Forbidden)
+    refused_gateway = described_class.new(context:, write_client: Timekeeping::EntryWriteClient.new(base_url:),
+                                                    read_client: refusing_reader)
+
+    expect do
+      refused_gateway.bulk_move(entry_ids: [entry], project: target_project, check: ->(_entries) { nil },
+                                expected_generation: 2)
+    end.to raise_error(Timekeeping::EntryWriteClient::Forbidden)
+    expect(forwarded_bulk_requests("/bulk-move")).to be_empty
   end
 end

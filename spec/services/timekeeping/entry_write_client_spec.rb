@@ -505,3 +505,303 @@ RSpec.describe Timekeeping::EntryWriteClient, "create body serialization" do
     expect(body).to include("source" => "mcp", "source_metadata" => { "mcp_server" => "miru" })
   end
 end
+
+RSpec.describe Timekeeping::EntryWriteClient do
+  let(:bulk_base_url) { "http://timekeeping.test" }
+  let(:bulk_company) { create(:company) }
+  let(:bulk_admin) { create(:user, current_workspace_id: bulk_company.id) }
+  let(:bulk_client) { create(:client, company: bulk_company) }
+  let(:bulk_source_project) { create(:project, billable: true, client: bulk_client) }
+  let(:bulk_target_project) { create(:project, billable: true, client: bulk_client) }
+  let(:bulk_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
+      with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, bulk_base_url) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company: bulk_company, user: bulk_admin)
+    bulk_admin.add_role :admin, bulk_company
+    bulk_fake.register_company(id: bulk_company.id, edit_days: bulk_company.timesheet_edit_days)
+    bulk_fake.register_user(id: bulk_admin.id, company_id: bulk_company.id, role: "admin")
+    bulk_fake.register_project(id: bulk_source_project.id, company_id: bulk_company.id)
+    bulk_fake.register_project(id: bulk_target_project.id, company_id: bulk_company.id)
+    route_timekeeping_to_fake(bulk_fake, base_url: bulk_base_url)
+  end
+
+  # "Like the single-entry methods, each sends `Authorization` with a write `UserToken` for the context's actor and company, `Ownership-Generation`, an `Idempotency-Key` and `X-Request-Id`."
+  # A resend after a lost answer must carry the same key, so Timekeeping replays instead of writing again.
+  it "a bulk move resent under the same request id with the same ids writes each entry once" do
+    entry = bulk_fake.add_entry(company_id: bulk_company.id, user_id: bulk_admin.id,
+                                project_id: bulk_source_project.id, work_date: Date.current.iso8601)
+    context = Timekeeping::WriteContext.new(company: bulk_company, actor: bulk_admin, actor_kind: "user",
+                                            request_id: "req-bulk-resend-1")
+    client = described_class.new(base_url: bulk_base_url)
+
+    first = client.bulk_move(context:, generation: bulk_fake.generation, entry_ids: [entry["id"]],
+                             project_id: bulk_target_project.id)
+    version_after_first = bulk_fake.stored_entry(entry["id"])["version"]
+    second = client.bulk_move(context:, generation: bulk_fake.generation, entry_ids: [entry["id"]],
+                              project_id: bulk_target_project.id)
+
+    expect(first["results"]).to eq([{ "entry_id" => entry["id"], "result" => "moved" }])
+    expect(second).to eq(first)
+    stored = bulk_fake.stored_entry(entry["id"])
+    expect(stored["project_id"]).to eq(bulk_target_project.id)
+    expect(stored["version"]).to eq(version_after_first)
+    keys = bulk_fake.requests.filter_map do |request|
+      request[:headers]["Idempotency-Key"] if request[:path].end_with?("/entries/bulk-move")
+    end
+    expect(keys.size).to eq(2)
+    expect(keys.uniq.size).to eq(1)
+  end
+end
+
+RSpec.describe Timekeeping::EntryWriteClient do
+  let(:stale_delete_base_url) { "http://timekeeping.test" }
+  let(:stale_delete_company) { create(:company) }
+  let(:stale_delete_admin) { create(:user, current_workspace_id: stale_delete_company.id) }
+  let(:stale_delete_project) { create(:project, billable: true, client: create(:client, company: stale_delete_company)) }
+  let(:stale_delete_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
+      with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, stale_delete_base_url) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company: stale_delete_company, user: stale_delete_admin)
+    stale_delete_admin.add_role :admin, stale_delete_company
+    stale_delete_fake.register_company(id: stale_delete_company.id, edit_days: stale_delete_company.timesheet_edit_days)
+    stale_delete_fake.register_user(id: stale_delete_admin.id, company_id: stale_delete_company.id, role: "admin")
+    stale_delete_fake.register_project(id: stale_delete_project.id, company_id: stale_delete_company.id)
+    route_timekeeping_to_fake(stale_delete_fake, base_url: stale_delete_base_url)
+  end
+
+  it "a bulk delete at a stale generation raises StaleGeneration and Timekeeping keeps every entry" do
+    stale_delete_fake.generation = 3
+    entries = Array.new(2) do
+      stale_delete_fake.add_entry(company_id: stale_delete_company.id, user_id: stale_delete_admin.id,
+                                  project_id: stale_delete_project.id, work_date: Date.current.iso8601)
+    end
+    context = Timekeeping::WriteContext.new(company: stale_delete_company, actor: stale_delete_admin,
+                                            actor_kind: "user", request_id: "req-bulk-delete-stale")
+
+    # "Each maps a 409 `stale_generation` answer to `Timekeeping::Gateway::StaleGeneration`."
+    expect do
+      described_class.new(base_url: stale_delete_base_url).bulk_delete(
+        context:, generation: 2, entry_ids: entries.pluck("id")
+      )
+    end.to raise_error(Timekeeping::Gateway::StaleGeneration)
+
+    entries.each do |entry|
+      expect(stale_delete_fake.stored_entry(entry["id"])["discarded_at"]).to be_nil
+    end
+  end
+end
+
+RSpec.describe Timekeeping::EntryWriteClient, "bulk move headers" do
+  let(:bulk_base_url) { "http://timekeeping.test" }
+  let(:bulk_company) { create(:company) }
+  let(:bulk_admin) { create(:user, current_workspace_id: bulk_company.id) }
+  let(:bulk_client) { create(:client, company: bulk_company) }
+  let(:bulk_source_project) { create(:project, billable: true, client: bulk_client) }
+  let(:bulk_target_project) { create(:project, billable: true, client: bulk_client) }
+  let(:bulk_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
+      with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, bulk_base_url) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company: bulk_company, user: bulk_admin)
+    bulk_admin.add_role :admin, bulk_company
+    bulk_fake.register_company(id: bulk_company.id, edit_days: bulk_company.timesheet_edit_days)
+    bulk_fake.register_user(id: bulk_admin.id, company_id: bulk_company.id, role: "admin")
+    bulk_fake.register_project(id: bulk_source_project.id, company_id: bulk_company.id)
+    bulk_fake.register_project(id: bulk_target_project.id, company_id: bulk_company.id)
+    bulk_fake.generation = 4
+    route_timekeeping_to_fake(bulk_fake, base_url: bulk_base_url)
+  end
+
+  # "Forwarded bulk_move and bulk_delete calls carry Ownership-Generation and the monolith's request_id header"
+  it "bulk_move sends the given Ownership-Generation and the context's request id and moves the entry" do
+    entry = bulk_fake.add_entry(company_id: bulk_company.id, user_id: bulk_admin.id, project_id: bulk_source_project.id)
+    context = Timekeeping::WriteContext.new(company: bulk_company, actor: bulk_admin, actor_kind: "user",
+                                            request_id: "req-bulk-move-1")
+
+    answer = described_class.new.bulk_move(context:, generation: 4, entry_ids: [entry["id"]],
+                                           project_id: bulk_target_project.id)
+
+    expect(answer["results"]).to eq([{ "entry_id" => entry["id"], "result" => "moved" }])
+    request = bulk_fake.requests.find { |sent| sent[:method] == "POST" && sent[:path].to_s.end_with?("/bulk-move") }
+    expect(request).not_to be_nil
+    expect(request[:headers]["Ownership-Generation"]).to eq("4")
+    expect(request[:headers]["X-Request-Id"]).to eq("req-bulk-move-1")
+    expect(request[:body]["entry_ids"]).to eq([entry["id"]])
+    expect(bulk_fake.stored_entry(entry["id"])["project_id"]).to eq(bulk_target_project.id)
+  end
+end
+
+RSpec.describe Timekeeping::EntryWriteClient, "bulk delete headers" do
+  let(:bulk_base_url) { "http://timekeeping.test" }
+  let(:bulk_company) { create(:company) }
+  let(:bulk_admin) { create(:user, current_workspace_id: bulk_company.id) }
+  let(:bulk_project) { create(:project, billable: true, client: create(:client, company: bulk_company)) }
+  let(:bulk_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
+      with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, bulk_base_url) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company: bulk_company, user: bulk_admin)
+    bulk_admin.add_role :admin, bulk_company
+    bulk_fake.register_company(id: bulk_company.id, edit_days: bulk_company.timesheet_edit_days)
+    bulk_fake.register_user(id: bulk_admin.id, company_id: bulk_company.id, role: "admin")
+    bulk_fake.register_project(id: bulk_project.id, company_id: bulk_company.id)
+    bulk_fake.generation = 5
+    route_timekeeping_to_fake(bulk_fake, base_url: bulk_base_url)
+  end
+
+  # "Forwarded bulk_move and bulk_delete calls carry Ownership-Generation and the monolith's request_id header"
+  it "bulk_delete sends the given Ownership-Generation and the context's request id and deletes the entry" do
+    entry = bulk_fake.add_entry(company_id: bulk_company.id, user_id: bulk_admin.id, project_id: bulk_project.id)
+    context = Timekeeping::WriteContext.new(company: bulk_company, actor: bulk_admin, actor_kind: "user",
+                                            request_id: "req-bulk-delete-1")
+
+    answer = described_class.new.bulk_delete(context:, generation: 5, entry_ids: [entry["id"]])
+
+    expect(answer["results"]).to eq([{ "entry_id" => entry["id"], "result" => "deleted" }])
+    request = bulk_fake.requests.find { |sent| sent[:method] == "POST" && sent[:path].to_s.end_with?("/bulk-delete") }
+    expect(request).not_to be_nil
+    expect(request[:headers]["Ownership-Generation"]).to eq("5")
+    expect(request[:headers]["X-Request-Id"]).to eq("req-bulk-delete-1")
+    expect(bulk_fake.stored_entry(entry["id"])["discarded_at"]).not_to be_nil
+  end
+end
+
+RSpec.describe Timekeeping::EntryWriteClient, "bulk stale generation" do
+  let(:bulk_base_url) { "http://timekeeping.test" }
+  let(:bulk_company) { create(:company) }
+  let(:bulk_admin) { create(:user, current_workspace_id: bulk_company.id) }
+  let(:bulk_client) { create(:client, company: bulk_company) }
+  let(:bulk_source_project) { create(:project, billable: true, client: bulk_client) }
+  let(:bulk_target_project) { create(:project, billable: true, client: bulk_client) }
+  let(:bulk_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
+      with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, bulk_base_url) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company: bulk_company, user: bulk_admin)
+    bulk_admin.add_role :admin, bulk_company
+    bulk_fake.register_company(id: bulk_company.id, edit_days: bulk_company.timesheet_edit_days)
+    bulk_fake.register_user(id: bulk_admin.id, company_id: bulk_company.id, role: "admin")
+    bulk_fake.register_project(id: bulk_source_project.id, company_id: bulk_company.id)
+    bulk_fake.register_project(id: bulk_target_project.id, company_id: bulk_company.id)
+    bulk_fake.generation = 3
+    route_timekeeping_to_fake(bulk_fake, base_url: bulk_base_url)
+  end
+
+  # "Each maps a 409 `stale_generation` answer to `Timekeeping::Gateway::StaleGeneration`."
+  # "A stale generation fails a whole bulk move and no entry in the request stays moved, on the legacy and forwarded branches"
+  it "bulk_move and bulk_delete at a stale generation raise StaleGeneration and change no entry in the fake" do
+    first = bulk_fake.add_entry(company_id: bulk_company.id, user_id: bulk_admin.id, project_id: bulk_source_project.id)
+    second = bulk_fake.add_entry(company_id: bulk_company.id, user_id: bulk_admin.id, project_id: bulk_source_project.id)
+    context = Timekeeping::WriteContext.new(company: bulk_company, actor: bulk_admin, actor_kind: "user",
+                                            request_id: "req-bulk-stale-1")
+    ids = [first["id"], second["id"]]
+
+    expect do
+      described_class.new.bulk_move(context:, generation: 2, entry_ids: ids, project_id: bulk_target_project.id)
+    end.to raise_error(Timekeeping::Gateway::StaleGeneration)
+    expect do
+      described_class.new.bulk_delete(context:, generation: 2, entry_ids: ids)
+    end.to raise_error(Timekeeping::Gateway::StaleGeneration)
+
+    ids.each do |id|
+      stored = bulk_fake.stored_entry(id)
+      expect(stored["project_id"]).to eq(bulk_source_project.id)
+      expect(stored["discarded_at"]).to be_nil
+    end
+  end
+end
+
+RSpec.describe Timekeeping::EntryWriteClient, "bulk idempotency key" do
+  def bulk_key_for(request_id: "req-bulk-key", operation: "bulk_move", entry_ids: [3, 1, 2])
+    described_class.bulk_idempotency_key(request_id:, operation:, entry_ids:)
+  end
+
+  it "gives the same key for the same request, operation and ids in any order" do
+    expect(bulk_key_for(entry_ids: [3, 1, 2])).to eq(bulk_key_for(entry_ids: [1, 2, 3]))
+  end
+
+  it "gives a different key for a different id set, operation or request id" do
+    key = bulk_key_for
+
+    expect(bulk_key_for(entry_ids: [1, 2])).not_to eq(key)
+    expect(bulk_key_for(operation: "bulk_delete")).not_to eq(key)
+    expect(bulk_key_for(request_id: "req-bulk-key-2")).not_to eq(key)
+  end
+end
+
+RSpec.describe Timekeeping::EntryWriteClient, "bulk move token" do
+  let(:bulk_token_base_url) { "http://timekeeping.test" }
+  let(:bulk_token_company) { create(:company) }
+  let(:bulk_token_admin) { create(:user, current_workspace_id: bulk_token_company.id) }
+  let(:bulk_token_client) { create(:client, company: bulk_token_company) }
+  let(:bulk_token_source) { create(:project, billable: true, client: bulk_token_client) }
+  let(:bulk_token_target) { create(:project, billable: true, client: bulk_token_client) }
+  let(:bulk_token_fake) do
+    TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
+  end
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+  end
+
+  before do
+    create(:employment, company: bulk_token_company, user: bulk_token_admin)
+    bulk_token_admin.add_role :admin, bulk_token_company
+    bulk_token_fake.register_company(id: bulk_token_company.id, edit_days: bulk_token_company.timesheet_edit_days)
+    bulk_token_fake.register_user(id: bulk_token_admin.id, company_id: bulk_token_company.id, role: "admin")
+    bulk_token_fake.register_project(id: bulk_token_source.id, company_id: bulk_token_company.id)
+    bulk_token_fake.register_project(id: bulk_token_target.id, company_id: bulk_token_company.id)
+    route_timekeeping_to_fake(bulk_token_fake, base_url: bulk_token_base_url)
+  end
+
+  it "mints the write token for the context's actor and company, naming only the target project" do
+    entry = bulk_token_fake.add_entry(company_id: bulk_token_company.id, user_id: bulk_token_admin.id,
+                                      project_id: bulk_token_source.id)
+    context = Timekeeping::WriteContext.new(company: bulk_token_company, actor: bulk_token_admin,
+                                            actor_kind: "user", request_id: "req-bulk-token")
+
+    described_class.new(base_url: bulk_token_base_url).bulk_move(
+      context:, generation: bulk_token_fake.generation, entry_ids: [entry["id"]], project_id: bulk_token_target.id
+    )
+
+    request = bulk_token_fake.requests.find { |sent| sent[:path].to_s.end_with?("/bulk-move") }
+    expect(request[:path]).to eq("/v1/companies/#{bulk_token_company.id}/entries/bulk-move")
+    expect(request[:headers]["Idempotency-Key"]).to eq(
+      described_class.bulk_idempotency_key(request_id: "req-bulk-token", operation: "bulk_move",
+                                           entry_ids: [entry["id"]])
+    )
+    claims = Timekeeping::UserToken.verify(request[:headers]["Authorization"].delete_prefix("Bearer "),
+                                           public_key: timekeeping_key_pair.public_key)
+    expect(claims.user_id).to eq(bulk_token_admin.id)
+    expect(claims.company_id).to eq(bulk_token_company.id)
+    expect(claims.purpose).to eq("write")
+    expect(claims.projects.map { |project| project.with_indifferent_access[:id] }).to eq([bulk_token_target.id])
+  end
+end
