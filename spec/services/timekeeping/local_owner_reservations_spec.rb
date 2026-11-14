@@ -645,6 +645,10 @@ RSpec.describe Timekeeping::LocalOwner, "foreign entry ids in prepare" do
     expect([outcome.body["reason"], *reasons]).to include("not_found")
     expect(outcome.body.to_json).not_to include(invoice_a.id.to_s) if outcome.body["conflicts"].nil?
     expect(timekeeping_row_counts).to eq(baseline)
+    # Equal totals would also hide company A's reservation moving to company B.
+    expect(ActiveRecord::Base.connection.select_value(
+      "SELECT COUNT(*) FROM reservations WHERE company_id = #{company_b.id}"
+    ).to_i).to eq(0)
     expect(foreign_entry.reload.attributes).to eq(foreign_before)
   end
 end
