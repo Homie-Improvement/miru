@@ -3,7 +3,9 @@
 # Every table a Timekeeping::LocalOwner write touches. A refusal check that
 # compares these counts before and after a call sees a stray row in any of
 # them; a shorter list would let a leak into the missing table pass.
-TIMEKEEPING_WRITE_TABLES = %w[entries entry_audits idempotency_records entry_outbox_items].freeze
+TIMEKEEPING_WRITE_TABLES = %w[
+  entries entry_audits idempotency_records entry_outbox_items reservations invoice_operations
+].freeze
 
 # Setup the Timekeeping::LocalOwner specs share, kept in one place so a
 # change to the write path's tables, ownership or roles is made once.

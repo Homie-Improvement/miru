@@ -35,14 +35,19 @@ RSpec.describe TimekeepingLocalOwnerSpecHelpers do
     user = timekeeping_member(company, "employee")
     before = timekeeping_row_counts
 
-    expect(TIMEKEEPING_WRITE_TABLES).to contain_exactly("entries", "entry_audits", "idempotency_records", "entry_outbox_items")
-    expect(before.keys).to contain_exactly("entries", "entry_audits", "idempotency_records", "entry_outbox_items")
+    expect(TIMEKEEPING_WRITE_TABLES).to contain_exactly(
+      "entries", "entry_audits", "idempotency_records", "entry_outbox_items", "reservations", "invoice_operations"
+    )
+    expect(before.keys).to contain_exactly(
+      "entries", "entry_audits", "idempotency_records", "entry_outbox_items", "reservations", "invoice_operations"
+    )
     expect(before.values).to all(eq(0))
 
     expect(create_entry_through_owner(user, "row-counts-helper-key").status).to eq(201)
     after_first = timekeeping_row_counts
     expect(after_first).to eq(
-      "entries" => 1, "entry_audits" => 1, "idempotency_records" => 1, "entry_outbox_items" => 1
+      "entries" => 1, "entry_audits" => 1, "idempotency_records" => 1, "entry_outbox_items" => 1,
+      "reservations" => 0, "invoice_operations" => 0
     )
 
     seed_local_entry(user)
@@ -105,5 +110,41 @@ RSpec.describe TimekeepingLocalOwnerSpecHelpers do
     expect(owner.has_role?("employee", company_a)).to be(false)
     expect(other.has_role?("employee", company_a)).to be(true)
     expect(other.has_role?("owner", company_a)).to be(false)
+  end
+end
+
+RSpec.describe TimekeepingLocalOwnerSpecHelpers do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, client: create(:client, company:)) }
+
+  # "TIMEKEEPING_WRITE_TABLES includes reservations and invoice_operations, and the existing local owner specs pass with the wider counts"
+  # "An entry write expects 0 in both new tables."
+  it "TIMEKEEPING_WRITE_TABLES includes reservations and invoice_operations and an entry create counts zero in both" do
+    generation = prepare_local_ownership!.generation.to_s
+    user = timekeeping_member(company, "employee")
+
+    expect(TIMEKEEPING_WRITE_TABLES).to contain_exactly(
+      "entries", "entry_audits", "idempotency_records", "entry_outbox_items", "reservations", "invoice_operations"
+    )
+    before = timekeeping_row_counts
+    expect(before.keys).to include("reservations", "invoice_operations")
+
+    outcome = Timekeeping::LocalOwner.call(
+      operation: :create, company_id: company.id, generation:,
+      actor: Timekeeping::LocalOwner::Actor.user(user_id: user.id, role: "employee"),
+      params: {
+        "idempotency_key" => "wider-counts-entry-create",
+        "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 30.0,
+                    "note" => "counted", "source" => "manual", "source_metadata" => {} }
+      }
+    )
+
+    expect(outcome.status).to eq(201)
+    expect(timekeeping_row_counts).to eq(
+      "entries" => before["entries"] + 1, "entry_audits" => before["entry_audits"] + 1,
+      "idempotency_records" => before["idempotency_records"] + 1,
+      "entry_outbox_items" => before["entry_outbox_items"] + 1,
+      "reservations" => before["reservations"], "invoice_operations" => before["invoice_operations"]
+    )
   end
 end

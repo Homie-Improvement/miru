@@ -22,7 +22,9 @@ RSpec.describe Timekeeping::LocalOwner do
     )
     attributes_before = entry_a.reload.attributes
     counts_before = timekeeping_row_counts
-    expect(counts_before.keys).to match_array(%w[entries entry_audits idempotency_records entry_outbox_items])
+    expect(counts_before.keys).to match_array(
+      %w[entries entry_audits idempotency_records entry_outbox_items reservations invoice_operations]
+    )
     expect(counts_before["entries"]).to eq(1)
     missing_id = entry_a.id + 1_000_000
     update_from_b = lambda do |entry_id, key|
@@ -216,9 +218,12 @@ RSpec.describe Timekeeping::LocalOwner, "cross-company references" do
     expect([entry.company_id, entry.user_id]).to eq([company_b.id, employee_b.id])
     expect(described_class::Receipt.sole.actor_id).to eq(employee_b.id)
     expect(described_class::AuditRow.where(company_id: company_b.id, entry_id: entry.id).sole.actor_id).to eq(employee_b.id)
+    # An entry create writes no reservation or invoice operation, so those tables stay empty.
+    reservation_tables = %w[reservations invoice_operations]
     TIMEKEEPING_WRITE_TABLES.each do |table|
+      expected = reservation_tables.include?(table) ? [] : [company_b.id]
       expect(connection.select_values("SELECT DISTINCT company_id FROM #{table}").map(&:to_i))
-        .to eq([company_b.id]), "#{table} should hold only the keyword company"
+        .to eq(expected), "#{table} should hold only the keyword company"
     end
   end
 end
