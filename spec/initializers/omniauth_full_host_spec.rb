@@ -73,6 +73,20 @@ RSpec.describe OmniauthFullHost do
       expect(OmniAuth.config.full_host).to eq(Rails.configuration.x.default_base_url)
     end
 
+    # The test environment declares the same host the specs expect, so this swaps in a
+    # distinct value to show the initializer reads the setting rather than a literal.
+    it "takes the fallback from config.x.default_base_url rather than a fixed value" do
+      original_default_base_url = Rails.configuration.x.default_base_url
+      ENV.delete("APP_BASE_URL")
+      Rails.configuration.x.default_base_url = "https://boot-check.test"
+
+      load initializer_path
+
+      expect(OmniAuth.config.full_host).to eq("https://boot-check.test")
+    ensure
+      Rails.configuration.x.default_base_url = original_default_base_url
+    end
+
     # A malformed value must stop boot: a relative or hostless full_host would let OmniAuth
     # fill in request-derived parts.
     it "refuses to boot on an APP_BASE_URL with no scheme instead of leaving full_host to the request" do
