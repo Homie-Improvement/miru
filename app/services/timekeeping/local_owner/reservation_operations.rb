@@ -67,7 +67,8 @@ module Timekeeping
       # DISPOSITIONS and entry_ids are Integers.
       Request = Data.define(:route, :company_id, :actor_name, :invoice_id, :operation_id, :disposition, :entry_ids)
 
-      # The two tables have no model the monolith shares.
+      # The two tables have no model the monolith shares. ServiceCommands
+      # reads Reservation too, to find an invoice's committed entries.
       class Reservation < ApplicationRecord
         self.table_name = "reservations"
       end
@@ -76,7 +77,7 @@ module Timekeeping
         self.table_name = "invoice_operations"
       end
 
-      private_constant :Request, :Reservation, :InvoiceOperation
+      private_constant :Request, :InvoiceOperation
 
       # :reek:LongParameterList
       def initialize(operation:, company_id:, generation:, actor:, params:, checkpoint:)
@@ -139,7 +140,7 @@ module Timekeeping
         # Only the params keys below are read, so a company_id or actor field
         # elsewhere in params changes nothing.
         def build_request
-          invoice_id = id_value(params["invoice_id"])
+          invoice_id = WriteSteps.id_value(params["invoice_id"])
           operation_id = params["operation_id"]
           return unless invoice_id && operation_id.is_a?(String) && UUID.match?(operation_id)
 
@@ -155,15 +156,8 @@ module Timekeeping
           raw_ids = params["entry_ids"]
           return [disposition, nil] unless DISPOSITIONS.include?(disposition) && raw_ids.is_a?(Array)
 
-          entry_ids = raw_ids.map { |id| id_value(id) }
+          entry_ids = raw_ids.map { |id| WriteSteps.id_value(id) }
           [disposition, entry_ids.all? ? entry_ids : nil]
-        end
-
-        # A positive Integer, or a string of digits read as one; nil otherwise.
-        def id_value(value)
-          return value if value.is_a?(Integer) && value.positive?
-
-          Integer(value, 10) if value.is_a?(String) && ID.match?(value)
         end
 
         # Only writers with the same company, service and operation_id wait on

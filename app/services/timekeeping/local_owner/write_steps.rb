@@ -95,6 +95,13 @@ module Timekeeping
         SQL
       end
 
+      # A positive Integer, or a string of digits read as one; nil otherwise.
+      def id_value(value)
+        return value if value.is_a?(Integer) && value.positive?
+
+        Integer(value, 10) if value.is_a?(String) && ID.match?(value)
+      end
+
       # nil matches nothing, and a sent value that is not a plain integer
       # never matches, so neither a missing header nor "abc" can be admitted.
       def generation_matches?(sent, stored_generation)
