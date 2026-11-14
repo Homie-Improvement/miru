@@ -51,6 +51,9 @@ Rails.application.configure do
   # Set host to be used by links generated in mailer templates.
   config.action_mailer.default_url_options = { host: "example.com" }
 
+  # Required base URL for OAuth callbacks when APP_BASE_URL is unset (config/initializers/omniauth_full_host.rb).
+  config.x.default_base_url = "http://example.com"
+
   # Set default from address for test environment
   config.action_mailer.default_options = { from: "test@example.com" }
 

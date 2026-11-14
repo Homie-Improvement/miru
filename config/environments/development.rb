@@ -49,6 +49,9 @@ Rails.application.configure do
   config.action_mailer.default_url_options = { host: "localhost", port: 3000 }
   config.action_mailer.asset_host = "http://localhost:3000"
 
+  # Required base URL for OAuth callbacks when APP_BASE_URL is unset (config/initializers/omniauth_full_host.rb).
+  config.x.default_base_url = "http://localhost:3000"
+
   # Print deprecation notices to the Rails logger.
   config.active_support.deprecation = :log
 
