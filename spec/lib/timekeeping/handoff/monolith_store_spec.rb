@@ -751,7 +751,7 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
     checkpoint = store.export_checkpoint
     receipts = checkpoint.rows.fetch("idempotency_records")
 
-    expect(receipts.map { |row| row["key"] }).to eq(["user-key"])
+    expect(receipts.pluck("key")).to eq(["user-key"])
     expect(receipts.first.keys).to match_array(Timekeeping::Handoff::Checkpoint::TABLES.fetch("idempotency_records"))
     expect(receipts.first).not_to have_key("actor_name")
     expect(checkpoint.digest.fetch("idempotency_records").fetch(5).fetch(:count)).to eq(1)
