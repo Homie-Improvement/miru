@@ -530,7 +530,7 @@ RSpec.describe Timekeeping::LocalOwner, "service command receipts per service an
     receipts_before = timekeeping_row_counts["idempotency_records"]
 
     first_detach = detach.call(company, actor.service(name: "agent-destroy", company_id: company.id, operations: grant), 77)
-    expect(first_detach.body).to eq("detached" => 2)
+    expect([first_detach.status, first_detach.body]).to eq([200, { "detached" => 2 }])
     expect(foreign_entry.reload.agent_id).to eq(77)
     baseline = timekeeping_row_counts
     entries_before = entries.map { |entry| entry.reload.attributes }
@@ -550,11 +550,11 @@ RSpec.describe Timekeeping::LocalOwner, "service command receipts per service an
       # Another service may send the same key for another agent: it gets its own receipt, not idempotency_key_reused.
       detach.call(company, actor.service(name: "agent-sweep", company_id: company.id, operations: grant), 78),
       detach.call(other_company, foreign_destroy_service, 77)
-    ].map(&:body)
+    ].map { |outcome| [outcome.status, outcome.body] }
 
     # The second service of the first company finds no entry left with agent 77, so a replay of the
     # first service's answer would show "detached" => 2 instead of its own 0.
-    expect(answers).to eq([{ "detached" => 0 }, { "detached" => 1 }, { "detached" => 1 }])
+    expect(answers).to eq([[200, { "detached" => 0 }], [200, { "detached" => 1 }], [200, { "detached" => 1 }]])
     expect(timekeeping_row_counts["idempotency_records"]).to eq(receipts_before + 4)
     expect(receipt_owners.call(detach_operation_id)).to contain_exactly(
       [company.id, "agent-destroy"], [company.id, "agent-cleanup"], [company.id, "agent-sweep"], [other_company.id, "agent-destroy"]
