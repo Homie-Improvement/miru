@@ -33,6 +33,32 @@ module TimekeepingLocalOwnerSpecHelpers
     user.add_role(role, company)
     user
   end
+
+  InvoiceSeed = Struct.new(:company, :owner, :project, :invoice, :entry, keyword_init: true)
+
+  # One company with an owner, a project, an invoice for the project's client
+  # and one unbilled local entry: the smallest state a reservation call needs.
+  def seeded_invoice_entry
+    company = create(:company)
+    owner = timekeeping_member(company, "owner")
+    project = create(:project, client: create(:client, company:))
+    invoice = create(:invoice, company:, client: project.client)
+    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
+                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
+    InvoiceSeed.new(company:, owner:, project:, invoice:, entry:)
+  end
+
+  # Builds the params a reservation route receives. Only prepare carries a
+  # disposition and entry ids; commit and abort name the operation alone.
+  def reservation_call(operation, company:, generation:, actor:, invoice:, operation_id:, entry_ids: nil,
+                       disposition: "active", checkpoint: ->(_step) { })
+    params = { "invoice_id" => invoice.id, "operation_id" => operation_id }
+    if operation == :prepare
+      params["disposition"] = disposition
+      params["entry_ids"] = entry_ids
+    end
+    Timekeeping::LocalOwner.call(operation:, company_id: company.id, generation:, actor:, params:, checkpoint:)
+  end
 end
 
 RSpec.configure do |config|

@@ -111,40 +111,45 @@ RSpec.describe TimekeepingLocalOwnerSpecHelpers do
     expect(other.has_role?("employee", company_a)).to be(true)
     expect(other.has_role?("owner", company_a)).to be(false)
   end
-end
 
-RSpec.describe TimekeepingLocalOwnerSpecHelpers do
-  let(:company) { create(:company) }
-  let(:project) { create(:project, client: create(:client, company:)) }
+  # Reservation examples build their state through this helper, so it must
+  # leave every record in the one seeded company.
+  it "seeded_invoice_entry creates an owner, project, invoice and one unbilled entry in one new company" do
+    seed = seeded_invoice_entry
 
-  # "TIMEKEEPING_WRITE_TABLES includes reservations and invoice_operations, and the existing local owner specs pass with the wider counts"
-  # "An entry write expects 0 in both new tables."
-  it "TIMEKEEPING_WRITE_TABLES includes reservations and invoice_operations and an entry create counts zero in both" do
-    generation = prepare_local_ownership!.generation.to_s
-    user = timekeeping_member(company, "employee")
+    expect(seed.owner.has_role?("owner", seed.company)).to be(true)
+    expect(Employment.where(user_id: seed.owner.id).pluck(:company_id)).to eq([seed.company.id])
+    expect(seed.project.client.company_id).to eq(seed.company.id)
+    expect(seed.invoice.company_id).to eq(seed.company.id)
+    expect(seed.invoice.client_id).to eq(seed.project.client_id)
+    expect(Timekeeping::LocalEntry.where(company_id: seed.company.id).pluck(:id)).to eq([seed.entry.id])
+    expect(seed.entry.user_id).to eq(seed.owner.id)
+    expect(seed.entry.project_id).to eq(seed.project.id)
+    expect(seed.entry.bill_status).to eq("unbilled")
+  end
 
-    expect(TIMEKEEPING_WRITE_TABLES).to contain_exactly(
-      "entries", "entry_audits", "idempotency_records", "entry_outbox_items", "reservations", "invoice_operations"
-    )
-    before = timekeeping_row_counts
-    expect(before.keys).to include("reservations", "invoice_operations")
+  it "reservation_call sends disposition and entry ids only on prepare and passes the checkpoint through" do
+    seed = seeded_invoice_entry
+    actor = Timekeeping::LocalOwner::Actor.service(name: "invoices", company_id: seed.company.id, operations: [])
+    checkpoint = ->(_step) { }
+    allow(Timekeeping::LocalOwner).to receive(:call).and_return(:answer)
+    shared = { company: seed.company, generation: "3", actor:, invoice: seed.invoice, operation_id: "op-1" }
 
-    outcome = Timekeeping::LocalOwner.call(
-      operation: :create, company_id: company.id, generation:,
-      actor: Timekeeping::LocalOwner::Actor.user(user_id: user.id, role: "employee"),
-      params: {
-        "idempotency_key" => "wider-counts-entry-create",
-        "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 30.0,
-                    "note" => "counted", "source" => "manual", "source_metadata" => {} }
-      }
-    )
+    expect(reservation_call(:prepare, **shared, entry_ids: [seed.entry.id])).to eq(:answer)
+    reservation_call(:prepare, **shared, entry_ids: [seed.entry.id], disposition: "retained", checkpoint:)
+    reservation_call(:commit, **shared)
+    reservation_call(:abort, **shared)
 
-    expect(outcome.status).to eq(201)
-    expect(timekeeping_row_counts).to eq(
-      "entries" => before["entries"] + 1, "entry_audits" => before["entry_audits"] + 1,
-      "idempotency_records" => before["idempotency_records"] + 1,
-      "entry_outbox_items" => before["entry_outbox_items"] + 1,
-      "reservations" => before["reservations"], "invoice_operations" => before["invoice_operations"]
-    )
+    base = { company_id: seed.company.id, generation: "3", actor:, checkpoint: kind_of(Proc) }
+    ids = { "invoice_id" => seed.invoice.id, "operation_id" => "op-1" }
+    expect(Timekeeping::LocalOwner).to have_received(:call).with(
+      operation: :prepare, **base, params: ids.merge("disposition" => "active", "entry_ids" => [seed.entry.id])
+    ).ordered
+    expect(Timekeeping::LocalOwner).to have_received(:call).with(
+      operation: :prepare, **base, checkpoint:,
+      params: ids.merge("disposition" => "retained", "entry_ids" => [seed.entry.id])
+    ).ordered
+    expect(Timekeeping::LocalOwner).to have_received(:call).with(operation: :commit, **base, params: ids).ordered
+    expect(Timekeeping::LocalOwner).to have_received(:call).with(operation: :abort, **base, params: ids).ordered
   end
 end
