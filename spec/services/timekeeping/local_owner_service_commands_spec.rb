@@ -725,6 +725,85 @@ RSpec.describe Timekeeping::LocalOwner, "service command key reused for another 
   end
 end
 
+RSpec.describe Timekeeping::LocalOwner, "mark_billed waiting on a successor invoice's reservation commit", committed_data: true do
+  include LocalOwnerServiceCommandRaceHelpers
+
+  # The two sessions share one lock: the entry row. The commit locks invoice B and its own
+  # operation id, mark_billed locks invoice A and another operation id, and both read the
+  # ownership row FOR SHARE, which does not conflict. So mark_billed waits only on the entry
+  # row the paused commit locked, and it must read the reservations again after that wait.
+  it "bills nothing for invoice A when successor invoice B commits A's retained entry while mark_billed waits" do
+    generation = prepare_local_ownership!.generation.to_s
+    seeded_invoice_entry => { company:, project:, invoice: invoice_a, entry: }
+    invoice_b = create(:invoice, company:, client: project.client)
+    reservations = described_class::Actor.service(name: "invoices", company_id: company.id,
+                                                  operations: ["reservations.prepare", "reservations.commit"])
+    billing = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
+                                             operations: ["invoices.mark_billed"])
+    operation_a = SecureRandom.uuid
+    expect(reservation_call(:prepare, company:, generation:, actor: reservations, invoice: invoice_a, operation_id: operation_a,
+                                      entry_ids: [entry.id], disposition: "retained").status).to eq(200)
+    expect(reservation_call(:commit, company:, generation:, actor: reservations, invoice: invoice_a,
+                                     operation_id: operation_a).status).to eq(200)
+    operation_b = SecureRandom.uuid
+    expect(reservation_call(:prepare, company:, generation:, actor: reservations, invoice: invoice_b, operation_id: operation_b,
+                                      entry_ids: [entry.id]).status).to eq(200)
+
+    # Invoice A still holds the entry by committed reservation, so before the race the entry is
+    # one mark_billed for A would bill.
+    reservation_rows = -> { Timekeeping::LocalOwner::ReservationOperations::Reservation.where(entry_id: entry.id) }
+    expect(reservation_rows.call.order(:invoice_id).pluck(:invoice_id, :state, :disposition))
+      .to eq([[invoice_a.id, "committed", "retained"], [invoice_b.id, "provisional", "active"]])
+    baseline = entry.reload.slice("version", "bill_status")
+    expect(baseline["bill_status"]).to eq("unbilled")
+    count_rows = lambda do |table|
+      ApplicationRecord.connection.select_value(
+        ApplicationRecord.sanitize_sql_array(["SELECT COUNT(*) FROM #{table} WHERE entry_id = ?", entry.id])
+      ).to_i
+    end
+    baseline_audits = count_rows.call("entry_audits")
+    baseline_outbox = count_rows.call("entry_outbox_items")
+
+    paused = Queue.new
+    release = Queue.new
+    commit_pids = []
+    billing_pids = []
+    pause_after_rows_locked = lambda do |step|
+      next unless step == :rows_locked
+
+      paused << true
+      release.pop
+    end
+
+    committer = biller = nil
+    begin
+      committer = committed_data_thread(commit_pids) do
+        reservation_call(:commit, company:, generation:, actor: reservations, invoice: invoice_b,
+                                  operation_id: operation_b, checkpoint: pause_after_rows_locked)
+      end
+      await_service_command_worker(committer) { paused.pop(timeout: 0) }
+      biller = committed_data_thread(billing_pids) do
+        described_class.call(operation: :mark_billed, company_id: company.id, generation:, actor: billing,
+                             params: { "invoice_id" => invoice_a.id, "operation_id" => SecureRandom.uuid })
+      end
+      await_service_command_worker(biller) { billing_pids.first }
+
+      expect(blocked_by?(billing_pids.first, commit_pids.first)).to be(true)
+    ensure
+      release << true
+      finish_service_command_workers(committer, biller)
+    end
+
+    expect([committer.value.status, committer.value.body]).to eq([200, { "reserved" => 1, "released" => 0 }])
+    # "It sets `bill_status: billed` on the kept entries that the invoice holds by committed reservation."
+    # Invoice A gave the entry up while mark_billed waited, so there is nothing left to bill.
+    expect([biller.value.status, biller.value.body]).to eq([200, { "billed" => 0 }])
+    expect(entry.reload.slice("version", "bill_status")).to eq(baseline)
+    expect(reservation_rows.call.pluck(:invoice_id, :state)).to eq([[invoice_b.id, "committed"]])
+    expect([count_rows.call("entry_audits"), count_rows.call("entry_outbox_items")]).to eq([baseline_audits, baseline_outbox])
+  end
+end
+
 RSpec.describe Timekeeping::LocalOwner, "stored service command receipts" do
   it "stores each command's receipt as a service receipt with the target-qualified operation and its SHA256 fingerprint" do
     generation = prepare_local_ownership!.generation.to_s
