@@ -27,13 +27,13 @@ RSpec.describe Timekeeping::Handoff::Capabilities do
     timekeeping = owner(:timekeeping, admission: enforcing_admission, settle:, drain:)
     gate = described_class.new
 
-    expect(gate.refusal(source_legacy: true, outgoing: owner(:monolith, admission: nil), incoming: timekeeping)).to be_a(String)
+    expect(gate.refusal(source_legacy: true, outgoing: owner(:monolith, admission: nil), incoming: timekeeping)).to be_a(String).and(be_present)
     expect(gate.refusal(source_legacy: true, outgoing: owner(:monolith, admission: non_enforcing_admission), incoming: timekeeping))
-      .to be_a(String)
+      .to be_a(String).and(be_present)
     expect(gate.refusal(source_legacy: false, outgoing: owner(:monolith, admission: enforcing_admission, drain:), incoming: timekeeping))
-      .to be_a(String)
+      .to be_a(String).and(be_present)
     expect(gate.refusal(source_legacy: false, outgoing: owner(:monolith, admission: enforcing_admission, settle:), incoming: timekeeping))
-      .to be_a(String)
+      .to be_a(String).and(be_present)
 
     # The one exception is a legacy source: settle and drain only verify that no unresolved rows remain.
     expect(gate.refusal(source_legacy: true, outgoing: owner(:monolith, admission: enforcing_admission), incoming: timekeeping)).to be_nil
@@ -42,16 +42,16 @@ RSpec.describe Timekeeping::Handoff::Capabilities do
 
     # Objects that lack the settle or drain calls are not working integrations.
     expect(gate.refusal(source_legacy: false, outgoing: owner(:monolith, admission: enforcing_admission, settle: Object.new, drain:),
-                        incoming: timekeeping)).to be_a(String)
+                        incoming: timekeeping)).to be_a(String).and(be_present)
     expect(gate.refusal(source_legacy: false, outgoing: owner(:monolith, admission: enforcing_admission, settle:, drain: Object.new),
-                        incoming: timekeeping)).to be_a(String)
+                        incoming: timekeeping)).to be_a(String).and(be_present)
   end
 
   it "refuses a non-legacy source with a settle integration but no drain" do
     timekeeping = owner(:timekeeping, admission: enforcing_admission, settle:)
     monolith = owner(:monolith, admission: enforcing_admission)
 
-    expect(described_class.new.refusal(source_legacy: false, outgoing: timekeeping, incoming: monolith)).to be_a(String)
+    expect(described_class.new.refusal(source_legacy: false, outgoing: timekeeping, incoming: monolith)).to be_a(String).and(be_present)
   end
 
   it "refuses a Timekeeping side without an enforcing admission adapter and accepts TimekeepingStore as one" do
