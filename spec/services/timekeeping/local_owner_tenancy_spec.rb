@@ -22,9 +22,7 @@ RSpec.describe Timekeeping::LocalOwner do
     )
     attributes_before = entry_a.reload.attributes
     counts_before = timekeeping_row_counts
-    expect(counts_before.keys).to match_array(
-      %w[entries entry_audits idempotency_records entry_outbox_items reservations invoice_operations]
-    )
+    expect(counts_before.keys).to match_array(TIMEKEEPING_WRITE_TABLES)
     expect(counts_before["entries"]).to eq(1)
     missing_id = entry_a.id + 1_000_000
     update_from_b = lambda do |entry_id, key|

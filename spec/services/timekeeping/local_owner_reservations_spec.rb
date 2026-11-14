@@ -5,13 +5,8 @@ require "rails_helper"
 RSpec.describe Timekeeping::LocalOwner, "reservation access refusals" do
   it "refuses nil, user, ungranted and foreign-company callers of prepare with 401, 403, 403 and 404 before any lock and with nothing changed" do
     generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
+    seeded_invoice_entry => { company:, owner:, invoice:, entry: }
     other_company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
     entry_before = entry.reload.attributes
     baseline = timekeeping_row_counts
     expect(baseline.keys).to include("reservations", "invoice_operations")
@@ -20,6 +15,8 @@ RSpec.describe Timekeeping::LocalOwner, "reservation access refusals" do
       nil => [401, "unauthorized"],
       actor.user(user_id: owner.id, role: "owner") => [403, "forbidden"],
       actor.service(name: "invoices", company_id: company.id, operations: ["reservations.commit"]) => [403, "forbidden"],
+      actor.service(name: "invoices", company_id: company.id,
+                    operations: ["reservations.commit", "entries.import"]) => [403, "forbidden"],
       actor.service(name: "invoices", company_id: other_company.id, operations: ["reservations.prepare"]) =>
         [404, "not_found"]
     }
@@ -27,12 +24,9 @@ RSpec.describe Timekeeping::LocalOwner, "reservation access refusals" do
     # "A nil actor, a user actor, a service without `reservations.prepare` and another company's service answer 401, 403, 403 and 404, with nothing changed."
     callers.each do |caller, (status, reason)|
       steps = []
-      outcome = described_class.call(
-        operation: :prepare, company_id: company.id, generation:, actor: caller,
-        params: { "invoice_id" => invoice.id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                  "entry_ids" => [entry.id] },
-        checkpoint: ->(step) { steps << step }
-      )
+      outcome = reservation_call(:prepare, company:, generation:, actor: caller, invoice:,
+                                           operation_id: SecureRandom.uuid, entry_ids: [entry.id],
+                                           checkpoint: ->(step) { steps << step })
 
       expect(outcome.status).to eq(status)
       expect(outcome.body).to eq("reason" => reason)
@@ -47,13 +41,8 @@ end
 RSpec.describe Timekeeping::LocalOwner, "refused callers and stored answers" do
   it "never replays a stored prepare or commit answer to a caller of the same operation_id that access refuses" do
     generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
+    seeded_invoice_entry => { company:, invoice:, entry: }
     other_company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
     operation_id = SecureRandom.uuid
     params = { "invoice_id" => invoice.id, "operation_id" => operation_id, "disposition" => "active",
                "entry_ids" => [entry.id] }
@@ -85,25 +74,11 @@ RSpec.describe Timekeeping::LocalOwner, "refused callers and stored answers" do
 end
 
 RSpec.describe Timekeeping::LocalOwner, "reservation rollback at an injected failure" do
-  def reservation_call(operation, company:, generation:, actor:, invoice:, operation_id:, entry_ids: nil, checkpoint: ->(_step) { })
-    params = { "invoice_id" => invoice.id, "operation_id" => operation_id }
-    if operation == :prepare
-      params["disposition"] = "active"
-      params["entry_ids"] = entry_ids
-    end
-    described_class.call(operation:, company_id: company.id, generation:, actor:, params:, checkpoint:)
-  end
-
   # "A failure injected after the reservation write leaves no reservation, operation, outbox row or receipt"
   it "a failure injected at reservations_written, outbox_written or receipt_written leaves every write table count and entry version at baseline" do
     expect(TIMEKEEPING_WRITE_TABLES).to include("reservations", "invoice_operations")
     generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
+    seeded_invoice_entry => { company:, invoice:, entry: }
     actor = described_class::Actor.service(name: "invoices", company_id: company.id,
                                            operations: ["reservations.prepare", "reservations.commit"])
     injected = Class.new(StandardError)
@@ -154,26 +129,12 @@ RSpec.describe Timekeeping::LocalOwner, "reservation rollback at an injected fai
 end
 
 RSpec.describe Timekeeping::LocalOwner, "reservation retry at a stale generation" do
-  def reservation_call(operation, company:, generation:, actor:, invoice:, operation_id:, entry_ids: nil)
-    params = { "invoice_id" => invoice.id, "operation_id" => operation_id }
-    if operation == :prepare
-      params["disposition"] = "active"
-      params["entry_ids"] = entry_ids
-    end
-    described_class.call(operation:, company_id: company.id, generation:, actor:, params:)
-  end
-
   # "The generation check comes before replay, so a stale generation always gets 409 and changes nothing."
   it "a prepare and a commit retried at a stale generation after their answers are stored answer 409 stale_generation and change no count" do
     stored_generation = prepare_local_ownership!.generation
     generation = stored_generation.to_s
     stale = (stored_generation + 1).to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
+    seeded_invoice_entry => { company:, invoice:, entry: }
     actor = described_class::Actor.service(name: "invoices", company_id: company.id,
                                            operations: ["reservations.prepare", "reservations.commit"])
     operation_id = SecureRandom.uuid
@@ -198,27 +159,101 @@ RSpec.describe Timekeeping::LocalOwner, "reservation retry at a stale generation
     expect(timekeeping_row_counts).to eq(baseline)
     expect(entry.reload.version).to eq(version)
   end
+
+  # Unlike the example above, the body keeps the old generation and the stored
+  # generation moves on.
+  it "a prepare retried at a stale generation after its answer is stored answers 409 stale_generation and changes no count" do
+    ownership = prepare_local_ownership!
+    generation = ownership.generation.to_s
+    seeded_invoice_entry => { company:, invoice:, entry: }
+    actor = described_class::Actor.service(name: "invoices", company_id: company.id, operations: ["reservations.prepare"])
+    operation_id = SecureRandom.uuid
+
+    first = reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id:, entry_ids: [entry.id])
+    expect(first.status).to eq(200)
+    # The stored answer must exist, or this retry cannot tell replay-first from check-first.
+    expect(ActiveRecord::Base.connection.select_value(
+      "SELECT COUNT(*) FROM invoice_operations WHERE company_id = #{company.id}"
+    ).to_i).to eq(1)
+
+    TimekeepingOwnership.current.update!(generation: ownership.generation + 1)
+    baseline = timekeeping_row_counts
+    version = entry.reload.version
+
+    retried = reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id:, entry_ids: [entry.id])
+
+    expect(retried.status).to eq(409)
+    expect(retried.body).to eq("reason" => "stale_generation")
+    expect(timekeeping_row_counts).to eq(baseline)
+    expect(entry.reload.version).to eq(version)
+  end
+
+  it "a commit retried at a stale generation after its receipt is stored answers 409 stale_generation and changes no count" do
+    ownership = prepare_local_ownership!
+    generation = ownership.generation.to_s
+    seeded_invoice_entry => { company:, invoice:, entry: }
+    actor = described_class::Actor.service(name: "invoices", company_id: company.id,
+                                           operations: ["reservations.prepare", "reservations.commit"])
+    operation_id = SecureRandom.uuid
+    prepared = reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id:, entry_ids: [entry.id])
+    expect(prepared.status).to eq(200)
+    committed = reservation_call(:commit, company:, generation:, actor:, invoice:, operation_id:)
+    expect(committed.status).to eq(200)
+    expect(ActiveRecord::Base.connection.select_value(
+      "SELECT COUNT(*) FROM idempotency_records WHERE company_id = #{company.id} AND actor_type = 'service'"
+    ).to_i).to eq(1)
+
+    TimekeepingOwnership.current.update!(generation: ownership.generation + 1)
+    baseline = timekeeping_row_counts
+    version = entry.reload.version
+
+    retried = reservation_call(:commit, company:, generation:, actor:, invoice:, operation_id:)
+
+    expect(retried.status).to eq(409)
+    expect(retried.body).to eq("reason" => "stale_generation")
+    expect(timekeeping_row_counts).to eq(baseline)
+    expect(entry.reload.version).to eq(version)
+  end
+
+  it "an abort retried at a stale generation after its receipt is stored answers 409 stale_generation and changes no count" do
+    ownership = prepare_local_ownership!
+    generation = ownership.generation.to_s
+    seeded_invoice_entry => { company:, invoice:, entry: }
+    actor = described_class::Actor.service(
+      name: "invoices", company_id: company.id, operations: ["reservations.prepare", "reservations.abort"]
+    )
+    operation_id = SecureRandom.uuid
+    prepared = reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id:, entry_ids: [entry.id])
+    expect(prepared.status).to be_between(200, 299)
+    aborted = reservation_call(:abort, company:, generation:, actor:, invoice:, operation_id:)
+    expect(aborted.status).to be_between(200, 299)
+    # The stored answer must exist, or this retry could not tell replay-first from generation-first.
+    expect(ActiveRecord::Base.connection.select_value(
+      ActiveRecord::Base.sanitize_sql_array(
+        ["SELECT COUNT(*) FROM idempotency_records WHERE company_id = ? AND actor_type = 'service' AND key = ?",
+         company.id, operation_id]
+      )
+    ).to_i).to eq(1)
+
+    ownership.reload.update_columns(generation: ownership.generation + 1)
+    baseline = timekeeping_row_counts
+    version = entry.reload.version
+
+    # "A stale body generation on prepare, commit or abort gives 409 stale_generation and writes nothing, including a retry whose earlier answer is stored"
+    retried = reservation_call(:abort, company:, generation:, actor:, invoice:, operation_id:)
+
+    expect(retried.status).to eq(409)
+    expect(retried.body).to eq("reason" => "stale_generation")
+    expect(timekeeping_row_counts).to eq(baseline)
+    expect(entry.reload.version).to eq(version)
+  end
 end
 
 RSpec.describe Timekeeping::LocalOwner, "reservation replay at the stored generation" do
-  def reservation_call(operation, company:, generation:, actor:, invoice:, operation_id:, entry_ids: nil)
-    params = { "invoice_id" => invoice.id, "operation_id" => operation_id }
-    if operation == :prepare
-      params["disposition"] = "active"
-      params["entry_ids"] = entry_ids
-    end
-    described_class.call(operation:, company_id: company.id, generation:, actor:, params:)
-  end
-
   # "Replay the stored answer: the operation row for prepare, the receipt for the other operations."
   it "a prepare and a commit repeated at the stored generation replay their answers with no second row or version" do
     generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
+    seeded_invoice_entry => { company:, invoice:, entry: }
     actor = described_class::Actor.service(name: "invoices", company_id: company.id,
                                            operations: ["reservations.prepare", "reservations.commit"])
     operation_id = SecureRandom.uuid
@@ -226,6 +261,7 @@ RSpec.describe Timekeeping::LocalOwner, "reservation replay at the stored genera
     first_prepare = reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id:, entry_ids: [entry.id])
     after_prepare = timekeeping_row_counts
     version = entry.reload.version
+    expect(version).to eq(2)
     again = reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id:, entry_ids: [entry.id])
     expect(again.status).to eq(first_prepare.status)
     expect(again.body).to eq(first_prepare.body)
@@ -233,9 +269,11 @@ RSpec.describe Timekeeping::LocalOwner, "reservation replay at the stored genera
     expect(entry.reload.version).to eq(version)
 
     first_commit = reservation_call(:commit, company:, generation:, actor:, invoice:, operation_id:)
-    expect(first_commit.status).to be_between(200, 299)
+    expect(first_commit.status).to eq(200)
     after_commit = timekeeping_row_counts
-    expect(after_commit["idempotency_records"]).to eq(after_prepare["idempotency_records"] + 1)
+    # "Committing a provisional reservation changes nothing visible, with no new version."
+    expect(after_commit).to eq(after_prepare.merge("idempotency_records" => after_prepare["idempotency_records"] + 1))
+    expect(entry.reload.version).to eq(version)
     again_commit = reservation_call(:commit, company:, generation:, actor:, invoice:, operation_id:)
     expect(again_commit.status).to eq(first_commit.status)
     expect(again_commit.body).to eq(first_commit.body)
@@ -245,15 +283,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservation replay at the stored genera
 end
 
 RSpec.describe Timekeeping::LocalOwner, "reservation lock flag flips" do
-  def reservation_call(operation, company:, generation:, actor:, invoice:, operation_id:, entry_ids: nil)
-    params = { "invoice_id" => invoice.id, "operation_id" => operation_id }
-    if operation == :prepare
-      params["disposition"] = "active"
-      params["entry_ids"] = entry_ids
-    end
-    described_class.call(operation:, company_id: company.id, generation:, actor:, params:)
-  end
-
   def reserved?(entry)
     Timekeeping::LocalEntry.with_reserved.find_by!(company_id: entry.company_id, id: entry.id).reserved
   end
@@ -261,82 +290,85 @@ RSpec.describe Timekeeping::LocalOwner, "reservation lock flag flips" do
   # "So prepare flips the flag from false to true. Committing a provisional reservation changes nothing visible, with no new version."
   it "prepare writes one version, audit and outbox row per flipped entry and a promotion-only commit writes none" do
     generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entries = %w[first second].map do |note|
-      Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                      work_date: Date.current, duration: 30.0, note:, bill_status: "unbilled")
-    end
-    actor = described_class::Actor.service(name: "invoices", company_id: company.id,
-                                           operations: ["reservations.prepare", "reservations.commit"])
+    seeded_invoice_entry => { company:, invoice:, entry: }
+    second = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: entry.user_id, project_id: entry.project_id,
+                                             work_date: Date.current, duration: 30.0, note: "second", bill_status: "unbilled")
+    entries = [entry, second]
+    # Prepare runs with a prepare-only grant, so the flips need no commit permission.
+    prepare_actor = described_class::Actor.service(name: "invoices", company_id: company.id,
+                                                   operations: ["reservations.prepare"])
+    commit_actor = described_class::Actor.service(name: "invoices", company_id: company.id,
+                                                  operations: ["reservations.commit"])
     operation_id = SecureRandom.uuid
-    versions = entries.map { |entry| entry.reload.version }
-    expect(entries.map { |entry| reserved?(entry) }).to eq([false, false])
+    versions = entries.map { |row| row.reload.version }
+    expect(entries.map { |row| reserved?(row) }).to eq([false, false])
     baseline = timekeeping_row_counts
 
-    prepared = reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id:,
+    prepared = reservation_call(:prepare, company:, generation:, actor: prepare_actor, invoice:, operation_id:,
                                           entry_ids: entries.map(&:id))
-    expect(prepared.status).to be_between(200, 299)
-    expect(entries.map { |entry| entry.reload.version }).to eq(versions.map { |version| version + 1 })
-    expect(entries.map { |entry| reserved?(entry) }).to eq([true, true])
+    expect(prepared.status).to eq(200)
+    expect(prepared.body["state"]).to eq("prepared")
+    expect(entries.map { |row| row.reload.version }).to eq(versions.map { |version| version + 1 })
+    expect(entries.map { |row| reserved?(row) }).to eq([true, true])
     after_prepare = timekeeping_row_counts
     expect(after_prepare["entry_audits"]).to eq(baseline["entry_audits"] + 2)
     expect(after_prepare["entry_outbox_items"]).to eq(baseline["entry_outbox_items"] + 2)
     expect(after_prepare["invoice_operations"]).to eq(baseline["invoice_operations"] + 1)
     expect(after_prepare["reservations"]).to eq(baseline["reservations"] + 2)
+    expect(after_prepare["entries"]).to eq(baseline["entries"])
 
-    committed = reservation_call(:commit, company:, generation:, actor:, invoice:, operation_id:)
-    expect(committed.status).to be_between(200, 299)
-    expect(entries.map { |entry| entry.reload.version }).to eq(versions.map { |version| version + 1 })
-    expect(entries.map { |entry| reserved?(entry) }).to eq([true, true])
+    committed = reservation_call(:commit, company:, generation:, actor: commit_actor, invoice:, operation_id:)
+    expect(committed.status).to eq(200)
+    expect(entries.map { |row| row.reload.version }).to eq(versions.map { |version| version + 1 })
+    expect(entries.map { |row| reserved?(row) }).to eq([true, true])
     after_commit = timekeeping_row_counts
     expect(after_commit["entry_audits"]).to eq(after_prepare["entry_audits"])
     expect(after_commit["entry_outbox_items"]).to eq(after_prepare["entry_outbox_items"])
     expect(after_commit["reservations"]).to eq(after_prepare["reservations"])
+    expect(after_commit["idempotency_records"]).to eq(after_prepare["idempotency_records"] + 1)
+    # "Service receipts are written with `actor_type "service"`, a nil `actor_id` and `actor_name` = service name."
+    receipt = ActiveRecord::Base.connection.select_one(
+      ActiveRecord::Base.sanitize_sql_array(
+        ["SELECT actor_type, actor_id, actor_name FROM idempotency_records WHERE company_id = ? AND key = ?",
+         company.id, operation_id]
+      )
+    )
+    expect(receipt).to eq("actor_type" => "service", "actor_id" => nil, "actor_name" => "invoices")
   end
 end
 
 RSpec.describe Timekeeping::LocalOwner, "reservation abort beside another invoice's hold" do
-  def reservation_call(operation, company:, generation:, actor:, invoice:, operation_id:, entry_ids: nil)
-    params = { "invoice_id" => invoice.id, "operation_id" => operation_id }
-    if operation == :prepare
-      params["disposition"] = "active"
-      params["entry_ids"] = entry_ids
-    end
-    described_class.call(operation:, company_id: company.id, generation:, actor:, params:)
-  end
-
   # "Abort flips the flag back to false only when no reservation is left."
-  it "abort of invoice B on an entry invoice A still holds keeps the entry locked and writes no version, audit or outbox row" do
+  # Invoice A retains its committed reservation on `held`, so invoice B can
+  # claim `held` beside it; an active reservation would refuse B's prepare as
+  # on_another_invoice before any abort ran.
+  it "abort of invoice B on an entry invoice A still holds keeps it locked and writes no version, audit or outbox row, while an abort leaving no reservation unlocks it" do
     generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice_a = create(:invoice, company:, client: project.client)
+    seeded_invoice_entry => { company:, project:, invoice: invoice_a, entry: held }
     invoice_b = create(:invoice, company:, client: project.client)
-    held = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                           work_date: Date.current, duration: 30.0, note: "held", bill_status: "unbilled")
-    free = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
+    free = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: held.user_id, project_id: project.id,
                                            work_date: Date.current, duration: 30.0, note: "free", bill_status: "unbilled")
     actor = described_class::Actor.service(name: "invoices", company_id: company.id,
                                            operations: ["reservations.prepare", "reservations.commit", "reservations.abort"])
     operation_a = SecureRandom.uuid
-    reservation_call(:prepare, company:, generation:, actor:, invoice: invoice_a, operation_id: operation_a, entry_ids: [held.id])
-    reservation_call(:commit, company:, generation:, actor:, invoice: invoice_a, operation_id: operation_a)
+    expect(reservation_call(:prepare, company:, generation:, actor:, invoice: invoice_a, operation_id: operation_a,
+                                      entry_ids: [held.id], disposition: "retained").status).to eq(200)
+    expect(reservation_call(:commit, company:, generation:, actor:, invoice: invoice_a,
+                                     operation_id: operation_a).status).to eq(200)
     operation_b = SecureRandom.uuid
-    reservation_call(:prepare, company:, generation:, actor:, invoice: invoice_b, operation_id: operation_b, entry_ids: [free.id])
+    expect(reservation_call(:prepare, company:, generation:, actor:, invoice: invoice_b, operation_id: operation_b,
+                                      entry_ids: [held.id, free.id]).status).to eq(200)
     held_version = held.reload.version
     free_version = free.reload.version
     before = timekeeping_row_counts
 
     aborted = reservation_call(:abort, company:, generation:, actor:, invoice: invoice_b, operation_id: operation_b)
 
-    expect(aborted.status).to be_between(200, 299)
-    expect(held.reload.version).to eq(held_version)
+    expect(aborted.status).to eq(200)
     expect(Timekeeping::LocalEntry.with_reserved.find_by!(company_id: company.id, id: held.id).reserved).to be(true)
+    expect(held.reload.version).to eq(held_version)
     # The entry only invoice B held loses its last reservation, so it is the one flip.
+    expect(Timekeeping::LocalEntry.with_reserved.find_by!(company_id: company.id, id: free.id).reserved).to be(false)
     expect(free.reload.version).to eq(free_version + 1)
     after = timekeeping_row_counts
     expect(after["entry_audits"]).to eq(before["entry_audits"] + 1)
@@ -348,22 +380,13 @@ RSpec.describe Timekeeping::LocalOwner, "reservation abort beside another invoic
   # the flag never flips.
   it "abort of invoice B's claim on an entry invoice A retains keeps it locked and writes no version, audit or outbox row" do
     generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice_a = create(:invoice, company:, client: project.client)
+    seeded_invoice_entry => { company:, project:, invoice: invoice_a, entry: held }
     invoice_b = create(:invoice, company:, client: project.client)
-    held = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                           work_date: Date.current, duration: 30.0, note: "held", bill_status: "unbilled")
     actor = described_class::Actor.service(name: "invoices", company_id: company.id,
                                            operations: ["reservations.prepare", "reservations.commit", "reservations.abort"])
     operation_a = SecureRandom.uuid
-    prepared_a = described_class.call(
-      operation: :prepare, company_id: company.id, generation:, actor:,
-      params: { "invoice_id" => invoice_a.id, "operation_id" => operation_a, "disposition" => "retained",
-                "entry_ids" => [held.id] }
-    )
-    expect(prepared_a.status).to eq(200)
+    expect(reservation_call(:prepare, company:, generation:, actor:, invoice: invoice_a, operation_id: operation_a,
+                                      entry_ids: [held.id], disposition: "retained").status).to eq(200)
     expect(reservation_call(:commit, company:, generation:, actor:, invoice: invoice_a,
                                      operation_id: operation_a).status).to eq(200)
     operation_b = SecureRandom.uuid
@@ -384,36 +407,17 @@ RSpec.describe Timekeeping::LocalOwner, "reservation abort beside another invoic
 end
 
 RSpec.describe Timekeeping::LocalOwner, "reservation keys per service and company" do
-  def reservation_call(operation, company:, generation:, actor:, invoice:, operation_id:, entry_ids: nil)
-    params = { "invoice_id" => invoice.id, "operation_id" => operation_id }
-    if operation == :prepare
-      params["disposition"] = "active"
-      params["entry_ids"] = entry_ids
-    end
-    described_class.call(operation:, company_id: company.id, generation:, actor:, params:)
-  end
-
-  def seeded_invoice_entry
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
-    [company, invoice, entry]
-  end
-
   # "The same operation_id from two services, or from two companies, gives separate operation rows and receipts."
   it "the same operation_id from two services and from two companies gives separate operation rows and receipts" do
     generation = prepare_local_ownership!.generation.to_s
     grants = ["reservations.prepare", "reservations.commit"]
     operation_id = SecureRandom.uuid
-    company, invoice_a, entry_a = seeded_invoice_entry
+    seeded_invoice_entry => { company:, invoice: invoice_a, entry: entry_a }
     project_b = create(:project, client: create(:client, company:))
     invoice_b = create(:invoice, company:, client: project_b.client)
     entry_b = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: entry_a.user_id, project_id: project_b.id,
                                               work_date: Date.current, duration: 30.0, note: "b", bill_status: "unbilled")
-    other_company, other_invoice, other_entry = seeded_invoice_entry
+    seeded_invoice_entry => { company: other_company, invoice: other_invoice, entry: other_entry }
     calls = [
       [company, invoice_a, entry_a, described_class::Actor.service(name: "invoices", company_id: company.id, operations: grants)],
       [company, invoice_b, entry_b, described_class::Actor.service(name: "agents", company_id: company.id, operations: grants)],
@@ -440,56 +444,70 @@ RSpec.describe Timekeeping::LocalOwner, "reservation keys per service and compan
       expect(Timekeeping::LocalEntry.with_reserved.find_by!(company_id: entry.company_id, id: entry.id).reserved).to be(true)
     end
   end
-end
 
-RSpec.describe Timekeeping::LocalOwner, "reservation access refusals" do
-  # "A nil actor answers `unauthorized`. A user actor, or a service without the operation, answers `forbidden`. A service bound to another company answers `not_found`."
-  it "a nil actor, a user, a service without reservations.prepare and another company's service answer 401, 403, 403 and 404 with nothing changed" do
+  it "the same operation_id from a second service on another invoice gets its own operation row, never the first service's stored answer" do
     generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    other_company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
-    refused = {
-      nil => [401, "unauthorized"],
-      described_class::Actor.user(user_id: owner.id, role: "owner") => [403, "forbidden"],
-      described_class::Actor.service(name: "invoices", company_id: company.id,
-                                     operations: ["reservations.commit", "entries.import"]) => [403, "forbidden"],
-      described_class::Actor.service(name: "invoices", company_id: other_company.id,
-                                     operations: ["reservations.prepare"]) => [404, "not_found"]
-    }
-    baseline = timekeeping_row_counts
-    version = entry.reload.version
+    seeded_invoice_entry => { company:, project:, invoice: first_invoice, entry: first_entry }
+    second_invoice = create(:invoice, company:, client: project.client)
+    second_entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: first_entry.user_id,
+                                                   project_id: project.id, work_date: Date.current, duration: 30.0,
+                                                   note: "b", bill_status: "unbilled")
+    operation_id = SecureRandom.uuid
+    first_service = described_class::Actor.service(name: "invoices", company_id: company.id,
+                                                   operations: ["reservations.prepare"])
+    second_service = described_class::Actor.service(name: "agents", company_id: company.id,
+                                                    operations: ["reservations.prepare"])
 
-    refused.each do |actor, (status, reason)|
-      steps = []
-      outcome = described_class.call(
-        operation: :prepare, company_id: company.id, generation:, actor:,
-        params: { "invoice_id" => invoice.id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                  "entry_ids" => [entry.id] },
-        checkpoint: ->(step) { steps << step }
-      )
-      expect(outcome.status).to eq(status)
-      expect(outcome.body).to eq("reason" => reason)
-      expect(steps).not_to include(:operation_key_locked)
-      expect(timekeeping_row_counts).to eq(baseline)
-      expect(entry.reload.version).to eq(version)
+    first = reservation_call(:prepare, company:, generation:, actor: first_service, invoice: first_invoice,
+                                       operation_id:, entry_ids: [first_entry.id])
+    # With a key missing the service name, this would replay the first answer or answer idempotency_key_reused.
+    second = reservation_call(:prepare, company:, generation:, actor: second_service, invoice: second_invoice,
+                                        operation_id:, entry_ids: [second_entry.id])
+
+    expect(first.status).to eq(200)
+    expect(second.status).to eq(200)
+    rows = ActiveRecord::Base.connection.select_rows(
+      "SELECT actor_name, invoice_id FROM invoice_operations " \
+      "WHERE company_id = #{company.id} AND operation_id = #{ActiveRecord::Base.connection.quote(operation_id)} " \
+      "ORDER BY actor_name"
+    )
+    expect(rows).to eq([["agents", second_invoice.id], ["invoices", first_invoice.id]])
+    expect(second_entry.reload.version).to eq(2)
+  end
+
+  it "the same operation_id and service name from two companies give two operation rows and two service receipts" do
+    generation = prepare_local_ownership!.generation.to_s
+    operation_id = SecureRandom.uuid
+    seeds = Array.new(2) { seeded_invoice_entry }
+
+    seeds.each do |seed|
+      seed => { company:, invoice:, entry: }
+      actor = described_class::Actor.service(name: "invoices", company_id: company.id,
+                                             operations: ["reservations.prepare", "reservations.commit"])
+      prepared = reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id:, entry_ids: [entry.id])
+      committed = reservation_call(:commit, company:, generation:, actor:, invoice:, operation_id:)
+      expect([prepared.status, committed.status]).to eq([200, 200])
+      expect(entry.reload.attributes.fetch("version")).to be > 0
     end
+
+    company_ids = seeds.map { |seed| seed.company.id }.sort
+    connection = ActiveRecord::Base.connection
+    quoted = connection.quote(operation_id)
+    expect(connection.select_values(
+      "SELECT company_id FROM invoice_operations WHERE operation_id = #{quoted} ORDER BY company_id"
+    )).to eq(company_ids)
+    receipts = connection.select_rows(
+      "SELECT company_id, actor_type, actor_id, actor_name FROM idempotency_records " \
+      "WHERE key = #{quoted} ORDER BY company_id"
+    )
+    expect(receipts).to eq(company_ids.map { |id| [id, "service", nil, "invoices"] })
   end
 end
 
 RSpec.describe Timekeeping::LocalOwner, "unpublishable reservation flip" do
   it "a prepare that would flip an unpublishable entry answers 422 unpublishable_entry with its id and field and writes nothing" do
     generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
+    seeded_invoice_entry => { company:, invoice:, entry: }
     # A source outside the snapshot contract's list is a stored value the
     # projection refuses, so publishing this entry's flip would stall the relay.
     entry.update_columns(source: "legacy")
@@ -498,11 +516,8 @@ RSpec.describe Timekeeping::LocalOwner, "unpublishable reservation flip" do
     actor = Timekeeping::LocalOwner::Actor.service(name: "invoices", company_id: company.id,
                                                    operations: ["reservations.prepare"])
 
-    outcome = described_class.call(
-      operation: :prepare, company_id: company.id, generation:, actor:,
-      params: { "invoice_id" => invoice.id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                "entry_ids" => [entry.id] }
-    )
+    outcome = reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id: SecureRandom.uuid,
+                                         entry_ids: [entry.id])
 
     # "A flipped entry that fails `EntryOutbox.invalid_fields` refuses the whole operation with 422
     # `unpublishable_entry`, listing entry ids and field names."
@@ -519,33 +534,27 @@ RSpec.describe Timekeeping::LocalOwner, "unpublishable reservation flip" do
 
   it "a commit releasing a dropped unpublishable entry, and an abort releasing one, answer 422 and leave the operation prepared" do
     generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
+    seeded_invoice_entry => { company:, project:, invoice:, entry: kept }
     other_invoice = create(:invoice, company:, client: project.client)
-    kept, dropped, aborted = %w[kept dropped aborted].map do |note|
-      Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
+    dropped, aborted = %w[dropped aborted].map do |note|
+      Timekeeping::LocalEntry.create!(company_id: company.id, user_id: kept.user_id, project_id: project.id,
                                       work_date: Date.current, duration: 30.0, note:, bill_status: "unbilled")
     end
     actor = described_class::Actor.service(
       name: "invoices", company_id: company.id,
       operations: ["reservations.prepare", "reservations.commit", "reservations.abort"]
     )
-    run = lambda do |operation, params|
-      described_class.call(operation:, company_id: company.id, generation:, actor:, params:)
-    end
-    prepare_params = lambda do |target, operation_id, entry_ids|
-      { "invoice_id" => target.id, "operation_id" => operation_id, "disposition" => "active", "entry_ids" => entry_ids }
+    call = lambda do |operation, target, operation_id, entry_ids = nil|
+      reservation_call(operation, company:, generation:, actor:, invoice: target, operation_id:, entry_ids:)
     end
     first_op = SecureRandom.uuid
-    expect(run.call(:prepare, prepare_params.call(invoice, first_op, [kept.id, dropped.id])).status).to eq(200)
-    expect(run.call(:commit, { "invoice_id" => invoice.id, "operation_id" => first_op }).status).to eq(200)
+    expect(call.call(:prepare, invoice, first_op, [kept.id, dropped.id]).status).to eq(200)
+    expect(call.call(:commit, invoice, first_op).status).to eq(200)
     # The stored desired set drops `dropped`, so this commit would release it.
     commit_op = SecureRandom.uuid
-    expect(run.call(:prepare, prepare_params.call(invoice, commit_op, [kept.id])).status).to eq(200)
+    expect(call.call(:prepare, invoice, commit_op, [kept.id]).status).to eq(200)
     abort_op = SecureRandom.uuid
-    expect(run.call(:prepare, prepare_params.call(other_invoice, abort_op, [aborted.id])).status).to eq(200)
+    expect(call.call(:prepare, other_invoice, abort_op, [aborted.id]).status).to eq(200)
     [dropped, aborted].each { |entry| entry.update_columns(source: "legacy") }
     operation_state = lambda do |operation_id|
       ActiveRecord::Base.connection.select_value(ActiveRecord::Base.sanitize_sql_array(
@@ -557,7 +566,7 @@ RSpec.describe Timekeeping::LocalOwner, "unpublishable reservation flip" do
       baseline = timekeeping_row_counts
       versions = [kept, dropped, aborted].map { |row| row.reload.version }
 
-      outcome = run.call(operation, { "invoice_id" => target.id, "operation_id" => operation_id })
+      outcome = call.call(operation, target, operation_id)
 
       expect([operation, outcome.status, outcome.body["reason"]]).to eq([operation, 422, "unpublishable_entry"])
       listed = JSON.generate(outcome.body)
@@ -571,116 +580,26 @@ RSpec.describe Timekeeping::LocalOwner, "unpublishable reservation flip" do
   end
 end
 
-RSpec.describe Timekeeping::LocalOwner, "reservation access across companies" do
-  # "A service bound to another company answers `not_found`."
-  it "a service bound to another company answers not_found on prepare, takes no lock and changes nothing" do
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    other_company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
-    baseline = timekeeping_row_counts
-    version_before = entry.reload.version
-    foreign_service = described_class::Actor.service(name: "invoices", company_id: other_company.id,
-                                                     operations: ["reservations.prepare"])
-    steps = []
-
-    outcome = described_class.call(
-      operation: :prepare, company_id: company.id, generation:, actor: foreign_service,
-      params: { "invoice_id" => invoice.id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                "entry_ids" => [entry.id] },
-      checkpoint: ->(step) { steps << step }
-    )
-
-    expect(outcome.status).to eq(404)
-    expect(outcome.body).to eq("reason" => "not_found")
-    # The company check runs "from a rule table, applied before any lock or read".
-    expect(steps).not_to include(:operation_key_locked)
-    expect(timekeeping_row_counts).to eq(baseline)
-    expect(baseline.keys).to include("reservations", "invoice_operations")
-    expect(entry.reload.version).to eq(version_before)
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner, "reservation keys per company" do
-  # "The same operation_id from two services, or from two companies, gives separate operation rows and receipts."
-  it "the same operation_id from two companies gives separate operation rows and service receipts" do
-    generation = prepare_local_ownership!.generation.to_s
-    operation_id = SecureRandom.uuid
-    companies = Array.new(2) { create(:company) }
-    companies.each do |company|
-      owner = timekeeping_member(company, "owner")
-      project = create(:project, client: create(:client, company:))
-      invoice = create(:invoice, company:, client: project.client)
-      entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                              work_date: Date.current, duration: 30.0, note: "n",
-                                              bill_status: "unbilled")
-      actor = described_class::Actor.service(name: "invoices", company_id: company.id,
-                                             operations: ["reservations.prepare", "reservations.commit"])
-
-      prepared = described_class.call(
-        operation: :prepare, company_id: company.id, generation:, actor:,
-        params: { "invoice_id" => invoice.id, "operation_id" => operation_id, "disposition" => "active",
-                  "entry_ids" => [entry.id] }
-      )
-      expect(prepared.status).to eq(200)
-      committed = described_class.call(
-        operation: :commit, company_id: company.id, generation:, actor:,
-        params: { "invoice_id" => invoice.id, "operation_id" => operation_id }
-      )
-      expect(committed.status).to eq(200)
-      expect(entry.reload.attributes.fetch("version")).to be > 0
-    end
-
-    connection = ActiveRecord::Base.connection
-    operation_companies = connection.select_values(
-      ActiveRecord::Base.sanitize_sql_array(["SELECT company_id FROM invoice_operations WHERE operation_id = ?", operation_id])
-    )
-    expect(operation_companies.map(&:to_i)).to match_array(companies.map(&:id))
-
-    receipts = connection.select_all(
-      ActiveRecord::Base.sanitize_sql_array(
-        ["SELECT company_id, actor_id, actor_name FROM idempotency_records WHERE actor_type = 'service' AND key = ?",
-         operation_id]
-      )
-    ).to_a
-    expect(receipts.map { |row| row["company_id"].to_i }).to match_array(companies.map(&:id))
-    expect(receipts.pluck("actor_id")).to all(be_nil)
-    expect(receipts.pluck("actor_name")).to all(eq("invoices"))
-  end
-end
-
 RSpec.describe Timekeeping::LocalOwner, "commit across companies" do
   # "Every local query filters by `company_id`." A commit in company B must not find company A's operation.
   it "a commit sent by another company's service for a prepared operation_id answers not_found and leaves that operation prepared" do
     generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
+    seeded_invoice_entry => { company:, invoice:, entry: }
     other_company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
     operation_id = SecureRandom.uuid
-    prepared = described_class.call(
-      operation: :prepare, company_id: company.id, generation:,
-      actor: described_class::Actor.service(name: "invoices", company_id: company.id,
-                                            operations: ["reservations.prepare"]),
-      params: { "invoice_id" => invoice.id, "operation_id" => operation_id, "disposition" => "active",
-                "entry_ids" => [entry.id] }
+    prepared = reservation_call(
+      :prepare, company:, generation:, invoice:, operation_id:, entry_ids: [entry.id],
+                actor: described_class::Actor.service(name: "invoices", company_id: company.id,
+                                                      operations: ["reservations.prepare"])
     )
     expect(prepared.status).to eq(200)
     baseline = timekeeping_row_counts
     version_after_prepare = entry.reload.version
 
-    outcome = described_class.call(
-      operation: :commit, company_id: other_company.id, generation:,
-      actor: described_class::Actor.service(name: "invoices", company_id: other_company.id,
-                                            operations: ["reservations.commit"]),
-      params: { "invoice_id" => invoice.id, "operation_id" => operation_id }
+    outcome = reservation_call(
+      :commit, company: other_company, generation:, invoice:, operation_id:,
+               actor: described_class::Actor.service(name: "invoices", company_id: other_company.id,
+                                                     operations: ["reservations.commit"])
     )
 
     expect(outcome.status).to eq(404)
@@ -702,127 +621,39 @@ RSpec.describe Timekeeping::LocalOwner, "foreign entry ids in prepare" do
   # come back as the decision's not_found reason, never as a conflict."
   it "a prepare naming another company's reserved entry reports it as not_found, never as held on another invoice, and changes nothing" do
     generation = prepare_local_ownership!.generation.to_s
-    company_a = create(:company)
-    company_b = create(:company)
-    owner_a = timekeeping_member(company_a, "owner")
-    project_a = create(:project, client: create(:client, company: company_a))
-    invoice_a = create(:invoice, company: company_a, client: project_a.client)
-    foreign_entry = Timekeeping::LocalEntry.create!(company_id: company_a.id, user_id: owner_a.id,
-                                                    project_id: project_a.id, work_date: Date.current,
-                                                    duration: 30.0, note: "a", bill_status: "unbilled")
-    reserved = described_class.call(
-      operation: :prepare, company_id: company_a.id, generation:,
-      actor: described_class::Actor.service(name: "invoices", company_id: company_a.id,
-                                            operations: ["reservations.prepare"]),
-      params: { "invoice_id" => invoice_a.id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                "entry_ids" => [foreign_entry.id] }
+    seeded_invoice_entry => { company: company_a, invoice: invoice_a, entry: foreign_entry }
+    reserved = reservation_call(
+      :prepare, company: company_a, generation:, invoice: invoice_a, operation_id: SecureRandom.uuid,
+                entry_ids: [foreign_entry.id],
+                actor: described_class::Actor.service(name: "invoices", company_id: company_a.id,
+                                                      operations: ["reservations.prepare"])
     )
     expect(reserved.status).to eq(200)
+    company_b = create(:company)
     project_b = create(:project, client: create(:client, company: company_b))
     invoice_b = create(:invoice, company: company_b, client: project_b.client)
     baseline = timekeeping_row_counts
-    version_before = foreign_entry.reload.version
+    foreign_before = foreign_entry.reload.attributes
 
-    outcome = described_class.call(
-      operation: :prepare, company_id: company_b.id, generation:,
-      actor: described_class::Actor.service(name: "invoices", company_id: company_b.id,
-                                            operations: ["reservations.prepare"]),
-      params: { "invoice_id" => invoice_b.id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                "entry_ids" => [foreign_entry.id] }
+    outcome = reservation_call(
+      :prepare, company: company_b, generation:, invoice: invoice_b, operation_id: SecureRandom.uuid,
+                entry_ids: [foreign_entry.id],
+                actor: described_class::Actor.service(name: "invoices", company_id: company_b.id,
+                                                      operations: ["reservations.prepare"])
     )
 
     expect(outcome.status).to be_between(400, 499)
     reasons = Array(outcome.body["conflicts"]).pluck("reason")
     expect(reasons).not_to include("on_another_invoice", "provisional_elsewhere")
+    expect(reasons - ["not_found"]).to be_empty
     expect([outcome.body["reason"], *reasons]).to include("not_found")
     expect(outcome.body.to_json).not_to include(invoice_a.id.to_s) if outcome.body["conflicts"].nil?
     expect(timekeeping_row_counts).to eq(baseline)
-    expect(foreign_entry.reload.version).to eq(version_before)
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner, "reservation prepare flips" do
-  # "Prepare flips locked from false to true; commit adds no version; abort flips it back to false only when no reservation remains"
-  it "prepare flips each unreserved entry to locked with exactly one version, audit row and outbox row" do
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entries = %w[first second].map do |note|
-      Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                      work_date: Date.current, duration: 30.0, note:, bill_status: "unbilled")
-    end
-    versions = entries.to_h { |entry| [entry.id, entry.reload.version] }
-    expect(Timekeeping::LocalEntry.with_reserved.where(id: entries.map(&:id)).map(&:reserved)).to all(be(false))
-    baseline = timekeeping_row_counts
-    actor = described_class::Actor.service(name: "invoices", company_id: company.id,
-                                           operations: ["reservations.prepare"])
-
-    outcome = described_class.call(
-      operation: :prepare, company_id: company.id, generation:, actor:,
-      params: { "invoice_id" => invoice.id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                "entry_ids" => entries.map(&:id) }
-    )
-
-    expect(outcome.status).to eq(200)
-    expect(outcome.body["state"]).to eq("prepared")
-    entries.each do |entry|
-      expect(entry.reload.version).to eq(versions.fetch(entry.id) + 1)
-      expect(Timekeeping::LocalEntry.with_reserved.find(entry.id).reserved).to be(true)
-    end
-    after = timekeeping_row_counts
-    expect(after["entry_audits"] - baseline["entry_audits"]).to eq(2)
-    expect(after["entry_outbox_items"] - baseline["entry_outbox_items"]).to eq(2)
-    expect(after["reservations"] - baseline["reservations"]).to eq(2)
-    expect(after["invoice_operations"] - baseline["invoice_operations"]).to eq(1)
-    expect(after["entries"]).to eq(baseline["entries"])
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner, "reservation commit of a provisional set" do
-  # "Committing a provisional reservation changes nothing visible, with no new version."
-  it "commit of a provisional set keeps the entry locked and writes no version, audit or outbox row but stores one service receipt" do
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
-    actor = described_class::Actor.service(name: "invoices", company_id: company.id,
-                                           operations: ["reservations.prepare", "reservations.commit"])
-    operation_id = SecureRandom.uuid
-    prepared = described_class.call(
-      operation: :prepare, company_id: company.id, generation:, actor:,
-      params: { "invoice_id" => invoice.id, "operation_id" => operation_id, "disposition" => "active",
-                "entry_ids" => [entry.id] }
-    )
-    expect(prepared.status).to eq(200)
-    version = entry.reload.version
-    baseline = timekeeping_row_counts
-
-    committed = described_class.call(
-      operation: :commit, company_id: company.id, generation:, actor:,
-      params: { "invoice_id" => invoice.id, "operation_id" => operation_id }
-    )
-
-    expect(committed.status).to eq(200)
-    expect(entry.reload.version).to eq(version)
-    expect(Timekeeping::LocalEntry.with_reserved.find(entry.id).reserved).to be(true)
-    after = timekeeping_row_counts
-    expect(after["entry_audits"]).to eq(baseline["entry_audits"])
-    expect(after["entry_outbox_items"]).to eq(baseline["entry_outbox_items"])
-    expect(after["reservations"]).to eq(baseline["reservations"])
-    expect(after["idempotency_records"]).to eq(baseline["idempotency_records"] + 1)
-    # "Service receipts are written with `actor_type "service"`, a nil `actor_id` and `actor_name` = service name."
-    receipt = ActiveRecord::Base.connection.select_one(
-      ActiveRecord::Base.sanitize_sql_array(
-        ["SELECT actor_type, actor_id, actor_name FROM idempotency_records WHERE company_id = ? AND key = ?",
-         company.id, operation_id]
-      )
-    )
-    expect(receipt).to eq("actor_type" => "service", "actor_id" => nil, "actor_name" => "invoices")
+    # Equal totals would also hide company A's reservation moving to company B.
+    expect(ActiveRecord::Base.connection.select_value(
+      "SELECT COUNT(*) FROM reservations WHERE company_id = #{company_b.id}"
+    ).to_i).to eq(0)
+    expect(foreign_entry.reload.attributes).to eq(foreign_before)
   end
 end
 
@@ -830,32 +661,25 @@ RSpec.describe Timekeeping::LocalOwner, "reservation commit releasing a dropped 
   # "A commit that releases an entry's last reservation unlocks it with exactly one version, audit and outbox row"
   it "a commit with no entries in its body releases the entry the stored desired set dropped with exactly one version, audit and outbox row" do
     generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    kept, dropped = %w[kept dropped].map do |note|
-      Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                      work_date: Date.current, duration: 30.0, note:, bill_status: "unbilled")
-    end
+    seeded_invoice_entry => { company:, project:, invoice:, entry: kept }
+    dropped = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: kept.user_id, project_id: project.id,
+                                              work_date: Date.current, duration: 30.0, note: "dropped",
+                                              bill_status: "unbilled")
     actor = described_class::Actor.service(name: "invoices", company_id: company.id,
                                            operations: ["reservations.prepare", "reservations.commit"])
-    run = lambda do |operation, params|
-      described_class.call(operation:, company_id: company.id, generation:, actor:, params:)
-    end
     first = SecureRandom.uuid
-    expect(run.call(:prepare, { "invoice_id" => invoice.id, "operation_id" => first, "disposition" => "active",
-                                "entry_ids" => [kept.id, dropped.id] }).status).to eq(200)
-    expect(run.call(:commit, { "invoice_id" => invoice.id, "operation_id" => first }).status).to eq(200)
+    expect(reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id: first,
+                                      entry_ids: [kept.id, dropped.id]).status).to eq(200)
+    expect(reservation_call(:commit, company:, generation:, actor:, invoice:, operation_id: first).status).to eq(200)
     second = SecureRandom.uuid
-    expect(run.call(:prepare, { "invoice_id" => invoice.id, "operation_id" => second, "disposition" => "active",
-                                "entry_ids" => [kept.id] }).status).to eq(200)
+    expect(reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id: second,
+                                      entry_ids: [kept.id]).status).to eq(200)
     kept_version = kept.reload.version
     dropped_version = dropped.reload.version
     expect(Timekeeping::LocalEntry.with_reserved.find(dropped.id).reserved).to be(true)
     baseline = timekeeping_row_counts
 
-    outcome = run.call(:commit, { "invoice_id" => invoice.id, "operation_id" => second })
+    outcome = reservation_call(:commit, company:, generation:, actor:, invoice:, operation_id: second)
 
     expect(outcome.status).to eq(200)
     expect(Timekeeping::LocalEntry.with_reserved.find(dropped.id).reserved).to be(false)
@@ -874,49 +698,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservation commit releasing a dropped 
   end
 end
 
-RSpec.describe Timekeeping::LocalOwner, "reservation abort" do
-  # "Abort flips the flag back to false only when no reservation is left."
-  it "abort of invoice B on an entry invoice A still holds keeps it locked and writes no version, audit or outbox row, while an abort leaving no reservation unlocks it" do
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice_a = create(:invoice, company:, client: project.client)
-    invoice_b = create(:invoice, company:, client: project.client)
-    held = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                           work_date: Date.current, duration: 30.0, note: "held", bill_status: "unbilled")
-    free = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                           work_date: Date.current, duration: 30.0, note: "free", bill_status: "unbilled")
-    actor = described_class::Actor.service(
-      name: "invoices", company_id: company.id,
-      operations: ["reservations.prepare", "reservations.commit", "reservations.abort"]
-    )
-    run = lambda do |operation, params|
-      described_class.call(operation:, company_id: company.id, generation:, actor:, params:)
-    end
-    op_a = SecureRandom.uuid
-    expect(run.call(:prepare, { "invoice_id" => invoice_a.id, "operation_id" => op_a, "disposition" => "active",
-                                "entry_ids" => [held.id] }).status).to eq(200)
-    expect(run.call(:commit, { "invoice_id" => invoice_a.id, "operation_id" => op_a }).status).to eq(200)
-    op_b = SecureRandom.uuid
-    expect(run.call(:prepare, { "invoice_id" => invoice_b.id, "operation_id" => op_b, "disposition" => "active",
-                                "entry_ids" => [free.id] }).status).to eq(200)
-    held_version = held.reload.version
-    free_version = free.reload.version
-    baseline = timekeeping_row_counts
-
-    expect(run.call(:abort, { "invoice_id" => invoice_b.id, "operation_id" => op_b }).status).to eq(200)
-
-    expect(Timekeeping::LocalEntry.with_reserved.find(held.id).reserved).to be(true)
-    expect(held.reload.version).to eq(held_version)
-    expect(Timekeeping::LocalEntry.with_reserved.find(free.id).reserved).to be(false)
-    expect(free.reload.version).to eq(free_version + 1)
-    after = timekeeping_row_counts
-    expect(after["entry_audits"] - baseline["entry_audits"]).to eq(1)
-    expect(after["entry_outbox_items"] - baseline["entry_outbox_items"]).to eq(1)
-  end
-end
-
 RSpec.describe Timekeeping::LocalOwner, "reservation status map" do
   # "Add `reservations.yml` errors to the status map (conflict 409, unresolved_operation 409, unpublishable_entry 422)."
   it "STATUS maps the reservation errors and keeps the entry errors" do
@@ -928,312 +709,38 @@ RSpec.describe Timekeeping::LocalOwner, "reservation status map" do
   end
 end
 
-RSpec.describe Timekeeping::LocalOwner::ServiceAccess, "route operations" do
-  # "A grant for one route never admits another. A spec pins the map."
-  it "ServiceAccess pins the route to qualified operation map and admits each grant only for its own route" do
-    map = described_class::ROUTE_OPERATIONS
-    expect(map).to eq(
-      prepare: "reservations.prepare", commit: "reservations.commit", abort: "reservations.abort",
-      mark_billed: "invoices.mark_billed", detach_entries: Timekeeping::ServiceToken::DETACH_ENTRIES
-    )
-    expect(Timekeeping::ServiceToken::DETACH_ENTRIES).to eq("agents.detach_entries")
-    company_id = 7
-    map.each do |granted_route, granted_name|
-      actor = Timekeeping::LocalOwner::Actor.service(name: "svc", company_id:, operations: [granted_name])
-      map.each_key do |route|
-        expected = route == granted_route ? :ok : :forbidden
-        expect(described_class.call(actor:, operation: route, company_id:)).to eq(expected),
-          "grant #{granted_name} on route #{route}"
-      end
-    end
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner, "reservation access refusals" do
-  # "A nil actor answers `unauthorized`. A user actor, or a service without the operation, answers `forbidden`. A service bound to another company answers `not_found`."
-  it "prepare from a nil actor, a user, a service without reservations.prepare and another company's service answers 401, 403, 403 and 404 with nothing changed" do
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    other_company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
-    version = entry.reload.version
-    baseline = timekeeping_row_counts
-    cases = [
-      [nil, 401, "unauthorized"],
-      [described_class::Actor.user(user_id: owner.id, role: "owner"), 403, "forbidden"],
-      [described_class::Actor.service(name: "invoices", company_id: company.id,
-                                      operations: ["reservations.commit", "entries.import"]), 403, "forbidden"],
-      [described_class::Actor.service(name: "invoices", company_id: other_company.id,
-                                      operations: ["reservations.prepare"]), 404, "not_found"]
-    ]
-
-    cases.each do |actor, status, reason|
-      steps = []
-      outcome = described_class.call(
-        operation: :prepare, company_id: company.id, generation:, actor:,
-        params: { "invoice_id" => invoice.id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                  "entry_ids" => [entry.id] },
-        checkpoint: ->(step) { steps << step }
-      )
-      expect(outcome.status).to eq(status)
-      expect(outcome.body).to eq("reason" => reason)
-      expect(steps).not_to include(:operation_key_locked)
-    end
-    expect(timekeeping_row_counts).to eq(baseline)
-    expect(baseline.keys).to include("reservations", "invoice_operations")
-    expect(entry.reload.version).to eq(version)
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner, "reservations: stale prepare retry" do
-  it "a prepare retried at a stale generation after its answer is stored answers 409 stale_generation and changes no count" do
-    tables = %w[entries entry_audits idempotency_records entry_outbox_items reservations invoice_operations]
-    ownership = prepare_local_ownership!
-    generation = ownership.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
-    actor = described_class::Actor.service(name: "invoices", company_id: company.id, operations: ["reservations.prepare"])
-    params = { "invoice_id" => invoice.id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-               "entry_ids" => [entry.id] }
-
-    first = described_class.call(operation: :prepare, company_id: company.id, generation:, actor:, params:)
-    expect(first.status).to eq(200)
-    # The stored answer must exist, or this retry cannot tell replay-first from check-first.
-    expect(ActiveRecord::Base.connection.select_value(
-      "SELECT COUNT(*) FROM invoice_operations WHERE company_id = #{company.id}"
-    ).to_i).to eq(1)
-
-    TimekeepingOwnership.current.update!(generation: ownership.generation + 1)
-    baseline = timekeeping_row_counts(tables)
-    version = entry.reload.version
-
-    # "The generation check comes before replay, so a stale generation always gets 409 and changes nothing."
-    retried = described_class.call(operation: :prepare, company_id: company.id, generation:, actor:, params:)
-
-    expect(retried.status).to eq(409)
-    expect(retried.body).to eq("reason" => "stale_generation")
-    expect(timekeeping_row_counts(tables)).to eq(baseline)
-    expect(entry.reload.version).to eq(version)
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner, "reservations: stale commit retry" do
-  it "a commit retried at a stale generation after its receipt is stored answers 409 stale_generation and changes no count" do
-    tables = %w[entries entry_audits idempotency_records entry_outbox_items reservations invoice_operations]
-    ownership = prepare_local_ownership!
-    generation = ownership.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
-    actor = described_class::Actor.service(name: "invoices", company_id: company.id,
-                                           operations: ["reservations.prepare", "reservations.commit"])
-    operation_id = SecureRandom.uuid
-    prepared = described_class.call(
-      operation: :prepare, company_id: company.id, generation:, actor:,
-      params: { "invoice_id" => invoice.id, "operation_id" => operation_id, "disposition" => "active",
-                "entry_ids" => [entry.id] }
-    )
-    expect(prepared.status).to eq(200)
-    commit_params = { "invoice_id" => invoice.id, "operation_id" => operation_id }
-    committed = described_class.call(operation: :commit, company_id: company.id, generation:, actor:,
-                                     params: commit_params)
-    expect(committed.status).to eq(200)
-    expect(ActiveRecord::Base.connection.select_value(
-      "SELECT COUNT(*) FROM idempotency_records WHERE company_id = #{company.id} AND actor_type = 'service'"
-    ).to_i).to eq(1)
-
-    TimekeepingOwnership.current.update!(generation: ownership.generation + 1)
-    baseline = timekeeping_row_counts(tables)
-    version = entry.reload.version
-
-    # "The generation check comes before replay, so a stale generation always gets 409 and changes nothing."
-    retried = described_class.call(operation: :commit, company_id: company.id, generation:, actor:,
-                                   params: commit_params)
-
-    expect(retried.status).to eq(409)
-    expect(retried.body).to eq("reason" => "stale_generation")
-    expect(timekeeping_row_counts(tables)).to eq(baseline)
-    expect(entry.reload.version).to eq(version)
-  end
-end
-
 RSpec.describe Timekeeping::LocalOwner, "reservations: handoff in progress" do
   it "a prepare at the matching generation while handoff_step is set answers stale_generation and writes nothing" do
-    tables = %w[entries entry_audits idempotency_records entry_outbox_items reservations invoice_operations]
     ownership = prepare_local_ownership!
     generation = ownership.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
+    seeded_invoice_entry => { company:, invoice:, entry: }
     actor = described_class::Actor.service(name: "invoices", company_id: company.id, operations: ["reservations.prepare"])
     ownership.update_column(:handoff_step, "close_admission")
-    baseline = timekeeping_row_counts(tables)
+    baseline = timekeeping_row_counts
 
     # "It counts only when `Timekeeping::EntryOwner.for` returns `:prepared` and `handoff_step` is nil."
-    outcome = described_class.call(
-      operation: :prepare, company_id: company.id, generation:, actor:,
-      params: { "invoice_id" => invoice.id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                "entry_ids" => [entry.id] }
-    )
+    outcome = reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id: SecureRandom.uuid,
+                                         entry_ids: [entry.id])
 
     expect(outcome.status).to eq(409)
     expect(outcome.body).to eq("reason" => "stale_generation")
-    expect(timekeeping_row_counts(tables)).to eq(baseline)
+    expect(timekeeping_row_counts).to eq(baseline)
     expect(entry.reload.version).to eq(1)
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner, "reservations: injected failure" do
-  it "a prepare failing at reservations_written or outbox_written leaves no reservation, operation, outbox row or receipt and no version change" do
-    tables = %w[entries entry_audits idempotency_records entry_outbox_items reservations invoice_operations]
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
-    actor = described_class::Actor.service(name: "invoices", company_id: company.id, operations: ["reservations.prepare"])
-    baseline = timekeeping_row_counts(tables)
-    injected = Class.new(StandardError)
-
-    # "A failure injected after the reservation write leaves no reservation, operation, outbox row or receipt"
-    %i[reservations_written outbox_written].each do |step_name|
-      expect(described_class::STEPS).to include(step_name)
-      seen = []
-      expect {
-        described_class.call(
-          operation: :prepare, company_id: company.id, generation:, actor:,
-          params: { "invoice_id" => invoice.id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                    "entry_ids" => [entry.id] },
-          checkpoint: lambda { |step|
-            seen << step
-            raise injected if step == step_name
-          }
-        )
-      }.to raise_error(injected)
-
-      expect(seen.last).to eq(step_name)
-      expect(timekeeping_row_counts(tables)).to eq(baseline)
-      expect(entry.reload.version).to eq(1)
-    end
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner, "reservations: one operation_id, two services" do
-  it "the same operation_id from a second service on another invoice gets its own operation row, never the first service's stored answer" do
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    first_invoice = create(:invoice, company:, client: project.client)
-    second_invoice = create(:invoice, company:, client: project.client)
-    first_entry, second_entry = %w[a b].map do |note|
-      Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                      work_date: Date.current, duration: 30.0, note:, bill_status: "unbilled")
-    end
-    operation_id = SecureRandom.uuid
-    first_service = described_class::Actor.service(name: "invoices", company_id: company.id,
-                                                   operations: ["reservations.prepare"])
-    second_service = described_class::Actor.service(name: "agents", company_id: company.id,
-                                                    operations: ["reservations.prepare"])
-
-    first = described_class.call(
-      operation: :prepare, company_id: company.id, generation:, actor: first_service,
-      params: { "invoice_id" => first_invoice.id, "operation_id" => operation_id, "disposition" => "active",
-                "entry_ids" => [first_entry.id] }
-    )
-    # With a key missing the service name, this would replay the first answer or answer idempotency_key_reused.
-    second = described_class.call(
-      operation: :prepare, company_id: company.id, generation:, actor: second_service,
-      params: { "invoice_id" => second_invoice.id, "operation_id" => operation_id, "disposition" => "active",
-                "entry_ids" => [second_entry.id] }
-    )
-
-    # "The same operation_id from two services, or from two companies, gives separate operation rows and receipts."
-    expect(first.status).to eq(200)
-    expect(second.status).to eq(200)
-    rows = ActiveRecord::Base.connection.select_rows(
-      "SELECT actor_name, invoice_id FROM invoice_operations " \
-      "WHERE company_id = #{company.id} AND operation_id = #{ActiveRecord::Base.connection.quote(operation_id)} " \
-      "ORDER BY actor_name"
-    )
-    expect(rows).to eq([["agents", second_invoice.id], ["invoices", first_invoice.id]])
-    expect(second_entry.reload.version).to eq(2)
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner, "reservations: one operation_id, two companies" do
-  it "the same operation_id and service name from two companies give two operation rows and two service receipts" do
-    generation = prepare_local_ownership!.generation.to_s
-    operation_id = SecureRandom.uuid
-    companies = Array.new(2) { create(:company) }
-
-    companies.each do |company|
-      owner = timekeeping_member(company, "owner")
-      project = create(:project, client: create(:client, company:))
-      invoice = create(:invoice, company:, client: project.client)
-      entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                              work_date: Date.current, duration: 30.0, note: "n",
-                                              bill_status: "unbilled")
-      actor = described_class::Actor.service(name: "invoices", company_id: company.id,
-                                             operations: ["reservations.prepare", "reservations.commit"])
-      prepared = described_class.call(
-        operation: :prepare, company_id: company.id, generation:, actor:,
-        params: { "invoice_id" => invoice.id, "operation_id" => operation_id, "disposition" => "active",
-                  "entry_ids" => [entry.id] }
-      )
-      committed = described_class.call(operation: :commit, company_id: company.id, generation:, actor:,
-                                       params: { "invoice_id" => invoice.id, "operation_id" => operation_id })
-      expect([prepared.status, committed.status]).to eq([200, 200])
-    end
-
-    connection = ActiveRecord::Base.connection
-    quoted = connection.quote(operation_id)
-    # "The same operation_id from two services, or from two companies, gives separate operation rows and receipts."
-    expect(connection.select_values(
-      "SELECT company_id FROM invoice_operations WHERE operation_id = #{quoted} ORDER BY company_id"
-    )).to eq(companies.map(&:id).sort)
-    receipts = connection.select_rows(
-      "SELECT company_id, actor_type, actor_id, actor_name FROM idempotency_records " \
-      "WHERE key = #{quoted} ORDER BY company_id"
-    )
-    expect(receipts).to eq(companies.map(&:id).sort.map { |id| [id, "service", nil, "invoices"] })
   end
 end
 
 RSpec.describe Timekeeping::LocalOwner, "reservations: refused callers and stored answers" do
   it "refused callers reusing a stored operation_id get only their refusal, take no lock and change nothing" do
-    tables = %w[entries entry_audits idempotency_records entry_outbox_items reservations invoice_operations]
     generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
+    seeded_invoice_entry => { company:, owner:, invoice:, entry: }
     other_company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
-    params = { "invoice_id" => invoice.id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-               "entry_ids" => [entry.id] }
+    operation_id = SecureRandom.uuid
     granted = described_class::Actor.service(name: "invoices", company_id: company.id,
                                              operations: ["reservations.prepare"])
-    stored = described_class.call(operation: :prepare, company_id: company.id, generation:, actor: granted, params:)
+    stored = reservation_call(:prepare, company:, generation:, actor: granted, invoice:, operation_id:,
+                                        entry_ids: [entry.id])
     expect(stored.status).to eq(200)
-    baseline = timekeeping_row_counts(tables)
+    baseline = timekeeping_row_counts
     version = entry.reload.version
 
     # "A nil actor answers `unauthorized`. A user actor, or a service without the operation, answers `forbidden`.
@@ -1249,69 +756,25 @@ RSpec.describe Timekeeping::LocalOwner, "reservations: refused callers and store
     }
     refused.each do |actor, status|
       steps = []
-      outcome = described_class.call(operation: :prepare, company_id: company.id, generation:, actor:, params:,
-                                     checkpoint: ->(step) { steps << step })
+      outcome = reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id:,
+                                           entry_ids: [entry.id], checkpoint: ->(step) { steps << step })
 
       expect(outcome.status).to eq(status)
       expect(outcome.body.keys).to eq(["reason"])
       # "applied before any lock or read"
       expect(steps).not_to include(:operation_key_locked)
-      expect(timekeeping_row_counts(tables)).to eq(baseline)
+      expect(timekeeping_row_counts).to eq(baseline)
       expect(entry.reload.version).to eq(version)
     end
   end
 end
 
-RSpec.describe Timekeeping::LocalOwner, "reservations: commit delivered twice" do
-  it "a commit delivered twice adds no version, audit or outbox row the second time and stores one receipt" do
-    tables = %w[entries entry_audits idempotency_records entry_outbox_items reservations invoice_operations]
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
-    actor = described_class::Actor.service(name: "invoices", company_id: company.id,
-                                           operations: ["reservations.prepare", "reservations.commit"])
-    operation_id = SecureRandom.uuid
-    described_class.call(
-      operation: :prepare, company_id: company.id, generation:, actor:,
-      params: { "invoice_id" => invoice.id, "operation_id" => operation_id, "disposition" => "active",
-                "entry_ids" => [entry.id] }
-    )
-    expect(entry.reload.version).to eq(2)
-    after_prepare = timekeeping_row_counts(tables)
-    commit_params = { "invoice_id" => invoice.id, "operation_id" => operation_id }
-
-    first = described_class.call(operation: :commit, company_id: company.id, generation:, actor:, params: commit_params)
-    after_first = timekeeping_row_counts(tables)
-    second = described_class.call(operation: :commit, company_id: company.id, generation:, actor:, params: commit_params)
-
-    # "Committing a provisional reservation changes nothing visible, with no new version."
-    expect(first.status).to eq(200)
-    expect(entry.reload.version).to eq(2)
-    expect(after_first).to eq(after_prepare.merge("idempotency_records" => after_prepare["idempotency_records"] + 1))
-    # The second delivery replays the stored receipt.
-    expect(second.status).to eq(first.status)
-    expect(second.body).to eq(first.body)
-    expect(timekeeping_row_counts(tables)).to eq(after_first)
-    expect(entry.reload.version).to eq(2)
-  end
-end
-
 RSpec.describe Timekeeping::LocalOwner, "reservations: queued ownership update", committed_data: true do
   it "with an ownership update queued behind a FOR SHARE holder, a prepare answers 409 stale_generation without waiting" do
-    tables = %w[entries entry_audits idempotency_records entry_outbox_items reservations invoice_operations]
     generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
+    seeded_invoice_entry => { company:, invoice:, entry: }
     actor = described_class::Actor.service(name: "invoices", company_id: company.id, operations: ["reservations.prepare"])
-    baseline = timekeeping_row_counts(tables)
+    baseline = timekeeping_row_counts
     holding = Queue.new
     release = Queue.new
     holder_pids = []
@@ -1338,11 +801,8 @@ RSpec.describe Timekeeping::LocalOwner, "reservations: queued ownership update",
       ApplicationRecord.transaction do
         ApplicationRecord.connection.execute("SET LOCAL statement_timeout = '2s'")
         # "With an ownership update queued, a reservation write answers 409 stale_generation without waiting"
-        outcome = described_class.call(
-          operation: :prepare, company_id: company.id, generation:, actor:,
-          params: { "invoice_id" => invoice.id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                    "entry_ids" => [entry.id] }
-        )
+        outcome = reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id: SecureRandom.uuid,
+                                             entry_ids: [entry.id])
       end
     ensure
       release << true
@@ -1352,94 +812,8 @@ RSpec.describe Timekeeping::LocalOwner, "reservations: queued ownership update",
 
     expect(outcome.status).to eq(409)
     expect(outcome.body).to eq("reason" => "stale_generation")
-    expect(timekeeping_row_counts(tables)).to eq(baseline)
-    expect(entry.reload.version).to eq(1)
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner, "reservations: foreign entry id" do
-  it "a prepare naming another company's reserved entry never reports it as a conflict and never touches it" do
-    generation = prepare_local_ownership!.generation.to_s
-    seeded = Array.new(2) do
-      company = create(:company)
-      owner = timekeeping_member(company, "owner")
-      project = create(:project, client: create(:client, company:))
-      invoice = create(:invoice, company:, client: project.client)
-      entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                              work_date: Date.current, duration: 30.0, note: "n",
-                                              bill_status: "unbilled")
-      actor = described_class::Actor.service(name: "invoices", company_id: company.id,
-                                             operations: ["reservations.prepare"])
-      { company:, invoice:, entry:, actor: }
-    end
-    mine, theirs = seeded
-    held = described_class.call(
-      operation: :prepare, company_id: theirs[:company].id, generation:, actor: theirs[:actor],
-      params: { "invoice_id" => theirs[:invoice].id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                "entry_ids" => [theirs[:entry].id] }
-    )
-    expect(held.status).to eq(200)
-    foreign_before = theirs[:entry].reload.attributes
-
-    outcome = described_class.call(
-      operation: :prepare, company_id: mine[:company].id, generation:, actor: mine[:actor],
-      params: { "invoice_id" => mine[:invoice].id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                "entry_ids" => [theirs[:entry].id] }
-    )
-
-    # "`current` holds only reservations on the company's kept, locked entries, so foreign or discarded ids come
-    # back as the decision's not_found reason, never as a conflict."
-    reasons = Array(outcome.body["conflicts"]).pluck("reason")
-    expect(reasons - ["not_found"]).to be_empty
-    expect(theirs[:entry].reload.attributes).to eq(foreign_before)
-    expect(ActiveRecord::Base.connection.select_value(
-      "SELECT COUNT(*) FROM reservations WHERE company_id = #{mine[:company].id}"
-    ).to_i).to eq(0)
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner, "abort retried after a generation change" do
-  it "an abort retried at a stale generation after its receipt is stored answers 409 stale_generation and changes no count" do
-    ownership = prepare_local_ownership!
-    generation = ownership.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
-    actor = Timekeeping::LocalOwner::Actor.service(
-      name: "invoices", company_id: company.id, operations: ["reservations.prepare", "reservations.abort"]
-    )
-    operation_id = SecureRandom.uuid
-    prepared = described_class.call(
-      operation: :prepare, company_id: company.id, generation:, actor:,
-      params: { "invoice_id" => invoice.id, "operation_id" => operation_id, "disposition" => "active",
-                "entry_ids" => [entry.id] }
-    )
-    expect(prepared.status).to be_between(200, 299)
-    abort_params = { "invoice_id" => invoice.id, "operation_id" => operation_id }
-    aborted = described_class.call(operation: :abort, company_id: company.id, generation:, actor:, params: abort_params)
-    expect(aborted.status).to be_between(200, 299)
-    # The stored answer must exist, or this retry could not tell replay-first from generation-first.
-    expect(ActiveRecord::Base.connection.select_value(
-      ActiveRecord::Base.sanitize_sql_array(
-        ["SELECT COUNT(*) FROM idempotency_records WHERE company_id = ? AND actor_type = 'service' AND key = ?",
-         company.id, operation_id]
-      )
-    ).to_i).to eq(1)
-
-    ownership.reload.update_columns(generation: ownership.generation + 1)
-    baseline = timekeeping_row_counts
-    version = entry.reload.version
-
-    # "A stale body generation on prepare, commit or abort gives 409 stale_generation and writes nothing, including a retry whose earlier answer is stored"
-    retried = described_class.call(operation: :abort, company_id: company.id, generation:, actor:, params: abort_params)
-
-    expect(retried.status).to eq(409)
-    expect(retried.body).to eq("reason" => "stale_generation")
     expect(timekeeping_row_counts).to eq(baseline)
-    expect(entry.reload.version).to eq(version)
+    expect(entry.reload.version).to eq(1)
   end
 end
 
@@ -1447,12 +821,7 @@ RSpec.describe Timekeeping::LocalOwner, "operation insert collision", committed_
   it "a prepare whose operation insert collides with a row another connection committed runs once more and replays it without a second flip" do
     ownership = prepare_local_ownership!
     generation = ownership.generation
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
+    seeded_invoice_entry => { company:, invoice:, entry: }
     actor = Timekeeping::LocalOwner::Actor.service(
       name: "invoices", company_id: company.id, operations: ["reservations.prepare"]
     )
@@ -1475,11 +844,8 @@ RSpec.describe Timekeeping::LocalOwner, "operation insert collision", committed_
     end
 
     # "A unique violation on either insert rolls back the attempt and runs it once more, as the existing `ReceiptTaken` backstop does."
-    outcome = described_class.call(
-      operation: :prepare, company_id: company.id, generation: generation.to_s, actor:, checkpoint:,
-      params: { "invoice_id" => invoice.id, "operation_id" => operation_id, "disposition" => "active",
-                "entry_ids" => [entry.id] }
-    )
+    outcome = reservation_call(:prepare, company:, generation: generation.to_s, actor:, invoice:, operation_id:,
+                                         entry_ids: [entry.id], checkpoint:)
 
     expect(collided).to eq(1)
     expect(outcome.status).to be_between(200, 299)
@@ -1495,20 +861,11 @@ end
 RSpec.describe Timekeeping::LocalOwner, "reservation receipt insert collision", committed_data: true do
   it "a commit whose receipt insert collides with a receipt another connection committed runs once more and replays that receipt" do
     generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
+    seeded_invoice_entry => { company:, invoice:, entry: }
     actor = described_class::Actor.service(name: "invoices", company_id: company.id,
                                            operations: %w[reservations.prepare reservations.commit])
     operation_id = SecureRandom.uuid
-    prepared = described_class.call(
-      operation: :prepare, company_id: company.id, generation:, actor:,
-      params: { "invoice_id" => invoice.id, "operation_id" => operation_id, "disposition" => "active",
-                "entry_ids" => [entry.id] }
-    )
+    prepared = reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id:, entry_ids: [entry.id])
     expect(prepared.status).to eq(200)
     baseline = timekeeping_row_counts
     version = entry.reload.version
@@ -1530,8 +887,7 @@ RSpec.describe Timekeeping::LocalOwner, "reservation receipt insert collision", 
     end
 
     # "A unique violation on either insert rolls back the attempt and runs it once more"
-    outcome = described_class.call(operation: :commit, company_id: company.id, generation:, actor:, checkpoint:,
-                                   params: { "invoice_id" => invoice.id, "operation_id" => operation_id })
+    outcome = reservation_call(:commit, company:, generation:, actor:, invoice:, operation_id:, checkpoint:)
 
     expect(collided).to eq(1)
     expect(outcome.status).to eq(200)
@@ -1544,27 +900,17 @@ end
 RSpec.describe Timekeeping::LocalOwner, "reservation receipt collision on both attempts" do
   it "a receipt insert that collides on the retry as well raises and leaves every count and version as before" do
     generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
+    seeded_invoice_entry => { company:, invoice:, entry: }
     actor = described_class::Actor.service(name: "invoices", company_id: company.id,
                                            operations: %w[reservations.prepare reservations.commit])
     operation_id = SecureRandom.uuid
-    described_class.call(
-      operation: :prepare, company_id: company.id, generation:, actor:,
-      params: { "invoice_id" => invoice.id, "operation_id" => operation_id, "disposition" => "active",
-                "entry_ids" => [entry.id] }
-    )
+    reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id:, entry_ids: [entry.id])
     baseline = timekeeping_row_counts
     version = entry.reload.version
     allow(described_class::Receipt).to receive(:create!).and_raise(ActiveRecord::RecordNotUnique, "duplicate key")
 
     expect {
-      described_class.call(operation: :commit, company_id: company.id, generation:, actor:,
-                           params: { "invoice_id" => invoice.id, "operation_id" => operation_id })
+      reservation_call(:commit, company:, generation:, actor:, invoice:, operation_id:)
     }.to raise_error(described_class::ReceiptTaken)
 
     # One first attempt and exactly one retry.
@@ -1577,13 +923,8 @@ end
 RSpec.describe Timekeeping::LocalOwner, "reservations written by the invoice coordinator" do
   it "prepare sees a provisional reservation Invoices::PreparedReservations wrote and refuses the entry as provisional_elsewhere" do
     ownership = prepare_local_ownership!
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice_a = create(:invoice, company:, client: project.client)
+    seeded_invoice_entry => { company:, project:, invoice: invoice_a, entry: }
     invoice_b = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
     coordinator = Invoices::PreparedReservations.new.prepare(Invoices::ReservationRequest.new(
       company_id: company.id, invoice_id: invoice_a.id, operation_id: SecureRandom.uuid,
       generation: ownership.generation, disposition: "active", entries: [entry.id]
@@ -1594,11 +935,8 @@ RSpec.describe Timekeeping::LocalOwner, "reservations written by the invoice coo
     actor = described_class::Actor.service(name: "invoices", company_id: company.id,
                                            operations: ["reservations.prepare"])
 
-    outcome = described_class.call(
-      operation: :prepare, company_id: company.id, generation: ownership.generation.to_s, actor:,
-      params: { "invoice_id" => invoice_b.id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                "entry_ids" => [entry.id] }
-    )
+    outcome = reservation_call(:prepare, company:, generation: ownership.generation.to_s, actor:, invoice: invoice_b,
+                                         operation_id: SecureRandom.uuid, entry_ids: [entry.id])
 
     expect(outcome.status).to eq(409)
     expect(outcome.body).to eq("reason" => "conflict",
@@ -1702,11 +1040,8 @@ RSpec.describe Timekeeping::LocalOwner, "reservation prepare beside another kept
     actor = described_class::Actor.service(name: "invoices", company_id: company.id,
                                            operations: ["reservations.prepare"])
 
-    outcome = described_class.call(
-      operation: :prepare, company_id: company.id, generation:, actor:,
-      params: { "invoice_id" => draft.id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                "entry_ids" => [direct.id, grouped.id] }
-    )
+    outcome = reservation_call(:prepare, company:, generation:, actor:, invoice: draft, operation_id: SecureRandom.uuid,
+                                         entry_ids: [direct.id, grouped.id])
 
     expect(outcome.status).to eq(409)
     expect(outcome.body["reason"]).to eq("conflict")
@@ -1738,11 +1073,8 @@ RSpec.describe Timekeeping::LocalOwner, "reservation prepare beside another kept
     actor = described_class::Actor.service(name: "invoices", company_id: company.id,
                                            operations: ["reservations.prepare"])
 
-    outcome = described_class.call(
-      operation: :prepare, company_id: company.id, generation:, actor:,
-      params: { "invoice_id" => restored.id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                "entry_ids" => [entry.id] }
-    )
+    outcome = reservation_call(:prepare, company:, generation:, actor:, invoice: restored,
+                                         operation_id: SecureRandom.uuid, entry_ids: [entry.id])
 
     expect(outcome.status).to eq(409)
     expect(outcome.body).to eq("reason" => "conflict",
