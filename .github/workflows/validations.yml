@@ -15,7 +15,7 @@ concurrency:
 jobs:
   tests:
     name: Running tests
-    runs-on: ubuntu-latest  # Standard 2-core runner
+    runs-on: ubuntu-24.04  # Standard 2-core runner
     timeout-minutes: 45
     permissions:
       contents: read
@@ -148,7 +148,7 @@ jobs:
 
   responsive-system-specs:
     name: Responsive system specs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
@@ -224,7 +224,7 @@ jobs:
   # passing run proves the gem does not depend on the app.
   timekeeping-rules:
     name: Timekeeping rules gem specs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -252,7 +252,7 @@ jobs:
   # the checkout must be the whole repository.
   timekeeping-relay:
     name: Timekeeping relay gem specs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -280,7 +280,7 @@ jobs:
   # shows the service needs no monolith database setting.
   timekeeping:
     name: Timekeeping service specs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
@@ -328,7 +328,7 @@ jobs:
   # task against its metrics endpoint. The spec starts and stops the server.
   timekeeping-alerts-live:
     name: Timekeeping alerts against a live service
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: read
@@ -384,7 +384,7 @@ jobs:
 
   security-audit:
     name: Security audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: read
