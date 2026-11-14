@@ -69,6 +69,8 @@ RSpec.describe Timekeeping::Handoff::Steps do
     expect(described_class.decide(aborted_once, direction: :re_cutover, abort: false, resume: true).kind).to eq(:refuse)
     expect(described_class.decide(handoff_state, direction: :re_cutover, abort: false, resume: true).kind).to eq(:refuse)
 
+    expect(described_class.decide(handoff_state(legacy_retired_at: retired), direction: :cutover, abort: false, resume: true).kind).to eq(:refuse)
+
     legacy_retired = handoff_state(generation: 3, legacy_retired_at: retired)
     expect(described_class.decide(legacy_retired, direction: :cutover, abort: false, resume: true).kind).to eq(:refuse)
     expect(described_class.decide(legacy_retired, direction: :re_cutover, abort: false, resume: true).kind).to eq(:start)
