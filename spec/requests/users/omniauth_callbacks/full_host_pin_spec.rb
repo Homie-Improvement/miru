@@ -2,14 +2,16 @@
 
 require "rails_helper"
 
-RSpec.describe "OmniAuth full host pin: spoofed Host on GitHub", type: :request do
+# Drives the OmniAuth request phase with forged headers against the host that
+# config/initializers/omniauth_full_host.rb pins at boot.
+RSpec.describe "OmniAuth full host pin", type: :request do
+  let(:app_base_url) { nil }
+
   around do |example|
     original_app_base_url = ENV["APP_BASE_URL"]
     original_full_host = OmniAuth.config.full_host
     original_forgery_protection = ActionController::Base.allow_forgery_protection
     ActionController::Base.allow_forgery_protection = false
-    ENV.delete("APP_BASE_URL")
-    load Rails.root.join("config/initializers/omniauth_full_host.rb").to_s
     example.run
   ensure
     ENV["APP_BASE_URL"] = original_app_base_url
@@ -17,72 +19,86 @@ RSpec.describe "OmniAuth full host pin: spoofed Host on GitHub", type: :request 
     ActionController::Base.allow_forgery_protection = original_forgery_protection
   end
 
-  before { OmniAuth.config.mock_auth[:github] = build(:github_user_data) }
+  before do
+    ENV["APP_BASE_URL"] = app_base_url
+    OmniAuth.config.mock_auth[:github] = build(:github_user_data)
+    OmniAuth.config.mock_auth[:google_oauth2] = build(:google_user_data)
+  end
 
-  # "OmniAuth's full_host is set from a required per-environment config value when APP_BASE_URL is unset, and a spec shows that a request with a spoofed Host header still builds its callback URL on the configured host."
-  it "builds the GitHub callback on the configured host when the Host header is spoofed and APP_BASE_URL is unset" do
+  def pin_full_host_at_boot
+    load Rails.root.join("config/initializers/omniauth_full_host.rb").to_s
+  end
+
+  def callback_url_without_query
+    callback = URI.parse(response.location)
+    "#{callback.scheme}://#{callback.host}#{callback.path}"
+  end
+
+  it "a spoofed Host header follows the request when unpinned but stays on the configured host once booted" do
+    # Control: without a pin the callback follows the forged header, so the
+    # pinned assertion below cannot pass just because the host is never read.
+    OmniAuth.config.full_host = nil
+    post "/users/auth/github", headers: { "Host" => "evil.example" }
+    expect(response).to have_http_status(:redirect)
+    expect(URI.parse(response.location).host).to eq("evil.example")
+
+    pin_full_host_at_boot
     post "/users/auth/github", headers: { "Host" => "evil.example" }
 
     expect(response).to have_http_status(:redirect)
-    callback = URI.parse(response.location)
-    expect(callback.host).to eq("example.com")
-    expect(callback.host).not_to eq("evil.example")
-    expect("#{callback.scheme}://#{callback.host}#{callback.path}").to eq("http://example.com/users/auth/github/callback")
-  end
-end
-
-RSpec.describe "OmniAuth full host pin: forged forwarding headers", type: :request do
-  around do |example|
-    original_app_base_url = ENV["APP_BASE_URL"]
-    original_full_host = OmniAuth.config.full_host
-    original_forgery_protection = ActionController::Base.allow_forgery_protection
-    ActionController::Base.allow_forgery_protection = false
-    ENV.delete("APP_BASE_URL")
-    load Rails.root.join("config/initializers/omniauth_full_host.rb").to_s
-    example.run
-  ensure
-    ENV["APP_BASE_URL"] = original_app_base_url
-    OmniAuth.config.full_host = original_full_host
-    ActionController::Base.allow_forgery_protection = original_forgery_protection
+    expect(callback_url_without_query).to eq("http://example.com/users/auth/github/callback")
   end
 
-  before { OmniAuth.config.mock_auth[:github] = build(:github_user_data) }
-
-  # The forwarding headers are as untrusted as Host: OmniAuth's own fallback reads them,
-  # so a pin that only covered Host would still let an attacker steer the callback.
+  # OmniAuth's own fallback also reads the forwarding headers, so a pin that only
+  # covered Host would still let an attacker steer the callback.
   it "ignores forged X-Forwarded-Host and X-Forwarded-Proto when building the GitHub callback" do
+    pin_full_host_at_boot
+
     post "/users/auth/github",
       headers: { "X-Forwarded-Host" => "evil.example", "X-Forwarded-Proto" => "https" }
 
     expect(response).to have_http_status(:redirect)
-    callback = URI.parse(response.location)
-    expect("#{callback.scheme}://#{callback.host}#{callback.path}").to eq("http://example.com/users/auth/github/callback")
-  end
-end
-
-RSpec.describe "OmniAuth full host pin: spoofed Host on Google", type: :request do
-  around do |example|
-    original_app_base_url = ENV["APP_BASE_URL"]
-    original_full_host = OmniAuth.config.full_host
-    original_forgery_protection = ActionController::Base.allow_forgery_protection
-    ActionController::Base.allow_forgery_protection = false
-    ENV.delete("APP_BASE_URL")
-    load Rails.root.join("config/initializers/omniauth_full_host.rb").to_s
-    example.run
-  ensure
-    ENV["APP_BASE_URL"] = original_app_base_url
-    OmniAuth.config.full_host = original_full_host
-    ActionController::Base.allow_forgery_protection = original_forgery_protection
+    expect(callback_url_without_query).to eq("http://example.com/users/auth/github/callback")
   end
 
-  before { OmniAuth.config.mock_auth[:google_oauth2] = build(:google_user_data) }
+  it "keeps the GitHub callback on the configured host when Host and X-Forwarded-* headers are forged and APP_BASE_URL is unset" do
+    pin_full_host_at_boot
 
-  # "OmniAuth's full_host is set from a required per-environment config value when APP_BASE_URL is unset, and a spec shows that a request with a spoofed Host header still builds its callback URL on the configured host."
-  it "builds the Google callback on the configured host when the Host header is spoofed and APP_BASE_URL is unset" do
-    post "/users/auth/google_oauth2", headers: { "Host" => "evil.example" }
+    post "/users/auth/github",
+      headers: {
+        "Host" => "evil.example",
+        "X-Forwarded-Host" => "evil.example",
+        "X-Forwarded-Proto" => "https",
+        "X-Forwarded-Port" => "8443"
+      }
 
     expect(response).to have_http_status(:redirect)
     callback = URI.parse(response.location)
-    expect("#{callback.scheme}://#{callback.host}#{callback.path}").to eq("http://example.com/users/auth/google_oauth2/callback")
+    expect(callback.scheme).to eq("http")
+    expect(callback.host).to eq("example.com")
+    expect(callback.port).to eq(80)
+    expect(callback.path).to eq("/users/auth/github/callback")
+  end
+
+  it "builds the Google callback on the configured host when the Host header is spoofed and APP_BASE_URL is unset" do
+    pin_full_host_at_boot
+
+    post "/users/auth/google_oauth2", headers: { "Host" => "evil.example" }
+
+    expect(response).to have_http_status(:redirect)
+    expect(callback_url_without_query).to eq("http://example.com/users/auth/google_oauth2/callback")
+  end
+
+  context "with APP_BASE_URL set" do
+    let(:app_base_url) { "https://app.miru.so" }
+
+    it "a set APP_BASE_URL still wins over the environment default and a spoofed Host" do
+      pin_full_host_at_boot
+
+      post "/users/auth/github", headers: { "Host" => "evil.example" }
+
+      expect(response).to have_http_status(:redirect)
+      expect(response.location).to start_with("https://app.miru.so/users/auth/github/callback")
+    end
   end
 end
