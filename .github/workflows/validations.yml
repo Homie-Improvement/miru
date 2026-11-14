@@ -15,8 +15,7 @@ concurrency:
 jobs:
   tests:
     name: Running tests
-    # Pinned: ruby-builder publishes no Ruby 4.0.1 build for ubuntu-26.04,
-    # which ubuntu-latest now resolves to.
+    # Pinned: ubuntu-latest now resolves to ubuntu-26.04, which has no prebuilt Ruby 4.0.1 for setup-ruby.
     runs-on: ubuntu-24.04  # Standard 2-core runner
     timeout-minutes: 45
     permissions:
