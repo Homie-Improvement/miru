@@ -675,16 +675,15 @@ RSpec.describe Timekeeping::LocalOwner, "agent lock and detach marker on the ent
   end
 
   it "answers a malformed body agent_id with the existing invalid_request refusal and takes no agent lock" do
-    [[1], {}, "abc"].each_with_index do |agent_id, index|
-      held = nil
-      checkpoint = ->(step) { held = agent_lock_held_by_this_session? if step == :receipt_key_locked }
+    allow(described_class::ServiceCommands).to receive(:lock_agent).and_call_original
 
-      outcome = write_entry(:create, "malformed-agent-#{index}", create_body("agent_id" => agent_id), checkpoint:)
+    [[1], {}, "abc"].each_with_index do |agent_id, index|
+      outcome = write_entry(:create, "malformed-agent-#{index}", create_body("agent_id" => agent_id))
 
       expect(outcome.status).to eq(400)
       expect(outcome.body).to eq("reason" => "invalid_request")
-      expect(held).to be(false)
     end
+    expect(described_class::ServiceCommands).not_to have_received(:lock_agent)
     expect(Timekeeping::LocalEntry.where(company_id: company.id)).to be_empty
   end
 

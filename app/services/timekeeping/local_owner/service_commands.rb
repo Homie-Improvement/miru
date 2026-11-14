@@ -97,8 +97,9 @@ module Timekeeping
         WriteSteps.lock_key(company_id, AGENT_LOCK, agent_id)
       end
 
-      # The target is part of the receipt's operation, as in the service, so
-      # one operation id used for two invoices or two agents is two commands.
+      # The target is part of the receipt's operation, as in the service. Here
+      # an operation id reused for another target is refused as
+      # idempotency_key_reused (see find_receipt).
       def self.operation_name(route, target_id)
         "#{route} #{target_id}"
       end

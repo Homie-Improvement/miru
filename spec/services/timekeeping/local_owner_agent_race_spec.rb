@@ -75,6 +75,12 @@ RSpec.describe Timekeeping::LocalOwner, "entry writes naming an agent against a 
     ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM #{table}").to_i
   end
 
+  # Joins each worker and kills one still running after the wait, so no open
+  # transaction outlives the example and blocks the committed-data reset.
+  def agent_race_stop(*threads)
+    threads.compact.each { |thread| thread.join(5) || thread.kill.join(5) }
+  end
+
   # The receipt is inserted before this pause and committed only after it,
   # so a fence read while the detach is paused would already count it as old.
   it "AE4: a create naming an agent waits on a detach whose receipt is inserted but uncommitted, then is refused not_found and writes nothing" do
@@ -106,7 +112,7 @@ RSpec.describe Timekeeping::LocalOwner, "entry writes naming an agent against a 
     expect(described_class::Receipt.where(actor_type: "user").count).to eq(0)
   ensure
     release&.push(true)
-    [detach, create_thread].compact.each { |thread| thread.join(5) }
+    agent_race_stop(detach, create_thread)
   end
 
   it "AE2: a create naming an agent paused before the agent lock is refused not_found after a detach of that agent commits" do
@@ -133,7 +139,7 @@ RSpec.describe Timekeeping::LocalOwner, "entry writes naming an agent against a 
     expect(described_class::Receipt.where(actor_type: "user").count).to eq(0)
   ensure
     release&.push(true)
-    create_thread&.join(5)
+    agent_race_stop(create_thread)
   end
 
   it "AE1: a detach waits on a create holding the agent lock and then detaches the committed entry" do
@@ -165,7 +171,7 @@ RSpec.describe Timekeeping::LocalOwner, "entry writes naming an agent against a 
     expect(described_class::AuditRow.where(entry_id: entry.id, action: "detach_entries").count).to eq(1)
   ensure
     release&.push(true)
-    [create_thread, detach].compact.each { |thread| thread.join(5) }
+    agent_race_stop(create_thread, detach)
   end
 
   it "update naming an agent in its body, paused before the agent lock, is refused not_found after a detach commits and the entry keeps no agent" do
@@ -192,7 +198,7 @@ RSpec.describe Timekeeping::LocalOwner, "entry writes naming an agent against a 
     expect(described_class::Receipt.where(actor_type: "user").count).to eq(0)
   ensure
     release&.push(true)
-    update_thread&.join(5)
+    agent_race_stop(update_thread)
   end
 
   it "an update naming the agent held before the agent lock while a detach of it commits is refused not_found and the row keeps agent_id nil" do
@@ -219,7 +225,7 @@ RSpec.describe Timekeeping::LocalOwner, "entry writes naming an agent against a 
     expect(described_class::Receipt.where(actor_type: "user").count).to eq(0)
   ensure
     release&.push(true)
-    update_thread&.join(5)
+    agent_race_stop(update_thread)
   end
 
   # The update pauses after its project check, before it locks the entry row,
@@ -253,7 +259,7 @@ RSpec.describe Timekeeping::LocalOwner, "entry writes naming an agent against a 
     expect(described_class::AuditRow.where(entry_id: entry.id, action: "detach_entries").count).to eq(1)
   ensure
     release&.push(true)
-    [update_thread, detach].compact.each { |thread| thread.join(5) }
+    agent_race_stop(update_thread, detach)
   end
 
   # Only a detach that commits after a write began refuses it: a detach that committed earlier, of an
@@ -285,11 +291,28 @@ RSpec.describe Timekeeping::LocalOwner, "entry writes naming an agent against a 
     expect(first.status).to eq(201)
     expect(first.body["agent_id"]).to eq(agent.id)
 
-    expect(agent_race_detach.status).to eq(200)
-    retried = agent_race_create("after-old-detach")
-    expect([retried.status, retried.body]).to eq([first.status, first.body])
+    # The retry has begun when the second detach commits, so that detach is
+    # newer than its marker: only replaying the receipt first answers 201.
+    entered = Queue.new
+    release = Queue.new
+    retry_thread = committed_data_thread do
+      agent_race_create("after-old-detach", checkpoint: agent_race_pause(:receipt_key_locked, entered, release))
+    end
+    expect(entered.pop(timeout: 5)).to be(true), "the retry never paused before taking the agent lock"
+    begin
+      second_detach = agent_race_detach
+    ensure
+      release << true
+    end
+
+    expect(second_detach.status).to eq(200)
+    retried = retry_thread.join(10)&.value
+    expect([retried&.status, retried&.body]).to eq([first.status, first.body])
     expect(Timekeeping::LocalEntry.where(company_id: company.id).count).to eq(1)
     expect(described_class::Receipt.where(actor_type: "user").count).to eq(1)
+  ensure
+    release&.push(true)
+    agent_race_stop(retry_thread)
   end
 
   # The detach marker is the receipt stored under the detaching company, so only
@@ -302,6 +325,7 @@ RSpec.describe Timekeeping::LocalOwner, "entry writes naming an agent against a 
       release = Queue.new
       checkpoint = agent_race_pause(:receipt_key_locked, entered, release)
       writer = committed_data_thread(Queue.new) { agent_race_create(key, checkpoint:) }
+      detach = nil
       begin
         expect(entered.pop(timeout: 5)).to be(true), "the create never paused before its agent lock"
         detach = committed_data_thread(Queue.new) { agent_race_detach(detaching_company) }
@@ -310,6 +334,8 @@ RSpec.describe Timekeeping::LocalOwner, "entry writes naming an agent against a 
         release << true
       end
       writer.join(10)&.value
+    ensure
+      agent_race_stop(writer, detach)
     end
 
     foreign = race.call("foreign-company-detach", other_company)
@@ -364,7 +390,7 @@ RSpec.describe Timekeeping::LocalOwner, "entry writes naming an agent against a 
     expect(Timekeeping::LocalEntry.where(company_id: company.id).count).to eq(0)
   ensure
     release_lock&.push(true)
-    [locker, create_thread, handoff].compact.each { |thread| thread.join(5) }
+    agent_race_stop(locker, create_thread, handoff)
   end
 
   # A create that never takes the lock lets a second session take the agent
@@ -395,6 +421,6 @@ RSpec.describe Timekeeping::LocalOwner, "entry writes naming an agent against a 
     expect(locker.join(5)).not_to be_nil
   ensure
     release&.push(true)
-    [writer, locker].compact.each { |thread| thread.join(5) }
+    agent_race_stop(writer, locker)
   end
 end
