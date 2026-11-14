@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner::ServiceAccess do
@@ -24,8 +26,6 @@ RSpec.describe Timekeeping::LocalOwner::ServiceAccess do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner::ServiceAccess do
   it "admits a route only with that route's own qualified grant held in the background operations" do
     routes = described_class::ROUTE_OPERATIONS
@@ -50,8 +50,6 @@ RSpec.describe Timekeeping::LocalOwner::ServiceAccess do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner::ServiceAccess do
   # "A spec pins the map."
   it "pins the route to qualified operation map" do
@@ -65,8 +63,6 @@ RSpec.describe Timekeeping::LocalOwner::ServiceAccess do
     expect(Timekeeping::ServiceToken::DETACH_ENTRIES).to eq("agents.detach_entries")
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner::ServiceAccess do
   it "no route's grant admits another route, a background name outside the route grants nothing, and an unbound service is never admitted" do

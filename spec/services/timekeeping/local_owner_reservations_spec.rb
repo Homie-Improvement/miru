@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "reservation access refusals" do
@@ -42,8 +44,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservation access refusals" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "refused callers and stored answers" do
   it "never replays a stored prepare or commit answer to a caller of the same operation_id that access refuses" do
     generation = prepare_local_ownership!.generation.to_s
@@ -84,12 +84,13 @@ RSpec.describe Timekeeping::LocalOwner, "refused callers and stored answers" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "reservation rollback at an injected failure" do
   def reservation_call(operation, company:, generation:, actor:, invoice:, operation_id:, entry_ids: nil, checkpoint: ->(_step) { })
     params = { "invoice_id" => invoice.id, "operation_id" => operation_id }
-    params.merge!("disposition" => "active", "entry_ids" => entry_ids) if operation == :prepare
+    if operation == :prepare
+      params["disposition"] = "active"
+      params["entry_ids"] = entry_ids
+    end
     described_class.call(operation:, company_id: company.id, generation:, actor:, params:, checkpoint:)
   end
 
@@ -134,12 +135,13 @@ RSpec.describe Timekeeping::LocalOwner, "reservation rollback at an injected fai
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "reservation retry at a stale generation" do
   def reservation_call(operation, company:, generation:, actor:, invoice:, operation_id:, entry_ids: nil)
     params = { "invoice_id" => invoice.id, "operation_id" => operation_id }
-    params.merge!("disposition" => "active", "entry_ids" => entry_ids) if operation == :prepare
+    if operation == :prepare
+      params["disposition"] = "active"
+      params["entry_ids"] = entry_ids
+    end
     described_class.call(operation:, company_id: company.id, generation:, actor:, params:)
   end
 
@@ -180,12 +182,13 @@ RSpec.describe Timekeeping::LocalOwner, "reservation retry at a stale generation
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "reservation replay at the stored generation" do
   def reservation_call(operation, company:, generation:, actor:, invoice:, operation_id:, entry_ids: nil)
     params = { "invoice_id" => invoice.id, "operation_id" => operation_id }
-    params.merge!("disposition" => "active", "entry_ids" => entry_ids) if operation == :prepare
+    if operation == :prepare
+      params["disposition"] = "active"
+      params["entry_ids"] = entry_ids
+    end
     described_class.call(operation:, company_id: company.id, generation:, actor:, params:)
   end
 
@@ -223,12 +226,13 @@ RSpec.describe Timekeeping::LocalOwner, "reservation replay at the stored genera
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "reservation lock flag flips" do
   def reservation_call(operation, company:, generation:, actor:, invoice:, operation_id:, entry_ids: nil)
     params = { "invoice_id" => invoice.id, "operation_id" => operation_id }
-    params.merge!("disposition" => "active", "entry_ids" => entry_ids) if operation == :prepare
+    if operation == :prepare
+      params["disposition"] = "active"
+      params["entry_ids"] = entry_ids
+    end
     described_class.call(operation:, company_id: company.id, generation:, actor:, params:)
   end
 
@@ -276,12 +280,13 @@ RSpec.describe Timekeeping::LocalOwner, "reservation lock flag flips" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "reservation abort beside another invoice's hold" do
   def reservation_call(operation, company:, generation:, actor:, invoice:, operation_id:, entry_ids: nil)
     params = { "invoice_id" => invoice.id, "operation_id" => operation_id }
-    params.merge!("disposition" => "active", "entry_ids" => entry_ids) if operation == :prepare
+    if operation == :prepare
+      params["disposition"] = "active"
+      params["entry_ids"] = entry_ids
+    end
     described_class.call(operation:, company_id: company.id, generation:, actor:, params:)
   end
 
@@ -360,12 +365,13 @@ RSpec.describe Timekeeping::LocalOwner, "reservation abort beside another invoic
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "reservation keys per service and company" do
   def reservation_call(operation, company:, generation:, actor:, invoice:, operation_id:, entry_ids: nil)
     params = { "invoice_id" => invoice.id, "operation_id" => operation_id }
-    params.merge!("disposition" => "active", "entry_ids" => entry_ids) if operation == :prepare
+    if operation == :prepare
+      params["disposition"] = "active"
+      params["entry_ids"] = entry_ids
+    end
     described_class.call(operation:, company_id: company.id, generation:, actor:, params:)
   end
 
@@ -418,8 +424,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservation keys per service and compan
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "reservation access refusals" do
   # "A nil actor answers `unauthorized`. A user actor, or a service without the operation, answers `forbidden`. A service bound to another company answers `not_found`."
   it "a nil actor, a user, a service without reservations.prepare and another company's service answer 401, 403, 403 and 404 with nothing changed" do
@@ -459,8 +463,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservation access refusals" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "unpublishable reservation flip" do
   it "a prepare that would flip an unpublishable entry answers 422 unpublishable_entry with its id and field and writes nothing" do
     generation = prepare_local_ownership!.generation.to_s
@@ -498,8 +500,6 @@ RSpec.describe Timekeeping::LocalOwner, "unpublishable reservation flip" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "reservation access across companies" do
   # "A service bound to another company answers `not_found`."
   it "a service bound to another company answers not_found on prepare, takes no lock and changes nothing" do
@@ -533,8 +533,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservation access across companies" do
     expect(entry.reload.version).to eq(version_before)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "reservation keys per company" do
   # "The same operation_id from two services, or from two companies, gives separate operation rows and receipts."
@@ -579,12 +577,10 @@ RSpec.describe Timekeeping::LocalOwner, "reservation keys per company" do
       )
     ).to_a
     expect(receipts.map { |row| row["company_id"].to_i }).to match_array(companies.map(&:id))
-    expect(receipts.map { |row| row["actor_id"] }).to all(be_nil)
-    expect(receipts.map { |row| row["actor_name"] }).to all(eq("invoices"))
+    expect(receipts.pluck("actor_id")).to all(be_nil)
+    expect(receipts.pluck("actor_name")).to all(eq("invoices"))
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "commit across companies" do
   # "Every local query filters by `company_id`." A commit in company B must not find company A's operation.
@@ -630,8 +626,6 @@ RSpec.describe Timekeeping::LocalOwner, "commit across companies" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "foreign entry ids in prepare" do
   # "`current` holds only reservations on the company's kept, locked entries, so foreign or discarded ids
   # come back as the decision's not_found reason, never as a conflict."
@@ -667,7 +661,7 @@ RSpec.describe Timekeeping::LocalOwner, "foreign entry ids in prepare" do
     )
 
     expect(outcome.status).to be_between(400, 499)
-    reasons = Array(outcome.body["conflicts"]).map { |conflict| conflict["reason"] }
+    reasons = Array(outcome.body["conflicts"]).pluck("reason")
     expect(reasons).not_to include("on_another_invoice", "provisional_elsewhere")
     expect([outcome.body["reason"], *reasons]).to include("not_found")
     expect(outcome.body.to_json).not_to include(invoice_a.id.to_s) if outcome.body["conflicts"].nil?
@@ -675,8 +669,6 @@ RSpec.describe Timekeeping::LocalOwner, "foreign entry ids in prepare" do
     expect(foreign_entry.reload.version).to eq(version_before)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "reservation prepare flips" do
   # "Prepare flips locked from false to true; commit adds no version; abort flips it back to false only when no reservation remains"
@@ -716,8 +708,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservation prepare flips" do
     expect(after["entries"]).to eq(baseline["entries"])
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "reservation commit of a provisional set" do
   # "Committing a provisional reservation changes nothing visible, with no new version."
@@ -764,8 +754,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservation commit of a provisional set
     expect(receipt).to eq("actor_type" => "service", "actor_id" => nil, "actor_name" => "invoices")
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "reservation commit releasing a dropped entry" do
   # "A commit that releases an entry's last reservation unlocks it with exactly one version, audit and outbox row"
@@ -815,8 +803,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservation commit releasing a dropped 
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "reservation abort" do
   # "Abort flips the flag back to false only when no reservation is left."
   it "abort of invoice B on an entry invoice A still holds keeps it locked and writes no version, audit or outbox row, while an abort leaving no reservation unlocks it" do
@@ -860,8 +846,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservation abort" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "reservation status map" do
   # "Add `reservations.yml` errors to the status map (conflict 409, unresolved_operation 409, unpublishable_entry 422)."
   it "STATUS maps the reservation errors and keeps the entry errors" do
@@ -872,8 +856,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservation status map" do
     )
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner::ServiceAccess, "route operations" do
   # "A grant for one route never admits another. A spec pins the map."
@@ -895,8 +877,6 @@ RSpec.describe Timekeeping::LocalOwner::ServiceAccess, "route operations" do
     end
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "reservation access refusals" do
   # "A nil actor answers `unauthorized`. A user actor, or a service without the operation, answers `forbidden`. A service bound to another company answers `not_found`."
@@ -938,8 +918,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservation access refusals" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "reservations: stale prepare retry" do
   it "a prepare retried at a stale generation after its answer is stored answers 409 stale_generation and changes no count" do
     tables = %w[entries entry_audits idempotency_records entry_outbox_items reservations invoice_operations]
@@ -975,8 +953,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservations: stale prepare retry" do
     expect(entry.reload.version).to eq(version)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "reservations: stale commit retry" do
   it "a commit retried at a stale generation after its receipt is stored answers 409 stale_generation and changes no count" do
@@ -1021,8 +997,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservations: stale commit retry" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "reservations: handoff in progress" do
   it "a prepare at the matching generation while handoff_step is set answers stale_generation and writes nothing" do
     tables = %w[entries entry_audits idempotency_records entry_outbox_items reservations invoice_operations]
@@ -1051,8 +1025,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservations: handoff in progress" do
     expect(entry.reload.version).to eq(1)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "reservations: injected failure" do
   it "a prepare failing at reservations_written or outbox_written leaves no reservation, operation, outbox row or receipt and no version change" do
@@ -1090,8 +1062,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservations: injected failure" do
     end
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "reservations: one operation_id, two services" do
   it "the same operation_id from a second service on another invoice gets its own operation row, never the first service's stored answer" do
@@ -1136,8 +1106,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservations: one operation_id, two ser
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "reservations: one operation_id, two companies" do
   it "the same operation_id and service name from two companies give two operation rows and two service receipts" do
     generation = prepare_local_ownership!.generation.to_s
@@ -1176,8 +1144,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservations: one operation_id, two com
     expect(receipts).to eq(companies.map(&:id).sort.map { |id| [id, "service", nil, "invoices"] })
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "reservations: refused callers and stored answers" do
   it "refused callers reusing a stored operation_id get only their refusal, take no lock and change nothing" do
@@ -1225,8 +1191,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservations: refused callers and store
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "reservations: commit delivered twice" do
   it "a commit delivered twice adds no version, audit or outbox row the second time and stores one receipt" do
     tables = %w[entries entry_audits idempotency_records entry_outbox_items reservations invoice_operations]
@@ -1264,8 +1228,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservations: commit delivered twice" d
     expect(entry.reload.version).to eq(2)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "reservations: queued ownership update", committed_data: true do
   it "with an ownership update queued behind a FOR SHARE holder, a prepare answers 409 stale_generation without waiting" do
@@ -1324,8 +1286,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservations: queued ownership update",
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "reservations: foreign entry id" do
   it "a prepare naming another company's reserved entry never reports it as a conflict and never touches it" do
     generation = prepare_local_ownership!.generation.to_s
@@ -1358,7 +1318,7 @@ RSpec.describe Timekeeping::LocalOwner, "reservations: foreign entry id" do
 
     # "`current` holds only reservations on the company's kept, locked entries, so foreign or discarded ids come
     # back as the decision's not_found reason, never as a conflict."
-    reasons = Array(outcome.body["conflicts"]).map { |conflict| conflict["reason"] }
+    reasons = Array(outcome.body["conflicts"]).pluck("reason")
     expect(reasons - ["not_found"]).to be_empty
     expect(theirs[:entry].reload.attributes).to eq(foreign_before)
     expect(ActiveRecord::Base.connection.select_value(
@@ -1366,8 +1326,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservations: foreign entry id" do
     ).to_i).to eq(0)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "abort retried after a generation change" do
   it "an abort retried at a stale generation after its receipt is stored answers 409 stale_generation and changes no count" do
@@ -1413,8 +1371,6 @@ RSpec.describe Timekeeping::LocalOwner, "abort retried after a generation change
     expect(entry.reload.version).to eq(version)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "operation insert collision", committed_data: true do
   it "a prepare whose operation insert collides with a row another connection committed runs once more and replays it without a second flip" do

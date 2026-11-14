@@ -113,8 +113,6 @@ RSpec.describe TimekeepingLocalOwnerSpecHelpers do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe TimekeepingLocalOwnerSpecHelpers do
   let(:company) { create(:company) }
   let(:project) { create(:project, client: create(:client, company:)) }
