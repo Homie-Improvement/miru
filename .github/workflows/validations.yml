@@ -18,7 +18,9 @@ jobs:
     # Pinned because ruby/setup-ruby has no Ruby 4.0.1 build for the
     # Ubuntu 26.04 image that ubuntu-latest now resolves to.
     runs-on: ubuntu-24.04  # Standard 2-core runner
-    timeout-minutes: 45
+    # Each Timekeeping handoff spec group reloads the two-tenant seed, so the
+    # process that draws those files runs far longer than the other.
+    timeout-minutes: 60
     permissions:
       contents: read
     if: github.event_name != 'push' || !contains(github.event.head_commit.message, 'skip ci')
