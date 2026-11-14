@@ -8,17 +8,15 @@ RSpec.describe Timekeeping::Handoff::Capabilities do
   let(:enforcing_admission) { TimekeepingHandoffFakes::RecordingAdmission.new }
   let(:non_enforcing_admission) { TimekeepingHandoffFakes::RecordingAdmission.new(enforces_fence: false) }
   # "Second, the outgoing owner has working settle and drain integrations configured."
-  let(:settle) { TimekeepingHandoffFakes::NoOpSettle.new }
-  # The support fakes have no drain on its own (TimekeepingHandoffFakeRelay needs a store), so this one stays local.
-  let(:drain) do
-    Class.new do
-      def drain!(through:) = through && nil
-      def drained?(through:) = through && true
-    end.new
+  let(:handoff_owners) do
+    TimekeepingHandoffFakes.owners(timekeeping: TimekeepingHandoffFakes::InMemoryTimekeepingStore.new, monolith_store: Object.new)
   end
+  let(:settle) { handoff_owners.fetch(:monolith).settle }
+  let(:drain) { handoff_owners.fetch(:monolith).drain }
 
-  def owner(name, admission:, settle: nil, drain: nil, store: Object.new)
-    Timekeeping::Handoff::Owner.new(name:, store:, admission:, settle:, drain:)
+  # Each case sets the admission, settle and drain it tests; anything it leaves out is absent.
+  def owner(name, admission:, settle: nil, drain: nil)
+    handoff_owners.fetch(name).with(admission:, settle:, drain:)
   end
 
   # "First, each owner has a configured admission adapter that enforces its fence: Timekeeping's is `Timekeeping::Admission`; the monolith's is the gateway of section 10.1, supplied when it exists."
@@ -57,7 +55,7 @@ RSpec.describe Timekeeping::Handoff::Capabilities do
   it "refuses a Timekeeping side without an enforcing admission adapter and accepts TimekeepingStore as one" do
     store = Timekeeping::Handoff::TimekeepingStore.new(base_url: "http://timekeeping.test", token: "token")
     monolith = owner(:monolith, admission: enforcing_admission)
-    unfenced = owner(:timekeeping, admission: nil, store:)
+    unfenced = owner(:timekeeping, admission: nil).with(store:)
 
     expect(store.enforces_fence?).to be(true)
     expect(described_class.new.refusal(source_legacy: true, outgoing: monolith, incoming: unfenced)).to include("timekeeping")

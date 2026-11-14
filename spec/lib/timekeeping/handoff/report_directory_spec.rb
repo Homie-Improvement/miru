@@ -23,6 +23,12 @@ RSpec.describe Timekeeping::Handoff::ReportDirectory do
 
       expect(writer.checkpoint?).to be(false)
       writer.write_money_before(money)
+
+      # With only the money file written, a fresh directory of the same generation reads it back,
+      # and a later generation refuses it.
+      expect(described_class.new(root:, generation: 2).read_money_before).to eq(money)
+      expect { described_class.new(root:, generation: 3).read_money_before }.to raise_error(described_class::Unreadable)
+
       writer.write_checkpoint(captured_at:, source_digest: "src-digest", loaded_digest: "load-digest", highest_entry_id: 907,
                               source_intents_digest: "intents-digest")
 
