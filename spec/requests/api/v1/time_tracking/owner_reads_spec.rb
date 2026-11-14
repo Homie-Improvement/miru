@@ -37,10 +37,14 @@ RSpec.describe "Owner-aware reads across owner states", type: :request do
     json_response.fetch("entry").fetch("id")
   end
 
+  # The fake numbers its entries from 1001, which the local timesheet_entries ids can also reach. Taking
+  # the id from the local sequence means no timesheet_entries row can share it, so a read that showed a
+  # local row in place of the owner's entry cannot pass by matching ids.
   def owner_reads_create_timekeeping_entry(note: "Timekeeping entry", **attributes)
     TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    id = ActiveRecord::Base.connection.select_value("SELECT nextval(pg_get_serial_sequence('timesheet_entries', 'id'))")
     fake_timekeeping.add_entry(company_id: company.id, user_id: user.id, project_id: project.id,
-                               work_date:, duration: 45.0, note:, **attributes).fetch("id")
+                               work_date:, duration: 45.0, note:, id:, **attributes).fetch("id")
   end
 
   def owner_reads_create_prepared_entry(entry_company: company, entry_project: project, note: "Prepared entry")
