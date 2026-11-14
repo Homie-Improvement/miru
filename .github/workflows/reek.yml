@@ -33,7 +33,9 @@ concurrency:
 jobs:
   code-smells:
     name: Code smells
-    runs-on: ubuntu-latest
+    # Pinned: ruby-builder publishes no Ruby 4.0.1 build for ubuntu-26.04,
+    # which ubuntu-latest now resolves to.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: read
