@@ -1580,3 +1580,138 @@ RSpec.describe Timekeeping::LocalOwner, "reservations written by the invoice coo
     expect(entry.reload.version).to eq(version)
   end
 end
+
+RSpec.describe Timekeeping::LocalOwner, "reservation refusals and terminal answers" do
+  # Statuses come from contracts/timekeeping/reservations.yml and idempotency.yml;
+  # the terminal bodies are the service's answers for a commit or abort the
+  # first terminal call already settled.
+  it "answers unresolved_operation, idempotency_key_reused, invalid_request and the terminal answers with nothing changed" do
+    generation = prepare_local_ownership!.generation.to_s
+    company = create(:company)
+    owner = timekeeping_member(company, "owner")
+    project = create(:project, client: create(:client, company:))
+    invoice = create(:invoice, company:, client: project.client)
+    other_invoice = create(:invoice, company:, client: project.client)
+    entries = %w[first second].map do |note|
+      Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
+                                      work_date: Date.current, duration: 30.0, note:, bill_status: "unbilled")
+    end
+    actor = described_class::Actor.service(
+      name: "invoices", company_id: company.id,
+      operations: ["reservations.prepare", "reservations.commit", "reservations.abort"]
+    )
+    run = lambda do |operation, params|
+      described_class.call(operation:, company_id: company.id, generation:, actor:, params:)
+    end
+    prepare_params = lambda do |target, operation_id, entry_ids|
+      { "invoice_id" => target.id, "operation_id" => operation_id, "disposition" => "active", "entry_ids" => entry_ids }
+    end
+    committed_op = SecureRandom.uuid
+    expect(run.call(:prepare, prepare_params.call(invoice, committed_op, [entries.first.id])).status).to eq(200)
+    expect(run.call(:commit, { "invoice_id" => invoice.id, "operation_id" => committed_op }).status).to eq(200)
+    aborted_op = SecureRandom.uuid
+    expect(run.call(:prepare, prepare_params.call(other_invoice, aborted_op, [entries.last.id])).status).to eq(200)
+    expect(run.call(:abort, { "invoice_id" => other_invoice.id, "operation_id" => aborted_op }).status).to eq(200)
+    open_op = SecureRandom.uuid
+    expect(run.call(:prepare, prepare_params.call(invoice, open_op, [entries.first.id])).status).to eq(200)
+
+    cases = [
+      [:prepare, prepare_params.call(invoice, SecureRandom.uuid, [entries.first.id]), 409,
+       { "reason" => "unresolved_operation", "operation_id" => open_op, "retryable" => true }],
+      [:prepare, prepare_params.call(invoice, open_op, [entries.last.id]), 422, { "reason" => "idempotency_key_reused" }],
+      [:commit, { "invoice_id" => other_invoice.id, "operation_id" => committed_op }, 422,
+       { "reason" => "idempotency_key_reused" }],
+      [:prepare, prepare_params.call(invoice, "not-a-uuid", [entries.first.id]), 400, { "reason" => "invalid_request" }],
+      [:prepare, prepare_params.call(invoice, SecureRandom.uuid, ["x"]), 400, { "reason" => "invalid_request" }],
+      [:commit, { "invoice_id" => other_invoice.id, "operation_id" => aborted_op }, 200,
+       { "reserved" => 0, "released" => 0 }],
+      [:abort, { "invoice_id" => invoice.id, "operation_id" => committed_op }, 200, { "dropped" => 0 }]
+    ]
+    baseline = timekeeping_row_counts
+    versions = entries.map { |entry| entry.reload.version }
+
+    cases.each do |operation, params, status, body|
+      outcome = run.call(operation, params)
+
+      expect([operation, outcome.status, outcome.body]).to eq([operation, status, body])
+      expect(entries.map { |entry| entry.reload.version }).to eq(versions)
+    end
+    # The terminal commit and abort store their receipts and change nothing else.
+    after = timekeeping_row_counts
+    expect(after.except("idempotency_records")).to eq(baseline.except("idempotency_records"))
+    expect(after["idempotency_records"]).to eq(baseline["idempotency_records"] + 2)
+  end
+end
+
+RSpec.describe Timekeeping::LocalOwner, "reservation prepare beside another kept invoice's line" do
+  # Lines are written before ownership moves to the prepared store, so no
+  # reservation row exists for them, as after a sent invoice's added lines
+  # pass admit.
+  it "refuses a prepare for entries a sent invoice claims only through a direct or grouped line, and writes nothing" do
+    company = create(:company)
+    client = create(:client, company:)
+    project = create(:project, client:, billable: true)
+    user = create(:user, current_workspace_id: company.id)
+    direct = create(:timesheet_entry, user:, project:, bill_status: "unbilled")
+    sent = create(:invoice, company:, client:, status: :sent)
+    line = create(:invoice_line_item, invoice: sent, timesheet_entry: direct, rate: 100, quantity: 60)
+    grouped = create(:invoice_line_item_time_entry, invoice_line_item: line).timesheet_entry
+    InvoiceEntryHolding.where(company_id: company.id, invoice_id: sent.id).delete_all
+    draft = create(:invoice, company:, client:, status: :draft)
+    [direct, grouped].each do |entry|
+      Timekeeping::LocalEntry.create!(id: entry.id, company_id: company.id, user_id: user.id, project_id: project.id,
+                                      work_date: Date.current, duration: 60.0, bill_status: "unbilled")
+    end
+    generation = prepare_local_ownership!.generation.to_s
+    baseline = timekeeping_row_counts
+    actor = described_class::Actor.service(name: "invoices", company_id: company.id,
+                                           operations: ["reservations.prepare"])
+
+    outcome = described_class.call(
+      operation: :prepare, company_id: company.id, generation:, actor:,
+      params: { "invoice_id" => draft.id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
+                "entry_ids" => [direct.id, grouped.id] }
+    )
+
+    expect(outcome.status).to eq(409)
+    expect(outcome.body["reason"]).to eq("conflict")
+    expect(outcome.body["conflicts"]).to contain_exactly(
+      { "entry_id" => direct.id, "reason" => "on_another_invoice" },
+      { "entry_id" => grouped.id, "reason" => "on_another_invoice" }
+    )
+    expect(timekeeping_row_counts).to eq(baseline)
+  end
+
+  it "refuses a restored invoice's prepare for its own retained entry another kept invoice claims through a line" do
+    company = create(:company)
+    client = create(:client, company:)
+    project = create(:project, client:, billable: true)
+    user = create(:user, current_workspace_id: company.id)
+    entry = create(:timesheet_entry, user:, project:, bill_status: "unbilled")
+    sent = create(:invoice, company:, client:, status: :sent)
+    create(:invoice_line_item, invoice: sent, timesheet_entry: entry, rate: 100, quantity: 60)
+    InvoiceEntryHolding.where(company_id: company.id, invoice_id: sent.id).delete_all
+    restored = create(:invoice, company:, client:, status: :draft)
+    Timekeeping::LocalEntry.create!(id: entry.id, company_id: company.id, user_id: user.id, project_id: project.id,
+                                    work_date: Date.current, duration: 60.0, bill_status: "unbilled")
+    ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, company.id, entry.id, restored.id, SecureRandom.uuid, Time.current]))
+      INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
+      VALUES (?, ?, ?, ?, 'committed', 'retained', ?)
+    SQL
+    generation = prepare_local_ownership!.generation.to_s
+    baseline = timekeeping_row_counts
+    actor = described_class::Actor.service(name: "invoices", company_id: company.id,
+                                           operations: ["reservations.prepare"])
+
+    outcome = described_class.call(
+      operation: :prepare, company_id: company.id, generation:, actor:,
+      params: { "invoice_id" => restored.id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
+                "entry_ids" => [entry.id] }
+    )
+
+    expect(outcome.status).to eq(409)
+    expect(outcome.body).to eq("reason" => "conflict",
+                               "conflicts" => [{ "entry_id" => entry.id, "reason" => "on_another_invoice" }])
+    expect(timekeeping_row_counts).to eq(baseline)
+  end
+end

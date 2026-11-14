@@ -49,7 +49,7 @@ module Timekeeping
       PROVISIONAL = TimekeepingRules::ReservationDecision::PROVISIONAL
       COMMITTED = TimekeepingRules::ReservationDecision::COMMITTED
       DISPOSITIONS = Invoices::ReservationRequest::DISPOSITIONS
-      RETAINED = DISPOSITIONS.last
+      ACTIVE, RETAINED = DISPOSITIONS
       PREPARED = "prepared"
       ABORTED = "aborted"
       ROW_LOCK = "FOR UPDATE"
@@ -226,7 +226,7 @@ module Timekeeping
           checkpoint.call(:rows_locked)
           kept_ids = entries.filter_map { |entry| entry.id if entry.discarded_at.nil? }
           decision = TimekeepingRules::ReservationDecision.call(
-            current: decision_reservations(kept_ids), desired: request.entry_ids,
+            current: prepare_reservations(kept_ids), desired: request.entry_ids,
             disposition: request.disposition, invoice_status: WIRE_INVOICE_STATUS
           )
           return conflict_refusal(decision[:conflicts]) unless decision[:conflicts].empty?
@@ -307,6 +307,27 @@ module Timekeeping
                 disposition: reservation.disposition }
             end
           end
+        end
+
+        # The reservations prepare decides on, with the claims other kept
+        # invoices make through their lines or active holdings. A sent
+        # invoice's added line passes admit and writes no reservation row, so
+        # reading rows alone would hand that entry to a second invoice. As
+        # Invoices::PreparedReservations does, an active committed row comes
+        # first, then another kept invoice's active claim, then a row that
+        # only retains the entry, this invoice's own included.
+        def prepare_reservations(kept_ids)
+          claims = Invoices::EntryClaims.new(company_id, kept_ids)
+          decision_reservations(kept_ids).to_h do |entry_id, reservations|
+            [entry_id, with_other_active_claim(reservations, claims.other_active_claim(entry_id, request.invoice_id))]
+          end
+        end
+
+        def with_other_active_claim(reservations, other_claim)
+          committed, provisional = reservations.partition { |reservation| reservation[:state] == COMMITTED }
+          return reservations if other_claim.nil? || committed.any? { |reservation| reservation[:disposition] == ACTIVE }
+
+          provisional + [{ invoice: :other, state: COMMITTED, disposition: ACTIVE }]
         end
 
         # The desired entries this invoice already holds only as a retained
