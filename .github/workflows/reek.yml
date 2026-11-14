@@ -33,6 +33,7 @@ concurrency:
 jobs:
   code-smells:
     name: Code smells
+    # Pinned: ubuntu-latest now resolves to ubuntu-26.04, which has no prebuilt Ruby 4.0.1 for setup-ruby.
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
