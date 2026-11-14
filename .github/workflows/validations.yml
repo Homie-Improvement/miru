@@ -15,8 +15,7 @@ concurrency:
 jobs:
   tests:
     name: Running tests
-    # Pinned because ruby/setup-ruby has no Ruby 4.0.1 build for the
-    # Ubuntu 26.04 image that ubuntu-latest now resolves to.
+    # Pinned: ubuntu-latest now resolves to ubuntu-26.04, which has no prebuilt Ruby 4.0.1 for setup-ruby.
     runs-on: ubuntu-24.04  # Standard 2-core runner
     # Each Timekeeping handoff spec group reloads the two-tenant seed, so the
     # process that draws those files runs far longer than the other.
