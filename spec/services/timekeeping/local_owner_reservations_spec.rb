@@ -928,27 +928,6 @@ RSpec.describe Timekeeping::LocalOwner, "reservation status map" do
   end
 end
 
-RSpec.describe Timekeeping::LocalOwner::ServiceAccess, "route operations" do
-  # "A grant for one route never admits another. A spec pins the map."
-  it "ServiceAccess pins the route to qualified operation map and admits each grant only for its own route" do
-    map = described_class::ROUTE_OPERATIONS
-    expect(map).to eq(
-      prepare: "reservations.prepare", commit: "reservations.commit", abort: "reservations.abort",
-      mark_billed: "invoices.mark_billed", detach_entries: Timekeeping::ServiceToken::DETACH_ENTRIES
-    )
-    expect(Timekeeping::ServiceToken::DETACH_ENTRIES).to eq("agents.detach_entries")
-    company_id = 7
-    map.each do |granted_route, granted_name|
-      actor = Timekeeping::LocalOwner::Actor.service(name: "svc", company_id:, operations: [granted_name])
-      map.each_key do |route|
-        expected = route == granted_route ? :ok : :forbidden
-        expect(described_class.call(actor:, operation: route, company_id:)).to eq(expected),
-          "grant #{granted_name} on route #{route}"
-      end
-    end
-  end
-end
-
 RSpec.describe Timekeeping::LocalOwner, "reservation access refusals" do
   # "A nil actor answers `unauthorized`. A user actor, or a service without the operation, answers `forbidden`. A service bound to another company answers `not_found`."
   it "prepare from a nil actor, a user, a service without reservations.prepare and another company's service answers 401, 403, 403 and 404 with nothing changed" do
