@@ -657,8 +657,8 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   # "Interrupt at `:after_reconcile`, delete a terminal intent, then resume."
   # "Require a fresh comparison with the saved intents before a resumed flip, and test this interruption with both deletion and `desired_entry_ids` changes."
   it "a terminal intent deleted after the recorded reconcile refuses every resumed flip, keeps the row at reconcile and leaves the saved baselines untouched" do
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+    owners = TimekeepingHandoffFakes.owners(timekeeping:)
     report_root = Dir.mktmpdir("handoff-report")
     operation_id = SecureRandom.uuid
     insert_committed_intent_for_source_intents_spec(operation_id)
@@ -703,8 +703,8 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
 
   # "Require a fresh comparison with the saved intents before a resumed flip, and test this interruption with both deletion and `desired_entry_ids` changes."
   it "desired_entry_ids changed after the recorded reconcile refuses the resumed flip, and restoring them lets a later resume flip and admit once" do
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+    owners = TimekeepingHandoffFakes.owners(timekeeping:)
     report_root = Dir.mktmpdir("handoff-report")
     operation_id = SecureRandom.uuid
     insert_committed_intent_for_source_intents_spec(operation_id, desired_entry_ids: "{7,8}")
@@ -762,8 +762,8 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   # deletion and `desired_entry_ids` changes."
   # Rollback resumes at the flip after a recorded reconcile too, so it needs the same comparison.
   it "a terminal intent deleted after a rollback's reconcile was recorded makes the resumed rollback flip refuse, and restoring it lets the rollback finish" do
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+    owners = TimekeepingHandoffFakes.owners(timekeeping:)
     report_root = Dir.mktmpdir("handoff-report")
     operation_id = "5d0b6a0e-1d7c-4f4e-9a52-6a1f1c0de255"
     insert_committed_intent_for_source_intents_spec(operation_id)
@@ -820,8 +820,8 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   # Without the saved file there is nothing to compare with; capturing the current rows again would compare them with
   # themselves, so the resumed flip must refuse.
   it "a resumed flip whose saved source intents file is gone refuses instead of moving ownership or capturing the intents again" do
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+    owners = TimekeepingHandoffFakes.owners(timekeeping:)
     report_root = Dir.mktmpdir("handoff-report")
 
     expect do
@@ -852,8 +852,8 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   # deletion and `desired_entry_ids` changes."
   # An intent that only the fresh read holds is a difference too; the saved file must stay as it was written.
   it "an intent written after the recorded reconcile makes the resumed flip refuse it as missing from the source" do
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+    owners = TimekeepingHandoffFakes.owners(timekeeping:)
     report_root = Dir.mktmpdir("handoff-report")
     operation_id = "5d0b6a0e-1d7c-4f4e-9a52-6a1f1c0d0252"
 
