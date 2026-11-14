@@ -16,13 +16,12 @@ RSpec.describe "OmniAuth request phase CSRF protection", type: :request do
 
   let(:forgery_protection) { true }
 
-  # The verifier either raises ActionController::InvalidAuthenticityToken or OmniAuth turns
-  # the error into a failure response; either way the request must not go on to the
-  # provider or the callback.
-  def refused_sign_in_request?(path, callback_path:, provider_host:, params: {})
+  # The verifier raises ActionController::InvalidAuthenticityToken. With show_exceptions set to
+  # :rescuable (config/environments/test.rb) Rails answers it with 422, so any other status,
+  # such as a redirect onward, a 404 or a 500, is not a CSRF refusal.
+  def refused_sign_in_request?(path, params: {})
     post(path, params:)
-    location = response.location.to_s
-    !(location.include?(callback_path) || location.include?(provider_host))
+    response.status == 422
   rescue ActionController::InvalidAuthenticityToken
     true
   end
@@ -37,19 +36,13 @@ RSpec.describe "OmniAuth request phase CSRF protection", type: :request do
     before { OmniAuth.config.mock_auth[:github] = build(:github_user_data) }
 
     it "refuses a sign-in request that carries no authenticity token" do
-      expect(
-        refused_sign_in_request?(
-          "/users/auth/github", callback_path: "/users/auth/github/callback", provider_host: "github.com")
-      ).to be(true)
+      expect(refused_sign_in_request?("/users/auth/github")).to be(true)
     end
 
     it "refuses a sign-in request that carries a forged authenticity token" do
       expect(
         refused_sign_in_request?(
-          "/users/auth/github",
-          callback_path: "/users/auth/github/callback",
-          provider_host: "github.com",
-          params: { authenticity_token: "forged-token-not-from-this-session" })
+          "/users/auth/github", params: { authenticity_token: "forged-token-not-from-this-session" })
       ).to be(true)
     end
 
@@ -80,12 +73,7 @@ RSpec.describe "OmniAuth request phase CSRF protection", type: :request do
     before { OmniAuth.config.mock_auth[:google_oauth2] = build(:google_user_data) }
 
     it "refuses a sign-in request that carries no authenticity token" do
-      expect(
-        refused_sign_in_request?(
-          "/users/auth/google_oauth2",
-          callback_path: "/users/auth/google_oauth2/callback",
-          provider_host: "accounts.google.com")
-      ).to be(true)
+      expect(refused_sign_in_request?("/users/auth/google_oauth2")).to be(true)
     end
 
     it "lets a sign-in request with a valid authenticity token reach the callback" do
