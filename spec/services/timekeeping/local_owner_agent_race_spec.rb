@@ -324,6 +324,49 @@ RSpec.describe Timekeeping::LocalOwner, "entry writes naming an agent against a 
     expect(Timekeeping::LocalEntry.where(company_id: company.id).pluck(:agent_id)).to eq([nil])
   end
 
+  # The create takes the agent lock before it reads the ownership row FOR
+  # SHARE, the order detach-entries uses. Were the order reversed, a create
+  # waiting on the agent lock would hold the row, so a handoff would wait
+  # behind it, and any holder of the agent lock that then read the row would
+  # close a cycle.
+  it "a create waiting on the agent lock holds no lock on the ownership row, so a handoff completes while it waits" do
+    hold_lock = Queue.new
+    release_lock = Queue.new
+    locker_pids = Queue.new
+    create_pids = Queue.new
+
+    locker = committed_data_thread(locker_pids) do
+      ActiveRecord::Base.transaction do
+        described_class::ServiceCommands.lock_agent(company.id, agent.id)
+        hold_lock << true
+        release_lock.pop
+      end
+    end
+    expect(hold_lock.pop(timeout: 5)).to be(true), "the agent lock was never taken"
+
+    create_thread = committed_data_thread(create_pids) { agent_race_create("create-beside-handoff") }
+    handoff = nil
+    begin
+      create_waits = blocked_by?(create_pids.pop(timeout: 5), locker_pids.pop(timeout: 5))
+      handoff = committed_data_thread do
+        TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(handoff_step: "close_admission")
+      end
+      handoff_done = handoff.join(5)
+    ensure
+      release_lock << true
+    end
+
+    expect(create_waits).to be(true), "the create never waited on the agent lock"
+    expect(handoff_done).not_to be_nil, "the handoff waited on the create while the create waited on the agent lock"
+    expect(locker.join(10)).not_to be_nil
+    outcome = create_thread.join(10)&.value
+    expect([outcome&.status, outcome&.body]).to eq([409, { "reason" => "stale_generation" }])
+    expect(Timekeeping::LocalEntry.where(company_id: company.id).count).to eq(0)
+  ensure
+    release_lock&.push(true)
+    [locker, create_thread, handoff].compact.each { |thread| thread.join(5) }
+  end
+
   # A create that never takes the lock lets a second session take the agent
   # lock at once, so nothing orders the two.
   it "a session taking lock_agent for the agent waits on a create naming that agent until the create commits" do
