@@ -5,6 +5,14 @@
 require "rails_helper"
 
 RSpec.describe Timekeeping::Handoff::Steps do
+  # decide reads only owner, handoff_step and legacy_retired_at, so a Struct stands in for the ownership row.
+  let(:state_class) { Struct.new(:owner, :generation, :handoff_step, :legacy_retired_at, keyword_init: true) }
+  let(:retired) { Time.zone.parse("2026-11-01 12:00") }
+
+  def handoff_state(**attributes)
+    state_class.new(owner: "monolith", generation: 1, handoff_step: nil, legacy_retired_at: nil, **attributes)
+  end
+
   it "lists the seven handoff steps in order, each with an action and a completion check, frozen" do
     # "Express the step order as a pure declarative table (step name, action, completion check), read by one small interpreter."
     names = described_class::TABLE.map { |row| row[:name].to_s }
@@ -18,15 +26,9 @@ RSpec.describe Timekeeping::Handoff::Steps do
     end
     expect(described_class::TABLE).to be_frozen
   end
-end
 
-RSpec.describe Timekeeping::Handoff::Steps do
-  def handoff_state(**attributes)
-    TimekeepingOwnership.new({ generation: 1, owner: "monolith", handoff_step: nil, legacy_retired_at: nil }.merge(attributes))
-  end
-
-  it "starts only from a null step and resumes at the step after each recorded one" do
-    # "Step 1 runs only when `handoff_step` is null; otherwise the runner resumes at the step after the recorded one, so a resume never raises the generation again."
+  # "Step 1 runs only when `handoff_step` is null; otherwise the runner resumes at the step after the recorded one, so a resume never raises the generation again."
+  it "starts only from a null step and otherwise resumes at the step after the recorded one, for either owner" do
     start = described_class.decide(handoff_state, direction: :cutover, abort: false, resume: true)
     expect(start.kind).to eq(:start)
 
@@ -34,39 +36,45 @@ RSpec.describe Timekeeping::Handoff::Steps do
       "close_admission" => "settle", "settle" => "freeze", "freeze" => "checkpoint",
       "checkpoint" => "sequence", "sequence" => "reconcile", "reconcile" => "flip"
     }
-    expected_next.each do |recorded, following|
-      decision = described_class.decide(handoff_state(generation: 2, handoff_step: recorded),
-                                        direction: :cutover, abort: false, resume: true)
-      expect([decision.kind, decision.step.to_s]).to eq([:resume, following])
+    in_progress_routes = [
+      [{ owner: "monolith", generation: 2, legacy_retired_at: nil }, :cutover],
+      [{ owner: "timekeeping", generation: 3, legacy_retired_at: retired }, :rollback]
+    ]
+    in_progress_routes.each do |attributes, direction|
+      expected_next.each do |recorded, following|
+        state = handoff_state(**attributes, handoff_step: recorded)
+        decision = described_class.decide(state, direction:, abort: false, resume: true)
+
+        expect(decision.kind).to eq(:resume), "#{direction} recorded #{recorded} decided #{decision.kind}"
+        expect(decision.step.to_s).to eq(following)
+      end
     end
   end
-end
 
-RSpec.describe Timekeeping::Handoff::Steps do
-  def handoff_state(**attributes)
-    TimekeepingOwnership.new({ generation: 1, owner: "monolith", handoff_step: nil, legacy_retired_at: nil }.merge(attributes))
-  end
+  # "The direction in progress is the current `owner` to the other owner, because `owner` changes only at the flip; a call whose `direction` disagrees is refused."
+  # "The source is legacy, and pre-flight and reservation derivation run, exactly while it is null. The generation is not used for this."
+  it "refuses a direction that disagrees with the current owner or the legacy marker, whatever the generation" do
+    %w[freeze checkpoint].each do |step|
+      half_done_cutover = handoff_state(generation: 2, handoff_step: step)
+      [false, true].each do |abort|
+        decision = described_class.decide(half_done_cutover, direction: :rollback, abort:, resume: true)
 
-  it "refuses a direction that disagrees with the current owner and the legacy marker" do
-    # "The direction in progress is the current `owner` to the other owner, because `owner` changes only at the flip; a call whose `direction` disagrees is refused."
-    in_progress_cutover = handoff_state(generation: 2, handoff_step: "freeze")
-    expect(described_class.decide(in_progress_cutover, direction: :rollback, abort: false, resume: true).kind).to eq(:refuse)
+        expect(decision.kind).to eq(:refuse), "rollback at #{step} with abort #{abort} decided #{decision.kind}"
+      end
+    end
 
-    retired = Time.zone.parse("2026-11-01 12:00")
-    expect(described_class.decide(handoff_state(legacy_retired_at: retired), direction: :cutover, abort: false, resume: true).kind)
-      .to eq(:refuse)
+    # An aborted first cutover keeps its raised generation but still has a legacy source.
+    aborted_once = handoff_state(generation: 2)
+    expect(described_class.decide(aborted_once, direction: :cutover, abort: false, resume: true).kind).to eq(:start)
+    expect(described_class.decide(aborted_once, direction: :re_cutover, abort: false, resume: true).kind).to eq(:refuse)
     expect(described_class.decide(handoff_state, direction: :re_cutover, abort: false, resume: true).kind).to eq(:refuse)
-    expect(described_class.decide(handoff_state(generation: 3, legacy_retired_at: retired), direction: :re_cutover,
-                                                                                         abort: false, resume: true).kind)
-      .to eq(:start)
-    expect(described_class.decide(handoff_state(generation: 2, owner: "timekeeping", legacy_retired_at: retired),
-                                  direction: :rollback, abort: false, resume: true).kind).to eq(:start)
-  end
-end
 
-RSpec.describe Timekeeping::Handoff::Steps do
-  def handoff_state(**attributes)
-    TimekeepingOwnership.new({ generation: 1, owner: "monolith", handoff_step: nil, legacy_retired_at: nil }.merge(attributes))
+    legacy_retired = handoff_state(generation: 3, legacy_retired_at: retired)
+    expect(described_class.decide(legacy_retired, direction: :cutover, abort: false, resume: true).kind).to eq(:refuse)
+    expect(described_class.decide(legacy_retired, direction: :re_cutover, abort: false, resume: true).kind).to eq(:start)
+
+    timekeeping_owned = handoff_state(generation: 2, owner: "timekeeping", legacy_retired_at: retired)
+    expect(described_class.decide(timekeeping_owned, direction: :rollback, abort: false, resume: true).kind).to eq(:start)
   end
 
   it "abort owes settle and freeze only when they are not yet recorded" do
@@ -83,130 +91,39 @@ RSpec.describe Timekeeping::Handoff::Steps do
     expect(owed.call("checkpoint")).to eq([])
     expect(owed.call("reconcile")).to eq([])
   end
-end
-
-RSpec.describe Timekeeping::Handoff::Steps do
-  def handoff_state(**attributes)
-    TimekeepingOwnership.new({ generation: 1, owner: "monolith", handoff_step: nil, legacy_retired_at: nil }.merge(attributes))
-  end
-
-  it "an idle resume of the direction just flipped re-admits only the current owner and never starts a handoff" do
-    # "Flip: in one monolith transaction, set the owner and clear `handoff_step` (...); then let the incoming owner admit writes at the new generation."
-    retired = Time.zone.parse("2026-11-01 12:00")
-    after_rollback = handoff_state(generation: 3, owner: "monolith", legacy_retired_at: retired)
-    decision = described_class.decide(after_rollback, direction: :rollback, abort: false, resume: true)
-
-    expect(decision.kind).to eq(:readmit)
-    expect(decision.owner.to_s).to eq("monolith")
-
-    # Abort when nothing is in progress and the direction does not start from the current owner is refused.
-    idle_monolith = handoff_state(generation: 3, legacy_retired_at: retired)
-    expect(described_class.decide(idle_monolith, direction: :rollback, abort: true, resume: true).kind).to eq(:refuse)
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Steps do
-  let(:handoff_state) { Struct.new(:owner, :generation, :handoff_step, :legacy_retired_at, keyword_init: true) }
-
-  # "The direction in progress is the current `owner` to the other owner, because `owner` changes only at the flip; a call whose `direction` disagrees is refused."
-  it "refuses a rollback started while a cutover is half done" do
-    state = handoff_state.new(owner: "monolith", generation: 2, handoff_step: "checkpoint", legacy_retired_at: nil)
-
-    [false, true].each do |abort|
-      decision = described_class.decide(state, direction: :rollback, abort:, resume: true)
-
-      expect(decision.kind).to eq(:refuse)
-    end
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Steps do
-  let(:handoff_state) { Struct.new(:owner, :generation, :handoff_step, :legacy_retired_at, keyword_init: true) }
-
-  # "Step 1 runs only when `handoff_step` is null; otherwise the runner resumes at the step after the recorded one, so a resume never raises the generation again."
-  it "never starts a new handoff, and so never raises the generation again, when a step is already recorded" do
-    expected_next = {
-      "close_admission" => "settle", "settle" => "freeze", "freeze" => "checkpoint",
-      "checkpoint" => "sequence", "sequence" => "reconcile", "reconcile" => "flip"
-    }
-
-    expected_next.each do |recorded, following|
-      state = handoff_state.new(owner: "timekeeping", generation: 3, handoff_step: recorded, legacy_retired_at: Time.current)
-      decision = described_class.decide(state, direction: :rollback, abort: false, resume: true)
-
-      expect(decision.kind).to eq(:resume), "recorded #{recorded} decided #{decision.kind}"
-      expect(decision.step.to_s).to eq(following)
-    end
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Steps do
-  let(:handoff_state) { Struct.new(:owner, :generation, :handoff_step, :legacy_retired_at, keyword_init: true) }
 
   # Scenario: step 1 fenced the monolith, then its transaction timed out, so handoff_step is still null.
   # "On timeout, stop and leave the handoff resumable or abortable."
-  it "an idle abort never starts a handoff and re-admits only the current owner" do
-    state = handoff_state.new(owner: "monolith", generation: 1, handoff_step: nil, legacy_retired_at: nil)
-
-    matching = described_class.decide(state, direction: :cutover, abort: true, resume: true)
-    expect(matching.kind).to eq(:readmit)
-    expect(matching.owner.to_s).to eq("monolith")
-
-    # An abort naming a direction whose outgoing owner is not the current owner is refused.
-    mismatched = described_class.decide(state, direction: :rollback, abort: true, resume: true)
-    expect(mismatched.kind).to eq(:refuse)
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Steps do
-  let(:handoff_state) { Struct.new(:owner, :generation, :handoff_step, :legacy_retired_at, keyword_init: true) }
-
   # Scenario: the rollback flip committed, then the monolith's admit call failed.
   # "\"Every step is safe to repeat.\" Resuming continues from the step that failed."
-  it "a resume after a flip whose admit call failed re-admits the new owner instead of starting a reverse handoff" do
-    state = handoff_state.new(owner: "monolith", generation: 3, handoff_step: nil, legacy_retired_at: Time.current)
+  it "an idle abort or a resume after a flip re-admits only the current owner and never starts a handoff" do
+    timed_out_close = handoff_state
+    matching_abort = described_class.decide(timed_out_close, direction: :cutover, abort: true, resume: true)
+    expect(matching_abort.kind).to eq(:readmit)
+    expect(matching_abort.owner.to_s).to eq("monolith")
 
-    decision = described_class.decide(state, direction: :rollback, abort: false, resume: true)
+    # An abort naming a direction whose outgoing owner is not the current owner is refused.
+    expect(described_class.decide(timed_out_close, direction: :rollback, abort: true, resume: true).kind).to eq(:refuse)
 
-    expect(decision.kind).to eq(:readmit)
-    expect(decision.owner.to_s).to eq("monolith")
+    after_rollback = handoff_state(generation: 3, legacy_retired_at: retired)
+    expect(described_class.decide(after_rollback, direction: :rollback, abort: true, resume: true).kind).to eq(:refuse)
+
+    resumed = described_class.decide(after_rollback, direction: :rollback, abort: false, resume: true)
+    expect(resumed.kind).to eq(:readmit)
+    expect(resumed.owner.to_s).to eq("monolith")
   end
-end
-
-RSpec.describe Timekeeping::Handoff::Steps do
-  let(:handoff_state) { Struct.new(:owner, :generation, :handoff_step, :legacy_retired_at, keyword_init: true) }
-
-  # "The source is legacy, and pre-flight and reservation derivation run, exactly while it is null. The generation is not used for this."
-  it "reads legacy from the marker column, not the raised generation of an aborted first cutover" do
-    aborted_once = handoff_state.new(owner: "monolith", generation: 2, handoff_step: nil, legacy_retired_at: nil)
-
-    expect(described_class.decide(aborted_once, direction: :cutover, abort: false, resume: true).kind).to eq(:start)
-    expect(described_class.decide(aborted_once, direction: :re_cutover, abort: false, resume: true).kind).to eq(:refuse)
-
-    retired = handoff_state.new(owner: "monolith", generation: 3, handoff_step: nil, legacy_retired_at: Time.current)
-    expect(described_class.decide(retired, direction: :cutover, abort: false, resume: true).kind).to eq(:refuse)
-    expect(described_class.decide(retired, direction: :re_cutover, abort: false, resume: true).kind).to eq(:start)
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Steps do
-  let(:steps_handoff_state) { Struct.new(:owner, :generation, :handoff_step, :legacy_retired_at, keyword_init: true) }
 
   it "refuses resume: false while a handoff is in progress" do
-    state = steps_handoff_state.new(owner: "monolith", generation: 2, handoff_step: "settle", legacy_retired_at: nil)
+    state = handoff_state(generation: 2, handoff_step: "settle")
 
     expect(described_class.decide(state, direction: :cutover, abort: false, resume: false).kind).to eq(:refuse)
   end
 
   it "refuses an idle rollback on a row that has never flipped instead of re-admitting the monolith" do
-    state = steps_handoff_state.new(owner: "monolith", generation: 1, handoff_step: nil, legacy_retired_at: nil)
-
-    expect(described_class.decide(state, direction: :rollback, abort: false, resume: true).kind).to eq(:refuse)
+    expect(described_class.decide(handoff_state, direction: :rollback, abort: false, resume: true).kind).to eq(:refuse)
   end
 
   it "refuses an unknown direction" do
-    state = steps_handoff_state.new(owner: "monolith", generation: 1, handoff_step: nil, legacy_retired_at: nil)
-
-    expect(described_class.decide(state, direction: :sideways, abort: false, resume: true).kind).to eq(:refuse)
+    expect(described_class.decide(handoff_state, direction: :sideways, abort: false, resume: true).kind).to eq(:refuse)
   end
 end
