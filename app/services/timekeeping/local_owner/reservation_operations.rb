@@ -41,8 +41,6 @@ module Timekeeping
     # LocalOwner::STEPS as each step finishes.
     class ReservationOperations
       ACTOR_TYPE = "service"
-      # The ownership read of step 2; see the class comment for why it never waits.
-      OWNERSHIP_LOCK = "FOR SHARE NOWAIT"
       # The reservation wire carries no invoice status, so the desired set
       # prepare stored is applied as a draft's, as the service does.
       WIRE_INVOICE_STATUS = TimekeepingRules::ReservationDecision::DRAFT_STATUS
@@ -69,11 +67,8 @@ module Timekeeping
       # DISPOSITIONS and entry_ids are Integers.
       Request = Data.define(:route, :company_id, :actor_name, :invoice_id, :operation_id, :disposition, :entry_ids)
 
-      # Raised when the NOWAIT ownership read finds the row locked, so only
-      # that read, and no other lock wait, is answered as stale_generation.
-      class OwnershipQueued < StandardError; end
-
-      # The two tables have no model the monolith shares.
+      # The two tables have no model the monolith shares. ServiceCommands
+      # reads Reservation too, to find an invoice's committed entries.
       class Reservation < ApplicationRecord
         self.table_name = "reservations"
       end
@@ -82,7 +77,7 @@ module Timekeeping
         self.table_name = "invoice_operations"
       end
 
-      private_constant :Request, :OwnershipQueued, :Reservation, :InvoiceOperation
+      private_constant :Request, :InvoiceOperation
 
       # :reek:LongParameterList
       def initialize(operation:, company_id:, generation:, actor:, params:, checkpoint:)
@@ -121,7 +116,7 @@ module Timekeeping
         # row the attempt wrote and leaves the caller's transaction usable.
         def attempt
           ApplicationRecord.transaction(requires_new: true) { write }
-        rescue OwnershipQueued
+        rescue WriteSteps::OwnershipQueued
           Outcome.refusal(:stale_generation)
         rescue WriteSteps::UnpublishableRows => error
           error.outcome
@@ -131,7 +126,7 @@ module Timekeeping
           lock_operation_key
           checkpoint.call(:operation_key_locked)
           Invoices::OperationLock.acquire!(ApplicationRecord.connection, company_id:, invoice_id: request.invoice_id)
-          stored_generation = locked_generation
+          stored_generation = WriteSteps.locked_generation_nowait
           return Outcome.refusal(:stale_generation) unless WriteSteps.generation_matches?(generation, stored_generation)
 
           checkpoint.call(:generation_checked)
@@ -142,32 +137,10 @@ module Timekeeping
           send(ROUTES.fetch(route), stored_generation)
         end
 
-        def locked_generation
-          stored_generation = WriteSteps.admitted_generation(lock: OWNERSHIP_LOCK)
-          raise OwnershipQueued, "an ownership update is waiting on the row" if ownership_update_queued?
-          stored_generation
-        rescue ActiveRecord::LockWaitTimeout => error
-          raise OwnershipQueued, error.message
-        end
-
-        # PostgreSQL grants a FOR SHARE request beside other share holders
-        # even while an update waits for them, so NOWAIT alone does not see a
-        # queued handoff. A backend waiting to lock a row holds a lock on that
-        # tuple for as long as it waits, so any tuple lock another backend
-        # holds on the ownership table means an update is queued there.
-        def ownership_update_queued?
-          ApplicationRecord.connection.select_value(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, TimekeepingOwnership.table_name]))
-            SELECT EXISTS (
-              SELECT 1 FROM pg_locks
-              WHERE locktype = 'tuple' AND relation = to_regclass(?) AND pid <> pg_backend_pid()
-            )
-          SQL
-        end
-
         # Only the params keys below are read, so a company_id or actor field
         # elsewhere in params changes nothing.
         def build_request
-          invoice_id = id_value(params["invoice_id"])
+          invoice_id = WriteSteps.id_value(params["invoice_id"])
           operation_id = params["operation_id"]
           return unless invoice_id && operation_id.is_a?(String) && UUID.match?(operation_id)
 
@@ -183,24 +156,14 @@ module Timekeeping
           raw_ids = params["entry_ids"]
           return [disposition, nil] unless DISPOSITIONS.include?(disposition) && raw_ids.is_a?(Array)
 
-          entry_ids = raw_ids.map { |id| id_value(id) }
+          entry_ids = raw_ids.map { |id| WriteSteps.id_value(id) }
           [disposition, entry_ids.all? ? entry_ids : nil]
         end
 
-        # A positive Integer, or a string of digits read as one; nil otherwise.
-        def id_value(value)
-          return value if value.is_a?(Integer) && value.positive?
-
-          Integer(value, 10) if value.is_a?(String) && ID.match?(value)
-        end
-
         # Only writers with the same company, service and operation_id wait on
-        # each other. The lock is taken on two signed 32-bit keys from a digest
-        # of those parts; rows are always read by their columns.
+        # each other.
         def lock_operation_key
-          WriteSteps.advisory_lock(*Digest::SHA256.digest(
-            [company_id, ACTOR_TYPE, request.actor_name, request.operation_id].join(KEY_SEPARATOR)
-          ).unpack("l>l>"))
+          WriteSteps.lock_key(company_id, ACTOR_TYPE, request.actor_name, request.operation_id)
         end
 
         # Prepare answers from its operation row with the operation's current
