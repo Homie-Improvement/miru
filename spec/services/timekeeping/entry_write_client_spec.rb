@@ -351,6 +351,89 @@ RSpec.describe Timekeeping::EntryWriteClient, "caller-supplied Idempotency-Key" 
   end
 end
 
+RSpec.describe Timekeeping::EntryWriteClient, "employee bulk calls against the token-mode fake" do
+  let(:employee_bulk_base_url) { "http://timekeeping.test" }
+  let(:employee_bulk_company) { create(:company) }
+  let(:employee_bulk_client) { create(:client, company: employee_bulk_company) }
+  let(:employee_bulk_source) { create(:project, billable: true, client: employee_bulk_client) }
+  let(:employee_bulk_target) { create(:project, billable: true, client: employee_bulk_client) }
+  let(:employee_bulk_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  def employee_bulk_member
+    create(:user, current_workspace_id: employee_bulk_company.id).tap do |user|
+      create(:employment, company: employee_bulk_company, user:)
+      user.add_role :employee, employee_bulk_company
+      employee_bulk_fake.register_user(id: user.id, company_id: employee_bulk_company.id, role: "employee")
+    end
+  end
+
+  def employee_bulk_entry(user, **attributes)
+    employee_bulk_fake.add_entry(company_id: employee_bulk_company.id, user_id: user.id,
+                                 project_id: employee_bulk_source.id, work_date: Date.current.iso8601,
+                                 **attributes).fetch("id")
+  end
+
+  def employee_bulk_context(user)
+    Timekeeping::WriteContext.new(company: employee_bulk_company, actor: user, actor_kind: "user",
+                                  request_id: SecureRandom.uuid)
+  end
+
+  def employee_bulk_results(answer)
+    answer.fetch("results").to_h { |row| [row["entry_id"], row["result"]] }
+  end
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+  end
+
+  before do
+    employee_bulk_fake.register_company(id: employee_bulk_company.id,
+                                        edit_days: employee_bulk_company.timesheet_edit_days)
+    employee_bulk_fake.register_project(id: employee_bulk_source.id, company_id: employee_bulk_company.id)
+    employee_bulk_fake.register_project(id: employee_bulk_target.id, company_id: employee_bulk_company.id)
+    route_timekeeping_to_fake(employee_bulk_fake, base_url: employee_bulk_base_url)
+  end
+
+  # "Failing entries are still skipped silently, as A9 does today."
+  it "skips an employee's locked entry in a bulk move and moves the unlocked one" do
+    employee = employee_bulk_member
+    locked_id = employee_bulk_entry(employee, locked: true)
+    unlocked_id = employee_bulk_entry(employee, locked: false)
+
+    answer = described_class.new(base_url: employee_bulk_base_url).bulk_move(
+      context: employee_bulk_context(employee), generation: employee_bulk_fake.generation,
+      entry_ids: [locked_id, unlocked_id], project_id: employee_bulk_target.id
+    )
+
+    expect(employee_bulk_results(answer)).to eq(locked_id => "not_found", unlocked_id => "moved")
+    expect(employee_bulk_fake.stored_entry(locked_id)["project_id"]).to eq(employee_bulk_source.id)
+    expect(employee_bulk_fake.stored_entry(unlocked_id)["project_id"]).to eq(employee_bulk_target.id)
+  end
+
+  # A colleague's entry is invisible to an employee, so it is reported as
+  # not_found and never turns the whole request into a refusal.
+  it "moves and deletes an employee's own entry while reporting a colleague's entry as not_found" do
+    employee = employee_bulk_member
+    colleague = employee_bulk_member
+    own_moved = employee_bulk_entry(employee)
+    own_deleted = employee_bulk_entry(employee)
+    colleague_entry = employee_bulk_entry(colleague)
+    client = described_class.new(base_url: employee_bulk_base_url)
+
+    moved = client.bulk_move(context: employee_bulk_context(employee), generation: employee_bulk_fake.generation,
+                             entry_ids: [own_moved, colleague_entry], project_id: employee_bulk_target.id)
+    deleted = client.bulk_delete(context: employee_bulk_context(employee), generation: employee_bulk_fake.generation,
+                                 entry_ids: [own_deleted, colleague_entry])
+
+    expect(employee_bulk_results(moved)).to eq(own_moved => "moved", colleague_entry => "not_found")
+    expect(employee_bulk_results(deleted)).to eq(own_deleted => "deleted", colleague_entry => "not_found")
+    expect(employee_bulk_fake.stored_entry(colleague_entry)).to include("project_id" => employee_bulk_source.id,
+                                                                       "discarded_at" => nil)
+    expect(employee_bulk_fake.stored_entry(own_moved)["project_id"]).to eq(employee_bulk_target.id)
+    expect(employee_bulk_fake.stored_entry(own_deleted)["discarded_at"]).not_to be_nil
+  end
+end
+
 RSpec.describe Timekeeping::EntryWriteClient, "web create body beside the import body" do
   let(:web_body_company) { create(:company) }
   let(:web_body_user) { create(:user, current_workspace_id: web_body_company.id) }

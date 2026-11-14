@@ -337,8 +337,12 @@ module Timekeeping
       # is the same non-raising call the relation-wide update and discard_all
       # made per record, so a failing entry is skipped, not raised. Answers
       # true when any entry was attempted, as discard_all.any? did.
+      #
+      # Each written row stays locked until the transaction ends, so entries
+      # are written in id order: two requests naming the same entries in
+      # opposite orders would otherwise wait on each other and deadlock.
       def write_each_admitted(entries, owner:, expected_generation:)
-        entries.each do |entry|
+        entries.sort_by(&:id).each do |entry|
           raise OwnershipMoving unless EntryOwner.for(admitted_ownership(expected_generation)) == owner
 
           yield entry
@@ -350,12 +354,12 @@ module Timekeeping
       # non-billable target project, for one), so entries the legacy save
       # would skip are left out of the call and skipped the same way. Every
       # found entry keeps the target project in memory, as the legacy entries
-      # do after a skipped save, so both branches render the same rows.
+      # do after a skipped save, so both branches render the same rows. The
+      # call is sent even when every entry is skipped, so Timekeeping still
+      # refuses a stale generation instead of the request answering 200.
       def forward_bulk_move(ownership:, entries:, project:)
         entries.each { |entry| entry.project = project }
         movable_ids = entries.filter_map { |entry| entry.id if entry.valid?(:update) }
-        return false if movable_ids.empty?
-
         answer = write_client.bulk_move(context:, generation: ownership.generation, entry_ids: movable_ids,
                                         project_id: project.id)
         reported?(answer, MOVED_RESULT)

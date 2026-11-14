@@ -747,8 +747,9 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#update forwarded s
   it "bulk moves entries that exist only in Timekeeping, sends one bulk-move call, and answers the legacy JSON shape" do
     first_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: source_project.id,
                               work_date: Date.current.iso8601).fetch("id")
+    second_date = Date.current - 1
     second_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: source_project.id,
-                               work_date: Date.current.iso8601).fetch("id")
+                               work_date: second_date.iso8601).fetch("id")
     local_count = TimesheetEntry.count
 
     send_request :patch, api_v1_bulk_action_path,
@@ -760,6 +761,12 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#update forwarded s
     expect(json_response["entries"]).to be_a(Hash)
     rendered_ids = json_response["entries"].values.flatten.pluck("id")
     expect(rendered_ids).to contain_exactly(first_id, second_id)
+    expect(json_response["entries"].transform_values { |snippets| snippets.pluck("id") })
+      .to eq(Date.current.iso8601 => [first_id], second_date.iso8601 => [second_id])
+    json_response["entries"].values.flatten.each do |snippet|
+      expect(snippet).to include("project" => target_project.name, "project_id" => target_project.id,
+                                 "client" => client.name)
+    end
 
     expect(fake.stored_entry(first_id)["project_id"]).to eq(target_project.id)
     expect(fake.stored_entry(second_id)["project_id"]).to eq(target_project.id)

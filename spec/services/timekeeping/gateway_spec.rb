@@ -1519,6 +1519,37 @@ RSpec.describe Timekeeping::Gateway, "legacy bulk writes" do
     Current.reset
   end
 
+  # Rows stay locked until the request's transaction ends, so two requests naming
+  # the same entries in opposite orders must still lock them in the same order.
+  it "writes legacy entries in id order whatever the request order, and answers them in request order" do
+    admin = legacy_bulk_member(:admin)
+    first = legacy_bulk_entry(admin)
+    second = legacy_bulk_entry(admin)
+    moved_ids = []
+    discarded_ids = []
+    allow_any_instance_of(TimesheetEntry).to receive(:update).and_wrap_original do |original, *args, **kwargs|
+      moved_ids << original.receiver.id
+      original.call(*args, **kwargs)
+    end
+    allow_any_instance_of(TimesheetEntry).to receive(:discard).and_wrap_original do |original, *args|
+      discarded_ids << original.receiver.id
+      original.call(*args)
+    end
+
+    moved = legacy_bulk_gateway(admin).bulk_move(
+      entry_ids: [second.id, first.id], project: target_project, check: ->(_entries) { nil },
+      expected_generation: described_class.current_generation
+    )
+    legacy_bulk_gateway(admin, request_id: "req-legacy-bulk-delete").bulk_delete(
+      entry_ids: [second.id, first.id], check: ->(_entries) { nil },
+      expected_generation: described_class.current_generation
+    )
+
+    expect(moved_ids).to eq([first.id, second.id])
+    expect(discarded_ids).to eq([first.id, second.id])
+    expect(moved.entries.map(&:id)).to eq([second.id, first.id])
+  end
+
   it "drops an id that is not a number and a duplicate, and moves the valid entry once" do
     admin = legacy_bulk_member(:admin)
     entry = legacy_bulk_entry(admin)
@@ -1717,14 +1748,29 @@ RSpec.describe Timekeeping::Gateway, "forwarded bulk writes" do
     expect(fake.stored_entry(non_billable)["project_id"]).to eq(non_billable_project.id)
   end
 
-  it "sends no bulk move when every found entry fails the legacy validations" do
+  it "sends a bulk move naming no ids when every found entry fails the legacy validations" do
     unbilled = forwarded_bulk_entry(bill_status: "unbilled")
 
     result = gateway.bulk_move(entry_ids: [unbilled], project: non_billable_project, check: ->(_entries) { nil },
                                expected_generation: 2)
 
-    expect(forwarded_bulk_requests("/bulk-move")).to be_empty
+    calls = forwarded_bulk_requests("/bulk-move")
+    expect(calls.size).to eq(1)
+    expect(calls.first[:body]["entry_ids"]).to eq([])
     expect(result.written).to be(false)
+    expect(fake.stored_entry(unbilled)["project_id"]).to eq(source_project.id)
+  end
+
+  # "A stale generation fails a whole bulk move and no entry in the request stays moved"
+  it "raises StaleGeneration when Timekeeping's generation moved, even when every found entry fails the legacy validations" do
+    unbilled = forwarded_bulk_entry(bill_status: "unbilled")
+    fake.generation = 3
+
+    expect do
+      gateway.bulk_move(entry_ids: [unbilled], project: non_billable_project, check: ->(_entries) { nil },
+                        expected_generation: 2)
+    end.to raise_error(Timekeeping::Gateway::StaleGeneration)
+    expect(fake.stored_entry(unbilled)["project_id"]).to eq(source_project.id)
   end
 
   it "sends one bulk delete naming the found ids and reports it written" do

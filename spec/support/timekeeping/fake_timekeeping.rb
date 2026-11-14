@@ -444,7 +444,8 @@ module TimekeepingContract
           return Wire.error(@entry_contract, "not_found")
         end
 
-        entries = Array(body["entry_ids"]).filter_map { |entry_id| visible_entry(entry_id, company_id) }.uniq { |entry| entry["id"] }
+        entries = Array(body["entry_ids"]).filter_map { |entry_id| visible_entry(entry_id, company_id) }
+          .uniq { |entry| entry["id"] }.select { |entry| bulk_visible_to_actor?(acting, entry) }
         decision = bulk_rules_decision(company_id, acting, entries, action:)
         return Wire.error(@entry_contract, "forbidden") if decision == :forbidden
 
@@ -455,6 +456,17 @@ module TimekeepingContract
           { "entry_id" => entry_id, "result" => applied_ids.include?(integer(entry_id)) ? result : "not_found" }
         end
         respond(200, "results" => results)
+      end
+
+      # In token mode an employee's bulk request sees only their own entries,
+      # as Timekeeping::EntryWriter#bulk_change locks only the visible ones, so
+      # a colleague's id is reported as not_found and takes no part in the
+      # decision. Opaque-token mode keeps every company entry visible.
+      def bulk_visible_to_actor?(acting, entry)
+        return true unless @token_public_key
+
+        scope = TimekeepingRules::EntryRules.visible_scope(role: acting["role"], acting_user_id: acting["id"])
+        scope == :company || entry["user_id"] == scope
       end
 
       # The shared bulk rules (A9) Timekeeping applies, decided on the token's
