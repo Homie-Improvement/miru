@@ -38,7 +38,7 @@ module Timekeeping
     STEPS = %i[
       receipt_key_locked operation_key_locked generation_checked request_checked receipt_checked operation_checked
       project_checked rows_locked rules_checked reservations_written entry_written audit_written outbox_written
-      receipt_written
+      receipt_written operation_written
     ].freeze
 
     ENTRY_API = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/entry_api.yml")).freeze

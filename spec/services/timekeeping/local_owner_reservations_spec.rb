@@ -108,7 +108,7 @@ RSpec.describe Timekeeping::LocalOwner, "reservation rollback at an injected fai
                                            operations: ["reservations.prepare", "reservations.commit"])
     injected = Class.new(StandardError)
 
-    %i[reservations_written outbox_written].each do |step|
+    %i[reservations_written outbox_written rules_checked operation_written].each do |step|
       expect(described_class::STEPS).to include(step)
       baseline = timekeeping_row_counts
       version = entry.reload.version
@@ -126,12 +126,30 @@ RSpec.describe Timekeeping::LocalOwner, "reservation rollback at an injected fai
     expect(described_class::STEPS).to include(:receipt_written)
     baseline = timekeeping_row_counts
     version = entry.reload.version
-    expect {
-      reservation_call(:commit, company:, generation:, actor:, invoice:, operation_id:,
-                                checkpoint: ->(seen) { raise injected if seen == :receipt_written })
-    }.to raise_error(injected)
-    expect(timekeeping_row_counts).to eq(baseline)
-    expect(entry.reload.version).to eq(version)
+    stored_rows = lambda do
+      connection = ActiveRecord::Base.connection
+      [
+        connection.select_rows(ActiveRecord::Base.sanitize_sql_array(
+          ["SELECT entry_id, state FROM reservations WHERE company_id = ? ORDER BY entry_id", company.id]
+        )),
+        connection.select_rows(ActiveRecord::Base.sanitize_sql_array(
+          ["SELECT operation_id, state FROM invoice_operations WHERE company_id = ? ORDER BY id", company.id]
+        ))
+      ]
+    end
+    rows_before = stored_rows.call
+    expect(rows_before).to eq([[[entry.id, "provisional"]], [[operation_id, "prepared"]]])
+
+    %i[rules_checked receipt_written].each do |step|
+      expect {
+        reservation_call(:commit, company:, generation:, actor:, invoice:, operation_id:,
+                                  checkpoint: ->(seen) { raise injected if seen == step })
+      }.to raise_error(injected)
+      expect(timekeeping_row_counts).to eq(baseline)
+      expect(entry.reload.version).to eq(version)
+      # The promotion and the operation's committed state roll back with the receipt.
+      expect(stored_rows.call).to eq(rows_before)
+    end
   end
 end
 
@@ -497,6 +515,59 @@ RSpec.describe Timekeeping::LocalOwner, "unpublishable reservation flip" do
     # "Nothing is written, as `Invoices::PreparedReservations` already does."
     expect(timekeeping_row_counts).to eq(baseline)
     expect(entry.reload.version).to eq(version_before)
+  end
+
+  it "a commit releasing a dropped unpublishable entry, and an abort releasing one, answer 422 and leave the operation prepared" do
+    generation = prepare_local_ownership!.generation.to_s
+    company = create(:company)
+    owner = timekeeping_member(company, "owner")
+    project = create(:project, client: create(:client, company:))
+    invoice = create(:invoice, company:, client: project.client)
+    other_invoice = create(:invoice, company:, client: project.client)
+    kept, dropped, aborted = %w[kept dropped aborted].map do |note|
+      Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
+                                      work_date: Date.current, duration: 30.0, note:, bill_status: "unbilled")
+    end
+    actor = described_class::Actor.service(
+      name: "invoices", company_id: company.id,
+      operations: ["reservations.prepare", "reservations.commit", "reservations.abort"]
+    )
+    run = lambda do |operation, params|
+      described_class.call(operation:, company_id: company.id, generation:, actor:, params:)
+    end
+    prepare_params = lambda do |target, operation_id, entry_ids|
+      { "invoice_id" => target.id, "operation_id" => operation_id, "disposition" => "active", "entry_ids" => entry_ids }
+    end
+    first_op = SecureRandom.uuid
+    expect(run.call(:prepare, prepare_params.call(invoice, first_op, [kept.id, dropped.id])).status).to eq(200)
+    expect(run.call(:commit, { "invoice_id" => invoice.id, "operation_id" => first_op }).status).to eq(200)
+    # The stored desired set drops `dropped`, so this commit would release it.
+    commit_op = SecureRandom.uuid
+    expect(run.call(:prepare, prepare_params.call(invoice, commit_op, [kept.id])).status).to eq(200)
+    abort_op = SecureRandom.uuid
+    expect(run.call(:prepare, prepare_params.call(other_invoice, abort_op, [aborted.id])).status).to eq(200)
+    [dropped, aborted].each { |entry| entry.update_columns(source: "legacy") }
+    operation_state = lambda do |operation_id|
+      ActiveRecord::Base.connection.select_value(ActiveRecord::Base.sanitize_sql_array(
+        ["SELECT state FROM invoice_operations WHERE company_id = ? AND operation_id = ?", company.id, operation_id]
+      ))
+    end
+
+    [[:commit, invoice, commit_op, dropped], [:abort, other_invoice, abort_op, aborted]].each do |operation, target, operation_id, entry|
+      baseline = timekeeping_row_counts
+      versions = [kept, dropped, aborted].map { |row| row.reload.version }
+
+      outcome = run.call(operation, { "invoice_id" => target.id, "operation_id" => operation_id })
+
+      expect([operation, outcome.status, outcome.body["reason"]]).to eq([operation, 422, "unpublishable_entry"])
+      listed = JSON.generate(outcome.body)
+      expect(listed).to include(entry.id.to_s)
+      expect(listed).to include("source")
+      expect(listed).not_to include("legacy")
+      expect(timekeeping_row_counts).to eq(baseline)
+      expect([kept, dropped, aborted].map { |row| row.reload.version }).to eq(versions)
+      expect(operation_state.call(operation_id)).to eq("prepared")
+    end
   end
 end
 
@@ -1581,7 +1652,15 @@ RSpec.describe Timekeeping::LocalOwner, "reservation refusals and terminal answe
       [:prepare, prepare_params.call(invoice, SecureRandom.uuid, ["x"]), 400, { "reason" => "invalid_request" }],
       [:commit, { "invoice_id" => other_invoice.id, "operation_id" => aborted_op }, 200,
        { "reserved" => 0, "released" => 0 }],
-      [:abort, { "invoice_id" => invoice.id, "operation_id" => committed_op }, 200, { "dropped" => 0 }]
+      [:abort, { "invoice_id" => invoice.id, "operation_id" => committed_op }, 200, { "dropped" => 0 }],
+      # rules.terminal_prepare: a prepare replayed after its operation ended answers
+      # that stored state, even while another operation on the invoice is open.
+      [:prepare, prepare_params.call(invoice, committed_op, [entries.first.id]), 200,
+       { "operation_id" => committed_op, "state" => "committed",
+         "entries" => [{ "entry_id" => entries.first.id, "company_id" => company.id }] }],
+      [:prepare, prepare_params.call(other_invoice, aborted_op, [entries.last.id]), 200,
+       { "operation_id" => aborted_op, "state" => "aborted",
+         "entries" => [{ "entry_id" => entries.last.id, "company_id" => company.id }] }]
     ]
     baseline = timekeeping_row_counts
     versions = entries.map { |entry| entry.reload.version }

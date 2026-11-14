@@ -224,20 +224,30 @@ module Timekeeping
 
           entries = lock_entries(request.entry_ids)
           checkpoint.call(:rows_locked)
+          decision = prepare_decision(entries)
+          return conflict_refusal(decision[:conflicts]) unless decision[:conflicts].empty?
+
+          checkpoint.call(:rules_checked)
+          store_prepare(entries, decision[:reserve], stored_generation)
+        end
+
+        def prepare_decision(entries)
           kept_ids = entries.filter_map { |entry| entry.id if entry.discarded_at.nil? }
-          decision = TimekeepingRules::ReservationDecision.call(
+          TimekeepingRules::ReservationDecision.call(
             current: prepare_reservations(kept_ids), desired: request.entry_ids,
             disposition: request.disposition, invoice_status: WIRE_INVOICE_STATUS
           )
-          return conflict_refusal(decision[:conflicts]) unless decision[:conflicts].empty?
+        end
 
-          # The id is taken first so the provisional rows can name their
-          # operation, while the operation row itself is stored last.
+        # The id is taken first so the provisional rows can name their
+        # operation, while the operation row itself is stored last.
+        def store_prepare(entries, reserve_ids, stored_generation)
           operation_row_id = next_operation_id
-          reserve_provisionally(operation_row_id, decision[:reserve] + retained_by_this)
+          reserve_provisionally(operation_row_id, reserve_ids + retained_by_this)
           checkpoint.call(:reservations_written)
           record_flips(entries, stored_generation)
           operation = insert_operation(operation_row_id, stored_generation)
+          checkpoint.call(:operation_written)
           prepare_answer(operation)
         end
 
@@ -256,6 +266,7 @@ module Timekeeping
             current: decision_reservations(held_ids), desired: operation.desired_entry_ids,
             disposition: operation.disposition, invoice_status: WIRE_INVOICE_STATUS
           )[:release]
+          checkpoint.call(:rules_checked)
 
           make_desired_set_the_reservation_set(operation, claimed_ids, released_ids)
           checkpoint.call(:reservations_written)
