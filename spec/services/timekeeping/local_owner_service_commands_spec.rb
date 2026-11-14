@@ -914,3 +914,146 @@ RSpec.describe Timekeeping::LocalOwner, "service command receipts per service an
     expect(entries.map { |entry| entry.reload.agent_id }).to eq([nil, nil, nil])
   end
 end
+
+RSpec.describe Timekeeping::LocalOwner, "service commands on an unpublishable entry" do
+  it "mark_billed and detach_entries answer 422 unpublishable_entry with the entry id and field, and write nothing" do
+    generation = prepare_local_ownership!.generation.to_s
+    company = create(:company)
+    owner = timekeeping_member(company, "owner")
+    project = create(:project, client: create(:client, company:))
+    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
+                                            work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled", agent_id: 77)
+    ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, company.id, entry.id, SecureRandom.uuid]))
+      INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
+      VALUES (?, ?, 501, ?, 'committed', 'active', NOW())
+    SQL
+    # A source outside the snapshot contract's list is a stored value the projection refuses.
+    entry.update_columns(source: "legacy")
+    before = entry.reload.attributes
+    baseline = timekeeping_row_counts
+    actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
+                                           operations: %w[invoices.mark_billed agents.detach_entries])
+
+    { mark_billed: { "invoice_id" => 501 }, detach_entries: { "agent_id" => 77 } }.each do |operation, target|
+      outcome = described_class.call(operation:, company_id: company.id, generation:, actor:,
+                                     params: target.merge("operation_id" => SecureRandom.uuid))
+
+      # "A flipped or changed entry that fails `EntryOutbox.invalid_fields` refuses the whole command with 422 `unpublishable_entry`."
+      expect([operation, outcome.status, outcome.body["reason"]]).to eq([operation, 422, "unpublishable_entry"])
+      expect(outcome.body["entries"]).to eq([{ "entry_id" => entry.id, "fields" => ["source"] }])
+      expect(timekeeping_row_counts).to eq(baseline)
+      expect(entry.reload.attributes).to eq(before)
+    end
+  end
+end
+
+RSpec.describe Timekeeping::LocalOwner, "service commands with an ownership update queued", committed_data: true do
+  it "mark_billed and detach_entries answer 409 stale_generation without waiting and write nothing" do
+    generation = prepare_local_ownership!.generation.to_s
+    company = create(:company)
+    owner = timekeeping_member(company, "owner")
+    project = create(:project, client: create(:client, company:))
+    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
+                                            work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled", agent_id: 77)
+    ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, company.id, entry.id, SecureRandom.uuid]))
+      INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
+      VALUES (?, ?, 501, ?, 'committed', 'active', NOW())
+    SQL
+    before = entry.reload.attributes
+    baseline = timekeeping_row_counts
+    actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
+                                           operations: %w[invoices.mark_billed agents.detach_entries])
+    holding = Queue.new
+    release = Queue.new
+    holder_pids = []
+    updater_pids = []
+
+    holder = committed_data_thread(holder_pids) do
+      ApplicationRecord.transaction do
+        TimekeepingOwnership.lock("FOR SHARE").find(TimekeepingOwnership::SINGLETON_ID)
+        holding << true
+        release.pop
+      end
+    end
+    holding.pop
+    updater = committed_data_thread(updater_pids) do
+      TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all("generation = generation")
+    end
+    sleep 0.01 while updater_pids.empty?
+
+    outcomes = {}
+    begin
+      expect(blocked_by?(updater_pids.first, holder_pids.first)).to be(true)
+      { mark_billed: { "invoice_id" => 501 }, detach_entries: { "agent_id" => 77 } }.each do |operation, target|
+        # statement_timeout, not lock_timeout: a blocking read then fails with a cancelled query
+        # instead of the lock_not_available error a NOWAIT read raises.
+        ApplicationRecord.transaction do
+          ApplicationRecord.connection.execute("SET LOCAL statement_timeout = '2s'")
+          outcomes[operation] = described_class.call(operation:, company_id: company.id, generation:, actor:,
+                                                     params: target.merge("operation_id" => SecureRandom.uuid))
+        end
+      end
+    ensure
+      release << true
+      holder.join
+      updater.join
+    end
+
+    # "A `lock_not_available` error answers 409 `stale_generation` with nothing written."
+    expect(outcomes.transform_values { |outcome| [outcome.status, outcome.body] })
+      .to eq(mark_billed: [409, { "reason" => "stale_generation" }], detach_entries: [409, { "reason" => "stale_generation" }])
+    expect(timekeeping_row_counts).to eq(baseline)
+    expect(entry.reload.attributes).to eq(before)
+  end
+end
+
+RSpec.describe Timekeeping::LocalOwner, "service command key reused for another target at the same time", committed_data: true do
+  it "a second session sending one operation_id for another agent waits for the first and answers idempotency_key_reused" do
+    generation = prepare_local_ownership!.generation.to_s
+    company = create(:company)
+    owner = timekeeping_member(company, "owner")
+    project = create(:project, client: create(:client, company:))
+    first_entry, second_entry = [77, 78].map do |agent_id|
+      Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
+                                      work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled", agent_id:)
+    end
+    actor = described_class::Actor.service(name: "agent-destroy", company_id: company.id,
+                                           operations: %w[agents.detach_entries])
+    operation_id = SecureRandom.uuid
+    paused = Queue.new
+    release = Queue.new
+    first_pids = []
+    second_pids = []
+    pause_after_rows_locked = lambda do |step|
+      next unless step == :rows_locked
+
+      paused << true
+      release.pop
+    end
+
+    first = committed_data_thread(first_pids) do
+      described_class.call(operation: :detach_entries, company_id: company.id, generation:, actor:,
+                           params: { "agent_id" => 77, "operation_id" => operation_id },
+                           checkpoint: pause_after_rows_locked)
+    end
+    paused.pop
+    second = committed_data_thread(second_pids) do
+      described_class.call(operation: :detach_entries, company_id: company.id, generation:, actor:,
+                           params: { "agent_id" => 78, "operation_id" => operation_id })
+    end
+    sleep 0.01 while second_pids.empty?
+
+    begin
+      # Without the operation lock that leaves out the target, the second session would not wait here,
+      # would find no receipt yet, and would detach agent 78 as a second command.
+      expect(blocked_by?(second_pids.first, first_pids.first)).to be(true)
+    ensure
+      release << true
+    end
+
+    expect(first.value.body).to eq("detached" => 1)
+    # "A reused key with a different target answers `idempotency_key_reused`."
+    expect(second.value.body).to include("reason" => "idempotency_key_reused")
+    expect([first_entry.reload.agent_id, second_entry.reload.agent_id]).to eq([nil, 78])
+  end
+end
