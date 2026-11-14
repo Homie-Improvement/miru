@@ -6,6 +6,13 @@ RSpec.describe "RackAttack auth throttles", type: :request do
   let(:ip_address) { "203.0.113.10" }
   let(:json_headers) { { "CONTENT_TYPE" => "application/json", "REMOTE_ADDR" => ip_address } }
 
+  # Rack::Attack counts each throttle in fixed one-minute windows keyed on Time.now.
+  # Freezing the clock keeps every request of an example in one window, so a minute
+  # boundary cannot reset the count before the over-limit request.
+  around do |example|
+    freeze_time { example.run }
+  end
+
   before do
     Rack::Attack.enabled = true
     Rack::Attack.cache.store.clear if Rack::Attack.cache.store.respond_to?(:clear)
