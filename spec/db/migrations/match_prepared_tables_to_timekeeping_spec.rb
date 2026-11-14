@@ -3,16 +3,21 @@
 require "rails_helper"
 require Rails.root.join("db/migrate/20261025120200_match_prepared_tables_to_timekeeping")
 require Rails.root.join("db/migrate/20261026130000_match_prepared_tables_to_timekeeping_service_actors")
+require Rails.root.join("db/migrate/20261028120000_add_service_actors_to_idempotency_records")
 
 # Runs the migration's down and up inside the example's transaction, so every
 # column it drops or adds is rolled back after the example.
 RSpec.describe MatchPreparedTablesToTimekeeping do
   let(:connection) { ActiveRecord::Base.connection }
 
-  # The later migration that adds service actors builds on these columns, so it
-  # is rolled back first to put the tables at the shape this migration made.
+  # The later migrations that add service actors build on these columns, so they
+  # are rolled back first, newest first, to put the tables at the shape this
+  # migration made.
   before do
-    ActiveRecord::Migration.suppress_messages { MatchPreparedTablesToTimekeepingServiceActors.new.migrate(:down) }
+    ActiveRecord::Migration.suppress_messages do
+      AddServiceActorsToIdempotencyRecords.new.migrate(:down)
+      MatchPreparedTablesToTimekeepingServiceActors.new.migrate(:down)
+    end
   end
 
   # [SQL type, nullable] per column, as Postgres reports them.
