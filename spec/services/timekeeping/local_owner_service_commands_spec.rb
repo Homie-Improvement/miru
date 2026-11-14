@@ -74,12 +74,19 @@ RSpec.describe Timekeeping::LocalOwner, "service command access refusals" do
     other_company = create(:company)
     owner = timekeeping_member(company, "owner")
     project = create(:project, client: create(:client, company:))
-    invoice_id = 501
+    invoice_id = create(:invoice, company:, client: project.client).id
     agent_id = 77
     billable = service_command_entry(company, user: owner, project:, work_date: "2026-03-02", duration: 60.0)
     reserve_service_command_entry(billable, invoice_id, state: "committed")
     agent_entry = service_command_entry(company, user: owner, project:, work_date: "2026-03-02", duration: 60.0, agent_id:)
-    before = [billable, agent_entry].map { |entry| entry.reload.attributes }
+    # One entry each command would change: reserved on the invoice and carrying the agent.
+    billable_agent_entry = service_command_entry(company, user: owner, project:, work_date: Date.current, duration: 30.0,
+                                                 note: "n", agent_id:)
+    reserve_service_command_entry(billable_agent_entry, invoice_id, state: "committed")
+    entries = [billable, agent_entry, billable_agent_entry]
+    before = entries.map { |entry| entry.reload.attributes }
+    expect(before.map { |attributes| attributes.values_at("bill_status", "agent_id") })
+      .to eq([["unbilled", nil], ["unbilled", agent_id], ["unbilled", agent_id]])
     baseline = timekeeping_row_counts
     actor = described_class::Actor
     targets = { mark_billed: { "invoice_id" => invoice_id }, detach_entries: { "agent_id" => agent_id } }
@@ -89,16 +96,20 @@ RSpec.describe Timekeeping::LocalOwner, "service command access refusals" do
 
     targets.each do |operation, target|
       # "A nil actor answers unauthorized, a user actor or a service without the qualified operation (invoices.mark_billed, agents.detach_entries) answers forbidden, and a service bound to another company answers not_found, all with nothing changed"
-      callers = {
-        nil => [401, "unauthorized"],
-        actor.user(user_id: owner.id, role: "owner") => [403, "forbidden"],
-        actor.service(name: "invoice-boundary", company_id: company.id, operations: [other_operation.fetch(operation)]) =>
-          [403, "forbidden"],
-        actor.service(name: "invoice-boundary", company_id: other_company.id,
-                      operations: [granted_operation.fetch(operation)]) => [404, "not_found"]
-      }
+      # The other company's service is refused both when it holds only this command's operation
+      # and when it holds both operations.
+      callers = [
+        [nil, 401, "unauthorized"],
+        [actor.user(user_id: owner.id, role: "owner"), 403, "forbidden"],
+        [actor.service(name: "invoice-boundary", company_id: company.id, operations: [other_operation.fetch(operation)]),
+         403, "forbidden"],
+        [actor.service(name: "invoice-boundary", company_id: other_company.id, operations: [granted_operation.fetch(operation)]),
+         404, "not_found"],
+        [actor.service(name: "invoice-boundary", company_id: other_company.id, operations: granted_operation.values),
+         404, "not_found"]
+      ]
 
-      callers.each do |caller, (status, reason)|
+      callers.each do |caller, status, reason|
         steps = []
         outcome = described_class.call(
           operation:, company_id: company.id, generation:, actor: caller,
@@ -110,51 +121,9 @@ RSpec.describe Timekeeping::LocalOwner, "service command access refusals" do
         # "Use `LocalOwner::ServiceAccess.call(actor:, operation:, company_id:)` from the sibling leaf, before any lock or read."
         expect(steps).to be_empty
         expect(timekeeping_row_counts).to eq(baseline)
-        expect([billable, agent_entry].map { |entry| entry.reload.attributes }).to eq(before)
+        expect(entries.map { |entry| entry.reload.attributes }).to eq(before)
       end
     end
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner, "service command receipts across callers" do
-  include LocalOwnerServiceCommandSetup
-
-  it "never replays a stored mark_billed answer to a refused caller of the same operation_id, and gives another company's service its own receipt" do
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    other_company = create(:company)
-    invoice_id = 501
-    own_entry, foreign_entry = [company, other_company].map do |owner_company|
-      entry = service_command_company_entry(owner_company, role: "employee", work_date: "2026-03-02", duration: 60.0)
-      reserve_service_command_entry(entry, invoice_id, state: "committed")
-      entry
-    end
-    operation_id = SecureRandom.uuid
-    params = { "invoice_id" => invoice_id, "operation_id" => operation_id }
-    actor = described_class::Actor
-    granted = actor.service(name: "invoice-boundary", company_id: company.id, operations: ["invoices.mark_billed"])
-    call = ->(caller, company_id) { described_class.call(operation: :mark_billed, company_id:, generation:, actor: caller, params:) }
-
-    first = call.call(granted, company.id)
-    expect([first.status, first.body]).to eq([200, { "billed" => 1 }])
-    baseline = timekeeping_row_counts
-    foreign_before = foreign_entry.reload.attributes
-
-    # A caller that access refuses learns nothing of the stored answer, even with the same service name and key.
-    ungranted = actor.service(name: "invoice-boundary", company_id: company.id, operations: ["agents.detach_entries"])
-    misbound = actor.service(name: "invoice-boundary", company_id: other_company.id, operations: ["invoices.mark_billed"])
-    expect([call.call(ungranted, company.id).status, call.call(ungranted, company.id).body]).to eq([403, { "reason" => "forbidden" }])
-    expect([call.call(misbound, company.id).status, call.call(misbound, company.id).body]).to eq([404, { "reason" => "not_found" }])
-    expect(timekeeping_row_counts).to eq(baseline)
-    expect(foreign_entry.reload.attributes).to eq(foreign_before)
-
-    # "The same operation_id from two services, or from two companies, gives separate receipts."
-    second = call.call(misbound, other_company.id)
-    expect([second.status, second.body]).to eq([200, { "billed" => 1 }])
-    expect(foreign_entry.reload.bill_status).to eq("billed")
-    expect(own_entry.reload.bill_status).to eq("billed")
-    receipts = described_class::Receipt.where(key: operation_id, actor_type: "service", actor_name: "invoice-boundary")
-    expect(receipts.pluck(:company_id)).to contain_exactly(company.id, other_company.id)
   end
 end
 
@@ -205,143 +174,6 @@ RSpec.describe Timekeeping::LocalOwner do
   end
 end
 
-RSpec.describe Timekeeping::LocalOwner, "mark_billed writes" do
-  include LocalOwnerServiceCommandSetup
-
-  it "mark_billed bills only the two committed entries of the invoice, each with version+1, one audit row and one outbox row, and stores one receipt" do
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    user = timekeeping_member(company, "employee")
-    project = create(:project, client: create(:client, company:))
-    x, y, provisional, other_invoice = Array.new(4) do
-      service_command_entry(company, user:, project:, work_date: "2026-03-02", duration: 60.0)
-    end
-    reserve_service_command_entry(x, 501, state: "committed")
-    reserve_service_command_entry(y, 501, state: "committed")
-    reserve_service_command_entry(provisional, 501, state: "provisional")
-    reserve_service_command_entry(other_invoice, 502, state: "committed")
-    entries = [x, y, provisional, other_invoice]
-    versions_before = entries.to_h { |entry| [entry.id, entry.reload.version] }
-    audits_before = entries.to_h { |entry| [entry.id, count_rows("entry_audits", entry.id)] }
-    counts_before = timekeeping_row_counts
-    actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
-                                           operations: ["invoices.mark_billed"])
-
-    # "mark_billed bills only the entries the invoice holds by committed reservation, writing version, audit, outbox and receipt in one transaction"
-    outcome = described_class.call(operation: :mark_billed, company_id: company.id, generation:, actor:,
-                                   params: { "invoice_id" => 501, "operation_id" => SecureRandom.uuid })
-
-    expect(outcome.status).to eq(200)
-    expect(outcome.body).to eq("billed" => 2)
-    expect(entries.map { |entry| entry.reload.bill_status }).to eq(%w[billed billed unbilled unbilled])
-    # "Each changed entry gets version + 1, one `entry_audits` row and one `entry_outbox_items` snapshot under the outbox advisory lock."
-    expect(entries.map { |entry| entry.reload.version - versions_before.fetch(entry.id) }).to eq([1, 1, 0, 0])
-    expect(entries.map { |entry| count_rows("entry_audits", entry.id) - audits_before.fetch(entry.id) }).to eq([1, 1, 0, 0])
-    counts_after = timekeeping_row_counts
-    expect(counts_after["entry_audits"] - counts_before["entry_audits"]).to eq(2)
-    expect(counts_after["entry_outbox_items"] - counts_before["entry_outbox_items"]).to eq(2)
-    expect(counts_after["idempotency_records"] - counts_before["idempotency_records"]).to eq(1)
-    expect(counts_after["entries"]).to eq(counts_before["entries"])
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner, "detach_entries retries" do
-  include LocalOwnerServiceCommandSetup
-
-  it "a retry of detach_entries at the current generation replays the first answer with no new rows and no version change, and a stale retry after the stored receipt answers 409 with nothing written" do
-    ownership = prepare_local_ownership!
-    generation = ownership.generation.to_s
-    company = create(:company)
-    user = timekeeping_member(company, "employee")
-    project = create(:project, client: create(:client, company:))
-    entries = Array.new(2) do
-      service_command_entry(company, user:, project:, work_date: "2026-03-02", duration: 60.0, agent_id: 77)
-    end
-    actor = described_class::Actor.service(name: "agent-destroy", company_id: company.id,
-                                           operations: ["agents.detach_entries"])
-    params = { "agent_id" => 77, "operation_id" => SecureRandom.uuid }
-    first = described_class.call(operation: :detach_entries, company_id: company.id, generation:, actor:, params:)
-    expect(first.status).to eq(200)
-    expect(first.body).to eq("detached" => 2)
-    counts_after_first = timekeeping_row_counts
-    versions_after_first = entries.map { |entry| entry.reload.version }
-
-    # "A retry at the current generation replays the first answer with no new rows."
-    replay = described_class.call(operation: :detach_entries, company_id: company.id, generation:, actor:, params:)
-    expect([replay.status, replay.body]).to eq([first.status, first.body])
-    expect(timekeeping_row_counts).to eq(counts_after_first)
-    expect(entries.map { |entry| entry.reload.version }).to eq(versions_after_first)
-
-    # "A stale body generation on mark_billed or detach_entries gives 409 stale_generation and writes nothing, including a retry whose earlier answer is stored"
-    ownership.update!(generation: ownership.generation + 1)
-    stale = described_class.call(operation: :detach_entries, company_id: company.id, generation:, actor:, params:)
-    expect(stale.status).to eq(409)
-    expect(stale.body).to eq("reason" => "stale_generation")
-    expect(timekeeping_row_counts).to eq(counts_after_first)
-    expect(entries.map { |entry| entry.reload.version }).to eq(versions_after_first)
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner, "mark_billed rollback at an injected failure" do
-  include LocalOwnerServiceCommandSetup
-
-  it "a failure injected after the entry write or the outbox write of mark_billed leaves no billed entry, audit, outbox row or receipt, and a later retry still runs" do
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    entry = service_command_company_entry(company, role: "employee", work_date: "2026-03-02", duration: 60.0)
-    reserve_service_command_entry(entry, 501, state: "committed")
-    actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
-                                           operations: ["invoices.mark_billed"])
-    params = { "invoice_id" => 501, "operation_id" => SecureRandom.uuid }
-    baseline = timekeeping_row_counts
-    entry_before = entry.reload.attributes
-    injected = Class.new(StandardError)
-
-    # "A failure injected after the entry write leaves no outbox row or receipt."
-    %i[entry_written outbox_written].each do |failing_step|
-      expect do
-        described_class.call(operation: :mark_billed, company_id: company.id, generation:, actor:, params:,
-                             checkpoint: ->(seen) { raise injected if seen == failing_step })
-      end.to raise_error(injected)
-      expect(timekeeping_row_counts).to eq(baseline)
-      expect(entry.reload.attributes).to eq(entry_before)
-    end
-
-    # Nothing was stored, so the same key runs as a first attempt.
-    outcome = described_class.call(operation: :mark_billed, company_id: company.id, generation:, actor:, params:)
-    expect(outcome.body).to eq("billed" => 1)
-    expect(entry.reload.bill_status).to eq("billed")
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner, "service receipts per service and company" do
-  include LocalOwnerServiceCommandSetup
-
-  it "one operation_id from two services and from two companies runs each detach_entries and stores separate receipts" do
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    other_company = create(:company)
-    first_entry, second_entry, foreign_entry = [[company, 77], [company, 78], [other_company, 77]].map do |owner_company, agent_id|
-      service_command_company_entry(owner_company, role: "employee", work_date: "2026-03-02", duration: 60.0, agent_id:)
-    end
-    operation_id = SecureRandom.uuid
-    detach = lambda do |owner_company, name, agent_id|
-      actor = described_class::Actor.service(name:, company_id: owner_company.id, operations: ["agents.detach_entries"])
-      described_class.call(operation: :detach_entries, company_id: owner_company.id, generation:, actor:,
-                           params: { "agent_id" => agent_id, "operation_id" => operation_id })
-    end
-    receipts_before = timekeeping_row_counts["idempotency_records"]
-
-    # "The same operation_id from two services, or from two companies, gives separate receipts."
-    expect(detach.call(company, "agent-destroy", 77).body).to eq("detached" => 1)
-    expect(detach.call(company, "agent-cleanup", 78).body).to eq("detached" => 1)
-    expect(detach.call(other_company, "agent-destroy", 77).body).to eq("detached" => 1)
-
-    expect(timekeeping_row_counts["idempotency_records"] - receipts_before).to eq(3)
-    expect([first_entry, second_entry, foreign_entry].map { |entry| entry.reload.agent_id }).to eq([nil, nil, nil])
-  end
-end
-
 RSpec.describe Timekeeping::LocalOwner, "service command key reuse" do
   include LocalOwnerServiceCommandSetup
 
@@ -350,7 +182,7 @@ RSpec.describe Timekeeping::LocalOwner, "service command key reuse" do
     company = create(:company)
     user = timekeeping_member(company, "employee")
     project = create(:project, client: create(:client, company:))
-    service_command_entry(company, user:, project:, work_date: "2026-03-02", duration: 60.0, agent_id: 77)
+    detached_entry = service_command_entry(company, user:, project:, work_date: "2026-03-02", duration: 60.0, agent_id: 77)
     other_agent_entry = service_command_entry(company, user:, project:, work_date: "2026-03-02", duration: 60.0, agent_id: 78)
     actor = described_class::Actor.service(name: "agent-destroy", company_id: company.id,
                                            operations: ["agents.detach_entries"])
@@ -358,6 +190,7 @@ RSpec.describe Timekeeping::LocalOwner, "service command key reuse" do
     first = described_class.call(operation: :detach_entries, company_id: company.id, generation:, actor:,
                                  params: { "agent_id" => 77, "operation_id" => operation_id })
     expect(first.body).to eq("detached" => 1)
+    expect(detached_entry.reload.agent_id).to be_nil
     baseline = timekeeping_row_counts
     other_before = other_agent_entry.reload.attributes
 
@@ -369,35 +202,6 @@ RSpec.describe Timekeeping::LocalOwner, "service command key reuse" do
     expect(reused.status).to eq(described_class::STATUS.fetch(:idempotency_key_reused))
     expect(timekeeping_row_counts).to eq(baseline)
     expect(other_agent_entry.reload.attributes).to eq(other_before)
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner, "detach_entries tenant boundary" do
-  include LocalOwnerServiceCommandSetup
-
-  it "detach_entries clears agent 77 on the caller company's entries and leaves another company's entry with agent 77 untouched" do
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    other_company = create(:company)
-    *own_entries, foreign_entry = [company, company, other_company].map do |owning_company|
-      service_command_company_entry(owning_company, role: "employee", work_date: "2026-03-02", duration: 60.0, agent_id: 77)
-    end
-    foreign_before = foreign_entry.reload.attributes
-    foreign_audits_before = count_rows("entry_audits", foreign_entry.id)
-    outbox_before = timekeeping_row_counts["entry_outbox_items"]
-    actor = described_class::Actor.service(name: "agent-destroy", company_id: company.id, operations: ["agents.detach_entries"])
-
-    # "detach_entries clears one agent on the caller company's entries only, leaving another company's entries unchanged"
-    outcome = described_class.call(operation: :detach_entries, company_id: company.id, generation:, actor:,
-                                   params: { "agent_id" => 77, "operation_id" => SecureRandom.uuid })
-
-    expect(outcome.status).to eq(200)
-    expect(outcome.body).to eq("detached" => 2)
-    expect(own_entries.map { |entry| entry.reload.agent_id }).to eq([nil, nil])
-    expect(foreign_entry.reload.attributes).to eq(foreign_before)
-    expect(count_rows("entry_audits", foreign_entry.id)).to eq(foreign_audits_before)
-    # Only the caller company's two changed entries get an outbox snapshot.
-    expect(timekeeping_row_counts["entry_outbox_items"]).to eq(outbox_before + 2)
   end
 end
 
@@ -471,44 +275,6 @@ RSpec.describe Timekeeping::LocalOwner, "service commands refuse another company
   end
 end
 
-RSpec.describe Timekeeping::LocalOwner, "service receipts per company" do
-  include LocalOwnerServiceCommandSetup
-
-  it "the same operation_id and service name from two companies runs detach_entries in each company with its own receipt" do
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    other_company = create(:company)
-    own_entry, foreign_entry = [company, other_company].map do |owning_company|
-      service_command_company_entry(owning_company, role: "employee", work_date: "2026-03-02", duration: 60.0, agent_id: 77)
-    end
-    operation_id = SecureRandom.uuid
-    receipts = lambda do |owning_company|
-      ActiveRecord::Base.connection.select_value(ActiveRecord::Base.sanitize_sql_array(
-        ["SELECT COUNT(*) FROM idempotency_records WHERE company_id = ? AND key = ? AND actor_type = 'service'",
-         owning_company.id, operation_id]
-      )).to_i
-    end
-    detach = lambda do |owning_company|
-      actor = described_class::Actor.service(name: "agent-destroy", company_id: owning_company.id,
-                                             operations: ["agents.detach_entries"])
-      described_class.call(operation: :detach_entries, company_id: owning_company.id, generation:, actor:,
-                           params: { "agent_id" => 77, "operation_id" => operation_id })
-    end
-
-    # "The same operation_id from two services, or from two companies, gives separate receipts."
-    first = detach.call(company)
-    expect(foreign_entry.reload.agent_id).to eq(77)
-    second = detach.call(other_company)
-
-    expect([first.status, first.body]).to eq([200, { "detached" => 1 }])
-    # The second company's command runs on its own entry; it is not a replay of the first.
-    expect([second.status, second.body]).to eq([200, { "detached" => 1 }])
-    expect(own_entry.reload.agent_id).to be_nil
-    expect(foreign_entry.reload.agent_id).to be_nil
-    expect([receipts.call(company), receipts.call(other_company)]).to eq([1, 1])
-  end
-end
-
 RSpec.describe Timekeeping::LocalOwner, "mark_billed on committed reservations" do
   include LocalOwnerServiceCommandSetup
 
@@ -569,6 +335,7 @@ RSpec.describe Timekeeping::LocalOwner, "detach_entries within one company" do
     foreign_before = foreign.reload.attributes
     other_agent_before = other_agent.reload.attributes
     own_versions = own.map { |entry| entry.reload.version }
+    outbox_before = timekeeping_row_counts["entry_outbox_items"]
     actor = described_class::Actor.service(name: "agent-destroy", company_id: company.id, operations: ["agents.detach_entries"])
 
     # "detach_entries clears one agent on the caller company's entries only, leaving another company's entries unchanged"
@@ -587,6 +354,8 @@ RSpec.describe Timekeeping::LocalOwner, "detach_entries within one company" do
     expect(count_rows("entry_audits", foreign.id)).to eq(0)
     expect(count_rows("entry_outbox_items", foreign.id)).to eq(0)
     expect(other_agent.reload.attributes).to eq(other_agent_before)
+    # Only the caller company's two changed entries get an outbox snapshot.
+    expect(timekeeping_row_counts["entry_outbox_items"]).to eq(outbox_before + 2)
   end
 end
 
@@ -594,7 +363,8 @@ RSpec.describe Timekeeping::LocalOwner, "service command retries" do
   include LocalOwnerServiceCommandSetup
 
   it "a retry at a stale generation after a stored receipt answers 409 stale_generation and writes nothing, while a retry at the current generation replays the first answer with no new rows" do
-    generation = prepare_local_ownership!.generation.to_s
+    ownership = prepare_local_ownership!
+    generation = ownership.generation.to_s
     stale = (Integer(generation, 10) - 1).to_s
     company = create(:company)
     owner = timekeeping_member(company, "owner")
@@ -606,9 +376,9 @@ RSpec.describe Timekeeping::LocalOwner, "service command retries" do
     actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
                                            operations: ["invoices.mark_billed", "agents.detach_entries"])
     commands = { mark_billed: { "invoice_id" => invoice.id }, detach_entries: { "agent_id" => 77 } }
+    stored_params = commands.to_h { |operation, target| [operation, target.merge("operation_id" => SecureRandom.uuid)] }
 
-    commands.each do |operation, target|
-      params = target.merge("operation_id" => SecureRandom.uuid)
+    stored_params.each do |operation, params|
       first = described_class.call(operation:, company_id: company.id, generation:, actor:, params:)
       expect(first.status).to eq(200)
       baseline = timekeeping_row_counts
@@ -626,120 +396,19 @@ RSpec.describe Timekeeping::LocalOwner, "service command retries" do
       expect(timekeeping_row_counts).to eq(baseline)
       expect([billable, agent_entry].map { |entry| entry.reload.attributes }).to eq(entries_before)
     end
-  end
-end
 
-RSpec.describe Timekeeping::LocalOwner, "service command key reuse" do
-  include LocalOwnerServiceCommandSetup
-
-  it "the same operation_id for a different agent answers idempotency_key_reused and changes nothing" do
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    first_agent_entry, second_agent_entry = [77, 78].map do |agent_id|
-      service_command_entry(company, user: owner, project:, work_date: Date.current, duration: 30.0, note: "n", agent_id:)
-    end
-    actor = described_class::Actor.service(name: "agent-destroy", company_id: company.id, operations: ["agents.detach_entries"])
-    operation_id = SecureRandom.uuid
-
-    first = described_class.call(operation: :detach_entries, company_id: company.id, generation:, actor:,
-                                 params: { "agent_id" => 77, "operation_id" => operation_id })
-    expect(first.body).to eq("detached" => 1)
-    expect(first_agent_entry.reload.agent_id).to be_nil
+    # The ownership generation moves on after both receipts are stored, so the generation each
+    # stored answer was given under is now stale too.
+    ownership.update!(generation: ownership.generation + 1)
     baseline = timekeeping_row_counts
-    second_before = second_agent_entry.reload.attributes
+    versions = Timekeeping::LocalEntry.where(company_id: company.id).order(:id).pluck(:id, :version)
 
-    # "A reused key with a different target answers `idempotency_key_reused`."
-    reused = described_class.call(operation: :detach_entries, company_id: company.id, generation:, actor:,
-                                  params: { "agent_id" => 78, "operation_id" => operation_id })
+    stored_params.each do |operation, params|
+      retry_outcome = described_class.call(operation:, company_id: company.id, generation:, actor:, params:)
 
-    expect(reused.body).to eq("reason" => "idempotency_key_reused")
-    expect(reused.status).to eq(described_class::STATUS.fetch(:idempotency_key_reused))
-    expect(timekeeping_row_counts).to eq(baseline)
-    expect(second_agent_entry.reload.attributes).to eq(second_before)
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner, "service receipts per service and company" do
-  include LocalOwnerServiceCommandSetup
-
-  it "the same operation_id from two services and from two companies gives separate receipts and each command runs" do
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    other_company = create(:company)
-    entry_attributes = { role: "owner", work_date: Date.current, duration: 30.0, note: "n", agent_id: 77 }
-    first_entry = service_command_company_entry(company, **entry_attributes)
-    foreign_entry = service_command_company_entry(other_company, **entry_attributes)
-    operation_id = SecureRandom.uuid
-    grant = ["agents.detach_entries"]
-    receipts = -> { timekeeping_row_counts(%w[idempotency_records]).fetch("idempotency_records") }
-    start = receipts.call
-
-    # "The same operation_id from two services, or from two companies, gives separate receipts"
-    first = described_class.call(operation: :detach_entries, company_id: company.id, generation:,
-                                 actor: described_class::Actor.service(name: "agent-destroy", company_id: company.id, operations: grant),
-                                 params: { "agent_id" => 77, "operation_id" => operation_id })
-    expect(first.body).to eq("detached" => 1)
-    expect(first_entry.reload.agent_id).to be_nil
-
-    second_entry = service_command_company_entry(company, **entry_attributes)
-    other_service = described_class.call(operation: :detach_entries, company_id: company.id, generation:,
-                                         actor: described_class::Actor.service(name: "agent-cleanup", company_id: company.id, operations: grant),
-                                         params: { "agent_id" => 77, "operation_id" => operation_id })
-    expect(other_service.body).to eq("detached" => 1)
-    expect(second_entry.reload.agent_id).to be_nil
-
-    other_company_answer = described_class.call(operation: :detach_entries, company_id: other_company.id, generation:,
-                                                actor: described_class::Actor.service(name: "agent-destroy", company_id: other_company.id, operations: grant),
-                                                params: { "agent_id" => 77, "operation_id" => operation_id })
-    expect(other_company_answer.body).to eq("detached" => 1)
-    expect(foreign_entry.reload.agent_id).to be_nil
-
-    expect(receipts.call).to eq(start + 3)
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner, "service command callers" do
-  include LocalOwnerServiceCommandSetup
-
-  it "service commands refuse nil, user, ungranted and other-company callers with 401, 403, 403 and 404 and change nothing" do
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    other_company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    invoice = create(:invoice, company:, client: project.client)
-    billable = service_command_entry(company, user: owner, project:, work_date: Date.current, duration: 30.0, note: "n", agent_id: 77)
-    reserve_service_command_entry(billable, invoice.id, state: "committed")
-    baseline = timekeeping_row_counts
-    entry_before = billable.reload.attributes
-    actor = described_class::Actor
-    both = ["invoices.mark_billed", "agents.detach_entries"]
-    commands = {
-      mark_billed: [{ "invoice_id" => invoice.id }, ["agents.detach_entries"]],
-      detach_entries: [{ "agent_id" => 77 }, ["invoices.mark_billed"]]
-    }
-
-    # "A nil actor answers unauthorized, a user actor or a service without the qualified operation (invoices.mark_billed, agents.detach_entries) answers forbidden, and a service bound to another company answers not_found, all with nothing changed"
-    commands.each do |operation, (target, other_grant)|
-      callers = {
-        nil => [401, "unauthorized"],
-        actor.user(user_id: owner.id, role: "owner") => [403, "forbidden"],
-        actor.service(name: "invoice-boundary", company_id: company.id, operations: other_grant) => [403, "forbidden"],
-        actor.service(name: "invoice-boundary", company_id: other_company.id, operations: both) => [404, "not_found"]
-      }
-      callers.each do |caller, (status, reason)|
-        steps = []
-        outcome = described_class.call(operation:, company_id: company.id, generation:, actor: caller,
-                                       params: target.merge("operation_id" => SecureRandom.uuid),
-                                       checkpoint: ->(step) { steps << step })
-
-        expect([operation, outcome.status, outcome.body]).to eq([operation, status, { "reason" => reason }])
-        expect(steps).to be_empty
-        expect(timekeeping_row_counts).to eq(baseline)
-        expect(billable.reload.attributes).to eq(entry_before)
-      end
+      expect([operation, retry_outcome.status, retry_outcome.body]).to eq([operation, 409, { "reason" => "stale_generation" }])
+      expect(timekeeping_row_counts).to eq(baseline)
+      expect(Timekeeping::LocalEntry.where(company_id: company.id).order(:id).pluck(:id, :version)).to eq(versions)
     end
   end
 end
@@ -747,7 +416,7 @@ end
 RSpec.describe Timekeeping::LocalOwner, "service command rollback" do
   include LocalOwnerServiceCommandSetup
 
-  it "a failure injected at entry_written or outbox_written leaves no entry change, audit, outbox row or receipt" do
+  it "a failure injected at entry_written or outbox_written leaves no entry change, audit, outbox row or receipt, and a later retry with the same key still runs" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
     owner = timekeeping_member(company, "owner")
@@ -758,10 +427,16 @@ RSpec.describe Timekeeping::LocalOwner, "service command rollback" do
     actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
                                            operations: ["invoices.mark_billed", "agents.detach_entries"])
     injected = Class.new(StandardError)
-    commands = { mark_billed: { "invoice_id" => invoice.id }, detach_entries: { "agent_id" => 77 } }
+    commands = {
+      mark_billed: [{ "invoice_id" => invoice.id }, { "billed" => 1 }],
+      detach_entries: [{ "agent_id" => 77 }, { "detached" => 1 }]
+    }
 
     # "A failure injected after the entry write leaves no outbox row or receipt."
-    commands.each do |operation, target|
+    commands.each do |operation, (target, answer)|
+      # Every failing call and the retry share one key, so the retry shows that no failure left a
+      # receipt behind for that key.
+      params = target.merge("operation_id" => SecureRandom.uuid)
       %i[entry_written outbox_written].each do |step|
         expect(described_class::STEPS).to include(step)
         baseline = timekeeping_row_counts
@@ -770,7 +445,7 @@ RSpec.describe Timekeeping::LocalOwner, "service command rollback" do
 
         expect {
           described_class.call(operation:, company_id: company.id, generation:, actor:,
-                               params: target.merge("operation_id" => SecureRandom.uuid),
+                               params:,
                                checkpoint: lambda { |seen|
                                  seen_steps << seen
                                  raise injected if seen == step
@@ -781,110 +456,110 @@ RSpec.describe Timekeeping::LocalOwner, "service command rollback" do
         expect(timekeeping_row_counts).to eq(baseline)
         expect(entry.reload.attributes).to eq(entry_before)
       end
+
+      # Nothing was stored, so the same key runs as a first attempt.
+      outcome = described_class.call(operation:, company_id: company.id, generation:, actor:, params:)
+      expect([operation, outcome.status, outcome.body]).to eq([operation, 200, answer])
     end
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner, "service command retries at a stale generation" do
-  include LocalOwnerServiceCommandSetup
-
-  it "a retry at a stale generation whose earlier answer is stored answers 409 stale_generation on mark_billed and detach_entries and writes nothing" do
-    ownership = prepare_local_ownership!
-    generation = ownership.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    billable = service_command_entry(company, user: owner, project:, work_date: "2026-03-02", duration: 60.0)
-    reserve_service_command_entry(billable, 501, state: "committed")
-    service_command_entry(company, user: owner, project:, work_date: "2026-03-02", duration: 60.0, agent_id: 77)
-    actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
-                                           operations: %w[invoices.mark_billed agents.detach_entries])
-    commands = { mark_billed: { "invoice_id" => 501 }, detach_entries: { "agent_id" => 77 } }
-    keys = commands.keys.index_with { SecureRandom.uuid }
-
-    commands.each do |operation, target|
-      first = described_class.call(operation:, company_id: company.id, generation:, actor:,
-                                   params: target.merge("operation_id" => keys.fetch(operation)))
-      expect(first.status).to eq(200)
-    end
-
-    ownership.update!(generation: ownership.generation + 1)
-    baseline = timekeeping_row_counts
-    versions = Timekeeping::LocalEntry.where(company_id: company.id).order(:id).pluck(:id, :version)
-
-    # "A stale body generation on mark_billed or detach_entries gives 409 stale_generation and writes nothing, including a retry whose earlier answer is stored"
-    commands.each do |operation, target|
-      retry_outcome = described_class.call(operation:, company_id: company.id, generation:, actor:,
-                                           params: target.merge("operation_id" => keys.fetch(operation)))
-      expect([operation, retry_outcome.status, retry_outcome.body]).to eq([operation, 409, { "reason" => "stale_generation" }])
-    end
-    expect(timekeeping_row_counts).to eq(baseline)
-    expect(Timekeeping::LocalEntry.where(company_id: company.id).order(:id).pluck(:id, :version)).to eq(versions)
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner, "service command key reused for another target" do
-  include LocalOwnerServiceCommandSetup
-
-  it "the same operation_id reused for a different agent answers idempotency_key_reused and leaves that agent's entries untouched" do
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    first_agent_entry, second_agent_entry = [77, 78].map do |agent_id|
-      service_command_entry(company, user: owner, project:, work_date: "2026-03-02", duration: 60.0, agent_id:)
-    end
-    actor = described_class::Actor.service(name: "agent-destroy", company_id: company.id, operations: %w[agents.detach_entries])
-    operation_id = SecureRandom.uuid
-
-    first = described_class.call(operation: :detach_entries, company_id: company.id, generation:, actor:,
-                                 params: { "agent_id" => 77, "operation_id" => operation_id })
-    expect(first.body).to eq("detached" => 1)
-    expect(first_agent_entry.reload.agent_id).to be_nil
-    baseline = timekeeping_row_counts
-    second_before = second_agent_entry.reload.attributes
-
-    # "A reused key with a different target answers `idempotency_key_reused`."
-    reused = described_class.call(operation: :detach_entries, company_id: company.id, generation:, actor:,
-                                  params: { "agent_id" => 78, "operation_id" => operation_id })
-
-    expect(reused.status).to eq(described_class::STATUS.fetch(:idempotency_key_reused))
-    expect(reused.body).to include("reason" => "idempotency_key_reused")
-    expect(second_agent_entry.reload.attributes).to eq(second_before)
-    expect(timekeeping_row_counts).to eq(baseline)
+    expect(entry.reload.attributes.values_at("bill_status", "agent_id")).to eq(["billed", nil])
   end
 end
 
 RSpec.describe Timekeeping::LocalOwner, "service command receipts per service and company" do
   include LocalOwnerServiceCommandSetup
 
-  it "one operation_id sent by two services and by two companies runs each command and stores a separate receipt for each" do
+  it "one operation_id sent by two services and by two companies runs each command and stores a separate receipt for each, and never replays a stored answer to a refused caller" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
     other_company = create(:company)
-    entries = [company, company, other_company].map do |owning|
-      service_command_company_entry(owning, role: "owner", work_date: "2026-03-02", duration: 60.0, agent_id: 77)
+    actor = described_class::Actor
+    receipt_owners = lambda do |operation_id|
+      described_class::Receipt.where(key: operation_id, actor_type: "service").pluck(:company_id, :actor_name)
     end
-    operation_id = SecureRandom.uuid
-    grant = %w[agents.detach_entries]
-    callers = [
-      [company, described_class::Actor.service(name: "agent-destroy", company_id: company.id, operations: grant)],
-      [company, described_class::Actor.service(name: "agent-cleanup", company_id: company.id, operations: grant)],
-      [other_company, described_class::Actor.service(name: "agent-destroy", company_id: other_company.id, operations: grant)]
-    ]
-    receipts_before = timekeeping_row_counts["idempotency_records"]
+
+    # mark_billed: both companies hold a committed reservation for the same invoice number.
+    invoice_id = 501
+    own_billable, foreign_billable = [company, other_company].map do |owning|
+      entry = service_command_company_entry(owning, role: "employee", work_date: "2026-03-02", duration: 60.0)
+      reserve_service_command_entry(entry, invoice_id, state: "committed")
+      entry
+    end
+    bill_params = { "invoice_id" => invoice_id, "operation_id" => SecureRandom.uuid }
+    bill = lambda do |caller, company_id|
+      described_class.call(operation: :mark_billed, company_id:, generation:, actor: caller, params: bill_params)
+    end
+    invoice_service = actor.service(name: "invoice-boundary", company_id: company.id, operations: ["invoices.mark_billed"])
+    foreign_invoice_service = actor.service(name: "invoice-boundary", company_id: other_company.id, operations: ["invoices.mark_billed"])
+
+    first_bill = bill.call(invoice_service, company.id)
+    expect([first_bill.status, first_bill.body]).to eq([200, { "billed" => 1 }])
+    baseline = timekeeping_row_counts
+    foreign_billable_before = foreign_billable.reload.attributes
+
+    # A caller that access refuses learns nothing of the stored answer, even with the same service name and key.
+    [
+      [actor.service(name: "invoice-boundary", company_id: company.id, operations: ["agents.detach_entries"]), 403, "forbidden"],
+      [foreign_invoice_service, 404, "not_found"]
+    ].each do |caller, status, reason|
+      refused = bill.call(caller, company.id)
+      expect([refused.status, refused.body]).to eq([status, { "reason" => reason }])
+      expect(timekeeping_row_counts).to eq(baseline)
+      expect(foreign_billable.reload.attributes).to eq(foreign_billable_before)
+    end
 
     # "The same operation_id from two services, or from two companies, gives separate receipts"
-    answers = callers.map do |owning, actor|
-      described_class.call(operation: :detach_entries, company_id: owning.id, generation:, actor:,
-                           params: { "agent_id" => 77, "operation_id" => operation_id }).body
+    foreign_bill = bill.call(foreign_invoice_service, other_company.id)
+    expect([foreign_bill.status, foreign_bill.body]).to eq([200, { "billed" => 1 }])
+    expect([own_billable, foreign_billable].map { |entry| entry.reload.bill_status }).to eq(%w[billed billed])
+    expect(receipt_owners.call(bill_params["operation_id"]))
+      .to contain_exactly([company.id, "invoice-boundary"], [other_company.id, "invoice-boundary"])
+
+    # detach_entries: two entries with agent 77 and one with agent 78 in the first company, one with
+    # agent 77 in the other.
+    entries = [[company, 77], [company, 77], [company, 78], [other_company, 77]].map do |owning, agent_id|
+      service_command_company_entry(owning, role: "owner", work_date: "2026-03-02", duration: 60.0, agent_id:)
     end
+    foreign_entry = entries.last
+    detach_operation_id = SecureRandom.uuid
+    grant = %w[agents.detach_entries]
+    detach = lambda do |owning, caller, agent_id|
+      described_class.call(operation: :detach_entries, company_id: owning.id, generation:, actor: caller,
+                           params: { "agent_id" => agent_id, "operation_id" => detach_operation_id })
+    end
+    foreign_destroy_service = actor.service(name: "agent-destroy", company_id: other_company.id, operations: grant)
+    receipts_before = timekeeping_row_counts["idempotency_records"]
+
+    first_detach = detach.call(company, actor.service(name: "agent-destroy", company_id: company.id, operations: grant), 77)
+    expect(first_detach.body).to eq("detached" => 2)
+    expect(foreign_entry.reload.agent_id).to eq(77)
+    baseline = timekeeping_row_counts
+    entries_before = entries.map { |entry| entry.reload.attributes }
+
+    [
+      [actor.service(name: "agent-destroy", company_id: company.id, operations: ["invoices.mark_billed"]), 403, "forbidden"],
+      [foreign_destroy_service, 404, "not_found"]
+    ].each do |caller, status, reason|
+      refused = detach.call(company, caller, 77)
+      expect([refused.status, refused.body]).to eq([status, { "reason" => reason }])
+      expect(timekeeping_row_counts).to eq(baseline)
+      expect(entries.map { |entry| entry.reload.attributes }).to eq(entries_before)
+    end
+
+    answers = [
+      detach.call(company, actor.service(name: "agent-cleanup", company_id: company.id, operations: grant), 77),
+      # Another service may send the same key for another agent: it gets its own receipt, not idempotency_key_reused.
+      detach.call(company, actor.service(name: "agent-sweep", company_id: company.id, operations: grant), 78),
+      detach.call(other_company, foreign_destroy_service, 77)
+    ].map(&:body)
 
     # The second service of the first company finds no entry left with agent 77, so a replay of the
     # first service's answer would show "detached" => 2 instead of its own 0.
-    expect(answers).to eq([{ "detached" => 2 }, { "detached" => 0 }, { "detached" => 1 }])
-    expect(timekeeping_row_counts["idempotency_records"]).to eq(receipts_before + 3)
-    expect(entries.map { |entry| entry.reload.agent_id }).to eq([nil, nil, nil])
+    expect(answers).to eq([{ "detached" => 0 }, { "detached" => 1 }, { "detached" => 1 }])
+    expect(timekeeping_row_counts["idempotency_records"]).to eq(receipts_before + 4)
+    expect(receipt_owners.call(detach_operation_id)).to contain_exactly(
+      [company.id, "agent-destroy"], [company.id, "agent-cleanup"], [company.id, "agent-sweep"], [other_company.id, "agent-destroy"]
+    )
+    expect(entries.map { |entry| entry.reload.agent_id }).to eq([nil, nil, nil, nil])
   end
 end
 
