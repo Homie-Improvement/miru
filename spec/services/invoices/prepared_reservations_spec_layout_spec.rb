@@ -62,6 +62,22 @@ RSpec.describe "prepared reservations spec layout" do
     expect(owners.size).to eq(1)
   end
 
+  # "... redelivered commit and late abort (231, 645, 918, 964), keeping both orderings; ..."
+  it "prepared reservations spec runs both redelivery orderings inside one example" do
+    committed_operations = /eq\((\["committed"\]|%w\[committed\])\)/
+    aborted_operations = /eq\((\["aborted"\]|%w\[aborted\])\)/
+    owners = prepared_layout_examples.select do |example|
+      example.match?(committed_operations) && example.match?(aborted_operations) &&
+        example.include?(".commit(") && example.include?(".abort(")
+    end
+
+    expect(owners.size).to eq(1)
+    # Commit then abort leaves the first operation committed; abort then commit leaves the second aborted.
+    owner = owners.first
+    expect(owner.scan(".commit(").size).to be >= 3
+    expect(owner.scan(".abort(").size).to be >= 2
+  end
+
   # "Put the file under one RSpec.describe that includes PreparedReservationsSpecSupport."
   # The per-group ownership `before` blocks are near-copies of one setup; the line-claim examples still flip
   # ownership inline, inside their examples, after building legacy-owner fixtures.
