@@ -53,5 +53,5 @@ The failure does not show at save time: the invoice save commits, and only the l
 ## Evidence
 
 - PR #219, `app/services/invoices/prepared_reservations.rb`: `make_desired_set_the_reservation_set` and its comment on the one-committed-per-entry index; `claimed_ids` adds provisional rows for entries this invoice retains.
-- `spec/services/invoices/prepared_reservations_spec.rb` in PR #219: "reclaiming a retained entry" and "an invoice that reclaims an entry it only retains commits to one active committed row without a unique violation" expect a single `committed`/`active` row and no operation left `prepared`.
+- `spec/services/invoices/prepared_reservations_spec.rb`: the "reclaiming a retained entry" group expects a single `committed`/`active` row after the reclaim, and every operation of the invoice `committed`, so none is left `prepared`.
 - The PR body records this as a step beyond the written rule: commit also drops the invoice's own retained row on an entry it claims again, so the one-committed-row index holds.

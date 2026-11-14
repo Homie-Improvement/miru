@@ -4,7 +4,8 @@
 
 require "rails_helper"
 
-RSpec.describe "MCP write tools through the entry gateway" do
+# The entries stay in the legacy store here, so a write that gets through the gateway leaves a local row.
+RSpec.describe "MCP time write tools through the entry gateway" do
   around do |example|
     Rails.cache.clear
     example.run
@@ -15,137 +16,69 @@ RSpec.describe "MCP write tools through the entry gateway" do
   let(:user) { create(:user, current_workspace_id: company.id) }
   let(:project) { create(:project, billable: true, client: create(:client, company:)) }
   let(:cli_token) { CliSession.issue_for(user:, company:).last }
-  let(:server_context) { { authorization: cli_token } }
 
   before do
     create(:employment, company:, user:)
     create(:project_member, project:, user:)
     user.add_role :employee, company
-  end
-
-  it "returns 503 ownership_moving from miru.time.create during a handoff, caches nothing, and writes exactly one entry on the retry after it" do
-    TimekeepingOwnership.current.update!(handoff_step: "close_admission")
-    create_entry = lambda do
-      MCP::Miru::Tools::TimeCreateTool.call(
-        project_id: project.id, duration_minutes: 30, work_date: Date.current.iso8601,
-        note: "Through MCP", idempotency_key: "mcp-handoff-1", server_context:
-      )
-    end
-
-    refused = create_entry.call
-    refused_payload = JSON.parse(refused.content.first.fetch(:text))
-
-    # "handoff_step set gives 503 ownership_moving from both controllers, including CLI calls made in-process by MCP"
-    # "Make sure no rescue in the CLI, MCP or agent path turns a gateway refusal into a generic error."
-    expect(refused.error?).to eq(true)
-    expect(refused_payload["status"]).to eq(503)
-    expect(refused_payload.dig("data", "reason")).to eq("ownership_moving")
-    expect(refused_payload.to_json).not_to include("REQUEST_FAILED")
-    expect(TimesheetEntry.where(user:)).not_to exist
-
-    TimekeepingOwnership.current.update!(handoff_step: nil)
-
-    expect { create_entry.call }.to change { TimesheetEntry.where(user:).count }.from(0).to(1)
-    expect { create_entry.call }.not_to change { TimesheetEntry.where(user:).count }
-  end
-end
-
-RSpec.describe "MCP time write tools through the entry gateway" do
-  let(:company) { create(:company, plan_tier: "paid") }
-  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
-  let(:user) { create(:user, current_workspace_id: company.id) }
-  let(:cli_token) { CliSession.issue_for(user:, company:).last }
-  let(:server_context) { { authorization: "Bearer #{cli_token}", host: "www.example.com" } }
-
-  around do |example|
-    Rails.cache.clear
-    example.run
-    Rails.cache.clear
-  end
-
-  before do
-    create(:employment, company:, user:)
-    user.add_role :employee, company
-    create(:project_member, project:, user:)
   end
 
   def mcp_gateway_payload(response)
     JSON.parse(response.content.first.fetch(:text))
   end
 
-  it "returns 503 ownership_moving from in-process MCP time writes during a handoff, never REQUEST_FAILED, and does not replay it afterwards" do
-    entry = create(:timesheet_entry, user:, project:, work_date: Date.current, duration: 30)
-    TimekeepingOwnership.current.update!(handoff_step: "close_admission")
+  # The MCP tools accept a bare CLI token and prefix it with "Bearer ", or take an already prefixed one with
+  # a host; the two shapes take different branches before the in-process CLI call.
+  {
+    "a bare CLI token" => ->(token) { { authorization: token } },
+    "a Bearer CLI token and a host" => ->(token) { { authorization: "Bearer #{token}", host: "www.example.com" } }
+  }.each do |credential_shape, build_server_context|
+    context "with #{credential_shape}" do
+      let(:server_context) { build_server_context.call(cli_token) }
 
-    responses = [
-      MCP::Miru::Tools::TimeCreateTool.call(project_id: project.id, duration_minutes: 20, work_date: Date.current.iso8601,
-                                            idempotency_key: "handoff-create", server_context:),
-      MCP::Miru::Tools::TimeUpdateTool.call(id: entry.id, project_id: project.id, duration_minutes: 45,
-                                            work_date: Date.current.iso8601, server_context:),
-      MCP::Miru::Tools::TimeDeleteTool.call(id: entry.id, server_context:)
-    ]
+      # "handoff_step set gives 503 ownership_moving from both controllers, including CLI calls made in-process by MCP"
+      # "Make sure no rescue in the CLI, MCP or agent path turns a gateway refusal into a generic error."
+      # The create is delivered again under the same idempotency key after the handoff: a cached refusal would
+      # hide the retryable 503 and block the write.
+      it "answers MCP time writes during a handoff with 503 ownership_moving, never REQUEST_FAILED, and writes exactly one entry on the retry after it" do
+        entry = create(:timesheet_entry, user:, project:, work_date: Date.current, duration: 30)
+        TimekeepingOwnership.current.update!(handoff_step: "close_admission")
+        create_entry = lambda do
+          MCP::Miru::Tools::TimeCreateTool.call(
+            project_id: project.id, duration_minutes: 20, work_date: Date.current.iso8601,
+            note: "During handoff", idempotency_key: "mcp-handoff-create", server_context:
+          )
+        end
 
-    # "handoff_step set gives 503 from both controllers, including a CLI call that MCP makes in-process."
-    responses.each do |response|
-      payload = mcp_gateway_payload(response)
-      expect(response.error?).to eq(true)
-      expect(payload["status"]).to eq(503)
-      expect(payload.dig("data", "reason")).to eq("ownership_moving")
-      expect(payload.to_json).not_to include("REQUEST_FAILED")
+        [
+          create_entry,
+          -> {
+            MCP::Miru::Tools::TimeUpdateTool.call(id: entry.id, project_id: project.id, duration_minutes: 45,
+                                                  work_date: Date.current.iso8601, server_context:)
+          },
+          -> { MCP::Miru::Tools::TimeDeleteTool.call(id: entry.id, server_context:) }
+        ].each do |write|
+          refused = write.call
+          payload = mcp_gateway_payload(refused)
+
+          expect(refused.error?).to be(true)
+          expect(payload["status"]).to eq(503)
+          expect(payload.dig("data", "reason")).to eq("ownership_moving")
+          expect(payload.to_json).not_to include("REQUEST_FAILED")
+          expect(payload.dig("details", "code")).not_to eq("REQUEST_FAILED")
+          expect(TimesheetEntry.where(user:).count).to eq(1)
+          expect(entry.reload).to have_attributes(duration: 30.0, discarded_at: nil)
+        end
+
+        TimekeepingOwnership.current.update!(handoff_step: nil)
+
+        retried = nil
+        expect { retried = create_entry.call }.to change { TimesheetEntry.where(user:).count }.from(1).to(2)
+        expect(mcp_gateway_payload(retried)["status"]).to eq(200)
+        expect(TimesheetEntry.where(user:, note: "During handoff").count).to eq(1)
+
+        expect { create_entry.call }.not_to change { TimesheetEntry.where(user:).count }
+      end
     end
-    expect(entry.reload).to have_attributes(duration: 30.0, discarded_at: nil)
-
-    TimekeepingOwnership.current.update!(handoff_step: nil)
-    retried = MCP::Miru::Tools::TimeCreateTool.call(project_id: project.id, duration_minutes: 20,
-                                                    work_date: Date.current.iso8601, idempotency_key: "handoff-create",
-                                                    server_context:)
-    expect(mcp_gateway_payload(retried)["status"]).to eq(200)
-  end
-end
-
-RSpec.describe "MCP time write tools through the entry gateway" do
-  around do |example|
-    Rails.cache.clear
-    example.run
-    Rails.cache.clear
-  end
-
-  let(:company) { create(:company, plan_tier: "paid") }
-  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
-  let(:user) do
-    create(:user, current_workspace_id: company.id).tap do |member|
-      create(:employment, company:, user: member)
-      member.add_role :employee, company
-      create(:project_member, project:, user: member)
-    end
-  end
-  let(:cli_token) { CliSession.issue_for(user:, company:).last }
-
-  # "handoff_step set gives 503 ownership_moving from both controllers, including CLI calls made in-process by MCP"
-  # "Make sure no rescue in the CLI, MCP or agent path turns a gateway refusal into a generic error."
-  # The same call is delivered twice under one idempotency key: a cached refusal would hide the retryable 503
-  # and block the write after the handoff ends.
-  it "answers a miru.time.create made during a handoff with 503 ownership_moving and does not replay that refusal once the handoff ends" do
-    TimekeepingOwnership.current.update!(handoff_step: "close_admission")
-    arguments = {
-      project_id: project.id, duration_minutes: 30, work_date: Date.current.iso8601, note: "During handoff",
-      idempotency_key: "handoff-create-1",
-      server_context: { authorization: "Bearer #{cli_token}", host: "www.example.com" }
-    }
-
-    refused = MCP::Miru::Tools::TimeCreateTool.call(**arguments)
-    refused_payload = JSON.parse(refused.content.first.fetch(:text))
-
-    expect(refused.error?).to be(true)
-    expect(refused_payload["status"]).to eq(503)
-    expect(refused_payload.dig("data", "reason")).to eq("ownership_moving")
-    expect(refused_payload.dig("details", "code")).not_to eq("REQUEST_FAILED")
-    expect(TimesheetEntry.where(user:).count).to eq(0)
-
-    TimekeepingOwnership.current.update!(handoff_step: nil)
-    retried = MCP::Miru::Tools::TimeCreateTool.call(**arguments)
-
-    expect(JSON.parse(retried.content.first.fetch(:text))["status"]).to eq(200)
-    expect(TimesheetEntry.where(user:, note: "During handoff").count).to eq(1)
   end
 end
