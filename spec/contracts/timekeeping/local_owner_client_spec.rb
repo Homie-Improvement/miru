@@ -32,3 +32,151 @@ RSpec.describe TimekeepingContract::LocalOwnerClient do
     expect(Timekeeping::LocalEntry.where(company_id: company).count).to eq(1)
   end
 end
+
+RSpec.describe TimekeepingContract::LocalOwnerClient, "reservation route credentials" do
+  include TimekeepingContractExampleHelpers
+
+  let(:timekeeping_arrange) { TimekeepingContract::LocalOwnerArrange.new(private_key: timekeeping_key_pair) }
+  let(:timekeeping_client) { described_class.new(public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_service_token do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  it "local owner client answers 401 to a forged, unsigned or held ENV service token and 403 to a user token on mark_billed, changing nothing" do
+    company = timekeeping_arrange.company
+    billable = timekeeping_arrange.reserved_entry(company:, invoice_id: 501, state: "committed")
+    granted = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: reservation_operations)
+    claims = JWT.decode(granted, nil, false).first
+    forged = JWT.encode(claims, OpenSSL::PKey::RSA.new(2048), "RS256")
+    unsigned = JWT.encode(claims, nil, "none")
+    # The client must not fall back to the one service token the owner holds in its environment.
+    held_env_token = ENV.fetch(Internal::V1::BaseController::SERVICE_TOKEN_ENV)
+    user_token = timekeeping_arrange.token_for(timekeeping_arrange.user(company:, role: "owner"))
+    before = timekeeping_arrange.stored_entry(billable)
+    baseline = timekeeping_row_counts
+
+    # "With no valid credential it passes `actor: nil`, so `LocalOwner` answers `unauthorized` itself."
+    [nil, "not-a-token", forged, unsigned, held_env_token].each do |credential|
+      response = reservation_command(:mark_billed, company, credential, { "operation_id" => new_key }, invoice_id: 501)
+      expect([response.status, response.body]).to eq([401, { "reason" => "unauthorized" }])
+    end
+
+    # "A user actor, or a service without the operation, answers `forbidden`."
+    response = reservation_command(:mark_billed, company, user_token, { "operation_id" => new_key }, invoice_id: 501)
+    expect([response.status, response.body]).to eq([403, { "reason" => "forbidden" }])
+
+    expect(timekeeping_arrange.stored_entry(billable)).to eq(before)
+    expect(timekeeping_row_counts).to eq(baseline)
+
+    accepted = reservation_command(:mark_billed, company, granted, { "operation_id" => new_key }, invoice_id: 501)
+    expect([accepted.status, accepted.body]).to eq([200, { "billed" => 1 }])
+  end
+end
+
+RSpec.describe TimekeepingContract::LocalOwnerClient, "reservation route company binding" do
+  include TimekeepingContractExampleHelpers
+
+  let(:timekeeping_arrange) { TimekeepingContract::LocalOwnerArrange.new(private_key: timekeeping_key_pair) }
+  let(:timekeeping_client) { described_class.new(public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_service_token do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  it "local owner client binds a service token to its own company, so another company's service gets 404 on detach_entries and changes nothing" do
+    company = timekeeping_arrange.company
+    other_company = timekeeping_arrange.company
+    user = timekeeping_arrange.user(company:, role: "employee")
+    entry = timekeeping_arrange.entry(company:, user:, project: timekeeping_arrange.project(company:), agent_id: 77)
+    foreign_service = timekeeping_arrange.service_identity(company: other_company, name: "agent-destroy",
+                                                           operations: reservation_operations)
+    before = timekeeping_arrange.stored_entry(entry)
+    baseline = timekeeping_row_counts
+
+    # "A service bound to another company answers `not_found`."
+    response = reservation_command(:detach_entries, company, foreign_service, { "operation_id" => new_key }, agent_id: 77)
+
+    expect([response.status, response.body]).to eq([404, { "reason" => "not_found" }])
+    expect(timekeeping_arrange.stored_entry(entry)).to eq(before)
+    expect(timekeeping_row_counts).to eq(baseline)
+  end
+end
+
+RSpec.describe TimekeepingContract::LocalOwnerClient do
+  include TimekeepingContractExampleHelpers
+
+  let(:timekeeping_arrange) { TimekeepingContract::LocalOwnerArrange.new(private_key: timekeeping_key_pair) }
+  let(:timekeeping_client) { described_class.new(public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_service_token do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  # "A user actor, or a service without the operation, answers `forbidden`."
+  it "local owner client answers 403 forbidden to a service token without invoices.mark_billed and bills nothing" do
+    company = timekeeping_arrange.company
+    billable = timekeeping_arrange.reserved_entry(company:, invoice_id: 501, state: "committed")
+    forbidden = timekeeping_contract_error(:reservations, "forbidden")
+    detach_only = timekeeping_arrange.service_identity(company:, name: "agent-destroy", operations: ["detach_entries"])
+    no_operations = timekeeping_arrange.service_identity(company:, name: "reporting", operations: [])
+    before = timekeeping_arrange.stored_entry(billable)
+
+    [detach_only, no_operations].each do |credential|
+      response = reservation_command(:mark_billed, company, credential, { "operation_id" => new_key }, invoice_id: 501)
+
+      expect([response.status, response.body]).to eq([forbidden.fetch("status"), forbidden.fetch("body")])
+    end
+    expect(timekeeping_arrange.stored_entry(billable)).to eq(before)
+    expect(timekeeping_arrange.stored_entry(billable)["bill_status"]).to eq("unbilled")
+  end
+end
+
+RSpec.describe TimekeepingContract::LocalOwnerClient do
+  # "No app or lib file names LocalOwnerClient or LocalOwnerArrange, and LocalOwner.call has no token parameter"
+  it "local owner client and arrange stay in spec support: no app or lib file names LocalOwnerClient or LocalOwnerArrange" do
+    expect(TimekeepingContract::LocalOwnerClient.instance_method(:call).source_location.first)
+      .to start_with(Rails.root.join("spec/support").to_s)
+    expect(TimekeepingContract::LocalOwnerArrange.instance_method(:service_identity).source_location.first)
+      .to start_with(Rails.root.join("spec/support").to_s)
+
+    offenders = Dir[Rails.root.join("{app,lib}/**/*.rb")].select do |path|
+      File.read(path).match?(/LocalOwnerClient|LocalOwnerArrange|local_owner_arrange/)
+    end
+    expect(offenders).to be_empty
+  end
+end
+
+RSpec.describe TimekeepingContract::LocalOwnerClient do
+  include TimekeepingContractExampleHelpers
+
+  let(:timekeeping_arrange) { TimekeepingContract::LocalOwnerArrange.new(private_key: timekeeping_key_pair) }
+  let(:timekeeping_client) { described_class.new(public_key: timekeeping_key_pair.public_key) }
+
+  # "`LocalOwnerClient` routes the `contracts/timekeeping/reservations.yml` routes, verifies the token and maps it to `Actor.service(name:, company_id:, operations:)`. With no valid credential it passes `actor: nil`, so `LocalOwner` answers `unauthorized` itself."
+  it "local owner client routes mark-billed with a signed service identity, replays it once, and answers 401 without a credential" do
+    company = timekeeping_arrange.company
+    billable = Array.new(2) { timekeeping_arrange.reserved_entry(company:, invoice_id: 501, state: "committed") }
+    service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: reservation_operations)
+
+    refused = reservation_command(:mark_billed, company, nil, { "operation_id" => new_key }, invoice_id: 501)
+    expect([refused.status, refused.body]).to eq([401, { "reason" => "unauthorized" }])
+    expect(billable.map { |id| timekeeping_arrange.stored_entry(id).fetch("bill_status") }).to eq(%w[unbilled unbilled])
+
+    operation_id = new_key
+    first = reservation_command(:mark_billed, company, service, { "operation_id" => operation_id }, invoice_id: 501)
+    receipts = ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM idempotency_records").to_i
+    replay = reservation_command(:mark_billed, company, service, { "operation_id" => operation_id }, invoice_id: 501)
+
+    expect([first.status, first.body]).to eq([200, { "billed" => 2 }])
+    expect([replay.status, replay.body]).to eq([first.status, first.body])
+    expect(ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM idempotency_records").to_i).to eq(receipts)
+    expect(billable.map { |id| timekeeping_arrange.stored_entry(id).fetch("bill_status") }).to eq(%w[billed billed])
+  end
+end

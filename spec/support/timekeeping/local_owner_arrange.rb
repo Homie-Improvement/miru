@@ -5,23 +5,30 @@ require_relative "contract"
 require_relative "monolith_arrange"
 
 module TimekeepingContract
-  # Drives Timekeeping::LocalOwner from the shared entry API examples. The
-  # gateway, not LocalOwner, knows who is signed in, so this client stands in
-  # for it: it verifies the bearer token, maps the route, token and headers to
-  # LocalOwner.call's keywords, and answers the read routes and 401 itself.
+  # Drives Timekeeping::LocalOwner from the shared entry API and reservations
+  # examples. The gateway, not LocalOwner, knows who is signed in, so this
+  # client stands in for it: it verifies the bearer token, maps the route,
+  # token and headers to LocalOwner.call's keywords, and answers the entry read
+  # routes and the entry routes' 401 itself. On the reservation routes it
+  # passes the verified actor, or nil, and LocalOwner decides who may call.
   # Token handling lives only here, in spec support; production code never
   # takes a token in place of the gateway's user.
   class LocalOwnerClient
     ENTRY_API = TimekeepingContract.load(:entry_api)
+    RESERVATIONS = TimekeepingContract.load(:reservations)
     READ_ROUTES = %w[show index].freeze
 
     def initialize(public_key:)
       @public_key = public_key
       @router = Router.new(ENTRY_API.fetch("routes"))
+      @reservation_router = Router.new(RESERVATIONS.fetch("routes"))
     end
 
     def call(method, path, headers: {}, body: nil)
       headers = headers.to_h
+      reservation_route, reservation_params = @reservation_router.match(method, path)
+      return reservation_write(reservation_route, reservation_params, headers, body) if reservation_route
+
       route, params = @router.match(method, path)
       return Wire.error(ENTRY_API, "not_found") unless route
 
@@ -56,6 +63,48 @@ module TimekeepingContract
           }
         )
         Response.new(status: outcome.status, body: Wire.copy(outcome.body))
+      end
+
+      # The path ids and the body reach LocalOwner as params; the body's
+      # generation goes to the generation: keyword. Prepare's wire field
+      # "entries" is the "entry_ids" param the owner reads.
+      def reservation_write(route, path_params, headers, body)
+        sent = Wire.copy(body) || {}
+        params = sent.except("generation").merge(path_params.except("company_id"))
+        params["entry_ids"] = params.delete("entries") if params.key?("entries")
+        outcome = Timekeeping::LocalOwner.call(
+          operation: route.to_sym,
+          company_id: Integer(path_params.fetch("company_id"), 10, exception: false),
+          generation: sent["generation"],
+          actor: reservation_actor(Wire.bearer(headers)),
+          params:
+        )
+        Response.new(status: outcome.status, body: Wire.copy(outcome.body))
+      end
+
+      # A verified service token is a service bound to the token's own
+      # company; a verified user token is a user, whom the owner refuses.
+      # Anything else, the owner's own TIMEKEEPING_SERVICE_TOKEN included, is
+      # no credential.
+      def reservation_actor(token)
+        return if token.nil?
+
+        service_actor(token) || user_actor(token)
+      end
+
+      def service_actor(token)
+        claims = Timekeeping::ServiceToken.verify(token, public_key: @public_key)
+        Timekeeping::LocalOwner::Actor.service(name: claims.subject, company_id: claims.company_id,
+                                               operations: claims.operations)
+      rescue Timekeeping::ServiceToken::InvalidTokenError
+        nil
+      end
+
+      def user_actor(token)
+        claims = Timekeeping::UserToken.verify(token, public_key: @public_key)
+        Timekeeping::LocalOwner::Actor.user(user_id: claims.user_id, role: claims.role)
+      rescue Timekeeping::UserToken::InvalidTokenError
+        nil
       end
 
       def read(route, claims, params)
@@ -103,15 +152,28 @@ module TimekeepingContract
     delegate :company, :user, :project, :token_for, :current_generation, :set_generation, :begin_handoff,
              :flip_ownership, :projected_entry, to: :@monolith
 
+    SERVICE_TOKEN_LIFETIME = 5.minutes
+
     def initialize(private_key:)
+      @private_key = private_key
       @monolith = MonolithArrange.new(private_key:)
       TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
     end
 
-    # The local owner holds one service credential, TIMEKEEPING_SERVICE_TOKEN,
-    # and scans entry bodies for it, so that is the identity handed out.
+    # A signed service token bound to the company, carrying the service's
+    # name and the operations the examples name by route (prepare,
+    # mark_billed, ...) as LocalOwner::ServiceAccess spells them. It is signed
+    # with this arrange's key in the shape Timekeeping::ServiceToken verifies,
+    # but with the caller's own name as subject, so two services get separate
+    # receipts.
     def service_identity(company:, name:, operations:)
-      ENV.fetch(Internal::V1::BaseController::SERVICE_TOKEN_ENV)
+      now = Time.now.to_i
+      granted = operations.map do |operation|
+        Timekeeping::LocalOwner::ServiceAccess::ROUTE_OPERATIONS.fetch(operation.to_sym, operation)
+      end
+      JWT.encode({ typ: Timekeeping::ServiceToken::TYPE, sub: name, company_id: company, operations: granted,
+                   iat: now, exp: now + SERVICE_TOKEN_LIFETIME.to_i, jti: SecureRandom.uuid },
+                 @private_key, Timekeeping::ServiceToken::ALGORITHM)
     end
 
     # An agent row of the company that belongs to user. Validations are
@@ -128,8 +190,9 @@ module TimekeepingContract
       ).id
     end
 
-    # An entry that already holds a reservation, without the reservation
-    # routes, which this owner does not serve yet.
+    # An entry that already holds a reservation, inserted straight into the
+    # reservations table, so an example can set a state such as a provisional
+    # hold on another operation without running prepare and commit.
     def reserved_entry(company:, invoice_id:, state: "committed", disposition: "active", **attributes)
       entry_id = entry(company:, user: user(company:, role: "employee"), project: project(company:), **attributes)
       ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, company, entry_id, invoice_id, SecureRandom.uuid, state, disposition]))

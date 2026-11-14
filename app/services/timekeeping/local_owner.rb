@@ -10,7 +10,8 @@ module Timekeeping
   # idempotency_records tables, decided by the same shared rules
   # (TimekeepingRules::EntryRules) the service uses. Background services'
   # prepare, commit and abort of invoice reservations are dispatched through
-  # WRITERS to ReservationOperations, which documents its own steps.
+  # WRITERS to ReservationOperations, and their mark-billed and
+  # detach-entries commands to ServiceCommands; each documents its own steps.
   #
   # Each entry write runs in one transaction, in this order:
   #
@@ -111,9 +112,11 @@ module Timekeeping
     end
 
     # The class that carries out each operation: the entry routes run here,
-    # the reservation operations in ReservationOperations.
+    # the reservation operations in ReservationOperations and the
+    # mark-billed and detach-entries commands in ServiceCommands.
     WRITERS = ROUTE_WRITERS.keys.index_with { self }
       .merge(ReservationOperations::ROUTES.keys.index_with { ReservationOperations })
+      .merge(ServiceCommands::COMMANDS.keys.index_with { ServiceCommands })
       .freeze
 
     def self.call(operation:, company_id:, generation:, actor:, params:, checkpoint: ->(_step) { })
@@ -244,11 +247,8 @@ module Timekeeping
         id_value(body["project_id"]) || :invalid
       end
 
-      # A positive Integer, or a string of digits read as one; nil otherwise.
       def id_value(value)
-        return value if value.is_a?(Integer) && value.positive?
-
-        Integer(value, 10) if value.is_a?(String) && ID.match?(value)
+        WriteSteps.id_value(value)
       end
 
       # Generation
