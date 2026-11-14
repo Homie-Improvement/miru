@@ -2,6 +2,34 @@
 
 require "rails_helper"
 
+# Bounded waits for the examples that hold one session at a lock while another runs.
+module LocalOwnerServiceCommandRaceHelpers
+  RACE_WAIT_SECONDS = 5
+
+  # Polls the block until it returns a value. A worker that has already died re-raises its error
+  # here, and one that never gets there fails the example after RACE_WAIT_SECONDS instead of hanging.
+  def await_service_command_worker(worker)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + RACE_WAIT_SECONDS
+    until (result = yield)
+      worker.value unless worker.alive?
+      raise "a race worker did not get there within #{RACE_WAIT_SECONDS} seconds" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+
+      sleep 0.01
+    end
+    result
+  end
+
+  # Joins each started worker so no connection stays checked out. A worker's own error is left
+  # for the example to read through its value, so it does not hide the example's first failure.
+  def finish_service_command_workers(*workers)
+    workers.compact.each do |worker|
+      worker.join(RACE_WAIT_SECONDS)
+    rescue StandardError
+      nil
+    end
+  end
+end
+
 RSpec.describe Timekeeping::LocalOwner, "service command access refusals" do
   it "refuses nil, user, ungranted and foreign-company callers of mark_billed and detach_entries with 401, 403, 403 and 404 before any lock and with nothing changed" do
     generation = prepare_local_ownership!.generation.to_s
@@ -948,6 +976,8 @@ RSpec.describe Timekeeping::LocalOwner, "service commands on an unpublishable en
 end
 
 RSpec.describe Timekeeping::LocalOwner, "service commands with an ownership update queued", committed_data: true do
+  include LocalOwnerServiceCommandRaceHelpers
+
   it "mark_billed and detach_entries answer 409 stale_generation without waiting and write nothing" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
@@ -968,21 +998,22 @@ RSpec.describe Timekeeping::LocalOwner, "service commands with an ownership upda
     holder_pids = []
     updater_pids = []
 
-    holder = committed_data_thread(holder_pids) do
-      ApplicationRecord.transaction do
-        TimekeepingOwnership.lock("FOR SHARE").find(TimekeepingOwnership::SINGLETON_ID)
-        holding << true
-        release.pop
-      end
-    end
-    holding.pop
-    updater = committed_data_thread(updater_pids) do
-      TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all("generation = generation")
-    end
-    sleep 0.01 while updater_pids.empty?
-
+    holder = updater = nil
     outcomes = {}
     begin
+      holder = committed_data_thread(holder_pids) do
+        ApplicationRecord.transaction do
+          TimekeepingOwnership.lock("FOR SHARE").find(TimekeepingOwnership::SINGLETON_ID)
+          holding << true
+          release.pop
+        end
+      end
+      await_service_command_worker(holder) { holding.pop(timeout: 0) }
+      updater = committed_data_thread(updater_pids) do
+        TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all("generation = generation")
+      end
+      await_service_command_worker(updater) { updater_pids.first }
+
       expect(blocked_by?(updater_pids.first, holder_pids.first)).to be(true)
       { mark_billed: { "invoice_id" => 501 }, detach_entries: { "agent_id" => 77 } }.each do |operation, target|
         # statement_timeout, not lock_timeout: a blocking read then fails with a cancelled query
@@ -995,8 +1026,7 @@ RSpec.describe Timekeeping::LocalOwner, "service commands with an ownership upda
       end
     ensure
       release << true
-      holder.join
-      updater.join
+      finish_service_command_workers(holder, updater)
     end
 
     # "A `lock_not_available` error answers 409 `stale_generation` with nothing written."
@@ -1008,6 +1038,8 @@ RSpec.describe Timekeeping::LocalOwner, "service commands with an ownership upda
 end
 
 RSpec.describe Timekeeping::LocalOwner, "service command key reused for another target at the same time", committed_data: true do
+  include LocalOwnerServiceCommandRaceHelpers
+
   it "a second session sending one operation_id for another agent waits for the first and answers idempotency_key_reused" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
@@ -1031,29 +1063,55 @@ RSpec.describe Timekeeping::LocalOwner, "service command key reused for another 
       release.pop
     end
 
-    first = committed_data_thread(first_pids) do
-      described_class.call(operation: :detach_entries, company_id: company.id, generation:, actor:,
-                           params: { "agent_id" => 77, "operation_id" => operation_id },
-                           checkpoint: pause_after_rows_locked)
-    end
-    paused.pop
-    second = committed_data_thread(second_pids) do
-      described_class.call(operation: :detach_entries, company_id: company.id, generation:, actor:,
-                           params: { "agent_id" => 78, "operation_id" => operation_id })
-    end
-    sleep 0.01 while second_pids.empty?
-
+    first = second = nil
     begin
+      first = committed_data_thread(first_pids) do
+        described_class.call(operation: :detach_entries, company_id: company.id, generation:, actor:,
+                             params: { "agent_id" => 77, "operation_id" => operation_id },
+                             checkpoint: pause_after_rows_locked)
+      end
+      await_service_command_worker(first) { paused.pop(timeout: 0) }
+      second = committed_data_thread(second_pids) do
+        described_class.call(operation: :detach_entries, company_id: company.id, generation:, actor:,
+                             params: { "agent_id" => 78, "operation_id" => operation_id })
+      end
+      await_service_command_worker(second) { second_pids.first }
+
       # Without the operation lock that leaves out the target, the second session would not wait here,
       # would find no receipt yet, and would detach agent 78 as a second command.
       expect(blocked_by?(second_pids.first, first_pids.first)).to be(true)
     ensure
       release << true
+      finish_service_command_workers(first, second)
     end
 
     expect(first.value.body).to eq("detached" => 1)
     # "A reused key with a different target answers `idempotency_key_reused`."
     expect(second.value.body).to include("reason" => "idempotency_key_reused")
     expect([first_entry.reload.agent_id, second_entry.reload.agent_id]).to eq([nil, 78])
+  end
+end
+
+RSpec.describe Timekeeping::LocalOwner, "stored service command receipts" do
+  it "stores each command's receipt as a service receipt with the target-qualified operation and its SHA256 fingerprint" do
+    generation = prepare_local_ownership!.generation.to_s
+    company = create(:company)
+    actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
+                                           operations: %w[invoices.mark_billed agents.detach_entries])
+    commands = { mark_billed: ["invoice_id", 501, "mark_billed 501"], detach_entries: ["agent_id", 77, "detach_entries 77"] }
+
+    commands.each do |operation, (target_param, target_id, operation_name)|
+      operation_id = SecureRandom.uuid
+      described_class.call(operation:, company_id: company.id, generation:, actor:,
+                           params: { target_param => target_id, "operation_id" => operation_id })
+
+      # "Write service receipts with `actor_type "service"`, a nil `actor_id` and `actor_name` = service name.
+      # The receipt operation includes the target, and the fingerprint is SHA256 of `"<route> <target>"`"
+      receipt = described_class::Receipt.find_by!(company_id: company.id, key: operation_id)
+      expect(receipt.attributes.slice("actor_type", "actor_id", "actor_name", "operation", "fingerprint")).to eq(
+        "actor_type" => "service", "actor_id" => nil, "actor_name" => "invoice-boundary",
+        "operation" => operation_name, "fingerprint" => Digest::SHA256.hexdigest(operation_name)
+      )
+    end
   end
 end
