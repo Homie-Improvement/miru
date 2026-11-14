@@ -40,13 +40,17 @@ module Timekeeping
 
     ENTRY_API = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/entry_api.yml")).freeze
     IDEMPOTENCY = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/idempotency.yml")).freeze
+    RESERVATIONS = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/reservations.yml")).freeze
 
     # Every reason this owner answers with and its status: the contracts'
-    # errors, plus this owner's own answers to a request without a key and to
-    # a body value the entries table or the projection could not take.
-    STATUS = [ENTRY_API, IDEMPOTENCY].flat_map { |contract| contract.fetch("errors").values }
-      .to_h { |error| [error.dig("body", "reason").to_sym, error.fetch("status")] }
-      .merge(idempotency_key_required: 422, invalid_request: 400)
+    # errors, plus this owner's own answers to a request without a key, to a
+    # body value the entries table or the projection could not take, and to a
+    # reservation change that would publish such a stored value. An error
+    # with a body names its reason there; one listing body_fields names it
+    # at the top level.
+    STATUS = [ENTRY_API, IDEMPOTENCY, RESERVATIONS].flat_map { |contract| contract.fetch("errors").values }
+      .to_h { |error| [(error["reason"] || error.dig("body", "reason")).to_sym, error.fetch("status")] }
+      .merge(idempotency_key_required: 422, invalid_request: 400, unpublishable_entry: 422)
       .freeze
 
     RESPONSE_FIELDS = ENTRY_API.dig("response", "entry_fields").freeze
@@ -83,18 +87,9 @@ module Timekeeping
     BULK_RESULTS = { bulk_move: "moved", bulk_delete: "deleted" }.freeze
     NOT_FOUND_RESULT = "not_found"
 
-    # What a write answers: an HTTP status and a JSON-ready body with string
-    # keys. A replayed receipt answers the body parsed from the stored text,
-    # so every body is built to survive that round trip unchanged.
-    Outcome = Data.define(:status, :body) do
-      def self.refusal(reason)
-        new(status: STATUS.fetch(reason), body: { "reason" => reason.to_s })
-      end
-
-      def self.success(status, payload)
-        new(status:, body: JSON.parse(JSON.generate(payload)))
-      end
-    end
+    # Named here as well as in WriteSteps, so the answer type exists as soon
+    # as this class loads, before any writer runs a shared step.
+    Outcome = WriteSteps::Outcome
 
     # The entries a route changed, the status to answer with, and how to build
     # the answer from the changed rows as committed.
@@ -248,20 +243,14 @@ module Timekeeping
 
       # Generation
 
-      # The one generation this owner admits, read FOR SHARE so a handoff that
-      # updates the row waits for this write to commit. nil while the monolith
-      # is not the prepared owner, during a handoff, or when the row is missing.
+      # Read FOR SHARE, waiting on a queued handoff, so the handoff waits for
+      # this write to commit.
       def admitted_generation
-        ownership = TimekeepingOwnership.lock("FOR SHARE").find_by(id: TimekeepingOwnership::SINGLETON_ID)
-        return if ownership.nil? || !ownership.handoff_step.nil? || EntryOwner.for(ownership) != :prepared
-
-        ownership.generation
+        WriteSteps.admitted_generation
       end
 
-      # nil matches nothing, and a sent value that is not a plain integer
-      # never matches, so neither a missing header nor "abc" can be admitted.
       def generation_matches?(stored_generation)
-        !stored_generation.nil? && ID.match?(generation.to_s) && Integer(generation.to_s, 10) == stored_generation
+        WriteSteps.generation_matches?(generation, stored_generation)
       end
 
       # Request checks
@@ -491,10 +480,8 @@ module Timekeeping
         reserved_rows(locked_ids).values_at(*locked_ids)
       end
 
-      # The company's entries with these ids as stored now, discarded ones
-      # included, each with the reservation flag, keyed by id.
       def reserved_rows(entry_ids)
-        LocalEntry.with_reserved.where(company_id:, id: entry_ids).index_by(&:id)
+        WriteSteps.reserved_rows(company_id, entry_ids)
       end
 
       def version_matches?(entry)
@@ -535,22 +522,18 @@ module Timekeeping
         entry.attributes.except("reserved")
       end
 
+      # An entry write audits the full stored values before and after.
       def write_audit(changes, rows)
-        now = Time.current
-        changes.each do |change|
+        events = changes.map do |change|
           row = rows.fetch(change.entry_id)
-          AuditRow.create!(
-            company_id:, entry_id: change.entry_id, action: operation.to_s, actor_type: ACTOR_TYPE,
-            actor_id: actor.user_id, before: change.before, after: stored_values(row),
-            entry_created_at: row.created_at, created_at: now
-          )
+          { entry_id: change.entry_id, before: change.before, after: stored_values(row), entry_created_at: row.created_at }
         end
+        WriteSteps.write_audit(company_id:, actor: { actor_type: ACTOR_TYPE, actor_id: actor.user_id },
+                               action: operation.to_s, events:)
       end
 
-      # Rows are read with the reservation flag, so each snapshot's locked is
-      # that flag, never the stored entries.locked column.
       def write_outbox(rows, stored_generation)
-        EntryOutbox.write(rows, generation: stored_generation)
+        WriteSteps.write_outbox(rows, stored_generation)
       end
 
       def response_body(row)
@@ -558,10 +541,7 @@ module Timekeeping
       end
 
       def advisory_lock(*keys)
-        placeholders = Array.new(keys.size, "?").join(", ")
-        ApplicationRecord.connection.execute(
-          ApplicationRecord.sanitize_sql_array(["SELECT pg_advisory_xact_lock(#{placeholders})", *keys])
-        )
+        WriteSteps.advisory_lock(*keys)
       end
   end
 end
