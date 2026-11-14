@@ -4,10 +4,25 @@
 # invoice_operations tables have no model in the monolith, so they are read
 # by SQL.
 module PreparedReservationsSpecSupport
-  def prepared_spec_entry(company, bill_status: "unbilled")
-    project = create(:project, client: create(:client, company:))
-    Timekeeping::LocalEntry.create!(company_id: company.id, user_id: create(:user).id, project_id: project.id,
-                                    work_date: Date.current, duration: 60.0, bill_status:)
+  # Without keywords each entry gets its own user and project. Pass user: to
+  # record entries in several companies with one user, and id: to copy a
+  # timesheet row into the prepared entries table under the row's id.
+  def prepared_spec_entry(company, bill_status: "unbilled", user: create(:user),
+                          project: create(:project, client: create(:client, company:)), id: nil,
+                          work_date: Date.current, duration: 60.0)
+    attributes = { company_id: company.id, user_id: user.id, project_id: project.id, work_date:, duration:, bill_status: }
+    attributes[:id] = id if id
+    Timekeeping::LocalEntry.create!(attributes)
+  end
+
+  # Invoice lines reference the timesheet_entries projection while the adapter
+  # reads the prepared entries table, so the entry exists in both under one id.
+  # Returns the timesheet row.
+  def prepared_spec_projected_entry(company, user: create(:user, current_workspace_id: company.id),
+                                    project: create(:project, client: create(:client, company:), billable: true))
+    row = create(:timesheet_entry, user:, project:, bill_status: "unbilled")
+    prepared_spec_entry(company, user:, project:, id: row.id, work_date: row.work_date, duration: row.duration)
+    row
   end
 
   def prepared_spec_invoice(company)
