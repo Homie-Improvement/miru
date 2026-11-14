@@ -31,10 +31,9 @@ RSpec.describe Timekeeping::Handoff::MoneySnapshotFile do
           [:invoice, 9, :amount] => BigDecimal("1234567890.12"),
           [:invoice, 9, :status] => "draft",
           [:invoice, 9, :status_code] => 1,
-          [:invoice, 9, :currency] => "USD",
-          [:invoice, 9, :discount] => nil,
           [:payment, 3, :amount] => 7,
-          [:payment, 7, :cents] => 0
+          [:payment, 7, :cents] => 0,
+          [:payment, 9, :amount] => BigDecimal("1234567890.12")
         }
       }.freeze
     }
@@ -55,6 +54,10 @@ RSpec.describe Timekeeping::Handoff::MoneySnapshotFile do
     expect(loaded[202][:values][[:payment, 3, :amount]]).to be_a(Integer)
     expect(loaded[101][:values]).to have_key([:invoice, 9, :discount])
     expect(loaded[101][:values]).to have_key([:payment, 3, :amount])
+    # Each company keeps only its own keys: neither picks up a key that only the other one has.
+    expect(loaded[101][:values]).not_to have_key([:payment, 9, :amount])
+    expect(loaded[202][:values]).not_to have_key([:invoice, 9, :discount])
+    expect(loaded[202][:values]).not_to have_key([:invoice, 9, :currency])
   end
 
   it "reads back a snapshot that FinancialSnapshot.compare finds unchanged, with string company ids as integers" do
