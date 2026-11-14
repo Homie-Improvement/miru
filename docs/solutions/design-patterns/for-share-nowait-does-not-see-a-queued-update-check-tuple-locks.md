@@ -39,7 +39,7 @@ SELECT EXISTS (
 )
 ```
 
-In `locked_generation`, the code raises a private `OwnershipQueued` error when this check is true, or when the NOWAIT read raises `ActiveRecord::LockWaitTimeout`. It rescues the error outside the attempt's `requires_new` savepoint. The attempt's rows roll back, the caller's transaction stays usable, and the answer is `stale_generation`. Only this read is turned into `stale_generation`; every other lock error still raises.
+In `WriteSteps.locked_generation_nowait`, the code raises `WriteSteps::OwnershipQueued` when this check is true, or when the NOWAIT read raises `ActiveRecord::LockWaitTimeout`. Each writer that calls it (`ReservationOperations` and `ServiceCommands`) rescues the error outside the attempt's `requires_new` savepoint. The attempt's rows roll back, the caller's transaction stays usable, and the answer is `stale_generation`. Only this read is turned into `stale_generation`; every other lock error still raises.
 
 Trade-off: the check also fires on unrelated tuple locks on that table, for example another session that waits to lock the row FOR SHARE. That gives a false 409 that the caller retries. The other choice is to wait, which can close the lock cycle described above. A spurious, retryable 409 costs less, so this change takes it.
 
@@ -54,4 +54,4 @@ An author who trusts NOWAIT ships a writer that still joins the lock cycle it wa
 - PR #274, `app/services/timekeeping/local_owner/reservation_operations.rb`: `OWNERSHIP_LOCK = "FOR SHARE NOWAIT"`, `locked_generation`, and `ownership_update_queued?`. The comment on `ownership_update_queued?` states that PostgreSQL grants FOR SHARE beside other share holders while an update waits, so NOWAIT alone does not see a queued handoff.
 - PR #274 body, under concerns about the written rules: the issue asked for NOWAIT only. The code adds the `pg_locks` check because PostgreSQL grants FOR SHARE NOWAIT while a handoff's update waits behind other share holders.
 - PR #274, `spec/services/timekeeping/local_owner_reservations_spec.rb`, example "with an ownership update queued behind a FOR SHARE holder, a prepare answers 409 stale_generation without waiting". It checks `blocked_by?(updater_pids.first, holder_pids.first)`, runs the call under `SET LOCAL statement_timeout = '2s'`, and its comment explains why `lock_timeout` would let a blocking read pass.
-- `app/services/timekeeping/local_owner/write_steps.rb`: `admitted_generation(lock:)` takes the lock clause, so entry routes keep plain `FOR SHARE` and only the reservation writer uses NOWAIT.
+- `app/services/timekeeping/local_owner/write_steps.rb`: `admitted_generation(lock:)` takes the lock clause, so entry routes keep plain `FOR SHARE`. PR #274 put the NOWAIT read in `ReservationOperations`; it has since moved to `WriteSteps.locked_generation_nowait`, which the reservation operations and the mark-billed and detach-entries commands (`LocalOwner::ServiceCommands`) share.
