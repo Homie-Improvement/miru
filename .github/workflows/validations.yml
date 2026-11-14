@@ -12,10 +12,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
+# Every job pins ubuntu-24.04: ruby/setup-ruby has no prebuilt Ruby 4.0.1
+# (.ruby-version) for ubuntu-26.04, which ubuntu-latest now resolves to.
 jobs:
   tests:
     name: Running tests
-    # Pinned: ubuntu-latest now resolves to ubuntu-26.04, which has no prebuilt Ruby 4.0.1 for setup-ruby.
     runs-on: ubuntu-24.04  # Standard 2-core runner
     # Each Timekeeping handoff spec group reloads the two-tenant seed, so the
     # process that draws those files runs far longer than the other.
