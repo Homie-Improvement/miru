@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_10_27_164215) do
+ActiveRecord::Schema[8.1].define(version: 2026_10_28_120000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pg_stat_statements"
@@ -571,7 +571,8 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_27_164215) do
   end
 
   create_table "idempotency_records", force: :cascade do |t|
-    t.bigint "actor_id", null: false
+    t.bigint "actor_id"
+    t.string "actor_name"
     t.string "actor_type", null: false
     t.text "body", null: false
     t.bigint "company_id", null: false
@@ -581,6 +582,8 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_27_164215) do
     t.string "operation", null: false
     t.integer "status", null: false
     t.index ["company_id", "actor_type", "actor_id", "operation", "key"], name: "index_idempotency_records_on_scope_and_key", unique: true
+    t.index ["company_id", "actor_type", "actor_name", "operation", "key"], name: "index_idempotency_records_on_service_scope_and_key", unique: true, where: "((actor_type)::text = 'service'::text)"
+    t.check_constraint "actor_type::text = 'service'::text AND actor_name IS NOT NULL OR actor_type::text <> 'service'::text AND actor_id IS NOT NULL", name: "idempotency_records_actor_check"
   end
 
   create_table "identities", force: :cascade do |t|

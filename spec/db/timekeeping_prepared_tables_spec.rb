@@ -91,9 +91,23 @@ RSpec.describe "Timekeeping prepared tables against Timekeeping's schema" do
     pairs = { "entry_audits" => "audit_events", "idempotency_records" => "idempotency_receipts",
               "entries" => "entries", "reservations" => "reservations" }
 
-    pairs.each do |prepared, counterpart|
-      expect([prepared, live_columns.call(prepared)]).to eq([prepared, timekeeping.fetch(counterpart)])
+    # idempotency_records also holds service receipts, which stay out of the
+    # checkpoint: they add actor_name and leave actor_id NULL, under
+    # idempotency_records_actor_check. Every other column must still match.
+    local_receipt_columns = %w[actor_name]
+    expected = pairs.to_h { |prepared, counterpart| [prepared, timekeeping.fetch(counterpart)] }
+    expected["idempotency_records"] = expected.fetch("idempotency_records").merge(
+      "actor_id" => expected.fetch("idempotency_records").fetch("actor_id").dup.tap { |shape| shape[1] = false }
+    )
+
+    pairs.each_key do |prepared|
+      live = live_columns.call(prepared)
+      live = live.except(*local_receipt_columns) if prepared == "idempotency_records"
+      expect([prepared, live]).to eq([prepared, expected.fetch(prepared)])
     end
+    expect(live_columns.call("idempotency_records").fetch("actor_name")).to eq(["string", false, nil, nil])
+    expect(ActiveRecord::Base.connection.check_constraints(:idempotency_records).map(&:name))
+      .to include("idempotency_records_actor_check")
     %w[entry_audits idempotency_records].each do |prepared|
       canonical = Timekeeping::Handoff::Checkpoint::TABLES.fetch(prepared)
       expect([prepared, canonical]).to match([prepared, match_array(timekeeping.fetch(pairs.fetch(prepared)).keys)])
