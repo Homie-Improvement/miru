@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "service command access refusals" do
@@ -55,8 +57,6 @@ RSpec.describe Timekeeping::LocalOwner, "service command access refusals" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "service command receipts across callers" do
   it "never replays a stored mark_billed answer to a refused caller of the same operation_id, and gives another company's service its own receipt" do
     generation = prepare_local_ownership!.generation.to_s
@@ -105,8 +105,6 @@ RSpec.describe Timekeeping::LocalOwner, "service command receipts across callers
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "service command target checks" do
   it "refuses detach_entries with a missing or non-integer agent_id and never touches the company's entries that have no agent" do
     generation = prepare_local_ownership!.generation.to_s
@@ -131,8 +129,6 @@ RSpec.describe Timekeeping::LocalOwner, "service command target checks" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner do
   # "No app or lib file names LocalOwnerClient or LocalOwnerArrange, and LocalOwner.call has no token parameter"
   it "LocalOwner.call takes no token parameter and answers mark_billed and detach_entries with a nil actor as unauthorized" do
@@ -156,8 +152,6 @@ RSpec.describe Timekeeping::LocalOwner do
     expect(timekeeping_row_counts).to eq(before)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "mark_billed writes" do
   it "mark_billed bills only the two committed entries of the invoice, each with version+1, one audit row and one outbox row, and stores one receipt" do
@@ -213,8 +207,6 @@ RSpec.describe Timekeeping::LocalOwner, "mark_billed writes" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "detach_entries retries" do
   it "a retry of detach_entries at the current generation replays the first answer with no new rows and no version change, and a stale retry after the stored receipt answers 409 with nothing written" do
     ownership = prepare_local_ownership!
@@ -250,8 +242,6 @@ RSpec.describe Timekeeping::LocalOwner, "detach_entries retries" do
     expect(entries.map { |entry| entry.reload.version }).to eq(versions_after_first)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "mark_billed rollback at an injected failure" do
   it "a failure injected after the entry write or the outbox write of mark_billed leaves no billed entry, audit, outbox row or receipt, and a later retry still runs" do
@@ -289,8 +279,6 @@ RSpec.describe Timekeeping::LocalOwner, "mark_billed rollback at an injected fai
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "service receipts per service and company" do
   it "one operation_id from two services and from two companies runs each detach_entries and stores separate receipts" do
     generation = prepare_local_ownership!.generation.to_s
@@ -322,8 +310,6 @@ RSpec.describe Timekeeping::LocalOwner, "service receipts per service and compan
     expect([first_entry, second_entry, foreign_entry].map { |entry| entry.reload.agent_id }).to eq([nil, nil, nil])
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "service command key reuse" do
   it "reusing a detach_entries operation_id for a different agent answers idempotency_key_reused and writes nothing" do
@@ -357,8 +343,6 @@ RSpec.describe Timekeeping::LocalOwner, "service command key reuse" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "detach_entries tenant boundary" do
   it "detach_entries clears agent 77 on the caller company's entries and leaves another company's entry with agent 77 untouched" do
     generation = prepare_local_ownership!.generation.to_s
@@ -391,8 +375,6 @@ RSpec.describe Timekeeping::LocalOwner, "detach_entries tenant boundary" do
     expect(timekeeping_row_counts["entry_outbox_items"]).to eq(outbox_before + 2)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "mark_billed tenant boundary" do
   it "mark_billed bills only the caller company's entries when another company holds a committed reservation for the same invoice number" do
@@ -431,8 +413,6 @@ RSpec.describe Timekeeping::LocalOwner, "mark_billed tenant boundary" do
     expect(foreign_entry.reload.attributes).to eq(foreign_before)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "service commands refuse another company's service" do
   it "a service bound to another company gets not_found on mark_billed and detach_entries, even for an operation_id with a stored receipt, and nothing changes" do
@@ -478,8 +458,6 @@ RSpec.describe Timekeeping::LocalOwner, "service commands refuse another company
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "service receipts per company" do
   it "the same operation_id and service name from two companies runs detach_entries in each company with its own receipt" do
     generation = prepare_local_ownership!.generation.to_s
@@ -520,8 +498,6 @@ RSpec.describe Timekeeping::LocalOwner, "service receipts per company" do
     expect([receipts.call(company), receipts.call(other_company)]).to eq([1, 1])
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "mark_billed on committed reservations" do
   def count_rows(table, entry_id)
@@ -584,8 +560,6 @@ RSpec.describe Timekeeping::LocalOwner, "mark_billed on committed reservations" 
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "detach_entries within one company" do
   def count_rows(table, entry_id)
     ActiveRecord::Base.connection.select_value(
@@ -631,8 +605,6 @@ RSpec.describe Timekeeping::LocalOwner, "detach_entries within one company" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "service command retries" do
   it "a retry at a stale generation after a stored receipt answers 409 stale_generation and writes nothing, while a retry at the current generation replays the first answer with no new rows" do
     generation = prepare_local_ownership!.generation.to_s
@@ -675,8 +647,6 @@ RSpec.describe Timekeeping::LocalOwner, "service command retries" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "service command key reuse" do
   it "the same operation_id for a different agent answers idempotency_key_reused and changes nothing" do
     generation = prepare_local_ownership!.generation.to_s
@@ -707,8 +677,6 @@ RSpec.describe Timekeeping::LocalOwner, "service command key reuse" do
     expect(second_agent_entry.reload.attributes).to eq(second_before)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "service receipts per service and company" do
   it "the same operation_id from two services and from two companies gives separate receipts and each command runs" do
@@ -751,8 +719,6 @@ RSpec.describe Timekeeping::LocalOwner, "service receipts per service and compan
     expect(receipts.call).to eq(start + 3)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "service command callers" do
   it "service commands refuse nil, user, ungranted and other-company callers with 401, 403, 403 and 404 and change nothing" do
@@ -800,8 +766,6 @@ RSpec.describe Timekeeping::LocalOwner, "service command callers" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "service command rollback" do
   it "a failure injected at entry_written or outbox_written leaves no entry change, audit, outbox row or receipt" do
     generation = prepare_local_ownership!.generation.to_s
@@ -845,8 +809,6 @@ RSpec.describe Timekeeping::LocalOwner, "service command rollback" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "service command retries at a stale generation" do
   it "a retry at a stale generation whose earlier answer is stored answers 409 stale_generation on mark_billed and detach_entries and writes nothing" do
     ownership = prepare_local_ownership!
@@ -888,8 +850,6 @@ RSpec.describe Timekeeping::LocalOwner, "service command retries at a stale gene
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "service command key reused for another target" do
   it "the same operation_id reused for a different agent answers idempotency_key_reused and leaves that agent's entries untouched" do
     generation = prepare_local_ownership!.generation.to_s
@@ -920,8 +880,6 @@ RSpec.describe Timekeeping::LocalOwner, "service command key reused for another 
     expect(timekeeping_row_counts).to eq(baseline)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "service command receipts per service and company" do
   it "one operation_id sent by two services and by two companies runs each command and stores a separate receipt for each" do

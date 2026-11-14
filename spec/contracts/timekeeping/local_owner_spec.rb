@@ -56,8 +56,6 @@ RSpec.describe "The local owner under the Timekeeping entry contracts" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping::LocalOwner reservations contract coverage" do
   # "spec/contracts/timekeeping/local_owner_spec.rb runs the timekeeping reservations contract and the idempotency contract with contracts: [:reservations] with zero pending or skipped examples"
   it "local_owner_spec.rb includes the timekeeping reservations contract with no pending or skipped example" do
@@ -77,8 +75,6 @@ RSpec.describe "Timekeeping::LocalOwner reservations contract coverage" do
     expect(skipped.map(&:full_description)).to eq([])
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "Timekeeping::LocalOwner reservation idempotency coverage" do
   # "spec/contracts/timekeeping/local_owner_spec.rb runs the timekeeping reservations contract and the idempotency contract with contracts: [:reservations] with zero pending or skipped examples"
