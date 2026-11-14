@@ -319,6 +319,45 @@ RSpec.describe Timekeeping::LocalOwner, "reservation abort beside another invoic
     expect(after["entry_audits"]).to eq(before["entry_audits"] + 1)
     expect(after["entry_outbox_items"]).to eq(before["entry_outbox_items"] + 1)
   end
+
+  # Invoice A keeps a retained committed reservation on the entry, so invoice B
+  # can still claim it with a provisional row; aborting B leaves A's row, so
+  # the flag never flips.
+  it "abort of invoice B's claim on an entry invoice A retains keeps it locked and writes no version, audit or outbox row" do
+    generation = prepare_local_ownership!.generation.to_s
+    company = create(:company)
+    owner = timekeeping_member(company, "owner")
+    project = create(:project, client: create(:client, company:))
+    invoice_a = create(:invoice, company:, client: project.client)
+    invoice_b = create(:invoice, company:, client: project.client)
+    held = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
+                                           work_date: Date.current, duration: 30.0, note: "held", bill_status: "unbilled")
+    actor = described_class::Actor.service(name: "invoices", company_id: company.id,
+                                           operations: ["reservations.prepare", "reservations.commit", "reservations.abort"])
+    operation_a = SecureRandom.uuid
+    prepared_a = described_class.call(
+      operation: :prepare, company_id: company.id, generation:, actor:,
+      params: { "invoice_id" => invoice_a.id, "operation_id" => operation_a, "disposition" => "retained",
+                "entry_ids" => [held.id] }
+    )
+    expect(prepared_a.status).to eq(200)
+    expect(reservation_call(:commit, company:, generation:, actor:, invoice: invoice_a,
+                                     operation_id: operation_a).status).to eq(200)
+    operation_b = SecureRandom.uuid
+    expect(reservation_call(:prepare, company:, generation:, actor:, invoice: invoice_b, operation_id: operation_b,
+                                      entry_ids: [held.id]).status).to eq(200)
+    held_version = held.reload.version
+    before = timekeeping_row_counts
+
+    aborted = reservation_call(:abort, company:, generation:, actor:, invoice: invoice_b, operation_id: operation_b)
+
+    expect(aborted.status).to eq(200)
+    expect(Timekeeping::LocalEntry.with_reserved.find_by!(company_id: company.id, id: held.id).reserved).to be(true)
+    expect(held.reload.version).to eq(held_version)
+    after = timekeeping_row_counts
+    expect(after["entry_audits"]).to eq(before["entry_audits"])
+    expect(after["entry_outbox_items"]).to eq(before["entry_outbox_items"])
+  end
 end
 
 require "rails_helper"
