@@ -33,7 +33,7 @@ concurrency:
 jobs:
   code-smells:
     name: Code smells
-    # Pinned: setup-ruby has no prebuilt Ruby 4.0.1 for ubuntu-26.04, which ubuntu-latest now points to.
+    # Pinned: ubuntu-latest now resolves to ubuntu-26.04, which has no prebuilt Ruby 4.0.1 for setup-ruby.
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
