@@ -82,8 +82,12 @@ module Timekeeping
           connection.execute("LOCK TABLE #{LOAD_ORDER.map { |table| quoted_table(table) }.join(', ')} IN EXCLUSIVE MODE")
           check_load_allowed!
           refuse_older_checkpoint_versions!(checkpoint.rows.fetch("entries"))
-          LOAD_ORDER.reverse_each { |table| connection.execute("DELETE FROM #{quoted_table(table)}") }
-          LOAD_ORDER.each { |table| insert_rows(table, checkpoint.rows.fetch(table)) }
+          LOAD_ORDER.reverse_each { |table| connection.execute("DELETE FROM #{quoted_table(table)}#{checkpoint_rows_where(table)}") }
+          LOAD_ORDER.each do |table|
+            rows = checkpoint.rows.fetch(table)
+            before_insert(table, rows)
+            insert_rows(table, rows)
+          end
           advance_loaded_id_sequences(checkpoint)
 
           stored = Checkpoint.new(rows: LOAD_ORDER.index_with { |table| read_rows(table) }, digest: checkpoint.digest)
@@ -114,6 +118,28 @@ module Timekeeping
         # locked and before anything is deleted. A store raises Store::Error
         # here to refuse a load its own state does not allow.
         def check_load_allowed!; end
+
+        # Columns this store's table holds that the checkpoint does not carry.
+        # A checkpoint row must hold NULL in each, so dropping them on export
+        # loses nothing.
+        def local_columns(_table)
+          []
+        end
+
+        # A SQL condition naming the rows of the table that belong to the
+        # checkpoint, or nil for every row. Export reads only these rows, and a
+        # load deletes only these rows, so every other row stays in place.
+        def checkpoint_rows_condition(_table); end
+
+        # Runs inside the load transaction, after the table's checkpoint rows
+        # are deleted and before the checkpoint's rows are inserted. A store
+        # uses it to make room for the incoming rows among the rows it keeps.
+        def before_insert(_table, _rows); end
+
+        def checkpoint_rows_where(table)
+          condition = checkpoint_rows_condition(table)
+          condition ? " WHERE #{condition}" : ""
+        end
 
         def table_name(table)
           @tables.fetch(table)
@@ -150,13 +176,31 @@ module Timekeeping
         def read_rows(table)
           check_columns!(table)
           order = READ_ORDER.fetch(table).map { |column| connection.quote_column_name(column) }.join(", ")
-          result = connection.select_all("SELECT * FROM #{quoted_table(table)} ORDER BY #{order}")
+          result = connection.select_all("SELECT * FROM #{quoted_table(table)}#{checkpoint_rows_where(table)} ORDER BY #{order}")
           jsonb_columns = result.columns.select { |column| result.column_types[column]&.type == :jsonb }
 
-          result.cast_values.zip(result.rows).map do |values, raw_values|
+          rows = result.cast_values.zip(result.rows).map do |values, raw_values|
             row = result.columns.zip(values).to_h
             jsonb_columns.each { |column| row[column] = parse_jsonb(raw_values[result.columns.index(column)]) }
             row
+          end
+          without_local_columns(table, rows)
+        end
+
+        # A value in a local column has no place in the checkpoint, so it
+        # raises rather than being dropped without notice.
+        def without_local_columns(table, rows)
+          local = local_columns(table)
+          return rows if local.empty?
+
+          rows.map do |row|
+            filled = local.reject { |column| row[column].nil? }
+            if filled.any?
+              raise Checkpoint::ShapeError,
+                "#{table_name(table)}: a checkpoint row holds values the checkpoint cannot carry: #{filled.join(', ')}"
+            end
+
+            row.except(*local)
           end
         end
 
@@ -174,7 +218,7 @@ module Timekeeping
         def check_columns!(table)
           stored = connection.columns(table_name(table)).map(&:name)
           canonical = Checkpoint::TABLES.fetch(table)
-          unknown = stored - canonical
+          unknown = stored - canonical - local_columns(table)
           missing = canonical - stored
           if unknown.any?
             raise Checkpoint::ShapeError, "#{table_name(table)}: columns with no home in the checkpoint: #{unknown.join(', ')}"
