@@ -294,14 +294,17 @@ RSpec.describe Timekeeping::LocalOwner, "reservation lock flag flips" do
     second = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: entry.user_id, project_id: entry.project_id,
                                              work_date: Date.current, duration: 30.0, note: "second", bill_status: "unbilled")
     entries = [entry, second]
-    actor = described_class::Actor.service(name: "invoices", company_id: company.id,
-                                           operations: ["reservations.prepare", "reservations.commit"])
+    # Prepare runs with a prepare-only grant, so the flips need no commit permission.
+    prepare_actor = described_class::Actor.service(name: "invoices", company_id: company.id,
+                                                   operations: ["reservations.prepare"])
+    commit_actor = described_class::Actor.service(name: "invoices", company_id: company.id,
+                                                  operations: ["reservations.commit"])
     operation_id = SecureRandom.uuid
     versions = entries.map { |row| row.reload.version }
     expect(entries.map { |row| reserved?(row) }).to eq([false, false])
     baseline = timekeeping_row_counts
 
-    prepared = reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id:,
+    prepared = reservation_call(:prepare, company:, generation:, actor: prepare_actor, invoice:, operation_id:,
                                           entry_ids: entries.map(&:id))
     expect(prepared.status).to eq(200)
     expect(prepared.body["state"]).to eq("prepared")
@@ -314,7 +317,7 @@ RSpec.describe Timekeeping::LocalOwner, "reservation lock flag flips" do
     expect(after_prepare["reservations"]).to eq(baseline["reservations"] + 2)
     expect(after_prepare["entries"]).to eq(baseline["entries"])
 
-    committed = reservation_call(:commit, company:, generation:, actor:, invoice:, operation_id:)
+    committed = reservation_call(:commit, company:, generation:, actor: commit_actor, invoice:, operation_id:)
     expect(committed.status).to eq(200)
     expect(entries.map { |row| row.reload.version }).to eq(versions.map { |version| version + 1 })
     expect(entries.map { |row| reserved?(row) }).to eq([true, true])
@@ -484,6 +487,7 @@ RSpec.describe Timekeeping::LocalOwner, "reservation keys per service and compan
       prepared = reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id:, entry_ids: [entry.id])
       committed = reservation_call(:commit, company:, generation:, actor:, invoice:, operation_id:)
       expect([prepared.status, committed.status]).to eq([200, 200])
+      expect(entry.reload.attributes.fetch("version")).to be > 0
     end
 
     company_ids = seeds.map { |seed| seed.company.id }.sort
