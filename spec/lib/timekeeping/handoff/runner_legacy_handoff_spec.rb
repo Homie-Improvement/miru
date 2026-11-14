@@ -836,7 +836,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
                           observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_reconcile))
     end.to raise_error(TimekeepingHandoffHooks::Interrupted)
     generation_dir = Pathname(report_root).join("generation-2")
-    saved_intents = generation_dir.join("source_intents.json").read
+    baselines = %w[source_intents.json checkpoint.json money_before.json].index_with { |name| generation_dir.join(name).read }
     # The first run's passing report is removed, so only a comparison made by the resume can name the change.
     generation_dir.join("reconciliation.json").delete
 
@@ -856,42 +856,18 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     expect(timekeeping.calls).not_to include([:admit, 2])
 
     # The refusal leaves the handoff resumable: once the intent matches the
-    # saved baseline again, the next resume rechecks and flips.
+    # saved baseline again, nothing differs from it, so the next resume starts
+    # at the flip step, rechecks and flips.
     InvoiceOperationsRecord.connection.execute(
       "UPDATE invoice_operation_intents SET desired_entry_ids = '{7,8}' WHERE operation_id = '#{operation_id}'"
     )
-    described_class.run(direction: :cutover, owners:, report_root:)
-
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
-    expect(timekeeping.calls.count([:admit, 2])).to eq(1)
-    expect(generation_dir.join("source_intents.json").read).to eq(saved_intents)
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-  include RunnerSourceIntentsSpecSupport
-
-  # "Source intents are saved at the checkpoint and reused on resume, and deleting or changing a terminal intent after the checkpoint makes reconcile report a difference."
-  # With nothing changed, the recheck before the resumed flip must find no difference.
-  it "a resume after the recorded reconcile with unchanged intents flips once, admits once and rewrites no saved baseline" do
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
-    report_root = Dir.mktmpdir("handoff-report")
-    insert_committed_intent_for_source_intents_spec(SecureRandom.uuid, desired_entry_ids: "{7,8}")
-
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:,
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_reconcile))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    expect(TimekeepingOwnership.current.handoff_step).to eq("reconcile")
-    generation_dir = Pathname(report_root).join("generation-2")
-    baselines = %w[source_intents.json checkpoint.json money_before.json].index_with { |name| generation_dir.join(name).read }
-    # The first run's passing report is removed, so a report after the resume shows the comparison ran again.
+    # The refused resume's report is removed, so a report after this resume shows the comparison ran again.
     generation_dir.join("reconciliation.json").delete
+    started_steps = []
+    recorder = ->(event, step:) { started_steps << step if event == :before_step }
+    described_class.run(direction: :cutover, owners:, report_root:, observer: recorder)
 
-    described_class.run(direction: :cutover, owners:, report_root:)
-
+    expect(started_steps).to eq(["flip"])
     expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
     expect(TimekeepingOwnership.current.legacy_retired_at).not_to be_nil
     expect(timekeeping.calls.count([:admit, 2])).to eq(1)
@@ -907,7 +883,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   # "Require a fresh comparison with the saved intents before a resumed flip, and test this interruption with both
   # deletion and `desired_entry_ids` changes."
   # Rollback resumes at the flip after a recorded reconcile too, so it needs the same comparison.
-  it "a terminal intent deleted after a rollback's reconcile was recorded makes the resumed rollback flip refuse" do
+  it "a terminal intent deleted after a rollback's reconcile was recorded makes the resumed rollback flip refuse, and restoring it lets the rollback finish" do
     timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
     owners = handoff_owners(timekeeping)
     report_root = Dir.mktmpdir("handoff-report")
@@ -921,76 +897,40 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
                           observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_reconcile))
     end.to raise_error(TimekeepingHandoffHooks::Interrupted)
     expect(TimekeepingOwnership.current.handoff_step).to eq("reconcile")
-    rollback_report = File.join(report_root, "generation-3", "reconciliation.json")
-    FileUtils.rm_f(rollback_report)
-    InvoiceOperationsRecord.connection.execute(
-      "DELETE FROM invoice_operation_intents WHERE operation_id = '#{operation_id}'"
-    )
-
-    expect { described_class.run(direction: :rollback, owners:, report_root:) }
-      .to raise_error(Timekeeping::Handoff::Runner::Refused, /Reconciliation found unexplained differences/)
-
-    expect(File.read(rollback_report)).to include(operation_id)
-    ownership = TimekeepingOwnership.current
-    expect([ownership.generation, ownership.owner, ownership.handoff_step]).to eq([3, "timekeeping", "reconcile"])
-    expect(owners.fetch(:monolith).admission.calls).not_to include([:admit, 3])
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-  include RunnerSourceIntentsSpecSupport
-
-  # "Require a fresh comparison with the saved intents before a resumed flip"
-  # With nothing changed, the rollback's comparison must pass too, or an interrupted rollback could never finish.
-  it "a rollback resume after reconcile was recorded with unchanged intents compares them again, flips once and admits once" do
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
-    report_root = Dir.mktmpdir("handoff-report")
-    insert_committed_intent_for_source_intents_spec("5d0b6a0e-1d7c-4f4e-9a52-6a1f1c0de256", desired_entry_ids: "{7,8}")
-    described_class.run(direction: :cutover, owners:, report_root:)
-
-    expect do
-      described_class.run(direction: :rollback, owners:, report_root:,
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_reconcile))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    expect(TimekeepingOwnership.current.handoff_step).to eq("reconcile")
     generation_dir = Pathname(report_root).join("generation-3")
     baselines = %w[source_intents.json checkpoint.json money_before.json].index_with { |name| generation_dir.join(name).read }
-    # The first run's passing report is removed, so a report after the resume shows the comparison ran again.
-    generation_dir.join("reconciliation.json").delete
+    rollback_report = generation_dir.join("reconciliation.json")
+    rollback_report.delete
+    connection = InvoiceOperationsRecord.connection
+    # The deleted row is kept whole, timestamps and id included, so restoring it later matches the saved intents exactly.
+    connection.execute(
+      "CREATE TEMP TABLE rollback_deleted_intent_spec AS " \
+      "SELECT * FROM invoice_operation_intents WHERE operation_id = '#{operation_id}'"
+    )
+    connection.execute("DELETE FROM invoice_operation_intents WHERE operation_id = '#{operation_id}'")
 
-    described_class.run(direction: :rollback, owners:, report_root:)
+    begin
+      expect { described_class.run(direction: :rollback, owners:, report_root:) }
+        .to raise_error(Timekeeping::Handoff::Runner::Refused, /Reconciliation found unexplained differences/)
+
+      expect(rollback_report.read).to include(operation_id)
+      ownership = TimekeepingOwnership.current
+      expect([ownership.generation, ownership.owner, ownership.handoff_step]).to eq([3, "timekeeping", "reconcile"])
+      expect(owners.fetch(:monolith).admission.calls).not_to include([:admit, 3])
+
+      # With the intent restored, nothing differs from the saved baseline, so the
+      # rollback's comparison passes too and an interrupted rollback can finish.
+      connection.execute("INSERT INTO invoice_operation_intents SELECT * FROM rollback_deleted_intent_spec")
+      rollback_report.delete
+      described_class.run(direction: :rollback, owners:, report_root:)
+    ensure
+      connection.execute("DROP TABLE IF EXISTS rollback_deleted_intent_spec")
+    end
 
     expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", generation: 3, handoff_step: nil)
     expect(owners.fetch(:monolith).admission.calls.count([:admit, 3])).to eq(1)
-    expect(generation_dir.join("reconciliation.json")).to exist
+    expect(rollback_report).to exist
     baselines.each { |name, text| expect(generation_dir.join(name).read).to eq(text), "#{name} was rewritten" }
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-
-  # A recorded reconcile still resumes at flip in the step decision; the recheck of the saved
-  # intents happens inside the flip step, so the resumed run reports only the flip step.
-  it "a resume after reconcile was recorded starts at the flip step and runs no earlier recorded step again" do
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
-    report_root = Dir.mktmpdir("handoff-report")
-
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:,
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_reconcile))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    expect(TimekeepingOwnership.current.handoff_step).to eq("reconcile")
-
-    started_steps = []
-    recorder = ->(event, step:) { started_steps << step if event == :before_step }
-    described_class.run(direction: :cutover, owners:, report_root:, observer: recorder)
-
-    expect(started_steps).to eq(["flip"])
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
   end
 end
 
