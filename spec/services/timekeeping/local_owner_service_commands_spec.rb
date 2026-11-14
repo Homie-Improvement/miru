@@ -30,7 +30,44 @@ module LocalOwnerServiceCommandRaceHelpers
   end
 end
 
+# Setup the service-command examples share, so a change to how an entry or a reservation is
+# seeded is made once. Every detail that makes an example its own case (company, member role,
+# agent, invoice, reservation state, entry attributes) is an argument, never a default here.
+module LocalOwnerServiceCommandSetup
+  # An unbilled entry for the given member and project. The attributes carry what differs
+  # between examples: work_date, duration, note and agent_id.
+  def service_command_entry(company, user:, project:, **attributes)
+    Timekeeping::LocalEntry.create!(company_id: company.id, user_id: user.id, project_id: project.id,
+                                    bill_status: "unbilled", **attributes)
+  end
+
+  # An entry under a new member with the given role and a new project, for examples that seed
+  # entries in more than one company.
+  def service_command_company_entry(company, role:, **attributes)
+    member = timekeeping_member(company, role)
+    project = create(:project, client: create(:client, company:))
+    service_command_entry(company, user: member, project:, **attributes)
+  end
+
+  # Writes the reservation row directly, because the examples need committed and provisional
+  # rows without running the reservation commands that would produce them.
+  def reserve_service_command_entry(entry, invoice_id, state:)
+    ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, entry.company_id, entry.id, invoice_id, SecureRandom.uuid, state]))
+      INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
+      VALUES (?, ?, ?, ?, ?, 'active', NOW())
+    SQL
+  end
+
+  def count_rows(table, entry_id)
+    ActiveRecord::Base.connection.select_value(
+      ActiveRecord::Base.sanitize_sql_array(["SELECT COUNT(*) FROM #{table} WHERE entry_id = ?", entry_id])
+    ).to_i
+  end
+end
+
 RSpec.describe Timekeeping::LocalOwner, "service command access refusals" do
+  include LocalOwnerServiceCommandSetup
+
   it "refuses nil, user, ungranted and foreign-company callers of mark_billed and detach_entries with 401, 403, 403 and 404 before any lock and with nothing changed" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
@@ -39,15 +76,9 @@ RSpec.describe Timekeeping::LocalOwner, "service command access refusals" do
     project = create(:project, client: create(:client, company:))
     invoice_id = 501
     agent_id = 77
-    billable = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                               work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled")
-    ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, company.id, billable.id, invoice_id, SecureRandom.uuid]))
-      INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
-      VALUES (?, ?, ?, ?, 'committed', 'active', NOW())
-    SQL
-    agent_entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                                  work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled",
-                                                  agent_id:)
+    billable = service_command_entry(company, user: owner, project:, work_date: "2026-03-02", duration: 60.0)
+    reserve_service_command_entry(billable, invoice_id, state: "committed")
+    agent_entry = service_command_entry(company, user: owner, project:, work_date: "2026-03-02", duration: 60.0, agent_id:)
     before = [billable, agent_entry].map { |entry| entry.reload.attributes }
     baseline = timekeeping_row_counts
     actor = described_class::Actor
@@ -86,24 +117,18 @@ RSpec.describe Timekeeping::LocalOwner, "service command access refusals" do
 end
 
 RSpec.describe Timekeeping::LocalOwner, "service command receipts across callers" do
+  include LocalOwnerServiceCommandSetup
+
   it "never replays a stored mark_billed answer to a refused caller of the same operation_id, and gives another company's service its own receipt" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
     other_company = create(:company)
     invoice_id = 501
-    reserve = lambda do |owner_company|
-      member = timekeeping_member(owner_company, "employee")
-      project = create(:project, client: create(:client, company: owner_company))
-      entry = Timekeeping::LocalEntry.create!(company_id: owner_company.id, user_id: member.id, project_id: project.id,
-                                              work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled")
-      ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, owner_company.id, entry.id, invoice_id, SecureRandom.uuid]))
-        INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
-        VALUES (?, ?, ?, ?, 'committed', 'active', NOW())
-      SQL
+    own_entry, foreign_entry = [company, other_company].map do |owner_company|
+      entry = service_command_company_entry(owner_company, role: "employee", work_date: "2026-03-02", duration: 60.0)
+      reserve_service_command_entry(entry, invoice_id, state: "committed")
       entry
     end
-    own_entry = reserve.call(company)
-    foreign_entry = reserve.call(other_company)
     operation_id = SecureRandom.uuid
     params = { "invoice_id" => invoice_id, "operation_id" => operation_id }
     actor = described_class::Actor
@@ -134,13 +159,12 @@ RSpec.describe Timekeeping::LocalOwner, "service command receipts across callers
 end
 
 RSpec.describe Timekeeping::LocalOwner, "service command target checks" do
+  include LocalOwnerServiceCommandSetup
+
   it "refuses detach_entries with a missing or non-integer agent_id and never touches the company's entries that have no agent" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
-    member = timekeeping_member(company, "employee")
-    project = create(:project, client: create(:client, company:))
-    unassigned = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: member.id, project_id: project.id,
-                                                 work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled")
+    unassigned = service_command_company_entry(company, role: "employee", work_date: "2026-03-02", duration: 60.0)
     before = unassigned.reload.attributes
     baseline = timekeeping_row_counts
     service = described_class::Actor.service(name: "agent-destroy", company_id: company.id,
@@ -182,37 +206,23 @@ RSpec.describe Timekeeping::LocalOwner do
 end
 
 RSpec.describe Timekeeping::LocalOwner, "mark_billed writes" do
+  include LocalOwnerServiceCommandSetup
+
   it "mark_billed bills only the two committed entries of the invoice, each with version+1, one audit row and one outbox row, and stores one receipt" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
     user = timekeeping_member(company, "employee")
     project = create(:project, client: create(:client, company:))
-    new_entry = lambda do
-      Timekeeping::LocalEntry.create!(company_id: company.id, user_id: user.id, project_id: project.id,
-                                      work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled")
+    x, y, provisional, other_invoice = Array.new(4) do
+      service_command_entry(company, user:, project:, work_date: "2026-03-02", duration: 60.0)
     end
-    reserve = lambda do |entry, invoice_id, state|
-      ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, company.id, entry.id, invoice_id, SecureRandom.uuid, state, "active"]))
-        INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, NOW())
-      SQL
-    end
-    audits_for = lambda do |entry|
-      ApplicationRecord.connection.select_value(
-        ApplicationRecord.sanitize_sql_array(["SELECT COUNT(*) FROM entry_audits WHERE entry_id = ?", entry.id])
-      ).to_i
-    end
-    x = new_entry.call
-    y = new_entry.call
-    provisional = new_entry.call
-    other_invoice = new_entry.call
-    reserve.call(x, 501, "committed")
-    reserve.call(y, 501, "committed")
-    reserve.call(provisional, 501, "provisional")
-    reserve.call(other_invoice, 502, "committed")
+    reserve_service_command_entry(x, 501, state: "committed")
+    reserve_service_command_entry(y, 501, state: "committed")
+    reserve_service_command_entry(provisional, 501, state: "provisional")
+    reserve_service_command_entry(other_invoice, 502, state: "committed")
     entries = [x, y, provisional, other_invoice]
     versions_before = entries.to_h { |entry| [entry.id, entry.reload.version] }
-    audits_before = entries.to_h { |entry| [entry.id, audits_for.call(entry)] }
+    audits_before = entries.to_h { |entry| [entry.id, count_rows("entry_audits", entry.id)] }
     counts_before = timekeeping_row_counts
     actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
                                            operations: ["invoices.mark_billed"])
@@ -226,7 +236,7 @@ RSpec.describe Timekeeping::LocalOwner, "mark_billed writes" do
     expect(entries.map { |entry| entry.reload.bill_status }).to eq(%w[billed billed unbilled unbilled])
     # "Each changed entry gets version + 1, one `entry_audits` row and one `entry_outbox_items` snapshot under the outbox advisory lock."
     expect(entries.map { |entry| entry.reload.version - versions_before.fetch(entry.id) }).to eq([1, 1, 0, 0])
-    expect(entries.map { |entry| audits_for.call(entry) - audits_before.fetch(entry.id) }).to eq([1, 1, 0, 0])
+    expect(entries.map { |entry| count_rows("entry_audits", entry.id) - audits_before.fetch(entry.id) }).to eq([1, 1, 0, 0])
     counts_after = timekeeping_row_counts
     expect(counts_after["entry_audits"] - counts_before["entry_audits"]).to eq(2)
     expect(counts_after["entry_outbox_items"] - counts_before["entry_outbox_items"]).to eq(2)
@@ -236,6 +246,8 @@ RSpec.describe Timekeeping::LocalOwner, "mark_billed writes" do
 end
 
 RSpec.describe Timekeeping::LocalOwner, "detach_entries retries" do
+  include LocalOwnerServiceCommandSetup
+
   it "a retry of detach_entries at the current generation replays the first answer with no new rows and no version change, and a stale retry after the stored receipt answers 409 with nothing written" do
     ownership = prepare_local_ownership!
     generation = ownership.generation.to_s
@@ -243,8 +255,7 @@ RSpec.describe Timekeeping::LocalOwner, "detach_entries retries" do
     user = timekeeping_member(company, "employee")
     project = create(:project, client: create(:client, company:))
     entries = Array.new(2) do
-      Timekeeping::LocalEntry.create!(company_id: company.id, user_id: user.id, project_id: project.id,
-                                      work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled", agent_id: 77)
+      service_command_entry(company, user:, project:, work_date: "2026-03-02", duration: 60.0, agent_id: 77)
     end
     actor = described_class::Actor.service(name: "agent-destroy", company_id: company.id,
                                            operations: ["agents.detach_entries"])
@@ -272,17 +283,13 @@ RSpec.describe Timekeeping::LocalOwner, "detach_entries retries" do
 end
 
 RSpec.describe Timekeeping::LocalOwner, "mark_billed rollback at an injected failure" do
+  include LocalOwnerServiceCommandSetup
+
   it "a failure injected after the entry write or the outbox write of mark_billed leaves no billed entry, audit, outbox row or receipt, and a later retry still runs" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
-    user = timekeeping_member(company, "employee")
-    project = create(:project, client: create(:client, company:))
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: user.id, project_id: project.id,
-                                            work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled")
-    ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, company.id, entry.id, 501, SecureRandom.uuid]))
-      INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
-      VALUES (?, ?, ?, ?, 'committed', 'active', NOW())
-    SQL
+    entry = service_command_company_entry(company, role: "employee", work_date: "2026-03-02", duration: 60.0)
+    reserve_service_command_entry(entry, 501, state: "committed")
     actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
                                            operations: ["invoices.mark_billed"])
     params = { "invoice_id" => 501, "operation_id" => SecureRandom.uuid }
@@ -308,19 +315,15 @@ RSpec.describe Timekeeping::LocalOwner, "mark_billed rollback at an injected fai
 end
 
 RSpec.describe Timekeeping::LocalOwner, "service receipts per service and company" do
+  include LocalOwnerServiceCommandSetup
+
   it "one operation_id from two services and from two companies runs each detach_entries and stores separate receipts" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
     other_company = create(:company)
-    entry_for = lambda do |owner_company, agent_id|
-      user = timekeeping_member(owner_company, "employee")
-      project = create(:project, client: create(:client, company: owner_company))
-      Timekeeping::LocalEntry.create!(company_id: owner_company.id, user_id: user.id, project_id: project.id,
-                                      work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled", agent_id:)
+    first_entry, second_entry, foreign_entry = [[company, 77], [company, 78], [other_company, 77]].map do |owner_company, agent_id|
+      service_command_company_entry(owner_company, role: "employee", work_date: "2026-03-02", duration: 60.0, agent_id:)
     end
-    first_entry = entry_for.call(company, 77)
-    second_entry = entry_for.call(company, 78)
-    foreign_entry = entry_for.call(other_company, 77)
     operation_id = SecureRandom.uuid
     detach = lambda do |owner_company, name, agent_id|
       actor = described_class::Actor.service(name:, company_id: owner_company.id, operations: ["agents.detach_entries"])
@@ -340,17 +343,15 @@ RSpec.describe Timekeeping::LocalOwner, "service receipts per service and compan
 end
 
 RSpec.describe Timekeeping::LocalOwner, "service command key reuse" do
+  include LocalOwnerServiceCommandSetup
+
   it "reusing a detach_entries operation_id for a different agent answers idempotency_key_reused and writes nothing" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
     user = timekeeping_member(company, "employee")
     project = create(:project, client: create(:client, company:))
-    entry_for = lambda do |agent_id|
-      Timekeeping::LocalEntry.create!(company_id: company.id, user_id: user.id, project_id: project.id,
-                                      work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled", agent_id:)
-    end
-    entry_for.call(77)
-    other_agent_entry = entry_for.call(78)
+    service_command_entry(company, user:, project:, work_date: "2026-03-02", duration: 60.0, agent_id: 77)
+    other_agent_entry = service_command_entry(company, user:, project:, work_date: "2026-03-02", duration: 60.0, agent_id: 78)
     actor = described_class::Actor.service(name: "agent-destroy", company_id: company.id,
                                            operations: ["agents.detach_entries"])
     operation_id = SecureRandom.uuid
@@ -372,21 +373,17 @@ RSpec.describe Timekeeping::LocalOwner, "service command key reuse" do
 end
 
 RSpec.describe Timekeeping::LocalOwner, "detach_entries tenant boundary" do
+  include LocalOwnerServiceCommandSetup
+
   it "detach_entries clears agent 77 on the caller company's entries and leaves another company's entry with agent 77 untouched" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
     other_company = create(:company)
-    new_entry = lambda do |owning_company|
-      member = timekeeping_member(owning_company, "employee")
-      project = create(:project, client: create(:client, company: owning_company))
-      Timekeeping::LocalEntry.create!(company_id: owning_company.id, user_id: member.id, project_id: project.id,
-                                      work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled", agent_id: 77)
+    *own_entries, foreign_entry = [company, company, other_company].map do |owning_company|
+      service_command_company_entry(owning_company, role: "employee", work_date: "2026-03-02", duration: 60.0, agent_id: 77)
     end
-    own_entries = Array.new(2) { new_entry.call(company) }
-    foreign_entry = new_entry.call(other_company)
     foreign_before = foreign_entry.reload.attributes
-    audits_for = ->(entry) { ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM entry_audits WHERE entry_id = #{entry.id.to_i}").to_i }
-    foreign_audits_before = audits_for.call(foreign_entry)
+    foreign_audits_before = count_rows("entry_audits", foreign_entry.id)
     outbox_before = timekeeping_row_counts["entry_outbox_items"]
     actor = described_class::Actor.service(name: "agent-destroy", company_id: company.id, operations: ["agents.detach_entries"])
 
@@ -398,34 +395,25 @@ RSpec.describe Timekeeping::LocalOwner, "detach_entries tenant boundary" do
     expect(outcome.body).to eq("detached" => 2)
     expect(own_entries.map { |entry| entry.reload.agent_id }).to eq([nil, nil])
     expect(foreign_entry.reload.attributes).to eq(foreign_before)
-    expect(audits_for.call(foreign_entry)).to eq(foreign_audits_before)
+    expect(count_rows("entry_audits", foreign_entry.id)).to eq(foreign_audits_before)
     # Only the caller company's two changed entries get an outbox snapshot.
     expect(timekeeping_row_counts["entry_outbox_items"]).to eq(outbox_before + 2)
   end
 end
 
 RSpec.describe Timekeeping::LocalOwner, "mark_billed tenant boundary" do
+  include LocalOwnerServiceCommandSetup
+
   it "mark_billed bills only the caller company's entries when another company holds a committed reservation for the same invoice number" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
     other_company = create(:company)
     invoice_number = 501
-    new_entry = lambda do |owning_company|
-      member = timekeeping_member(owning_company, "employee")
-      project = create(:project, client: create(:client, company: owning_company))
-      Timekeeping::LocalEntry.create!(company_id: owning_company.id, user_id: member.id, project_id: project.id,
-                                      work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled")
+    own_entry, foreign_entry = [company, other_company].map do |owning_company|
+      entry = service_command_company_entry(owning_company, role: "employee", work_date: "2026-03-02", duration: 60.0)
+      reserve_service_command_entry(entry, invoice_number, state: "committed")
+      entry
     end
-    commit_to_invoice = lambda do |entry|
-      ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, entry.company_id, entry.id, invoice_number, SecureRandom.uuid]))
-        INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
-        VALUES (?, ?, ?, ?, 'committed', 'active', NOW())
-      SQL
-    end
-    own_entry = new_entry.call(company)
-    commit_to_invoice.call(own_entry)
-    foreign_entry = new_entry.call(other_company)
-    commit_to_invoice.call(foreign_entry)
     foreign_before = foreign_entry.reload.attributes
     actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id, operations: ["invoices.mark_billed"])
 
@@ -443,20 +431,17 @@ RSpec.describe Timekeeping::LocalOwner, "mark_billed tenant boundary" do
 end
 
 RSpec.describe Timekeeping::LocalOwner, "service commands refuse another company's service" do
+  include LocalOwnerServiceCommandSetup
+
   it "a service bound to another company gets not_found on mark_billed and detach_entries, even for an operation_id with a stored receipt, and nothing changes" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
     other_company = create(:company)
     member = timekeeping_member(company, "employee")
     project = create(:project, client: create(:client, company:))
-    agent_entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: member.id, project_id: project.id,
-                                                  work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled", agent_id: 77)
-    billable = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: member.id, project_id: project.id,
-                                               work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled")
-    ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, company.id, billable.id, 501, SecureRandom.uuid]))
-      INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
-      VALUES (?, ?, ?, ?, 'committed', 'active', NOW())
-    SQL
+    agent_entry = service_command_entry(company, user: member, project:, work_date: "2026-03-02", duration: 60.0, agent_id: 77)
+    billable = service_command_entry(company, user: member, project:, work_date: "2026-03-02", duration: 60.0)
+    reserve_service_command_entry(billable, 501, state: "committed")
     operations = %w[invoices.mark_billed agents.detach_entries]
     own_service = described_class::Actor.service(name: "invoice-boundary", company_id: company.id, operations:)
     foreign_service = described_class::Actor.service(name: "invoice-boundary", company_id: other_company.id, operations:)
@@ -487,18 +472,15 @@ RSpec.describe Timekeeping::LocalOwner, "service commands refuse another company
 end
 
 RSpec.describe Timekeeping::LocalOwner, "service receipts per company" do
+  include LocalOwnerServiceCommandSetup
+
   it "the same operation_id and service name from two companies runs detach_entries in each company with its own receipt" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
     other_company = create(:company)
-    new_entry = lambda do |owning_company|
-      member = timekeeping_member(owning_company, "employee")
-      project = create(:project, client: create(:client, company: owning_company))
-      Timekeeping::LocalEntry.create!(company_id: owning_company.id, user_id: member.id, project_id: project.id,
-                                      work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled", agent_id: 77)
+    own_entry, foreign_entry = [company, other_company].map do |owning_company|
+      service_command_company_entry(owning_company, role: "employee", work_date: "2026-03-02", duration: 60.0, agent_id: 77)
     end
-    own_entry = new_entry.call(company)
-    foreign_entry = new_entry.call(other_company)
     operation_id = SecureRandom.uuid
     receipts = lambda do |owning_company|
       ActiveRecord::Base.connection.select_value(ActiveRecord::Base.sanitize_sql_array(
@@ -528,11 +510,7 @@ RSpec.describe Timekeeping::LocalOwner, "service receipts per company" do
 end
 
 RSpec.describe Timekeeping::LocalOwner, "mark_billed on committed reservations" do
-  def count_rows(table, entry_id)
-    ActiveRecord::Base.connection.select_value(
-      ActiveRecord::Base.sanitize_sql_array(["SELECT COUNT(*) FROM #{table} WHERE entry_id = ?", entry_id])
-    ).to_i
-  end
+  include LocalOwnerServiceCommandSetup
 
   it "mark_billed bills the two committed entries, skips a provisional entry and another invoice's entry, and writes version, one audit, one outbox row each and one receipt" do
     generation = prepare_local_ownership!.generation.to_s
@@ -541,24 +519,13 @@ RSpec.describe Timekeeping::LocalOwner, "mark_billed on committed reservations" 
     project = create(:project, client: create(:client, company:))
     invoice = create(:invoice, company:, client: project.client)
     other_invoice = create(:invoice, company:, client: project.client)
-    new_entry = lambda do
-      Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                      work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
+    x, y, provisional, elsewhere = Array.new(4) do
+      service_command_entry(company, user: owner, project:, work_date: Date.current, duration: 30.0, note: "n")
     end
-    reserve = lambda do |entry, invoice_id, state|
-      ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, company.id, entry.id, invoice_id, SecureRandom.uuid, state, "active"]))
-        INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, NOW())
-      SQL
-    end
-    x = new_entry.call
-    y = new_entry.call
-    provisional = new_entry.call
-    elsewhere = new_entry.call
-    reserve.call(x, invoice.id, "committed")
-    reserve.call(y, invoice.id, "committed")
-    reserve.call(provisional, invoice.id, "provisional")
-    reserve.call(elsewhere, other_invoice.id, "committed")
+    reserve_service_command_entry(x, invoice.id, state: "committed")
+    reserve_service_command_entry(y, invoice.id, state: "committed")
+    reserve_service_command_entry(provisional, invoice.id, state: "provisional")
+    reserve_service_command_entry(elsewhere, other_invoice.id, state: "committed")
     versions = [x, y, provisional, elsewhere].to_h { |entry| [entry.id, entry.reload.version] }
     baseline = timekeeping_row_counts
     actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id, operations: ["invoices.mark_billed"])
@@ -589,26 +556,16 @@ RSpec.describe Timekeeping::LocalOwner, "mark_billed on committed reservations" 
 end
 
 RSpec.describe Timekeeping::LocalOwner, "detach_entries within one company" do
-  def count_rows(table, entry_id)
-    ActiveRecord::Base.connection.select_value(
-      ActiveRecord::Base.sanitize_sql_array(["SELECT COUNT(*) FROM #{table} WHERE entry_id = ?", entry_id])
-    ).to_i
-  end
-
-  def agent_entry(company, agent_id)
-    member = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    Timekeeping::LocalEntry.create!(company_id: company.id, user_id: member.id, project_id: project.id,
-                                    work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled", agent_id:)
-  end
+  include LocalOwnerServiceCommandSetup
 
   it "detach_entries clears agent 77 on the caller company's entries and leaves the same agent id on a second company's entry untouched" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
     other_company = create(:company)
-    own = [agent_entry(company, 77), agent_entry(company, 77)]
-    other_agent = agent_entry(company, 78)
-    foreign = agent_entry(other_company, 77)
+    first_own, second_own, other_agent, foreign = [[company, 77], [company, 77], [company, 78], [other_company, 77]].map do |owning, agent_id|
+      service_command_company_entry(owning, role: "owner", work_date: Date.current, duration: 30.0, note: "n", agent_id:)
+    end
+    own = [first_own, second_own]
     foreign_before = foreign.reload.attributes
     other_agent_before = other_agent.reload.attributes
     own_versions = own.map { |entry| entry.reload.version }
@@ -634,6 +591,8 @@ RSpec.describe Timekeeping::LocalOwner, "detach_entries within one company" do
 end
 
 RSpec.describe Timekeeping::LocalOwner, "service command retries" do
+  include LocalOwnerServiceCommandSetup
+
   it "a retry at a stale generation after a stored receipt answers 409 stale_generation and writes nothing, while a retry at the current generation replays the first answer with no new rows" do
     generation = prepare_local_ownership!.generation.to_s
     stale = (Integer(generation, 10) - 1).to_s
@@ -641,14 +600,9 @@ RSpec.describe Timekeeping::LocalOwner, "service command retries" do
     owner = timekeeping_member(company, "owner")
     project = create(:project, client: create(:client, company:))
     invoice = create(:invoice, company:, client: project.client)
-    billable = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                               work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
-    ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, company.id, billable.id, invoice.id, SecureRandom.uuid]))
-      INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
-      VALUES (?, ?, ?, ?, 'committed', 'active', NOW())
-    SQL
-    agent_entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                                  work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled", agent_id: 77)
+    billable = service_command_entry(company, user: owner, project:, work_date: Date.current, duration: 30.0, note: "n")
+    reserve_service_command_entry(billable, invoice.id, state: "committed")
+    agent_entry = service_command_entry(company, user: owner, project:, work_date: Date.current, duration: 30.0, note: "n", agent_id: 77)
     actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
                                            operations: ["invoices.mark_billed", "agents.detach_entries"])
     commands = { mark_billed: { "invoice_id" => invoice.id }, detach_entries: { "agent_id" => 77 } }
@@ -676,15 +630,16 @@ RSpec.describe Timekeeping::LocalOwner, "service command retries" do
 end
 
 RSpec.describe Timekeeping::LocalOwner, "service command key reuse" do
+  include LocalOwnerServiceCommandSetup
+
   it "the same operation_id for a different agent answers idempotency_key_reused and changes nothing" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
     owner = timekeeping_member(company, "owner")
     project = create(:project, client: create(:client, company:))
-    first_agent_entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                                        work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled", agent_id: 77)
-    second_agent_entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                                         work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled", agent_id: 78)
+    first_agent_entry, second_agent_entry = [77, 78].map do |agent_id|
+      service_command_entry(company, user: owner, project:, work_date: Date.current, duration: 30.0, note: "n", agent_id:)
+    end
     actor = described_class::Actor.service(name: "agent-destroy", company_id: company.id, operations: ["agents.detach_entries"])
     operation_id = SecureRandom.uuid
 
@@ -707,18 +662,15 @@ RSpec.describe Timekeeping::LocalOwner, "service command key reuse" do
 end
 
 RSpec.describe Timekeeping::LocalOwner, "service receipts per service and company" do
+  include LocalOwnerServiceCommandSetup
+
   it "the same operation_id from two services and from two companies gives separate receipts and each command runs" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
     other_company = create(:company)
-    entry_for = lambda do |owner_company|
-      member = timekeeping_member(owner_company, "owner")
-      project = create(:project, client: create(:client, company: owner_company))
-      Timekeeping::LocalEntry.create!(company_id: owner_company.id, user_id: member.id, project_id: project.id,
-                                      work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled", agent_id: 77)
-    end
-    first_entry = entry_for.call(company)
-    foreign_entry = entry_for.call(other_company)
+    entry_attributes = { role: "owner", work_date: Date.current, duration: 30.0, note: "n", agent_id: 77 }
+    first_entry = service_command_company_entry(company, **entry_attributes)
+    foreign_entry = service_command_company_entry(other_company, **entry_attributes)
     operation_id = SecureRandom.uuid
     grant = ["agents.detach_entries"]
     receipts = -> { timekeeping_row_counts(%w[idempotency_records]).fetch("idempotency_records") }
@@ -731,7 +683,7 @@ RSpec.describe Timekeeping::LocalOwner, "service receipts per service and compan
     expect(first.body).to eq("detached" => 1)
     expect(first_entry.reload.agent_id).to be_nil
 
-    second_entry = entry_for.call(company)
+    second_entry = service_command_company_entry(company, **entry_attributes)
     other_service = described_class.call(operation: :detach_entries, company_id: company.id, generation:,
                                          actor: described_class::Actor.service(name: "agent-cleanup", company_id: company.id, operations: grant),
                                          params: { "agent_id" => 77, "operation_id" => operation_id })
@@ -749,6 +701,8 @@ RSpec.describe Timekeeping::LocalOwner, "service receipts per service and compan
 end
 
 RSpec.describe Timekeeping::LocalOwner, "service command callers" do
+  include LocalOwnerServiceCommandSetup
+
   it "service commands refuse nil, user, ungranted and other-company callers with 401, 403, 403 and 404 and change nothing" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
@@ -756,12 +710,8 @@ RSpec.describe Timekeeping::LocalOwner, "service command callers" do
     owner = timekeeping_member(company, "owner")
     project = create(:project, client: create(:client, company:))
     invoice = create(:invoice, company:, client: project.client)
-    billable = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                               work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled", agent_id: 77)
-    ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, company.id, billable.id, invoice.id, SecureRandom.uuid]))
-      INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
-      VALUES (?, ?, ?, ?, 'committed', 'active', NOW())
-    SQL
+    billable = service_command_entry(company, user: owner, project:, work_date: Date.current, duration: 30.0, note: "n", agent_id: 77)
+    reserve_service_command_entry(billable, invoice.id, state: "committed")
     baseline = timekeeping_row_counts
     entry_before = billable.reload.attributes
     actor = described_class::Actor
@@ -795,18 +745,16 @@ RSpec.describe Timekeeping::LocalOwner, "service command callers" do
 end
 
 RSpec.describe Timekeeping::LocalOwner, "service command rollback" do
+  include LocalOwnerServiceCommandSetup
+
   it "a failure injected at entry_written or outbox_written leaves no entry change, audit, outbox row or receipt" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
     owner = timekeeping_member(company, "owner")
     project = create(:project, client: create(:client, company:))
     invoice = create(:invoice, company:, client: project.client)
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled", agent_id: 77)
-    ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, company.id, entry.id, invoice.id, SecureRandom.uuid]))
-      INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
-      VALUES (?, ?, ?, ?, 'committed', 'active', NOW())
-    SQL
+    entry = service_command_entry(company, user: owner, project:, work_date: Date.current, duration: 30.0, note: "n", agent_id: 77)
+    reserve_service_command_entry(entry, invoice.id, state: "committed")
     actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
                                            operations: ["invoices.mark_billed", "agents.detach_entries"])
     injected = Class.new(StandardError)
@@ -838,20 +786,17 @@ RSpec.describe Timekeeping::LocalOwner, "service command rollback" do
 end
 
 RSpec.describe Timekeeping::LocalOwner, "service command retries at a stale generation" do
+  include LocalOwnerServiceCommandSetup
+
   it "a retry at a stale generation whose earlier answer is stored answers 409 stale_generation on mark_billed and detach_entries and writes nothing" do
     ownership = prepare_local_ownership!
     generation = ownership.generation.to_s
     company = create(:company)
     owner = timekeeping_member(company, "owner")
     project = create(:project, client: create(:client, company:))
-    billable = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                               work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled")
-    ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, company.id, billable.id, 501, SecureRandom.uuid]))
-      INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
-      VALUES (?, ?, ?, ?, 'committed', 'active', NOW())
-    SQL
-    Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                    work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled", agent_id: 77)
+    billable = service_command_entry(company, user: owner, project:, work_date: "2026-03-02", duration: 60.0)
+    reserve_service_command_entry(billable, 501, state: "committed")
+    service_command_entry(company, user: owner, project:, work_date: "2026-03-02", duration: 60.0, agent_id: 77)
     actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
                                            operations: %w[invoices.mark_billed agents.detach_entries])
     commands = { mark_billed: { "invoice_id" => 501 }, detach_entries: { "agent_id" => 77 } }
@@ -879,15 +824,16 @@ RSpec.describe Timekeeping::LocalOwner, "service command retries at a stale gene
 end
 
 RSpec.describe Timekeeping::LocalOwner, "service command key reused for another target" do
+  include LocalOwnerServiceCommandSetup
+
   it "the same operation_id reused for a different agent answers idempotency_key_reused and leaves that agent's entries untouched" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
     owner = timekeeping_member(company, "owner")
     project = create(:project, client: create(:client, company:))
-    first_agent_entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                                        work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled", agent_id: 77)
-    second_agent_entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                                         work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled", agent_id: 78)
+    first_agent_entry, second_agent_entry = [77, 78].map do |agent_id|
+      service_command_entry(company, user: owner, project:, work_date: "2026-03-02", duration: 60.0, agent_id:)
+    end
     actor = described_class::Actor.service(name: "agent-destroy", company_id: company.id, operations: %w[agents.detach_entries])
     operation_id = SecureRandom.uuid
 
@@ -910,15 +856,14 @@ RSpec.describe Timekeeping::LocalOwner, "service command key reused for another 
 end
 
 RSpec.describe Timekeeping::LocalOwner, "service command receipts per service and company" do
+  include LocalOwnerServiceCommandSetup
+
   it "one operation_id sent by two services and by two companies runs each command and stores a separate receipt for each" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
     other_company = create(:company)
     entries = [company, company, other_company].map do |owning|
-      member = timekeeping_member(owning, "owner")
-      project = create(:project, client: create(:client, company: owning))
-      Timekeeping::LocalEntry.create!(company_id: owning.id, user_id: member.id, project_id: project.id,
-                                      work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled", agent_id: 77)
+      service_command_company_entry(owning, role: "owner", work_date: "2026-03-02", duration: 60.0, agent_id: 77)
     end
     operation_id = SecureRandom.uuid
     grant = %w[agents.detach_entries]
@@ -944,17 +889,13 @@ RSpec.describe Timekeeping::LocalOwner, "service command receipts per service an
 end
 
 RSpec.describe Timekeeping::LocalOwner, "service commands on an unpublishable entry" do
+  include LocalOwnerServiceCommandSetup
+
   it "mark_billed and detach_entries answer 422 unpublishable_entry with the entry id and field, and write nothing" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled", agent_id: 77)
-    ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, company.id, entry.id, SecureRandom.uuid]))
-      INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
-      VALUES (?, ?, 501, ?, 'committed', 'active', NOW())
-    SQL
+    entry = service_command_company_entry(company, role: "owner", work_date: "2026-03-02", duration: 60.0, agent_id: 77)
+    reserve_service_command_entry(entry, 501, state: "committed")
     # A source outside the snapshot contract's list is a stored value the projection refuses.
     entry.update_columns(source: "legacy")
     before = entry.reload.attributes
@@ -977,18 +918,13 @@ end
 
 RSpec.describe Timekeeping::LocalOwner, "service commands with an ownership update queued", committed_data: true do
   include LocalOwnerServiceCommandRaceHelpers
+  include LocalOwnerServiceCommandSetup
 
   it "mark_billed and detach_entries answer 409 stale_generation without waiting and write nothing" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
-    owner = timekeeping_member(company, "owner")
-    project = create(:project, client: create(:client, company:))
-    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                            work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled", agent_id: 77)
-    ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, company.id, entry.id, SecureRandom.uuid]))
-      INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
-      VALUES (?, ?, 501, ?, 'committed', 'active', NOW())
-    SQL
+    entry = service_command_company_entry(company, role: "owner", work_date: "2026-03-02", duration: 60.0, agent_id: 77)
+    reserve_service_command_entry(entry, 501, state: "committed")
     before = entry.reload.attributes
     baseline = timekeeping_row_counts
     actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
@@ -1039,6 +975,7 @@ end
 
 RSpec.describe Timekeeping::LocalOwner, "service command key reused for another target at the same time", committed_data: true do
   include LocalOwnerServiceCommandRaceHelpers
+  include LocalOwnerServiceCommandSetup
 
   it "a second session sending one operation_id for another agent waits for the first and answers idempotency_key_reused" do
     generation = prepare_local_ownership!.generation.to_s
@@ -1046,8 +983,7 @@ RSpec.describe Timekeeping::LocalOwner, "service command key reused for another 
     owner = timekeeping_member(company, "owner")
     project = create(:project, client: create(:client, company:))
     first_entry, second_entry = [77, 78].map do |agent_id|
-      Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
-                                      work_date: "2026-03-02", duration: 60.0, bill_status: "unbilled", agent_id:)
+      service_command_entry(company, user: owner, project:, work_date: "2026-03-02", duration: 60.0, agent_id:)
     end
     actor = described_class::Actor.service(name: "agent-destroy", company_id: company.id,
                                            operations: %w[agents.detach_entries])
