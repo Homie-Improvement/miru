@@ -10,14 +10,25 @@ RSpec.describe Timekeeping::Handoff::ReportDirectory do
   # under a per-generation report directory. A resumed run, including a restart after step 4 was recorded, then
   # compares against the same snapshot and rebuilds the first-cutover corrections from the frozen source with the
   # stored capture time."
+  # The stored snapshot must hand each company back its own values, even when two companies share the same
+  # value keys.
   it "a fresh report directory for the same generation reads back the stored capture time, digests and money snapshot exactly" do
     Dir.mktmpdir do |root|
       captured_at = Time.utc(2026, 10, 30, 12, 0, 0, 123_456)
-      money = { 11 => { company_id: 11, values: { [:invoice, 1, :amount] => BigDecimal("10.005") } }.freeze }
+      money = {
+        101 => { company_id: 101, values: { [:invoice, 9, :amount] => BigDecimal("10.005") } }.freeze,
+        202 => { company_id: 202, values: { [:invoice, 9, :amount] => BigDecimal("75.25") } }.freeze
+      }
       writer = described_class.new(root:, generation: 2)
 
       expect(writer.checkpoint?).to be(false)
       writer.write_money_before(money)
+
+      # With only the money file written, a fresh directory of the same generation reads it back,
+      # and a later generation refuses it.
+      expect(described_class.new(root:, generation: 2).read_money_before).to eq(money)
+      expect { described_class.new(root:, generation: 3).read_money_before }.to raise_error(described_class::Unreadable)
+
       writer.write_checkpoint(captured_at:, source_digest: "src-digest", loaded_digest: "load-digest", highest_entry_id: 907,
                               source_intents_digest: "intents-digest")
 
@@ -29,89 +40,46 @@ RSpec.describe Timekeeping::Handoff::ReportDirectory do
       expect(checkpoint.fetch(:source_digest)).to eq("src-digest")
       expect(checkpoint.fetch(:loaded_digest)).to eq("load-digest")
       expect(checkpoint.fetch(:highest_entry_id)).to eq(907)
-      expect(restarted.read_money_before).to eq(money)
+      expect(checkpoint.fetch(:source_intents_digest)).to eq("intents-digest")
+
+      reread = restarted.read_money_before
+      expect(reread).to eq(money)
+      expect(reread.keys).to contain_exactly(101, 202)
+      expect(reread[101][:values]).to eq({ [:invoice, 9, :amount] => BigDecimal("10.005") })
+      expect(reread[202][:values]).to eq({ [:invoice, 9, :amount] => BigDecimal("75.25") })
+      expect(Dir.glob(File.join(root, "**", "*.tmp*"))).to be_empty
     end
   end
-end
 
-RSpec.describe Timekeeping::Handoff::ReportDirectory do
   # A resumed run must refuse rather than retake a lost step-2 snapshot, and a retry at a later generation
   # must not compare against an aborted generation's baseline.
   it "a later generation never reads an earlier generation's report files and a missing or truncated money file refuses" do
     Dir.mktmpdir do |root|
       money = { 11 => { company_id: 11, values: { [:invoice, 1, :amount] => BigDecimal("10") } }.freeze }
       aborted = described_class.new(root:, generation: 2)
-      aborted.write_money_before(money)
+
+      expect(aborted.checkpoint?).to be(false)
       aborted.write_checkpoint(captured_at: Time.utc(2026, 10, 30), source_digest: "a", loaded_digest: "b",
                                highest_entry_id: 1, source_intents_digest: "c")
+      expect(aborted.checkpoint?).to be(true)
+      expect { aborted.read_money_before }.to raise_error(described_class::Unreadable)
+
+      aborted.write_money_before(money)
+      expect(aborted.read_money_before).to eq(money)
 
       retry_run = described_class.new(root:, generation: 3)
 
       expect(retry_run.checkpoint?).to be(false)
-      expect { retry_run.read_money_before }.to raise_error(StandardError) { |error|
-        expect(error).not_to be_a(NoMethodError)
-      }
+      expect { retry_run.read_money_before }.to raise_error(described_class::Unreadable)
 
       written = Dir.glob(File.join(root, "**", "*")).select { |path| File.file?(path) && File.read(path).include?("10") }
       expect(written).not_to be_empty
       written.each { |path| File.write(path, File.read(path)[0, 5]) }
 
-      expect { described_class.new(root:, generation: 2).read_money_before }.to raise_error(StandardError) { |error|
-        expect(error).not_to be_a(NoMethodError)
-      }
+      expect { described_class.new(root:, generation: 2).read_money_before }.to raise_error(described_class::Unreadable)
     end
   end
-end
 
-RSpec.describe Timekeeping::Handoff::ReportDirectory do
-  # "A resumed run, including a restart after step 4 was recorded, then compares against the same snapshot
-  # and rebuilds the first-cutover corrections from the frozen source with the stored capture time."
-  # The stored snapshot must hand each company back its own values, and a later generation must never
-  # read an earlier generation's snapshot as its own baseline.
-  it "reads back the step 2 money of each company only from its own generation's directory" do
-    snapshots = {
-      101 => { company_id: 101, values: { [:invoice, 9, :amount] => BigDecimal("50.00") } },
-      202 => { company_id: 202, values: { [:invoice, 9, :amount] => BigDecimal("75.25") } }
-    }
-
-    Dir.mktmpdir do |root|
-      described_class.new(root: root, generation: 2).write_money_before(snapshots)
-
-      reread = described_class.new(root: root, generation: 2).read_money_before
-      expect(reread.keys).to contain_exactly(101, 202)
-      expect(reread[101][:values]).to eq({ [:invoice, 9, :amount] => BigDecimal("50.00") })
-      expect(reread[202][:values]).to eq({ [:invoice, 9, :amount] => BigDecimal("75.25") })
-
-      expect { described_class.new(root: root, generation: 3).read_money_before }.to raise_error(StandardError)
-    end
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::ReportDirectory do
-  it "keeps each generation's files apart and refuses a missing money snapshot instead of inventing one" do
-    # "Persist the step 2 snapshot, the checkpoint capture time and digest, and the reconciliation report as files under a per-generation report directory."
-    Dir.mktmpdir do |root|
-      second = described_class.new(root:, generation: 2)
-      third = described_class.new(root:, generation: 3)
-      captured_at = Time.utc(2026, 11, 1, 12, 0, 0)
-
-      expect(second.checkpoint?).to be(false)
-      second.write_checkpoint(captured_at:, source_digest: "abc", loaded_digest: "def", highest_entry_id: 42,
-                              source_intents_digest: "ghi")
-      expect(second.checkpoint?).to be(true)
-      expect(third.checkpoint?).to be(false)
-
-      stored = second.read_checkpoint
-      expect(Time.zone.parse(stored[:captured_at].to_s)).to eq(captured_at)
-      expect(stored.values_at(:source_digest, :loaded_digest, :highest_entry_id)).to eq(["abc", "def", 42])
-
-      expect { third.read_money_before }.to raise_error(StandardError)
-      expect(Dir.glob(File.join(root, "**", "*.tmp*"))).to be_empty
-    end
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::ReportDirectory do
   it "replaces an earlier file whole, leaves no temporary file and writes plain JSON" do
     Dir.mktmpdir do |root|
       directory = described_class.new(root:, generation: 4)
@@ -137,10 +105,7 @@ RSpec.describe Timekeeping::Handoff::ReportDirectory do
       expect { directory.read_money_before }.to raise_error(described_class::Unreadable)
     end
   end
-end
 
-# Generated by Descant: acceptance tests below.
-RSpec.describe Timekeeping::Handoff::ReportDirectory do
   # "Source intents are saved at the checkpoint and reused on resume, and deleting or changing a terminal
   # intent after the checkpoint makes reconcile report a difference."
   # Reconciliation compares fields with ==, so a resumed run must read back values equal to a fresh database

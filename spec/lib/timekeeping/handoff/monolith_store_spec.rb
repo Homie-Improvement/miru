@@ -36,6 +36,27 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
     )
   end
 
+  # A checkpoint holding entry 1 and one audit of it for each id.
+  def checkpoint_with_audits(audit_ids:)
+    audits = audit_ids.map do |id|
+      {
+        "id" => id, "company_id" => 1, "entry_id" => 1, "actor_type" => "User", "actor_id" => 1,
+        "actor_name" => nil, "action" => "create", "before" => nil, "after" => { "note" => "" },
+        "entry_created_at" => checkpoint_stamp, "created_at" => checkpoint_stamp
+      }
+    end
+    checkpoint_of("entries" => [entry_row(id: 1)], "entry_audits" => audits)
+  end
+
+  # Inserts an audit of entry 1 without an id, so the table's sequence picks it.
+  def insert_audit_returning_id
+    connection.select_value(<<~SQL.squish)
+      INSERT INTO entry_audits (company_id, entry_id, actor_type, actor_id, action, after, entry_created_at, created_at)
+      VALUES (1, 1, 'User', 1, 'update', '{}', now(), now())
+      RETURNING id
+    SQL
+  end
+
   # Every row of every table a load replaces.
   def prepared_rows
     described_class::LOAD_ORDER.index_with do |table|
@@ -216,7 +237,8 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
       good = checkpoint_of("entries" => [entry_row(id: 1, note: "tamperme-alpha")])
       tampered = Timekeeping::Handoff::Checkpoint.from_json(good.to_json.gsub("tamperme-alpha", "tamperme-omega"))
 
-      expect { store.load_checkpoint(tampered) }.to raise_error(StandardError)
+      expect { store.load_checkpoint(tampered) }
+        .to raise_error(Timekeeping::Handoff::Store::Error, /does not match its own digest/)
       expect(connection.select_values("SELECT note FROM entries")).to eq(["stored-before-load"])
     end
 
@@ -548,6 +570,26 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
         .to raise_error(Timekeeping::Handoff::Store::Error, /entries/)
       expect(prepared_rows).to eq(baseline)
     end
+
+    it "moves a loaded table's id sequence above the highest loaded id, and never back" do
+      store.load_checkpoint(checkpoint_with_audits(audit_ids: [7, 50]))
+      expect(insert_audit_returning_id).to eq(51)
+
+      store.load_checkpoint(checkpoint_with_audits(audit_ids: [3]))
+      expect(insert_audit_returning_id).to eq(52)
+    end
+
+    it "refuses a checkpoint holding a table with no mapping and leaves every table as it was" do
+      store.load_checkpoint(checkpoint_with_audits(audit_ids: [7]))
+      valid = checkpoint_with_audits(audit_ids: [9])
+      unmapped = Timekeeping::Handoff::Checkpoint.new(
+        rows: valid.rows.merge("timesheet_entries" => []), digest: valid.digest
+      )
+
+      expect { store.load_checkpoint(unmapped) }
+        .to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError, /unknown tables: timesheet_entries/)
+      expect(connection.select_values("SELECT id FROM entry_audits")).to eq([7])
+    end
   end
 
   describe "#advance_entry_id_sequence" do
@@ -624,69 +666,6 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
       expect(billing_rows).to eq(baseline)
     end
   end
-end
-
-RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
-  let(:loaded_ids_connection) { ActiveRecord::Base.connection }
-  let(:loaded_ids_store) { described_class.new(connection: loaded_ids_connection) }
-
-  def loaded_ids_entry(id:)
-    {
-      "id" => id, "company_id" => 1, "version" => 1, "project_id" => 1, "user_id" => 1, "agent_id" => nil,
-      "work_date" => Date.new(2026, 1, 5), "duration" => 1.0, "note" => "", "bill_status" => "unbilled",
-      "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
-      "external_run_id" => nil, "external_session_id" => nil, "proof_url" => nil, "proof_metadata" => {},
-      "discarded_at" => nil, "created_at" => Time.utc(2026, 1, 5, 9), "updated_at" => Time.utc(2026, 1, 5, 9)
-    }
-  end
-
-  def loaded_ids_audit(id:, entry_id:)
-    {
-      "id" => id, "company_id" => 1, "entry_id" => entry_id, "actor_type" => "User", "actor_id" => 1,
-      "actor_name" => nil, "action" => "create", "before" => nil, "after" => { "note" => "" },
-      "entry_created_at" => Time.utc(2026, 1, 5, 9), "created_at" => Time.utc(2026, 1, 5, 9)
-    }
-  end
-
-  def loaded_ids_checkpoint(audit_ids:)
-    tables = Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }
-    tables["entries"] = [loaded_ids_entry(id: 1)]
-    tables["entry_audits"] = audit_ids.map { |id| loaded_ids_audit(id:, entry_id: 1) }
-    Timekeeping::Handoff::Checkpoint.build(tables:)
-  end
-
-  def loaded_ids_insert_audit
-    loaded_ids_connection.select_value(<<~SQL.squish)
-      INSERT INTO entry_audits (company_id, entry_id, actor_type, actor_id, action, after, entry_created_at, created_at)
-      VALUES (1, 1, 'User', 1, 'update', '{}', now(), now())
-      RETURNING id
-    SQL
-  end
-
-  it "moves a loaded table's id sequence above the highest loaded id, and never back" do
-    loaded_ids_store.load_checkpoint(loaded_ids_checkpoint(audit_ids: [7, 50]))
-    expect(loaded_ids_insert_audit).to eq(51)
-
-    loaded_ids_store.load_checkpoint(loaded_ids_checkpoint(audit_ids: [3]))
-    expect(loaded_ids_insert_audit).to eq(52)
-  end
-
-  it "refuses a checkpoint holding a table with no mapping and leaves every table as it was" do
-    loaded_ids_store.load_checkpoint(loaded_ids_checkpoint(audit_ids: [7]))
-    valid = loaded_ids_checkpoint(audit_ids: [9])
-    unmapped = Timekeeping::Handoff::Checkpoint.new(
-      rows: valid.rows.merge("timesheet_entries" => []), digest: valid.digest
-    )
-
-    expect { loaded_ids_store.load_checkpoint(unmapped) }
-      .to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError, /unknown tables: timesheet_entries/)
-    expect(loaded_ids_connection.select_values("SELECT id FROM entry_audits")).to eq([7])
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
-  let(:connection) { ActiveRecord::Base.connection }
-  let(:store) { described_class.new(connection:) }
 
   it "loading the same checkpoint twice replaces user receipts and keeps one copy of the stored service receipt" do
     connection.execute(<<~SQL.squish)

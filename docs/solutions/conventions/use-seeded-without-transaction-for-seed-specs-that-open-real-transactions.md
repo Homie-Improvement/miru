@@ -39,7 +39,7 @@ Tag the group `:two_tenant_seed, :seeded_without_transaction`. The new tag runs 
 The tag has one cost: examples share the seed with no rollback. So:
 
 - Put examples that only read in one shared group, so the large seed loads once.
-- Give every example that writes rows (`update_columns`, `Audited::Audit.create!`, a new duplicate entry) its own top-level `RSpec.describe` with both tags, so the next group reloads a clean seed.
+- Give every example that writes rows (`update_columns`, `Audited::Audit.create!`, a new duplicate entry) its own group with both tags, so the next group reloads a clean seed. The groups can be sibling `context` blocks under one `RSpec.describe`, as long as the tags sit on each context and not on the describe: the seed loads in a `before(:all)` of a shared context that RSpec includes only once per ancestry, so a tagged parent would give all its children one shared seed.
 - Build faults in memory where you can (for example, change the recorded disposition hash) so the example stays read-only.
 
 ## Why it matters
@@ -50,4 +50,4 @@ With the wrong tag, the spec fails in setup or finds an empty database, and neve
 
 - PR #90, head commit d2ca3d1191f4fa42215e4ab2cd416f757189d62a.
 - `spec/support/database_cleaner.rb`: `outside_transaction` now also matches `example.metadata[:seeded_without_transaction]`. The comment says these examples are not truncated so the seed survives, and that an example that writes rows needs a group of its own.
-- `spec/lib/timekeeping/handoff/legacy_source_spec.rb`: the first group holds read-only examples, with a comment that the seed is loaded once for all of them. The discarded-invoice, company-mismatch, orphan and audit examples each sit in their own group. The example "refuses an export started inside a caller's open transaction and exports outside one" expects `ActiveRecord::TransactionIsolationError` inside a transaction.
+- `spec/lib/timekeeping/handoff/legacy_source_spec.rb`: one `RSpec.describe` with no tags holds a sibling context per group. The first context holds read-only examples, with a comment that the seed is loaded once for all of them. The discarded-invoice, company-mismatch, orphan and audit examples each sit in their own context, each tagged `:two_tenant_seed, :seeded_without_transaction`. The example "refuses an export started inside a caller's open transaction and exports outside one" expects `ActiveRecord::TransactionIsolationError` inside a transaction.
