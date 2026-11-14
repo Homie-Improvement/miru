@@ -3,7 +3,12 @@
 require "active_support/core_ext/integer/time"
 
 Rails.application.configure do
-  app_base_url = ENV.fetch("APP_BASE_URL", "https://miru-production.onrender.com")
+  default_base_url = "https://miru-production.onrender.com"
+  app_base_url = ENV.fetch("APP_BASE_URL", default_base_url)
+
+  # OmniAuth pins its callback host to this when APP_BASE_URL is unset
+  # (config/initializers/omniauth_full_host.rb), so it shares host authorization's fallback.
+  config.x.default_base_url = default_base_url
   parsed_app_host = URI.parse(app_base_url).host rescue nil
   allowed_hosts = [
     parsed_app_host,
