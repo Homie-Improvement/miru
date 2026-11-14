@@ -98,9 +98,7 @@ module Timekeeping
         flipped = entries.reject { |entry| after.fetch(entry.id).reserved == entry.reserved }
         return [] if flipped.empty?
 
-        flipped_ids = flipped.map(&:id)
-        LocalEntry.where(company_id:, id: flipped_ids).update_all(["version = version + 1, updated_at = ?", Time.current])
-        rows = reserved_rows(company_id, flipped_ids).values_at(*flipped_ids)
+        rows = bump_versions(company_id, flipped.map(&:id))
         checkpoint.call(:entry_written)
         invalid = EntryOutbox.invalid_fields(rows)
         raise UnpublishableRows, invalid if invalid.any?
@@ -109,7 +107,14 @@ module Timekeeping
         checkpoint.call(:audit_written)
         write_outbox(rows, generation)
         checkpoint.call(:outbox_written)
-        flipped_ids
+        rows.map(&:id)
+      end
+
+      # Writes version + 1 on each entry and returns the rows as stored now,
+      # with the reservation flag, in the order of entry_ids.
+      def bump_versions(company_id, entry_ids)
+        LocalEntry.where(company_id:, id: entry_ids).update_all(["version = version + 1, updated_at = ?", Time.current])
+        reserved_rows(company_id, entry_ids).values_at(*entry_ids)
       end
 
       # The company's entries with these ids as stored now, discarded ones
