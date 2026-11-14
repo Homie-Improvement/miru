@@ -8,9 +8,11 @@ module Timekeeping
   # section 10.1): after a rollback from the Timekeeping service, entry writes
   # land in the monolith's own entries, entry_audits, entry_outbox_items and
   # idempotency_records tables, decided by the same shared rules
-  # (TimekeepingRules::EntryRules) the service uses.
+  # (TimekeepingRules::EntryRules) the service uses. Background services'
+  # prepare, commit and abort of invoice reservations are dispatched through
+  # WRITERS to ReservationOperations, which documents its own steps.
   #
-  # Each call runs in one transaction, in this order:
+  # Each entry write runs in one transaction, in this order:
   #
   # 1. Lock the receipt key (company, actor, operation, key).
   # 2. Read the stored generation FOR SHARE. Any other generation, or any
@@ -34,8 +36,9 @@ module Timekeeping
   # known point; an error it raises is never rescued here.
   class LocalOwner
     STEPS = %i[
-      receipt_key_locked generation_checked request_checked receipt_checked project_checked
-      rows_locked rules_checked entry_written audit_written outbox_written receipt_written
+      receipt_key_locked operation_key_locked generation_checked request_checked receipt_checked operation_checked
+      project_checked rows_locked rules_checked reservations_written entry_written audit_written outbox_written
+      receipt_written
     ].freeze
 
     ENTRY_API = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/entry_api.yml")).freeze
@@ -107,8 +110,15 @@ module Timekeeping
       self.table_name = "entry_audits"
     end
 
+    # The class that carries out each operation: the entry routes run here,
+    # the reservation operations in ReservationOperations.
+    WRITERS = ROUTE_WRITERS.keys.index_with { self }
+      .merge(ReservationOperations::ROUTES.keys.index_with { ReservationOperations })
+      .freeze
+
     def self.call(operation:, company_id:, generation:, actor:, params:, checkpoint: ->(_step) { })
-      new(operation:, company_id:, generation:, actor:, params:, checkpoint:).call
+      writer = WRITERS.fetch(operation.to_sym) { raise ArgumentError, "unknown operation #{operation.inspect}" }
+      writer.new(operation:, company_id:, generation:, actor:, params:, checkpoint:).call
     end
 
     # :reek:LongParameterList
