@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "rails_helper"
 
 RSpec.describe "OmniAuth full host pin: spoofed Host on GitHub", type: :request do
@@ -29,8 +31,6 @@ RSpec.describe "OmniAuth full host pin: spoofed Host on GitHub", type: :request 
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "OmniAuth full host pin: forged forwarding headers", type: :request do
   around do |example|
     original_app_base_url = ENV["APP_BASE_URL"]
@@ -59,8 +59,6 @@ RSpec.describe "OmniAuth full host pin: forged forwarding headers", type: :reque
     expect("#{callback.scheme}://#{callback.host}#{callback.path}").to eq("http://example.com/users/auth/github/callback")
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "OmniAuth full host pin: spoofed Host on Google", type: :request do
   around do |example|

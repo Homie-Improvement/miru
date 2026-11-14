@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "rails_helper"
 
 RSpec.describe "OmniauthFullHost.resolve rejects unusable base URLs" do
@@ -17,8 +19,6 @@ RSpec.describe "OmniauthFullHost.resolve rejects unusable base URLs" do
     end
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "OmniAuth full host initializer with APP_BASE_URL unset" do
   around do |example|
