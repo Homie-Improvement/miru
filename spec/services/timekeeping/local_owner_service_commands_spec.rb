@@ -372,29 +372,36 @@ RSpec.describe Timekeeping::LocalOwner, "service command retries" do
     invoice = create(:invoice, company:, client: project.client)
     billable = service_command_entry(company, user: owner, project:, work_date: Date.current, duration: 30.0, note: "n")
     reserve_service_command_entry(billable, invoice.id, state: "committed")
-    agent_entry = service_command_entry(company, user: owner, project:, work_date: Date.current, duration: 30.0, note: "n", agent_id: 77)
+    # Two entries carry the agent, so a replay must give back the stored count of two.
+    agent_entries = Array.new(2) do
+      service_command_entry(company, user: owner, project:, work_date: Date.current, duration: 30.0, note: "n", agent_id: 77)
+    end
+    entries = [billable, *agent_entries]
     actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
                                            operations: ["invoices.mark_billed", "agents.detach_entries"])
-    commands = { mark_billed: { "invoice_id" => invoice.id }, detach_entries: { "agent_id" => 77 } }
-    stored_params = commands.to_h { |operation, target| [operation, target.merge("operation_id" => SecureRandom.uuid)] }
+    commands = {
+      mark_billed: [{ "invoice_id" => invoice.id }, { "billed" => 1 }],
+      detach_entries: [{ "agent_id" => 77 }, { "detached" => 2 }]
+    }
+    stored_params = commands.to_h { |operation, (target, _answer)| [operation, target.merge("operation_id" => SecureRandom.uuid)] }
 
     stored_params.each do |operation, params|
       first = described_class.call(operation:, company_id: company.id, generation:, actor:, params:)
-      expect(first.status).to eq(200)
+      expect([operation, first.status, first.body]).to eq([operation, 200, commands.fetch(operation).last])
       baseline = timekeeping_row_counts
-      entries_before = [billable, agent_entry].map { |entry| entry.reload.attributes }
+      entries_before = entries.map { |entry| entry.reload.attributes }
 
       # "A stale body generation on mark_billed or detach_entries gives 409 stale_generation and writes nothing, including a retry whose earlier answer is stored"
       refused = described_class.call(operation:, company_id: company.id, generation: stale, actor:, params:)
       expect([refused.status, refused.body]).to eq([409, { "reason" => "stale_generation" }])
       expect(timekeeping_row_counts).to eq(baseline)
-      expect([billable, agent_entry].map { |entry| entry.reload.attributes }).to eq(entries_before)
+      expect(entries.map { |entry| entry.reload.attributes }).to eq(entries_before)
 
       # "A retry at the current generation replays the first answer with no new rows."
       replay = described_class.call(operation:, company_id: company.id, generation:, actor:, params:)
       expect([replay.status, replay.body]).to eq([first.status, first.body])
       expect(timekeeping_row_counts).to eq(baseline)
-      expect([billable, agent_entry].map { |entry| entry.reload.attributes }).to eq(entries_before)
+      expect(entries.map { |entry| entry.reload.attributes }).to eq(entries_before)
     end
 
     # The ownership generation moves on after both receipts are stored, so the generation each
@@ -432,11 +439,14 @@ RSpec.describe Timekeeping::LocalOwner, "service command rollback" do
       detach_entries: [{ "agent_id" => 77 }, { "detached" => 1 }]
     }
 
+    # Every failing call and the retry of a command share one key, so the retry shows that no
+    # failure left a receipt behind for that key.
+    keyed_params = commands.to_h { |operation, (target, _answer)| [operation, target.merge("operation_id" => SecureRandom.uuid)] }
+
     # "A failure injected after the entry write leaves no outbox row or receipt."
-    commands.each do |operation, (target, answer)|
-      # Every failing call and the retry share one key, so the retry shows that no failure left a
-      # receipt behind for that key.
-      params = target.merge("operation_id" => SecureRandom.uuid)
+    # All failures run before any retry, so each command fails against the unbilled entry that
+    # still carries the agent.
+    keyed_params.each do |operation, params|
       %i[entry_written outbox_written].each do |step|
         expect(described_class::STEPS).to include(step)
         baseline = timekeeping_row_counts
@@ -455,11 +465,14 @@ RSpec.describe Timekeeping::LocalOwner, "service command rollback" do
         expect(seen_steps).to include(step)
         expect(timekeeping_row_counts).to eq(baseline)
         expect(entry.reload.attributes).to eq(entry_before)
+        expect(entry.attributes.values_at("bill_status", "agent_id")).to eq(["unbilled", 77])
       end
+    end
 
-      # Nothing was stored, so the same key runs as a first attempt.
+    # Nothing was stored, so the same key runs as a first attempt.
+    keyed_params.each do |operation, params|
       outcome = described_class.call(operation:, company_id: company.id, generation:, actor:, params:)
-      expect([operation, outcome.status, outcome.body]).to eq([operation, 200, answer])
+      expect([operation, outcome.status, outcome.body]).to eq([operation, 200, commands.fetch(operation).last])
     end
     expect(entry.reload.attributes.values_at("bill_status", "agent_id")).to eq(["billed", nil])
   end
@@ -555,9 +568,18 @@ RSpec.describe Timekeeping::LocalOwner, "service command receipts per service an
     # The second service of the first company finds no entry left with agent 77, so a replay of the
     # first service's answer would show "detached" => 2 instead of its own 0.
     expect(answers).to eq([[200, { "detached" => 0 }], [200, { "detached" => 1 }], [200, { "detached" => 1 }]])
-    expect(timekeeping_row_counts["idempotency_records"]).to eq(receipts_before + 4)
+
+    # A new entry with agent 77 appears after the first service's receipt is stored. A further
+    # service sending the same key and the same agent runs its own command and detaches it.
+    fresh_entry = service_command_company_entry(company, role: "owner", work_date: "2026-03-02", duration: 60.0, agent_id: 77)
+    fresh_detach = detach.call(company, actor.service(name: "agent-reaper", company_id: company.id, operations: grant), 77)
+    expect([fresh_detach.status, fresh_detach.body]).to eq([200, { "detached" => 1 }])
+    expect(fresh_entry.reload.agent_id).to be_nil
+
+    expect(timekeeping_row_counts["idempotency_records"]).to eq(receipts_before + 5)
     expect(receipt_owners.call(detach_operation_id)).to contain_exactly(
-      [company.id, "agent-destroy"], [company.id, "agent-cleanup"], [company.id, "agent-sweep"], [other_company.id, "agent-destroy"]
+      [company.id, "agent-destroy"], [company.id, "agent-cleanup"], [company.id, "agent-sweep"], [company.id, "agent-reaper"],
+      [other_company.id, "agent-destroy"]
     )
     expect(entries.map { |entry| entry.reload.agent_id }).to eq([nil, nil, nil, nil])
   end
