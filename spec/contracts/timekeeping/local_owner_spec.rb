@@ -22,10 +22,11 @@ end
 
 require_relative "entry_api_examples"
 require_relative "idempotency_examples"
+require_relative "reservations_examples"
 require_relative "../../support/timekeeping/local_owner_arrange"
 
-# Runs the shared entry API and entry idempotency contracts against the
-# prepared monolith's local owner, through the spec-only gateway stand-in.
+# Runs the shared entry API, reservations and idempotency contracts against
+# the prepared monolith's local owner, through the spec-only gateway stand-in.
 RSpec.describe "The local owner under the Timekeeping entry contracts" do
   let(:timekeeping_client) { TimekeepingContract::LocalOwnerClient.new(public_key: timekeeping_key_pair.public_key) }
   let(:timekeeping_arrange) { TimekeepingContract::LocalOwnerArrange.new(private_key: timekeeping_key_pair) }
@@ -44,5 +45,56 @@ RSpec.describe "The local owner under the Timekeeping entry contracts" do
 
   describe "the idempotency contract for entries" do
     it_behaves_like "timekeeping idempotency contract", contracts: [:entry_api]
+  end
+
+  describe "the reservation operations and service commands" do
+    it_behaves_like "timekeeping reservations contract"
+  end
+
+  describe "the idempotency contract for reservations" do
+    it_behaves_like "timekeeping idempotency contract", contracts: [:reservations]
+  end
+end
+
+require "rails_helper"
+
+RSpec.describe "Timekeeping::LocalOwner reservations contract coverage" do
+  # "spec/contracts/timekeeping/local_owner_spec.rb runs the timekeeping reservations contract and the idempotency contract with contracts: [:reservations] with zero pending or skipped examples"
+  it "local_owner_spec.rb includes the timekeeping reservations contract with no pending or skipped example" do
+    this_file = File.expand_path(__FILE__)
+    groups = RSpec.world.example_groups.select { |group| File.expand_path(group.metadata[:file_path].to_s) == this_file }
+    examples = groups.flat_map(&:descendants).flat_map(&:examples)
+    contract_examples = examples.select do |example|
+      Array(example.metadata[:shared_group_inclusion_backtrace]).map(&:shared_group_name)
+        .include?("timekeeping reservations contract")
+    end
+
+    expect(contract_examples).not_to be_empty
+    # The contract's service-command examples must be among them.
+    expect(contract_examples.map(&:full_description).join("\n")).to include("marks billed the entries the invoice holds by committed reservation")
+    expect(contract_examples.map(&:full_description).join("\n")).to include("detaches the agent from that company's entries only")
+    skipped = contract_examples.select { |example| example.metadata[:skip] || example.metadata[:pending] }
+    expect(skipped.map(&:full_description)).to eq([])
+  end
+end
+
+require "rails_helper"
+
+RSpec.describe "Timekeeping::LocalOwner reservation idempotency coverage" do
+  # "spec/contracts/timekeeping/local_owner_spec.rb runs the timekeeping reservations contract and the idempotency contract with contracts: [:reservations] with zero pending or skipped examples"
+  it "local_owner_spec.rb includes the idempotency contract for reservation operation ids with no pending or skipped example" do
+    this_file = File.expand_path(__FILE__)
+    groups = RSpec.world.example_groups.select { |group| File.expand_path(group.metadata[:file_path].to_s) == this_file }
+    examples = groups.flat_map(&:descendants).flat_map(&:examples)
+    # contracts: [:reservations] defines the "with reservation operation ids" context of the shared group.
+    reservation_idempotency = examples.select do |example|
+      Array(example.metadata[:shared_group_inclusion_backtrace]).map(&:shared_group_name)
+        .include?("timekeeping idempotency contract") &&
+        example.full_description.include?("with reservation operation ids")
+    end
+
+    expect(reservation_idempotency).not_to be_empty
+    skipped = reservation_idempotency.select { |example| example.metadata[:skip] || example.metadata[:pending] }
+    expect(skipped.map(&:full_description)).to eq([])
   end
 end
