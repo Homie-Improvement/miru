@@ -939,6 +939,38 @@ end
 
 RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
   include RunnerLegacyHandoffSpecSupport
+  include RunnerSourceIntentsSpecSupport
+
+  # "Require a fresh comparison with the saved intents before a resumed flip"
+  # With nothing changed, the rollback's comparison must pass too, or an interrupted rollback could never finish.
+  it "a rollback resume after reconcile was recorded with unchanged intents compares them again, flips once and admits once" do
+    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
+    owners = handoff_owners(timekeeping)
+    report_root = Dir.mktmpdir("handoff-report")
+    insert_committed_intent_for_source_intents_spec("5d0b6a0e-1d7c-4f4e-9a52-6a1f1c0de256", desired_entry_ids: "{7,8}")
+    described_class.run(direction: :cutover, owners:, report_root:)
+
+    expect do
+      described_class.run(direction: :rollback, owners:, report_root:,
+                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_reconcile))
+    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+    expect(TimekeepingOwnership.current.handoff_step).to eq("reconcile")
+    generation_dir = Pathname(report_root).join("generation-3")
+    baselines = %w[source_intents.json checkpoint.json money_before.json].index_with { |name| generation_dir.join(name).read }
+    # The first run's passing report is removed, so a report after the resume shows the comparison ran again.
+    generation_dir.join("reconciliation.json").delete
+
+    described_class.run(direction: :rollback, owners:, report_root:)
+
+    expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", generation: 3, handoff_step: nil)
+    expect(owners.fetch(:monolith).admission.calls.count([:admit, 3])).to eq(1)
+    expect(generation_dir.join("reconciliation.json")).to exist
+    baselines.each { |name, text| expect(generation_dir.join(name).read).to eq(text), "#{name} was rewritten" }
+  end
+end
+
+RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
+  include RunnerLegacyHandoffSpecSupport
 
   # A recorded reconcile still resumes at flip in the step decision; the recheck of the saved
   # intents happens inside the flip step, so the resumed run reports only the flip step.
