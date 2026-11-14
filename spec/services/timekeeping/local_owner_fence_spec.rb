@@ -20,7 +20,8 @@ RSpec.describe Timekeeping::LocalOwner, "stale refusal then fresh write, merged"
                               "note" => "fresh", "source" => "manual", "source_metadata" => {} } }
       )
     end
-    empty = { "entries" => 0, "entry_audits" => 0, "idempotency_records" => 0, "entry_outbox_items" => 0 }
+    empty = { "entries" => 0, "entry_audits" => 0, "idempotency_records" => 0, "entry_outbox_items" => 0,
+              "reservations" => 0, "invoice_operations" => 0 }
     expect(timekeeping_row_counts).to eq(empty)
 
     stale = request_at.call(current + 1)
@@ -29,7 +30,9 @@ RSpec.describe Timekeeping::LocalOwner, "stale refusal then fresh write, merged"
     expect(stale.body.with_indifferent_access[:reason]).to eq("stale_generation")
     expect(timekeeping_row_counts).to eq(empty)
     expect(request_at.call(current).status).to eq(201)
-    expect(timekeeping_row_counts).to eq(empty.transform_values { 1 })
+    expect(timekeeping_row_counts).to eq(
+      empty.merge("entries" => 1, "entry_audits" => 1, "idempotency_records" => 1, "entry_outbox_items" => 1)
+    )
   end
 end
 
@@ -54,7 +57,8 @@ RSpec.describe Timekeeping::LocalOwner do
       TimekeepingOwnership.current.update!(generation: old_generation + 1)
       before_retry = timekeeping_row_counts
       # The baseline must hold the first write, or an unchanged count proves nothing.
-      expect(before_retry).to eq("entries" => 1, "entry_audits" => 1, "idempotency_records" => 1, "entry_outbox_items" => 1)
+      expect(before_retry).to eq("entries" => 1, "entry_audits" => 1, "idempotency_records" => 1, "entry_outbox_items" => 1,
+                                 "reservations" => 0, "invoice_operations" => 0)
 
       retried = request.call
 
@@ -99,7 +103,8 @@ RSpec.describe Timekeeping::LocalOwner, "malformed generation union" do
 
     expect(retried.status).to eq(201)
     expect(timekeeping_row_counts).to eq(
-      "entries" => 1, "entry_audits" => 1, "idempotency_records" => 1, "entry_outbox_items" => 1
+      "entries" => 1, "entry_audits" => 1, "idempotency_records" => 1, "entry_outbox_items" => 1,
+      "reservations" => 0, "invoice_operations" => 0
     )
   end
 end

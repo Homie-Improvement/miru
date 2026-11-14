@@ -54,7 +54,8 @@ RSpec.describe Timekeeping::LocalOwner, "credential in body" do
                                               work_date: Date.current, duration: 5.0, note: "seeded", bill_status: "unbilled")
       attributes_before = entry.reload.attributes
       before = timekeeping_row_counts
-      expect(before).to eq("entries" => 1, "entry_audits" => 0, "idempotency_records" => 0, "entry_outbox_items" => 0)
+      expect(before).to eq("entries" => 1, "entry_audits" => 0, "idempotency_records" => 0, "entry_outbox_items" => 0,
+                           "reservations" => 0, "invoice_operations" => 0)
 
       held_token = nil
       outcome = with_timekeeping_service_token do |token|
@@ -115,7 +116,7 @@ RSpec.describe Timekeeping::LocalOwner, "a committed create" do
   let(:company) { create(:company) }
   let(:project) { create(:project, client: create(:client, company:)) }
   let(:employee) { timekeeping_member(company, "employee") }
-  let(:one_row_each) { TIMEKEEPING_WRITE_TABLES.index_with { 1 } }
+  let(:one_row_each) { TIMEKEEPING_WRITE_TABLES.index_with { 1 }.merge("reservations" => 0, "invoice_operations" => 0) }
 
   before { prepare_local_ownership! }
 

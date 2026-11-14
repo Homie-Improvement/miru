@@ -21,7 +21,8 @@ RSpec.describe Timekeeping::LocalOwner, "entry_written rollback, merged" do
     expect(created.status).to eq(201)
     entry = Timekeeping::LocalEntry.find_by!(company_id: company.id, note: "before")
     baseline = timekeeping_row_counts
-    expect(baseline).to eq("entries" => 1, "entry_audits" => 1, "idempotency_records" => 1, "entry_outbox_items" => 1)
+    expect(baseline).to eq("entries" => 1, "entry_audits" => 1, "idempotency_records" => 1, "entry_outbox_items" => 1,
+                           "reservations" => 0, "invoice_operations" => 0)
     attributes_before = entry.reload.attributes
     injected = Class.new(StandardError)
     expect(described_class::STEPS).to include(:entry_written)
@@ -135,7 +136,8 @@ RSpec.describe Timekeeping::LocalOwner, "when a failure is injected before commi
   it "an employee create failing at entry_written leaves no entry, audit, receipt or outbox row" do
     seed_entry
     baseline = timekeeping_row_counts
-    expect(baseline).to eq("entries" => 1, "entry_audits" => 0, "idempotency_records" => 0, "entry_outbox_items" => 0)
+    expect(baseline).to eq("entries" => 1, "entry_audits" => 0, "idempotency_records" => 0, "entry_outbox_items" => 0,
+                           "reservations" => 0, "invoice_operations" => 0)
     injected = Class.new(StandardError)
 
     expect { create_as_employee("injected-create", checkpoint: failing_at(:entry_written, injected)) }
@@ -248,6 +250,7 @@ RSpec.describe Timekeeping::LocalOwner, "receipt backstop", committed_data: true
     expect(outcome.status).to eq(201)
     expect(outcome.body).to eq(stored_answer)
     expect(timekeeping_row_counts)
-      .to eq("entries" => 0, "entry_audits" => 0, "idempotency_records" => 1, "entry_outbox_items" => 0)
+      .to eq("entries" => 0, "entry_audits" => 0, "idempotency_records" => 1, "entry_outbox_items" => 0,
+             "reservations" => 0, "invoice_operations" => 0)
   end
 end
