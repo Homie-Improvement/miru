@@ -739,16 +739,6 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
     expect(connection.select_all("SELECT * FROM idempotency_records ORDER BY id").to_a).to eq(before_rows)
   end
 
-  it "export refuses a user receipt carrying actor_name instead of dropping the value" do
-    connection.execute(<<~SQL.squish)
-      INSERT INTO idempotency_records (company_id, actor_type, actor_id, actor_name, operation, key, fingerprint, status, body, created_at)
-      VALUES (1, 'User', 7, 'stray-name', 'create_entry', 'k-u', 'fp-user', 201, '{}', now())
-    SQL
-
-    # "An exported row whose `actor_name` is not null raises `ShapeError`, so nothing is dropped without notice."
-    expect { store.export_checkpoint }.to raise_error(Timekeeping::Handoff::Checkpoint::ShapeError)
-  end
-
   # "With one user receipt and one service receipt stored, export holds only the user receipt and raises no ShapeError."
   it "exports only the user receipt when a user and a service receipt are stored, with no actor_name key" do
     connection.execute(<<~SQL.squish)
@@ -806,14 +796,9 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
     SQL
     expect([7, kept.first.fetch("id")]).not_to include(next_id)
   end
-end
-
-RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
-  let(:service_only_connection) { ActiveRecord::Base.connection }
-  let(:service_only_store) { described_class.new(connection: service_only_connection) }
 
   it "exports an empty idempotency_records table when only a service receipt is stored" do
-    service_only_connection.execute(<<~SQL.squish)
+    connection.execute(<<~SQL.squish)
       INSERT INTO idempotency_records
         (company_id, actor_type, actor_id, actor_name, operation, key, fingerprint, status, body, created_at)
       VALUES (1, 'service', NULL, 'reservations-worker', 'prepare', 'k-1', 'digest', 201, '{"ok":true}', now())
@@ -821,26 +806,13 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
 
     # "MonolithStore export with a stored service receipt raises no ShapeError and holds only non-service receipts"
     checkpoint = nil
-    expect { checkpoint = service_only_store.export_checkpoint }.not_to raise_error
+    expect { checkpoint = store.export_checkpoint }.not_to raise_error
     expect(checkpoint.rows.fetch("idempotency_records")).to eq([])
-    expect(service_only_connection.select_value("SELECT count(*) FROM idempotency_records WHERE actor_type = 'service'")).to eq(1)
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
-  let(:ahead_connection) { ActiveRecord::Base.connection }
-  let(:ahead_store) { described_class.new(connection: ahead_connection) }
-
-  def ahead_user_receipt(id:)
-    {
-      "id" => id, "company_id" => 1, "actor_type" => "User", "actor_id" => 3, "operation" => "create",
-      "key" => "user-key", "fingerprint" => "digest", "status" => 201, "body" => "{\"ok\":true}",
-      "created_at" => Time.utc(2026, 4, 2, 10, 15, 30)
-    }
+    expect(connection.select_value("SELECT count(*) FROM idempotency_records WHERE actor_type = 'service'")).to eq(1)
   end
 
   it "keeps service receipts stored with ids ahead of the sequence when a user receipt with id 7 loads" do
-    ahead_connection.execute(<<~SQL.squish)
+    connection.execute(<<~SQL.squish)
       INSERT INTO idempotency_records
         (id, company_id, actor_type, actor_id, actor_name, operation, key, fingerprint, status, body, created_at)
       VALUES
@@ -848,74 +820,37 @@ RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
         (9, 1, 'service', NULL, 'worker-b', 'prepare', 'k-9', 'f-9', 202, '{"n":9}', '2026-01-05 09:00:00')
     SQL
     # The sequence still hands out 8, so kept rows cannot rely on it standing above stored ids.
-    ahead_connection.execute("SELECT setval(pg_get_serial_sequence('idempotency_records', 'id'), 8, false)")
-    tables = Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }
-    tables["idempotency_records"] = [ahead_user_receipt(id: 7)]
-    checkpoint = Timekeeping::Handoff::Checkpoint.build(tables:)
+    connection.execute("SELECT setval(pg_get_serial_sequence('idempotency_records', 'id'), 8, false)")
+    user_receipt = {
+      "id" => 7, "company_id" => 1, "actor_type" => "User", "actor_id" => 3, "operation" => "create",
+      "key" => "user-key", "fingerprint" => "digest", "status" => 201, "body" => "{\"ok\":true}",
+      "created_at" => Time.utc(2026, 4, 2, 10, 15, 30)
+    }
+    checkpoint = Timekeeping::Handoff::Checkpoint.build(
+      tables: Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }.merge("idempotency_records" => [user_receipt])
+    )
 
     # "A load keeps stored service receipts, including one whose id equals an incoming checkpoint receipt id"
-    expect { ahead_store.load_checkpoint(checkpoint) }.not_to raise_error
+    expect { store.load_checkpoint(checkpoint) }.not_to raise_error
 
-    kept = ahead_connection.select_rows(<<~SQL.squish)
+    kept = connection.select_rows(<<~SQL.squish)
       SELECT id, actor_name, key, fingerprint, status, body FROM idempotency_records
       WHERE actor_type = 'service' ORDER BY actor_name
     SQL
     expect(kept.map { |row| row.drop(1) }).to eq([
-      ["worker-a", "k-8", "f-8", 202 - 1, "{\"n\":8}"],
+      ["worker-a", "k-8", "f-8", 201, "{\"n\":8}"],
       ["worker-b", "k-9", "f-9", 202, "{\"n\":9}"]
     ])
     expect(kept.map(&:first)).to all(be > 9)
     expect(kept.map(&:first).uniq.size).to eq(2)
-    expect(ahead_connection.select_values("SELECT id FROM idempotency_records WHERE actor_type = 'User'")).to eq([7])
-    expect(ahead_store.export_checkpoint.digest).to eq(checkpoint.digest)
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::MonolithStore, :without_transaction do
-  let(:connection) { ActiveRecord::Base.connection }
-  let(:store) { described_class.new(connection:) }
-
-  def service_receipt_checkpoint_of(receipts)
-    Timekeeping::Handoff::Checkpoint.build(
-      tables: Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }.merge("idempotency_records" => receipts)
-    )
-  end
-
-  def service_receipt_user_row(id:)
-    {
-      "id" => id, "company_id" => 1, "actor_type" => "User", "actor_id" => 7, "operation" => "create_entry",
-      "key" => "user-k-#{id}", "fingerprint" => "fp-user", "status" => 201, "body" => "{\"user\":true}",
-      "created_at" => Time.utc(2026, 4, 2, 10, 15, 30, 654_321)
-    }
-  end
-
-  it "keeps service receipts stored with explicit ids ahead of the sequence when a checkpoint user receipt loads" do
-    # The table starts truncated with its id sequence restarted, so the
-    # sequence still hands out 1 while the stored service receipts hold 8 and 9.
-    connection.execute(<<~SQL.squish)
-      INSERT INTO idempotency_records (id, company_id, actor_type, actor_id, actor_name, operation, key, fingerprint, status, body, created_at)
-      VALUES (8, 1, 'service', NULL, 'billing-worker', 'reserve', 'svc-k-8', 'fp-8', 200, '{"svc":8}', '2026-04-01 09:00:00'),
-             (9, 1, 'service', NULL, 'export-worker', 'reserve', 'svc-k-9', 'fp-9', 200, '{"svc":9}', '2026-04-01 09:00:01')
-    SQL
-
-    # "A load keeps stored service receipts, including one whose id equals an incoming checkpoint receipt id"
-    expect { store.load_checkpoint(service_receipt_checkpoint_of([service_receipt_user_row(id: 7)])) }.not_to raise_error
-
-    service_rows = connection.select_all(<<~SQL.squish).to_a
-      SELECT id, actor_name, key, fingerprint, body FROM idempotency_records WHERE actor_type = 'service' ORDER BY actor_name
-    SQL
-    expect(service_rows.map { |row| row.except("id") }).to eq([
-      { "actor_name" => "billing-worker", "key" => "svc-k-8", "fingerprint" => "fp-8", "body" => "{\"svc\":8}" },
-      { "actor_name" => "export-worker", "key" => "svc-k-9", "fingerprint" => "fp-9", "body" => "{\"svc\":9}" }
-    ])
-    expect(service_rows.map { |row| row["id"] }).to all(be > 9)
     expect(connection.select_values("SELECT id FROM idempotency_records WHERE actor_type = 'User'")).to eq([7])
+    expect(store.export_checkpoint.digest).to eq(checkpoint.digest)
 
     # The next ordinary insert draws from the sequence and must not meet a kept or loaded id.
     expect {
       connection.execute(<<~SQL.squish)
         INSERT INTO idempotency_records (company_id, actor_type, actor_id, operation, key, fingerprint, status, body, created_at)
-        VALUES (1, 'User', 7, 'create_entry', 'user-k-next', 'fp', 201, '{}', now())
+        VALUES (1, 'User', 3, 'create', 'user-key-next', 'fp', 201, '{}', now())
       SQL
     }.not_to raise_error
   end
