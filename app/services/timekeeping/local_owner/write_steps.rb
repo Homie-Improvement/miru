@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "digest"
+
 module Timekeeping
   class LocalOwner
     # The steps every local writer takes inside its own transaction: the
@@ -10,6 +12,13 @@ module Timekeeping
       ID = TimekeepingRules::EntryDecision::ID
       UNPUBLISHABLE_REASON = :unpublishable_entry
       SHARED_OWNERSHIP_LOCK = "FOR SHARE"
+      # The ownership read of a service writer; see locked_generation_nowait
+      # for why it never waits.
+      NOWAIT_OWNERSHIP_LOCK = "FOR SHARE NOWAIT"
+
+      # Raised when the NOWAIT ownership read finds the row locked, so only
+      # that read, and no other lock wait, is answered as stale_generation.
+      class OwnershipQueued < StandardError; end
 
       # What a write answers: an HTTP status and a JSON-ready body with string
       # keys. A replayed receipt answers the body parsed from the stored text,
@@ -58,6 +67,34 @@ module Timekeeping
         ownership.generation
       end
 
+      # The admitted generation, read FOR SHARE NOWAIT. A billing write holds
+      # the ownership row FOR SHARE before it takes the invoice lock, so with
+      # a handoff's update queued on that row a waiting read here could close
+      # a lock cycle. Raises OwnershipQueued instead of waiting, which the
+      # writer answers as stale_generation.
+      def locked_generation_nowait
+        stored_generation = admitted_generation(lock: NOWAIT_OWNERSHIP_LOCK)
+        raise OwnershipQueued, "an ownership update is waiting on the row" if ownership_update_queued?
+
+        stored_generation
+      rescue ActiveRecord::LockWaitTimeout => error
+        raise OwnershipQueued, error.message
+      end
+
+      # PostgreSQL grants a FOR SHARE request beside other share holders
+      # even while an update waits for them, so NOWAIT alone does not see a
+      # queued handoff. A backend waiting to lock a row holds a lock on that
+      # tuple for as long as it waits, so any tuple lock another backend
+      # holds on the ownership table means an update is queued there.
+      def ownership_update_queued?
+        ApplicationRecord.connection.select_value(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, TimekeepingOwnership.table_name]))
+          SELECT EXISTS (
+            SELECT 1 FROM pg_locks
+            WHERE locktype = 'tuple' AND relation = to_regclass(?) AND pid <> pg_backend_pid()
+          )
+        SQL
+      end
+
       # nil matches nothing, and a sent value that is not a plain integer
       # never matches, so neither a missing header nor "abc" can be admitted.
       def generation_matches?(sent, stored_generation)
@@ -70,6 +107,13 @@ module Timekeeping
         ApplicationRecord.connection.execute(
           ApplicationRecord.sanitize_sql_array(["SELECT pg_advisory_xact_lock(#{placeholders})", *keys])
         )
+      end
+
+      # Only writers naming the same parts wait on each other. The lock is
+      # taken on two signed 32-bit keys from a digest of the parts; rows are
+      # always read by their columns, never by this key.
+      def lock_key(*parts)
+        advisory_lock(*Digest::SHA256.digest(parts.join(LocalOwner::KEY_SEPARATOR)).unpack("l>l>"))
       end
 
       # One audit row per event. actor holds the actor columns: actor_type
@@ -127,7 +171,7 @@ module Timekeeping
         { entry_id: entry.id, before: { "locked" => entry.reserved }, after: { "locked" => !entry.reserved },
           entry_created_at: entry.created_at }
       end
-      private_class_method :locked_event
+      private_class_method :locked_event, :ownership_update_queued?
     end
   end
 end
