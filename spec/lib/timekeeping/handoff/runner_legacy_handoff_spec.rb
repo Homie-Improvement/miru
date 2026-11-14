@@ -267,8 +267,8 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   # "Source intents are saved at the checkpoint and reused on resume, and deleting or changing a terminal
   # intent after the checkpoint makes reconcile report a difference."
   it "a terminal intent deleted after the checkpoint makes the resumed reconcile report it and keep the monolith as owner" do
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+    owners = TimekeepingHandoffFakes.owners(timekeeping:)
     report_root = Dir.mktmpdir("handoff-report")
     operation_id = "5d0b6a0e-1d7c-4f4e-9a52-6a1f1c0de001"
     insert_committed_intent_for_source_intents_spec(operation_id)
@@ -299,8 +299,8 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   # "Source intents are saved at the checkpoint and reused on resume, and deleting or changing a terminal
   # intent after the checkpoint makes reconcile report a difference."
   it "a terminal intent whose desired_entry_ids change after the checkpoint makes the resumed reconcile report that field" do
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+    owners = TimekeepingHandoffFakes.owners(timekeeping:)
     report_root = Dir.mktmpdir("handoff-report")
     operation_id = "5d0b6a0e-1d7c-4f4e-9a52-6a1f1c0de002"
     insert_committed_intent_for_source_intents_spec(operation_id)
@@ -331,8 +331,8 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   # intent after the checkpoint makes reconcile report a difference."
   # With nothing changed, the saved intents must read back equal to a fresh read, so the resume passes.
   it "a resume with unchanged intents reuses the saved source intents and finishes the cutover" do
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+    owners = TimekeepingHandoffFakes.owners(timekeeping:)
     report_root = Dir.mktmpdir("handoff-report")
     insert_committed_intent_for_source_intents_spec("5d0b6a0e-1d7c-4f4e-9a52-6a1f1c0de003", desired_entry_ids: "{7,8}")
 
@@ -358,8 +358,8 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   # intent after the checkpoint makes reconcile report a difference."
   # Capturing again at reconcile would compare current intents with themselves and hide any change.
   it "a resume whose saved source intents file is gone refuses instead of capturing the intents again" do
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+    owners = TimekeepingHandoffFakes.owners(timekeeping:)
     report_root = Dir.mktmpdir("handoff-report")
 
     expect do
@@ -380,16 +380,15 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   end
 end
 
-# Uses RunnerLegacyHandoffSpecTimekeeping and RunnerLegacyHandoffSpecSupport,
-# defined at the top of this file.
+# Uses RunnerLegacyHandoffSpecSupport, defined at the top of this file.
 RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
   include RunnerLegacyHandoffSpecSupport
   include RunnerSourceIntentsSpecSupport
 
   # "Capture and persist the source intents at the frozen checkpoint boundary, reuse them after restart, and pass a separate current read to reconciliation."
   it "an intent written after the checkpoint appears only in the current read and makes the resumed reconcile report it missing from the source" do
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+    owners = TimekeepingHandoffFakes.owners(timekeeping:)
     report_root = Dir.mktmpdir("handoff-report")
     operation_id = SecureRandom.uuid
 
@@ -413,16 +412,15 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   end
 end
 
-# Uses RunnerLegacyHandoffSpecTimekeeping and RunnerLegacyHandoffSpecSupport,
-# defined at the top of this file.
+# Uses RunnerLegacyHandoffSpecSupport, defined at the top of this file.
 RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
   include RunnerLegacyHandoffSpecSupport
   include RunnerSourceIntentsSpecSupport
 
   # "Keep the existing checks for pending intents and operation states."
   it "an intent committed at the checkpoint and pending on resume is still reported as a pending intent from the current read" do
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+    owners = TimekeepingHandoffFakes.owners(timekeeping:)
     report_root = Dir.mktmpdir("handoff-report")
     operation_id = SecureRandom.uuid
     insert_committed_intent_for_source_intents_spec(operation_id)
@@ -449,8 +447,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   end
 end
 
-# Uses RunnerLegacyHandoffSpecTimekeeping and RunnerLegacyHandoffSpecSupport,
-# defined at the top of this file.
+# Uses RunnerLegacyHandoffSpecSupport, defined at the top of this file.
 RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
   include RunnerLegacyHandoffSpecSupport
   include RunnerSourceIntentsSpecSupport
@@ -459,8 +456,8 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   # receipt difference; once it fails after the checkpoint, that listing must
   # not explain away its state change.
   it "a legacy intent committed at the checkpoint and failed on resume is reported, not listed as expected" do
-    timekeeping = RunnerLegacyHandoffSpecTimekeeping.new
-    owners = handoff_owners(timekeeping)
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+    owners = TimekeepingHandoffFakes.owners(timekeeping:)
     report_root = Dir.mktmpdir("handoff-report")
     operation_id = SecureRandom.uuid
     insert_committed_intent_for_source_intents_spec(operation_id)
@@ -482,8 +479,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   end
 end
 
-# Uses RunnerLegacyHandoffSpecTimekeeping and RunnerLegacyHandoffSpecSupport,
-# defined at the top of this file.
+# Uses RunnerLegacyHandoffSpecSupport, defined at the top of this file.
 RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
   include RunnerLegacyHandoffSpecSupport
 
