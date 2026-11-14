@@ -17,6 +17,13 @@ RSpec.describe "RackAttack OTP throttles", type: :request do
     Rack::Attack.cache.store = store
   end
 
+  # Rack::Attack counts each throttle in fixed one-minute windows keyed on Time.now.
+  # Freezing the clock keeps every request of an example in one window, so a minute
+  # boundary cannot reset the count before the over-limit request.
+  around do |example|
+    freeze_time { example.run }
+  end
+
   before { Rack::Attack.cache.store.clear }
   after { Rack::Attack.cache.store.clear }
 
