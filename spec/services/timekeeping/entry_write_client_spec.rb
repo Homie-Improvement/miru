@@ -888,3 +888,31 @@ RSpec.describe Timekeeping::EntryWriteClient, "bulk move token" do
     expect(claims.projects.map { |project| project.with_indifferent_access[:id] }).to eq([bulk_token_target.id])
   end
 end
+
+RSpec.describe Timekeeping::EntryWriteClient, "refusal mapping" do
+  # "Idempotency-Key and If-Match from the request reach the local owner, so retries replay and stale versions answer version_conflict"
+  it "maps a local owner's 409 version_conflict to Conflict, 409 stale_generation to StaleGeneration and 404 to RecordNotFound" do
+    conflict = described_class.refusal_error(operation: "update", status: 409, reason: "version_conflict")
+    stale = described_class.refusal_error(operation: "update", status: 409, reason: "stale_generation")
+    missing = described_class.refusal_error(operation: "destroy", status: 404, reason: "not_found")
+    forbidden = described_class.refusal_error(operation: "create", status: 403, reason: "forbidden")
+    rejected = described_class.refusal_error(operation: "create", status: 422, reason: "idempotency_key_required")
+
+    expect(conflict).to be_a(Timekeeping::EntryWriteClient::Conflict)
+    expect(stale).to be_a(Timekeeping::Gateway::StaleGeneration)
+    expect(missing).to be_a(ActiveRecord::RecordNotFound)
+    expect(forbidden).to be_a(Timekeeping::EntryWriteClient::Forbidden)
+    expect(rejected).to be_a(Timekeeping::EntryWriteClient::Rejected)
+  end
+
+  it "maps a local owner's 422 credential_in_body and 400 invalid_request to Rejected and a 500 to Error" do
+    credential = described_class.refusal_error(operation: "create", status: 422, reason: "credential_in_body")
+    invalid = described_class.refusal_error(operation: "create", status: 400, reason: "invalid_request")
+    failed = described_class.refusal_error(operation: "create", status: 500, reason: nil)
+
+    expect(credential).to be_a(Timekeeping::EntryWriteClient::Rejected)
+    expect(invalid).to be_a(Timekeeping::EntryWriteClient::Rejected)
+    expect(failed).to be_a(Timekeeping::EntryWriteClient::Error)
+    expect(failed.message).to eq("Timekeeping entry create answered 500")
+  end
+end

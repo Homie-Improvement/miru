@@ -43,8 +43,7 @@ RSpec.describe Timekeeping::EntryLookup do
     # The owner's answer is not trusted to stay inside the company: a foreign row answers as a missing id does.
     expect do
       described_class.find(
-        ownership:, context: lookup_context, entry_id: 4242,
-        local_owner: Timekeeping::Gateway::UnavailableLocalOwner.new, read_client: lookup_read_client
+        ownership:, context: lookup_context, entry_id: 4242, read_client: lookup_read_client
       )
     end.to raise_error(ActiveRecord::RecordNotFound)
   end
@@ -78,7 +77,7 @@ RSpec.describe Timekeeping::EntryLookup do
     expect do
       described_class.find(
         ownership: TimekeepingOwnership.current, context: legacy_lookup_context, entry_id: foreign_entry.id,
-        local_owner: Timekeeping::Gateway::UnavailableLocalOwner.new, read_client: legacy_unused_read_client
+        read_client: legacy_unused_read_client
       )
     end.to raise_error(ActiveRecord::RecordNotFound)
   end
@@ -100,7 +99,6 @@ RSpec.describe Timekeeping::EntryLookup do
       define_method(:show_entry) { |**| raise "this branch must not call Timekeeping" }
     end.new
   end
-  let(:owner_lookup_unused_local_owner) { Timekeeping::FakeLocalOwner.new }
 
   before do
     create(:employment, company: owner_lookup_company, user: owner_lookup_admin)
@@ -109,9 +107,8 @@ RSpec.describe Timekeeping::EntryLookup do
     owner_lookup_colleague.add_role :employee, owner_lookup_company
   end
 
-  def owner_lookup_find(ownership:, entry_id:, local_owner: owner_lookup_unused_local_owner,
-                        read_client: owner_lookup_unused_client, scope: :company)
-    described_class.find(ownership:, context: owner_lookup_context, entry_id:, local_owner:, read_client:, scope:)
+  def owner_lookup_find(ownership:, entry_id:, read_client: owner_lookup_unused_client, scope: :company)
+    described_class.find(ownership:, context: owner_lookup_context, entry_id:, read_client:, scope:)
   end
 
   def owner_lookup_row(id:, user_id:)
@@ -131,7 +128,6 @@ RSpec.describe Timekeeping::EntryLookup do
 
       expect(found.entry).to eq(entry)
       expect(found.version).to be_nil
-      expect(owner_lookup_unused_local_owner.calls).to be_empty
     end
 
     it "raises RecordNotFound for a discarded entry" do
@@ -229,39 +225,67 @@ RSpec.describe Timekeeping::EntryLookup do
       TimekeepingOwnership.current.tap { |ownership| ownership.update!(monolith_store: "prepared", generation: 3) }
     end
 
-    it "asks only the local owner" do
-      entry = TimesheetEntry.new(id: 6161, company_id: owner_lookup_company.id, user_id: owner_lookup_colleague.id,
-                                 project: owner_lookup_project)
-      local_owner = Timekeeping::FakeLocalOwner.new(entries: { 6161 => entry })
-
-      found = owner_lookup_find(ownership: owner_lookup_ownership, entry_id: 6161, local_owner:)
-
-      expect(found.entry).to eq(entry)
-      expect(local_owner.calls).to eq([{ method: :find_entry, kwargs: { context: owner_lookup_context, entry_id: 6161 } }])
+    def owner_lookup_local_entry(company_id: owner_lookup_company.id, **attributes)
+      Timekeeping::LocalEntry.create!(
+        { company_id:, user_id: owner_lookup_colleague.id, project_id: owner_lookup_project.id, work_date: Date.current,
+          duration: 30.0, note: "Local copy", bill_status: "unbilled" }.merge(attributes)
+      )
     end
 
-    it "raises RecordNotFound when the local owner answers another company's entry" do
-      entry = TimesheetEntry.new(id: 6162, company_id: create(:company).id, user_id: owner_lookup_colleague.id)
-      local_owner = Timekeeping::FakeLocalOwner.new(entries: { 6162 => entry })
+    def owner_lookup_reserve(row)
+      invoice = create(:invoice, company: owner_lookup_company, client: owner_lookup_project.client)
+      ActiveRecord::Base.connection.execute(ActiveRecord::Base.sanitize_sql_array([<<~SQL.squish, row.company_id, row.id, invoice.id, SecureRandom.uuid]))
+        INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
+        VALUES (?, ?, ?, ?, 'committed', 'active', NOW())
+      SQL
+    end
 
-      expect { owner_lookup_find(ownership: owner_lookup_ownership, entry_id: 6162, local_owner:) }
+    it "reads the company's local entry with the row's own user and version, without calling Timekeeping" do
+      row = owner_lookup_local_entry(version: 4)
+
+      found = owner_lookup_find(ownership: owner_lookup_ownership, entry_id: row.id)
+
+      expect(found.entry).to have_attributes(id: row.id, user_id: owner_lookup_colleague.id, note: "Local copy")
+      expect(found.entry).not_to be_persisted
+      expect(found.entry.project).to eq(owner_lookup_project)
+      expect(found.version).to eq(4)
+    end
+
+    it "reads a local entry holding a reservation as locked" do
+      row = owner_lookup_local_entry(locked: false)
+      owner_lookup_reserve(row)
+
+      found = owner_lookup_find(ownership: owner_lookup_ownership, entry_id: row.id)
+
+      expect(found.entry.locked).to be(true)
+    end
+
+    it "raises RecordNotFound for another company's local entry" do
+      row = owner_lookup_local_entry(company_id: create(:company).id)
+
+      expect { owner_lookup_find(ownership: owner_lookup_ownership, entry_id: row.id) }
         .to raise_error(ActiveRecord::RecordNotFound)
     end
 
-    it "raises RecordNotFound when the local owner answers an entry with another id" do
-      entry = TimesheetEntry.new(id: 6163, company_id: owner_lookup_company.id, user_id: owner_lookup_colleague.id,
-                                 project: owner_lookup_project)
-      local_owner = Timekeeping::FakeLocalOwner.new(entries: { 6161 => entry })
+    it "raises RecordNotFound for a discarded local entry" do
+      row = owner_lookup_local_entry(discarded_at: Time.current)
 
-      expect { owner_lookup_find(ownership: owner_lookup_ownership, entry_id: 6161, local_owner:) }
+      expect { owner_lookup_find(ownership: owner_lookup_ownership, entry_id: row.id) }
         .to raise_error(ActiveRecord::RecordNotFound)
     end
 
-    it "refuses as ownership moving with the default local owner" do
-      expect do
-        owner_lookup_find(ownership: owner_lookup_ownership, entry_id: 6161,
-                          local_owner: Timekeeping::Gateway::UnavailableLocalOwner.new)
-      end.to raise_error(Timekeeping::Gateway::OwnershipMoving)
+    it "raises RecordNotFound for an id that exists only in timesheet_entries" do
+      legacy = create(:timesheet_entry, user: owner_lookup_colleague, project: owner_lookup_project, work_date: Date.current)
+
+      expect { owner_lookup_find(ownership: owner_lookup_ownership, entry_id: legacy.id) }
+        .to raise_error(ActiveRecord::RecordNotFound)
+    end
+
+    it "hides a colleague's local entry under the actor scope" do
+      row = owner_lookup_local_entry
+
+      expect { owner_lookup_find(ownership: owner_lookup_ownership, entry_id: row.id, scope: :actor) }
+        .to raise_error(ActiveRecord::RecordNotFound)
     end
   end
 end
@@ -318,5 +342,63 @@ RSpec.describe Timekeeping::EntryLookup, "replayed delete answers" do
 
     expect(entry).to be_a(TimesheetEntry)
     expect([entry.id, entry.company_id]).to eq([4242, replayed_company.id])
+  end
+end
+
+RSpec.describe Timekeeping::EntryLookup do
+  let(:prepared_tenant_company) { create(:company) }
+  let(:prepared_tenant_foreign_company) { create(:company) }
+  let(:prepared_tenant_admin) { timekeeping_member(prepared_tenant_company, "admin") }
+  let(:prepared_tenant_foreign_user) { timekeeping_member(prepared_tenant_foreign_company, "admin") }
+  let(:prepared_tenant_foreign_project) { create(:project, client: create(:client, company: prepared_tenant_foreign_company)) }
+  let(:prepared_tenant_unused_client) do
+    Class.new do
+      define_method(:show_entry) { |**| raise "the prepared branch must not call Timekeeping" }
+    end.new
+  end
+
+  it "prepared lookup raises RecordNotFound for another company's local entry and never answers its fields" do
+    ownership = prepare_local_ownership!
+    foreign_entry = Timekeeping::LocalEntry.create!(
+      company_id: prepared_tenant_foreign_company.id, user_id: prepared_tenant_foreign_user.id,
+      project_id: prepared_tenant_foreign_project.id, work_date: Date.current, duration: 30.0, note: "foreign",
+      bill_status: "unbilled"
+    )
+    context = Timekeeping::WriteContext.new(company: prepared_tenant_company, actor: prepared_tenant_admin,
+                                            actor_kind: "user", request_id: "req-prepared-tenant-lookup")
+
+    # A foreign id must answer exactly as a missing one does, so it never shows the entry exists elsewhere.
+    expect do
+      described_class.find(ownership:, context:, entry_id: foreign_entry.id, read_client: prepared_tenant_unused_client)
+    end.to raise_error(ActiveRecord::RecordNotFound)
+  end
+end
+
+RSpec.describe Timekeeping::EntryLookup do
+  let(:stale_lock_company) { create(:company) }
+  let(:stale_lock_admin) { create(:user, current_workspace_id: stale_lock_company.id) }
+  let(:stale_lock_project) { create(:project, billable: true, client: create(:client, company: stale_lock_company)) }
+
+  before do
+    create(:employment, company: stale_lock_company, user: stale_lock_admin)
+    stale_lock_admin.add_role :admin, stale_lock_company
+  end
+
+  # "With ownership in the prepared state, the gateway's entry writes go to Timekeeping::LocalOwner and make no HTTP call to Timekeeping"
+  # A released reservation leaves entries.locked stale; a lookup that trusted it would let the model's
+  # locked check skip a move that the local owner would apply.
+  it "reads a prepared entry whose stale stored locked column is true but has no reservation as unlocked" do
+    ownership = prepare_local_ownership!
+    row = Timekeeping::LocalEntry.create!(company_id: stale_lock_company.id, user_id: stale_lock_admin.id,
+                                          project_id: stale_lock_project.id, work_date: Date.current, duration: 30.0,
+                                          note: "n", bill_status: "unbilled", locked: true)
+    context = Timekeeping::WriteContext.new(company: stale_lock_company, actor: stale_lock_admin, actor_kind: "user",
+                                            request_id: "req-stale-lock")
+
+    found = described_class.find(ownership:, context:, entry_id: row.id, read_client: instance_double(Timekeeping::EntryApiClient))
+
+    expect(found.entry.id).to eq(row.id)
+    expect(found.entry.locked).to be(false)
+    expect(found.version).to eq(row.version)
   end
 end

@@ -57,3 +57,48 @@ RSpec.describe Timekeeping::WriteContext do
     expect(context.agent).to be_nil
   end
 end
+
+RSpec.describe Timekeeping::WriteContext, "built for a request" do
+  # "Idempotency-Key and If-Match from the request reach the local owner, so retries replay and stale versions answer version_conflict"
+  it "reads Idempotency-Key, If-Match and the request id from a request, and leaves blank headers nil" do
+    company = create(:company)
+    actor = create(:user)
+    with_headers = ActionDispatch::TestRequest.create(
+      "HTTP_IDEMPOTENCY_KEY" => "k-1", "HTTP_IF_MATCH" => "4", "action_dispatch.request_id" => "req-for-request-1"
+    )
+    blank_headers = ActionDispatch::TestRequest.create(
+      "HTTP_IDEMPOTENCY_KEY" => "", "HTTP_IF_MATCH" => "  ", "action_dispatch.request_id" => "req-for-request-2"
+    )
+
+    context = described_class.for_request(with_headers, company:, actor:, actor_kind: "user")
+    blank = described_class.for_request(blank_headers, company:, actor:, actor_kind: "user")
+
+    expect(context.idempotency_key).to eq("k-1")
+    expect(context.if_match).to eq("4")
+    expect(context.request_id).to eq("req-for-request-1")
+    expect(context.company).to eq(company)
+    expect(context.actor).to eq(actor)
+    expect(context.agent).to be_nil
+    expect(blank.idempotency_key).to be_nil
+    expect(blank.if_match).to be_nil
+  end
+
+  it "leaves both headers nil when the request sends neither, and keeps the agent it is given" do
+    agent = create(:agent)
+    request = ActionDispatch::TestRequest.create("action_dispatch.request_id" => "req-for-request-3")
+
+    context = described_class.for_request(request, company: agent.company, actor: agent.user, actor_kind: "agent", agent:)
+
+    expect(context.idempotency_key).to be_nil
+    expect(context.if_match).to be_nil
+    expect(context.agent).to eq(agent)
+    expect(context.request_id).to eq("req-for-request-3")
+  end
+
+  it "builds without the header keywords, as callers outside a request do" do
+    context = described_class.new(company: create(:company), actor: create(:user), actor_kind: "import", request_id: "r")
+
+    expect(context.idempotency_key).to be_nil
+    expect(context.if_match).to be_nil
+  end
+end
