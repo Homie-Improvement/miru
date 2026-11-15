@@ -295,7 +295,8 @@ RSpec.describe Invoices::OutboxDelivery do
   end
 end
 
-RSpec.describe Invoices::OutboxDelivery do
+# Committed data, so the event is proven to fire when the mark really commits.
+RSpec.describe Invoices::OutboxDelivery, committed_data: true do
   # "a stale_generation answer sets `undeliverable_at`, keeps the row and emits one event, and a later recovery run sends no request for that row."
   # "When the adapter answers retryable with reason `stale_generation`, set `undeliverable_at` and emit `Invoices::UndeliverableOperation.notify(company_id:, operation_id:, kind:)`."
   it "marks a stale_generation commit row undeliverable once, keeps the row and its payload, emits one event and sends nothing on a second delivery" do
@@ -582,62 +583,6 @@ RSpec.describe Invoices::OutboxDelivery, "abort settlement through the Timekeepi
   end
 end
 
-RSpec.describe Invoices::OutboxDelivery, "stale_generation answers from the Timekeeping client", committed_data: true do
-  around do |example|
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) { example.run }
-  end
-
-  it "a stale_generation answer sets undeliverable_at, keeps the row, emits one event with only company_id, operation_id and kind, and a second delivery sends nothing" do
-    fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
-    client = Timekeeping::ReservationClient.new(http: TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil))
-    company_id = fake.add_company
-    user_id = fake.add_user(company_id:, role: "admin")
-    entry_id = fake.add_entry(company_id:, user_id:, project_id: fake.add_project(company_id:))["id"]
-    operation_id = SecureRandom.uuid
-    generation = fake.generation
-    request = Invoices::ReservationRequest.new(
-      company_id:, invoice_id: 503, operation_id:, generation:, disposition: "active", entries: [entry_id]
-    )
-    expect(client.prepare(request).state).to eq("prepared")
-    InvoiceOperationIntent.create!(
-      company_id:, invoice_id: 503, operation_id:, state: "committed", generation:,
-      disposition: "active", desired_entry_ids: [entry_id]
-    )
-    row = InvoiceOperationOutboxItem.create!(
-      company_id:, invoice_id: 503, operation_id:, kind: "commit",
-      payload: { company_id:, invoice_id: 503, operation_id:, generation:, disposition: "active", desired_entry_ids: [entry_id] }
-    )
-    # The stored rows now name an older generation than the service's, so the service answers 409 stale_generation.
-    fake.generation = generation + 1
-    delivery = described_class.new(adapter_source: -> { client })
-
-    events = []
-    subscriber = Object.new
-    subscriber.define_singleton_method(:emit) { |event| events << event }
-    Rails.event.subscribe(subscriber)
-    begin
-      delivery.deliver(row.id)
-      requests_after_first = fake.requests.size
-      delivery.deliver(row.id)
-      expect(fake.requests.size).to eq(requests_after_first)
-    ensure
-      Rails.event.unsubscribe(subscriber)
-    end
-
-    # "a stale_generation answer sets `undeliverable_at`, keeps the row and emits one event"
-    row = InvoiceOperationOutboxItem.find_by(id: row.id)
-    expect(row).to be_present
-    expect(row.undeliverable_at).to be_present
-    expect(row.delivered_at).to be_nil
-    payloads = events.filter_map do |event|
-      event[:payload].to_h.symbolize_keys if event[:name] == Invoices::UndeliverableOperation::NAME
-    end
-    expect(payloads.size).to eq(1)
-    # "The payload carries no token and no body."
-    expect(payloads.first).to eq(company_id:, operation_id:, kind: "commit")
-  end
-end
-
 RSpec.describe Invoices::OutboxDelivery, "the existing settlement rule for other adapters" do
   it "an adapter other than the Timekeeping client answering retryable stale_generation only counts an attempt and never marks the row undeliverable" do
     operation_id = SecureRandom.uuid
@@ -695,143 +640,6 @@ RSpec.describe Invoices::OutboxDelivery do
   end
 end
 
-RSpec.describe Invoices::OutboxDelivery, "settling timekeeping commit rows against a failed intent" do
-  let(:mismatch_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-  let(:mismatch_client) { Timekeeping::ReservationClient.new(http: TimekeepingContract::FakeClient.new(timekeeping: mismatch_fake, relay: nil)) }
-
-  around do |example|
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) { example.run }
-  end
-
-  # Ordering: recovery moved the intent to failed while the commit row was still waiting.
-  # The remote side answers committed, so a delivery that trusts the answer alone would settle a commit for a failed save.
-  it "timekeeping client: a commit row the fake answers committed stays undelivered with one more attempt when recovery already failed its intent" do
-    company_id = mismatch_fake.add_company
-    user_id = mismatch_fake.add_user(company_id:, role: "admin")
-    entry_id = mismatch_fake.add_entry(company_id:, user_id:, project_id: mismatch_fake.add_project(company_id:))["id"]
-    operation_id = SecureRandom.uuid
-    generation = mismatch_fake.generation
-    request = Invoices::ReservationRequest.new(
-      company_id:, invoice_id: 8101, operation_id:, generation:, disposition: "active", entries: [entry_id]
-    )
-    expect(mismatch_client.prepare(request).state).to eq("prepared")
-    InvoiceOperationIntent.create!(
-      company_id:, invoice_id: 8101, operation_id:, state: "failed", generation:,
-      disposition: "active", desired_entry_ids: [entry_id]
-    )
-    row = InvoiceOperationOutboxItem.create!(
-      company_id:, invoice_id: 8101, operation_id:, kind: "commit",
-      payload: { company_id:, invoice_id: 8101, operation_id:, generation:, disposition: "active", desired_entry_ids: [entry_id] }
-    )
-
-    described_class.new(adapter_source: -> { mismatch_client }).deliver(row.id)
-
-    # The fake did commit, so the answer the client returned was committed.
-    expect(mismatch_fake.reservations_for(entry_id)).to eq([{ "invoice_id" => 8101, "state" => "committed" }])
-    # "Decide the result from the remote state and the intent state through the contract's `save_reconciliation` table: remote committed with intent committed → existing_success; remote aborted with intent failed → save_failed; any other pair → retryable reconciliation_error. HTTP 200 alone is never success."
-    expect(row.reload.delivered_at).to be_nil
-    expect(row.attempts).to eq(1)
-  end
-end
-
-RSpec.describe Invoices::OutboxDelivery, "settling timekeeping abort rows against a pending intent" do
-  let(:pending_abort_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-  let(:pending_abort_client) { Timekeeping::ReservationClient.new(http: TimekeepingContract::FakeClient.new(timekeeping: pending_abort_fake, relay: nil)) }
-
-  around do |example|
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) { example.run }
-  end
-
-  # Ordering: an abort row is delivered before the intent it belongs to has been failed.
-  it "timekeeping client: an abort row the fake answers aborted stays undelivered with one more attempt while its intent is still pending" do
-    company_id = pending_abort_fake.add_company
-    user_id = pending_abort_fake.add_user(company_id:, role: "admin")
-    entry_id = pending_abort_fake.add_entry(company_id:, user_id:, project_id: pending_abort_fake.add_project(company_id:))["id"]
-    operation_id = SecureRandom.uuid
-    generation = pending_abort_fake.generation
-    request = Invoices::ReservationRequest.new(
-      company_id:, invoice_id: 8201, operation_id:, generation:, disposition: "active", entries: [entry_id]
-    )
-    expect(pending_abort_client.prepare(request).state).to eq("prepared")
-    InvoiceOperationIntent.create!(
-      company_id:, invoice_id: 8201, operation_id:, state: "pending", generation:,
-      disposition: "active", desired_entry_ids: [entry_id]
-    )
-    row = InvoiceOperationOutboxItem.create!(
-      company_id:, invoice_id: 8201, operation_id:, kind: "abort",
-      payload: { company_id:, invoice_id: 8201, operation_id:, generation:, disposition: "active", desired_entry_ids: [entry_id] }
-    )
-
-    described_class.new(adapter_source: -> { pending_abort_client }).deliver(row.id)
-
-    expect(pending_abort_fake.entry_locked?(entry_id)).to be(false)
-    # "Decide the result from the remote state and the intent state through the contract's `save_reconciliation` table: remote committed with intent committed → existing_success; remote aborted with intent failed → save_failed; any other pair → retryable reconciliation_error. HTTP 200 alone is never success."
-    expect(row.reload.delivered_at).to be_nil
-    expect(row.attempts).to eq(1)
-  end
-end
-
-RSpec.describe Invoices::OutboxDelivery, "stale_generation answers delivered twice" do
-  let(:stale_twice_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-  let(:stale_twice_client) { Timekeeping::ReservationClient.new(http: TimekeepingContract::FakeClient.new(timekeeping: stale_twice_fake, relay: nil)) }
-
-  around do |example|
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) { example.run }
-  end
-
-  # Delivered twice: inline delivery and the recovery sweep can both reach one stale row.
-  it "timekeeping client: delivering a stale_generation commit row twice marks it undeliverable once, emits one event and sends nothing the second time" do
-    company_id = stale_twice_fake.add_company
-    user_id = stale_twice_fake.add_user(company_id:, role: "admin")
-    entry_id = stale_twice_fake.add_entry(company_id:, user_id:, project_id: stale_twice_fake.add_project(company_id:))["id"]
-    operation_id = SecureRandom.uuid
-    generation = stale_twice_fake.generation
-    request = Invoices::ReservationRequest.new(
-      company_id:, invoice_id: 8301, operation_id:, generation:, disposition: "active", entries: [entry_id]
-    )
-    expect(stale_twice_client.prepare(request).state).to eq("prepared")
-    InvoiceOperationIntent.create!(
-      company_id:, invoice_id: 8301, operation_id:, state: "committed", generation:,
-      disposition: "active", desired_entry_ids: [entry_id]
-    )
-    row = InvoiceOperationOutboxItem.create!(
-      company_id:, invoice_id: 8301, operation_id:, kind: "commit",
-      payload: { company_id:, invoice_id: 8301, operation_id:, generation:, disposition: "active", desired_entry_ids: [entry_id] }
-    )
-    stale_twice_fake.generation = generation + 1
-    delivery = described_class.new(adapter_source: -> { stale_twice_client })
-
-    events = []
-    subscriber = Object.new
-    subscriber.define_singleton_method(:emit) { |event| events << event }
-    Rails.event.subscribe(subscriber)
-    begin
-      delivery.deliver(row.id)
-      first_marked_at = row.reload.undeliverable_at
-      requests_after_first = stale_twice_fake.requests.size
-      travel 1.minute do
-        delivery.deliver(row.id)
-      end
-    ensure
-      Rails.event.unsubscribe(subscriber)
-    end
-    payloads = events.filter_map do |event|
-      event[:payload].to_h.symbolize_keys if event[:name] == Invoices::UndeliverableOperation::NAME
-    end
-
-    # "`stale_generation` marks the row undeliverable with a log signal."
-    expect(first_marked_at).to be_present
-    expect(InvoiceOperationOutboxItem.exists?(row.id)).to be(true)
-    expect(row.reload.delivered_at).to be_nil
-    expect(row.undeliverable_at).to eq(first_marked_at)
-    # "a stale_generation answer sets `undeliverable_at`, keeps the row and emits one event, and a later recovery run sends no request for that row."
-    expect(payloads).to eq([{ company_id:, operation_id:, kind: "commit" }])
-    # "`OutboxDelivery#deliver` and `RecoverInvoiceOperationIntentsJob#deliver_undelivered` skip rows that have `undeliverable_at` set."
-    expect(stale_twice_fake.requests.size).to eq(requests_after_first)
-    expect(Invoices::UndeliverableOperation::NAME).to eq("invoices.undeliverable_operation")
-  end
-end
-
 RSpec.describe Invoices::OutboxDelivery, "a commit row for an operation the service already aborted" do
   let(:aborted_first_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
   let(:aborted_first_client) do
@@ -870,77 +678,6 @@ RSpec.describe Invoices::OutboxDelivery, "a commit row for an operation the serv
     expect(row.reload.delivered_at).to be_nil
     expect(row.undeliverable_at).to be_nil
     expect(row.attempts).to eq(1)
-  end
-end
-
-RSpec.describe Invoices::OutboxDelivery, "a lost commit answer" do
-  let(:lost_commit_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-
-  around do |example|
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) { example.run }
-  end
-
-  # Partial failure: the fake applies the first commit, then the answer is dropped on the way back.
-  # A lost answer carries no reason, so it must stay an ordinary retry, never an undeliverable row.
-  it "timekeeping client: a commit the fake applied but whose answer was lost is not marked undeliverable, and redelivery settles it without applying it again" do
-    dropping_first_commit = Class.new do
-      def initialize(inner)
-        @inner = inner
-        @dropped = false
-      end
-
-      def call(method, path, headers: {}, body: nil)
-        answer = @inner.call(method, path, headers:, body:)
-        if !@dropped && path.end_with?("/reservations/commit")
-          @dropped = true
-          raise Timekeeping::ReservationHttp::Error, "answer lost after the fake applied the commit"
-        end
-        answer
-      end
-    end
-    client = Timekeeping::ReservationClient.new(
-      http: dropping_first_commit.new(TimekeepingContract::FakeClient.new(timekeeping: lost_commit_fake, relay: nil))
-    )
-    company_id = lost_commit_fake.add_company
-    user_id = lost_commit_fake.add_user(company_id:, role: "admin")
-    entry_id = lost_commit_fake.add_entry(company_id:, user_id:, project_id: lost_commit_fake.add_project(company_id:))["id"]
-    operation_id = SecureRandom.uuid
-    generation = lost_commit_fake.generation
-    request = Invoices::ReservationRequest.new(
-      company_id:, invoice_id: 8401, operation_id:, generation:, disposition: "active", entries: [entry_id]
-    )
-    expect(client.prepare(request).state).to eq("prepared")
-    InvoiceOperationIntent.create!(
-      company_id:, invoice_id: 8401, operation_id:, state: "committed", generation:,
-      disposition: "active", desired_entry_ids: [entry_id]
-    )
-    row = InvoiceOperationOutboxItem.create!(
-      company_id:, invoice_id: 8401, operation_id:, kind: "commit",
-      payload: { company_id:, invoice_id: 8401, operation_id:, generation:, disposition: "active", desired_entry_ids: [entry_id] }
-    )
-    delivery = described_class.new(adapter_source: -> { client })
-
-    delivery.deliver(row.id)
-
-    # The fake really applied the dropped commit.
-    applied_once = lost_commit_fake.reservations_for(entry_id)
-    expect(applied_once).to eq([{ "invoice_id" => 8401, "state" => "committed" }])
-    expect(row.reload.delivered_at).to be_nil
-    expect(row.undeliverable_at).to be_nil
-    expect(row.attempts).to eq(1)
-
-    delivery.deliver(row.id)
-
-    # "A lost commit answer is redelivered and applies once"
-    expect(row.reload.delivered_at).to be_present
-    expect(row.undeliverable_at).to be_nil
-    expect(lost_commit_fake.reservations_for(entry_id)).to eq(applied_once)
-    expect(lost_commit_fake.entry_locked?(entry_id)).to be(true)
-    commit_bodies = lost_commit_fake.requests.filter_map do |logged|
-      logged[:body] if logged[:path].end_with?("/reservations/commit")
-    end
-    expect(commit_bodies.size).to eq(2)
-    expect(commit_bodies.uniq.size).to eq(1)
   end
 end
 

@@ -55,6 +55,7 @@ RSpec.describe Invoices::OutboxDelivery, "Timekeeping delivery convergence" do
     expect(after_first["attempts"]).to eq(1)
 
     expect(row.reload.delivered_at).to be_present
+    expect(row.undeliverable_at).to be_nil
     commits = fake.requests.select { |sent| sent[:path].end_with?("/reservations/commit") }
     expect(commits.size).to eq(2)
     expect(commits.pluck(:body).uniq.size).to eq(1)
