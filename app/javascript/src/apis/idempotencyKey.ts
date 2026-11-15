@@ -2,7 +2,7 @@
 // only successful answers and refuses a reused key with a different body
 // (422 idempotency_key_reused), so a key is reused only for an unchanged
 // resend of the same action and is dropped once that action succeeds.
-// Kept free of imports and side effects so it can be tested on its own.
+// Kept free of imports so it can be tested on its own.
 
 export type ActionKey = {
   readonly key: string;
@@ -42,6 +42,33 @@ export const afterAnswer = (
   held: ActionKey | null,
   succeeded: boolean
 ): ActionKey | null => (succeeded ? null : held);
+
+// Where one user action keeps its key between sends, such as a React ref.
+export type HeldKey = { current: ActionKey | null };
+
+// Runs one write of the action under its key. While the write is in flight
+// nothing is held, so a second send started before it settles gets its own
+// key even with an equal body: two distinct writes never share a receipt.
+// Only this send's own outcome decides what is held afterwards: a success
+// leaves nothing, and a failure puts this send's key back for an unchanged
+// retry. The caller's write resolves only on a 2xx answer.
+// A function declaration, because the build parses this file as TSX, where a
+// generic arrow function's <T> reads as a JSX tag.
+export async function sendWithHeldKey<T>(
+  held: HeldKey,
+  body: unknown,
+  newKey: () => string,
+  write: (idempotencyKey: string) => Promise<T>
+): Promise<T> {
+  const action = keyForSend(held.current, body, newKey);
+  held.current = null;
+  try {
+    return await write(action.key);
+  } catch (error) {
+    held.current = afterAnswer(action, false);
+    throw error;
+  }
+}
 
 export const isEntryGatewayWrite = (method: string, url: string): boolean =>
   STATE_CHANGING_METHODS.has(method.toLowerCase()) &&

@@ -138,47 +138,6 @@ RSpec.describe "Api::V1::Mobile::TimesheetEntries", type: :request do
   end
 end
 
-require "rails_helper"
-require_relative "../../../../support/timekeeping/fake_timekeeping"
-
-RSpec.describe "Api::V1::Mobile::TimesheetEntries forwarded client key retry", type: :request do
-  let(:company) { create(:company) }
-  let(:user) { create(:user, current_workspace_id: company.id) }
-  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
-  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-
-  around { |example| with_forwarded_timekeeping_env { example.run } }
-
-  before do
-    create(:employment, company:, user:)
-    create(:project_member, project:, user:)
-    user.add_role :employee, company
-    arrange_forwarded_timekeeping(fake, company:, users: { user => "employee" }, project:)
-    sign_in user
-  end
-
-  # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
-  it "replays a mobile-route create retried with the same Idempotency-Key while Timekeeping owns the entries" do
-    params = {
-      project_id: project.id,
-      user_id: user.id,
-      timesheet_entry: { bill_status: :unbilled, duration: 30, note: "Mobile retry", work_date: Date.current }
-    }
-    headers = auth_headers(user).merge("Idempotency-Key" => SecureRandom.uuid)
-
-    post "/api/v1/mobile/timesheet_entries", params:, headers: headers
-    expect(response).to have_http_status(:ok)
-    first_id = json_response.dig("entry", "id")
-
-    post "/api/v1/mobile/timesheet_entries", params:, headers: headers
-    expect(response).to have_http_status(:ok)
-
-    expect(json_response.dig("entry", "id")).to eq(first_id)
-    creates = fake.requests.select { |request| request[:method] == "POST" && request[:path].to_s.end_with?("/entries") }
-    expect(creates.map { |request| request[:headers]["Idempotency-Key"] }.uniq.size).to eq(1)
-  end
-end
-
 require_relative "../../../../support/timekeeping/fake_timekeeping"
 
 RSpec.describe "Api::V1::Mobile::TimesheetEntries forwarded client key retry", type: :request do

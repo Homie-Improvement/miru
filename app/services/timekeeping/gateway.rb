@@ -386,7 +386,7 @@ module Timekeeping
       end
 
       def forward_bulk_delete(ownership:, entries:, requested_ids:)
-        return replay_timekeeping_bulk_delete(ownership:, requested_ids:) if entries.empty?
+        return replay_timekeeping_bulk_delete(requested_ids:) if entries.empty?
 
         answer = write_client.bulk_delete(context:, generation: ownership.generation, entry_ids: entries.map(&:id))
         reported?(answer, DELETED_RESULT)
@@ -398,13 +398,15 @@ module Timekeeping
       # check did not approve can be discarded. A key derived from the request
       # id is new on every retry and can match no receipt, so without a client
       # key no call is made. Every refusal, a body that differs from the stored
-      # one included, is answered as nothing deleted, as before.
-      def replay_timekeeping_bulk_delete(ownership:, requested_ids:)
+      # one included, is answered as nothing deleted, as before. The call
+      # carries no real generation, so a Timekeeping release without bulk
+      # replay refuses it as stale_generation, which is answered the same way.
+      def replay_timekeeping_bulk_delete(requested_ids:)
         return false if context.idempotency_key.nil? || requested_ids.empty?
 
-        answer = write_client.replay_bulk_delete(context:, generation: ownership.generation, entry_ids: requested_ids)
+        answer = write_client.replay_bulk_delete(context:, entry_ids: requested_ids)
         reported?(answer, DELETED_RESULT)
-      rescue ActiveRecord::RecordNotFound, EntryWriteClient::Conflict, EntryWriteClient::Rejected
+      rescue ActiveRecord::RecordNotFound, EntryWriteClient::Conflict, EntryWriteClient::Rejected, StaleGeneration
         false
       end
 

@@ -107,7 +107,10 @@ rules:
     the receipt stored for the same company, acting user and Idempotency-Key:
     a matching body replays the stored answer, a different body answers
     idempotency_key_reused, and with no such receipt it answers not_found and
-    discards nothing.
+    discards nothing. The caller also sends Ownership-Generation: replay-only,
+    a value that is never a generation and is read only after the receipt, so
+    a provider that does not read the header on bulk-delete still replays a
+    stored receipt or refuses with stale_generation, and never discards.
     Every other route, and any other header value, ignores the header.
   credential_in_body: >-
     A write whose body holds, anywhere, a credential the provider issued or

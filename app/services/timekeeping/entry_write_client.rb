@@ -69,6 +69,11 @@ module Timekeeping
     # as version_conflict instead of discarding an entry the lookup hid.
     REPLAY_ONLY_IF_MATCH = "replay-only"
 
+    # Sent as Ownership-Generation on a replay-only bulk delete. It is never a
+    # generation, so a Timekeeping instance that predates bulk replay refuses
+    # the call as stale_generation instead of deleting.
+    REPLAY_ONLY_GENERATION = "replay-only"
+
     # Timekeeping could not be reached, refused the monolith's own token, or
     # answered something unexpected. A subclass of the read client's error, so
     # it renders as the same retryable 503.
@@ -234,10 +239,12 @@ module Timekeeping
     # names the entries the first attempt deleted matches its receipt.
     # Timekeeping never deletes on this call: with no stored answer for the
     # same company, actor and key it answers 404, raised as RecordNotFound.
-    def replay_bulk_delete(context:, generation:, entry_ids:)
+    # Timekeeping reads the receipt before the generation, so sending
+    # REPLAY_ONLY_GENERATION still replays a stored receipt on any release.
+    def replay_bulk_delete(context:, entry_ids:)
       path = format(BULK_DELETE_PATH, company_id: context.company.id)
       ids = bulk_body_ids(entry_ids)
-      forward(Net::HTTP::Post, path, operation: "bulk_delete", context:, generation:,
+      forward(Net::HTTP::Post, path, operation: "bulk_delete", context:, generation: REPLAY_ONLY_GENERATION,
                                      idempotency_key: bulk_key(context, "bulk_delete", ids),
                                      body: { "entry_ids" => ids }, replay_only: true)
     end

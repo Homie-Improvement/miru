@@ -1018,62 +1018,7 @@ RSpec.describe Timekeeping::EntryWriteClient, "client idempotency key scoped per
       described_class.new.create_entry(context:, generation: scoped_key_fake.generation, body:)
     end
 
-    expect(created.map { |entry| entry["id"] }.uniq.size).to eq(2)
-  end
-end
-
-RSpec.describe Timekeeping::EntryWriteClient, "replay-only bulk delete" do
-  let(:replay_bulk_base_url) { "http://timekeeping.test" }
-  let(:replay_bulk_company) { create(:company) }
-  let(:replay_bulk_admin) { create(:user, current_workspace_id: replay_bulk_company.id) }
-  let(:replay_bulk_project) { create(:project, billable: true, client: create(:client, company: replay_bulk_company)) }
-  let(:replay_bulk_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-
-  around do |example|
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
-      with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, replay_bulk_base_url) { example.run }
-    end
-  end
-
-  before do
-    create(:employment, company: replay_bulk_company, user: replay_bulk_admin)
-    replay_bulk_admin.add_role :admin, replay_bulk_company
-    replay_bulk_fake.register_company(id: replay_bulk_company.id, edit_days: replay_bulk_company.timesheet_edit_days)
-    replay_bulk_fake.register_user(id: replay_bulk_admin.id, company_id: replay_bulk_company.id, role: "admin")
-    replay_bulk_fake.register_project(id: replay_bulk_project.id, company_id: replay_bulk_company.id)
-    route_timekeeping_to_fake(replay_bulk_fake, base_url: replay_bulk_base_url)
-  end
-
-  # The replay skips the monolith's lookup, scope and lock checks, so it must only ever return a stored
-  # receipt: with none, it must answer not found and delete nothing, even for an entry that is still live.
-  it "a replay-only bulk delete with no stored receipt is refused and leaves a live entry undeleted" do
-    create_context = Timekeeping::WriteContext.new(company: replay_bulk_company, actor: replay_bulk_admin,
-                                                   actor_kind: "user", request_id: "req-replay-bulk-create")
-    entry = described_class.new.create_entry(
-      context: create_context, generation: replay_bulk_fake.generation,
-      body: { "project_id" => replay_bulk_project.id, "user_id" => replay_bulk_admin.id,
-              "work_date" => Date.current.iso8601, "duration" => 30.0, "note" => "still live",
-              "source" => "manual", "source_metadata" => {} }
-    )
-    replay_context = Timekeeping::WriteContext.new(company: replay_bulk_company, actor: replay_bulk_admin,
-                                                   actor_kind: "user", request_id: "req-replay-bulk-1",
-                                                   idempotency_key: SecureRandom.uuid)
-
-    expect do
-      described_class.new.replay_bulk_delete(context: replay_context, generation: replay_bulk_fake.generation,
-                                             entry_ids: [entry["id"]])
-    end.to raise_error(StandardError)
-
-    replay_request = replay_bulk_fake.requests.reverse.find do |request|
-      request[:path].to_s.end_with?("/entries/bulk-delete")
-    end
-    expect(replay_request[:headers]["Idempotency-Replay"]).to eq("only")
-
-    delete_context = Timekeeping::WriteContext.new(company: replay_bulk_company, actor: replay_bulk_admin,
-                                                   actor_kind: "user", request_id: "req-replay-bulk-real")
-    answer = described_class.new.bulk_delete(context: delete_context, generation: replay_bulk_fake.generation,
-                                             entry_ids: [entry["id"]])
-    expect(answer.to_json).to include("deleted")
+    expect(created.pluck("id").uniq.size).to eq(2)
   end
 end
 
@@ -1108,8 +1053,7 @@ RSpec.describe Timekeeping::EntryWriteClient, "replay-only bulk delete" do
     end
 
     bulk_replay_client.bulk_delete(context: bulk_replay_context("req-bulk-first"), generation: 3, entry_ids: [5, 3])
-    answer = bulk_replay_client.replay_bulk_delete(context: bulk_replay_context("req-bulk-retry"), generation: 3,
-                                                   entry_ids: [3, 5])
+    answer = bulk_replay_client.replay_bulk_delete(context: bulk_replay_context("req-bulk-retry"), entry_ids: [3, 5])
 
     original, replay = sent
     expect(answer).to eq(answer_body)
@@ -1117,6 +1061,8 @@ RSpec.describe Timekeeping::EntryWriteClient, "replay-only bulk delete" do
     expect(replay.headers["Idempotency-Key"]).not_to eq("client-bulk-key-1")
     expect(replay.headers["Idempotency-Replay"]).to eq("only")
     expect(original.headers["Idempotency-Replay"]).to be_nil
+    # A Timekeeping release without bulk replay refuses this generation as stale before it writes.
+    expect(replay.headers["Ownership-Generation"]).to eq("replay-only")
     expect(JSON.parse(replay.body)).to eq(JSON.parse(original.body))
   end
 end
@@ -1195,11 +1141,29 @@ RSpec.describe Timekeeping::EntryWriteClient, "replay-only bulk delete" do
 
     expect do
       described_class.new(base_url: replay_bulk_base_url)
-        .replay_bulk_delete(context:, generation: 2, entry_ids: live_ids)
+        .replay_bulk_delete(context:, entry_ids: live_ids)
     end.to raise_error(ActiveRecord::RecordNotFound)
 
     live_ids.each { |entry_id| expect(replay_bulk_fake.stored_entry(entry_id)["discarded_at"]).to be_nil }
     replay = replay_bulk_fake.requests.find { |request| request[:path].to_s.end_with?("/entries/bulk-delete") }
     expect(replay[:headers]["Idempotency-Replay"]).to eq("only")
+  end
+
+  # A Timekeeping release from before bulk replay ignores the replay header on bulk-delete, so the
+  # never-current generation the replay sends is what stops it from running an ordinary delete.
+  it "a replay-only bulk delete to a provider without bulk replay is refused as stale and deletes nothing" do
+    stub_const("TimekeepingContract::FakeTimekeeping::REPLAY_ONLY_ROUTES", %w[destroy])
+    live_ids = Array.new(2) do
+      replay_bulk_fake.add_entry(company_id: replay_bulk_company.id, user_id: replay_bulk_admin.id,
+                                 project_id: replay_bulk_project.id, work_date: Date.current.iso8601).fetch("id")
+    end
+    context = Timekeeping::WriteContext.new(company: replay_bulk_company, actor: replay_bulk_admin, actor_kind: "user",
+                                            request_id: "req-replay-bulk-old", idempotency_key: SecureRandom.uuid)
+
+    expect do
+      described_class.new(base_url: replay_bulk_base_url).replay_bulk_delete(context:, entry_ids: live_ids)
+    end.to raise_error(Timekeeping::Gateway::StaleGeneration)
+
+    live_ids.each { |entry_id| expect(replay_bulk_fake.stored_entry(entry_id)["discarded_at"]).to be_nil }
   end
 end

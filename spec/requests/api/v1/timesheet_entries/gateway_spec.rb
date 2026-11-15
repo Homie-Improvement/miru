@@ -2251,9 +2251,6 @@ RSpec.describe "Api::V1::TimesheetEntry prepared create with a forged actor", ty
   end
 end
 
-require "rails_helper"
-require_relative "../../../../support/timekeeping/fake_timekeeping"
-
 RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client key retry", type: :request do
   let(:company) { create(:company) }
   let(:project) { create(:project, billable: true, client: create(:client, company:)) }
@@ -2270,104 +2267,76 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client key retry", typ
   end
 
   # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
-  it "replays a forwarded create retried with the same client Idempotency-Key and leaves one entry in Timekeeping" do
+  it "replays a timekeeping-owned create retried with the same Idempotency-Key under a new request id" do
+    client_key = "3f7c9a52-1b0e-4c6d-9e2f-8a1b2c3d4e5f"
     params = {
       project_id: project.id,
       timesheet_entry: { duration: 30, work_date: Date.current, note: "Forwarded retry", bill_status: :unbilled }
     }
-    headers = auth_headers(admin).merge("Idempotency-Key" => SecureRandom.uuid)
 
-    send_request :post, api_v1_timesheet_entry_index_path, params:, headers: headers
-    expect(response).to be_successful
+    send_request :post, api_v1_timesheet_entry_index_path, params:,
+      headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => "forwarded-retry-first")
+    expect(response).to have_http_status(:ok)
     first_id = json_response.dig("entry", "id")
 
-    # Each request gets its own request id, so only the client key can tie the two together.
-    send_request :post, api_v1_timesheet_entry_index_path, params:, headers: headers
-    expect(response).to be_successful
+    # The two requests carry different request ids, so only the client key can tie them together.
+    send_request :post, api_v1_timesheet_entry_index_path, params:,
+      headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => "forwarded-retry-second")
+    expect(response).to have_http_status(:ok)
 
     expect(json_response.dig("entry", "id")).to eq(first_id)
     creates = fake.requests.select { |request| request[:method] == "POST" && request[:path].to_s.end_with?("/entries") }
     expect(creates.size).to eq(2)
-    expect(creates.map { |request| request[:headers]["Idempotency-Key"] }.uniq.size).to eq(1)
+    expect(creates.map { |request| request[:headers]["X-Request-Id"] }.uniq.size).to eq(2)
+    forwarded_keys = creates.map { |request| request[:headers]["Idempotency-Key"] }
+    expect(forwarded_keys.uniq.size).to eq(1)
+    expect(forwarded_keys.first).not_to eq(client_key)
     expect(fake.stored_entry(first_id)["note"]).to eq("Forwarded retry")
-  end
-end
-
-require "rails_helper"
-require_relative "../../../../support/timekeeping/fake_timekeeping"
-
-RSpec.describe "Api::V1::TimesheetEntry gateway forwarded fallback key", type: :request do
-  let(:company) { create(:company) }
-  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
-  let(:admin) { create(:user, current_workspace_id: company.id) }
-  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-
-  around { |example| with_forwarded_timekeeping_env { example.run } }
-
-  before do
-    create(:employment, company:, user: admin)
-    admin.add_role :admin, company
-    arrange_forwarded_timekeeping(fake, company:, users: { admin => "admin" }, project:)
-    sign_in admin
+    expect(TimesheetEntry.where(note: "Forwarded retry")).not_to exist
   end
 
   # A request without a client key keeps the key derived from its own request id, so
   # two such requests are two writes.
-  it "writes two forwarded entries for two creates that send no Idempotency-Key" do
+  it "keeps the request-id fallback key for timekeeping-owned creates sent without an Idempotency-Key" do
     params = {
       project_id: project.id,
-      timesheet_entry: { duration: 30, work_date: Date.current, note: "No key", bill_status: :unbilled }
+      timesheet_entry: { duration: 30, work_date: Date.current, note: "No client key", bill_status: :unbilled }
     }
 
-    send_request :post, api_v1_timesheet_entry_index_path, params:, headers: auth_headers(admin)
+    send_request :post, api_v1_timesheet_entry_index_path, params:,
+      headers: auth_headers(admin).merge("X-Request-Id" => "fallback-key-first")
     expect(response).to be_successful
     first_id = json_response.dig("entry", "id")
-    send_request :post, api_v1_timesheet_entry_index_path, params:, headers: auth_headers(admin)
+    send_request :post, api_v1_timesheet_entry_index_path, params:,
+      headers: auth_headers(admin).merge("X-Request-Id" => "fallback-key-second")
     expect(response).to be_successful
 
     expect(json_response.dig("entry", "id")).not_to eq(first_id)
     creates = fake.requests.select { |request| request[:method] == "POST" && request[:path].to_s.end_with?("/entries") }
     expect(creates.map { |request| request[:headers]["Idempotency-Key"] }.uniq.size).to eq(2)
   end
-end
-
-require "rails_helper"
-require_relative "../../../../support/timekeeping/fake_timekeeping"
-
-RSpec.describe "Api::V1::TimesheetEntry gateway forwarded delete client key retry", type: :request do
-  let(:company) { create(:company) }
-  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
-  let(:admin) { create(:user, current_workspace_id: company.id) }
-  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-
-  around { |example| with_forwarded_timekeeping_env { example.run } }
-
-  before do
-    create(:employment, company:, user: admin)
-    admin.add_role :admin, company
-    arrange_forwarded_timekeeping(fake, company:, users: { admin => "admin" }, project:)
-    sign_in admin
-  end
 
   # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
-  it "answers a retried forwarded delete with the same client Idempotency-Key from the stored receipt" do
+  it "a forwarded delete retried after it committed replays its answer under the client key instead of answering not found" do
     entry_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
                               work_date: Date.current.iso8601).fetch("id")
     headers = auth_headers(admin).merge("Idempotency-Key" => SecureRandom.uuid)
 
     send_request :delete, api_v1_timesheet_entry_path(entry_id), headers: headers
-    expect(response).to be_successful
+    expect(response).to have_http_status(:ok)
     discarded_at = fake.stored_entry(entry_id)["discarded_at"]
     expect(discarded_at).not_to be_nil
 
     send_request :delete, api_v1_timesheet_entry_path(entry_id), headers: headers
-    expect(response).to be_successful
+    expect(response).to have_http_status(:ok)
 
-    deletes = fake.requests.select { |request| request[:method] == "DELETE" }
-    replay = deletes.find { |request| request[:headers]["Idempotency-Replay"] == "only" }
-    expect(replay).not_to be_nil
-    expect(replay[:headers]["Idempotency-Key"]).to eq(deletes.first[:headers]["Idempotency-Key"])
     expect(fake.stored_entry(entry_id)["discarded_at"]).to eq(discarded_at)
+    deletes = fake.requests.select { |request| request[:method] == "DELETE" }
+    expect(deletes.size).to eq(2)
+    original, replay = deletes
+    expect(original[:headers]["Idempotency-Replay"]).to be_nil
+    expect(replay[:headers]["Idempotency-Replay"]).to eq("only")
+    expect(replay[:headers]["Idempotency-Key"]).to eq(original[:headers]["Idempotency-Key"])
   end
 end
 
@@ -2423,156 +2392,5 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client key across comp
     expect(fake.stored_entry(second_id)["company_id"]).to eq(second_company.id)
     expect(fake.stored_entry(second_id)["user_id"]).to eq(second_admin.id)
     expect(fake.stored_entry(first_id)["company_id"]).to eq(first_company.id)
-  end
-end
-
-RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client key retry", type: :request do
-  let(:company) { create(:company) }
-  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
-  let(:admin) { create(:user, current_workspace_id: company.id) }
-  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-
-  around { |example| with_forwarded_timekeeping_env { example.run } }
-
-  before do
-    create(:employment, company:, user: admin)
-    admin.add_role :admin, company
-    arrange_forwarded_timekeeping(fake, company:, users: { admin => "admin" }, project:)
-    sign_in admin
-  end
-
-  # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
-  it "replays a timekeeping-owned create retried with the same Idempotency-Key under a new request id" do
-    client_key = "3f7c9a52-1b0e-4c6d-9e2f-8a1b2c3d4e5f"
-    params = {
-      project_id: project.id,
-      timesheet_entry: { duration: 30, work_date: Date.current, note: "Forwarded retry", bill_status: :unbilled }
-    }
-
-    send_request :post, api_v1_timesheet_entry_index_path, params:,
-      headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => "forwarded-retry-first")
-    expect(response).to be_successful
-    first_id = json_response.dig("entry", "id")
-
-    send_request :post, api_v1_timesheet_entry_index_path, params:,
-      headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => "forwarded-retry-second")
-    expect(response).to be_successful
-
-    expect(json_response.dig("entry", "id")).to eq(first_id)
-    creates = fake.requests.select { |request| request[:method] == "POST" && request[:path].to_s.end_with?("/entries") }
-    expect(creates.size).to eq(2)
-    forwarded_keys = creates.map { |request| request[:headers]["Idempotency-Key"] }
-    expect(forwarded_keys.uniq.size).to eq(1)
-    expect(forwarded_keys.first).not_to eq(client_key)
-    expect(TimesheetEntry.where(note: "Forwarded retry")).not_to exist
-  end
-end
-
-RSpec.describe "Api::V1::TimesheetEntry gateway forwarded fallback key", type: :request do
-  let(:company) { create(:company) }
-  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
-  let(:admin) { create(:user, current_workspace_id: company.id) }
-  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-
-  around { |example| with_forwarded_timekeeping_env { example.run } }
-
-  before do
-    create(:employment, company:, user: admin)
-    admin.add_role :admin, company
-    arrange_forwarded_timekeeping(fake, company:, users: { admin => "admin" }, project:)
-    sign_in admin
-  end
-
-  it "keeps the request-id fallback key for timekeeping-owned creates sent without an Idempotency-Key" do
-    params = {
-      project_id: project.id,
-      timesheet_entry: { duration: 30, work_date: Date.current, note: "No client key", bill_status: :unbilled }
-    }
-
-    send_request :post, api_v1_timesheet_entry_index_path, params:,
-      headers: auth_headers(admin).merge("X-Request-Id" => "fallback-key-first")
-    expect(response).to be_successful
-    first_id = json_response.dig("entry", "id")
-    send_request :post, api_v1_timesheet_entry_index_path, params:,
-      headers: auth_headers(admin).merge("X-Request-Id" => "fallback-key-second")
-    expect(response).to be_successful
-
-    expect(json_response.dig("entry", "id")).not_to eq(first_id)
-    creates = fake.requests.select { |request| request[:method] == "POST" && request[:path].to_s.end_with?("/entries") }
-    expect(creates.map { |request| request[:headers]["Idempotency-Key"] }.uniq.size).to eq(2)
-  end
-end
-
-RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client key retry", type: :request do
-  let(:company) { create(:company) }
-  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
-  let(:admin) { create(:user, current_workspace_id: company.id) }
-  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-
-  around { |example| with_forwarded_timekeeping_env { example.run } }
-
-  before do
-    create(:employment, company:, user: admin)
-    admin.add_role :admin, company
-    arrange_forwarded_timekeeping(fake, company:, users: { admin => "admin" }, project:)
-    sign_in admin
-  end
-
-  # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
-  it "a forwarded create delivered twice with one Idempotency-Key under new request ids writes one entry and replays its answer" do
-    params = {
-      project_id: project.id, user_id: admin.id,
-      timesheet_entry: { duration: 25, work_date: Date.current, note: "Lost answer create", bill_status: :unbilled }
-    }
-    headers = auth_headers(admin).merge("Idempotency-Key" => SecureRandom.uuid)
-
-    send_request :post, api_v1_timesheet_entry_index_path, params:, headers: headers
-    expect(response).to have_http_status(:ok)
-    first_id = json_response["entry"]["id"]
-
-    send_request :post, api_v1_timesheet_entry_index_path, params:, headers: headers
-    expect(response).to have_http_status(:ok)
-
-    expect(json_response["entry"]["id"]).to eq(first_id)
-    creates = fake.requests.select { |request| request[:method] == "POST" && request[:path].to_s.end_with?("/entries") }
-    expect(creates.size).to eq(2)
-    expect(creates.map { |request| request[:headers]["X-Request-Id"] }.uniq.size).to eq(2)
-    expect(creates.map { |request| request[:headers]["Idempotency-Key"] }.uniq.size).to eq(1)
-  end
-end
-
-RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client key delete retry", type: :request do
-  let(:company) { create(:company) }
-  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
-  let(:admin) { create(:user, current_workspace_id: company.id) }
-  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-
-  around { |example| with_forwarded_timekeeping_env { example.run } }
-
-  before do
-    create(:employment, company:, user: admin)
-    admin.add_role :admin, company
-    arrange_forwarded_timekeeping(fake, company:, users: { admin => "admin" }, project:)
-    sign_in admin
-  end
-
-  # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
-  it "a forwarded delete retried after it committed replays its answer under the client key instead of answering not found" do
-    entry_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
-                              work_date: Date.current.iso8601).fetch("id")
-    headers = auth_headers(admin).merge("Idempotency-Key" => SecureRandom.uuid)
-
-    send_request :delete, api_v1_timesheet_entry_path(entry_id), headers: headers
-    expect(response).to have_http_status(:ok)
-
-    send_request :delete, api_v1_timesheet_entry_path(entry_id), headers: headers
-    expect(response).to have_http_status(:ok)
-
-    expect(fake.stored_entry(entry_id)["discarded_at"]).not_to be_nil
-    deletes = fake.requests.select { |request| request[:method] == "DELETE" }
-    expect(deletes.size).to eq(2)
-    original, replay = deletes
-    expect(replay[:headers]["Idempotency-Replay"]).to eq("only")
-    expect(replay[:headers]["Idempotency-Key"]).to eq(original[:headers]["Idempotency-Key"])
   end
 end
