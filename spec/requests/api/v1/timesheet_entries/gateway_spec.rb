@@ -1430,29 +1430,34 @@ RSpec.describe "Api::V1::TimesheetEntry gateway prepared state", type: :request 
     end
 
     # "The acting user recorded in entry_audits is the gateway's signed-in user, and an actor field in the request is ignored"
-    # The actor is sent as a hash at the top level and as a scalar inside the entry, so both forms are ignored.
+    # The top-level actor is sent once as a hash and once as a scalar, each request with its own key, and the
+    # entry always carries a scalar actor, so every forged form is ignored.
     it "audits a prepared create as the signed-in user when the request forges actor fields naming a colleague" do
-      send_request :post, api_v1_timesheet_entry_index_path, params: {
-        project_id: project.id, actor_id: colleague.id, actor_type: "user", actor: { user_id: colleague.id },
-        timesheet_entry: {
-          duration: 30, work_date: Date.current, note: "Forged actor", bill_status: :unbilled,
-          actor_id: colleague.id, actor_type: "user", actor: colleague.id
-        }
-      }, headers: auth_headers(admin).merge("Idempotency-Key" => "prepared-forged-actor-1")
+      top_level_actor_forms = { "hash" => { user_id: colleague.id }, "scalar" => colleague.id }
 
-      expect(response).to have_http_status(:ok)
-      entries = Timekeeping::LocalEntry.where(company_id: company.id)
-      expect(entries.count).to eq(1)
-      entry = entries.find_by!(note: "Forged actor")
-      audits = Timekeeping::LocalOwner::AuditRow.where(entry_id: entry.id)
-      expect(audits.count).to eq(1)
-      expect(audits.first.actor_type).to eq("user")
-      expect(audits.first.actor_id).to eq(admin.id)
-      expect(audits.first.actor_id).not_to eq(colleague.id)
+      top_level_actor_forms.each do |form, top_level_actor|
+        send_request :post, api_v1_timesheet_entry_index_path, params: {
+          project_id: project.id, actor_id: colleague.id, actor_type: "user", actor: top_level_actor,
+          timesheet_entry: {
+            duration: 30, work_date: Date.current, note: "Forged actor #{form}", bill_status: :unbilled,
+            actor_id: colleague.id, actor_type: "user", actor: colleague.id
+          }
+        }, headers: auth_headers(admin).merge("Idempotency-Key" => "prepared-forged-actor-#{form}")
+
+        expect(response).to have_http_status(:ok)
+        entry = Timekeeping::LocalEntry.find_by!(company_id: company.id, note: "Forged actor #{form}")
+        audits = Timekeeping::LocalOwner::AuditRow.where(entry_id: entry.id)
+        expect(audits.count).to eq(1)
+        expect(audits.first.actor_type).to eq("user")
+        expect(audits.first.actor_id).to eq(admin.id)
+        expect(audits.first.actor_id).not_to eq(colleague.id)
+      end
+
+      expect(Timekeeping::LocalEntry.where(company_id: company.id).count).to eq(top_level_actor_forms.size)
       audit_actor_ids = ActiveRecord::Base.connection.select_values(
         ActiveRecord::Base.sanitize_sql_array(["SELECT actor_id FROM entry_audits WHERE company_id = ?", company.id])
       ).map(&:to_i)
-      expect(audit_actor_ids).to eq([admin.id])
+      expect(audit_actor_ids).to eq([admin.id] * top_level_actor_forms.size)
       # "With ownership in the prepared state, the gateway's entry writes go to Timekeeping::LocalOwner and make no HTTP call to Timekeeping"
       expect(fake.requests).to be_empty
     end
