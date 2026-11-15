@@ -943,7 +943,7 @@ RSpec.describe "Api::V1::TimesheetEntry gateway handoff refusal", type: :request
   end
 end
 
-RSpec.describe "Api::V1::TimesheetEntry gateway missing ownership row", type: :request do
+RSpec.describe "Api::V1::TimesheetEntry gateway missing ownership row on update", type: :request do
   let(:company) { create(:company) }
   let(:project) { create(:project, billable: true, client: create(:client, company:)) }
   let(:user) { create(:user, current_workspace_id: company.id) }
@@ -999,7 +999,7 @@ RSpec.describe "Api::V1::TimesheetEntry gateway legacy at raised generation", ty
   end
 end
 
-RSpec.describe "Api::V1::TimesheetEntry gateway refusal event", type: :request do
+RSpec.describe "Api::V1::TimesheetEntry gateway refusal event during settle", type: :request do
   let(:company) { create(:company) }
   let(:project) { create(:project, billable: true, client: create(:client, company:)) }
   let(:user) { create(:user, current_workspace_id: company.id) }
