@@ -56,6 +56,11 @@ module Timekeeping
               outcome: ->(_body) { { state: RETRYABLE, reason: } })
     end.freeze
 
+    # A 409 conflict that names its conflicting entries.
+    CONFLICT_ROW = Row.new(status: CONFLICT_STATUS,
+                           matches: ->(body) { body["reason"] == CONFLICT_REASON && conflicts_in(body).any? },
+                           outcome: ->(body) { { state: REFUSED, conflicts: conflicts_in(body) } })
+
     # How each kind of answer maps to an outcome. The first matching row wins;
     # an answer no row matches, including a body that is not a JSON object or
     # a request that never got an answer, is retryable. So nothing outside
@@ -64,14 +69,13 @@ module Timekeeping
       prepare: [
         Row.new(status: 200, matches: ->(body) { OPERATION_STATES.include?(body["state"]) },
                 outcome: ->(body) { { state: body["state"] } }),
-        Row.new(status: CONFLICT_STATUS,
-                matches: ->(body) { body["reason"] == CONFLICT_REASON && conflicts_in(body).any? },
-                outcome: ->(body) { { state: REFUSED, conflicts: conflicts_in(body) } }),
+        CONFLICT_ROW,
         *RETRYABLE_ROWS
       ],
       mark_billed: [
         Row.new(status: 200, matches: ->(body) { body["billed"].is_a?(Integer) },
                 outcome: ->(body) { { state: COMMITTED, counts: { billed: body["billed"] } } }),
+        CONFLICT_ROW,
         *RETRYABLE_ROWS
       ],
       # A commit or abort request that was not accepted.

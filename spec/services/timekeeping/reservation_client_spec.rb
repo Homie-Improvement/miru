@@ -453,10 +453,9 @@ RSpec.describe Timekeeping::ReservationClient, "answers outside the table" do
       company_id: 7, invoice_id: 501, operation_id: SecureRandom.uuid, generation: 1,
       disposition: "active", entries: [3]
     )
-    answering = lambda do |status, body|
-      ->(_method, _path, headers:, body: nil) { TimekeepingContract::Response.new(status:, body: body_for_answer(body)) }
+    answering = lambda do |status, answer_body|
+      ->(_method, _path, headers:, body: nil) { TimekeepingContract::Response.new(status:, body: answer_body) }
     end
-    define_singleton_method(:body_for_answer) { |value| value }
 
     answers = [
       answering.call(503, { "reason" => "unavailable" }),
@@ -555,6 +554,17 @@ RSpec.describe Timekeeping::ReservationClient, "mark_billed" do
 
     string_count = ->(_method, _path, headers:, body: nil) { TimekeepingContract::Response.new(status: 200, body: { "billed" => "1" }) }
     expect(described_class.new(http: string_count).mark_billed(build.call).state).to eq("retryable")
+
+    # "A 409 `conflict` maps to refused, with `[{entry_id:, reason:}]`." holds for billing too.
+    billing_conflict = lambda do |_method, _path, headers:, body: nil|
+      TimekeepingContract::Response.new(status: 409, body: {
+                                          "reason" => "conflict",
+                                          "conflicts" => [{ "entry_id" => entry_id, "reason" => "on_another_invoice" }]
+                                        })
+    end
+    refused = described_class.new(http: billing_conflict).mark_billed(build.call)
+    expect(refused.state).to eq("refused")
+    expect(refused.conflicts).to eq([{ entry_id:, reason: "on_another_invoice" }])
   end
 end
 

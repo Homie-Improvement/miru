@@ -235,8 +235,11 @@ RSpec.describe "Api::V1::Invoices#update under the timekeeping owner, racing sav
     sign_in race_admin
   end
 
+  # Each save gets its own integration session, so two threads never share
+  # one request and response.
   def race_patch_entry_line(invoice, entry)
-    send_request :patch, api_v1_invoice_path(invoice), params: {
+    race_session = open_session
+    race_session.put api_v1_invoice_path(invoice), params: {
       invoice: {
         client_id: race_client.id, invoice_number: invoice.invoice_number,
         issue_date: invoice.issue_date.iso8601, due_date: invoice.due_date.iso8601,
@@ -247,7 +250,7 @@ RSpec.describe "Api::V1::Invoices#update under the timekeeping owner, racing sav
         ]
       }
     }, headers: auth_headers(race_admin)
-    [response.status, response.body]
+    [race_session.response.status, race_session.response.body]
   end
 
   # "Concurrent saves on separate connections over committed data converge: exactly one invoice keeps a raced entry and the other fails with \"entry is on another invoice\""
@@ -257,14 +260,30 @@ RSpec.describe "Api::V1::Invoices#update under the timekeeping owner, racing sav
     TimekeepingOwnership.current.update!(owner: "timekeeping", handoff_step: nil)
     race_fake.generation = TimekeepingOwnership.current.generation
     race_fake.add_entry(company_id: race_company.id, user_id: entry.user_id, project_id: entry.project_id, id: entry.id)
-    allow(Timekeeping::ReservationHttp).to receive(:new)
-      .and_return(TimekeepingContract::FakeClient.new(timekeeping: race_fake, relay: nil))
     winner = create(:invoice, company: race_company, client: race_client)
     loser = create(:invoice, company: race_company, client: race_client)
+    fake_client = TimekeepingContract::FakeClient.new(timekeeping: race_fake, relay: nil)
+    loser_at_prepare = Queue.new
+    release_loser = Queue.new
+    loser_held = false
+    # The barrier: the loser's first prepare waits here, inside its open save,
+    # until the winner's save has committed.
+    barrier_http = lambda do |method, path, headers:, body:|
+      if !loser_held && path.end_with?("/reservations/prepare") && body["invoice_id"] == loser.id
+        loser_held = true
+        loser_at_prepare << true
+        raise "the winner never released the loser" if release_loser.pop(timeout: 60).nil?
+      end
+      fake_client.call(method, path, headers:, body:)
+    end
+    allow(Timekeeping::ReservationHttp).to receive(:new).and_return(barrier_http)
 
-    # The barrier: the winner's save runs on its own connection and commits before the loser prepares.
+    loser_thread = committed_data_thread { race_patch_entry_line(loser, entry) }
+    raise "the loser never reached its prepare" if loser_at_prepare.pop(timeout: 60).nil?
+
     winner_result = committed_data_thread { race_patch_entry_line(winner, entry) }.value
-    loser_result = committed_data_thread { race_patch_entry_line(loser, entry) }.value
+    release_loser << true
+    loser_result = loser_thread.value
 
     expect(winner_result.first).to eq(200)
     expect(loser_result.first).to eq(422)
