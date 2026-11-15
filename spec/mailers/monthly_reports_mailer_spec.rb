@@ -60,19 +60,14 @@ end
 RSpec.describe MonthlyReportsMailer, "base URL", type: :mailer do
   # "each reads the one per-environment base URL (APP_BASE_URL, else config.x.default_base_url)."
   it "links the cash flow digest to the swapped config.x.default_base_url reports page when APP_BASE_URL is unset" do
-    original_default = Rails.configuration.x.default_base_url
-    original_env = ENV["APP_BASE_URL"]
-    ENV.delete("APP_BASE_URL")
-    Rails.configuration.x.default_base_url = "https://boot-check.test"
-    company = create(:company, name: "Saeloun Inc", base_currency: "USD")
-    user = create(:user, current_workspace: company, locale: "en-US")
+    with_app_base_url(env: nil, default: "https://boot-check.test") do
+      company = create(:company, name: "Saeloun Inc", base_currency: "USD")
+      user = create(:user, current_workspace: company, locale: "en-US")
 
-    mail = described_class.with(company_id: company.id, recipient_id: user.id, month: "2026-03-01").cash_flow_digest
-    body = mail.html_part&.body&.decoded || mail.body.decoded
+      mail = described_class.with(company_id: company.id, recipient_id: user.id, month: "2026-03-01").cash_flow_digest
+      body = mail.html_part&.body&.decoded || mail.body.decoded
 
-    expect(body).to include("https://boot-check.test/reports")
-  ensure
-    Rails.configuration.x.default_base_url = original_default
-    original_env.nil? ? ENV.delete("APP_BASE_URL") : ENV["APP_BASE_URL"] = original_env
+      expect(body).to include("https://boot-check.test/reports")
+    end
   end
 end

@@ -27,15 +27,10 @@ RSpec.describe QuickBooks::Configuration do
 
   describe ".redirect_uri" do
     around do |example|
-      original_default_base_url = Rails.configuration.x.default_base_url
-      Rails.configuration.x.default_base_url = "https://boot-check.test"
-      example.run
-    ensure
-      Rails.configuration.x.default_base_url = original_default_base_url
+      with_app_base_url(env: nil, default: "https://boot-check.test") { example.run }
     end
 
     before do
-      ENV.delete("APP_BASE_URL")
       ENV.delete("INTUIT_REDIRECT_URI")
       ENV.delete("QUICKBOOKS_REDIRECT_URI")
     end

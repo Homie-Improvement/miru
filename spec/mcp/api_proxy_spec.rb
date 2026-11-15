@@ -7,12 +7,7 @@ RSpec.describe MCP::Miru::ApiProxy do
     let(:sent_hosts) { [] }
 
     around do |example|
-      original_app_base_url = ENV["APP_BASE_URL"]
-      original_default_base_url = Rails.configuration.x.default_base_url
-      example.run
-    ensure
-      original_app_base_url.nil? ? ENV.delete("APP_BASE_URL") : ENV["APP_BASE_URL"] = original_app_base_url
-      Rails.configuration.x.default_base_url = original_default_base_url
+      with_app_base_url(env: nil, default: "https://boot-check.test") { example.run }
     end
 
     before do
@@ -54,6 +49,19 @@ RSpec.describe MCP::Miru::ApiProxy do
       proxy_get
 
       expect(sent_hosts).to eq(["app.miru.so:8443"])
+    end
+
+    # A caller that passes its own Host must not be able to replace the configured one, so the
+    # proxy no longer accepts request headers at all.
+    it "refuses a caller-supplied headers keyword so no caller can replace the configured Host" do
+      expect {
+        described_class.request(
+          method: :get, path: "/api/v1/users/_me", authorization: "Bearer token",
+          headers: { "Host" => "attacker.test" }
+        )
+      }.to raise_error(ArgumentError, /headers/)
+
+      expect(sent_hosts).to be_empty
     end
   end
 end

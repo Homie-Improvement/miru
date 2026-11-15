@@ -27,8 +27,8 @@ RSpec.describe "MCP time write tools through the entry gateway" do
     JSON.parse(response.content.first.fetch(:text))
   end
 
-  # The MCP tools accept a bare CLI token and prefix it with "Bearer ", or take an already prefixed one with
-  # a host; the two shapes take different branches before the in-process CLI call.
+  # The MCP tools accept a bare CLI token and prefix it with "Bearer ", or take an already prefixed one; the two
+  # shapes take different branches before the in-process CLI call. A host in the server context is ignored.
   {
     "a bare CLI token" => ->(token) { { authorization: token } },
     "a Bearer CLI token and a host" => ->(token) { { authorization: "Bearer #{token}", host: "www.example.com" } }
