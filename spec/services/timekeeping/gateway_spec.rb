@@ -40,7 +40,7 @@ RSpec.describe Timekeeping::Gateway do
     expect(after["entry_outbox_items"] - before["entry_outbox_items"]).to eq(1)
     expect(after["entry_audits"] - before["entry_audits"]).to eq(1)
     stored = Timekeeping::LocalEntry.find_by(company_id: prepared_company.id, user_id: prepared_user.id)
-    expect([entry.id, entry.note]).to eq([stored.id, "Prepared"])
+    expect([entry.id, entry.note, stored.note]).to eq([stored.id, "Prepared", "Prepared"])
     audit = Timekeeping::LocalOwner::AuditRow.find_by(entry_id: entry.id)
     expect([audit.actor_type, audit.actor_id]).to eq(["user", prepared_user.id])
   end
