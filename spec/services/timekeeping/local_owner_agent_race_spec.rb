@@ -176,6 +176,7 @@ RSpec.describe Timekeeping::LocalOwner, "entry writes naming an agent against a 
 
   it "update naming an agent in its body, paused before the agent lock, is refused not_found after a detach commits and the entry keeps no agent" do
     entry = agent_race_entry
+    attributes_before = entry.reload.attributes
     entered = Queue.new
     release = Queue.new
     update_thread = committed_data_thread do
@@ -193,7 +194,7 @@ RSpec.describe Timekeeping::LocalOwner, "entry writes naming an agent against a 
     expect(detached.status).to eq(200)
     outcome = update_thread.join(10)&.value
     expect([outcome&.status, outcome&.body]).to eq([404, { "reason" => "not_found" }])
-    entry.reload
+    expect(entry.reload.attributes).to eq(attributes_before)
     expect([entry.agent_id, entry.version]).to eq([nil, 1])
     expect(described_class::Receipt.where(actor_type: "user").count).to eq(0)
   ensure
@@ -262,25 +263,6 @@ RSpec.describe Timekeeping::LocalOwner, "entry writes naming an agent against a 
     agent_race_stop(update_thread, detach)
   end
 
-  # Only a detach that commits after a write began refuses it: a detach that committed earlier, of an
-  # agent that still exists, would otherwise refuse every later write for that agent forever.
-  it "accepts a fresh create naming a surviving agent after an older committed detach, and a nil agent create, and ignores another company's detach" do
-    expect(agent_race_detach(other_company).status).to eq(200)
-    across = agent_race_create("after-other-company-detach")
-    expect(across.status).to eq(201)
-    expect(across.body["agent_id"]).to eq(agent.id)
-
-    expect(agent_race_detach.status).to eq(200)
-    later = agent_race_create("after-older-detach")
-    expect(later.status).to eq(201)
-    expect(later.body["agent_id"]).to eq(agent.id)
-
-    unassigned = agent_race_create("no-agent-after-detach", agent_id: nil)
-    expect(unassigned.status).to eq(201)
-    expect(unassigned.body["agent_id"]).to be_nil
-    expect(Timekeeping::LocalEntry.where(company_id: company.id, agent_id: agent.id).count).to eq(1)
-  end
-
   # Refusing on any detach receipt ever stored would refuse every later write
   # for an agent that still exists, and would turn a retry of a write that
   # already committed into a refusal instead of replaying its stored answer.
@@ -315,39 +297,64 @@ RSpec.describe Timekeeping::LocalOwner, "entry writes naming an agent against a 
     agent_race_stop(retry_thread)
   end
 
-  # The detach marker is the receipt stored under the detaching company, so only
-  # a detach in the writing company may refuse the write.
-  it "a detach of the agent id run under another company does not refuse an in-flight create, while one run under the writing company does" do
-    # Pauses the create after it has begun and before it takes the agent lock,
-    # lets the detach commit, then releases the create.
-    race = lambda do |key, detaching_company|
-      entered = Queue.new
-      release = Queue.new
-      checkpoint = agent_race_pause(:receipt_key_locked, entered, release)
-      writer = committed_data_thread(Queue.new) { agent_race_create(key, checkpoint:) }
-      detach = nil
-      begin
-        expect(entered.pop(timeout: 5)).to be(true), "the create never paused before its agent lock"
-        detach = committed_data_thread(Queue.new) { agent_race_detach(detaching_company) }
-        expect(detach.join(10)&.value&.status).to eq(200)
+  # The detach marker is the newest detach receipt stored under the writing company that committed before the
+  # write began. So only a detach in the writing company that commits after the write began may refuse it: one
+  # run under another company must not, and neither may an older one, or every later write for an agent that
+  # still exists would be refused. The in-flight rows differ only in the detaching company. A paused create has
+  # not taken the agent lock yet, so no row waits on a lock and only the committed detach receipt decides it.
+  it "refuses a create naming an agent only for a detach in its own company that commits after the create began" do
+    create_after_detach = {
+      committed_before: lambda do |key, detaching_company|
+        expect(agent_race_detach(detaching_company).status).to eq(200)
+        agent_race_create(key)
+      end,
+      # Pauses the create after it has begun and before it takes the agent
+      # lock, lets the detach commit, then releases the create.
+      in_flight: lambda do |key, detaching_company|
+        entered = Queue.new
+        release = Queue.new
+        checkpoint = agent_race_pause(:receipt_key_locked, entered, release)
+        writer = committed_data_thread(Queue.new) { agent_race_create(key, checkpoint:) }
+        detach = nil
+        begin
+          expect(entered.pop(timeout: 5)).to be(true), "the create never paused before its agent lock"
+          detach = committed_data_thread(Queue.new) { agent_race_detach(detaching_company) }
+          expect(detach.join(10)&.value&.status).to eq(200)
+        ensure
+          release << true
+        end
+        writer.join(10)&.value
       ensure
-        release << true
+        agent_race_stop(writer, detach)
       end
-      writer.join(10)&.value
-    ensure
-      agent_race_stop(writer, detach)
+    }
+    rows = [
+      { name: "another company's detach while the create is in flight", detaching_company: other_company,
+        timing: :in_flight, accepted: true },
+      { name: "an older committed detach in the writing company", detaching_company: company,
+        timing: :committed_before, accepted: true },
+      { name: "a detach in the writing company while the create is in flight", detaching_company: company,
+        timing: :in_flight, accepted: false }
+    ]
+
+    rows.each_with_index do |row, index|
+      entries_before = Timekeeping::LocalEntry.where(company_id: company.id).count
+      user_receipts_before = described_class::Receipt.where(actor_type: "user").count
+
+      outcome = create_after_detach.fetch(row[:timing]).call("marker-row-#{index}", row[:detaching_company])
+
+      if row[:accepted]
+        expect([outcome&.status, outcome&.body&.dig("agent_id")]).to eq([201, agent.id]), row[:name]
+        expect(Timekeeping::LocalEntry.find(outcome.body.fetch("id")).agent_id).to eq(agent.id), row[:name]
+        expect(Timekeeping::LocalEntry.where(company_id: company.id).count).to eq(entries_before + 1), row[:name]
+        expect(described_class::Receipt.where(actor_type: "user").count).to eq(user_receipts_before + 1), row[:name]
+      else
+        expect([outcome&.status, outcome&.body]).to eq([404, { "reason" => "not_found" }]), row[:name]
+        expect(outcome.body.to_json).not_to include("agent-destroy"), row[:name]
+        expect(Timekeeping::LocalEntry.where(company_id: company.id).count).to eq(entries_before), row[:name]
+        expect(described_class::Receipt.where(actor_type: "user").count).to eq(user_receipts_before), row[:name]
+      end
     end
-
-    foreign = race.call("foreign-company-detach", other_company)
-    expect(foreign.status).to eq(201)
-    expect(Timekeeping::LocalEntry.where(company_id: company.id).pluck(:agent_id)).to eq([agent.id])
-
-    entries_before = Timekeeping::LocalEntry.where(company_id: company.id).count
-    own = race.call("own-company-detach", company)
-    expect(own.status).to eq(404)
-    expect(own.body).to eq("reason" => "not_found")
-    expect(Timekeeping::LocalEntry.where(company_id: company.id).count).to eq(entries_before)
-    expect(Timekeeping::LocalEntry.where(company_id: company.id).pluck(:agent_id)).to eq([nil])
   end
 
   # The create takes the agent lock before it reads the ownership row FOR
