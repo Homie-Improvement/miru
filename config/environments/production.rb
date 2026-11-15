@@ -4,7 +4,9 @@ require "active_support/core_ext/integer/time"
 
 Rails.application.configure do
   default_base_url = "https://miru-production.onrender.com"
-  app_base_url = ENV.fetch("APP_BASE_URL", default_base_url)
+  # Blank counts as unset, as in AppBaseUrl (config/initializers/app_base_url.rb), which
+  # this file cannot call because environment files run before initializers.
+  app_base_url = ENV["APP_BASE_URL"].presence || default_base_url
 
   # OmniAuth pins its callback host to this when APP_BASE_URL is unset
   # (config/initializers/omniauth_full_host.rb), so it shares host authorization's fallback.
