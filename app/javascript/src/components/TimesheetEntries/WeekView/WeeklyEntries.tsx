@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 
 import { timesheetEntryApi } from "apis/api";
 import { Toastr } from "StyledComponents";
+import { useIdempotencyKey } from "~/hooks/useIdempotencyKey";
 
 import WeeklyEntriesCard from "./WeeklyEntriesCard";
 
@@ -29,6 +30,7 @@ const WeeklyEntries = ({
   const [currentEntries, setCurrentEntries] = useState([]);
   const [currentProjectId, setCurrentProjectId] = useState(-1);
   const [isProjectBillable, setIsProjectBillable] = useState<boolean>(false);
+  const bulkUpdateKey = useIdempotencyKey();
 
   useEffect(() => {
     if (projects[client]) {
@@ -52,10 +54,10 @@ const WeeklyEntries = ({
   const handleEditEntries = async () => {
     try {
       const ids = getIds();
-      const res = await timesheetEntryApi.updateBulk({
-        project_id: setProjectId(),
-        ids,
-      });
+      const payload = { project_id: setProjectId(), ids };
+      const res = await bulkUpdateKey.sendWithKey(payload, idempotencyKey =>
+        timesheetEntryApi.updateBulk(payload, idempotencyKey)
+      );
       if (res.status === 200) {
         setEntryList(prevState => {
           const newState = { ...prevState, ...res.data.entries };
