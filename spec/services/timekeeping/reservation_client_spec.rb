@@ -561,10 +561,11 @@ end
 RSpec.describe Timekeeping::ReservationClient, "per-company credentials" do
   let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
   let(:client) { described_class.new(http: TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil)) }
+  let(:per_company_shared_token) { SecureRandom.hex(32) }
 
   around do |example|
     with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem,
-                         "TIMEKEEPING_SERVICE_TOKEN" => "shared-service-token") { example.run }
+                         Internal::V1::BaseController::SERVICE_TOKEN_ENV => per_company_shared_token) { example.run }
   end
 
   it "two companies' requests each carry their own path and a freshly minted one-operation token" do
@@ -586,7 +587,7 @@ RSpec.describe Timekeeping::ReservationClient, "per-company credentials" do
     expect(logged.pluck(:path))
       .to eq(companies.map { |company_id| "/v1/companies/#{company_id}/reservations/prepare" })
     tokens = logged.map { |request| request[:headers]["Authorization"].delete_prefix("Bearer ") }
-    expect(tokens).not_to include("shared-service-token")
+    expect(tokens).not_to include(per_company_shared_token)
     claims = tokens.map { |token| Timekeeping::ServiceToken.verify(token, public_key: timekeeping_key_pair.public_key) }
     expect(claims.map(&:company_id)).to eq(companies)
     expect(claims.map(&:operations)).to all(eq(["reservations.prepare"]))
