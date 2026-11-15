@@ -17,7 +17,7 @@ module Timekeeping
   module EntryLookup
     # The entry, and the version Timekeeping holds for it. The version is sent
     # as If-Match on the write, so a change made after the policy check is
-    # refused rather than applied. Only Timekeeping's answer carries one.
+    # refused rather than applied. The legacy store's answer carries none.
     Found = Data.define(:entry, :version)
 
     # Which of the company's entries a caller may target. A scope only ever
@@ -29,8 +29,8 @@ module Timekeeping
 
     module_function
 
-    def find(ownership:, context:, entry_id:, local_owner:, read_client:, scope: :company)
-      found = find_in_owner(ownership:, context:, entry_id:, local_owner:, read_client:)
+    def find(ownership:, context:, entry_id:, read_client:, scope: :company)
+      found = find_in_owner(ownership:, context:, entry_id:, read_client:)
       check_target(found.entry, context:, entry_id:, scope:)
       found
     end
@@ -55,12 +55,12 @@ module Timekeeping
       raise not_found
     end
 
-    def find_in_owner(ownership:, context:, entry_id:, local_owner:, read_client:)
+    def find_in_owner(ownership:, context:, entry_id:, read_client:)
       case EntryOwner.for(ownership)
       when :legacy
         Found.new(entry: context.company.timesheet_entries.kept.find(entry_id), version: nil)
       when :prepared
-        Found.new(entry: local_owner.find_entry(context:, entry_id:), version: nil)
+        local_entry(context:, entry_id:)
       when :timekeeping
         timekeeping_entry(context:, entry_id:, read_client:)
       else
@@ -88,6 +88,20 @@ module Timekeeping
       end
 
       Found.new(entry:, version:)
+    end
+
+    # The company's kept entry in the prepared store. locked is the computed
+    # reservation flag, never the stored entries.locked column, which is not
+    # kept current: a stale true would make the model refuse a change the
+    # local owner allows. The version goes out as If-Match when the request
+    # sends none.
+    def local_entry(context:, entry_id:)
+      row = LocalEntry.with_reserved.where(company_id: context.company.id, discarded_at: nil).find(entry_id)
+      fields = row.attributes.except("reserved").merge("locked" => row.reserved)
+      entry = EntryReader.hydrate([fields], company: context.company, user_id: row.user_id).first
+      raise not_found if entry.nil?
+
+      Found.new(entry:, version: row.version)
     end
 
     def not_found

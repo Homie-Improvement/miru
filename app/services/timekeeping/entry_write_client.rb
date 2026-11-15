@@ -104,6 +104,17 @@ module Timekeeping
       Digest::UUID.uuid_v5(IDEMPOTENCY_NAMESPACE, "#{request_id}/#{operation}/#{entry_id || "new"}")
     end
 
+    # Pure: the error an entry owner's refusal is raised as, by its status
+    # and reason. Shared by Timekeeping's HTTP answers and the prepared
+    # monolith's local owner, so both refusals render alike.
+    def self.refusal_error(operation:, status:, reason:)
+      return ActiveRecord::RecordNotFound.new("Couldn't find TimesheetEntry", "TimesheetEntry") if status == 404
+      return CONFLICT_ERRORS.fetch(reason, Conflict).new if status == 409
+
+      error_class = STATUS_ERRORS.fetch(status) { (400..499).cover?(status) ? Rejected : Error }
+      error_class.new("Timekeeping entry #{operation} answered #{status}")
+    end
+
     # Pure: the key of one bulk call, derived from the request id, the
     # operation and the set of entry ids, whatever their order. A resend that
     # names the same entries replays Timekeeping's stored answer. A resend
@@ -267,13 +278,7 @@ module Timekeeping
       end
 
       def refusal_for(operation, response)
-        status = response.code.to_i
-        message = "Timekeeping entry #{operation} answered #{status}"
-        return ActiveRecord::RecordNotFound.new("Couldn't find TimesheetEntry", "TimesheetEntry") if status == 404
-        return CONFLICT_ERRORS.fetch(reason_of(response), Conflict).new if status == 409
-
-        error_class = STATUS_ERRORS.fetch(status) { (400..499).cover?(status) ? Rejected : Error }
-        error_class.new(message)
+        self.class.refusal_error(operation:, status: response.code.to_i, reason: reason_of(response))
       end
 
       # The contract's error bodies carry only a reason. Anything unreadable
