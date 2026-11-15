@@ -132,8 +132,10 @@ RSpec.describe Invoices::OperationCoordinator, "with a dropped prepare answer fr
     expect(rows.first.reload.delivered_at).to be_present
     expect(state_of.call).to eq(before_save)
 
-    # A late copy of the identical prepare must not reserve anything again.
-    client.prepare(request)
+    # "A prepare whose answer was lost is then terminal, and a late copy cannot reserve."
+    # The dropping client drops only the first prepare, so this copy is answered.
+    late_copy = client.prepare(request)
+    expect(late_copy.state).to eq("aborted")
     expect(state_of.call).to eq(before_save)
   end
 end
@@ -236,67 +238,5 @@ RSpec.describe Invoices::OperationCoordinator, "with a step-3 guard that matches
       InvoiceOperationOutboxItem.where(company_id: company.id, operation_id: request.operation_id, kind: "commit")
     ).not_to exist
     expect(InvoiceOperationIntent.find_by!(company_id: company.id, operation_id: request.operation_id).state).to eq("failed")
-  end
-end
-
-RSpec.describe Invoices::OutboxDelivery, "lost prepare answer then a late copy" do
-  it "timekeeping client: a prepare the fake applied but whose answer was lost is aborted back to the entry's prior state, and a late copy of it reserves nothing" do
-    fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
-    fake.generation = 7
-    company_id = fake.add_company
-    user_id = fake.add_user(company_id:, role: "admin")
-    project_id = fake.add_project(company_id:)
-    entry_id = fake.add_entry(company_id:, user_id:, project_id:)["id"]
-    invoice_id = 9601
-    operation_id = SecureRandom.uuid
-    request = Invoices::ReservationRequest.new(
-      company_id:, invoice_id:, operation_id:, generation: 7, disposition: "active", entries: [entry_id]
-    )
-    locked_before = fake.entry_locked?(entry_id)
-    reservations_before = fake.reservations_for(entry_id)
-
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) do
-      fake_http = TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil)
-      # Only the save's first prepare loses its answer; the replays abort delivery sends are answered.
-      dropped = false
-      drop_first_prepare = lambda do |_method, path|
-        next false if dropped || !path.end_with?("/reservations/prepare")
-
-        dropped = true
-      end
-      dropping_client = Timekeeping::ReservationClient.new(
-        http: TimekeepingContract::DroppingHttp.new(fake_http, drop: drop_first_prepare)
-      )
-
-      lost = dropping_client.prepare(request)
-
-      expect(lost.state).to eq("retryable")
-      # The wrapper forwards before it raises, so the fake really holds the entry now.
-      expect(fake.entry_locked?(entry_id)).to be(true)
-
-      # The save failed: its intent is failed and its abort row waits for delivery.
-      InvoiceOperationIntent.create!(
-        company_id:, invoice_id:, operation_id:, state: "failed", generation: 7,
-        disposition: "active", desired_entry_ids: [entry_id]
-      )
-      item = InvoiceOperationOutboxItem.create!(
-        company_id:, invoice_id:, operation_id:, kind: "abort",
-        payload: { company_id:, invoice_id:, operation_id:, generation: 7, disposition: "active", desired_entry_ids: [entry_id] }
-      )
-
-      described_class.new(adapter_source: -> { dropping_client }).deliver(item.id)
-
-      expect(item.reload.delivered_at).to be_present
-      # "Lost responses and a crash after prepare over committed data converge: after abort, each entry's reservation state equals its state before the save"
-      expect(fake.entry_locked?(entry_id)).to eq(locked_before)
-      expect(fake.reservations_for(entry_id)).to eq(reservations_before)
-
-      # "A prepare whose answer was lost is then terminal, and a late copy cannot reserve."
-      late_copy = Timekeeping::ReservationClient.new(http: fake_http).prepare(request)
-
-      expect(late_copy.state).to eq("aborted")
-      expect(fake.entry_locked?(entry_id)).to eq(locked_before)
-      expect(fake.reservations_for(entry_id)).to eq(reservations_before)
-    end
   end
 end
