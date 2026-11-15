@@ -77,8 +77,18 @@ RSpec.describe Invoices::OperationCoordinator, "with a dropped prepare answer fr
     company = create(:company)
     invoice = create(:invoice, company:, client: create(:client, company:))
     entry_ids = Array.new(2) { fake.add_entry(company_id: company.id, user_id: 1, project_id: 1)["id"] }.sort
-    state_of = -> { entry_ids.index_with { |id| [fake.reservations_for(id), fake.entry_locked?(id)] } }
+    # An earlier save of this invoice committed two entries: the new save keeps
+    # one and drops the other, and abort must leave both as they were.
+    retained_id, omitted_id = Array.new(2) { fake.add_entry(company_id: company.id, user_id: 1, project_id: 1)["id"] }
+    [retained_id, omitted_id].each do |id|
+      fake.add_reservation(entry_id: id, invoice_id: invoice.id, state: "committed", disposition: "active")
+    end
+    desired_ids = (entry_ids + [retained_id]).sort
+    watched_ids = entry_ids + [retained_id, omitted_id]
+    state_of = -> { watched_ids.index_with { |id| [fake.reservations_for(id), fake.entry_locked?(id)] } }
     before_save = state_of.call
+    expect(before_save.values_at(retained_id, omitted_id))
+      .to all(eq([[{ "invoice_id" => invoice.id, "state" => "committed" }], true]))
 
     # Records what the fake holds right after it answers the first prepare,
     # so the test proves the dropped prepare really reserved the entries.
@@ -100,7 +110,7 @@ RSpec.describe Invoices::OperationCoordinator, "with a dropped prepare answer fr
     client = Timekeeping::ReservationClient.new(http: dropping_http)
     request = Invoices::ReservationRequest.new(
       company_id: company.id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
-      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: entry_ids
+      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: desired_ids
     )
     original_reference = invoice.reference
 
@@ -140,19 +150,29 @@ RSpec.describe RecoverInvoiceOperationIntentsJob, "after a crash between prepare
     company = create(:company)
     invoice = create(:invoice, company:, client: create(:client, company:))
     entry_ids = Array.new(2) { fake.add_entry(company_id: company.id, user_id: 1, project_id: 1)["id"] }.sort
-    state_of = -> { entry_ids.index_with { |id| [fake.reservations_for(id), fake.entry_locked?(id)] } }
+    # An earlier save of this invoice committed two entries: the new save keeps
+    # one and drops the other, and abort must leave both as they were.
+    retained_id, omitted_id = Array.new(2) { fake.add_entry(company_id: company.id, user_id: 1, project_id: 1)["id"] }
+    [retained_id, omitted_id].each do |id|
+      fake.add_reservation(entry_id: id, invoice_id: invoice.id, state: "committed", disposition: "active")
+    end
+    desired_ids = (entry_ids + [retained_id]).sort
+    watched_ids = entry_ids + [retained_id, omitted_id]
+    state_of = -> { watched_ids.index_with { |id| [fake.reservations_for(id), fake.entry_locked?(id)] } }
     before_save = state_of.call
+    expect(before_save.values_at(retained_id, omitted_id))
+      .to all(eq([[{ "invoice_id" => invoice.id, "state" => "committed" }], true]))
     client = Timekeeping::ReservationClient.new(http: TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil))
     request = Invoices::ReservationRequest.new(
       company_id: company.id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
-      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: entry_ids
+      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: desired_ids
     )
 
     # The save wrote its pending intent and prepared, then crashed before step 3,
     # past the recovery pickup age.
     intent = InvoiceOperationIntent.create!(
       company_id: company.id, invoice_id: invoice.id, operation_id: request.operation_id, state: "pending",
-      generation: request.generation, disposition: "active", desired_entry_ids: entry_ids, created_at: 61.seconds.ago
+      generation: request.generation, disposition: "active", desired_entry_ids: desired_ids, created_at: 61.seconds.ago
     )
     expect(client.prepare(request).state).to eq("prepared")
     expect(entry_ids.map { |id| fake.entry_locked?(id) }).to eq([true, true])

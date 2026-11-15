@@ -499,6 +499,50 @@ RSpec.describe Invoices::OutboxDelivery, "stale_generation answers to an abort r
   end
 end
 
+RSpec.describe Invoices::OutboxDelivery, "an intent that changes while the Timekeeping call is in flight" do
+  around do |example|
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) { example.run }
+  end
+
+  # Recovery fails the pending intent while the abort is on the wire. A state
+  # captured when the request was built would still read pending and hold the
+  # row back; the state read after the answer is failed, so the row settles.
+  it "settles an abort row against the intent state read after the answer, not the state seen when the request was built" do
+    fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
+    company_id = fake.add_company
+    user_id = fake.add_user(company_id:, role: "admin")
+    entry_id = fake.add_entry(company_id:, user_id:, project_id: fake.add_project(company_id:))["id"]
+    operation_id = SecureRandom.uuid
+    generation = fake.generation
+    intent = InvoiceOperationIntent.create!(
+      company_id:, invoice_id: 507, operation_id:, state: "pending", generation:,
+      disposition: "active", desired_entry_ids: [entry_id]
+    )
+    row = InvoiceOperationOutboxItem.create!(
+      company_id:, invoice_id: 507, operation_id:, kind: "abort",
+      payload: { company_id:, invoice_id: 507, operation_id:, generation:, disposition: "active", desired_entry_ids: [entry_id] }
+    )
+    fake_client = TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil)
+    failing_intent_mid_call = Object.new
+    failing_intent_mid_call.define_singleton_method(:call) do |method, path, headers: {}, body: nil|
+      fake_client.call(method, path, headers:, body:).tap do
+        intent.update!(state: "failed") if path.end_with?("/reservations/abort")
+      end
+    end
+    client = Timekeeping::ReservationClient.new(http: failing_intent_mid_call)
+    request = Invoices::ReservationRequest.new(
+      company_id:, invoice_id: 507, operation_id:, generation:, disposition: "active", entries: [entry_id]
+    )
+    expect(client.prepare(request).state).to eq("prepared")
+
+    described_class.new(adapter_source: -> { client }).deliver(row.id)
+
+    expect(intent.reload.state).to eq("failed")
+    expect(row.reload.delivered_at).to be_present
+    expect(row.attempts).to eq(0)
+  end
+end
+
 RSpec.describe Invoices::OutboxDelivery, "Timekeeping settlement reads only the row's own company's intent" do
   let(:tenant_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
   let(:tenant_client) { Timekeeping::ReservationClient.new(http: TimekeepingContract::FakeClient.new(timekeeping: tenant_fake, relay: nil)) }
