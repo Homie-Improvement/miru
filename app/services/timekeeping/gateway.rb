@@ -174,7 +174,7 @@ module Timekeeping
           import_legacy(user:, project:, final:)
         when :prepared
           row = local_write(ownership:, operation: :create, body: import_body(user:, project:, final:),
-                            idempotency_key: context.idempotency_key || idempotency_key)
+                            idempotency_key:)
           hydrate(row, user_id: user.id)
         when :timekeeping
           import_forwarded(ownership:, user:, project:, final:, idempotency_key:)
