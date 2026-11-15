@@ -194,14 +194,22 @@ module Timekeeping
     # write will change.
     #
     # In the prepared store, a retry of an update this actor already committed
-    # replays the stored answer before the policy runs: the first update may
-    # have made the entry one the policy refuses to edit, such as billed. The
-    # replayed entry still passes the lookup's company, id and scope checks.
-    def update(entry_id:, project:, attributes:, authorize:, expected_generation: nil, scope: :company)
+    # replays the stored answer before the edit policy runs: the first update
+    # may have made the entry one that policy refuses to edit, such as billed.
+    # The replayed entry passes the lookup's company, id and scope checks and
+    # then authorize_replay, the permission to read back a committed answer.
+    # It defaults to authorize for callers that grant no separate one.
+    # :reek:LongParameterList
+    def update(entry_id:, project:, attributes:, authorize:, authorize_replay: authorize, expected_generation: nil,
+               scope: :company)
       perform(expected_generation) do |ownership, owner|
         identity = update_identity(project:, attributes:)
         replayed = owner == :prepared && replay_local(ownership:, operation: :update, entry_id:, identity:)
-        next EntryLookup.replayed(context:, row: replayed, entry_id:, scope:) if replayed
+        if replayed
+          entry = EntryLookup.replayed(context:, row: replayed, entry_id:, scope:)
+          authorize_replay.call(entry)
+          next entry
+        end
 
         found = find_authorized(ownership:, entry_id:, authorize:, scope:)
         entry = found.entry

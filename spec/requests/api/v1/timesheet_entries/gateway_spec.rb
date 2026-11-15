@@ -1961,6 +1961,29 @@ RSpec.describe "Api::V1::TimesheetEntry gateway prepared local owner If-Match", 
     expect(local_entry.reload.note).to eq("Current edit")
     expect(local_entry.version).to eq(current_version + 1)
   end
+
+  # A billed entry is one the edit policy refuses, so its retry must replay without that policy.
+  %w[unbilled billed].each do |status|
+    it "replays a committed #{status} prepared update retried with the same key, writing nothing more" do
+      version = local_entry.reload.version.to_s
+      path = api_v1_timesheet_entry_path(local_entry.id)
+      request_params = {
+        project_id: project.id,
+        timesheet_entry: { duration: 30, work_date: Date.current, note: "Replay", bill_status: status }
+      }
+      request_headers = auth_headers(admin).merge("Idempotency-Key" => "prepared-replay-#{status}", "If-Match" => version)
+      send_request :patch, path, params: request_params, headers: request_headers
+      expect(response).to have_http_status(:ok)
+      original_response = json_response.deep_dup
+      counts = timekeeping_row_counts
+
+      send_request :patch, path, params: request_params, headers: request_headers
+
+      expect(response).to have_http_status(:ok)
+      expect(json_response).to eq(original_response)
+      expect(timekeeping_row_counts).to eq(counts)
+    end
+  end
 end
 
 RSpec.describe "Api::V1::TimesheetEntry gateway prepared local owner delete replay", type: :request do

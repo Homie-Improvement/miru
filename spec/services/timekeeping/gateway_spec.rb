@@ -566,8 +566,11 @@ RSpec.describe Timekeeping::Gateway do
     expect(stored.reload.bill_status).to eq("billed")
     after_first = timekeeping_row_counts
 
-    second = gw_prepared_gateway(request_id: "req-billed-2", idempotency_key: "k-billed", if_match: version)
-      .update(entry_id: stored.id, project: gw_project, attributes: { bill_status: "billed" }, authorize: policy)
+    replay_policy = ->(entry) { raise Pundit::NotAuthorizedError unless TimesheetEntryPolicy.new(gw_admin, entry).show? }
+    second = gw_prepared_gateway(request_id: "req-billed-2", idempotency_key: "k-billed", if_match: version).update(
+      entry_id: stored.id, project: gw_project, attributes: { bill_status: "billed" }, authorize: policy,
+      authorize_replay: replay_policy
+    )
 
     expect(second.attributes).to eq(first.attributes)
     expect(timekeeping_row_counts).to eq(after_first)

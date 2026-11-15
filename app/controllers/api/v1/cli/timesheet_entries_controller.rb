@@ -14,7 +14,8 @@ class Api::V1::Cli::TimesheetEntriesController < Api::V1::Cli::BaseController
 
   def update
     timesheet_entry = entry_gateway.update(
-      entry_id: params[:id], project:, attributes: update_attributes, authorize: method(:authorize), scope: :actor
+      entry_id: params[:id], project:, attributes: update_attributes, authorize: method(:authorize),
+      authorize_replay: method(:authorize_replayed_entry), scope: :actor
     )
 
     render json: {
@@ -30,6 +31,13 @@ class Api::V1::Cli::TimesheetEntriesController < Api::V1::Cli::BaseController
   end
 
   private
+
+    # A replayed update returns an edit already committed, so reading it back
+    # needs only show?: the edit policy may refuse the entry the edit made,
+    # such as a billed one.
+    def authorize_replayed_entry(entry)
+      authorize(entry, :show?)
+    end
 
     def project
       @_project ||= ProjectPolicy::Scope.new(current_user, current_company).resolve.find(cli_timesheet_entry_params[:project_id])
