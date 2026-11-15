@@ -205,11 +205,7 @@ module Timekeeping
       perform(expected_generation) do |ownership, owner|
         identity = update_identity(project:, attributes:)
         replayed = owner == :prepared && replay_local(ownership:, operation: :update, entry_id:, identity:)
-        if replayed
-          entry = EntryLookup.replayed(context:, row: replayed, entry_id:, scope:)
-          authorize_replay.call(entry)
-          next entry
-        end
+        next replayed_update(replayed, entry_id:, authorize_replay:, scope:) if replayed
 
         found = find_authorized(ownership:, entry_id:, authorize:, scope:)
         entry = found.entry
@@ -219,10 +215,7 @@ module Timekeeping
           entry.update!(attributes)
           entry
         when :prepared
-          row = local_write(ownership:, operation: :update, entry_id: entry.id, if_match: context.if_match || found.version,
-                            body: update_body(entry, project:, attributes:), identity:,
-                            idempotency_key: request_key(:update, entry.id))
-          hydrate(row, user_id: entry.user_id)
+          local_update(ownership:, found:, project:, attributes:, identity:)
         when :timekeeping
           body = normalized_update_attributes(entry, attributes).merge("project_id" => project.id)
           row = write_client.update_entry(context:, generation: ownership.generation, entry_id: entry.id,
@@ -400,6 +393,23 @@ module Timekeeping
       # Skips the same entries as forward_bulk_move. With nothing to write no
       # call is made: the gateway has already fenced the generation, and the
       # local owner would store a receipt for an empty write.
+      # The request's own If-Match wins; with none, the version the lookup read
+      # is sent, so a change made after the policy check is refused.
+      # :reek:LongParameterList
+      def local_update(ownership:, found:, project:, attributes:, identity:)
+        entry = found.entry
+        row = local_write(ownership:, operation: :update, entry_id: entry.id, if_match: context.if_match || found.version,
+                          body: update_body(entry, project:, attributes:), identity:,
+                          idempotency_key: request_key(:update, entry.id))
+        hydrate(row, user_id: entry.user_id)
+      end
+
+      # The stored answer to a committed update, held to the lookup's company,
+      # id and scope checks, then to the caller's permission to read it back.
+      def replayed_update(row, entry_id:, authorize_replay:, scope:)
+        EntryLookup.replayed(context:, row:, entry_id:, scope:).tap { |entry| authorize_replay.call(entry) }
+      end
+
       def local_bulk_move(ownership:, entries:, project:, identity:)
         ids = movable_entry_ids(entries, project).sort
         return false if ids.empty?
