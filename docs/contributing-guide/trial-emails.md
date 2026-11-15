@@ -10,7 +10,10 @@ reminders 7, 2, and 1 days before the trial ends.
 - Run `rails db:migrate` (adds `companies.trial_email_last_sent_on`).
 - Restart the Solid Queue dispatcher/worker process so it picks up the new
   `trial_emails` recurring task from `config/solid_queue.yml`.
-- `APP_BASE_URL` must be set for the email CTA links (already required by other mailers).
+- Set `APP_BASE_URL` to your app's URL for the email CTA links. When it is unset or blank,
+  the links use the environment's `config.x.default_base_url` (see
+  `config/initializers/app_base_url.rb`). In production that is
+  `https://miru-production.onrender.com`, which is wrong for a self-hosted instance.
 
 ## Self-hosted instances
 
