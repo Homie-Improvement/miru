@@ -10,13 +10,52 @@ module Invoices
   #
   # The row is locked for the whole delivery and skipped when another
   # deliverer holds it, so inline delivery and the worker never both call the
-  # adapter for one row. Every result that is not settled, including a failed
-  # adapter lookup or a raised error, is counted as an attempt and leaves the
-  # row for the next sweep; delivery never raises to its caller, because by
-  # the time it runs the invoice change is already committed or rolled back.
+  # adapter for one row. A row marked undeliverable is skipped as well.
+  #
+  # The adapter's answer goes through the settlement rule chosen by the
+  # adapter's class. A stale_generation answer from the Timekeeping service
+  # marks the row undeliverable instead, because the service refuses it on
+  # every retry; no later sweep sends it. Every other result that is not
+  # settled, including a failed adapter lookup or a raised error, is counted
+  # as an attempt and leaves the row for the next sweep. Delivery never raises
+  # to its caller, because by the time it runs the invoice change is already
+  # committed or rolled back.
   class OutboxDelivery
-    # The adapter answer that settles each kind of row.
+    # The adapter answer that settles each kind of row under the legacy rule.
     SETTLED_STATE = { "commit" => "committed", "abort" => "aborted" }.freeze
+
+    # The save_reconciliation outcome that settles each kind of row for the
+    # Timekeeping service.
+    RECONCILED_OUTCOME = { "commit" => "existing_success", "abort" => "save_failed" }.freeze
+
+    # The reason the Timekeeping service gives for a row stored under an older
+    # ownership generation. The service will refuse that row on every retry.
+    STALE_GENERATION = Timekeeping::ReservationClient::ERRORS.dig("stale_generation", "body", "reason")
+
+    # The monolith's adapters answer from the store they write, so their
+    # answer alone settles the row.
+    LEGACY_RULE = lambda do |kind, outcome, _intent_state|
+      outcome&.state == SETTLED_STATE.fetch(kind) ? :delivered : :attempt
+    end
+
+    # The Timekeeping service's commit and abort answers carry no state of
+    # their own, and it answers a commit of an operation it already aborted
+    # with success. So the row settles only when the remote state and the
+    # stored intent's state agree through the contract's reconciliation table.
+    RECONCILED_RULE = lambda do |kind, outcome, intent_state|
+      if outcome&.reason == STALE_GENERATION
+        :undeliverable
+      elsif SaveReconciliation.call(remote_state: outcome&.state, intent_state:).fetch("outcome") ==
+            RECONCILED_OUTCOME.fetch(kind)
+        :delivered
+      else
+        :attempt
+      end
+    end
+
+    # Matched on the exact adapter class; every other adapter, and a delivery
+    # that never reached an adapter, takes LEGACY_RULE.
+    SETTLEMENT_RULES = { Timekeeping::ReservationClient => RECONCILED_RULE }.freeze
 
     def initialize(adapter_source:)
       @adapter_source = adapter_source
@@ -25,10 +64,13 @@ module Invoices
     def deliver(outbox_item_id)
       InvoiceOperationOutboxItem.transaction do
         item = InvoiceOperationOutboxItem.lock("FOR UPDATE SKIP LOCKED").find_by(id: outbox_item_id)
-        next if item.nil? || item.delivered_at.present?
+        next if item.nil? || item.delivered_at.present? || item.undeliverable_at.present?
 
-        outcome = settle(item)
-        record(item, outcome)
+        adapter, outcome = settle(item)
+        rule = SETTLEMENT_RULES.fetch(adapter.class, LEGACY_RULE)
+        # Read after the answer, because recovery can fail a pending intent
+        # while the request is in flight.
+        record(item, rule.call(item.kind, outcome, intent_scope(item).pick(:state)))
         outcome
       end
     rescue StandardError => error
@@ -43,6 +85,8 @@ module Invoices
 
       attr_reader :adapter_source
 
+      # Returns the adapter it called and that adapter's outcome, or nil when
+      # no request could be built or the adapter could not answer.
       def settle(item)
         request = request_for(item)
         return if request.nil?
@@ -50,7 +94,8 @@ module Invoices
         # A savepoint keeps a database error raised by the adapter from
         # aborting the transaction that must still record the attempt.
         InvoiceOperationOutboxItem.transaction(requires_new: true) do
-          adapter_source.call.public_send(item.kind, request)
+          adapter = adapter_source.call
+          [adapter, adapter.public_send(item.kind, request)]
         end
       rescue StandardError => error
         Rails.error.report(error, handled: true, context: { outbox_item_id: item.id, company_id: item.company_id })
@@ -58,7 +103,7 @@ module Invoices
       end
 
       def request_for(item)
-        intent = intent_for(item)
+        intent = intent_scope(item).first
         return if intent.nil?
 
         ReservationRequest.new(
@@ -71,17 +116,29 @@ module Invoices
         )
       end
 
-      def intent_for(item)
+      def intent_scope(item)
         scope = InvoiceOperationIntent.where(company_id: item.company_id, operation_id: item.operation_id)
-        scope = scope.where(invoice_id: item.invoice_id) if item.invoice_id
-        scope.first
+        item.invoice_id ? scope.where(invoice_id: item.invoice_id) : scope
       end
 
-      def record(item, outcome)
-        if outcome&.state == SETTLED_STATE.fetch(item.kind)
-          InvoiceOperationOutboxItem.where(id: item.id, delivered_at: nil).update_all(delivered_at: Time.current)
-        else
+      def record(item, decision)
+        undelivered = InvoiceOperationOutboxItem.where(id: item.id, delivered_at: nil)
+        case decision
+        when :delivered
+          undelivered.update_all(delivered_at: Time.current)
+        when :attempt
           InvoiceOperationOutboxItem.where(id: item.id).update_all("attempts = attempts + 1")
+        when :undeliverable
+          marked = undelivered.where(undeliverable_at: nil).update_all(undeliverable_at: Time.current)
+          notify_undeliverable(item) if marked == 1
+        end
+      end
+
+      # Sent only once the row's mark is committed, so a rolled-back mark
+      # never reaches an operator.
+      def notify_undeliverable(item)
+        ActiveRecord.after_all_transactions_commit do
+          UndeliverableOperation.notify(company_id: item.company_id, operation_id: item.operation_id, kind: item.kind)
         end
       end
   end
