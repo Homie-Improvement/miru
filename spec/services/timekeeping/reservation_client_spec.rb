@@ -4,34 +4,37 @@ require "rails_helper"
 
 RSpec.describe Timekeeping::ReservationClient do
   it "two companies' prepares each carry their own path and a fresh one-operation service token, never the shared TIMEKEEPING_SERVICE_TOKEN" do
-    fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
-    fake.generation = 7
-    companies = Array.new(2) do
-      company_id = fake.add_company
-      user_id = fake.add_user(company_id:, role: "admin")
-      project_id = fake.add_project(company_id:)
-      entry = fake.add_entry(company_id:, user_id:, project_id:)
-      # A second invoice of the same company needs its own entry: the first
-      # invoice's prepare holds this one provisionally.
-      later_entry = fake.add_entry(company_id:, user_id:, project_id:)
-      { company_id:, entry_id: entry["id"], later_entry_id: later_entry["id"] }
-    end
-    request_for = lambda do |company, invoice_id, entry_key = :entry_id|
-      Invoices::ReservationRequest.new(
-        company_id: company[:company_id], invoice_id:, operation_id: SecureRandom.uuid,
-        generation: 7, disposition: "active", entries: [company[entry_key]]
-      )
-    end
-
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) do
+    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV => "http://timekeeping.test",
+                         Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) do
       with_timekeeping_service_token do |shared_token|
+        fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
+        generation = TimekeepingOwnership.current.generation
+        fake.generation = generation
+        # Real company rows, so the ids the client sends are the monolith's own.
+        companies = Array.new(2) do
+          company_id = create(:company).id
+          user_id = fake.add_user(company_id:, role: "admin")
+          project_id = fake.add_project(company_id:)
+          entry = fake.add_entry(company_id:, user_id:, project_id:)
+          # A second invoice of the same company needs its own entry: the first
+          # invoice's prepare holds this one provisionally.
+          later_entry = fake.add_entry(company_id:, user_id:, project_id:)
+          { company_id:, entry_id: entry["id"], later_entry_id: later_entry["id"] }
+        end
+        request_for = lambda do |company, invoice_id, entry_key = :entry_id|
+          Invoices::ReservationRequest.new(
+            company_id: company[:company_id], invoice_id:, operation_id: SecureRandom.uuid,
+            generation:, disposition: "active", entries: [company[entry_key]]
+          )
+        end
         # One client instance serves both companies, so nothing it remembers may cross between them.
         client = described_class.new(http: TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil))
+        first_request = request_for.call(companies[0], 501)
 
         outcomes = [
-          client.prepare(request_for.call(companies[0], 101)),
-          client.prepare(request_for.call(companies[1], 201)),
-          client.prepare(request_for.call(companies[0], 102, :later_entry_id))
+          client.prepare(first_request),
+          client.prepare(request_for.call(companies[1], 502)),
+          client.prepare(request_for.call(companies[0], 503, :later_entry_id))
         ]
         expect(outcomes.map(&:state)).to eq(%w[prepared prepared prepared])
 
@@ -52,6 +55,17 @@ RSpec.describe Timekeeping::ReservationClient do
 
         tokens = sent.map { |request| TimekeepingContract::Wire.bearer(request[:headers]) }
         expect(tokens.uniq.size).to eq(3)
+        expect(fake.reservations_for(companies[0][:entry_id]).pluck("invoice_id")).to eq([501])
+        expect(fake.reservations_for(companies[1][:entry_id]).pluck("invoice_id")).to eq([502])
+        expect(fake.reservations_for(companies[0][:later_entry_id]).pluck("invoice_id")).to eq([503])
+
+        # Sending the same request again mints a new token rather than reusing the first.
+        client.prepare(first_request)
+        repeat = fake.requests.last
+        expect(repeat[:path]).to eq("/v1/companies/#{companies[0][:company_id]}/reservations/prepare")
+        repeat_token = TimekeepingContract::Wire.bearer(repeat[:headers])
+        expect(repeat_token).not_to eq(tokens.first)
+        expect(repeat_token).not_to eq(shared_token)
       end
     end
   end
@@ -206,6 +220,43 @@ RSpec.describe Timekeeping::ReservationClient do
     expect(fake.entry_locked?(entry_id)).to be(false)
     expect(fake.reservations_for(entry_id)).to eq([])
   end
+
+  it "the same holds when the conflicting holder is a committed invoice that later releases the entry" do
+    fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
+    company_id = fake.add_company
+    user_id = fake.add_user(company_id:, role: "admin")
+    project_id = fake.add_project(company_id:)
+    entry_id = fake.add_entry(company_id:, user_id:, project_id:)["id"]
+    client = described_class.new(http: TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil))
+    build = lambda do |invoice_id, entries|
+      Invoices::ReservationRequest.new(
+        company_id:, invoice_id:, operation_id: SecureRandom.uuid, generation: fake.generation,
+        disposition: "active", entries:
+      )
+    end
+    holder = build.call(900, [entry_id])
+    expect(client.prepare(holder).state).to eq("prepared")
+    expect(client.commit(holder).state).to eq("committed")
+    request = build.call(501, [entry_id])
+
+    # "In that case abort answers retryable with reason `conflict`, and the row is retried until the abort makes the operation terminal."
+    refused_abort = client.abort(request)
+    expect(refused_abort.state).to eq("retryable")
+    expect(refused_abort.reason).to eq("conflict")
+
+    # Invoice 900 commits again with no entries, which releases the entry.
+    release = build.call(900, [])
+    expect(client.prepare(release).state).to eq("prepared")
+    expect(client.commit(release).state).to eq("committed")
+    expect(fake.reservations_for(entry_id)).to eq([])
+
+    expect(client.prepare(request).state).to eq("prepared")
+    expect(fake.entry_locked?(entry_id)).to be(true)
+
+    expect(client.abort(request).state).to eq("aborted")
+    expect(fake.entry_locked?(entry_id)).to be(false)
+    expect(fake.reservations_for(entry_id)).to eq([])
+  end
 end
 
 RSpec.describe Timekeeping::ReservationClient do
@@ -241,50 +292,6 @@ RSpec.describe Timekeeping::ReservationClient do
     [first_entry, second_entry].each do |entry_id|
       expect(fake.reservations_for(entry_id)).to eq([{ "invoice_id" => 701, "state" => "committed" }])
       expect(fake.entry_locked?(entry_id)).to be(true)
-    end
-  end
-end
-
-RSpec.describe Timekeeping::ReservationClient do
-  it "sends each company's prepare to its own company path with a freshly minted token for that company and the one operation" do
-    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV => "http://timekeeping.test",
-                         Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) do
-      with_timekeeping_service_token do |shared_token|
-        fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
-        generation = TimekeepingOwnership.current.generation
-        fake.generation = generation
-        client = described_class.new(http: TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil))
-        company_a = create(:company)
-        company_b = create(:company)
-        entry_a = fake.add_entry(company_id: company_a.id, user_id: 1, project_id: 1)
-        entry_b = fake.add_entry(company_id: company_b.id, user_id: 2, project_id: 2)
-        later_entry_a = fake.add_entry(company_id: company_a.id, user_id: 1, project_id: 1)
-        request_for = lambda do |company, invoice_id, entry|
-          Invoices::ReservationRequest.new(company_id: company.id, invoice_id:, operation_id: SecureRandom.uuid,
-                                           generation:, disposition: "active", entries: [entry["id"]])
-        end
-
-        outcomes = [
-          client.prepare(request_for.call(company_a, 501, entry_a)),
-          client.prepare(request_for.call(company_b, 502, entry_b)),
-          client.prepare(request_for.call(company_a, 503, later_entry_a))
-        ]
-
-        expect(outcomes.map(&:state)).to eq(%w[prepared prepared prepared])
-        expected_companies = [company_a.id, company_b.id, company_a.id]
-        expect(fake.requests.pluck(:path))
-          .to eq(expected_companies.map { |id| "/v1/companies/#{id}/reservations/prepare" })
-        # "The default mints a new `Timekeeping::ServiceToken` on each call, for the request's company and the one operation."
-        tokens = fake.requests.map { |request| TimekeepingContract::Wire.bearer(request[:headers]) }
-        claims = tokens.map { |token| Timekeeping::ServiceToken.verify(token, public_key: timekeeping_key_pair.public_key) }
-        expect(claims.map(&:company_id)).to eq(expected_companies)
-        expect(claims.map(&:operations)).to all(eq(["reservations.prepare"]))
-        # "The client never sends the shared `TIMEKEEPING_SERVICE_TOKEN` and never caches a token."
-        expect(tokens).not_to include(shared_token)
-        expect(tokens.uniq.size).to eq(3)
-        expect(fake.reservations_for(entry_a["id"]).pluck("invoice_id")).to eq([501])
-        expect(fake.reservations_for(entry_b["id"]).pluck("invoice_id")).to eq([502])
-      end
     end
   end
 end
@@ -477,50 +484,6 @@ RSpec.describe Timekeeping::ReservationClient, "answers outside the table" do
   end
 end
 
-RSpec.describe Timekeeping::ReservationClient, "delayed copy after a conflict" do
-  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-  let(:client) { described_class.new(http: TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil)) }
-  let(:company_id) { fake.add_company }
-  let(:entry_id) do
-    user_id = fake.add_user(company_id:, role: "admin")
-    fake.add_entry(company_id:, user_id:, project_id: fake.add_project(company_id:))["id"]
-  end
-
-  around do |example|
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) { example.run }
-  end
-
-  it "a refused replay keeps abort retryable until a delayed copy after the conflict clears is aborted" do
-    build = lambda do |invoice_id, entries|
-      Invoices::ReservationRequest.new(
-        company_id:, invoice_id:, operation_id: SecureRandom.uuid, generation: fake.generation,
-        disposition: "active", entries:
-      )
-    end
-    holder = build.call(900, [entry_id])
-    expect(client.prepare(holder).state).to eq("prepared")
-    expect(client.commit(holder).state).to eq("committed")
-    request = build.call(501, [entry_id])
-
-    # "In that case abort answers retryable with reason `conflict`, and the row is retried until the abort makes the operation terminal."
-    refused_abort = client.abort(request)
-    expect(refused_abort.state).to eq("retryable")
-    expect(refused_abort.reason).to eq("conflict")
-
-    release = build.call(900, [])
-    expect(client.prepare(release).state).to eq("prepared")
-    expect(client.commit(release).state).to eq("committed")
-    expect(fake.reservations_for(entry_id)).to eq([])
-
-    expect(client.prepare(request).state).to eq("prepared")
-    expect(fake.entry_locked?(entry_id)).to be(true)
-
-    expect(client.abort(request).state).to eq("aborted")
-    expect(fake.entry_locked?(entry_id)).to be(false)
-    expect(fake.reservations_for(entry_id)).to eq([])
-  end
-end
-
 RSpec.describe Timekeeping::ReservationClient, "mark_billed" do
   let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
   let(:client) { described_class.new(http: TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil)) }
@@ -568,45 +531,6 @@ RSpec.describe Timekeeping::ReservationClient, "mark_billed" do
   end
 end
 
-RSpec.describe Timekeeping::ReservationClient, "per-company credentials" do
-  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-  let(:client) { described_class.new(http: TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil)) }
-  let(:per_company_shared_token) { SecureRandom.hex(32) }
-
-  around do |example|
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem,
-                         Internal::V1::BaseController::SERVICE_TOKEN_ENV => per_company_shared_token) { example.run }
-  end
-
-  it "two companies' requests each carry their own path and a freshly minted one-operation token" do
-    companies = Array.new(2) { fake.add_company }
-    requests = companies.map do |company_id|
-      user_id = fake.add_user(company_id:, role: "admin")
-      entry_id = fake.add_entry(company_id:, user_id:, project_id: fake.add_project(company_id:))["id"]
-      Invoices::ReservationRequest.new(
-        company_id:, invoice_id: 501, operation_id: SecureRandom.uuid, generation: fake.generation,
-        disposition: "active", entries: [entry_id]
-      )
-    end
-
-    outcomes = requests.map { |request| client.prepare(request) }
-    expect(outcomes.map(&:state)).to eq(%w[prepared prepared])
-
-    # "two companies' requests each carry their own path and token"
-    logged = fake.requests
-    expect(logged.pluck(:path))
-      .to eq(companies.map { |company_id| "/v1/companies/#{company_id}/reservations/prepare" })
-    tokens = logged.map { |request| request[:headers]["Authorization"].delete_prefix("Bearer ") }
-    expect(tokens).not_to include(per_company_shared_token)
-    claims = tokens.map { |token| Timekeeping::ServiceToken.verify(token, public_key: timekeeping_key_pair.public_key) }
-    expect(claims.map(&:company_id)).to eq(companies)
-    expect(claims.map(&:operations)).to all(eq(["reservations.prepare"]))
-
-    client.prepare(requests.first)
-    expect(fake.requests.last[:headers]["Authorization"]).not_to eq(logged.first[:headers]["Authorization"])
-  end
-end
-
 RSpec.describe Timekeeping::ReservationClient, "admit" do
   it "admit answers from the local claim check and sends no request to the service" do
     sent = []
@@ -625,47 +549,6 @@ RSpec.describe Timekeeping::ReservationClient, "admit" do
 
     expect(outcome.state).to eq("prepared")
     expect(sent).to eq([])
-  end
-end
-
-RSpec.describe Timekeeping::ReservationClient, "an abort whose replay meets a conflict" do
-  around do |example|
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) { example.run }
-  end
-
-  # Acceptance bar: "A prepare that arrives after its abort reserves nothing, including a delayed copy that arrives after a conflict clears"
-  it "an abort whose replay is refused stays retryable with reason conflict until a delayed copy is aborted and nothing stays reserved" do
-    fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
-    company_id = fake.add_company
-    user_id = fake.add_user(company_id:, role: "admin")
-    project_id = fake.add_project(company_id:)
-    entry_id = fake.add_entry(company_id:, user_id:, project_id:).fetch("id")
-    client = described_class.new(http: TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil))
-    build = lambda do |invoice_id|
-      Invoices::ReservationRequest.new(
-        company_id:, invoice_id:, operation_id: SecureRandom.uuid,
-        generation: fake.generation, disposition: "active", entries: [entry_id]
-      )
-    end
-    other = build.call(601)
-    request = build.call(602)
-
-    # Another invoice holds the entry provisionally, so this abort's replay is refused.
-    expect(client.prepare(other).state).to eq("prepared")
-
-    # "A replay refused with 409 conflict stores nothing in the service, so a delayed copy could still reserve later. In that case abort answers retryable with reason `conflict`, and the row is retried until the abort makes the operation terminal."
-    refused_abort = client.abort(request)
-    expect(refused_abort.state).to eq("retryable")
-    expect(refused_abort.reason).to eq("conflict")
-
-    # The conflict clears, then a delayed copy of the original prepare arrives and reserves.
-    expect(client.abort(other).state).to eq("aborted")
-    expect(client.prepare(request).state).to eq("prepared")
-    expect(fake.entry_locked?(entry_id)).to be(true)
-
-    expect(client.abort(request).state).to eq("aborted")
-    expect(fake.entry_locked?(entry_id)).to be(false)
-    expect(fake.reservations_for(entry_id)).to eq([])
   end
 end
 
