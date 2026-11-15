@@ -98,8 +98,6 @@ RSpec.describe OmniauthFullHost do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe OmniauthFullHost do
   let(:initializer_path) { Rails.root.join("config/initializers/omniauth_full_host.rb").to_s }
 
@@ -127,8 +125,6 @@ RSpec.describe OmniauthFullHost do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe OmniauthFullHost do
   it "requires https from either source only when require_https is set" do
     expect { described_class.resolve(app_base_url: "http://app.miru.so", fallback: "https://fallback.test", require_https: true) }
@@ -146,8 +142,6 @@ RSpec.describe OmniauthFullHost do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe OmniauthFullHost do
   # Boot errors reach deploy logs, and APP_BASE_URL is stored as a deploy secret.
   it "keeps credentials embedded in a refused http base URL out of the error message" do
@@ -159,8 +153,6 @@ RSpec.describe OmniauthFullHost do
     }
   end
 end
-
-require "rails_helper"
 
 RSpec.describe OmniauthFullHost do
   let(:initializer_path) { Rails.root.join("config/initializers/omniauth_full_host.rb").to_s }
@@ -184,8 +176,6 @@ RSpec.describe OmniauthFullHost do
     expect(OmniAuth.config.full_host).to be_nil
   end
 end
-
-require "rails_helper"
 
 RSpec.describe OmniauthFullHost do
   let(:initializer_path) { Rails.root.join("config/initializers/omniauth_full_host.rb").to_s }
@@ -212,8 +202,6 @@ RSpec.describe OmniauthFullHost do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe OmniauthFullHost do
   it "resolve with require_https refuses an http base URL from either source without echoing its credentials" do
     expect { described_class.resolve(app_base_url: "http://app.miru.so", fallback: "https://x.test", require_https: true) }
@@ -229,8 +217,6 @@ RSpec.describe OmniauthFullHost do
       .to eq("http://app.miru.so")
   end
 end
-
-require "rails_helper"
 
 RSpec.describe OmniauthFullHost do
   let(:initializer_path) { Rails.root.join("config/initializers/omniauth_full_host.rb").to_s }
@@ -255,8 +241,6 @@ RSpec.describe OmniauthFullHost do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe OmniauthFullHost do
   it "resolve with require_https refuses an http base URL from APP_BASE_URL or the fallback and accepts https" do
     expect { described_class.resolve(app_base_url: "http://app.miru.so", fallback: "https://fallback.test", require_https: true) }
@@ -273,8 +257,6 @@ RSpec.describe OmniauthFullHost do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe OmniauthFullHost do
   # Development and test keep their plain-http local defaults; only production requires https.
   it "resolve keeps accepting http base URLs when require_https is false or omitted" do
@@ -287,8 +269,6 @@ RSpec.describe OmniauthFullHost do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe OmniauthFullHost do
   # The refusal reaches boot logs, so a password embedded in the URL must not appear in it.
   it "resolve with require_https names the source but not URL credentials when refusing http" do
@@ -299,8 +279,6 @@ RSpec.describe OmniauthFullHost do
       }
   end
 end
-
-require "rails_helper"
 
 RSpec.describe OmniauthFullHost do
   let(:initializer_path) { Rails.root.join("config/initializers/omniauth_full_host.rb").to_s }
@@ -330,8 +308,6 @@ RSpec.describe OmniauthFullHost do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe OmniauthFullHost do
   let(:initializer_path) { Rails.root.join("config/initializers/omniauth_full_host.rb").to_s }
 
@@ -357,8 +333,6 @@ RSpec.describe OmniauthFullHost do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe OmniauthFullHost do
   # Acceptance: "Either production boot raises on an http​:// APP_BASE_URL (checked by a spec), or a
   # recorded decision says plain http is allowed in production."
@@ -373,8 +347,6 @@ RSpec.describe OmniauthFullHost do
     }.to raise_error(OmniauthFullHost::InvalidBaseUrl) { |error| expect(error.message).not_to include("secret") }
   end
 end
-
-require "rails_helper"
 
 RSpec.describe OmniauthFullHost do
   # Acceptance: "Either production boot raises on an http​:// APP_BASE_URL (checked by a spec), or a
