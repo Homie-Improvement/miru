@@ -44,14 +44,22 @@ module Invoices
       "refused" => OperationErrors::Refused
     }.freeze
 
-    # Bills the entries the invoice's lines reference. An entry its holding
-    # still lists after a line was removed stays reserved, but it is no longer
-    # on the invoice, so it is not billed. Every answer but `committed`
-    # raises, so the caller's transaction rolls back the sent status with it
-    # and the invoice is never sent with its entries left unbilled.
+    # The reason a billing is refused while the invoice's commit has not
+    # reached the Timekeeping service yet.
+    COMMIT_UNDELIVERED_REASON = "commit_undelivered"
+
+    # Bills the invoice's entries. The monolith's adapters bill the entries
+    # the invoice's lines reference, so an entry its holding still lists after
+    # a line was removed stays reserved but is not billed. The Timekeeping
+    # service's mark-billed route takes no entry list and bills every entry it
+    # holds as committed for the invoice, held-only entries included. Every
+    # answer but `committed` raises, so the caller's transaction rolls back the
+    # sent status with it and the invoice is never sent with its entries left
+    # unbilled.
     def mark_billed(invoice)
       holding = InvoiceEntryHolding.find_by(company_id: invoice.company_id, invoice_id: invoice.id)
       ownership = TimekeepingOwnership.current
+      raise_while_commit_undelivered!(invoice, ownership)
       request = ReservationRequest.new(
         company_id: invoice.company_id,
         invoice_id: invoice.id,
@@ -73,6 +81,21 @@ module Invoices
       raise route.new(outcome.reason) if outcome.reason
 
       raise route
+    end
+
+    # The Timekeeping service bills only the reservations it holds as
+    # committed, and answers success with nothing billed for any other. So
+    # while a commit row of this invoice is undelivered, billing would let the
+    # invoice be sent with its entries unbilled. The invoice's operation lock
+    # keeps a save of the same invoice from adding a commit row meanwhile.
+    def raise_while_commit_undelivered!(invoice, ownership)
+      return unless Timekeeping::EntryOwner.for(ownership) == :timekeeping
+
+      OperationLock.acquire!(ApplicationRecord.connection, company_id: invoice.company_id, invoice_id: invoice.id)
+      undelivered = InvoiceOperationOutboxItem.where(
+        company_id: invoice.company_id, invoice_id: invoice.id, kind: "commit", delivered_at: nil
+      ).exists?
+      raise OperationErrors::PrepareRetryable, COMMIT_UNDELIVERED_REASON if undelivered
     end
 
     # Commit callbacks fire only on the transaction whose parent is not
