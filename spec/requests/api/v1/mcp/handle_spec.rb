@@ -109,6 +109,49 @@ RSpec.describe "Api::V1::MCP#handle", type: :request do
         tool_error = json_response["error"].present? || json_response.dig("result", "isError") == true
         expect(tool_error).to be(true)
       end
+
+      # "A BaseTool invocation whose server_context host differs from AppBaseUrl.current sends the configured host,
+      # not the request host, as HTTP_HOST in the internal Rack request."
+      context "with a configured base URL that differs from the request host" do
+        let(:internal_hosts) { [] }
+
+        around do |example|
+          original_app_base_url = ENV["APP_BASE_URL"]
+          original_default_base_url = Rails.configuration.x.default_base_url
+          ENV.delete("APP_BASE_URL")
+          Rails.configuration.x.default_base_url = "https://configured-host.test"
+          example.run
+        ensure
+          original_app_base_url.nil? ? ENV.delete("APP_BASE_URL") : ENV["APP_BASE_URL"] = original_app_base_url
+          Rails.configuration.x.default_base_url = original_default_base_url
+        end
+
+        before do
+          allow_any_instance_of(Rack::MockRequest).to receive(:request).and_wrap_original do |original, verb, path, options|
+            internal_hosts << options["HTTP_HOST"]
+            original.call(verb, path, options)
+          end
+        end
+
+        it "proxies a tools/call sent to a forged request Host with the configured host instead" do
+          host! "attacker.test"
+
+          post mcp_path, params: tool_call_payload(name: "miru.workspace.whoami").to_json, headers: mcp_headers(cli_token:, mcp_method: "tools/call")
+
+          expect(response).to have_http_status(:ok)
+          expect(json_response["id"]).to eq("tool-1")
+          expect(internal_hosts).to eq(["configured-host.test"])
+        end
+
+        it "sends the configured host, not the request host, on the internal request of a tools/call" do
+          post mcp_path, params: tool_call_payload(name: "miru.workspace.whoami").to_json, headers: mcp_headers(cli_token:, mcp_method: "tools/call")
+
+          expect(response).to have_http_status(:ok)
+          expect(json_response["id"]).to eq("tool-1")
+          expect(internal_hosts).to eq(["configured-host.test"])
+          expect(internal_hosts).not_to include("www.example.com")
+        end
+      end
     end
 
     context "with active trial" do
@@ -240,69 +283,4 @@ RSpec.describe "Api::V1::MCP#handle", type: :request do
         }
       }
     end
-end
-
-RSpec.describe "Api::V1::MCP#handle", type: :request do
-  let(:company) { create(:company, plan_tier: "paid") }
-  let(:user) { create(:user, current_workspace_id: company.id) }
-  let(:cli_token) { CliSession.issue_for(user:, company:).last }
-  let(:internal_hosts) { [] }
-
-  around do |example|
-    original_app_base_url = ENV["APP_BASE_URL"]
-    original_default_base_url = Rails.configuration.x.default_base_url
-    ENV.delete("APP_BASE_URL")
-    Rails.configuration.x.default_base_url = "https://configured-host.test"
-    example.run
-  ensure
-    original_app_base_url.nil? ? ENV.delete("APP_BASE_URL") : ENV["APP_BASE_URL"] = original_app_base_url
-    Rails.configuration.x.default_base_url = original_default_base_url
-  end
-
-  before do
-    create(:employment, company:, user:)
-    user.add_role :employee, company
-    allow_any_instance_of(Rack::MockRequest).to receive(:request).and_wrap_original do |original, verb, path, options|
-      internal_hosts << options["HTTP_HOST"]
-      original.call(verb, path, options)
-    end
-  end
-
-  def post_whoami_tool_call
-    payload = {
-      jsonrpc: "2.0",
-      id: "tool-1",
-      method: "tools/call",
-      params: { name: "miru.workspace.whoami", arguments: {} }
-    }
-    headers = cli_auth_headers(cli_token, {
-      "CONTENT_TYPE" => "application/json",
-      "ACCEPT" => "application/json, text/event-stream",
-      "MCP-Protocol-Version" => "2025-03-26",
-      "MCP-Method" => "tools/call"
-    })
-
-    post mcp_path, params: payload.to_json, headers: headers
-  end
-
-  # "A BaseTool invocation whose server_context host differs from AppBaseUrl.current sends the configured host,
-  # not the request host, as HTTP_HOST in the internal Rack request."
-  it "proxies a tools/call sent to a forged request Host with the configured host instead" do
-    host! "attacker.test"
-
-    post_whoami_tool_call
-
-    expect(response).to have_http_status(:ok)
-    expect(JSON.parse(response.body)["id"]).to eq("tool-1")
-    expect(internal_hosts).to eq(["configured-host.test"])
-  end
-
-  it "sends the configured host, not the request host, on the internal request of a tools/call" do
-    post_whoami_tool_call
-
-    expect(response).to have_http_status(:ok)
-    expect(json_response["id"]).to eq("tool-1")
-    expect(internal_hosts).to eq(["configured-host.test"])
-    expect(internal_hosts).not_to include("www.example.com")
-  end
 end

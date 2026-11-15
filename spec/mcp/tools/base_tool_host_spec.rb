@@ -6,6 +6,7 @@ require "rails_helper"
 # not the request host, as HTTP_HOST in the internal Rack request."
 RSpec.describe "MCP tool proxied Host" do
   let(:sent_requests) { [] }
+  let(:proxied_response_status) { 201 }
 
   around do |example|
     original_app_base_url = ENV["APP_BASE_URL"]
@@ -21,7 +22,7 @@ RSpec.describe "MCP tool proxied Host" do
   before do
     allow_any_instance_of(Rack::MockRequest).to receive(:request) do |_mock, _verb, _path, options|
       sent_requests << options
-      Rack::MockResponse.new(201, { "content-type" => "application/json" }, "{}")
+      Rack::MockResponse.new(proxied_response_status, { "content-type" => "application/json" }, "{}")
     end
   end
 
@@ -76,15 +77,20 @@ RSpec.describe "MCP tool proxied Host" do
   end
 
   # A retry may arrive from a different host; whichever delivery reaches the internal API must carry the configured host.
-  it "sends the configured host on a write delivered twice with different request hosts under one idempotency key" do
-    ["first-request.test", "second-request.test"].each do |request_host|
-      create_time_entry(
-        server_context: { authorization: "Bearer token", host: request_host },
-        idempotency_key: "mcp-host-retry"
-      )
-    end
+  # The first delivery fails, so the idempotency store caches nothing and the retry reaches the proxy too.
+  context "when a failed write is retried from a different request host" do
+    let(:proxied_response_status) { 503 }
 
-    expect(sent_requests).not_to be_empty
-    expect(sent_requests.pluck("HTTP_HOST").uniq).to eq(["configured-host.test"])
+    it "sends the configured host on a write delivered twice with different request hosts under one idempotency key" do
+      ["first-request.test", "second-request.test"].each do |request_host|
+        create_time_entry(
+          server_context: { authorization: "Bearer token", host: request_host },
+          idempotency_key: "mcp-host-retry"
+        )
+      end
+
+      expect(sent_requests.size).to eq(2)
+      expect(sent_requests.pluck("HTTP_HOST")).to eq(["configured-host.test", "configured-host.test"])
+    end
   end
 end
