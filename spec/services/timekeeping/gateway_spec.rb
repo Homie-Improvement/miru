@@ -2306,100 +2306,6 @@ RSpec.describe Timekeeping::Gateway, "prepared branch call shape" do
   end
 end
 
-RSpec.describe Timekeeping::Gateway, "prepared agent detach service actor scope" do
-  # "With ownership prepared, deleting an agent calls LocalOwner.call(operation: :detach_entries, ...) with a service actor and clears agent_id on its entries instead of answering 503 ownership_moving."
-  it "prepared detach acts as a service actor bound only to the agent's company and the detach operation" do
-    agent = create(:agent)
-    ownership = prepare_local_ownership!
-    local_owner = class_double(Timekeeping::LocalOwner)
-    allow(local_owner).to receive(:call)
-      .and_return(Timekeeping::LocalOwner::Outcome.new(status: 200, body: { "detached" => 1 }))
-    service_client = instance_double(Timekeeping::ServiceCommandClient)
-    context = Timekeeping::WriteContext.new(company: agent.company, actor: agent.user, actor_kind: "agent_destroy",
-                                            request_id: "req-prepared-actor-scope")
-    gateway = described_class.new(context:, local_owner:, service_client:)
-
-    expect(gateway.detach_agent_entries(agent:)).to eq(1)
-    expect(local_owner).to have_received(:call).once do |**kwargs|
-      actor = kwargs[:actor]
-      expect(kwargs[:operation]).to eq(:detach_entries)
-      expect(kwargs[:company_id]).to eq(agent.company_id)
-      expect(kwargs[:generation]).to eq(ownership.generation)
-      expect(actor.kind).to eq(:service)
-      expect(actor.user_id).to be_nil
-      expect(actor.company_id).to eq(agent.company_id)
-      expect(actor.operations).to eq([Timekeeping::ServiceToken::DETACH_ENTRIES])
-      expect(actor.name).to eq(Timekeeping::ServiceToken::SUBJECT)
-      expect(kwargs[:params]["agent_id"]).to eq(agent.id)
-      expect(kwargs[:params]["operation_id"]).to eq(
-        described_class.detach_operation_id(request_id: "req-prepared-actor-scope", agent_id: agent.id)
-      )
-    end
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, "prepared agent detach company boundary" do
-  # "With ownership prepared, deleting an agent calls LocalOwner.call(operation: :detach_entries, ...) with a service actor and clears agent_id on its entries instead of answering 503 ownership_moving."
-  it "prepared detach clears only the agent's company entries and leaves another company's entry with the same agent id" do
-    agent = create(:agent)
-    prepare_local_ownership!
-    project = create(:project, client: create(:client, company: agent.company))
-    own_entry = Timekeeping::LocalEntry.create!(company_id: agent.company_id, user_id: agent.user_id,
-                                                project_id: project.id, work_date: Date.current, duration: 30.0,
-                                                note: "n", bill_status: "unbilled", agent_id: agent.id)
-    other_company = create(:company)
-    other_user = create(:user)
-    create(:employment, company: other_company, user: other_user)
-    other_project = create(:project, client: create(:client, company: other_company))
-    foreign_entry = Timekeeping::LocalEntry.create!(company_id: other_company.id, user_id: other_user.id,
-                                                    project_id: other_project.id, work_date: Date.current,
-                                                    duration: 30.0, note: "n", bill_status: "unbilled",
-                                                    agent_id: agent.id)
-    context = Timekeeping::WriteContext.new(company: agent.company, actor: agent.user, actor_kind: "agent_destroy",
-                                            request_id: "req-prepared-company-boundary")
-
-    expect(described_class.new(context:).detach_agent_entries(agent:)).to eq(1)
-    expect(own_entry.reload.agent_id).to be_nil
-    expect(foreign_entry.reload.agent_id).to eq(agent.id)
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, "prepared agent detach persistence" do
-  # "With ownership prepared, deleting an agent calls LocalOwner.call(operation: :detach_entries, ...) with a service actor and clears agent_id on its entries instead of answering 503 ownership_moving."
-  it "prepared detach clears agent_id on the agent's live and discarded local entries only and writes one audit per entry" do
-    agent = create(:agent)
-    prepare_local_ownership!
-    project = create(:project, client: create(:client, company: agent.company))
-    live = Timekeeping::LocalEntry.create!(company_id: agent.company_id, user_id: agent.user_id, project_id: project.id,
-                                           work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled",
-                                           agent_id: agent.id)
-    discarded = Timekeeping::LocalEntry.create!(company_id: agent.company_id, user_id: agent.user_id,
-                                                project_id: project.id, work_date: Date.current, duration: 30.0,
-                                                note: "n", bill_status: "unbilled", agent_id: agent.id,
-                                                discarded_at: Time.current)
-    other_company = create(:company)
-    other_user = create(:user)
-    create(:employment, company: other_company, user: other_user)
-    other_project = create(:project, client: create(:client, company: other_company))
-    # Same agent id value in another company: no database key ties entries to agents.
-    foreign = Timekeeping::LocalEntry.create!(company_id: other_company.id, user_id: other_user.id,
-                                              project_id: other_project.id, work_date: Date.current, duration: 30.0,
-                                              note: "n", bill_status: "unbilled", agent_id: agent.id)
-    service_client = instance_double(Timekeeping::ServiceCommandClient)
-    context = Timekeeping::WriteContext.new(company: agent.company, actor: agent.user, actor_kind: "agent_destroy",
-                                            request_id: "req-prepared-detach-persist")
-    audits_before = timekeeping_row_counts(%w[entry_audits]).fetch("entry_audits")
-
-    detached = described_class.new(context:, service_client:).detach_agent_entries(agent:)
-
-    expect(detached).to eq(2)
-    expect(Timekeeping::LocalEntry.unscoped.find(live.id).agent_id).to be_nil
-    expect(Timekeeping::LocalEntry.unscoped.find(discarded.id).agent_id).to be_nil
-    expect(Timekeeping::LocalEntry.unscoped.find(foreign.id).agent_id).to eq(agent.id)
-    expect(timekeeping_row_counts(%w[entry_audits]).fetch("entry_audits")).to eq(audits_before + 2)
-  end
-end
-
 RSpec.describe Timekeeping::Gateway, "prepared agent detach replay" do
   it "repeating a prepared detach with the same request id replays its count and writes no second audit or outbox row" do
     agent = create(:agent)
@@ -2420,39 +2326,6 @@ RSpec.describe Timekeeping::Gateway, "prepared agent detach replay" do
     expect(second).to eq(first)
     expect(timekeeping_row_counts).to eq(counts_after_first)
     expect(entry.reload.agent_id).to be_nil
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, "prepared agent detach tenant binding" do
-  # "With ownership prepared, deleting an agent calls LocalOwner.call(operation: :detach_entries, ...) with a service
-  # actor and clears agent_id on its entries instead of answering 503 ownership_moving."
-  it "a prepared detach binds the service actor and the call to the agent's own company and to the detach operation only" do
-    agent = create(:agent)
-    create(:agent) # a second company exists, so a wrong company id cannot match by accident
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
-      .update_columns(owner: "monolith", monolith_store: "prepared", handoff_step: nil, generation: 2)
-    calls = []
-    local_owner = Object.new
-    local_owner.define_singleton_method(:call) do |**kwargs|
-      calls << kwargs
-      Timekeeping::LocalOwner::Outcome.new(status: 200, body: { "detached" => 1 })
-    end
-    service_client = instance_double(Timekeeping::ServiceCommandClient)
-    context = Timekeeping::WriteContext.new(company: agent.company, actor: agent.user, actor_kind: "agent_destroy",
-                                            request_id: "req-prepared-tenant")
-    gateway = described_class.new(context:, local_owner:, service_client:)
-
-    expect(gateway.detach_agent_entries(agent:)).to eq(1)
-
-    expect(calls.size).to eq(1)
-    call = calls.first
-    expect(call[:operation]).to eq(:detach_entries)
-    expect(call[:company_id]).to eq(agent.company_id)
-    actor = call[:actor]
-    expect(actor.kind).to eq(:service)
-    expect(actor.company_id).to eq(agent.company_id)
-    expect(actor.operations).to eq([Timekeeping::ServiceToken::DETACH_ENTRIES])
-    expect(call[:params]["agent_id"]).to eq(agent.id)
   end
 end
 
@@ -2478,6 +2351,7 @@ RSpec.describe Timekeeping::Gateway, "prepared agent entry detach call" do
       expect(Integer(kwargs[:generation])).to eq(2)
       actor = kwargs[:actor]
       expect(actor.kind).to eq(:service)
+      expect(actor.user_id).to be_nil
       expect(actor.company_id).to eq(agent.company_id)
       expect(actor.operations).to eq([Timekeeping::ServiceToken::DETACH_ENTRIES])
       expect(actor.name).to eq(Timekeeping::ServiceToken::SUBJECT)
@@ -2511,10 +2385,12 @@ RSpec.describe Timekeeping::Gateway, "prepared agent entry detach through the lo
     service_client = instance_double(Timekeeping::ServiceCommandClient)
     context = Timekeeping::WriteContext.new(company: agent.company, actor: agent.user, actor_kind: "agent_destroy",
                                             request_id: "req-prepared-detach-real")
+    audits_before = timekeeping_row_counts(%w[entry_audits]).fetch("entry_audits")
 
     detached = described_class.new(context:, service_client:).detach_agent_entries(agent:)
 
     expect(detached).to eq(2)
+    expect(timekeeping_row_counts(%w[entry_audits]).fetch("entry_audits")).to eq(audits_before + 2)
     [live, discarded].each do |entry|
       entry.reload
       expect(entry.agent_id).to be_nil
@@ -2523,27 +2399,6 @@ RSpec.describe Timekeeping::Gateway, "prepared agent entry detach through the lo
     end
     expect(foreign.reload.agent_id).to eq(agent.id)
     expect(Timekeeping::LocalOwner::AuditRow.where(entry_id: foreign.id, action: "detach_entries").count).to eq(0)
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, "prepared agent entry detach replay" do
-  it "a repeated prepared detach in the same attempt returns the same count and writes no second audit" do
-    agent = create(:agent)
-    prepare_local_ownership!
-    project = create(:project, client: create(:client, company: agent.company))
-    entry = Timekeeping::LocalEntry.create!(company_id: agent.company_id, user_id: agent.user_id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled",
-                                            agent_id: agent.id)
-    context = Timekeeping::WriteContext.new(company: agent.company, actor: agent.user, actor_kind: "agent_destroy",
-                                            request_id: "req-prepared-detach-replay")
-    service_client = instance_double(Timekeeping::ServiceCommandClient)
-
-    first = described_class.new(context:, service_client:).detach_agent_entries(agent:)
-    second = described_class.new(context:, service_client:).detach_agent_entries(agent:)
-
-    expect([first, second]).to eq([1, 1])
-    expect(entry.reload.agent_id).to be_nil
-    expect(Timekeeping::LocalOwner::AuditRow.where(entry_id: entry.id, action: "detach_entries").count).to eq(1)
   end
 end
 
@@ -2571,52 +2426,6 @@ RSpec.describe Timekeeping::Gateway, "prepared agent entry detach refusal" do
 
     expect(local_owner).to have_received(:call).once
     expect(events.size).to eq(1)
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, "prepared agent detach delivered twice" do
-  # "With ownership prepared, deleting an agent calls LocalOwner.call(operation: :detach_entries, ...) with a service actor and clears agent_id on its entries instead of answering 503 ownership_moving."
-  it "replays a prepared detach delivered twice in one attempt without writing a second set of audit rows" do
-    agent = create(:agent)
-    prepare_local_ownership!
-    project = create(:project, client: create(:client, company: agent.company))
-    entry = Timekeeping::LocalEntry.create!(company_id: agent.company_id, user_id: agent.user_id, project_id: project.id,
-                                            work_date: Date.current, duration: 30.0, note: "n",
-                                            bill_status: "unbilled", agent_id: agent.id)
-    context = Timekeeping::WriteContext.new(company: agent.company, actor: agent.user, actor_kind: "agent_destroy",
-                                            request_id: "req-prepared-detach-twice")
-
-    first = described_class.new(context:).detach_agent_entries(agent:)
-    counts_after_first = timekeeping_row_counts(%w[entry_audits entry_outbox_items])
-    second = described_class.new(context:).detach_agent_entries(agent:)
-
-    expect(first).to eq(1)
-    expect(second).to eq(first)
-    expect(timekeeping_row_counts(%w[entry_audits entry_outbox_items])).to eq(counts_after_first)
-    expect(entry.reload.agent_id).to be_nil
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, "prepared agent detach across companies" do
-  # "With ownership prepared, deleting an agent calls LocalOwner.call(operation: :detach_entries, ...) with a service actor and clears agent_id on its entries instead of answering 503 ownership_moving."
-  it "detaches only the agent's company entries when another company has an entry with the same agent id value" do
-    agent = create(:agent)
-    prepare_local_ownership!
-    project = create(:project, client: create(:client, company: agent.company))
-    own = Timekeeping::LocalEntry.create!(company_id: agent.company_id, user_id: agent.user_id, project_id: project.id,
-                                          work_date: Date.current, duration: 30.0, note: "n",
-                                          bill_status: "unbilled", agent_id: agent.id)
-    other_company = create(:company)
-    other_project = create(:project, client: create(:client, company: other_company))
-    foreign = Timekeeping::LocalEntry.create!(company_id: other_company.id, user_id: create(:user).id,
-                                              project_id: other_project.id, work_date: Date.current, duration: 30.0,
-                                              note: "n", bill_status: "unbilled", agent_id: agent.id)
-    context = Timekeeping::WriteContext.new(company: agent.company, actor: agent.user, actor_kind: "agent_destroy",
-                                            request_id: "req-prepared-detach-tenant")
-
-    expect(described_class.new(context:).detach_agent_entries(agent:)).to eq(1)
-    expect(own.reload.agent_id).to be_nil
-    expect(foreign.reload.agent_id).to eq(agent.id)
   end
 end
 
