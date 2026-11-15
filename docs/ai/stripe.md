@@ -15,7 +15,7 @@ Add these to your local env file (or shell profile) before starting the app:
 - `STRIPE_SECRET_KEY` (required)
 - `STRIPE_PUBLISHABLE_KEY` (required for frontend/public usage)
 - `STRIPE_WEBHOOK_ENDPOINT_SECRET` (required to validate webhook signatures)
-- `APP_BASE_URL` (required for Stripe Connect refresh/return URLs; local value: `http://127.0.0.1:3000`)
+- `APP_BASE_URL` (required for Stripe Connect refresh/return URLs; local value: `http://127.0.0.1:3000`). Billing and invoice email links do not need it: when it is unset or blank, they use the environment's `config.x.default_base_url` (see `config/initializers/app_base_url.rb`; `http://localhost:3000` in development, `https://miru-production.onrender.com` in production). Stripe Connect URLs still read `APP_BASE_URL` directly (`app/models/stripe_connected_account.rb`) and get no fallback.
 - `STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY` (recommended for subscriptions)
 - `STRIPE_SUBSCRIPTION_PRICE_ID_YEARLY` (recommended for subscriptions)
 - `STRIPE_SUBSCRIPTION_PRICE_ID` (fallback if interval-specific IDs are not set)
@@ -206,6 +206,8 @@ Use these as focused checks during integration work:
 - Missing/invalid `STRIPE_SECRET_KEY` or missing subscription price env var.
 - Stripe Connect refresh/return links are wrong:
 - `APP_BASE_URL` is missing or not set to the active local host.
+- Billing or invoice email links point at the wrong host:
+- `APP_BASE_URL` is unset or blank, so the links use `config.x.default_base_url`. Set `APP_BASE_URL` to the app's real URL.
 - Billing checkout returns pricing error:
 - Missing `STRIPE_SUBSCRIPTION_PRICE_ID_MONTHLY` / `YEARLY` and no fallback `STRIPE_SUBSCRIPTION_PRICE_ID`.
 
