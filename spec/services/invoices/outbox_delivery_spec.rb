@@ -447,6 +447,58 @@ RSpec.describe Invoices::OutboxDelivery do
   end
 end
 
+RSpec.describe Invoices::OutboxDelivery, "stale_generation answers to an abort row", committed_data: true do
+  around do |example|
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) { example.run }
+  end
+
+  # An abort row reaches the reason through the prepare replay and the abort post, not the commit post.
+  it "marks a stale_generation abort row undeliverable once without counting an attempt and emits one event with kind abort" do
+    fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
+    fake.generation = 7
+    company_id = fake.add_company
+    user_id = fake.add_user(company_id:, role: "admin")
+    entry_id = fake.add_entry(company_id:, user_id:, project_id: fake.add_project(company_id:))["id"]
+    invoice_id = 88_701
+    operation_id = SecureRandom.uuid
+    InvoiceOperationIntent.create!(
+      company_id:, invoice_id:, operation_id:, state: "failed", generation: 7,
+      disposition: "active", desired_entry_ids: [entry_id]
+    )
+    row = InvoiceOperationOutboxItem.create!(
+      company_id:, invoice_id:, operation_id:, kind: "abort",
+      payload: { company_id:, invoice_id:, operation_id:, generation: 7, disposition: "active", desired_entry_ids: [entry_id] }
+    )
+    client = Timekeeping::ReservationClient.new(http: TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil))
+    request = Invoices::ReservationRequest.new(
+      company_id:, invoice_id:, operation_id:, generation: 7, disposition: "active", entries: [entry_id]
+    )
+    expect(client.prepare(request).state).to eq("prepared")
+    fake.generation = 8
+    delivery = described_class.new(adapter_source: -> { client })
+
+    events = []
+    subscriber = Object.new
+    subscriber.define_singleton_method(:emit) { |event| events << event }
+    Rails.event.subscribe(subscriber)
+    begin
+      delivery.deliver(row.id)
+      delivery.deliver(row.id)
+    ensure
+      Rails.event.unsubscribe(subscriber)
+    end
+
+    row.reload
+    expect(row.undeliverable_at).to be_present
+    expect(row.delivered_at).to be_nil
+    expect(row.attempts).to eq(0)
+    payloads = events.filter_map do |event|
+      event[:payload].to_h.symbolize_keys if event[:name] == Invoices::UndeliverableOperation::NAME
+    end
+    expect(payloads).to eq([{ company_id:, operation_id:, kind: "abort" }])
+  end
+end
+
 RSpec.describe Invoices::OutboxDelivery, "Timekeeping settlement reads only the row's own company's intent" do
   let(:tenant_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
   let(:tenant_client) { Timekeeping::ReservationClient.new(http: TimekeepingContract::FakeClient.new(timekeeping: tenant_fake, relay: nil)) }

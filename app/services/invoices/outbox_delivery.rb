@@ -13,10 +13,13 @@ module Invoices
   # adapter for one row. A row marked undeliverable is skipped as well.
   #
   # The adapter's answer goes through the settlement rule chosen by the
-  # adapter's class. Every result that is not settled, including a failed
-  # adapter lookup or a raised error, is counted as an attempt and leaves the
-  # row for the next sweep; delivery never raises to its caller, because by
-  # the time it runs the invoice change is already committed or rolled back.
+  # adapter's class. A stale_generation answer from the Timekeeping service
+  # marks the row undeliverable instead, because the service refuses it on
+  # every retry; no later sweep sends it. Every other result that is not
+  # settled, including a failed adapter lookup or a raised error, is counted
+  # as an attempt and leaves the row for the next sweep. Delivery never raises
+  # to its caller, because by the time it runs the invoice change is already
+  # committed or rolled back.
   class OutboxDelivery
     # The adapter answer that settles each kind of row under the legacy rule.
     SETTLED_STATE = { "commit" => "committed", "abort" => "aborted" }.freeze
