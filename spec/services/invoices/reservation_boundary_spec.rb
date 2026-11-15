@@ -383,6 +383,21 @@ RSpec.describe Invoices::ReservationBoundary do
     expect([held_only_entry, line_entry].map { |entry| entry.reload.bill_status }).to eq(%w[unbilled billed])
   end
 
+  it "mark_billed raises a retryable error for an aborted billing answer and for a retryable one with no reason" do
+    invoice = create(:invoice, company: boundary_flush_company, client: boundary_flush_client, status: :sent)
+    adapter = instance_double(Invoices::LegacyReservations)
+    allow(Invoices::ReservationAdapters).to receive(:for).and_return(adapter)
+
+    allow(adapter).to receive(:mark_billed)
+      .and_return(Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {}))
+    expect { described_class.mark_billed(invoice) }.to raise_error(Invoices::OperationErrors::PrepareRetryable)
+
+    allow(adapter).to receive(:mark_billed)
+      .and_return(Invoices::ReservationOutcome.new(state: "retryable", conflicts: [], counts: {}))
+    expect { described_class.mark_billed(invoice) }
+      .to raise_error(Invoices::OperationErrors::PrepareRetryable, "prepare_retryable")
+  end
+
   # "A discarded draft (L2): \"Its reservations are released.\""
   it "unlocks a discarded draft's entries with one intent, and the invoice-number rename adds none" do
     entry = boundary_flush_entry
@@ -571,5 +586,35 @@ RSpec.describe Invoices::ReservationBoundary do
 
     expect(InvoiceLineItemTimeEntry.where(invoice_line_item_id: line.id)).to be_empty
     expect(entry.reload.locked).to be(false)
+  end
+end
+
+RSpec.describe Invoices::ReservationBoundary, "mark_billed decision" do
+  it "mark_billed raises a retryable error with the reason for every answer that is not committed or refused" do
+    invoice = create(:invoice)
+    answers = {
+      "committed" => Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: { billed: 0 }),
+      "retryable" => Invoices::ReservationOutcome.new(state: "retryable", conflicts: [], counts: {}, reason: "stale_generation"),
+      "prepared" => Invoices::ReservationOutcome.new(state: "prepared", conflicts: [], counts: {}),
+      "refused" => Invoices::ReservationOutcome.new(state: "refused", conflicts: [{ entry_id: 3, reason: "on_another_invoice" }], counts: {})
+    }
+    adapter = Object.new
+    current = nil
+    adapter.define_singleton_method(:mark_billed) { |_request| answers.fetch(current) }
+    allow(Invoices::ReservationAdapters).to receive(:for).and_return(adapter)
+
+    # "Make it decide from a table: `committed` returns, `refused` raises `OperationErrors::Refused`, and every other state raises `OperationErrors::PrepareRetryable` with the reason."
+    current = "committed"
+    expect(described_class.mark_billed(invoice).state).to eq("committed")
+
+    current = "retryable"
+    expect { described_class.mark_billed(invoice) }
+      .to raise_error(Invoices::OperationErrors::PrepareRetryable, "stale_generation")
+
+    current = "prepared"
+    expect { described_class.mark_billed(invoice) }.to raise_error(Invoices::OperationErrors::PrepareRetryable)
+
+    current = "refused"
+    expect { described_class.mark_billed(invoice) }.to raise_error(Invoices::OperationErrors::Refused)
   end
 end
