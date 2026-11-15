@@ -85,7 +85,7 @@ RSpec.describe "Api::V1::MCP#handle", type: :request do
         expect(json_response.dig("result", "protocolVersion")).to be_a(String).and be_present
       end
 
-      it "forwards request host to proxy-backed tool calls" do
+      it "proxies tool calls without passing the request host to the proxy" do
         allow(MCP::Miru::ApiProxy).to receive(:request).and_call_original
 
         post mcp_path, params: tool_call_payload(name: "miru.workspace.whoami").to_json, headers: mcp_headers(cli_token:, mcp_method: "tools/call")
@@ -94,11 +94,7 @@ RSpec.describe "Api::V1::MCP#handle", type: :request do
         expect(json_response["id"]).to eq("tool-1")
         expect(json_response.dig("result", "content")).to be_an(Array).and be_present
         expect(MCP::Miru::ApiProxy).to have_received(:request).once.with(
-          hash_including(
-            method: :get,
-            path: "/api/v1/users/_me",
-            headers: hash_including("Host" => "www.example.com")
-          )
+          method: :get, path: "/api/v1/users/_me", params: nil, body: nil, authorization: "Bearer #{cli_token}"
         )
       end
 
@@ -244,4 +240,159 @@ RSpec.describe "Api::V1::MCP#handle", type: :request do
         }
       }
     end
+end
+
+RSpec.describe "Api::V1::MCP#handle", type: :request do
+  let(:company) { create(:company, plan_tier: "paid") }
+  let(:user) { create(:user, current_workspace_id: company.id) }
+  let(:cli_token) { CliSession.issue_for(user:, company:).last }
+
+  around do |example|
+    original_app_base_url = ENV["APP_BASE_URL"]
+    original_default_base_url = Rails.configuration.x.default_base_url
+    ENV.delete("APP_BASE_URL")
+    Rails.configuration.x.default_base_url = "https://configured-host.test"
+    example.run
+  ensure
+    original_app_base_url.nil? ? ENV.delete("APP_BASE_URL") : ENV["APP_BASE_URL"] = original_app_base_url
+    Rails.configuration.x.default_base_url = original_default_base_url
+  end
+
+  before do
+    create(:employment, company:, user:)
+    user.add_role :employee, company
+  end
+
+  # "A BaseTool invocation whose server_context host differs from AppBaseUrl.current sends the configured host,
+  # not the request host, as HTTP_HOST in the internal Rack request."
+  it "proxies a tools/call sent to a forged request Host with the configured host instead" do
+    proxied_hosts = []
+    allow_any_instance_of(Rack::MockRequest).to receive(:request).and_wrap_original do |original, verb, path, options|
+      proxied_hosts << options["HTTP_HOST"]
+      original.call(verb, path, options)
+    end
+    host! "attacker.test"
+    payload = {
+      jsonrpc: "2.0",
+      id: "tool-1",
+      method: "tools/call",
+      params: { name: "miru.workspace.whoami", arguments: {} }
+    }
+    headers = cli_auth_headers(cli_token, {
+      "CONTENT_TYPE" => "application/json",
+      "ACCEPT" => "application/json, text/event-stream",
+      "MCP-Protocol-Version" => "2025-03-26",
+      "MCP-Method" => "tools/call"
+    })
+
+    post mcp_path, params: payload.to_json, headers: headers
+
+    expect(response).to have_http_status(:ok)
+    expect(JSON.parse(response.body)["id"]).to eq("tool-1")
+    expect(proxied_hosts).to eq(["configured-host.test"])
+  end
+end
+
+require "rails_helper"
+
+RSpec.describe "Api::V1::MCP#handle", type: :request do
+  let(:company) { create(:company, plan_tier: "paid") }
+  let(:user) { create(:user, current_workspace_id: company.id) }
+  let(:cli_token) { CliSession.issue_for(user:, company:).last }
+  let(:internal_hosts) { [] }
+
+  around do |example|
+    original_app_base_url = ENV["APP_BASE_URL"]
+    original_default_base_url = Rails.configuration.x.default_base_url
+    ENV.delete("APP_BASE_URL")
+    Rails.configuration.x.default_base_url = "https://configured-host.test"
+    example.run
+  ensure
+    original_app_base_url.nil? ? ENV.delete("APP_BASE_URL") : ENV["APP_BASE_URL"] = original_app_base_url
+    Rails.configuration.x.default_base_url = original_default_base_url
+  end
+
+  before do
+    create(:employment, company:, user:)
+    user.add_role :employee, company
+    allow_any_instance_of(Rack::MockRequest).to receive(:request).and_wrap_original do |original, verb, path, options|
+      internal_hosts << options["HTTP_HOST"]
+      original.call(verb, path, options)
+    end
+  end
+
+  # "A BaseTool invocation whose server_context host differs from AppBaseUrl.current sends the configured host, not the request host, as HTTP_HOST in the internal Rack request."
+  it "sends the configured host, not the request host, on the internal request of a tools/call" do
+    payload = {
+      jsonrpc: "2.0",
+      id: "tool-1",
+      method: "tools/call",
+      params: { name: "miru.workspace.whoami", arguments: {} }
+    }
+    headers = cli_auth_headers(cli_token, {
+      "CONTENT_TYPE" => "application/json",
+      "ACCEPT" => "application/json, text/event-stream",
+      "MCP-Protocol-Version" => "2025-03-26",
+      "MCP-Method" => "tools/call"
+    })
+
+    post mcp_path, params: payload.to_json, headers: headers
+
+    expect(response).to have_http_status(:ok)
+    expect(json_response["id"]).to eq("tool-1")
+    expect(internal_hosts).to eq(["configured-host.test"])
+    expect(internal_hosts).not_to include("www.example.com")
+  end
+end
+
+require "rails_helper"
+
+RSpec.describe "Api::V1::MCP#handle", type: :request do
+  let(:company) { create(:company, plan_tier: "paid") }
+  let(:user) { create(:user, current_workspace_id: company.id) }
+  let(:cli_token) { CliSession.issue_for(user:, company:).last }
+  let(:internal_hosts) { [] }
+
+  around do |example|
+    original_app_base_url = ENV["APP_BASE_URL"]
+    original_default_base_url = Rails.configuration.x.default_base_url
+    ENV.delete("APP_BASE_URL")
+    Rails.configuration.x.default_base_url = "https://configured-host.test"
+    example.run
+  ensure
+    original_app_base_url.nil? ? ENV.delete("APP_BASE_URL") : ENV["APP_BASE_URL"] = original_app_base_url
+    Rails.configuration.x.default_base_url = original_default_base_url
+  end
+
+  before do
+    create(:employment, company:, user:)
+    user.add_role :employee, company
+    allow_any_instance_of(Rack::MockRequest).to receive(:request).and_wrap_original do |original, verb, path, options|
+      internal_hosts << options["HTTP_HOST"]
+      original.call(verb, path, options)
+    end
+  end
+
+  # "A BaseTool invocation whose server_context host differs from AppBaseUrl.current sends the configured host, not the request host, as HTTP_HOST in the internal Rack request."
+  it "sends the configured host, not the MCP request host, to the internal request for a tools/call" do
+    payload = {
+      jsonrpc: "2.0",
+      id: "tool-1",
+      method: "tools/call",
+      params: { name: "miru.workspace.whoami", arguments: {} }
+    }
+    headers = cli_auth_headers(cli_token, {
+      "CONTENT_TYPE" => "application/json",
+      "ACCEPT" => "application/json, text/event-stream",
+      "MCP-Protocol-Version" => "2025-03-26",
+      "MCP-Method" => "tools/call"
+    })
+
+    post mcp_path, params: payload.to_json, headers: headers
+
+    expect(response).to have_http_status(:ok)
+    expect(json_response["id"]).to eq("tool-1")
+    expect(internal_hosts).to eq(["configured-host.test"])
+    expect(internal_hosts).not_to include("www.example.com")
+  end
 end
