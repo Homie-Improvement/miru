@@ -7,20 +7,19 @@ require "rails_helper"
 RSpec.describe "OmniAuth full host pin", type: :request do
   let(:app_base_url) { nil }
 
+  # The test environment's declared default stays in place: the examples expect its host,
+  # http://example.com, whenever APP_BASE_URL is unset.
   around do |example|
-    original_app_base_url = ENV["APP_BASE_URL"]
     original_full_host = OmniAuth.config.full_host
     original_forgery_protection = ActionController::Base.allow_forgery_protection
     ActionController::Base.allow_forgery_protection = false
-    example.run
+    with_app_base_url(env: app_base_url, default: Rails.configuration.x.default_base_url) { example.run }
   ensure
-    ENV["APP_BASE_URL"] = original_app_base_url
     OmniAuth.config.full_host = original_full_host
     ActionController::Base.allow_forgery_protection = original_forgery_protection
   end
 
   before do
-    ENV["APP_BASE_URL"] = app_base_url
     OmniAuth.config.mock_auth[:github] = build(:github_user_data)
     OmniAuth.config.mock_auth[:google_oauth2] = build(:google_user_data)
   end
