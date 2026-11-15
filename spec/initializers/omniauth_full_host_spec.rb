@@ -96,4 +96,95 @@ RSpec.describe OmniauthFullHost do
       expect { load initializer_path }.to raise_error(OmniauthFullHost::InvalidBaseUrl)
     end
   end
+
+  # Production forces SSL, so an http base URL there must stop boot; development and test keep
+  # their plain-http local defaults.
+  describe "the production https rule" do
+    def stub_production_env_for_https_rule
+      allow(Rails).to receive(:env).and_return(ActiveSupport::EnvironmentInquirer.new("production"))
+    end
+
+    # A silent upgrade to https would hide the misconfiguration, so boot must raise and pin nothing.
+    it "refuses to boot in production on an http APP_BASE_URL, leaving full_host unpinned" do
+      stub_production_env_for_https_rule
+      ENV["APP_BASE_URL"] = "http://app.miru.so"
+      OmniAuth.config.full_host = nil
+
+      expect { load initializer_path }.to raise_error(OmniauthFullHost::InvalidBaseUrl)
+      expect(OmniAuth.config.full_host).to be_nil
+    end
+
+    # An unset APP_BASE_URL must not route around the rule through an http fallback.
+    it "refuses to boot in production on an http fallback when APP_BASE_URL is unset" do
+      original_default_base_url = Rails.configuration.x.default_base_url
+      stub_production_env_for_https_rule
+      ENV.delete("APP_BASE_URL")
+      Rails.configuration.x.default_base_url = "http://fallback-check.test"
+      OmniAuth.config.full_host = nil
+
+      expect { load initializer_path }.to raise_error(OmniauthFullHost::InvalidBaseUrl)
+      expect(OmniAuth.config.full_host).to be_nil
+    ensure
+      Rails.configuration.x.default_base_url = original_default_base_url
+    end
+
+    it "boots in production on an https APP_BASE_URL and pins it without its trailing slash" do
+      stub_production_env_for_https_rule
+      ENV["APP_BASE_URL"] = "https://app.miru.so/"
+      OmniAuth.config.full_host = nil
+
+      expect { load initializer_path }.not_to raise_error
+      expect(OmniAuth.config.full_host).to eq("https://app.miru.so")
+    end
+
+    it "still boots in the test environment on an http APP_BASE_URL" do
+      ENV["APP_BASE_URL"] = "http://app.miru.so"
+
+      load initializer_path
+
+      expect(OmniAuth.config.full_host).to eq("http://app.miru.so")
+    end
+
+    # Letter case or padding must not become a way around the https rule.
+    it "resolve with require_https refuses non-https base URLs from either source" do
+      ["http://app.miru.so", "HTTP://app.miru.so", "  http://app.miru.so/  ", "ftp://app.miru.so"].each do |non_https|
+        expect { described_class.resolve(app_base_url: non_https, fallback: "https://fallback.test", require_https: true) }
+          .to raise_error(OmniauthFullHost::InvalidBaseUrl)
+      end
+      expect { described_class.resolve(app_base_url: nil, fallback: "http://example.com", require_https: true) }
+        .to raise_error(OmniauthFullHost::InvalidBaseUrl)
+    end
+
+    it "resolve with require_https accepts https from either source" do
+      expect(described_class.resolve(app_base_url: "https://app.miru.so", fallback: "http://example.com", require_https: true))
+        .to eq("https://app.miru.so")
+      expect(described_class.resolve(app_base_url: "https://app.miru.so/", fallback: "http://example.com", require_https: true))
+        .to eq("https://app.miru.so")
+      expect(described_class.resolve(app_base_url: "  ", fallback: "https://fallback.test/", require_https: true))
+        .to eq("https://fallback.test")
+    end
+
+    it "resolve keeps accepting http base URLs when require_https is false or omitted" do
+      expect(described_class.resolve(app_base_url: "http://app.miru.so", fallback: "http://example.com"))
+        .to eq("http://app.miru.so")
+      expect(described_class.resolve(app_base_url: "http://app.miru.so", fallback: "http://example.com", require_https: false))
+        .to eq("http://app.miru.so")
+      expect(described_class.resolve(app_base_url: nil, fallback: "http://localhost:3000", require_https: false))
+        .to eq("http://localhost:3000")
+    end
+
+    # Boot errors reach deploy logs, and APP_BASE_URL is stored as a deploy secret.
+    it "resolve with require_https names the source but not URL credentials when refusing http" do
+      {
+        "http://deploy-user:s3cr3t-token@app.miru.so" => "s3cr3t-token",
+        "http://user:secret@app.miru.so" => "secret"
+      }.each do |with_credentials, password|
+        expect { described_class.resolve(app_base_url: with_credentials, fallback: "https://fallback.test", require_https: true) }
+          .to raise_error(OmniauthFullHost::InvalidBaseUrl) { |error|
+            expect(error.message).to include("APP_BASE_URL")
+            expect(error.message).not_to include(password)
+          }
+      end
+    end
+  end
 end
