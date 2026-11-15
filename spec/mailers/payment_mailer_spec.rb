@@ -45,3 +45,26 @@ RSpec.describe PaymentMailer, type: :mailer do
     expect(ActionMailer::Base.deliveries).to be_empty
   end
 end
+
+RSpec.describe PaymentMailer, "base URL", type: :mailer do
+  # "each reads the one per-environment base URL (APP_BASE_URL, else config.x.default_base_url)."
+  it "links the payment confirmation to the swapped config.x.default_base_url when APP_BASE_URL is unset" do
+    original_default = Rails.configuration.x.default_base_url
+    original_env = ENV["APP_BASE_URL"]
+    ENV.delete("APP_BASE_URL")
+    Rails.configuration.x.default_base_url = "https://boot-check.test"
+    company = create(:company)
+    client = create(:client, company:)
+    invoice = create(:invoice, client:, company:)
+    user = create(:user, current_workspace_id: company.id, companies: [company])
+    user.add_role :admin, company
+
+    mail = PaymentMailer.with(invoice_id: invoice.id, subject: "Payment").payment
+    body = mail.html_part&.body&.decoded || mail.body.decoded
+
+    expect(body).to include("https://boot-check.test/invoices/#{invoice.external_view_key}/view")
+  ensure
+    Rails.configuration.x.default_base_url = original_default
+    original_env.nil? ? ENV.delete("APP_BASE_URL") : ENV["APP_BASE_URL"] = original_env
+  end
+end

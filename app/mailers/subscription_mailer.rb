@@ -67,7 +67,7 @@ class SubscriptionMailer < ApplicationMailer
     @stripe_subscription_id = params[:stripe_subscription_id]
     @subscription_interval = params[:subscription_interval].presence || "month"
     @seat_quantity = params[:seat_quantity].presence || @company.billable_team_seats
-    @billing_url = params[:billing_url].presence || "#{ENV['APP_BASE_URL']}/settings/billing"
+    @billing_url = params[:billing_url].presence || "#{AppBaseUrl.current}/settings/billing"
 
     mail(
       to: @alert_email,
@@ -83,8 +83,8 @@ class SubscriptionMailer < ApplicationMailer
       @recipient = User.find(params[:recipient_id])
       @trial_ends_at = @company.trial_ends_at
       @trial_end_date_text = @trial_ends_at&.in_time_zone(resolved_time_zone)&.strftime("%B %-d, %Y")
-      @app_url = ENV["APP_BASE_URL"]
-      @billing_url = "#{ENV['APP_BASE_URL']}/settings/billing"
+      @app_url = AppBaseUrl.current
+      @billing_url = "#{AppBaseUrl.current}/settings/billing"
     end
 
     def resolved_time_zone

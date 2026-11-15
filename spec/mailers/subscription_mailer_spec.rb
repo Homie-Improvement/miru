@@ -160,3 +160,23 @@ RSpec.describe SubscriptionMailer, type: :mailer do
     end
   end
 end
+
+RSpec.describe SubscriptionMailer, "base URL", type: :mailer do
+  # "each reads the one per-environment base URL (APP_BASE_URL, else config.x.default_base_url)."
+  it "links the trial expired email to the swapped config.x.default_base_url billing page when APP_BASE_URL is unset" do
+    original_default = Rails.configuration.x.default_base_url
+    original_env = ENV["APP_BASE_URL"]
+    ENV.delete("APP_BASE_URL")
+    Rails.configuration.x.default_base_url = "https://boot-check.test"
+    company = create(:company, name: "Saeloun Inc")
+    user = create(:user, email: "base-url-check@saeloun.com")
+
+    mail = described_class.with(company_id: company.id, recipient_id: user.id).trial_expired
+
+    expect(mail.html_part.body.decoded).to include("https://boot-check.test/settings/billing")
+    expect(mail.text_part.body.decoded).to include("https://boot-check.test/settings/billing")
+  ensure
+    Rails.configuration.x.default_base_url = original_default
+    original_env.nil? ? ENV.delete("APP_BASE_URL") : ENV["APP_BASE_URL"] = original_env
+  end
+end
