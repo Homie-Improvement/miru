@@ -499,6 +499,26 @@ RSpec.describe Timekeeping::Gateway do
     expect(foreign.reload.discarded_at).to be_nil
   end
 
+  it "refuses a prepared destroy replay whose stored entry fails the retry's scope or policy and writes nothing" do
+    gw_ownership.update_columns(monolith_store: "prepared", generation: 2)
+    colleague = timekeeping_member(gw_company, "employee")
+    stored = gw_local_entry(user_id: colleague.id)
+    gw_prepared_gateway(request_id: "req-scope-1", idempotency_key: "k-scope")
+      .destroy(entry_id: stored.id, authorize: gw_allow_all)
+    after_first = timekeeping_row_counts
+    refusing_policy = ->(_entry) { raise Pundit::NotAuthorizedError }
+
+    expect do
+      gw_prepared_gateway(request_id: "req-scope-2", idempotency_key: "k-scope")
+        .destroy(entry_id: stored.id, authorize: gw_allow_all, scope: :actor)
+    end.to raise_error(ActiveRecord::RecordNotFound)
+    expect do
+      gw_prepared_gateway(request_id: "req-scope-3", idempotency_key: "k-scope")
+        .destroy(entry_id: stored.id, authorize: refusing_policy)
+    end.to raise_error(Pundit::NotAuthorizedError)
+    expect(timekeeping_row_counts).to eq(after_first)
+  end
+
   # The replay call's If-Match is never a version, so a live entry it reaches answers a version conflict.
   it "sends the replay-only If-Match on a prepared destroy the lookup misses and answers a conflict as not found" do
     gw_ownership.update_columns(monolith_store: "prepared", generation: 2)
