@@ -612,3 +612,26 @@ RSpec.describe Invoices::ReservationBoundary, "mark_billed decision" do
       .to raise_error(Invoices::OperationErrors::PrepareRetryable, "prepare_retryable")
   end
 end
+
+RSpec.describe Invoices::ReservationBoundary, "mark_billed with an undeliverable commit row" do
+  # A row marked undeliverable never reaches the service, so its entries are
+  # never committed there and billing would send the invoice with them unbilled.
+  it "under the timekeeping owner still refuses billing while the invoice's commit row is marked undeliverable" do
+    invoice = create(:invoice)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", handoff_step: nil)
+    operation_id = SecureRandom.uuid
+    InvoiceOperationOutboxItem.create!(
+      company_id: invoice.company_id, invoice_id: invoice.id, operation_id:, kind: "commit",
+      undeliverable_at: Time.current,
+      payload: { company_id: invoice.company_id, invoice_id: invoice.id, operation_id:, generation: 1,
+                 disposition: "active", desired_entry_ids: [1] }
+    )
+    adapter = instance_double(Timekeeping::ReservationClient)
+    allow(Invoices::ReservationAdapters).to receive(:for).and_return(adapter)
+    allow(adapter).to receive(:mark_billed)
+
+    expect { described_class.mark_billed(invoice) }
+      .to raise_error(Invoices::OperationErrors::PrepareRetryable, Invoices::ReservationBoundary::COMMIT_UNDELIVERED_REASON)
+    expect(adapter).not_to have_received(:mark_billed)
+  end
+end
