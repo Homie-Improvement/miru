@@ -499,6 +499,33 @@ RSpec.describe Timekeeping::Gateway do
     expect(foreign.reload.discarded_at).to be_nil
   end
 
+  # The replay call's If-Match is never a version, so a live entry it reaches answers a version conflict.
+  it "sends the replay-only If-Match on a prepared destroy the lookup misses and answers a conflict as not found" do
+    gw_ownership.update_columns(monolith_store: "prepared", generation: 2)
+    local_owner = Timekeeping::FakeLocalOwner.new(outcome: Timekeeping::LocalOwner::Outcome.refusal(:version_conflict))
+
+    expect { gw_gateway(local_owner:).destroy(entry_id: 987_654, authorize: gw_allow_all) }
+      .to raise_error(ActiveRecord::RecordNotFound)
+    params = local_owner.calls.sole[:kwargs][:params]
+    expect(params["if_match"]).to eq(Timekeeping::EntryWriteClient::REPLAY_ONLY_IF_MATCH)
+    expect(params["entry_id"]).to eq(987_654)
+  end
+
+  it "keeps a live prepared entry that the lookup hides when a destroy falls through to the replay" do
+    gw_ownership.update_columns(monolith_store: "prepared", generation: 2)
+    # A user with no employment in the company: hydration drops the row, so the lookup misses a kept entry.
+    outsider = create(:user)
+    hidden = gw_local_entry(user_id: outsider.id)
+    before = timekeeping_row_counts
+
+    expect do
+      gw_prepared_gateway(request_id: "req-del-hidden", idempotency_key: "k-hidden")
+        .destroy(entry_id: hidden.id, authorize: gw_allow_all)
+    end.to raise_error(ActiveRecord::RecordNotFound)
+    expect(hidden.reload.discarded_at).to be_nil
+    expect(timekeeping_row_counts).to eq(before)
+  end
+
   it "passes an import's own idempotency key to the local owner" do
     gw_ownership.update_columns(monolith_store: "prepared", generation: 2)
     stored = gw_local_entry
