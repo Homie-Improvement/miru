@@ -13,24 +13,31 @@ module OmniauthFullHost
   # again without a constant-redefinition warning.
   class InvalidBaseUrl < StandardError; end
 
-  def self.resolve(app_base_url:, fallback:)
+  # `require_https` is on in production, which forces SSL: an http base URL there would send
+  # OAuth codes and emailed links over plain http to a scheme the app redirects away from.
+  def self.resolve(app_base_url:, fallback:, require_https: false)
     source, base_url = if app_base_url.present?
       ["APP_BASE_URL", app_base_url]
     else
       ["config.x.default_base_url", fallback]
     end
 
-    validate!(source, base_url.to_s.strip)
+    validate!(source, base_url.to_s.strip, require_https:)
   end
 
   def self.pin!(base_url)
     OmniAuth.config.full_host = base_url
   end
 
-  def self.validate!(source, base_url)
+  def self.validate!(source, base_url, require_https:)
     uri = URI.parse(base_url)
     unless %w[http https].include?(uri.scheme) && uri.host.present?
       raise InvalidBaseUrl, "#{source} must be an absolute http or https URL with a host, got #{base_url.inspect}"
+    end
+
+    # Names only the scheme, so a password embedded in the URL stays out of boot logs.
+    if require_https && uri.scheme != "https"
+      raise InvalidBaseUrl, "#{source} must use https in production, got scheme #{uri.scheme.inspect}"
     end
 
     # OmniAuth appends the callback path to full_host, so a trailing slash would double it.
@@ -42,5 +49,9 @@ module OmniauthFullHost
 end
 
 OmniauthFullHost.pin!(
-  OmniauthFullHost.resolve(app_base_url: ENV["APP_BASE_URL"], fallback: Rails.configuration.x.default_base_url)
+  OmniauthFullHost.resolve(
+    app_base_url: ENV["APP_BASE_URL"],
+    fallback: Rails.configuration.x.default_base_url,
+    require_https: Rails.env.production?
+  )
 )
