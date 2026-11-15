@@ -75,8 +75,6 @@ RSpec.describe MCP::Miru::ApiProxy do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe MCP::Miru::ApiProxy do
   before do
     allow_any_instance_of(Rack::MockRequest).to receive(:request) do
@@ -93,8 +91,6 @@ RSpec.describe MCP::Miru::ApiProxy do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe MCP::Miru::ApiProxy do
   it "refuses a caller-supplied headers keyword so no caller can replace the configured Host" do
     expect do
@@ -104,8 +100,6 @@ RSpec.describe MCP::Miru::ApiProxy do
     end.to raise_error(ArgumentError, /headers/)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe MCP::Miru::ApiProxy do
   let(:proxy_hosts_seen_by_override_check) { [] }

@@ -293,8 +293,6 @@ RSpec.describe "Api::V1::MCP#handle", type: :request do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Api::V1::MCP#handle", type: :request do
   let(:company) { create(:company, plan_tier: "paid") }
   let(:user) { create(:user, current_workspace_id: company.id) }
@@ -344,8 +342,6 @@ RSpec.describe "Api::V1::MCP#handle", type: :request do
     expect(internal_hosts).not_to include("www.example.com")
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "Api::V1::MCP#handle", type: :request do
   let(:company) { create(:company, plan_tier: "paid") }

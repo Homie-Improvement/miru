@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "rails_helper"
 
 RSpec.describe "MCP tool proxied Host" do
@@ -35,8 +37,6 @@ RSpec.describe "MCP tool proxied Host" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "MCP tool proxied Host" do
   let(:sent_requests) { [] }
 
@@ -66,12 +66,10 @@ RSpec.describe "MCP tool proxied Host" do
     MCP::Miru::Tools::WorkspaceWhoamiTool.call(server_context: { authorization: "Bearer token-a", host: "attacker.test" })
     MCP::Miru::Tools::WorkspaceWhoamiTool.call(server_context: { authorization: "token-b", host: "attacker.test" })
 
-    expect(sent_requests.map { |options| options["HTTP_AUTHORIZATION"] }).to eq(["Bearer token-a", "Bearer token-b"])
-    expect(sent_requests.map { |options| options["HTTP_HOST"] }).to eq(["configured-host.test", "configured-host.test"])
+    expect(sent_requests.pluck("HTTP_AUTHORIZATION")).to eq(["Bearer token-a", "Bearer token-b"])
+    expect(sent_requests.pluck("HTTP_HOST")).to eq(["configured-host.test", "configured-host.test"])
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "MCP tool proxied Host" do
   let(:sent_requests) { [] }
