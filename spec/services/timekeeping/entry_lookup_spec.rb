@@ -260,6 +260,19 @@ RSpec.describe Timekeeping::EntryLookup do
       expect(found.entry.locked).to be(true)
     end
 
+    # A released reservation leaves entries.locked stale; a lookup that trusted it would let the model's
+    # locked check skip a move that the local owner would apply.
+    it "reads a prepared entry whose stale stored locked column is true but has no reservation as unlocked" do
+      row = owner_lookup_local_entry(locked: true)
+
+      found = owner_lookup_find(ownership: owner_lookup_ownership, entry_id: row.id)
+
+      expect(found.entry.id).to eq(row.id)
+      expect(found.entry.locked).to be(false)
+      expect(found.version).to eq(row.version)
+    end
+
+    # A foreign id must answer exactly as a missing one does, so it never shows the entry exists elsewhere.
     it "raises RecordNotFound for another company's local entry" do
       row = owner_lookup_local_entry(company_id: create(:company).id)
 
@@ -342,63 +355,5 @@ RSpec.describe Timekeeping::EntryLookup, "replayed delete answers" do
 
     expect(entry).to be_a(TimesheetEntry)
     expect([entry.id, entry.company_id]).to eq([4242, replayed_company.id])
-  end
-end
-
-RSpec.describe Timekeeping::EntryLookup do
-  let(:prepared_tenant_company) { create(:company) }
-  let(:prepared_tenant_foreign_company) { create(:company) }
-  let(:prepared_tenant_admin) { timekeeping_member(prepared_tenant_company, "admin") }
-  let(:prepared_tenant_foreign_user) { timekeeping_member(prepared_tenant_foreign_company, "admin") }
-  let(:prepared_tenant_foreign_project) { create(:project, client: create(:client, company: prepared_tenant_foreign_company)) }
-  let(:prepared_tenant_unused_client) do
-    Class.new do
-      define_method(:show_entry) { |**| raise "the prepared branch must not call Timekeeping" }
-    end.new
-  end
-
-  it "prepared lookup raises RecordNotFound for another company's local entry and never answers its fields" do
-    ownership = prepare_local_ownership!
-    foreign_entry = Timekeeping::LocalEntry.create!(
-      company_id: prepared_tenant_foreign_company.id, user_id: prepared_tenant_foreign_user.id,
-      project_id: prepared_tenant_foreign_project.id, work_date: Date.current, duration: 30.0, note: "foreign",
-      bill_status: "unbilled"
-    )
-    context = Timekeeping::WriteContext.new(company: prepared_tenant_company, actor: prepared_tenant_admin,
-                                            actor_kind: "user", request_id: "req-prepared-tenant-lookup")
-
-    # A foreign id must answer exactly as a missing one does, so it never shows the entry exists elsewhere.
-    expect do
-      described_class.find(ownership:, context:, entry_id: foreign_entry.id, read_client: prepared_tenant_unused_client)
-    end.to raise_error(ActiveRecord::RecordNotFound)
-  end
-end
-
-RSpec.describe Timekeeping::EntryLookup do
-  let(:stale_lock_company) { create(:company) }
-  let(:stale_lock_admin) { create(:user, current_workspace_id: stale_lock_company.id) }
-  let(:stale_lock_project) { create(:project, billable: true, client: create(:client, company: stale_lock_company)) }
-
-  before do
-    create(:employment, company: stale_lock_company, user: stale_lock_admin)
-    stale_lock_admin.add_role :admin, stale_lock_company
-  end
-
-  # "With ownership in the prepared state, the gateway's entry writes go to Timekeeping::LocalOwner and make no HTTP call to Timekeeping"
-  # A released reservation leaves entries.locked stale; a lookup that trusted it would let the model's
-  # locked check skip a move that the local owner would apply.
-  it "reads a prepared entry whose stale stored locked column is true but has no reservation as unlocked" do
-    ownership = prepare_local_ownership!
-    row = Timekeeping::LocalEntry.create!(company_id: stale_lock_company.id, user_id: stale_lock_admin.id,
-                                          project_id: stale_lock_project.id, work_date: Date.current, duration: 30.0,
-                                          note: "n", bill_status: "unbilled", locked: true)
-    context = Timekeeping::WriteContext.new(company: stale_lock_company, actor: stale_lock_admin, actor_kind: "user",
-                                            request_id: "req-stale-lock")
-
-    found = described_class.find(ownership:, context:, entry_id: row.id, read_client: instance_double(Timekeeping::EntryApiClient))
-
-    expect(found.entry.id).to eq(row.id)
-    expect(found.entry.locked).to be(false)
-    expect(found.version).to eq(row.version)
   end
 end
