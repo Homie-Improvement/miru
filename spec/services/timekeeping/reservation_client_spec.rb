@@ -72,55 +72,6 @@ RSpec.describe Timekeeping::ReservationClient do
 end
 
 RSpec.describe Timekeeping::ReservationClient do
-  it "malformed, unauthorized or unknown service answers to prepare and mark_billed map to retryable and never to success" do
-    request = Invoices::ReservationRequest.new(
-      company_id: 41, invoice_id: 501, operation_id: SecureRandom.uuid,
-      generation: 3, disposition: "active", entries: [9001]
-    )
-    client_answering = lambda do |status, answer_body|
-      http = ->(_method, _path, headers:, body: nil) { TimekeepingContract::Response.new(status:, body: answer_body) }
-      described_class.new(http:, credential: ->(company_id:, operation:) { "test-credential-#{company_id}-#{operation}" })
-    end
-
-    # "Nothing outside this table maps to success."
-    # "A 401, 403 or 404, an unknown status, or a missing or unknown state maps to retryable."
-    prepare_answers = [
-      [200, { "operation_id" => request.operation_id, "state" => "reserved_everything" }],
-      [200, { "operation_id" => request.operation_id }],
-      [200, "not a json object"],
-      [401, { "reason" => "unauthorized" }],
-      [403, { "reason" => "forbidden" }],
-      [404, { "reason" => "not_found" }],
-      [418, { "state" => "prepared" }],
-      [503, { "state" => "prepared" }],
-      [409, { "reason" => "conflict", "conflicts" => [] }],
-      [409, { "reason" => "conflict", "conflicts" => [{ "reason" => "on_another_invoice" }] }]
-    ]
-    prepare_answers.each do |status, body|
-      outcome = client_answering.call(status, body).prepare(request)
-      expect(outcome.state).to eq("retryable"), "prepare answered #{status} #{body.inspect} gave #{outcome.state}"
-    end
-
-    # "A 200 mark_billed answer with an integer `billed` maps to `committed` with `counts: { billed: }`."
-    [{ "billed" => "3" }, {}, { "billed" => nil }].each do |body|
-      outcome = client_answering.call(200, body).mark_billed(request)
-      expect(outcome.state).to eq("retryable"), "mark_billed answered #{body.inspect} gave #{outcome.state}"
-    end
-
-    # The well-formed rows still map as the issue states, so the cases above are not retryable only by default.
-    # "A 409 `conflict` maps to refused, with `[{entry_id:, reason:}]`."
-    refused = client_answering.call(409, { "reason" => "conflict",
-                                           "conflicts" => [{ "entry_id" => 9001, "reason" => "on_another_invoice" }] })
-      .prepare(request)
-    expect(refused.state).to eq("refused")
-    expect(refused.conflicts).to eq([{ entry_id: 9001, reason: "on_another_invoice" }])
-    billed = client_answering.call(200, { "billed" => 1 }).mark_billed(request)
-    expect(billed.state).to eq("committed")
-    expect(billed.counts).to eq({ billed: 1 })
-  end
-end
-
-RSpec.describe Timekeeping::ReservationClient do
   it "a prepare whose service token cannot be minted answers retryable and sends no request, not even with the shared token" do
     fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
     fake.generation = 4
@@ -450,40 +401,6 @@ RSpec.describe Timekeeping::ReservationClient, "retryable 409 mapping" do
   end
 end
 
-RSpec.describe Timekeeping::ReservationClient, "answers outside the table" do
-  around do |example|
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) { example.run }
-  end
-
-  it "a 5xx, a transport error, a 404, an unknown status or an unknown state never maps to success" do
-    request = Invoices::ReservationRequest.new(
-      company_id: 7, invoice_id: 501, operation_id: SecureRandom.uuid, generation: 1,
-      disposition: "active", entries: [3]
-    )
-    answering = lambda do |status, answer_body|
-      ->(_method, _path, headers:, body: nil) { TimekeepingContract::Response.new(status:, body: answer_body) }
-    end
-
-    answers = [
-      answering.call(503, { "reason" => "unavailable" }),
-      answering.call(404, { "reason" => "not_found" }),
-      answering.call(401, { "reason" => "unauthorized" }),
-      answering.call(403, { "reason" => "forbidden" }),
-      answering.call(418, {}),
-      answering.call(200, { "operation_id" => request.operation_id }),
-      answering.call(200, { "operation_id" => request.operation_id, "state" => "reserved" }),
-      answering.call(200, "not a json object"),
-      ->(_method, _path, headers:, body: nil) { raise Timekeeping::ReservationHttp::Error, "prepare failed: Timeout::Error" }
-    ]
-
-    # "Nothing outside this table maps to success."
-    answers.each do |http|
-      outcome = described_class.new(http:).prepare(request)
-      expect(outcome.state).to eq("retryable")
-    end
-  end
-end
-
 RSpec.describe Timekeeping::ReservationClient, "mark_billed" do
   let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
   let(:client) { described_class.new(http: TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil)) }
@@ -497,7 +414,7 @@ RSpec.describe Timekeeping::ReservationClient, "mark_billed" do
     with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) { example.run }
   end
 
-  it "mark_billed with an integer billed answer is committed with the billed count, and a non-integer billed is retryable" do
+  it "mark_billed with an integer billed answer is committed with the billed count, and a 409 conflict is refused" do
     build = lambda do
       Invoices::ReservationRequest.new(
         company_id:, invoice_id: 501, operation_id: SecureRandom.uuid, generation: fake.generation,
@@ -514,9 +431,6 @@ RSpec.describe Timekeeping::ReservationClient, "mark_billed" do
     expect(billed.counts).to eq({ billed: 1 })
     expect(fake.requests.last[:path]).to eq("/v1/companies/#{company_id}/invoices/501/mark-billed")
     expect(fake.stored_entry(entry_id)["bill_status"]).to eq("billed")
-
-    string_count = ->(_method, _path, headers:, body: nil) { TimekeepingContract::Response.new(status: 200, body: { "billed" => "1" }) }
-    expect(described_class.new(http: string_count).mark_billed(build.call).state).to eq("retryable")
 
     # "A 409 `conflict` maps to refused, with `[{entry_id:, reason:}]`." holds for billing too.
     billing_conflict = lambda do |_method, _path, headers:, body: nil|
@@ -620,61 +534,105 @@ RSpec.describe Timekeeping::ReservationClient, "a commit for an unknown operatio
   end
 end
 
-RSpec.describe Timekeeping::ReservationClient, "malformed prepare answers" do
+# One table per route of every answer the service can give outside the
+# contract's mapping table, beside the well-formed answer that must still map.
+RSpec.describe Timekeeping::ReservationClient, "answers outside the mapping table" do
+  operation_id = "6f1d2c3b-4a5e-4f60-8b7a-9c0d1e2f3a4b"
+
+  # The default credential mints a real token, so the key must be loadable or
+  # every row would be retryable for the wrong reason.
   around do |example|
     with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) { example.run }
   end
 
-  # "A 401, 403 or 404, an unknown status, or a missing or unknown state maps to retryable."
-  # "Nothing outside this table maps to success."
-  it "a prepare answer outside the mapping table never maps to success" do
-    request = Invoices::ReservationRequest.new(
-      company_id: 41, invoice_id: 901, operation_id: SecureRandom.uuid,
-      generation: 1, disposition: "active", entries: [7]
-    )
-    answers = [
-      TimekeepingContract::Response.new(status: 200, body: { "operation_id" => request.operation_id, "entries" => [] }),
-      TimekeepingContract::Response.new(status: 200, body: { "operation_id" => request.operation_id, "state" => "done" }),
-      TimekeepingContract::Response.new(status: 200, body: nil),
-      TimekeepingContract::Response.new(status: 418, body: { "state" => "prepared" }),
-      TimekeepingContract::Response.new(status: 409, body: { "reason" => "conflict", "conflicts" => [] }),
-      TimekeepingContract::Response.new(status: 409, body: { "reason" => "conflict" })
-    ]
+  # answer is a [status, body] pair the service sends back, or an exception
+  # the transport raises in place of an answer.
+  def client_answering(answer)
+    http = Object.new
+    http.define_singleton_method(:call) do |_method, _path, headers: {}, body: nil|
+      raise answer if answer.is_a?(Exception)
 
-    states = answers.map do |answer|
-      http = Object.new
-      http.define_singleton_method(:call) { |_method, _path, headers: {}, body: nil| answer }
-      described_class.new(http:).prepare(request).state
+      TimekeepingContract::Response.new(status: answer[0], body: answer[1])
+    end
+    described_class.new(http:)
+  end
+
+  def table_request(operation_id)
+    Invoices::ReservationRequest.new(company_id: 41, invoice_id: 901, operation_id:,
+                                     generation: 1, disposition: "active", entries: [7])
+  end
+
+  # "Nothing outside this table maps to success."
+  # "A 401, 403 or 404, an unknown status, or a missing or unknown state maps to retryable."
+  # "A 5xx, a `ReservationHttp::Error` or an unparseable body maps to retryable."
+  describe "prepare" do
+    {
+      "a 200 with the unknown state reserved_everything" => [200, { "operation_id" => operation_id, "state" => "reserved_everything" }],
+      "a 200 with the unknown state reserved" => [200, { "operation_id" => operation_id, "state" => "reserved" }],
+      "a 200 with the unknown state done" => [200, { "operation_id" => operation_id, "state" => "done" }],
+      "a 200 with no state" => [200, { "operation_id" => operation_id }],
+      "a 200 with entries but no state" => [200, { "operation_id" => operation_id, "entries" => [] }],
+      "a 200 whose body is not a JSON object" => [200, "not a json object"],
+      "a 200 with no body" => [200, nil],
+      "a 401" => [401, { "reason" => "unauthorized" }],
+      "a 403" => [403, { "reason" => "forbidden" }],
+      "a 404" => [404, { "reason" => "not_found" }],
+      "an unknown status carrying a known state" => [418, { "state" => "prepared" }],
+      "an unknown status with an empty body" => [418, {}],
+      "a 503 carrying a known state" => [503, { "state" => "prepared" }],
+      "a 503" => [503, { "reason" => "unavailable" }],
+      "a 409 conflict with an empty conflicts list" => [409, { "reason" => "conflict", "conflicts" => [] }],
+      "a 409 conflict whose item has no entry_id" => [409, { "reason" => "conflict",
+                                                              "conflicts" => [{ "reason" => "on_another_invoice" }] }],
+      "a 409 conflict with no conflicts key" => [409, { "reason" => "conflict" }],
+      "a transport error" => Timekeeping::ReservationHttp::Error.new("prepare failed: Timeout::Error")
+    }.each do |answer_name, answer|
+      it "#{answer_name} is retryable, never a success" do
+        outcome = client_answering(answer).prepare(table_request(operation_id))
+
+        expect(outcome.state).to eq("retryable")
+        expect(outcome.reason).to be_nil
+        expect(outcome.conflicts).to eq([])
+      end
     end
 
-    expect(states).to all(eq("retryable"))
-  end
-end
+    # The well-formed row still maps as stated, so the rows above are not retryable only by default.
+    # "A 409 `conflict` maps to refused, with `[{entry_id:, reason:}]`."
+    it "a well-formed 409 conflict is refused with its conflicts" do
+      answer = [409, { "reason" => "conflict", "conflicts" => [{ "entry_id" => 7, "reason" => "on_another_invoice" }] }]
 
-RSpec.describe Timekeeping::ReservationClient, "malformed mark_billed answers" do
-  around do |example|
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) { example.run }
+      outcome = client_answering(answer).prepare(table_request(operation_id))
+
+      expect(outcome.state).to eq("refused")
+      expect(outcome.conflicts).to eq([{ entry_id: 7, reason: "on_another_invoice" }])
+    end
   end
 
   # "A 200 mark_billed answer with an integer `billed` maps to `committed` with `counts: { billed: }`."
   # "Nothing outside this table maps to success."
-  it "a mark_billed answer without an integer billed count is retryable, not committed" do
-    request = Invoices::ReservationRequest.new(
-      company_id: 42, invoice_id: 902, operation_id: SecureRandom.uuid,
-      generation: 1, disposition: "active", entries: [8]
-    )
-    answers = [
-      TimekeepingContract::Response.new(status: 200, body: { "billed" => "3" }),
-      TimekeepingContract::Response.new(status: 200, body: {}),
-      TimekeepingContract::Response.new(status: 503, body: { "billed" => 3 })
-    ]
+  describe "mark_billed" do
+    {
+      "a 200 with the string billed count 3" => [200, { "billed" => "3" }],
+      "a 200 with the string billed count 1" => [200, { "billed" => "1" }],
+      "a 200 with no billed count" => [200, {}],
+      "a 200 with a null billed count" => [200, { "billed" => nil }],
+      "a 503 with an integer billed count" => [503, { "billed" => 3 }]
+    }.each do |answer_name, answer|
+      it "#{answer_name} is retryable, not committed" do
+        outcome = client_answering(answer).mark_billed(table_request(operation_id))
 
-    states = answers.map do |answer|
-      http = Object.new
-      http.define_singleton_method(:call) { |_method, _path, headers: {}, body: nil| answer }
-      described_class.new(http:).mark_billed(request).state
+        expect(outcome.state).to eq("retryable")
+        expect(outcome.reason).to be_nil
+        expect(outcome.counts).to eq({})
+      end
     end
 
-    expect(states).to all(eq("retryable"))
+    # The well-formed row still maps as stated, so the rows above are not retryable only by default.
+    it "a 200 with an integer billed count is committed with that count" do
+      outcome = client_answering([200, { "billed" => 1 }]).mark_billed(table_request(operation_id))
+
+      expect(outcome.state).to eq("committed")
+      expect(outcome.counts).to eq({ billed: 1 })
+    end
   end
 end
