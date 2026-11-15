@@ -69,6 +69,34 @@ RSpec.describe QuickBooks::Configuration do
 
       expect(described_class.redirect_uri).to eq("https://quickbooks.example/callback")
     end
+
+    it "treats a whitespace APP_BASE_URL as unset when building the redirect uri" do
+      ENV["APP_BASE_URL"] = "   "
+
+      expect(described_class.redirect_uri).to eq("https://boot-check.test/api/v1/integrations/quickbooks/callback")
+    end
+
+    it "builds the callback from config.x.default_base_url outside local environments when APP_BASE_URL is whitespace" do
+      ENV["APP_BASE_URL"] = "  "
+      Rails.configuration.x.default_base_url = "https://boot-check.test/"
+      allow(Rails.env).to receive(:development?).and_return(false)
+      allow(Rails.env).to receive(:test?).and_return(false)
+
+      expect(described_class.redirect_uri).to eq("https://boot-check.test/api/v1/integrations/quickbooks/callback")
+    end
+
+    it "builds the redirect uri from a set APP_BASE_URL ahead of config.x.default_base_url and strips every trailing slash" do
+      ENV["APP_BASE_URL"] = "https://app.miru.so//"
+
+      expect(described_class.redirect_uri).to eq("https://app.miru.so/api/v1/integrations/quickbooks/callback")
+    end
+
+    # A malformed APP_BASE_URL raises rather than sending users to a relative OAuth callback.
+    it "redirect_uri refuses a schemeless APP_BASE_URL instead of building a relative OAuth callback" do
+      ENV["APP_BASE_URL"] = "evil.example"
+
+      expect { described_class.redirect_uri }.to raise_error(AppBaseUrl::InvalidBaseUrl)
+    end
   end
 
   describe ".configured?" do
@@ -96,115 +124,5 @@ RSpec.describe QuickBooks::Configuration do
         timeout: 15
       )
     end
-  end
-end
-
-RSpec.describe QuickBooks::Configuration do
-  # The QuickBooks OAuth redirect must come from the one validated base URL, so a
-  # malformed APP_BASE_URL raises rather than sending users to a relative callback.
-  it "redirect_uri refuses a schemeless APP_BASE_URL instead of building a relative OAuth callback" do
-    original_env = %w[APP_BASE_URL INTUIT_REDIRECT_URI QUICKBOOKS_REDIRECT_URI].index_with { |key| ENV[key] }
-    ENV.delete("INTUIT_REDIRECT_URI")
-    ENV.delete("QUICKBOOKS_REDIRECT_URI")
-    ENV["APP_BASE_URL"] = "evil.example"
-
-    expect { described_class.redirect_uri }.to raise_error(AppBaseUrl::InvalidBaseUrl)
-  ensure
-    original_env.each { |key, value| value.nil? ? ENV.delete(key) : ENV[key] = value }
-  end
-end
-
-RSpec.describe QuickBooks::Configuration do
-  # "app/services/quick_books/configuration.rb, app/mcp/api_proxy.rb and the mailers no longer carry their own
-  # APP_BASE_URL fallback literals; each reads the one per-environment base URL (APP_BASE_URL, else config.x.default_base_url)."
-  it "builds the redirect uri from the swapped config.x.default_base_url in and outside local Rails environments when APP_BASE_URL is unset" do
-    saved_env = %w[APP_BASE_URL INTUIT_REDIRECT_URI QUICKBOOKS_REDIRECT_URI].index_with { |key| ENV[key] }
-    original_default_base_url = Rails.configuration.x.default_base_url
-    saved_env.each_key { |key| ENV.delete(key) }
-    Rails.configuration.x.default_base_url = "https://boot-check.test"
-
-    expect(described_class.redirect_uri).to eq("https://boot-check.test/api/v1/integrations/quickbooks/callback")
-
-    allow(Rails.env).to receive(:development?).and_return(false)
-    allow(Rails.env).to receive(:test?).and_return(false)
-    expect(described_class.redirect_uri).to eq("https://boot-check.test/api/v1/integrations/quickbooks/callback")
-  ensure
-    saved_env.each { |key, value| value.nil? ? ENV.delete(key) : ENV[key] = value }
-    Rails.configuration.x.default_base_url = original_default_base_url
-  end
-end
-
-RSpec.describe QuickBooks::Configuration do
-  # Disclosed behaviour change: with APP_BASE_URL unset, production now builds a redirect uri from
-  # config.x.default_base_url, so the integration counts as configured; that uri must match the one registered with Intuit.
-  it "is configured outside local Rails environments from client credentials and the per-environment base URL alone" do
-    saved_env = %w[APP_BASE_URL INTUIT_REDIRECT_URI QUICKBOOKS_REDIRECT_URI].index_with { |key| ENV[key] }
-    original_default_base_url = Rails.configuration.x.default_base_url
-    saved_env.each_key { |key| ENV.delete(key) }
-    Rails.configuration.x.default_base_url = "https://boot-check.test"
-    allow(Rails.env).to receive(:development?).and_return(false)
-    allow(Rails.env).to receive(:test?).and_return(false)
-    allow(described_class).to receive(:client_id).and_return("client-id")
-    allow(described_class).to receive(:client_secret).and_return("client-secret")
-
-    expect(described_class.configured?).to be(true)
-  ensure
-    saved_env.each { |key, value| value.nil? ? ENV.delete(key) : ENV[key] = value }
-    Rails.configuration.x.default_base_url = original_default_base_url
-  end
-end
-
-RSpec.describe QuickBooks::Configuration do
-  it "treats a whitespace APP_BASE_URL as unset when building the redirect uri" do
-    saved_env = %w[APP_BASE_URL INTUIT_REDIRECT_URI QUICKBOOKS_REDIRECT_URI].index_with { |key| ENV[key] }
-    original_default_base_url = Rails.configuration.x.default_base_url
-    ENV.delete("INTUIT_REDIRECT_URI")
-    ENV.delete("QUICKBOOKS_REDIRECT_URI")
-    ENV["APP_BASE_URL"] = "   "
-    Rails.configuration.x.default_base_url = "https://boot-check.test"
-
-    expect(described_class.redirect_uri).to eq("https://boot-check.test/api/v1/integrations/quickbooks/callback")
-  ensure
-    saved_env.each { |key, value| value.nil? ? ENV.delete(key) : ENV[key] = value }
-    Rails.configuration.x.default_base_url = original_default_base_url
-  end
-end
-
-RSpec.describe QuickBooks::Configuration do
-  # "each reads the one per-environment base URL (APP_BASE_URL, else config.x.default_base_url)."
-  it "builds the redirect uri from a set APP_BASE_URL ahead of config.x.default_base_url and strips every trailing slash" do
-    saved_env = %w[APP_BASE_URL INTUIT_REDIRECT_URI QUICKBOOKS_REDIRECT_URI].index_with { |key| ENV[key] }
-    original_default = Rails.configuration.x.default_base_url
-    ENV.delete("INTUIT_REDIRECT_URI")
-    ENV.delete("QUICKBOOKS_REDIRECT_URI")
-    ENV["APP_BASE_URL"] = "https://app.miru.so//"
-    Rails.configuration.x.default_base_url = "https://boot-check.test"
-
-    expect(described_class.redirect_uri).to eq("https://app.miru.so/api/v1/integrations/quickbooks/callback")
-  ensure
-    Rails.configuration.x.default_base_url = original_default
-    saved_env.each { |key, value| value.nil? ? ENV.delete(key) : ENV[key] = value }
-  end
-end
-
-RSpec.describe QuickBooks::Configuration do
-  # Acceptance: "app/services/quick_books/configuration.rb ... no longer carry their own APP_BASE_URL
-  # fallback literals; each reads the one per-environment base URL (APP_BASE_URL, else
-  # config.x.default_base_url)." Disclosed behaviour change: outside development and test this
-  # now yields a redirect URI where it used to yield nil.
-  it "builds the callback from config.x.default_base_url outside local environments when APP_BASE_URL is whitespace" do
-    saved_env = %w[APP_BASE_URL INTUIT_REDIRECT_URI QUICKBOOKS_REDIRECT_URI].index_with { |key| ENV[key] }
-    original_default_base_url = Rails.configuration.x.default_base_url
-    ENV["APP_BASE_URL"] = "  "
-    ENV.delete("INTUIT_REDIRECT_URI")
-    ENV.delete("QUICKBOOKS_REDIRECT_URI")
-    Rails.configuration.x.default_base_url = "https://boot-check.test/"
-    allow(Rails.env).to receive(:development?).and_return(false)
-    allow(Rails.env).to receive(:test?).and_return(false)
-
-    expect(described_class.redirect_uri).to eq("https://boot-check.test/api/v1/integrations/quickbooks/callback")
-  ensure
-    saved_env.each { |key, value| value.nil? ? ENV.delete(key) : ENV[key] = value }
-    Rails.configuration.x.default_base_url = original_default_base_url
   end
 end
