@@ -9,14 +9,7 @@ RSpec.describe "MCP tool proxied Host" do
   let(:proxied_response_status) { 201 }
 
   around do |example|
-    original_app_base_url = ENV["APP_BASE_URL"]
-    original_default_base_url = Rails.configuration.x.default_base_url
-    ENV.delete("APP_BASE_URL")
-    Rails.configuration.x.default_base_url = "https://configured-host.test"
-    example.run
-  ensure
-    original_app_base_url.nil? ? ENV.delete("APP_BASE_URL") : ENV["APP_BASE_URL"] = original_app_base_url
-    Rails.configuration.x.default_base_url = original_default_base_url
+    with_app_base_url(env: nil, default: "https://configured-host.test") { example.run }
   end
 
   before do
