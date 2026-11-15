@@ -61,40 +61,30 @@ end
 RSpec.describe ClientPaymentMailer, "base URL", type: :mailer do
   # "each reads the one per-environment base URL (APP_BASE_URL, else config.x.default_base_url)."
   it "links the client payment receipt to the swapped config.x.default_base_url when APP_BASE_URL is unset" do
-    original_default = Rails.configuration.x.default_base_url
-    original_env = ENV["APP_BASE_URL"]
-    ENV.delete("APP_BASE_URL")
-    Rails.configuration.x.default_base_url = "https://boot-check.test"
-    company = create(:company)
-    client = create(:client, company:)
-    invoice = create(:invoice, client:, company:)
+    with_app_base_url(env: nil, default: "https://boot-check.test") do
+      company = create(:company)
+      client = create(:client, company:)
+      invoice = create(:invoice, client:, company:)
 
-    mail = ClientPaymentMailer.with(invoice_id: invoice.id, subject: "Paid").payment
-    body = mail.html_part&.body&.decoded || mail.body.decoded
+      mail = ClientPaymentMailer.with(invoice_id: invoice.id, subject: "Paid").payment
+      body = mail.html_part&.body&.decoded || mail.body.decoded
 
-    expect(body).to include("https://boot-check.test/invoices/#{invoice.external_view_key}/view")
-  ensure
-    Rails.configuration.x.default_base_url = original_default
-    original_env.nil? ? ENV.delete("APP_BASE_URL") : ENV["APP_BASE_URL"] = original_env
+      expect(body).to include("https://boot-check.test/invoices/#{invoice.external_view_key}/view")
+    end
   end
 
   # "each reads the one per-environment base URL (APP_BASE_URL, else config.x.default_base_url)."
   it "links the client payment receipt to a set APP_BASE_URL ahead of config.x.default_base_url" do
-    original_default = Rails.configuration.x.default_base_url
-    original_env = ENV["APP_BASE_URL"]
-    ENV["APP_BASE_URL"] = "https://app.miru.so/"
-    Rails.configuration.x.default_base_url = "https://boot-check.test"
-    company = create(:company)
-    client = create(:client, company:)
-    invoice = create(:invoice, client:, company:)
+    with_app_base_url(env: "https://app.miru.so/", default: "https://boot-check.test") do
+      company = create(:company)
+      client = create(:client, company:)
+      invoice = create(:invoice, client:, company:)
 
-    mail = ClientPaymentMailer.with(invoice_id: invoice.id, subject: "Paid").payment
-    body = mail.html_part&.body&.decoded || mail.body.decoded
+      mail = ClientPaymentMailer.with(invoice_id: invoice.id, subject: "Paid").payment
+      body = mail.html_part&.body&.decoded || mail.body.decoded
 
-    expect(body).to include("https://app.miru.so/invoices/#{invoice.external_view_key}/view")
-    expect(body).not_to include("boot-check.test")
-  ensure
-    Rails.configuration.x.default_base_url = original_default
-    original_env.nil? ? ENV.delete("APP_BASE_URL") : ENV["APP_BASE_URL"] = original_env
+      expect(body).to include("https://app.miru.so/invoices/#{invoice.external_view_key}/view")
+      expect(body).not_to include("boot-check.test")
+    end
   end
 end

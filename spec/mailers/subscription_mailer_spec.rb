@@ -164,61 +164,46 @@ end
 RSpec.describe SubscriptionMailer, "base URL", type: :mailer do
   # "each reads the one per-environment base URL (APP_BASE_URL, else config.x.default_base_url)."
   it "links the trial expired email to the swapped config.x.default_base_url billing page when APP_BASE_URL is unset" do
-    original_default = Rails.configuration.x.default_base_url
-    original_env = ENV["APP_BASE_URL"]
-    ENV.delete("APP_BASE_URL")
-    Rails.configuration.x.default_base_url = "https://boot-check.test"
-    company = create(:company, name: "Saeloun Inc")
-    user = create(:user, email: "base-url-check@saeloun.com")
+    with_app_base_url(env: nil, default: "https://boot-check.test") do
+      company = create(:company, name: "Saeloun Inc")
+      user = create(:user, email: "base-url-check@saeloun.com")
 
-    mail = described_class.with(company_id: company.id, recipient_id: user.id).trial_expired
+      mail = described_class.with(company_id: company.id, recipient_id: user.id).trial_expired
 
-    expect(mail.html_part.body.decoded).to include("https://boot-check.test/settings/billing")
-    expect(mail.text_part.body.decoded).to include("https://boot-check.test/settings/billing")
-  ensure
-    Rails.configuration.x.default_base_url = original_default
-    original_env.nil? ? ENV.delete("APP_BASE_URL") : ENV["APP_BASE_URL"] = original_env
+      expect(mail.html_part.body.decoded).to include("https://boot-check.test/settings/billing")
+      expect(mail.text_part.body.decoded).to include("https://boot-check.test/settings/billing")
+    end
   end
 
   it "links the trial getting started email to the swapped config.x.default_base_url when APP_BASE_URL is unset" do
-    original_default = Rails.configuration.x.default_base_url
-    original_env = ENV["APP_BASE_URL"]
-    ENV.delete("APP_BASE_URL")
-    Rails.configuration.x.default_base_url = "https://boot-check.test"
-    company = create(:company, name: "Saeloun Inc")
-    user = create(:user, email: "app-link-check@saeloun.com")
+    with_app_base_url(env: nil, default: "https://boot-check.test") do
+      company = create(:company, name: "Saeloun Inc")
+      user = create(:user, email: "app-link-check@saeloun.com")
 
-    mail = described_class.with(company_id: company.id, recipient_id: user.id).trial_getting_started
+      mail = described_class.with(company_id: company.id, recipient_id: user.id).trial_getting_started
 
-    expect(mail.html_part.body.decoded).to include('href="https://boot-check.test"')
-    expect(mail.text_part.body.decoded).to include("https://boot-check.test")
-  ensure
-    Rails.configuration.x.default_base_url = original_default
-    original_env.nil? ? ENV.delete("APP_BASE_URL") : ENV["APP_BASE_URL"] = original_env
+      expect(mail.html_part.body.decoded).to include('href="https://boot-check.test"')
+      expect(mail.text_part.body.decoded).to include("https://boot-check.test")
+    end
   end
 
   # Subscriptions::StripeSyncService passes no billing_url, so the purchase alert's link must
   # come from the shared base URL rather than a relative path.
   it "links the plan purchased email to the swapped config.x.default_base_url billing page when no billing_url is given" do
-    original_default = Rails.configuration.x.default_base_url
-    original_env = ENV["APP_BASE_URL"]
-    ENV.delete("APP_BASE_URL")
-    Rails.configuration.x.default_base_url = "https://boot-check.test"
-    company = create(:company, name: "Saeloun Inc")
+    with_app_base_url(env: nil, default: "https://boot-check.test") do
+      company = create(:company, name: "Saeloun Inc")
 
-    mail = described_class.with(
-      company_id: company.id,
-      alert_email: "vipul@saeloun.com",
-      plan_label: "Paid",
-      stripe_subscription_id: "sub_123",
-      subscription_interval: "month",
-      seat_quantity: 12
-    ).plan_purchased
+      mail = described_class.with(
+        company_id: company.id,
+        alert_email: "vipul@saeloun.com",
+        plan_label: "Paid",
+        stripe_subscription_id: "sub_123",
+        subscription_interval: "month",
+        seat_quantity: 12
+      ).plan_purchased
 
-    expect(mail.html_part.body.decoded).to include("https://boot-check.test/settings/billing")
-    expect(mail.text_part.body.decoded).to include("https://boot-check.test/settings/billing")
-  ensure
-    Rails.configuration.x.default_base_url = original_default
-    original_env.nil? ? ENV.delete("APP_BASE_URL") : ENV["APP_BASE_URL"] = original_env
+      expect(mail.html_part.body.decoded).to include("https://boot-check.test/settings/billing")
+      expect(mail.text_part.body.decoded).to include("https://boot-check.test/settings/billing")
+    end
   end
 end
