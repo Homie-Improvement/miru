@@ -506,6 +506,35 @@ RSpec.describe Timekeeping::ReservationClient, "an abort request that fails afte
   end
 end
 
+RSpec.describe Timekeeping::ReservationClient, "an abort whose final replay is refused" do
+  # "A replay refused with 409 conflict stores nothing in the service, so a delayed copy could still reserve later."
+  # The first replay and the abort both succeed here, so only the final replay's refusal keeps the abort retryable.
+  it "an abort whose first replay is prepared and whose final replay gets a 409 conflict is retryable with reason conflict" do
+    answers = {
+      "/reservations/prepare" => [
+        [200, { "operation_id" => "op", "state" => "prepared" }],
+        [409, { "reason" => "conflict", "conflicts" => [{ "entry_id" => 7, "reason" => "on_another_invoice" }] }]
+      ],
+      "/reservations/abort" => [[200, {}]]
+    }
+    sent = []
+    http = lambda do |_method, path, headers:, body: nil|
+      route = answers.keys.find { |suffix| path.end_with?(suffix) }
+      sent << route
+      status, answer_body = answers.fetch(route).shift
+      TimekeepingContract::Response.new(status:, body: answer_body)
+    end
+    request = Invoices::ReservationRequest.new(company_id: 41, invoice_id: 902, operation_id: SecureRandom.uuid,
+                                               generation: 1, disposition: "active", entries: [7])
+
+    outcome = described_class.new(http:, credential: ->(company_id:, operation:) { "unused" }).abort(request)
+
+    expect(sent).to eq(%w[/reservations/prepare /reservations/abort /reservations/prepare])
+    expect(outcome.state).to eq("retryable")
+    expect(outcome.reason).to eq("conflict")
+  end
+end
+
 RSpec.describe Timekeeping::ReservationClient, "a commit for an unknown operation" do
   around do |example|
     with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) { example.run }
