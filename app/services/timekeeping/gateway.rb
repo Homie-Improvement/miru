@@ -33,43 +33,11 @@ module Timekeeping
       end
     end
 
-    # The local-owner dependency until the prepared monolith's entry writer
-    # exists. The prepared store must never be written by anything else, so
-    # every call refuses as a retryable ownership move rather than writing.
-    class UnavailableLocalOwner
-      def find_entry(**)
-        raise OwnershipMoving
-      end
-
-      def create_entry(**)
-        raise OwnershipMoving
-      end
-
-      def update_entry(**)
-        raise OwnershipMoving
-      end
-
-      def destroy_entry(**)
-        raise OwnershipMoving
-      end
-
-      def detach_agent_entries(**)
-        raise OwnershipMoving
-      end
-
-      def bulk_move(**)
-        raise OwnershipMoving
-      end
-
-      def bulk_delete(**)
-        raise OwnershipMoving
-      end
-    end
-
     # What a bulk move or delete did. entries are the requested entries found
     # inside the scope, in request order. refusal is what the caller's check
     # answered; when it is set nothing was written. written is true once at
-    # least one entry was written (legacy) or reported changed (Timekeeping).
+    # least one entry was written (legacy) or reported changed (the local
+    # owner or Timekeeping).
     BulkResult = Data.define(:entries, :refusal, :written)
 
     # Casts requested ids the way the legacy where(id:) query did, so an id
@@ -104,8 +72,10 @@ module Timekeeping
 
     attr_reader :context, :local_owner, :write_client, :read_client, :service_client, :ownership_reader
 
+    # local_owner takes Timekeeping::LocalOwner.call's keywords and answers its
+    # Outcome; it writes the prepared monolith's store.
     # :reek:LongParameterList
-    def initialize(context:, local_owner: UnavailableLocalOwner.new, write_client: EntryWriteClient.new,
+    def initialize(context:, local_owner: LocalOwner, write_client: EntryWriteClient.new,
                    read_client: EntryApiClient.new, service_client: ServiceCommandClient.new,
                    ownership_reader: LockedOwnership)
       @context = context
@@ -153,7 +123,9 @@ module Timekeeping
         when :legacy
           agent.timesheet_entries.update_all(agent_id: nil)
         when :prepared
-          local_owner.detach_agent_entries(context:, agent:)
+          # The local owner detaches only for a background service actor,
+          # which this context does not carry, so the prepared store refuses.
+          raise OwnershipMoving
         when :timekeeping
           service_client.detach_agent_entries(
             company_id: agent.company_id, agent_id: agent.id, generation: ownership.generation,
@@ -176,11 +148,11 @@ module Timekeeping
             entry.save!
           end
         when :prepared
-          local_owner.create_entry(context:, user:, project:, attributes:)
+          row = local_write(ownership:, operation: :create, body: create_body(user:, project:, attributes:),
+                            idempotency_key: request_key(:create))
+          hydrate(row, user_id: user.id)
         when :timekeeping
-          body = EntryWriteClient.create_body(user:, project:, attributes: checked_create_attributes(user:, project:,
-                                                                                                    attributes:),
-                                              actor_kind: context.actor_kind)
+          body = create_body(user:, project:, attributes:)
           hydrate(write_client.create_entry(context:, generation: ownership.generation, body:), user_id: user.id)
         end
       end
@@ -201,7 +173,9 @@ module Timekeeping
         when :legacy
           import_legacy(user:, project:, final:)
         when :prepared
-          local_owner.create_entry(context:, user:, project:, attributes: final)
+          row = local_write(ownership:, operation: :create, body: import_body(user:, project:, final:),
+                            idempotency_key: context.idempotency_key || idempotency_key)
+          hydrate(row, user_id: user.id)
         when :timekeeping
           import_forwarded(ownership:, user:, project:, final:, idempotency_key:)
         end
@@ -221,7 +195,10 @@ module Timekeeping
           entry.update!(attributes)
           entry
         when :prepared
-          local_owner.update_entry(context:, entry:, project:, attributes:)
+          row = local_write(ownership:, operation: :update, entry_id: entry.id, if_match: context.if_match || found.version,
+                            body: update_body(entry, project:, attributes:),
+                            idempotency_key: request_key(:update, entry.id))
+          hydrate(row, user_id: entry.user_id)
         when :timekeeping
           body = normalized_update_attributes(entry, attributes).merge("project_id" => project.id)
           row = write_client.update_entry(context:, generation: ownership.generation, entry_id: entry.id,
@@ -245,11 +222,12 @@ module Timekeeping
     def destroy(entry_id:, authorize:, expected_generation: nil, scope: :company)
       perform(expected_generation) do |ownership, owner|
         found = begin
-          EntryLookup.find_in_owner(ownership:, context:, entry_id:, local_owner:, read_client:)
+          EntryLookup.find_in_owner(ownership:, context:, entry_id:, read_client:)
         rescue ActiveRecord::RecordNotFound
-          raise unless owner == :timekeeping
+          next replay_timekeeping_destroy(ownership:, entry_id:, authorize:, scope:) if owner == :timekeeping
+          next replay_local_destroy(ownership:, entry_id:, authorize:, scope:) if owner == :prepared
 
-          next replay_timekeeping_destroy(ownership:, entry_id:, authorize:, scope:)
+          raise
         end
         entry = found.entry
         EntryLookup.check_target(entry, context:, entry_id:, scope:)
@@ -258,7 +236,8 @@ module Timekeeping
         when :legacy
           entry.discard!
         when :prepared
-          local_owner.destroy_entry(context:, entry:)
+          local_write(ownership:, operation: :destroy, entry_id: entry.id, if_match: context.if_match || found.version,
+                      body: {}, idempotency_key: request_key(:destroy, entry.id))
         when :timekeeping
           write_client.destroy_entry(context:, generation: ownership.generation, entry_id: entry.id,
                                      version: found.version)
@@ -282,7 +261,7 @@ module Timekeeping
         when :legacy
           write_each_admitted(entries, owner:, expected_generation:) { |entry| entry.update(project_id: project.id) }
         when :prepared
-          local_owner.bulk_move(context:, entries:, project:)
+          local_bulk_move(ownership:, entries:, project:)
         when :timekeeping
           forward_bulk_move(ownership:, entries:, project:)
         end
@@ -298,7 +277,7 @@ module Timekeeping
         when :legacy
           write_each_admitted(entries, owner:, expected_generation:, &:discard)
         when :prepared
-          local_owner.bulk_delete(context:, entries:)
+          local_bulk_delete(ownership:, entries:)
         when :timekeeping
           forward_bulk_delete(ownership:, entries:)
         end
@@ -325,7 +304,7 @@ module Timekeeping
       # unreachable, still fails the request.
       def bulk_entries(ownership:, entry_ids:, scope:)
         self.class.requested_entry_ids(entry_ids).filter_map do |entry_id|
-          EntryLookup.find(ownership:, context:, entry_id:, local_owner:, read_client:, scope:).entry
+          EntryLookup.find(ownership:, context:, entry_id:, read_client:, scope:).entry
         rescue ActiveRecord::RecordNotFound
           nil
         end
@@ -358,10 +337,8 @@ module Timekeeping
       # call is sent even when every entry is skipped, so Timekeeping still
       # refuses a stale generation instead of the request answering 200.
       def forward_bulk_move(ownership:, entries:, project:)
-        entries.each { |entry| entry.project = project }
-        movable_ids = entries.filter_map { |entry| entry.id if entry.valid?(:update) }
-        answer = write_client.bulk_move(context:, generation: ownership.generation, entry_ids: movable_ids,
-                                        project_id: project.id)
+        answer = write_client.bulk_move(context:, generation: ownership.generation,
+                                        entry_ids: movable_entry_ids(entries, project), project_id: project.id)
         reported?(answer, MOVED_RESULT)
       end
 
@@ -370,6 +347,84 @@ module Timekeeping
 
         answer = write_client.bulk_delete(context:, generation: ownership.generation, entry_ids: entries.map(&:id))
         reported?(answer, DELETED_RESULT)
+      end
+
+      # Skips the same entries as forward_bulk_move. With nothing to write no
+      # call is made: the gateway has already fenced the generation, and the
+      # local owner would store a receipt for an empty write.
+      def local_bulk_move(ownership:, entries:, project:)
+        ids = movable_entry_ids(entries, project).sort
+        return false if ids.empty?
+
+        answer = local_write(ownership:, operation: :bulk_move, body: { "entry_ids" => ids, "project_id" => project.id },
+                             idempotency_key: bulk_request_key(:bulk_move, ids))
+        reported?(answer, MOVED_RESULT)
+      end
+
+      def local_bulk_delete(ownership:, entries:)
+        ids = entries.map(&:id).sort
+        return false if ids.empty?
+
+        answer = local_write(ownership:, operation: :bulk_delete, body: { "entry_ids" => ids },
+                             idempotency_key: bulk_request_key(:bulk_delete, ids))
+        reported?(answer, DELETED_RESULT)
+      end
+
+      # The ids of the entries the legacy save would not skip.
+      def movable_entry_ids(entries, project)
+        entries.each { |entry| entry.project = project }
+        entries.filter_map { |entry| entry.id if entry.valid?(:update) }
+      end
+
+      # One write to the prepared store's local owner, in the gateway's
+      # transaction at the generation perform read. The body goes through JSON
+      # so the owner receives and fingerprints the same values a forwarded
+      # write sends over the wire. A refusal raises the error a Timekeeping
+      # refusal raises, so callers and controllers handle both alike.
+      def local_write(ownership:, operation:, body:, idempotency_key:, entry_id: nil, if_match: nil)
+        outcome = local_owner.call(
+          operation:, company_id: context.company.id, generation: ownership.generation, actor: local_actor,
+          params: { "idempotency_key" => idempotency_key, "if_match" => if_match, "entry_id" => entry_id,
+                    "body" => JSON.parse(JSON.generate(body)) }
+        )
+        return outcome.body if (200..299).cover?(outcome.status)
+
+        reason = outcome.body["reason"] if outcome.body.is_a?(Hash)
+        raise EntryWriteClient.refusal_error(operation:, status: outcome.status, reason:)
+      end
+
+      # The signed-in user the context names, never a request value. The role
+      # grants nothing: the local owner decides access from its own facts.
+      def local_actor
+        LocalOwner::Actor.user(user_id: context.actor.id, role: context.actor.primary_role(context.company))
+      end
+
+      # The request's own Idempotency-Key, or the key a forwarded write derives
+      # from the request id when the request sent none.
+      def request_key(operation, entry_id = nil)
+        context.idempotency_key ||
+          EntryWriteClient.idempotency_key(request_id: context.request_id, operation: operation.to_s, entry_id:)
+      end
+
+      def bulk_request_key(operation, entry_ids)
+        context.idempotency_key ||
+          EntryWriteClient.bulk_idempotency_key(request_id: context.request_id, operation: operation.to_s, entry_ids:)
+      end
+
+      # The create body a forwarded and a local create both send. Only the
+      # fields the writer may forward reach the draft, so a stray key such as
+      # an actor or company_id is dropped instead of set on the draft.
+      def create_body(user:, project:, attributes:)
+        fields = EntryWriteClient.forwarded_fields(attributes, actor_kind: context.actor_kind, operation: :create)
+        EntryWriteClient.create_body(user:, project:, attributes: checked_create_attributes(user:, project:,
+                                                                                           attributes: fields),
+                                     actor_kind: context.actor_kind)
+      end
+
+      # The update fields a forwarded update sends, as the local owner takes them.
+      def update_body(entry, project:, attributes:)
+        EntryWriteClient.forwarded_fields(normalized_update_attributes(entry, attributes).merge("project_id" => project.id),
+                                          actor_kind: context.actor_kind, operation: :update)
       end
 
       def reported?(answer, result)
@@ -390,14 +445,18 @@ module Timekeeping
         end
       end
 
+      def import_forwarded(ownership:, user:, project:, final:, idempotency_key:)
+        row = write_client.create_entry(context:, generation: ownership.generation,
+                                        body: import_body(user:, project:, final:), idempotency_key:)
+        hydrate(row, user_id: user.id)
+      end
+
       # The draft is validated with the status the legacy store would create
       # it with, and the one create sent carries the row's final status.
-      def import_forwarded(ownership:, user:, project:, final:, idempotency_key:)
+      def import_body(user:, project:, final:)
         checked = checked_create_attributes(user:, project:, attributes: create_time_attributes(final))
         checked = checked.merge("bill_status" => "billed") if billed?(final)
-        body = EntryWriteClient.import_create_body(user:, project:, attributes: checked, source: final)
-        row = write_client.create_entry(context:, generation: ownership.generation, body:, idempotency_key:)
-        hydrate(row, user_id: user.id)
+        EntryWriteClient.import_create_body(user:, project:, attributes: checked, source: final)
       end
 
       def billed?(attributes)
@@ -478,7 +537,7 @@ module Timekeeping
       end
 
       def find_authorized(ownership:, entry_id:, authorize:, scope:)
-        EntryLookup.find(ownership:, context:, entry_id:, local_owner:, read_client:, scope:).tap do |found|
+        EntryLookup.find(ownership:, context:, entry_id:, read_client:, scope:).tap do |found|
           authorize.call(found.entry)
         end
       end
@@ -493,6 +552,22 @@ module Timekeeping
       def replay_timekeeping_destroy(ownership:, entry_id:, authorize:, scope:)
         row = begin
           write_client.replay_destroy_entry(context:, generation: ownership.generation, entry_id:)
+        rescue EntryWriteClient::Conflict
+          raise EntryLookup.not_found
+        end
+        authorize.call(EntryLookup.replayed(context:, row:, entry_id:, scope:))
+        true
+      end
+
+      # The prepared store's lookup hides a discarded entry too, so a retried
+      # delete whose answer was lost asks the local owner for its stored
+      # receipt. The local owner reads the receipt before it checks If-Match,
+      # and the fixed If-Match is never a version, so a live entry is refused
+      # as a version conflict instead of discarded. Every miss answers not found.
+      def replay_local_destroy(ownership:, entry_id:, authorize:, scope:)
+        row = begin
+          local_write(ownership:, operation: :destroy, entry_id:, if_match: EntryWriteClient::REPLAY_ONLY_IF_MATCH,
+                      body: {}, idempotency_key: request_key(:destroy, entry_id))
         rescue EntryWriteClient::Conflict
           raise EntryLookup.not_found
         end

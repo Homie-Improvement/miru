@@ -267,19 +267,16 @@ RSpec.describe TimekeepingContract::FakeTimekeeping, "in token mode" do
 end
 
 RSpec.describe Timekeeping::FakeLocalOwner do
-  it "records each call with its method and arguments and answers lookups from the given entries" do
-    entry = build(:timesheet_entry)
-    local_owner = described_class.new(entries: { 7 => entry })
+  it "records each call with its keywords and answers the outcome it was given" do
+    outcome = Timekeeping::LocalOwner::Outcome.new(status: 201, body: { "id" => 7 })
+    local_owner = described_class.new(outcome:)
 
-    found = local_owner.find_entry(context: :a_context, entry_id: 7)
-    local_owner.destroy_entry(context: :a_context, entry: found)
+    answer = local_owner.call(operation: :create, company_id: 1, generation: 2, actor: :an_actor, params: {})
 
-    expect(found).to be(entry)
+    expect(answer).to be(outcome)
     expect(local_owner.calls).to eq([
-      { method: :find_entry, kwargs: { context: :a_context, entry_id: 7 } },
-      { method: :destroy_entry, kwargs: { context: :a_context, entry: } }
+      { method: :call, kwargs: { operation: :create, company_id: 1, generation: 2, actor: :an_actor, params: {} } }
     ])
-    expect { local_owner.find_entry(context: :a_context, entry_id: 8) }.to raise_error(ActiveRecord::RecordNotFound)
   end
 end
 
