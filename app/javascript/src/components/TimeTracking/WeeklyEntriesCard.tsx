@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 
 import { timesheetEntryApi } from "apis/api";
 import { minFromHHMM, minToHHMM, validateTimesheetEntry } from "helpers";
+import { useIdempotencyKey } from "~/hooks/useIdempotencyKey";
 import { PencilSimple } from "phosphor-react";
 import { TimeInput } from "../ui/time-input";
 import { Toastr } from "../ui/toastr";
@@ -36,6 +37,8 @@ const WeeklyEntriesCard = ({
   const [weeklyTotalHours, setWeeklyTotalHours] = useState<number>(0);
   const [billable, setBillable] = useState<boolean>(false);
   const [dataChanged, setDataChanged] = useState<boolean>(false);
+  const saveKey = useIdempotencyKey();
+  const updateKey = useIdempotencyKey();
 
   const getPayload = () => ({
     project_id: currentProjectId,
@@ -84,7 +87,11 @@ const WeeklyEntriesCard = ({
         return;
       }
       payload["work_date"] = dayInfo[selectedInputBox]["fullDate"];
-      const res = await timesheetEntryApi.create(payload, selectedEmployeeId);
+      const res = await saveKey.sendWithKey(
+        { body: payload, userId: selectedEmployeeId },
+        idempotencyKey =>
+          timesheetEntryApi.create(payload, selectedEmployeeId, idempotencyKey)
+      );
       if (res.status === 200) {
         setEntryList(prevState => {
           const newState: any = { ...prevState };
@@ -120,7 +127,12 @@ const WeeklyEntriesCard = ({
 
         return;
       }
-      const res = await timesheetEntryApi.update(timesheetEntryId, payload);
+
+      const res = await updateKey.sendWithKey(
+        { body: payload, entryId: timesheetEntryId },
+        idempotencyKey =>
+          timesheetEntryApi.update(timesheetEntryId, payload, idempotencyKey)
+      );
       if (res.status === 200) {
         setEntryList(prevState => {
           const newState: any = { ...prevState };

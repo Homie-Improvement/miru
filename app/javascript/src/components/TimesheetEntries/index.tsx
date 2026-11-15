@@ -12,6 +12,7 @@ import Loader from "common/Loader/index";
 import withLayout from "common/Mobile/HOC/withLayout";
 import SearchTimeEntries from "common/SearchTimeEntries";
 import { useUserContext } from "context/UserContext";
+import { useIdempotencyKey } from "~/hooks/useIdempotencyKey";
 import { sendGAPageView } from "utils/googleAnalytics";
 
 import DatesInWeek from "./DatesInWeek";
@@ -48,6 +49,8 @@ const TimesheetEntries = ({ user, isAdminUser }: Iprops) => {
   const [endOfTheMonth, setEndOfTheMonth] = useState<string>(
     dayjs().endOf("month").format("YYYY-MM-DD")
   );
+  const deleteKey = useIdempotencyKey();
+  const duplicateKey = useIdempotencyKey();
   const [view, setView] = useState<string>("day");
   const [newEntryView, setNewEntryView] = useState<boolean>(false);
   const [newTimeoffEntryView, setNewTimeoffEntryView] =
@@ -326,7 +329,9 @@ const TimesheetEntries = ({ user, isAdminUser }: Iprops) => {
   };
 
   const handleDeleteEntry = async id => {
-    const res = await timesheetEntryApi.destroy(id);
+    const res = await deleteKey.sendWithKey({ entryId: id }, idempotencyKey =>
+      timesheetEntryApi.destroy(id, idempotencyKey)
+    );
     if (!(res.status === 200)) return;
     await handleFilterEntry(selectedFullDate, id);
   };
@@ -353,12 +358,15 @@ const TimesheetEntries = ({ user, isAdminUser }: Iprops) => {
         entry.bill_status == "billed" ? "unbilled" : entry.bill_status,
     };
 
-    const res = await timesheetEntryApi.create(
-      {
-        project_id: entry.project_id,
-        timesheet_entry: data,
-      },
-      selectedEmployeeId
+    const body = {
+      project_id: entry.project_id,
+      timesheet_entry: data,
+    };
+
+    const res = await duplicateKey.sendWithKey(
+      { body, userId: selectedEmployeeId },
+      idempotencyKey =>
+        timesheetEntryApi.create(body, selectedEmployeeId, idempotencyKey)
     );
     if (res.status === 200) {
       await fetchEntries(selectedFullDate, selectedFullDate);

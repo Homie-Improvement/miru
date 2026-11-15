@@ -1,10 +1,14 @@
 import axios from "axios";
 import { Toastr } from "StyledComponents";
+import { v4 as uuidv4 } from "uuid";
 import { getActiveLocale } from "../i18n";
+import { isEntryGatewayWrite } from "./idempotencyKey";
 
 import { clearCredentialsFromLocalStorage } from "utils/storage";
 import { getCsrfToken, getSessionRequestHeaders } from "utils/authHeaders";
 import { reportClientError } from "utils/runtimeRecovery";
+
+const IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
 
 const AUTH_PATH_PREFIXES = [
   "/user/sign_in",
@@ -115,6 +119,17 @@ class ApiHandler {
         config.headers["X-CSRF-TOKEN"] = this.getCsrfToken();
         config.headers["X-Miru-Locale"] = getActiveLocale();
 
+        // An entry write the caller sent without a key still gets one, so
+        // every write can be replayed. It is set only when absent: the 401
+        // handler resends this same config, and that resend must keep the
+        // key so the server replays instead of writing twice.
+        if (
+          isEntryGatewayWrite(config.method ?? "get", config.url ?? "") &&
+          !config.headers[IDEMPOTENCY_KEY_HEADER]
+        ) {
+          config.headers[IDEMPOTENCY_KEY_HEADER] = uuidv4();
+        }
+
         return config;
       },
       (error: any) => Promise.reject(error)
@@ -186,6 +201,13 @@ export default Api.axios;
 
 // Single-entry inlined API modules
 const http = Api.axios;
+
+// The request config that sends a caller's own Idempotency-Key. Without one,
+// the request interceptor gives the write a fresh key.
+const idempotencyKeyConfig = (idempotencyKey?: string) =>
+  idempotencyKey
+    ? { headers: { [IDEMPOTENCY_KEY_HEADER]: idempotencyKey } }
+    : {};
 
 // Auth
 export const authenticationApi = {
@@ -737,12 +759,12 @@ export const timesheetEntryApi = {
 
     return http.get(url);
   },
-  create: (params: any, userId?: string | number) => {
+  create: (params: any, userId?: string | number, idempotencyKey?: string) => {
     const url = userId
       ? `/timesheet_entry?user_id=${userId}`
       : `/timesheet_entry`;
 
-    return http.post(url, params);
+    return http.post(url, params, idempotencyKeyConfig(idempotencyKey));
   },
   list: (from: string, to: string, uid?: string | number) =>
     http.get(`/timesheet_entry`, {
@@ -752,13 +774,25 @@ export const timesheetEntryApi = {
         ...(uid ? { user_id: uid } : {}),
       },
     }),
-  update: (id: string | number, payload: any) =>
-    http.put(`/timesheet_entry/${id}`, payload),
-  destroy: (id: string | number) => http.delete(`/timesheet_entry/${id}`),
-  destroyBulk: (payload: any) =>
-    http.delete(`/timesheet_entry/bulk_action/`, { data: { source: payload } }),
-  updateBulk: (payload: any) =>
-    http.patch(`/timesheet_entry/bulk_action/`, payload),
+  update: (id: string | number, payload: any, idempotencyKey?: string) =>
+    http.put(
+      `/timesheet_entry/${id}`,
+      payload,
+      idempotencyKeyConfig(idempotencyKey)
+    ),
+  destroy: (id: string | number, idempotencyKey?: string) =>
+    http.delete(`/timesheet_entry/${id}`, idempotencyKeyConfig(idempotencyKey)),
+  destroyBulk: (payload: any, idempotencyKey?: string) =>
+    http.delete(`/timesheet_entry/bulk_action/`, {
+      ...idempotencyKeyConfig(idempotencyKey),
+      data: { source: payload },
+    }),
+  updateBulk: (payload: any, idempotencyKey?: string) =>
+    http.patch(
+      `/timesheet_entry/bulk_action/`,
+      payload,
+      idempotencyKeyConfig(idempotencyKey)
+    ),
 };
 
 // Time Tracking

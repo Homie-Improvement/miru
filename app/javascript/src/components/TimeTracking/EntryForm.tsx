@@ -9,6 +9,7 @@ import {
   useDebounce,
   validateTimesheetEntry,
 } from "helpers";
+import { useIdempotencyKey } from "~/hooks/useIdempotencyKey";
 import { TimeInput } from "../ui/time-input";
 import { Toastr } from "../ui/toastr";
 import { Textarea } from "../ui/textarea";
@@ -70,6 +71,9 @@ const AddEntry: React.FC<Iprops> = ({
   const [projectBillable, setProjectBillable] = useState<boolean>(false);
 
   const { isDesktop, company } = useUserContext();
+  const saveKey = useIdempotencyKey();
+  const editKey = useIdempotencyKey();
+  const duplicateKey = useIdempotencyKey();
   const dateFormat =
     company?.date_format || company?.dateFormat || "MM-DD-YYYY";
   const isNewEntry = !editEntryId;
@@ -205,13 +209,15 @@ const AddEntry: React.FC<Iprops> = ({
     const savedTaskType = taskType;
 
     removeLocalStorageItems();
-    const tse = getPayload();
-    const res = await timesheetEntryApi.create(
-      {
-        project_id: projectId,
-        timesheet_entry: tse,
-      },
-      selectedEmployeeId
+    const body = {
+      project_id: projectId,
+      timesheet_entry: getPayload(),
+    };
+
+    const res = await saveKey.sendWithKey(
+      { body, userId: selectedEmployeeId },
+      idempotencyKey =>
+        timesheetEntryApi.create(body, selectedEmployeeId, idempotencyKey)
     );
 
     if (res.status === 200) {
@@ -241,11 +247,16 @@ const AddEntry: React.FC<Iprops> = ({
   const handleEdit = async () => {
     try {
       setSubmitting(true);
-      const tse = getPayload();
-      const updateRes = await timesheetEntryApi.update(editEntryId, {
+      const body = {
         project_id: projectId,
-        timesheet_entry: tse,
-      });
+        timesheet_entry: getPayload(),
+      };
+
+      const updateRes = await editKey.sendWithKey(
+        { body, entryId: editEntryId },
+        idempotencyKey =>
+          timesheetEntryApi.update(editEntryId, body, idempotencyKey)
+      );
 
       if (updateRes.status >= 200 && updateRes.status < 300) {
         await refreshVisibleEntries();
@@ -321,21 +332,24 @@ const AddEntry: React.FC<Iprops> = ({
 
     try {
       setSubmitting(true);
-      const res = await timesheetEntryApi.create(
-        {
-          project_id: latestTrackedEntry.project_id,
-          timesheet_entry: {
-            work_date: dayjs(selectedFullDate).format("YYYY-MM-DD"),
-            duration: latestTrackedEntry.duration,
-            note: latestTrackedEntry.note,
-            task_type: latestTrackedEntry.task_type || "development",
-            bill_status:
-              latestTrackedEntry.bill_status === "billed"
-                ? "unbilled"
-                : latestTrackedEntry.bill_status,
-          },
+      const body = {
+        project_id: latestTrackedEntry.project_id,
+        timesheet_entry: {
+          work_date: dayjs(selectedFullDate).format("YYYY-MM-DD"),
+          duration: latestTrackedEntry.duration,
+          note: latestTrackedEntry.note,
+          task_type: latestTrackedEntry.task_type || "development",
+          bill_status:
+            latestTrackedEntry.bill_status === "billed"
+              ? "unbilled"
+              : latestTrackedEntry.bill_status,
         },
-        selectedEmployeeId
+      };
+
+      const res = await duplicateKey.sendWithKey(
+        { body, userId: selectedEmployeeId },
+        idempotencyKey =>
+          timesheetEntryApi.create(body, selectedEmployeeId, idempotencyKey)
       );
 
       if (res.status === 200) {

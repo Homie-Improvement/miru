@@ -6,6 +6,7 @@ import { TimeEntryFormContext } from "context/TimesheetEntries/TimeEntryFormCont
 import { useUserContext } from "context/UserContext";
 import dayjs from "dayjs";
 import { minFromHHMM, minToHHMM, useDebounce, useOutsideClick } from "helpers";
+import { useIdempotencyKey } from "~/hooks/useIdempotencyKey";
 import { getValueFromLocalStorage, setToLocalStorage } from "utils/storage";
 
 import DesktopTimeEntryForm from "./DesktopTimeEntryForm";
@@ -57,6 +58,8 @@ const AddEntry = () => {
 
   const datePickerRef: MutableRefObject<any> = useRef();
   const { isDesktop } = useUserContext();
+  const saveKey = useIdempotencyKey();
+  const editKey = useIdempotencyKey();
   const isNewEntry = !editEntryId;
   const debouncedNote = useDebounce(note, 500);
   useOutsideClick(datePickerRef, () => {
@@ -110,13 +113,15 @@ const AddEntry = () => {
 
   const handleSave = async () => {
     removeLocalStorageItems();
-    const tse = getPayload();
-    const res = await timesheetEntryApi.create(
-      {
-        project_id: projectId,
-        timesheet_entry: tse,
-      },
-      selectedEmployeeId
+    const body = {
+      project_id: projectId,
+      timesheet_entry: getPayload(),
+    };
+
+    const res = await saveKey.sendWithKey(
+      { body, userId: selectedEmployeeId },
+      idempotencyKey =>
+        timesheetEntryApi.create(body, selectedEmployeeId, idempotencyKey)
     );
 
     if (res.status === 200) {
@@ -134,11 +139,16 @@ const AddEntry = () => {
   };
 
   const handleEdit = async () => {
-    const tsEntry = getPayload();
-    const updateRes = await timesheetEntryApi.update(editEntryId, {
+    const body = {
       project_id: projectId,
-      timesheet_entry: tsEntry,
-    });
+      timesheet_entry: getPayload(),
+    };
+
+    const updateRes = await editKey.sendWithKey(
+      { body, entryId: editEntryId },
+      idempotencyKey =>
+        timesheetEntryApi.update(editEntryId, body, idempotencyKey)
+    );
 
     if (updateRes.status >= 200 && updateRes.status < 300) {
       if (selectedDate !== selectedFullDate) {

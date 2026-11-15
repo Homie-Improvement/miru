@@ -114,11 +114,7 @@ const WeeklyEntries: React.FC<Props> = ({
         return;
       }
 
-      const res = await timesheetEntryApi.updateBulk(
-        ids,
-        { project_id: currentProjectId },
-        selectedEmployeeId
-      );
+      const res = await timesheetEntryApi.updateBulk(ids);
 
       if (res.status === 200) {
         const updatedEntries = res.data.entries;

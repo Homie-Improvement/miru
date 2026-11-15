@@ -15,6 +15,7 @@ import customParseFormat from "dayjs/plugin/customParseFormat";
 import updateLocale from "dayjs/plugin/updateLocale";
 import weekday from "dayjs/plugin/weekday";
 import { buildDateParseFormats, minToHHMM } from "helpers";
+import { useIdempotencyKey } from "~/hooks/useIdempotencyKey";
 import Logger from "js-logger";
 import { sendGAPageView } from "utils/googleAnalytics";
 import { Button } from "../ui/button";
@@ -44,6 +45,8 @@ dayjs.Ls.en.weekStart = 1;
 
 const TimeTracking: React.FC<Iprops> = ({ user, isAdminUser }) => {
   const { isDesktop, company } = useUserContext();
+  const deleteKey = useIdempotencyKey();
+  const duplicateKey = useIdempotencyKey();
   const dateFormat =
     company?.date_format || company?.dateFormat || "MM-DD-YYYY"; // Display format
 
@@ -509,7 +512,9 @@ const TimeTracking: React.FC<Iprops> = ({ user, isAdminUser }) => {
   };
 
   const handleDeleteEntry = async id => {
-    const res = await timesheetEntryApi.destroy(id);
+    const res = await deleteKey.sendWithKey({ entryId: id }, idempotencyKey =>
+      timesheetEntryApi.destroy(id, idempotencyKey)
+    );
     if (!(res.status === 200)) return;
     await handleFilterEntry(selectedFullDate, id);
 
@@ -558,12 +563,15 @@ const TimeTracking: React.FC<Iprops> = ({ user, isAdminUser }) => {
         entry.bill_status == "billed" ? "unbilled" : entry.bill_status,
     };
 
-    const res = await timesheetEntryApi.create(
-      {
-        project_id: entry.project_id,
-        timesheet_entry: data,
-      },
-      selectedEmployeeId
+    const body = {
+      project_id: entry.project_id,
+      timesheet_entry: data,
+    };
+
+    const res = await duplicateKey.sendWithKey(
+      { body, userId: selectedEmployeeId },
+      idempotencyKey =>
+        timesheetEntryApi.create(body, selectedEmployeeId, idempotencyKey)
     );
     if (res.status === 200) {
       await refreshVisibleEntries();
