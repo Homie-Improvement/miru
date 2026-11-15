@@ -312,7 +312,7 @@ module Timekeeping
         when :prepared
           local_bulk_delete(ownership:, entries:, identity:)
         when :timekeeping
-          forward_bulk_delete(ownership:, entries:)
+          forward_bulk_delete(ownership:, entries:, requested_ids: identity.fetch("entry_ids"))
         end
       end
     end
@@ -385,11 +385,27 @@ module Timekeeping
         reported?(answer, MOVED_RESULT)
       end
 
-      def forward_bulk_delete(ownership:, entries:)
-        return false if entries.empty?
+      def forward_bulk_delete(ownership:, entries:, requested_ids:)
+        return replay_timekeeping_bulk_delete(ownership:, requested_ids:) if entries.empty?
 
         answer = write_client.bulk_delete(context:, generation: ownership.generation, entry_ids: entries.map(&:id))
         reported?(answer, DELETED_RESULT)
+      end
+
+      # A retry whose first attempt deleted every entry finds none of them, so
+      # it asks Timekeeping only for the stored answer under the client's key.
+      # Timekeeping never deletes on that call, so no entry the lookup and the
+      # check did not approve can be discarded. A key derived from the request
+      # id is new on every retry and can match no receipt, so without a client
+      # key no call is made. Every refusal, a body that differs from the stored
+      # one included, is answered as nothing deleted, as before.
+      def replay_timekeeping_bulk_delete(ownership:, requested_ids:)
+        return false if context.idempotency_key.nil? || requested_ids.empty?
+
+        answer = write_client.replay_bulk_delete(context:, generation: ownership.generation, entry_ids: requested_ids)
+        reported?(answer, DELETED_RESULT)
+      rescue ActiveRecord::RecordNotFound, EntryWriteClient::Conflict, EntryWriteClient::Rejected
+        false
       end
 
       # Skips the same entries as forward_bulk_move. With nothing to write no

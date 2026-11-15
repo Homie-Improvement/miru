@@ -241,3 +241,40 @@ RSpec.describe Timekeeping::EntryCommand do
     end
   end
 end
+
+RSpec.describe Timekeeping::EntryCommand, "bulk delete replay-only header" do
+  let(:bulk_replay_facts) do
+    Timekeeping::ReferenceClient::Facts.new(
+      company_id: 3, edit_days: 30, users: [Timekeeping::ReferenceClient::User.new(id: 7, role: "owner")],
+      projects: [Timekeeping::ReferenceClient::Project.new(id: 11, company_id: 3, billable: true, member_user_ids: [])],
+      missing_project_ids: [], agents: []
+    )
+  end
+  let(:bulk_replay_reference_client) { instance_double(Timekeeping::ReferenceClient, fetch: bulk_replay_facts) }
+  let(:bulk_replay_identity) do
+    Timekeeping::Identity.new(kind: :user, status: :verified, user_id: 7, company_id: 3, role: "owner")
+  end
+
+  def build_bulk_replay(route, headers, body)
+    described_class.build(route:, identity: bulk_replay_identity, bearer: "caller-token", company_id: 3, entry_id: nil,
+                          headers: { "Idempotency-Key" => "key-bulk", "Ownership-Generation" => "1" }.merge(headers),
+                          raw_body: JSON.generate(body), reference_client: bulk_replay_reference_client,
+                          today: Date.new(2026, 3, 3))
+  end
+
+  # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
+  it "marks a bulk delete carrying Idempotency-Replay only as replay-only with the first bulk delete's receipt identity, and never a bulk move" do
+    replay_headers = { "Idempotency-Replay" => "only" }
+    delete_body = { "entry_ids" => [4, 9] }
+
+    replay = build_bulk_replay(:bulk_delete, replay_headers, delete_body)
+    plain = build_bulk_replay(:bulk_delete, {}, delete_body)
+    other_value = build_bulk_replay(:bulk_delete, { "Idempotency-Replay" => "yes" }, delete_body)
+    move = build_bulk_replay(:bulk_move, replay_headers, { "entry_ids" => [4, 9], "project_id" => 11 })
+
+    expect(replay).to have_attributes(replay_only: true, actor_id: 7, company_id: 3, key: "key-bulk",
+                                      operation: plain.operation)
+    expect(replay.fingerprint).to eq(plain.fingerprint)
+    expect([plain, other_value, move].map(&:replay_only)).to eq([false, false, false])
+  end
+end

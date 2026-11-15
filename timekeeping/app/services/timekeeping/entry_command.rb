@@ -43,14 +43,15 @@ module Timekeeping
     ENTRY_ROUTES = %i[update destroy].freeze
     BULK_ROUTES = %i[bulk_move bulk_delete].freeze
 
-    # A DELETE carrying this header and value is answered only from its stored
-    # receipt (contracts/timekeeping/entry_api.yml rules.replay_only). It lets a
-    # caller whose own lookup no longer finds the entry reach the answer of a
-    # delete that already committed, without ever running a new delete. Every
-    # other route, and any other value, is an ordinary write.
+    # A DELETE or bulk delete carrying this header and value is answered only
+    # from its stored receipt (contracts/timekeeping/entry_api.yml
+    # rules.replay_only). It lets a caller whose own lookup no longer finds the
+    # entries reach the answer of a delete that already committed, without ever
+    # running a new delete. Every other route, and any other value, is an
+    # ordinary write.
     REPLAY_HEADER = "Idempotency-Replay"
     REPLAY_ONLY_VALUE = "only"
-    REPLAY_ROUTES = %i[destroy].freeze
+    REPLAY_ROUTES = %i[destroy bulk_delete].freeze
 
     # Returns an EntryCommand, or the Timekeeping::WriteOutcome that refuses
     # the request. Raises ActionController::BadRequest for a body that is not

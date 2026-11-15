@@ -228,6 +228,20 @@ module Timekeeping
                                        version: REPLAY_ONLY_IF_MATCH, replay_only: true)
     end
 
+    # Returns the stored answer of a bulk delete this client key already
+    # committed, for a retry whose lookup no longer finds any of the entries.
+    # The body and key are built as bulk_delete builds them, so a resend that
+    # names the entries the first attempt deleted matches its receipt.
+    # Timekeeping never deletes on this call: with no stored answer for the
+    # same company, actor and key it answers 404, raised as RecordNotFound.
+    def replay_bulk_delete(context:, generation:, entry_ids:)
+      path = format(BULK_DELETE_PATH, company_id: context.company.id)
+      ids = bulk_body_ids(entry_ids)
+      forward(Net::HTTP::Post, path, operation: "bulk_delete", context:, generation:,
+                                     idempotency_key: bulk_key(context, "bulk_delete", ids),
+                                     body: { "entry_ids" => ids }, replay_only: true)
+    end
+
     private
 
       def request_key(context, operation, entry_id = nil)

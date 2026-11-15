@@ -36,7 +36,7 @@ headers:
   # Optional. The monolith request a call was made for, so a forwarded write
   # and the lookup before it can be traced to the same monolith request.
   x_request_id: "X-Request-Id: <monolith request id>"
-  # Optional, DELETE only. See rules.replay_only.
+  # Optional, DELETE of one entry and bulk-delete only. See rules.replay_only.
   idempotency_replay: "Idempotency-Replay: only"
 
 # Claims the provider reads from the signed bearer token. purpose is "read"
@@ -103,6 +103,11 @@ rules:
     caller also sends If-Match: replay-only, a value that never matches a
     version, so a provider that does not read the header still replays a
     stored receipt or refuses with version_conflict, and never discards.
+    A bulk-delete carrying Idempotency-Replay: only follows the same rule for
+    the receipt stored for the same company, acting user and Idempotency-Key:
+    a matching body replays the stored answer, a different body answers
+    idempotency_key_reused, and with no such receipt it answers not_found and
+    discards nothing.
     Every other route, and any other header value, ignores the header.
   credential_in_body: >-
     A write whose body holds, anywhere, a credential the provider issued or
