@@ -234,216 +234,79 @@ RSpec.describe Invoices::OutboxDelivery do
   end
 end
 
-RSpec.describe Invoices::OutboxDelivery do
+# Committed data, so the event is proven to fire when the mark really commits.
+RSpec.describe Invoices::OutboxDelivery, committed_data: true do
   around do |example|
     with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) { example.run }
   end
 
-  # Returns every undeliverable-operation event sent while the block runs, with symbol keys.
-  def undeliverable_security_event_payloads
-    events = []
-    subscriber = Object.new
-    subscriber.define_singleton_method(:emit) { |event| events << event }
-    Rails.event.subscribe(subscriber)
-    begin
-      yield
-    ensure
-      Rails.event.unsubscribe(subscriber)
-    end
-    events.filter_map do |event|
-      event[:payload].to_h.symbolize_keys if event[:name] == Invoices::UndeliverableOperation::NAME
-    end
-  end
-
-  it "a stale_generation commit answer emits one undeliverable event carrying only company_id, operation_id and kind, with no token and no body" do
-    fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
-    company_id = fake.add_company
-    user_id = fake.add_user(company_id:, role: "admin")
-    entry_id = fake.add_entry(company_id:, user_id:, project_id: fake.add_project(company_id:))["id"]
-    client = Timekeeping::ReservationClient.new(http: TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil))
-
-    operation_id = SecureRandom.uuid
-    # The stored generation is older than the fake's, so the fake answers 409 stale_generation.
-    stale_generation = fake.generation - 1
-    InvoiceOperationIntent.create!(
-      company_id:, invoice_id: 501, operation_id:, state: "committed", generation: stale_generation,
-      disposition: "active", desired_entry_ids: [entry_id]
-    )
-    item = InvoiceOperationOutboxItem.create!(
-      company_id:, invoice_id: 501, operation_id:, kind: "commit",
-      payload: { company_id:, invoice_id: 501, operation_id:, generation: stale_generation, disposition: "active",
-                 desired_entry_ids: [entry_id] }
-    )
-
-    payloads = undeliverable_security_event_payloads do
-      described_class.new(adapter_source: -> { client }).deliver(item.id)
-    end
-
-    # "When the adapter answers retryable with reason `stale_generation`, set `undeliverable_at` and emit `Invoices::UndeliverableOperation.notify(company_id:, operation_id:, kind:)`."
-    expect(item.reload.undeliverable_at).not_to be_nil
-    expect(item.delivered_at).to be_nil
-    expect(payloads.size).to eq(1)
-    # "The payload carries no token and no body."
-    expect(payloads.first.keys).to contain_exactly(:company_id, :operation_id, :kind)
-    expect(payloads.first).to eq(company_id:, operation_id:, kind: "commit")
-
-    sent_tokens = fake.requests.filter_map { |request| TimekeepingContract::Wire.bearer(request[:headers]) }
-    expect(sent_tokens).not_to be_empty
-    rendered = payloads.first.values.map(&:to_s)
-    sent_tokens.each { |token| expect(rendered).not_to include(token) }
-    expect(rendered).not_to include(entry_id.to_s)
-  end
-end
-
-# Committed data, so the event is proven to fire when the mark really commits.
-RSpec.describe Invoices::OutboxDelivery, committed_data: true do
   # "a stale_generation answer sets `undeliverable_at`, keeps the row and emits one event, and a later recovery run sends no request for that row."
   # "When the adapter answers retryable with reason `stale_generation`, set `undeliverable_at` and emit `Invoices::UndeliverableOperation.notify(company_id:, operation_id:, kind:)`."
   it "marks a stale_generation commit row undeliverable once, keeps the row and its payload, emits one event and sends nothing on a second delivery" do
-    fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
-    fake.generation = 7
-    company_id = fake.add_company
-    user_id = fake.add_user(company_id:, role: "admin")
-    project_id = fake.add_project(company_id:)
-    entry_id = fake.add_entry(company_id:, user_id:, project_id:)["id"]
-    invoice_id = 88_101
-    operation_id = SecureRandom.uuid
-    payload = {
-      "company_id" => company_id, "invoice_id" => invoice_id, "operation_id" => operation_id,
-      "generation" => 7, "disposition" => "active", "desired_entry_ids" => [entry_id]
-    }
-    InvoiceOperationIntent.create!(
-      company_id:, invoice_id:, operation_id:, state: "committed", generation: 7,
-      disposition: "active", desired_entry_ids: [entry_id]
-    )
-    row = InvoiceOperationOutboxItem.create!(company_id:, invoice_id:, operation_id:, kind: "commit", payload:)
-    events = []
-    subscriber = Object.new
-    subscriber.define_singleton_method(:emit) { |event| events << event }
-    first_state = nil
-    requests_after_first = nil
-    requests_after_second = nil
+    # Subscribers and alerts match on this name, so a rename must fail here
+    # rather than pass silently through the helper's constant filter.
+    expect(Invoices::UndeliverableOperation::NAME).to eq("invoices.undeliverable_operation")
 
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) do
-      client = Timekeeping::ReservationClient.new(http: TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil))
-      request = Invoices::ReservationRequest.new(
-        company_id:, invoice_id:, operation_id:, generation: 7, disposition: "active", entries: [entry_id]
-      )
-      expect(client.prepare(request).state).to eq("prepared")
-      # The service moved to a newer generation, so it answers the stored row's commit with 409 stale_generation.
-      fake.generation = 8
-      delivery = described_class.new(adapter_source: -> { client })
+    # The stored row is at generation 7 and the service at 8 in both setups, so
+    # the service answers 409 stale_generation whether or not it saw a prepare.
+    { "prepared before the service moved on" => true, "never prepared" => false }
+      .each_with_index do |(setup, prepare_first), index|
+        fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
+        fake.generation = 7
+        company_id = fake.add_company
+        user_id = fake.add_user(company_id:, role: "admin")
+        project_id = fake.add_project(company_id:)
+        entry_id = fake.add_entry(company_id:, user_id:, project_id:)["id"]
+        invoice_id = 88_101 + index
+        operation_id = SecureRandom.uuid
+        payload = {
+          "company_id" => company_id, "invoice_id" => invoice_id, "operation_id" => operation_id,
+          "generation" => 7, "disposition" => "active", "desired_entry_ids" => [entry_id]
+        }
+        InvoiceOperationIntent.create!(
+          company_id:, invoice_id:, operation_id:, state: "committed", generation: 7,
+          disposition: "active", desired_entry_ids: [entry_id]
+        )
+        row = InvoiceOperationOutboxItem.create!(company_id:, invoice_id:, operation_id:, kind: "commit", payload:)
+        client = Timekeeping::ReservationClient.new(http: TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil))
+        if prepare_first
+          request = Invoices::ReservationRequest.new(
+            company_id:, invoice_id:, operation_id:, generation: 7, disposition: "active", entries: [entry_id]
+          )
+          expect(client.prepare(request).state).to eq("prepared"), setup
+        end
+        fake.generation = 8
+        delivery = described_class.new(adapter_source: -> { client })
+        first_state = nil
+        requests_after_first = nil
+        requests_after_second = nil
 
-      Rails.event.subscribe(subscriber)
-      begin
-        delivery.deliver(row.id)
-        first_state = row.reload.attributes
-        requests_after_first = fake.requests.size
-        delivery.deliver(row.id)
-        requests_after_second = fake.requests.size
-      ensure
-        Rails.event.unsubscribe(subscriber)
+        payloads = undeliverable_operation_event_payloads do
+          delivery.deliver(row.id)
+          first_state = row.reload.attributes
+          requests_after_first = fake.requests.size
+          delivery.deliver(row.id)
+          requests_after_second = fake.requests.size
+        end
+
+        expect(InvoiceOperationOutboxItem.exists?(row.id)).to be(true), setup
+        expect(first_state["undeliverable_at"]).to be_present, setup
+        expect(first_state["delivered_at"]).to be_nil, setup
+        expect(first_state["payload"]).to eq(payload), setup
+        # A second reach of the row must change nothing: same timestamp, no request, no second event.
+        expect(row.reload.attributes).to eq(first_state), setup
+        expect(requests_after_second).to eq(requests_after_first), setup
+        expect(payloads.size).to eq(1), setup
+
+        # "The payload carries no token and no body."
+        expect(payloads.first.keys).to contain_exactly(:company_id, :operation_id, :kind), setup
+        expect(payloads.first).to eq({ company_id:, operation_id:, kind: "commit" }), setup
+        sent_tokens = fake.requests.filter_map { |sent| TimekeepingContract::Wire.bearer(sent[:headers]) }
+        expect(sent_tokens).not_to be_empty, setup
+        rendered = payloads.first.values.map(&:to_s)
+        sent_tokens.each { |token| expect(rendered).not_to include(token), setup }
+        expect(rendered).not_to include(entry_id.to_s), setup
       end
-    end
-
-    expect(InvoiceOperationOutboxItem.exists?(row.id)).to be(true)
-    expect(first_state["undeliverable_at"]).to be_present
-    expect(first_state["delivered_at"]).to be_nil
-    expect(first_state["payload"]).to eq(payload)
-    # A second reach of the row must change nothing: same timestamp, no request, no second event.
-    expect(row.reload.attributes).to eq(first_state)
-    expect(requests_after_second).to eq(requests_after_first)
-
-    undeliverable = events.select { |event| event[:name] == "invoices.undeliverable_operation" }
-    expect(undeliverable.size).to eq(1)
-    # "The payload carries no token and no body."
-    expect(undeliverable.first[:payload].to_h.symbolize_keys).to eq(company_id:, operation_id:, kind: "commit")
-  end
-end
-
-RSpec.describe Invoices::OutboxDelivery do
-  # "with the Timekeeping client, a commit row answered committed while the stored intent is failed stays undelivered with attempts + 1"
-  # "remote committed with intent committed → existing_success; remote aborted with intent failed → save_failed; any other pair → retryable reconciliation_error. HTTP 200 alone is never success."
-  it "with the Timekeeping client a commit row answered committed while the stored intent is failed stays undelivered with one more attempt" do
-    fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
-    fake.generation = 7
-    company_id = fake.add_company
-    user_id = fake.add_user(company_id:, role: "admin")
-    project_id = fake.add_project(company_id:)
-    entry_id = fake.add_entry(company_id:, user_id:, project_id:)["id"]
-    invoice_id = 88_201
-    operation_id = SecureRandom.uuid
-    InvoiceOperationIntent.create!(
-      company_id:, invoice_id:, operation_id:, state: "failed", generation: 7,
-      disposition: "active", desired_entry_ids: [entry_id]
-    )
-    row = InvoiceOperationOutboxItem.create!(
-      company_id:, invoice_id:, operation_id:, kind: "commit",
-      payload: {
-        "company_id" => company_id, "invoice_id" => invoice_id, "operation_id" => operation_id,
-        "generation" => 7, "disposition" => "active", "desired_entry_ids" => [entry_id]
-      }
-    )
-
-    outcome = nil
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) do
-      client = Timekeeping::ReservationClient.new(http: TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil))
-      request = Invoices::ReservationRequest.new(
-        company_id:, invoice_id:, operation_id:, generation: 7, disposition: "active", entries: [entry_id]
-      )
-      expect(client.prepare(request).state).to eq("prepared")
-
-      outcome = described_class.new(adapter_source: -> { client }).deliver(row.id)
-    end
-
-    # The remote side really committed, so only the intent state can hold the row back.
-    expect(outcome&.state).to eq("committed")
-    expect(fake.reservations_for(entry_id)).to eq([{ "invoice_id" => invoice_id, "state" => "committed" }])
-    row.reload
-    expect(row.delivered_at).to be_nil
-    expect(row.attempts).to eq(1)
-  end
-end
-
-RSpec.describe Invoices::OutboxDelivery do
-  # "with the Timekeeping client, a commit row answered committed while the stored intent is failed stays undelivered with attempts + 1, and so does an abort row answered aborted while the stored intent is pending"
-  it "with the Timekeeping client an abort row answered aborted while the stored intent is pending stays undelivered with one more attempt" do
-    fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
-    fake.generation = 7
-    company_id = fake.add_company
-    user_id = fake.add_user(company_id:, role: "admin")
-    project_id = fake.add_project(company_id:)
-    entry_id = fake.add_entry(company_id:, user_id:, project_id:)["id"]
-    invoice_id = 88_301
-    operation_id = SecureRandom.uuid
-    InvoiceOperationIntent.create!(
-      company_id:, invoice_id:, operation_id:, state: "pending", generation: 7,
-      disposition: "active", desired_entry_ids: [entry_id]
-    )
-    row = InvoiceOperationOutboxItem.create!(
-      company_id:, invoice_id:, operation_id:, kind: "abort",
-      payload: {
-        "company_id" => company_id, "invoice_id" => invoice_id, "operation_id" => operation_id,
-        "generation" => 7, "disposition" => "active", "desired_entry_ids" => [entry_id]
-      }
-    )
-
-    outcome = nil
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) do
-      client = Timekeeping::ReservationClient.new(http: TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil))
-      request = Invoices::ReservationRequest.new(
-        company_id:, invoice_id:, operation_id:, generation: 7, disposition: "active", entries: [entry_id]
-      )
-      expect(client.prepare(request).state).to eq("prepared")
-
-      outcome = described_class.new(adapter_source: -> { client }).deliver(row.id)
-    end
-
-    expect(outcome&.state).to eq("aborted")
-    expect(fake.entry_locked?(entry_id)).to be(false)
-    row.reload
-    expect(row.delivered_at).to be_nil
-    expect(row.attempts).to eq(1)
   end
 end
 
@@ -477,24 +340,15 @@ RSpec.describe Invoices::OutboxDelivery, "stale_generation answers to an abort r
     fake.generation = 8
     delivery = described_class.new(adapter_source: -> { client })
 
-    events = []
-    subscriber = Object.new
-    subscriber.define_singleton_method(:emit) { |event| events << event }
-    Rails.event.subscribe(subscriber)
-    begin
+    payloads = undeliverable_operation_event_payloads do
       delivery.deliver(row.id)
       delivery.deliver(row.id)
-    ensure
-      Rails.event.unsubscribe(subscriber)
     end
 
     row.reload
     expect(row.undeliverable_at).to be_present
     expect(row.delivered_at).to be_nil
     expect(row.attempts).to eq(0)
-    payloads = events.filter_map do |event|
-      event[:payload].to_h.symbolize_keys if event[:name] == Invoices::UndeliverableOperation::NAME
-    end
     expect(payloads).to eq([{ company_id:, operation_id:, kind: "abort" }])
   end
 end
@@ -544,47 +398,53 @@ RSpec.describe Invoices::OutboxDelivery, "an intent that changes while the Timek
 end
 
 RSpec.describe Invoices::OutboxDelivery, "Timekeeping settlement reads only the row's own company's intent" do
-  let(:tenant_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-  let(:tenant_client) { Timekeeping::ReservationClient.new(http: TimekeepingContract::FakeClient.new(timekeeping: tenant_fake, relay: nil)) }
-
   around do |example|
     with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV => timekeeping_key_pair.to_pem) { example.run }
   end
 
+  # "remote committed with intent committed → existing_success; remote aborted with intent failed → save_failed; any other pair → retryable reconciliation_error. HTTP 200 alone is never success."
   it "with the Timekeeping client a commit row settles against its own company's failed intent, never another company's committed intent sharing the operation id" do
-    company_id = tenant_fake.add_company
-    user_id = tenant_fake.add_user(company_id:, role: "admin")
-    entry_id = tenant_fake.add_entry(company_id:, user_id:, project_id: tenant_fake.add_project(company_id:))["id"]
-    other_company_id = company_id + 100_000
-    operation_id = SecureRandom.uuid
-    request = Invoices::ReservationRequest.new(
-      company_id:, invoice_id: 501, operation_id:, generation: tenant_fake.generation,
-      disposition: "active", entries: [entry_id]
-    )
-    tenant_client.prepare(request)
-    expect(tenant_client.commit(request).state).to eq("committed")
+    # Committed before delivery, the delivery replays a commit; only prepared, the delivery itself commits.
+    { "committed before delivery" => true, "only prepared before delivery" => false }.each do |setup, commit_first|
+      tenant_fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
+      tenant_client = Timekeeping::ReservationClient.new(http: TimekeepingContract::FakeClient.new(timekeeping: tenant_fake, relay: nil))
+      company_id = tenant_fake.add_company
+      user_id = tenant_fake.add_user(company_id:, role: "admin")
+      entry_id = tenant_fake.add_entry(company_id:, user_id:, project_id: tenant_fake.add_project(company_id:))["id"]
+      other_company_id = company_id + 100_000
+      operation_id = SecureRandom.uuid
+      request = Invoices::ReservationRequest.new(
+        company_id:, invoice_id: 501, operation_id:, generation: tenant_fake.generation,
+        disposition: "active", entries: [entry_id]
+      )
+      expect(tenant_client.prepare(request).state).to eq("prepared"), setup
+      expect(tenant_client.commit(request).state).to eq("committed"), setup if commit_first
 
-    # The other company's committed intent is written first, so a lookup that
-    # ignores the company would find it before the row's own failed intent.
-    InvoiceOperationIntent.insert_all!([
-      { company_id: other_company_id, invoice_id: 501, operation_id:, state: "committed",
-        generation: tenant_fake.generation, desired_entry_ids: [entry_id], disposition: "active", created_at: Time.current },
-      { company_id:, invoice_id: 501, operation_id:, state: "failed",
-        generation: tenant_fake.generation, desired_entry_ids: [entry_id], disposition: "active", created_at: Time.current }
-    ])
-    item = InvoiceOperationOutboxItem.create!(
-      company_id:, invoice_id: 501, operation_id:, kind: "commit",
-      payload: { company_id:, invoice_id: 501, operation_id:, generation: tenant_fake.generation,
-                 disposition: "active", desired_entry_ids: [entry_id] }
-    )
+      # The other company's committed intent is written first, so a lookup that
+      # ignores the company would find it before the row's own failed intent.
+      InvoiceOperationIntent.insert_all!([
+        { company_id: other_company_id, invoice_id: 501, operation_id:, state: "committed",
+          generation: tenant_fake.generation, desired_entry_ids: [entry_id], disposition: "active", created_at: Time.current },
+        { company_id:, invoice_id: 501, operation_id:, state: "failed",
+          generation: tenant_fake.generation, desired_entry_ids: [entry_id], disposition: "active", created_at: Time.current }
+      ])
+      item = InvoiceOperationOutboxItem.create!(
+        company_id:, invoice_id: 501, operation_id:, kind: "commit",
+        payload: { company_id:, invoice_id: 501, operation_id:, generation: tenant_fake.generation,
+                   disposition: "active", desired_entry_ids: [entry_id] }
+      )
 
-    described_class.new(adapter_source: -> { tenant_client }).deliver(item.id)
+      outcome = described_class.new(adapter_source: -> { tenant_client }).deliver(item.id)
 
-    # "with the Timekeeping client, a commit row answered committed while the stored intent is failed stays undelivered with attempts + 1"
-    expect(item.reload.delivered_at).to be_nil
-    expect(item.attempts).to eq(1)
-    expect(tenant_fake.requests.pluck(:path)).to all(start_with("/v1/companies/#{company_id}/reservations/"))
-    expect(InvoiceOperationOutboxItem.where(company_id: other_company_id).count).to eq(0)
+      # The remote side really committed, so only the intent state can hold the row back.
+      expect(outcome&.state).to eq("committed"), setup
+      expect(tenant_fake.reservations_for(entry_id)).to eq([{ "invoice_id" => 501, "state" => "committed" }]), setup
+      # "with the Timekeeping client, a commit row answered committed while the stored intent is failed stays undelivered with attempts + 1"
+      expect(item.reload.delivered_at).to be_nil, setup
+      expect(item.attempts).to eq(1), setup
+      expect(tenant_fake.requests.pluck(:path)).to all(start_with("/v1/companies/#{company_id}/reservations/")), setup
+      expect(InvoiceOperationOutboxItem.where(company_id: other_company_id).count).to eq(0), setup
+    end
   end
 end
 
@@ -640,42 +500,47 @@ RSpec.describe Invoices::OutboxDelivery, "abort settlement through the Timekeepi
   end
 
   it "with the Timekeeping client an abort row answered aborted while the stored intent is pending stays undelivered, and settles once the intent is failed" do
-    fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
-    client = Timekeeping::ReservationClient.new(http: TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil))
-    company_id = fake.add_company
-    user_id = fake.add_user(company_id:, role: "admin")
-    entry_id = fake.add_entry(company_id:, user_id:, project_id: fake.add_project(company_id:))["id"]
-    operation_id = SecureRandom.uuid
-    generation = fake.generation
-    request = Invoices::ReservationRequest.new(
-      company_id:, invoice_id: 502, operation_id:, generation:, disposition: "active", entries: [entry_id]
-    )
-    expect(client.prepare(request).state).to eq("prepared")
-    expect(client.abort(request).state).to eq("aborted")
-    intent = InvoiceOperationIntent.create!(
-      company_id:, invoice_id: 502, operation_id:, state: "pending", generation:,
-      disposition: "active", desired_entry_ids: [entry_id]
-    )
-    row = InvoiceOperationOutboxItem.create!(
-      company_id:, invoice_id: 502, operation_id:, kind: "abort",
-      payload: { company_id:, invoice_id: 502, operation_id:, generation:, disposition: "active", desired_entry_ids: [entry_id] }
-    )
-    delivery = described_class.new(adapter_source: -> { client })
+    # Aborted before delivery, the delivery replays an abort; only prepared, the delivery itself aborts.
+    { "aborted before delivery" => true, "only prepared before delivery" => false }.each do |setup, abort_first|
+      fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
+      client = Timekeeping::ReservationClient.new(http: TimekeepingContract::FakeClient.new(timekeeping: fake, relay: nil))
+      company_id = fake.add_company
+      user_id = fake.add_user(company_id:, role: "admin")
+      entry_id = fake.add_entry(company_id:, user_id:, project_id: fake.add_project(company_id:))["id"]
+      operation_id = SecureRandom.uuid
+      generation = fake.generation
+      request = Invoices::ReservationRequest.new(
+        company_id:, invoice_id: 502, operation_id:, generation:, disposition: "active", entries: [entry_id]
+      )
+      expect(client.prepare(request).state).to eq("prepared"), setup
+      expect(client.abort(request).state).to eq("aborted"), setup if abort_first
+      intent = InvoiceOperationIntent.create!(
+        company_id:, invoice_id: 502, operation_id:, state: "pending", generation:,
+        disposition: "active", desired_entry_ids: [entry_id]
+      )
+      row = InvoiceOperationOutboxItem.create!(
+        company_id:, invoice_id: 502, operation_id:, kind: "abort",
+        payload: { company_id:, invoice_id: 502, operation_id:, generation:, disposition: "active", desired_entry_ids: [entry_id] }
+      )
+      delivery = described_class.new(adapter_source: -> { client })
 
-    delivery.deliver(row.id)
+      outcome = delivery.deliver(row.id)
 
-    # "with the Timekeeping client, ... and so does an abort row answered aborted while the stored intent is pending"
-    expect(row.reload.delivered_at).to be_nil
-    expect(row.attempts).to eq(1)
+      # "with the Timekeeping client, ... and so does an abort row answered aborted while the stored intent is pending"
+      expect(outcome&.state).to eq("aborted"), setup
+      expect(fake.entry_locked?(entry_id)).to be(false), setup
+      expect(row.reload.delivered_at).to be_nil, setup
+      expect(row.attempts).to eq(1), setup
 
-    # "remote aborted with intent failed → save_failed"; the intent state is read at delivery time.
-    intent.update!(state: "failed")
-    delivery.deliver(row.id)
+      # "remote aborted with intent failed → save_failed"; the intent state is read at delivery time.
+      intent.update!(state: "failed")
+      delivery.deliver(row.id)
 
-    expect(row.reload.delivered_at).to be_present
-    expect(row.attempts).to eq(1)
-    expect(fake.reservations_for(entry_id)).to eq([])
-    expect(fake.entry_locked?(entry_id)).to be(false)
+      expect(row.reload.delivered_at).to be_present, setup
+      expect(row.attempts).to eq(1), setup
+      expect(fake.reservations_for(entry_id)).to eq([]), setup
+      expect(fake.entry_locked?(entry_id)).to be(false), setup
+    end
   end
 end
 
