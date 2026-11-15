@@ -409,3 +409,86 @@ RSpec.describe RecoverInvoiceOperationIntentsJob do
     end
   end
 end
+
+require "rails_helper"
+
+RSpec.describe RecoverInvoiceOperationIntentsJob do
+  # "`OutboxDelivery#deliver` and `RecoverInvoiceOperationIntentsJob#deliver_undelivered` skip rows that have `undeliverable_at` set."
+  # "a stale_generation answer sets `undeliverable_at`, keeps the row and emits one event, and a later recovery run sends no request for that row."
+  it "a recovery run sends no request for an undeliverable row and still delivers an ordinary undelivered row", committed_data: true do
+    stale_operation_id = SecureRandom.uuid
+    ordinary_operation_id = SecureRandom.uuid
+    [[stale_operation_id, 88_501], [ordinary_operation_id, 88_502]].each do |operation_id, invoice_id|
+      InvoiceOperationIntent.create!(
+        company_id: 8850, invoice_id:, operation_id:, state: "committed", generation: 1,
+        disposition: "active", desired_entry_ids: [61], finished_at: Time.current
+      )
+    end
+    stale_row, ordinary_row = [[stale_operation_id, 88_501], [ordinary_operation_id, 88_502]].map do |operation_id, invoice_id|
+      InvoiceOperationOutboxItem.create!(
+        company_id: 8850, invoice_id:, operation_id:, kind: "commit",
+        payload: {
+          "company_id" => 8850, "invoice_id" => invoice_id, "operation_id" => operation_id,
+          "generation" => 1, "disposition" => "active", "desired_entry_ids" => [61]
+        }
+      )
+    end
+    marked_at = 1.hour.ago.change(usec: 0)
+    stale_row.update_column(:undeliverable_at, marked_at)
+    committed = Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {})
+    commit_requests = []
+    adapter = RecordingReservationAdapter.new(
+      prepare: Invoices::ReservationOutcome.new(state: "prepared", conflicts: [], counts: {}),
+      commit: ->(request) { commit_requests << request; committed },
+      abort: Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
+    )
+
+    described_class.perform_now(reservations: adapter)
+
+    expect(commit_requests.map(&:operation_id)).to eq([ordinary_operation_id])
+    expect(ordinary_row.reload.delivered_at).to be_present
+    stale_row.reload
+    expect(stale_row.delivered_at).to be_nil
+    expect(stale_row.attempts).to eq(0)
+    expect(stale_row.undeliverable_at).to eq(marked_at)
+  end
+end
+
+RSpec.describe RecoverInvoiceOperationIntentsJob, "skipping undeliverable rows" do
+  # The ordinary row proves the sweep ran, so "no request for the undeliverable row" cannot pass by the sweep doing nothing.
+  it "a recovery sweep sends nothing for an undeliverable abort row and still delivers the ordinary undelivered row beside it", committed_data: true do
+    stale_operation_id = SecureRandom.uuid
+    ordinary_operation_id = SecureRandom.uuid
+    [[stale_operation_id, 8501], [ordinary_operation_id, 8502]].each do |operation_id, invoice_id|
+      InvoiceOperationIntent.create!(
+        company_id: 85, invoice_id:, operation_id:, state: "failed", generation: 1,
+        disposition: "active", desired_entry_ids: [7], finished_at: Time.current
+      )
+    end
+    marked_at = 5.minutes.ago.change(usec: 0)
+    stale_row = InvoiceOperationOutboxItem.create!(
+      company_id: 85, invoice_id: 8501, operation_id: stale_operation_id, kind: "abort", undeliverable_at: marked_at,
+      payload: { company_id: 85, invoice_id: 8501, operation_id: stale_operation_id, generation: 1, disposition: "active", desired_entry_ids: [7] }
+    )
+    ordinary_row = InvoiceOperationOutboxItem.create!(
+      company_id: 85, invoice_id: 8502, operation_id: ordinary_operation_id, kind: "abort",
+      payload: { company_id: 85, invoice_id: 8502, operation_id: ordinary_operation_id, generation: 1, disposition: "active", desired_entry_ids: [7] }
+    )
+    aborted = Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {})
+    abort_requests = []
+    adapter = RecordingReservationAdapter.new(
+      prepare: Invoices::ReservationOutcome.new(state: "prepared", conflicts: [], counts: {}),
+      commit: Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: {}),
+      abort: ->(request) { abort_requests << request; aborted }
+    )
+
+    described_class.perform_now(reservations: adapter)
+
+    # "`OutboxDelivery#deliver` and `RecoverInvoiceOperationIntentsJob#deliver_undelivered` skip rows that have `undeliverable_at` set."
+    expect(abort_requests.map(&:operation_id)).to eq([ordinary_operation_id])
+    expect(ordinary_row.reload.delivered_at).to be_present
+    expect(stale_row.reload.delivered_at).to be_nil
+    expect(stale_row.attempts).to eq(0)
+    expect(stale_row.undeliverable_at).to eq(marked_at)
+  end
+end
