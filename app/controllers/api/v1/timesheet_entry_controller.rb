@@ -28,9 +28,12 @@ class Api::V1::TimesheetEntryController < Api::V1::ApplicationController
 
   def create
     authorize TimesheetEntry
+    # The request's user_id goes to the gateway unchanged. The prepared store's
+    # local owner decides it itself; the other stores write for the user
+    # timesheet_entry_user resolves.
     timesheet_entry = entry_gateway.create(
-      user: timesheet_entry_user, project: current_project, attributes: timesheet_entry_params.to_h
-    )
+      requested_user_id: params[:user_id], project: current_project, attributes: timesheet_entry_params.to_h
+    ) { timesheet_entry_user }
     render json: { notice: I18n.t("timesheet_entry.create.message"), entry: timesheet_entry.snippet }
   end
 

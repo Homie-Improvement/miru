@@ -646,6 +646,36 @@ RSpec.describe Timekeeping::Gateway do
     expect(timekeeping_row_counts).to eq(before)
   end
 
+  # "The request's `user_id` is passed through unchanged, and the local owner decides it."
+  it "passes a requested user_id to the local owner unchanged without resolving it" do
+    gw_ownership.update_columns(monolith_store: "prepared", generation: 2)
+    colleague = timekeeping_member(gw_company, "employee")
+    stored = gw_local_entry(user_id: colleague.id)
+    local_owner = Timekeeping::FakeLocalOwner.new(
+      outcome: Timekeeping::LocalOwner::Outcome.new(status: 201, body: gw_entry_body(stored))
+    )
+    resolved = []
+
+    entry = gw_gateway(local_owner:).create(
+      requested_user_id: colleague.id.to_s, project: gw_project, attributes: gw_attributes
+    ) { resolved << :called }
+
+    expect(local_owner.calls.sole[:kwargs][:params]["body"]["user_id"]).to eq(colleague.id.to_s)
+    expect(resolved).to be_empty
+    expect(entry.user_id).to eq(colleague.id)
+  end
+
+  it "resolves a requested user_id with the caller's block outside the prepared store" do
+    colleague = timekeeping_member(gw_company, "employee")
+
+    entry = gw_gateway.create(requested_user_id: colleague.id.to_s, project: gw_project, attributes: gw_attributes) do
+      colleague
+    end
+
+    expect(entry).to be_persisted
+    expect(entry.user_id).to eq(colleague.id)
+  end
+
   it "passes an import's own idempotency key to the local owner" do
     gw_ownership.update_columns(monolith_store: "prepared", generation: 2)
     stored = gw_local_entry

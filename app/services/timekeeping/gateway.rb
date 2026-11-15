@@ -137,28 +137,30 @@ module Timekeeping
       end
     end
 
-    # user and project are records the caller already resolved inside the
-    # context's company. Returns the created TimesheetEntry: saved on the
-    # legacy branch, unsaved when another store owns the entries.
-    def create(user:, project:, attributes:, expected_generation: nil)
+    # project is a record the caller already resolved inside the context's
+    # company. The target user is given one of two ways: user, a record the
+    # caller already resolved, or requested_user_id, the request's own value,
+    # with a block that resolves it by the caller's rule. The prepared store's
+    # local owner decides a requested_user_id itself, so it receives the value
+    # unchanged and the block is not called; the legacy store and Timekeeping
+    # write for the user the block resolves. Returns the created
+    # TimesheetEntry: saved on the legacy branch, unsaved when another store
+    # owns the entries.
+    # :reek:LongParameterList
+    def create(project:, attributes:, user: nil, requested_user_id: nil, expected_generation: nil, &resolve_user)
       perform(expected_generation) do |ownership, owner|
         case owner
         when :legacy
           project.timesheet_entries.new(attributes).tap do |entry|
-            entry.user = user
+            entry.user = user || resolve_user.call
             entry.save!
           end
         when :prepared
-          identity = create_identity(user:, project:, fields: EntryWriteClient.forwarded_fields(
-            attributes, actor_kind: context.actor_kind, operation: :create
-          ))
-          row = replay_local(ownership:, operation: :create, identity:) ||
-                local_write(ownership:, operation: :create, body: create_body(user:, project:, attributes:), identity:,
-                            idempotency_key: request_key(:create))
-          hydrate(row, user_id: user.id)
+          local_create(ownership:, project:, attributes:, user:, requested_user_id:)
         when :timekeeping
-          body = create_body(user:, project:, attributes:)
-          hydrate(write_client.create_entry(context:, generation: ownership.generation, body:), user_id: user.id)
+          target = user || resolve_user.call
+          body = create_body(user: target, project:, attributes:)
+          hydrate(write_client.create_entry(context:, generation: ownership.generation, body:), user_id: target.id)
         end
       end
     end
@@ -178,7 +180,7 @@ module Timekeeping
         when :legacy
           import_legacy(user:, project:, final:)
         when :prepared
-          identity = create_identity(user:, project:, fields: final)
+          identity = create_identity(user_id: user.id, project:, fields: final)
           row = replay_local(ownership:, operation: :create, identity:, idempotency_key:) ||
                 local_write(ownership:, operation: :create, body: import_body(user:, project:, final:), identity:,
                             idempotency_key:)
@@ -393,6 +395,25 @@ module Timekeeping
       # Skips the same entries as forward_bulk_move. With nothing to write no
       # call is made: the gateway has already fenced the generation, and the
       # local owner would store a receipt for an empty write.
+      # A create for a resolved user sends that user's id. A create for a
+      # requested user sends the request's value unchanged, and the local
+      # owner decides it by the shared target-user rule; the draft the legacy
+      # create rules check is then built for the acting user, since no target
+      # record was resolved. The answer is hydrated for the user the owner
+      # wrote the entry for.
+      # :reek:LongParameterList
+      def local_create(ownership:, project:, attributes:, user:, requested_user_id:)
+        draft_user = user || context.actor
+        target_user_id = user ? user.id : requested_user_id
+        fields = EntryWriteClient.forwarded_fields(attributes, actor_kind: context.actor_kind, operation: :create)
+        identity = create_identity(user_id: target_user_id, project:, fields:)
+        row = replay_local(ownership:, operation: :create, identity:) || local_write(
+          ownership:, operation: :create, identity:, idempotency_key: request_key(:create),
+          body: create_body(user: draft_user, project:, attributes:).merge("user_id" => target_user_id)
+        )
+        hydrate(row, user_id: row["user_id"])
+      end
+
       # The request's own If-Match wins; with none, the version the lookup read
       # is sent, so a change made after the policy check is refused.
       # :reek:LongParameterList
@@ -481,10 +502,11 @@ module Timekeeping
         JSON.parse(JSON.generate(value))
       end
 
-      # The request values of a create: the resolved target user and project
-      # and the fields the writer may forward, before any default is filled.
-      def create_identity(user:, project:, fields:)
-        { "user_id" => user.id, "project_id" => project.id, "fields" => fields.to_h.stringify_keys }
+      # The request values of a create: the target user id as the write sends
+      # it, the project, and the fields the writer may forward, before any
+      # default is filled.
+      def create_identity(user_id:, project:, fields:)
+        { "user_id" => user_id, "project_id" => project.id, "fields" => fields.to_h.stringify_keys }
       end
 
       def update_identity(project:, attributes:)
