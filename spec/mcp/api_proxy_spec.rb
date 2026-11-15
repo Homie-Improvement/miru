@@ -50,5 +50,18 @@ RSpec.describe MCP::Miru::ApiProxy do
 
       expect(sent_hosts).to eq(["app.miru.so:8443"])
     end
+
+    # A caller that passes its own Host must not be able to replace the configured one, so the
+    # proxy no longer accepts request headers at all.
+    it "refuses a caller-supplied headers keyword so no caller can replace the configured Host" do
+      expect {
+        described_class.request(
+          method: :get, path: "/api/v1/users/_me", authorization: "Bearer token",
+          headers: { "Host" => "attacker.test" }
+        )
+      }.to raise_error(ArgumentError, /headers/)
+
+      expect(sent_hosts).to be_empty
+    end
   end
 end
