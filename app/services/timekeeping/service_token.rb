@@ -33,6 +33,11 @@ module Timekeeping
 
     # The operation name Timekeeping requires on the detach-entries route.
     DETACH_ENTRIES = "agents.detach_entries"
+    # The operation names Timekeeping requires on the reservation routes.
+    RESERVATIONS_PREPARE = "reservations.prepare"
+    RESERVATIONS_COMMIT = "reservations.commit"
+    RESERVATIONS_ABORT = "reservations.abort"
+    INVOICES_MARK_BILLED = "invoices.mark_billed"
 
     class InvalidTokenError < UserToken::Error; end
 
