@@ -519,6 +519,103 @@ RSpec.describe Timekeeping::Gateway do
     expect(timekeeping_row_counts).to eq(after_first)
   end
 
+  # "Idempotency-Key and If-Match from the request reach the local owner, so retries replay and stale versions answer version_conflict"
+  it "replays a committed prepared bulk delete retried with the same key after its entries are discarded" do
+    gw_ownership.update_columns(monolith_store: "prepared", generation: 2)
+    stored = gw_local_entry
+    first = gw_prepared_gateway(request_id: "req-bulk-replay-1", idempotency_key: "k-bulk-replay")
+      .bulk_delete(entry_ids: [stored.id], check: gw_allow_all, expected_generation: 2)
+    expect(stored.reload.discarded_at).not_to be_nil
+    after_first = timekeeping_row_counts
+
+    second = gw_prepared_gateway(request_id: "req-bulk-replay-2", idempotency_key: "k-bulk-replay")
+      .bulk_delete(entry_ids: [stored.id], check: ->(_entries) { :refused_on_retry }, expected_generation: 2)
+
+    expect([first.written, second.written]).to eq([true, true])
+    expect(second.refusal).to be_nil
+    expect(timekeeping_row_counts).to eq(after_first)
+  end
+
+  it "replays a committed prepared create after its project stops being billable, with or without bill_status" do
+    gw_ownership.update_columns(monolith_store: "prepared", generation: 2)
+    project = create(:project, billable: true, client: create(:client, company: gw_company))
+    explicit = gw_attributes
+    omitted = gw_attributes.except(:bill_status)
+    firsts = [[explicit, "k-create-explicit"], [omitted, "k-create-omitted"]].map do |attributes, key|
+      gw_prepared_gateway(request_id: "#{key}-1", idempotency_key: key).create(user: gw_admin, project:, attributes:)
+    end
+    project.update_columns(billable: false)
+    after_first = timekeeping_row_counts
+
+    seconds = [[explicit, "k-create-explicit"], [omitted, "k-create-omitted"]].map do |attributes, key|
+      gw_prepared_gateway(request_id: "#{key}-2", idempotency_key: key).create(user: gw_admin, project:, attributes:)
+    end
+
+    expect(seconds.map(&:id)).to eq(firsts.map(&:id))
+    expect(seconds.map(&:bill_status)).to eq(firsts.map(&:bill_status))
+    expect(timekeeping_row_counts).to eq(after_first)
+  end
+
+  it "replays a committed prepared update to billed although the policy now refuses editing the entry" do
+    gw_ownership.update_columns(monolith_store: "prepared", generation: 2)
+    stored = gw_local_entry
+    version = stored.version.to_s
+    policy = ->(entry) { raise Pundit::NotAuthorizedError unless TimesheetEntryPolicy.new(gw_admin, entry).update? }
+    first = gw_prepared_gateway(request_id: "req-billed-1", idempotency_key: "k-billed", if_match: version)
+      .update(entry_id: stored.id, project: gw_project, attributes: { bill_status: "billed" }, authorize: policy)
+    expect(stored.reload.bill_status).to eq("billed")
+    after_first = timekeeping_row_counts
+
+    second = gw_prepared_gateway(request_id: "req-billed-2", idempotency_key: "k-billed", if_match: version)
+      .update(entry_id: stored.id, project: gw_project, attributes: { bill_status: "billed" }, authorize: policy)
+
+    expect(second.attributes).to eq(first.attributes)
+    expect(timekeeping_row_counts).to eq(after_first)
+    expect do
+      gw_prepared_gateway(request_id: "req-billed-3", idempotency_key: "k-billed-fresh", if_match: stored.version.to_s)
+        .update(entry_id: stored.id, project: gw_project, attributes: { note: "fresh" }, authorize: policy)
+    end.to raise_error(Pundit::NotAuthorizedError)
+  end
+
+  it "replays a committed CLI update after another edit changes the stored source metadata" do
+    gw_ownership.update_columns(monolith_store: "prepared", generation: 2)
+    stored = gw_local_entry(source: "cli", source_metadata: {})
+    version = stored.version.to_s
+    cli_gateway = lambda do |request_id, key, if_match|
+      described_class.new(context: Timekeeping::WriteContext.new(
+        company: gw_company, actor: gw_admin, actor_kind: "cli", request_id:, idempotency_key: key, if_match:
+      ))
+    end
+    attributes = { duration: 45, work_date: Date.current, source: "cli", note: "original" }
+    first = cli_gateway.call("req-meta-1", "k-meta", version)
+      .update(entry_id: stored.id, project: gw_project, attributes:, authorize: gw_allow_all, scope: :actor)
+    cli_gateway.call("req-meta-other", "k-meta-other", stored.reload.version.to_s).update(
+      entry_id: stored.id, project: gw_project, attributes: { source: "cli", source_metadata: { "tool" => "x" } },
+      authorize: gw_allow_all, scope: :actor
+    )
+    expect(stored.reload.source_metadata).to eq("tool" => "x")
+    after_edit = timekeeping_row_counts
+
+    second = cli_gateway.call("req-meta-2", "k-meta", version)
+      .update(entry_id: stored.id, project: gw_project, attributes:, authorize: gw_allow_all, scope: :actor)
+
+    expect(second.attributes).to eq(first.attributes)
+    expect(timekeeping_row_counts).to eq(after_edit)
+  end
+
+  it "refuses a prepared create that reuses a committed key with different request values and writes nothing" do
+    gw_ownership.update_columns(monolith_store: "prepared", generation: 2)
+    gw_prepared_gateway(request_id: "req-reuse-1", idempotency_key: "k-reuse")
+      .create(user: gw_admin, project: gw_project, attributes: gw_attributes)
+    after_first = timekeeping_row_counts
+
+    expect do
+      gw_prepared_gateway(request_id: "req-reuse-2", idempotency_key: "k-reuse")
+        .create(user: gw_admin, project: gw_project, attributes: gw_attributes.merge(note: "different"))
+    end.to raise_error(Timekeeping::EntryWriteClient::Rejected)
+    expect(timekeeping_row_counts).to eq(after_first)
+  end
+
   # The replay call's If-Match is never a version, so a live entry it reaches answers a version conflict.
   it "sends the replay-only If-Match on a prepared destroy the lookup misses and answers a conflict as not found" do
     gw_ownership.update_columns(monolith_store: "prepared", generation: 2)

@@ -17,5 +17,10 @@ module Timekeeping
       @calls += [{ method: :call, kwargs: }]
       @outcome
     end
+
+    # Holds no stored answers, so every write goes on to call.
+    def replay(**)
+      nil
+    end
   end
 end

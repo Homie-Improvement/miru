@@ -48,6 +48,7 @@ module Timekeeping
     # The per-entry answers of contracts/timekeeping/entry_api.yml bulk routes.
     MOVED_RESULT = "moved"
     DELETED_RESULT = "deleted"
+    BULK_RESULTS = { bulk_move: MOVED_RESULT, bulk_delete: DELETED_RESULT }.freeze
 
     # Reads the ownership row under a share lock, or nil when it is missing.
     # Never TimekeepingOwnership.current, whose RecordNotFound would answer a
@@ -148,7 +149,11 @@ module Timekeeping
             entry.save!
           end
         when :prepared
-          row = local_write(ownership:, operation: :create, body: create_body(user:, project:, attributes:),
+          identity = create_identity(user:, project:, fields: EntryWriteClient.forwarded_fields(
+            attributes, actor_kind: context.actor_kind, operation: :create
+          ))
+          row = replay_local(ownership:, operation: :create, identity:) ||
+                local_write(ownership:, operation: :create, body: create_body(user:, project:, attributes:), identity:,
                             idempotency_key: request_key(:create))
           hydrate(row, user_id: user.id)
         when :timekeeping
@@ -173,7 +178,9 @@ module Timekeeping
         when :legacy
           import_legacy(user:, project:, final:)
         when :prepared
-          row = local_write(ownership:, operation: :create, body: import_body(user:, project:, final:),
+          identity = create_identity(user:, project:, fields: final)
+          row = replay_local(ownership:, operation: :create, identity:, idempotency_key:) ||
+                local_write(ownership:, operation: :create, body: import_body(user:, project:, final:), identity:,
                             idempotency_key:)
           hydrate(row, user_id: user.id)
         when :timekeeping
@@ -185,8 +192,17 @@ module Timekeeping
     # authorize is called with the entry found in the owning store, inside the
     # transaction and before the write, so the policy decides on the copy the
     # write will change.
+    #
+    # In the prepared store, a retry of an update this actor already committed
+    # replays the stored answer before the policy runs: the first update may
+    # have made the entry one the policy refuses to edit, such as billed. The
+    # replayed entry still passes the lookup's company, id and scope checks.
     def update(entry_id:, project:, attributes:, authorize:, expected_generation: nil, scope: :company)
       perform(expected_generation) do |ownership, owner|
+        identity = update_identity(project:, attributes:)
+        replayed = owner == :prepared && replay_local(ownership:, operation: :update, entry_id:, identity:)
+        next EntryLookup.replayed(context:, row: replayed, entry_id:, scope:) if replayed
+
         found = find_authorized(ownership:, entry_id:, authorize:, scope:)
         entry = found.entry
         case owner
@@ -196,7 +212,7 @@ module Timekeeping
           entry
         when :prepared
           row = local_write(ownership:, operation: :update, entry_id: entry.id, if_match: context.if_match || found.version,
-                            body: update_body(entry, project:, attributes:),
+                            body: update_body(entry, project:, attributes:), identity:,
                             idempotency_key: request_key(:update, entry.id))
           hydrate(row, user_id: entry.user_id)
         when :timekeeping
@@ -219,8 +235,18 @@ module Timekeeping
     # receipt for the same actor and key (see replay_timekeeping_destroy).
     # An entry the lookup finds but the scope refuses is still live, so no
     # delete of it can have committed, and it is refused without a replay.
+    #
+    # In the prepared store, a retry with the request's own Idempotency-Key
+    # replays this actor's stored answer before the lookup, which no longer
+    # finds the discarded entry.
     def destroy(entry_id:, authorize:, expected_generation: nil, scope: :company)
       perform(expected_generation) do |ownership, owner|
+        replayed = owner == :prepared && replay_local(ownership:, operation: :destroy, entry_id:, identity: {})
+        if replayed
+          authorize.call(EntryLookup.replayed(context:, row: replayed, entry_id:, scope:))
+          next true
+        end
+
         found = begin
           EntryLookup.find_in_owner(ownership:, context:, entry_id:, read_client:)
         rescue ActiveRecord::RecordNotFound
@@ -237,7 +263,7 @@ module Timekeeping
           entry.discard!
         when :prepared
           local_write(ownership:, operation: :destroy, entry_id: entry.id, if_match: context.if_match || found.version,
-                      body: {}, idempotency_key: request_key(:destroy, entry.id))
+                      body: {}, identity: {}, idempotency_key: request_key(:destroy, entry.id))
         when :timekeeping
           write_client.destroy_entry(context:, generation: ownership.generation, entry_id: entry.id,
                                      version: found.version)
@@ -256,12 +282,14 @@ module Timekeeping
     # locked entry an employee moves, is skipped silently on both branches.
     # A generation or handoff refusal raises and leaves no entry moved.
     def bulk_move(entry_ids:, project:, check:, expected_generation:, scope: :company)
-      bulk_write(entry_ids:, check:, expected_generation:, scope:) do |ownership, owner, entries|
+      identity = bulk_identity(entry_ids).merge("project_id" => project.id)
+      bulk_write(operation: :bulk_move, identity:, entry_ids:, check:, expected_generation:,
+                 scope:) do |ownership, owner, entries|
         case owner
         when :legacy
           write_each_admitted(entries, owner:, expected_generation:) { |entry| entry.update(project_id: project.id) }
         when :prepared
-          local_bulk_move(ownership:, entries:, project:)
+          local_bulk_move(ownership:, entries:, project:, identity:)
         when :timekeeping
           forward_bulk_move(ownership:, entries:, project:)
         end
@@ -272,12 +300,14 @@ module Timekeeping
     # refusal rules as bulk_move. Discarding runs no validations, as the
     # legacy discard_all never did.
     def bulk_delete(entry_ids:, check:, expected_generation:, scope: :company)
-      bulk_write(entry_ids:, check:, expected_generation:, scope:) do |ownership, owner, entries|
+      identity = bulk_identity(entry_ids)
+      bulk_write(operation: :bulk_delete, identity:, entry_ids:, check:, expected_generation:,
+                 scope:) do |ownership, owner, entries|
         case owner
         when :legacy
           write_each_admitted(entries, owner:, expected_generation:, &:discard)
         when :prepared
-          local_bulk_delete(ownership:, entries:)
+          local_bulk_delete(ownership:, entries:, identity:)
         when :timekeeping
           forward_bulk_delete(ownership:, entries:)
         end
@@ -289,9 +319,19 @@ module Timekeeping
       # One gateway transaction for the whole request, so a refusal at any
       # entry rolls back every write before it and is counted once. The block
       # answers whether anything was written.
-      def bulk_write(entry_ids:, check:, expected_generation:, scope:)
+      #
+      # In the prepared store, a retry with the request's own Idempotency-Key
+      # replays this actor's stored answer before the lookup and the check,
+      # since the first write may have discarded or moved the entries.
+      # :reek:LongParameterList
+      def bulk_write(operation:, identity:, entry_ids:, check:, expected_generation:, scope:)
         perform(expected_generation) do |ownership, owner|
+          replayed = owner == :prepared && replay_local(ownership:, operation:, identity:)
           entries = bulk_entries(ownership:, entry_ids:, scope:)
+          if replayed
+            next BulkResult.new(entries:, refusal: nil, written: reported?(replayed, BULK_RESULTS.fetch(operation)))
+          end
+
           refusal = check.call(entries)
           next BulkResult.new(entries:, refusal:, written: false) unless refusal.nil?
 
@@ -352,20 +392,20 @@ module Timekeeping
       # Skips the same entries as forward_bulk_move. With nothing to write no
       # call is made: the gateway has already fenced the generation, and the
       # local owner would store a receipt for an empty write.
-      def local_bulk_move(ownership:, entries:, project:)
+      def local_bulk_move(ownership:, entries:, project:, identity:)
         ids = movable_entry_ids(entries, project).sort
         return false if ids.empty?
 
         answer = local_write(ownership:, operation: :bulk_move, body: { "entry_ids" => ids, "project_id" => project.id },
-                             idempotency_key: bulk_request_key(:bulk_move, ids))
+                             identity:, idempotency_key: bulk_request_key(:bulk_move, ids))
         reported?(answer, MOVED_RESULT)
       end
 
-      def local_bulk_delete(ownership:, entries:)
+      def local_bulk_delete(ownership:, entries:, identity:)
         ids = entries.map(&:id).sort
         return false if ids.empty?
 
-        answer = local_write(ownership:, operation: :bulk_delete, body: { "entry_ids" => ids },
+        answer = local_write(ownership:, operation: :bulk_delete, body: { "entry_ids" => ids }, identity:,
                              idempotency_key: bulk_request_key(:bulk_delete, ids))
         reported?(answer, DELETED_RESULT)
       end
@@ -378,19 +418,65 @@ module Timekeeping
 
       # One write to the prepared store's local owner, in the gateway's
       # transaction at the generation perform read. The body goes through JSON
-      # so the owner receives and fingerprints the same values a forwarded
-      # write sends over the wire. A refusal raises the error a Timekeeping
-      # refusal raises, so callers and controllers handle both alike.
-      def local_write(ownership:, operation:, body:, idempotency_key:, entry_id: nil, if_match: nil)
+      # so the owner receives the same values a forwarded write sends over the
+      # wire. The receipt fingerprints identity, the request values the body is
+      # built from, because the body also holds values read from current state
+      # (a project's billing default, an entry's stored source fields, the ids
+      # the lookup still finds) that the write itself can change.
+      # :reek:LongParameterList
+      def local_write(ownership:, operation:, body:, identity:, idempotency_key:, entry_id: nil, if_match: nil)
         outcome = local_owner.call(
           operation:, company_id: context.company.id, generation: ownership.generation, actor: local_actor,
           params: { "idempotency_key" => idempotency_key, "if_match" => if_match, "entry_id" => entry_id,
-                    "body" => JSON.parse(JSON.generate(body)) }
+                    "body" => as_json_value(body) },
+          identity: as_json_value(identity)
         )
+        local_answer(operation, outcome)
+      end
+
+      # The local owner's stored answer to an earlier write of the same request
+      # under the same stable key, or nil when there is none. Read before any
+      # check of current state, so a retry whose first attempt committed
+      # replays instead of being refused by what that attempt changed. A key
+      # derived from the request id is new on every retry, so only a key the
+      # client or the import chose is looked up.
+      def replay_local(ownership:, operation:, identity:, idempotency_key: context.idempotency_key, entry_id: nil)
+        return if idempotency_key.nil?
+
+        outcome = local_owner.replay(
+          operation:, company_id: context.company.id, generation: ownership.generation, actor: local_actor,
+          params: { "idempotency_key" => idempotency_key, "entry_id" => entry_id }, identity: as_json_value(identity)
+        )
+        local_answer(operation, outcome) unless outcome.nil?
+      end
+
+      # A success answers its body; a refusal raises the error a Timekeeping
+      # refusal raises, so callers and controllers handle both alike.
+      def local_answer(operation, outcome)
         return outcome.body if (200..299).cover?(outcome.status)
 
         reason = outcome.body["reason"] if outcome.body.is_a?(Hash)
         raise EntryWriteClient.refusal_error(operation:, status: outcome.status, reason:)
+      end
+
+      def as_json_value(value)
+        JSON.parse(JSON.generate(value))
+      end
+
+      # The request values of a create: the resolved target user and project
+      # and the fields the writer may forward, before any default is filled.
+      def create_identity(user:, project:, fields:)
+        { "user_id" => user.id, "project_id" => project.id, "fields" => fields.to_h.stringify_keys }
+      end
+
+      def update_identity(project:, attributes:)
+        { "project_id" => project.id,
+          "fields" => EntryWriteClient.forwarded_fields(attributes, actor_kind: context.actor_kind, operation: :update) }
+      end
+
+      # The requested ids, as given, whatever the lookup still finds.
+      def bulk_identity(entry_ids)
+        { "entry_ids" => self.class.requested_entry_ids(entry_ids).sort }
       end
 
       # The signed-in user the context names, never a request value. The role
@@ -567,7 +653,7 @@ module Timekeeping
       def replay_local_destroy(ownership:, entry_id:, authorize:, scope:)
         row = begin
           local_write(ownership:, operation: :destroy, entry_id:, if_match: EntryWriteClient::REPLAY_ONLY_IF_MATCH,
-                      body: {}, idempotency_key: request_key(:destroy, entry_id))
+                      body: {}, identity: {}, idempotency_key: request_key(:destroy, entry_id))
         rescue EntryWriteClient::Conflict
           raise EntryLookup.not_found
         end
