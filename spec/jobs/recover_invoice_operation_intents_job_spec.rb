@@ -410,8 +410,6 @@ RSpec.describe RecoverInvoiceOperationIntentsJob do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe RecoverInvoiceOperationIntentsJob do
   # "`OutboxDelivery#deliver` and `RecoverInvoiceOperationIntentsJob#deliver_undelivered` skip rows that have `undeliverable_at` set."
   # "a stale_generation answer sets `undeliverable_at`, keeps the row and emits one event, and a later recovery run sends no request for that row."
