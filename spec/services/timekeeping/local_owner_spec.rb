@@ -559,6 +559,7 @@ RSpec.describe Timekeeping::LocalOwner, "agent lock and detach marker on the ent
     cleared = write_entry(:update, "clear-agent", { "agent_id" => nil }, entry:)
 
     expect([created.status, created.body["agent_id"]]).to eq([201, nil])
+    expect(Timekeeping::LocalEntry.find(created.body.fetch("id")).agent_id).to be_nil
     expect([cleared.status, entry.reload.agent_id]).to eq([200, nil])
   end
 
