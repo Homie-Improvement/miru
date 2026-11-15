@@ -21,12 +21,15 @@ class StripeConnectedAccount < ApplicationRecord
   end
 
   def url
+    return if details_submitted
+
+    base_url = AppBaseUrl.current
     Stripe::AccountLink.create(
       type: "account_onboarding",
       account: self.account_id,
-      refresh_url: payments_settings_stripe_connect_refresh_url(host: "#{ENV['APP_BASE_URL']}"),
-      return_url: "#{ENV['APP_BASE_URL']}/settings/payment"
-    ).url unless details_submitted
+      refresh_url: "#{base_url}#{payments_settings_stripe_connect_refresh_path}",
+      return_url: "#{base_url}/settings/payment"
+    ).url
   end
 
   private
