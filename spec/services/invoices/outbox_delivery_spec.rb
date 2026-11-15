@@ -243,6 +243,10 @@ RSpec.describe Invoices::OutboxDelivery, committed_data: true do
   # "a stale_generation answer sets `undeliverable_at`, keeps the row and emits one event, and a later recovery run sends no request for that row."
   # "When the adapter answers retryable with reason `stale_generation`, set `undeliverable_at` and emit `Invoices::UndeliverableOperation.notify(company_id:, operation_id:, kind:)`."
   it "marks a stale_generation commit row undeliverable once, keeps the row and its payload, emits one event and sends nothing on a second delivery" do
+    # Subscribers and alerts match on this name, so a rename must fail here
+    # rather than pass silently through the helper's constant filter.
+    expect(Invoices::UndeliverableOperation::NAME).to eq("invoices.undeliverable_operation")
+
     # The stored row is at generation 7 and the service at 8 in both setups, so
     # the service answers 409 stale_generation whether or not it saw a prepare.
     { "prepared before the service moved on" => true, "never prepared" => false }
