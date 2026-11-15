@@ -63,8 +63,8 @@ class Api::V1::TimesheetEntryController < Api::V1::ApplicationController
     # only resolves the target user and project inside the current company.
     def entry_gateway
       Timekeeping::Gateway.new(
-        context: Timekeeping::WriteContext.new(
-          company: current_company, actor: current_user, actor_kind: "user", request_id: request.request_id
+        context: Timekeeping::WriteContext.for_request(
+          request, company: current_company, actor: current_user, actor_kind: "user"
         )
       )
     end

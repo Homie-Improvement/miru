@@ -40,8 +40,8 @@ class Api::V1::Cli::TimesheetEntriesController < Api::V1::Cli::BaseController
     # and destroy look entries up with the :actor scope.
     def entry_gateway
       Timekeeping::Gateway.new(
-        context: Timekeeping::WriteContext.new(
-          company: current_company, actor: current_user, actor_kind: "cli", request_id: request.request_id
+        context: Timekeeping::WriteContext.for_request(
+          request, company: current_company, actor: current_user, actor_kind: "cli"
         )
       )
     end

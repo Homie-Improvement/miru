@@ -10,10 +10,30 @@ module Timekeeping
   # token is minted for. agent is set only when an agent acts for that user.
   # An agent_destroy write detaches a deleted agent's entries; its actor is
   # the agent's backing user, and a forwarded detach uses a service token.
-  class WriteContext < Data.define(:company, :actor, :actor_kind, :request_id, :agent)
+  #
+  # idempotency_key and if_match are the request's own Idempotency-Key and
+  # If-Match headers, nil when the request sent none, so a client's retry
+  # and its expected version reach the store that owns the entries.
+  class WriteContext < Data.define(:company, :actor, :actor_kind, :request_id, :agent, :idempotency_key, :if_match)
     ACTOR_KINDS = %w[user cli agent service import agent_destroy].freeze
 
-    def initialize(company:, actor:, actor_kind:, request_id:, agent: nil)
+    IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+    IF_MATCH_HEADER = "If-Match"
+
+    # The context of a write made for a web request: its request id and the
+    # two headers, read here so every controller reads them alike. A blank
+    # header counts as absent.
+    def self.for_request(request, company:, actor:, actor_kind:, agent: nil)
+      new(
+        company:, actor:, actor_kind:, agent:,
+        request_id: request.request_id,
+        idempotency_key: request.headers[IDEMPOTENCY_KEY_HEADER].presence,
+        if_match: request.headers[IF_MATCH_HEADER].presence
+      )
+    end
+
+    # :reek:LongParameterList
+    def initialize(company:, actor:, actor_kind:, request_id:, agent: nil, idempotency_key: nil, if_match: nil)
       actor_kind = actor_kind.to_s
       raise ArgumentError, "unknown actor_kind #{actor_kind.inspect}" unless ACTOR_KINDS.include?(actor_kind)
 
