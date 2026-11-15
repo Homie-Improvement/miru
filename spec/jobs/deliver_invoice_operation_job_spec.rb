@@ -41,8 +41,8 @@ RSpec.describe DeliverInvoiceOperationJob do
   # "Until later issues register their adapters, every owner maps to a retryable \"adapter not available\" error."
   # "It calls the adapter's `commit` or `abort`, sets `delivered_at` only on a settled outcome, and otherwise keeps the row and increments `attempts`."
   it "counts an attempt and keeps the row when no adapter is registered for the current owner" do
-    # The Timekeeping service owner has no adapter registered yet.
-    TimekeepingOwnership.current.update_columns(owner: "timekeeping", monolith_store: "prepared")
+    # Every real owner has an adapter, so the lookup is stubbed to name one the table does not list.
+    allow(Timekeeping::EntryOwner).to receive(:for).and_return(:unlisted)
     row = deliver_job_outbox_row(company_id: 8, kind: "abort", intent_state: "failed")
 
     expect { described_class.perform_now(row.id) }.not_to raise_error
