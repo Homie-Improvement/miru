@@ -34,6 +34,7 @@ Set `full_host` in one place, at boot, and never leave it unset:
 - Pick `APP_BASE_URL` when it is non-blank. Whitespace counts as unset.
 - Otherwise use `config.x.default_base_url`, which every `config/environments/*.rb` file declares.
 - Require an absolute `http` or `https` URL with a host. Anything else raises `OmniauthFullHost::InvalidBaseUrl` and stops boot. There is no fallback to the request.
+- In production, require `https` as well. The boot call passes `require_https: Rails.env.production?` to `resolve`, and an `http` base URL from either source raises `OmniauthFullHost::InvalidBaseUrl`. Production forces SSL, so an `http` base URL there would only send OAuth codes and emailed links over plain http. The error names the source and the scheme, never the full URL, so a password embedded in it stays out of boot logs. Development and test keep their `http` defaults.
 - Strip trailing slashes, because OmniAuth appends the callback path and would double the slash.
 - Assign the result as a plain String, not a lambda:
 
@@ -59,3 +60,4 @@ A missing environment variable should never quietly change where sign-in sends a
 - PR #288 declares `config.x.default_base_url` in `config/environments/development.rb`, `config/environments/test.rb` and `config/environments/production.rb`; production reuses one `default_base_url` local for both `ENV.fetch("APP_BASE_URL", ...)` and the new setting.
 - `spec/requests/users/omniauth_callbacks/full_host_pin_spec.rb` shows the control: with `full_host` set to `nil`, a `Host: evil.example` request redirects to `evil.example`; after the initializer loads, the callback is `http://example.com/users/auth/github/callback`, including with forged `X-Forwarded-*` headers.
 - `spec/initializers/omniauth_full_host_spec.rb` checks that `pin!` leaves a value that does not respond to `call`, and that `example.com`, `ftp://example.com` and `http://` raise `OmniauthFullHost::InvalidBaseUrl`.
+- `spec/initializers/omniauth_full_host_spec.rb` and `spec/initializers/omniauth_full_host_2_spec.rb` stub `Rails.env` to production and check that the initializer refuses to boot on an `http` APP_BASE_URL or fallback and boots on an `https` one, and that `resolve` without `require_https` still accepts `http`.
