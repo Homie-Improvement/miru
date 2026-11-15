@@ -219,3 +219,25 @@ RSpec.describe InvoiceMailer, "refused billing under the prepared owner", type: 
     expect(ActionMailer::Base.deliveries).to be_empty
   end
 end
+
+RSpec.describe InvoiceMailer, "base URL", type: :mailer do
+  # "each reads the one per-environment base URL (APP_BASE_URL, else config.x.default_base_url)."
+  it "links the invoice email to the swapped config.x.default_base_url when APP_BASE_URL is unset" do
+    original_default = Rails.configuration.x.default_base_url
+    original_env = ENV["APP_BASE_URL"]
+    ENV.delete("APP_BASE_URL")
+    Rails.configuration.x.default_base_url = "https://boot-check.test"
+    allow(InvoicePayment::PdfGeneration).to receive(:process).and_return("%PDF-1.4 invoice")
+    company = create(:company)
+    client = create(:client, company:)
+    invoice = create(:invoice, client:, company:, status: :sending)
+
+    mail = InvoiceMailer.with(invoice_id: invoice.id, subject: "Invoice", recipients: [client.email]).invoice
+    body = mail.html_part&.body&.decoded || mail.body.decoded
+
+    expect(body).to include("https://boot-check.test/invoices/#{invoice.external_view_key}/view")
+  ensure
+    Rails.configuration.x.default_base_url = original_default
+    original_env.nil? ? ENV.delete("APP_BASE_URL") : ENV["APP_BASE_URL"] = original_env
+  end
+end

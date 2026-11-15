@@ -5,7 +5,7 @@ class SendReminderMailer < ApplicationMailer
     @invoice = params[:invoice]
     recipients = params[:recipients]
     @message = params[:message]
-    @invoice_url = "#{ENV['APP_BASE_URL']}/invoices/#{@invoice.external_view_key}/view"
+    @invoice_url = "#{AppBaseUrl.current}/invoices/#{@invoice.external_view_key}/view"
     @company = @invoice.company
     @company_logo = company_logo
     @amount = FormatAmountService.new(@company.base_currency, @invoice.amount).process

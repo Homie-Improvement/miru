@@ -57,7 +57,7 @@ class ExpenseMailer < ApplicationMailer
 
     def load_expense
       @expense = Expense.includes(:company, :user).find(params[:expense_id])
-      @expense_url = "#{ENV['APP_BASE_URL']}/expenses/#{@expense.id}"
+      @expense_url = "#{AppBaseUrl.current}/expenses/#{@expense.id}"
       @company = @expense.company
     end
 end

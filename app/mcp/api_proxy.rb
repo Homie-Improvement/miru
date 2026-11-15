@@ -66,22 +66,19 @@ module MCP
               "CONTENT_TYPE" => "application/json"
             }
 
-            host = default_host
-            headers["HTTP_HOST"] = host if host.present?
+            headers["HTTP_HOST"] = default_host
             headers
           end
 
+          # AppBaseUrl.current is already validated as an absolute URL with a host.
           def default_host
-            uri = URI.parse(ENV.fetch("APP_BASE_URL", ""))
-            return if uri.host.blank?
+            uri = URI.parse(AppBaseUrl.current)
 
-            if uri.port && uri.port != uri.default_port
+            if uri.port != uri.default_port
               "#{uri.host}:#{uri.port}"
             else
               uri.host
             end
-          rescue URI::InvalidURIError
-            nil
           end
 
           def normalize_headers(headers)

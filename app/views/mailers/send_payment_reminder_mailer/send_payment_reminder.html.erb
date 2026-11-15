@@ -18,6 +18,6 @@
       { label: t("mailers.labels.issue_date"), value: CompanyDateFormattingService.new(invoice.issue_date, company: @company).process },
       { label: t("mailers.labels.status"), value: invoice.status.humanize }
     ] %>
-    <%= render "shared/mailer/button", href: "#{ENV['APP_BASE_URL']}/invoices/#{invoice.external_view_key}/view", label: t("mailers.actions.open_invoice") %>
+    <%= render "shared/mailer/button", href: "#{AppBaseUrl.current}/invoices/#{invoice.external_view_key}/view", label: t("mailers.actions.open_invoice") %>
   </div>
 <% end %>

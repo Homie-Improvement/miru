@@ -6,7 +6,7 @@ class MonthlyReportsMailer < ApplicationMailer
     @recipient = User.find_by(id: params[:recipient_id])
     @month = params[:month].present? ? Date.parse(params[:month].to_s) : Date.current.prev_month
     @digest = Reports::MonthlyCashFlowDigest.new(company: @company, month: @month).process
-    @reports_url = "#{ENV['APP_BASE_URL']}/reports"
+    @reports_url = "#{AppBaseUrl.current}/reports"
     recipients = Array(params[:recipients]).presence || Array(@recipient&.email)
     with_recipient_locale(@recipient) do
       mail(

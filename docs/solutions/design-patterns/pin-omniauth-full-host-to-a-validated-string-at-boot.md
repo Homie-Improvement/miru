@@ -29,12 +29,12 @@ Before PR #288, `config/initializers/devise.rb` set `full_host` only when `APP_B
 
 ## Solution
 
-Set `full_host` in one place, at boot, and never leave it unset:
+Set `full_host` in one place, at boot, and never leave it unset. The value comes from `AppBaseUrl.current` (`config/initializers/app_base_url.rb`), which the mailers, the QuickBooks configuration and the MCP API proxy also read:
 
 - Pick `APP_BASE_URL` when it is non-blank. Whitespace counts as unset.
 - Otherwise use `config.x.default_base_url`, which every `config/environments/*.rb` file declares.
-- Require an absolute `http` or `https` URL with a host. Anything else raises `OmniauthFullHost::InvalidBaseUrl` and stops boot. There is no fallback to the request.
-- In production, require `https` as well. The boot call passes `require_https: Rails.env.production?` to `resolve`, and an `http` base URL from either source raises `OmniauthFullHost::InvalidBaseUrl`. Production forces SSL, so an `http` base URL there would only send OAuth codes and emailed links over plain http. The error names the source and the scheme, never the full URL, so a password embedded in it stays out of boot logs. Development and test keep their `http` defaults.
+- Require an absolute `http` or `https` URL with a host. Anything else raises `AppBaseUrl::InvalidBaseUrl` and stops boot. There is no fallback to the request.
+- In production, require `https` as well. The boot call passes `AppBaseUrl.current` to `OmniauthFullHost.enforce_https` with `require_https: Rails.env.production?`, and an `http` base URL from either source raises `OmniauthFullHost::InvalidBaseUrl`, which is the same class as `AppBaseUrl::InvalidBaseUrl`. Production forces SSL, so an `http` base URL there would only send OAuth codes and emailed links over plain http. The error names the settings and the scheme, never the full URL, so a password embedded in it stays out of boot logs. Development and test keep their `http` defaults.
 - Strip trailing slashes, because OmniAuth appends the callback path and would double the slash.
 - Assign the result as a plain String, not a lambda:
 

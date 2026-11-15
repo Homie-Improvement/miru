@@ -14,40 +14,6 @@ RSpec.describe OmniauthFullHost do
     OmniAuth.config.full_host = original_full_host
   end
 
-  describe ".resolve" do
-    it "uses the per-environment fallback when APP_BASE_URL is nil, empty or whitespace" do
-      [nil, "", "   "].each do |unset_value|
-        expect(described_class.resolve(app_base_url: unset_value, fallback: "http://example.com"))
-          .to eq("http://example.com")
-      end
-    end
-
-    it "keeps a non-blank APP_BASE_URL ahead of the fallback and drops its trailing slash" do
-      expect(described_class.resolve(app_base_url: "https://app.miru.so", fallback: "http://example.com"))
-        .to eq("https://app.miru.so")
-      expect(described_class.resolve(app_base_url: "https://app.miru.so/", fallback: "http://example.com"))
-        .to eq("https://app.miru.so")
-    end
-
-    # The per-environment value is required: a missing one must not leave OmniAuth
-    # building the host from the request.
-    it "refuses to resolve when both APP_BASE_URL and the required fallback are missing or blank" do
-      [nil, "", "  ", "   "].each do |missing_fallback|
-        expect { described_class.resolve(app_base_url: nil, fallback: missing_fallback) }
-          .to raise_error(OmniauthFullHost::InvalidBaseUrl)
-      end
-    end
-
-    it "refuses a base URL that is not an absolute http or https URL with a host" do
-      ["example.com", "ftp://example.com", "http://"].each do |malformed|
-        expect { described_class.resolve(app_base_url: malformed, fallback: "http://example.com") }
-          .to raise_error(OmniauthFullHost::InvalidBaseUrl)
-        expect { described_class.resolve(app_base_url: nil, fallback: malformed) }
-          .to raise_error(OmniauthFullHost::InvalidBaseUrl)
-      end
-    end
-  end
-
   describe ".pin!" do
     it "pins full_host to the fixed string rather than a callable that reads the request" do
       described_class.pin!("http://example.com")
@@ -93,7 +59,7 @@ RSpec.describe OmniauthFullHost do
       ENV["APP_BASE_URL"] = "example.com"
       OmniAuth.config.full_host = nil
 
-      expect { load initializer_path }.to raise_error(OmniauthFullHost::InvalidBaseUrl)
+      expect { load initializer_path }.to raise_error(AppBaseUrl::InvalidBaseUrl)
     end
   end
 

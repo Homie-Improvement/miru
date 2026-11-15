@@ -35,3 +35,23 @@ RSpec.describe Devise::Mailer, type: :mailer do
     end
   end
 end
+
+RSpec.describe Devise::Mailer, type: :mailer do
+  # "app/services/quick_books/configuration.rb, app/mcp/api_proxy.rb and the mailers no longer carry their own
+  # APP_BASE_URL fallback literals; each reads the one per-environment base URL (APP_BASE_URL, else config.x.default_base_url)."
+  it "points the unlock email at the swapped config.x.default_base_url instead of 127.0.0.1 when APP_BASE_URL is unset" do
+    original_app_base_url = ENV["APP_BASE_URL"]
+    original_default_base_url = Rails.configuration.x.default_base_url
+    ENV.delete("APP_BASE_URL")
+    Rails.configuration.x.default_base_url = "https://boot-check.test"
+    user = create(:user)
+
+    body = described_class.unlock_instructions(user, "preview-unlock-token").body.decoded
+
+    expect(body).to include("https://boot-check.test/password/new")
+    expect(body).not_to include("127.0.0.1")
+  ensure
+    original_app_base_url.nil? ? ENV.delete("APP_BASE_URL") : ENV["APP_BASE_URL"] = original_app_base_url
+    Rails.configuration.x.default_base_url = original_default_base_url
+  end
+end
