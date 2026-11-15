@@ -29,11 +29,11 @@ Before PR #288, `config/initializers/devise.rb` set `full_host` only when `APP_B
 
 ## Solution
 
-Set `full_host` in one place, at boot, and never leave it unset:
+Set `full_host` in one place, at boot, and never leave it unset. The value comes from `AppBaseUrl.current` (`config/initializers/app_base_url.rb`), which the mailers, the QuickBooks configuration and the MCP API proxy also read:
 
 - Pick `APP_BASE_URL` when it is non-blank. Whitespace counts as unset.
 - Otherwise use `config.x.default_base_url`, which every `config/environments/*.rb` file declares.
-- Require an absolute `http` or `https` URL with a host. Anything else raises `OmniauthFullHost::InvalidBaseUrl` and stops boot. There is no fallback to the request.
+- Require an absolute `http` or `https` URL with a host. Anything else raises `AppBaseUrl::InvalidBaseUrl` and stops boot. There is no fallback to the request.
 - Strip trailing slashes, because OmniAuth appends the callback path and would double the slash.
 - Assign the result as a plain String, not a lambda:
 
