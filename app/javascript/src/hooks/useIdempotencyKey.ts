@@ -9,8 +9,6 @@ import {
 } from "../apis/idempotencyKey";
 
 interface UseIdempotencyKeyReturn {
-  keyFor: (body: unknown) => string;
-  settle: (succeeded: boolean) => void;
   sendWithKey: <T extends object>(
     body: unknown,
     write: (idempotencyKey: string) => Promise<T>
@@ -23,16 +21,6 @@ interface UseIdempotencyKeyReturn {
 export const useIdempotencyKey = (): UseIdempotencyKeyReturn => {
   const held = useRef<ActionKey | null>(null);
 
-  const keyFor = useCallback((body: unknown): string => {
-    held.current = keyForSend(held.current, body, uuidv4);
-
-    return held.current.key;
-  }, []);
-
-  const settle = useCallback((succeeded: boolean): void => {
-    held.current = afterAnswer(held.current, succeeded);
-  }, []);
-
   // Runs one write under the held key and settles it by the outcome. The API
   // client resolves only 2xx answers and rejects every other answer and every
   // network error, so a resolved write is a success.
@@ -43,21 +31,22 @@ export const useIdempotencyKey = (): UseIdempotencyKeyReturn => {
       body: unknown,
       write: (idempotencyKey: string) => Promise<T>
     ): Promise<T> => {
-      const idempotencyKey = keyFor(body);
+      const action = keyForSend(held.current, body, uuidv4);
+      held.current = action;
       try {
-        const result = await write(idempotencyKey);
-        settle(true);
+        const result = await write(action.key);
+        held.current = afterAnswer(held.current, true);
 
         return result;
       } catch (error) {
-        settle(false);
+        held.current = afterAnswer(held.current, false);
         throw error;
       }
     },
-    [keyFor, settle]
+    []
   );
 
-  return { keyFor, settle, sendWithKey };
+  return { sendWithKey };
 };
 
 export default useIdempotencyKey;
