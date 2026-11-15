@@ -916,3 +916,290 @@ RSpec.describe Timekeeping::EntryWriteClient, "refusal mapping" do
     expect(failed.message).to eq("Timekeeping entry create answered 500")
   end
 end
+
+RSpec.describe Timekeeping::EntryWriteClient, "client idempotency key on forwarded writes" do
+  let(:client_key_base_url) { "http://timekeeping.test" }
+  let(:client_key_company) { create(:company) }
+  let(:client_key_admin) { create(:user, current_workspace_id: client_key_company.id) }
+  let(:client_key_project) { create(:project, billable: true, client: create(:client, company: client_key_company)) }
+  let(:client_key_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
+      with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, client_key_base_url) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company: client_key_company, user: client_key_admin)
+    client_key_admin.add_role :admin, client_key_company
+    client_key_fake.register_company(id: client_key_company.id, edit_days: client_key_company.timesheet_edit_days)
+    client_key_fake.register_user(id: client_key_admin.id, company_id: client_key_company.id, role: "admin")
+    client_key_fake.register_project(id: client_key_project.id, company_id: client_key_company.id)
+    route_timekeeping_to_fake(client_key_fake, base_url: client_key_base_url)
+  end
+
+  # The client header is untrusted input: Timekeeping must only ever receive a well-formed UUID derived from it,
+  # and a retry under a new request id must carry the same derived key so it replays instead of writing twice.
+  it "forwards a UUID derived from the client Idempotency-Key, never the raw header, and the same key under two request ids" do
+    raw_client_key = "client-key-#{'x' * 300}"
+    body = {
+      "project_id" => client_key_project.id, "user_id" => client_key_admin.id, "work_date" => Date.current.iso8601,
+      "duration" => 30.0, "note" => "client keyed", "source" => "manual", "source_metadata" => {}
+    }
+    contexts = %w[req-client-key-a req-client-key-b].map do |request_id|
+      Timekeeping::WriteContext.new(company: client_key_company, actor: client_key_admin, actor_kind: "user",
+                                    request_id:, idempotency_key: raw_client_key)
+    end
+
+    first = described_class.new.create_entry(context: contexts.first, generation: client_key_fake.generation, body:)
+    second = described_class.new.create_entry(context: contexts.last, generation: client_key_fake.generation, body:)
+
+    expect(second["id"]).to eq(first["id"])
+    keys = client_key_fake.requests.filter_map do |request|
+      request[:headers]["Idempotency-Key"] if request[:method] == "POST"
+    end
+    expect(keys.size).to eq(2)
+    expect(keys.uniq.size).to eq(1)
+    expect(keys.first).not_to include(raw_client_key)
+    expect(keys.first).to match(/\A\h{8}-\h{4}-\h{4}-\h{4}-\h{12}\z/)
+  end
+end
+
+RSpec.describe Timekeeping::EntryWriteClient, "client idempotency key scoped per actor" do
+  let(:scoped_key_base_url) { "http://timekeeping.test" }
+  let(:scoped_key_company) { create(:company) }
+  let(:scoped_key_project) { create(:project, billable: true, client: create(:client, company: scoped_key_company)) }
+  let(:scoped_key_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+  let(:scoped_key_admins) do
+    Array.new(2) do
+      create(:user, current_workspace_id: scoped_key_company.id).tap do |admin|
+        create(:employment, company: scoped_key_company, user: admin)
+        admin.add_role :admin, scoped_key_company
+      end
+    end
+  end
+  let(:scoped_key_employee) do
+    create(:user, current_workspace_id: scoped_key_company.id).tap do |employee|
+      create(:employment, company: scoped_key_company, user: employee)
+      employee.add_role :employee, scoped_key_company
+    end
+  end
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
+      with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, scoped_key_base_url) { example.run }
+    end
+  end
+
+  before do
+    scoped_key_fake.register_company(id: scoped_key_company.id, edit_days: scoped_key_company.timesheet_edit_days)
+    scoped_key_admins.each do |admin|
+      scoped_key_fake.register_user(id: admin.id, company_id: scoped_key_company.id, role: "admin")
+    end
+    scoped_key_fake.register_user(id: scoped_key_employee.id, company_id: scoped_key_company.id, role: "employee")
+    scoped_key_fake.register_project(id: scoped_key_project.id, company_id: scoped_key_company.id)
+    route_timekeeping_to_fake(scoped_key_fake, base_url: scoped_key_base_url)
+  end
+
+  # "A key from another company or actor never matches." (docs/architecture/timekeeping-soa.md section 5.1)
+  # The derived key does not name the actor, so a guessed or shared client key must still not hand one
+  # actor the stored answer of another actor's write.
+  it "never replays one actor's create to another actor who sends the same client Idempotency-Key" do
+    shared_client_key = SecureRandom.uuid
+    body = {
+      "project_id" => scoped_key_project.id, "user_id" => scoped_key_employee.id, "work_date" => Date.current.iso8601,
+      "duration" => 45.0, "note" => "same body", "source" => "manual", "source_metadata" => {}
+    }
+
+    created = scoped_key_admins.each_with_index.map do |admin, index|
+      context = Timekeeping::WriteContext.new(company: scoped_key_company, actor: admin, actor_kind: "user",
+                                              request_id: "req-scoped-#{index}", idempotency_key: shared_client_key)
+      described_class.new.create_entry(context:, generation: scoped_key_fake.generation, body:)
+    end
+
+    expect(created.map { |entry| entry["id"] }.uniq.size).to eq(2)
+  end
+end
+
+RSpec.describe Timekeeping::EntryWriteClient, "replay-only bulk delete" do
+  let(:replay_bulk_base_url) { "http://timekeeping.test" }
+  let(:replay_bulk_company) { create(:company) }
+  let(:replay_bulk_admin) { create(:user, current_workspace_id: replay_bulk_company.id) }
+  let(:replay_bulk_project) { create(:project, billable: true, client: create(:client, company: replay_bulk_company)) }
+  let(:replay_bulk_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
+      with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, replay_bulk_base_url) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company: replay_bulk_company, user: replay_bulk_admin)
+    replay_bulk_admin.add_role :admin, replay_bulk_company
+    replay_bulk_fake.register_company(id: replay_bulk_company.id, edit_days: replay_bulk_company.timesheet_edit_days)
+    replay_bulk_fake.register_user(id: replay_bulk_admin.id, company_id: replay_bulk_company.id, role: "admin")
+    replay_bulk_fake.register_project(id: replay_bulk_project.id, company_id: replay_bulk_company.id)
+    route_timekeeping_to_fake(replay_bulk_fake, base_url: replay_bulk_base_url)
+  end
+
+  # The replay skips the monolith's lookup, scope and lock checks, so it must only ever return a stored
+  # receipt: with none, it must answer not found and delete nothing, even for an entry that is still live.
+  it "a replay-only bulk delete with no stored receipt is refused and leaves a live entry undeleted" do
+    create_context = Timekeeping::WriteContext.new(company: replay_bulk_company, actor: replay_bulk_admin,
+                                                   actor_kind: "user", request_id: "req-replay-bulk-create")
+    entry = described_class.new.create_entry(
+      context: create_context, generation: replay_bulk_fake.generation,
+      body: { "project_id" => replay_bulk_project.id, "user_id" => replay_bulk_admin.id,
+              "work_date" => Date.current.iso8601, "duration" => 30.0, "note" => "still live",
+              "source" => "manual", "source_metadata" => {} }
+    )
+    replay_context = Timekeeping::WriteContext.new(company: replay_bulk_company, actor: replay_bulk_admin,
+                                                   actor_kind: "user", request_id: "req-replay-bulk-1",
+                                                   idempotency_key: SecureRandom.uuid)
+
+    expect do
+      described_class.new.replay_bulk_delete(context: replay_context, generation: replay_bulk_fake.generation,
+                                             entry_ids: [entry["id"]])
+    end.to raise_error(StandardError)
+
+    replay_request = replay_bulk_fake.requests.reverse.find do |request|
+      request[:path].to_s.end_with?("/entries/bulk-delete")
+    end
+    expect(replay_request[:headers]["Idempotency-Replay"]).to eq("only")
+
+    delete_context = Timekeeping::WriteContext.new(company: replay_bulk_company, actor: replay_bulk_admin,
+                                                   actor_kind: "user", request_id: "req-replay-bulk-real")
+    answer = described_class.new.bulk_delete(context: delete_context, generation: replay_bulk_fake.generation,
+                                             entry_ids: [entry["id"]])
+    expect(answer.to_json).to include("deleted")
+  end
+end
+
+RSpec.describe Timekeeping::EntryWriteClient, "replay-only bulk delete" do
+  let(:bulk_replay_base_url) { "http://timekeeping.test" }
+  let(:bulk_replay_company) { create(:company) }
+  let(:bulk_replay_admin) do
+    create(:user).tap do |admin|
+      create(:employment, company: bulk_replay_company, user: admin)
+      admin.add_role :admin, bulk_replay_company
+    end
+  end
+  let(:bulk_replay_url) { "#{bulk_replay_base_url}/v1/companies/#{bulk_replay_company.id}/entries/bulk-delete" }
+  let(:bulk_replay_client) { described_class.new(base_url: bulk_replay_base_url) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+  end
+
+  def bulk_replay_context(request_id)
+    Timekeeping::WriteContext.new(company: bulk_replay_company, actor: bulk_replay_admin, actor_kind: "user",
+                                  request_id:, idempotency_key: "client-bulk-key-1")
+  end
+
+  # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
+  it "sends the replay-only bulk delete under a new request id with the original client-key derived key and the same body" do
+    sent = []
+    answer_body = { "results" => [{ "id" => 3, "result" => "deleted" }, { "id" => 5, "result" => "deleted" }] }
+    stub_request(:post, bulk_replay_url).to_return do |request|
+      sent << request
+      { status: 200, body: answer_body.to_json, headers: { "Content-Type" => "application/json" } }
+    end
+
+    bulk_replay_client.bulk_delete(context: bulk_replay_context("req-bulk-first"), generation: 3, entry_ids: [5, 3])
+    answer = bulk_replay_client.replay_bulk_delete(context: bulk_replay_context("req-bulk-retry"), generation: 3,
+                                                   entry_ids: [3, 5])
+
+    original, replay = sent
+    expect(answer).to eq(answer_body)
+    expect(replay.headers["Idempotency-Key"]).to eq(original.headers["Idempotency-Key"])
+    expect(replay.headers["Idempotency-Key"]).not_to eq("client-bulk-key-1")
+    expect(replay.headers["Idempotency-Replay"]).to eq("only")
+    expect(original.headers["Idempotency-Replay"]).to be_nil
+    expect(JSON.parse(replay.body)).to eq(JSON.parse(original.body))
+  end
+end
+
+RSpec.describe Timekeeping::EntryWriteClient, "client idempotency key seed" do
+  let(:seed_base_url) { "http://timekeeping.test" }
+  let(:seed_company) { create(:company) }
+  let(:seed_admin) do
+    create(:user).tap do |admin|
+      create(:employment, company: seed_company, user: admin)
+      admin.add_role :admin, seed_company
+    end
+  end
+  let(:seed_entry_url) { "#{seed_base_url}/v1/companies/#{seed_company.id}/entries/52" }
+  let(:seed_client) { described_class.new(base_url: seed_base_url) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+  end
+
+  def seed_context(request_id, idempotency_key)
+    Timekeeping::WriteContext.new(company: seed_company, actor: seed_admin, actor_kind: "user", request_id:,
+                                  idempotency_key:)
+  end
+
+  it "sends one derived Idempotency-Key for the same client key under two request ids and never the raw client key" do
+    sent = []
+    stub_request(:delete, seed_entry_url).to_return do |request|
+      sent << request
+      { status: 200, body: { "id" => 52, "company_id" => seed_company.id }.to_json }
+    end
+    client_key = "7e6d5c4b-3a29-4180-9f8e-7d6c5b4a3928"
+
+    seed_client.destroy_entry(context: seed_context("req-seed-one", client_key), generation: 3, entry_id: 52, version: 1)
+    seed_client.destroy_entry(context: seed_context("req-seed-two", client_key), generation: 3, entry_id: 52, version: 1)
+    seed_client.destroy_entry(context: seed_context("req-seed-three", nil), generation: 3, entry_id: 52, version: 1)
+
+    keys = sent.map { |request| request.headers["Idempotency-Key"] }
+    expect(keys[0]).to eq(keys[1])
+    expect(keys[0]).not_to eq(client_key)
+    expect(keys[0]).to match(/\A\h{8}-\h{4}-\h{4}-\h{4}-\h{12}\z/)
+    expect(keys[2]).not_to eq(keys[0])
+  end
+end
+
+RSpec.describe Timekeeping::EntryWriteClient, "replay-only bulk delete" do
+  let(:replay_bulk_base_url) { "http://timekeeping.test" }
+  let(:replay_bulk_company) { create(:company) }
+  let(:replay_bulk_admin) { create(:user, current_workspace_id: replay_bulk_company.id) }
+  let(:replay_bulk_project) { create(:project, billable: true, client: create(:client, company: replay_bulk_company)) }
+  let(:replay_bulk_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+  end
+
+  before do
+    create(:employment, company: replay_bulk_company, user: replay_bulk_admin)
+    replay_bulk_admin.add_role :admin, replay_bulk_company
+    replay_bulk_fake.generation = 2
+    replay_bulk_fake.register_company(id: replay_bulk_company.id, edit_days: replay_bulk_company.timesheet_edit_days)
+    replay_bulk_fake.register_user(id: replay_bulk_admin.id, company_id: replay_bulk_company.id, role: "admin")
+    replay_bulk_fake.register_project(id: replay_bulk_project.id, company_id: replay_bulk_company.id)
+    route_timekeeping_to_fake(replay_bulk_fake, base_url: replay_bulk_base_url)
+  end
+
+  # A replay may only return an answer this actor already committed; it must never delete entries the
+  # monolith's own lookup and lock checks did not approve.
+  it "a replay-only bulk delete with no stored receipt raises not found and leaves live entries undeleted" do
+    live_ids = Array.new(2) do
+      replay_bulk_fake.add_entry(company_id: replay_bulk_company.id, user_id: replay_bulk_admin.id,
+                                 project_id: replay_bulk_project.id, work_date: Date.current.iso8601).fetch("id")
+    end
+    context = Timekeeping::WriteContext.new(company: replay_bulk_company, actor: replay_bulk_admin, actor_kind: "user",
+                                            request_id: "req-replay-bulk-none", idempotency_key: SecureRandom.uuid)
+
+    expect do
+      described_class.new(base_url: replay_bulk_base_url)
+        .replay_bulk_delete(context:, generation: 2, entry_ids: live_ids)
+    end.to raise_error(ActiveRecord::RecordNotFound)
+
+    live_ids.each { |entry_id| expect(replay_bulk_fake.stored_entry(entry_id)["discarded_at"]).to be_nil }
+    replay = replay_bulk_fake.requests.find { |request| request[:path].to_s.end_with?("/entries/bulk-delete") }
+    expect(replay[:headers]["Idempotency-Replay"]).to eq("only")
+  end
+end

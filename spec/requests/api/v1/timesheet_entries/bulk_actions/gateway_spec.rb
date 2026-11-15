@@ -1211,3 +1211,294 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController legacy skips throu
     expect(entry.reload.project_id).to eq(to_project.id)
   end
 end
+
+require "rails_helper"
+require_relative "../../../../../support/timekeeping/fake_timekeeping"
+
+RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#destroy forwarded client key replay", type: :request do
+  let(:company) { create(:company) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around { |example| with_forwarded_timekeeping_env { example.run } }
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    arrange_forwarded_timekeeping(fake, company:, users: { admin => "admin" }, project:)
+    sign_in admin
+  end
+
+  # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
+  it "answers 200 for a forwarded bulk delete retried with the same client key after every entry was already deleted" do
+    first_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                              work_date: Date.current.iso8601).fetch("id")
+    second_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                               work_date: Date.current.iso8601).fetch("id")
+    headers = auth_headers(admin).merge("Idempotency-Key" => SecureRandom.uuid)
+    params = { source: { ids: [first_id, second_id] } }
+
+    send_request :delete, api_v1_bulk_action_path, params:, headers: headers
+    expect(response).to have_http_status(:ok)
+    discarded = [first_id, second_id].map { |id| fake.stored_entry(id)["discarded_at"] }
+    expect(discarded).to all(be_present)
+
+    send_request :delete, api_v1_bulk_action_path, params:, headers: headers
+
+    expect(response).to have_http_status(:ok)
+    expect(json_response["notice"]).to eq(I18n.t("timesheet_entry.destroy.message"))
+    expect([first_id, second_id].map { |id| fake.stored_entry(id)["discarded_at"] }).to eq(discarded)
+    bulk_calls = fake.requests.select { |request| request[:path].to_s.end_with?("/entries/bulk-delete") }
+    replay = bulk_calls.find { |request| request[:headers]["Idempotency-Replay"] == "only" }
+    expect(replay).not_to be_nil
+    expect(replay[:headers]["Idempotency-Key"]).to eq(bulk_calls.first[:headers]["Idempotency-Key"])
+  end
+end
+
+require "rails_helper"
+require_relative "../../../../../support/timekeeping/fake_timekeeping"
+
+RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#destroy forwarded client key fewer ids", type: :request do
+  let(:company) { create(:company) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around { |example| with_forwarded_timekeeping_env { example.run } }
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    arrange_forwarded_timekeeping(fake, company:, users: { admin => "admin" }, project:)
+    sign_in admin
+  end
+
+  # A resend under one client key whose body names fewer entries must not be refused as a
+  # reused key, and must not delete anything twice.
+  it "deletes the remaining entry when a forwarded bulk delete is resent with the same client key naming fewer ids" do
+    first_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                              work_date: Date.current.iso8601).fetch("id")
+    second_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                               work_date: Date.current.iso8601).fetch("id")
+    headers = auth_headers(admin).merge("Idempotency-Key" => SecureRandom.uuid)
+
+    send_request :delete, api_v1_bulk_action_path, params: { source: { ids: [first_id] } }, headers: headers
+    expect(response).to have_http_status(:ok)
+    first_discarded_at = fake.stored_entry(first_id)["discarded_at"]
+
+    send_request :delete, api_v1_bulk_action_path, params: { source: { ids: [first_id, second_id] } }, headers: headers
+
+    expect(response).to have_http_status(:ok)
+    expect(fake.stored_entry(second_id)["discarded_at"]).to be_present
+    expect(fake.stored_entry(first_id)["discarded_at"]).to eq(first_discarded_at)
+  end
+end
+
+require "rails_helper"
+require_relative "../../../../../support/timekeeping/fake_timekeeping"
+
+RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#destroy forwarded replay without receipt", type: :request do
+  let(:company) { create(:company) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around { |example| with_forwarded_timekeeping_env { example.run } }
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    arrange_forwarded_timekeeping(fake, company:, users: { admin => "admin" }, project:)
+    sign_in admin
+  end
+
+  # A replay-only bulk delete is answered only from a stored receipt under its own key;
+  # with none it reports not found and writes nothing.
+  it "refuses a forwarded bulk delete under a new client key whose entries are already gone and changes nothing" do
+    entry_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                              work_date: Date.current.iso8601).fetch("id")
+    send_request :delete, api_v1_bulk_action_path, params: { source: { ids: [entry_id] } },
+      headers: auth_headers(admin).merge("Idempotency-Key" => SecureRandom.uuid)
+    expect(response).to have_http_status(:ok)
+    discarded_at = fake.stored_entry(entry_id)["discarded_at"]
+
+    send_request :delete, api_v1_bulk_action_path, params: { source: { ids: [entry_id] } },
+      headers: auth_headers(admin).merge("Idempotency-Key" => SecureRandom.uuid)
+
+    expect(response).to have_http_status(:unprocessable_content)
+    expect(fake.stored_entry(entry_id)["discarded_at"]).to eq(discarded_at)
+  end
+end
+
+RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#destroy forwarded client key across companies", type: :request do
+  let(:company) { create(:company) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:other_company) { create(:company) }
+  let(:other_admin) { create(:user, current_workspace_id: other_company.id) }
+  let(:other_project) { create(:project, billable: true, client: create(:client, company: other_company)) }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around { |example| with_forwarded_timekeeping_env { example.run } }
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    create(:employment, company: other_company, user: other_admin)
+    other_admin.add_role :admin, other_company
+    arrange_forwarded_timekeeping(fake, company:, users: { admin => "admin" }, project:)
+    fake.register_company(id: other_company.id, edit_days: other_company.timesheet_edit_days)
+    fake.register_user(id: other_admin.id, company_id: other_company.id, role: "admin")
+    fake.register_project(id: other_project.id, company_id: other_company.id)
+  end
+
+  it "a forwarded bulk delete retried with the same Idempotency-Key replays for its own company while another company naming those ids under that key is refused" do
+    shared_key = SecureRandom.uuid
+    own_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                            work_date: Date.current.iso8601).fetch("id")
+    other_live_id = fake.add_entry(company_id: other_company.id, user_id: other_admin.id, project_id: other_project.id,
+                                   work_date: Date.current.iso8601).fetch("id")
+
+    sign_in admin
+    send_request :delete, api_v1_bulk_action_path,
+      params: { source: { ids: [own_id] } }, headers: auth_headers(admin).merge("Idempotency-Key" => shared_key)
+    expect(response).to have_http_status(:ok)
+    # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
+    send_request :delete, api_v1_bulk_action_path,
+      params: { source: { ids: [own_id] } }, headers: auth_headers(admin).merge("Idempotency-Key" => shared_key)
+    expect(response).to have_http_status(:ok)
+    expect(json_response["notice"]).to eq(I18n.t("timesheet_entry.destroy.message"))
+    sign_out admin
+
+    sign_in other_admin
+    send_request :delete, api_v1_bulk_action_path,
+      params: { source: { ids: [own_id] } }, headers: auth_headers(other_admin).merge("Idempotency-Key" => shared_key)
+
+    # The first company's stored receipt must never answer another company's request.
+    expect(response).to have_http_status(:unprocessable_entity)
+    expect(json_response).not_to have_key("notice")
+    expect(fake.stored_entry(other_live_id)["discarded_at"]).to be_nil
+    expect(fake.stored_entry(own_id)["company_id"]).to eq(company.id)
+  end
+end
+
+RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#destroy forwarded client key retry", type: :request do
+  let(:company) { create(:company) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around { |example| with_forwarded_timekeeping_env { example.run } }
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    arrange_forwarded_timekeeping(fake, company:, users: { admin => "admin" }, project:)
+    sign_in admin
+  end
+
+  # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
+  it "answers a forwarded bulk delete retried after it committed with the stored success, not 422" do
+    ids = Array.new(2) do
+      fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                     work_date: Date.current.iso8601).fetch("id")
+    end
+    client_key = "6d1e2f3a-4b5c-4d7e-8f90-a1b2c3d4e5f6"
+
+    send_request :delete, api_v1_bulk_action_path, params: { source: { ids: } },
+      headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => "bulk-retry-first")
+    expect(response).to have_http_status(:ok)
+    discarded = ids.map { |id| fake.stored_entry(id)["discarded_at"] }
+    expect(discarded).to all(be_present)
+
+    send_request :delete, api_v1_bulk_action_path, params: { source: { ids: } },
+      headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => "bulk-retry-second")
+
+    expect(response).to have_http_status(:ok)
+    expect(json_response["notice"]).to eq(I18n.t("timesheet_entry.destroy.message"))
+    expect(ids.map { |id| fake.stored_entry(id)["discarded_at"] }).to eq(discarded)
+    bulk_calls = fake.requests.select { |request| request[:method] == "POST" && request[:path].to_s.end_with?("/entries/bulk-delete") }
+    expect(bulk_calls.size).to eq(2)
+    expect(bulk_calls.last[:headers]["Idempotency-Replay"]).to eq("only")
+    expect(bulk_calls.last[:headers]["Idempotency-Key"]).to eq(bulk_calls.first[:headers]["Idempotency-Key"])
+  end
+end
+
+RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#destroy forwarded client key partial resend", type: :request do
+  let(:company) { create(:company) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around { |example| with_forwarded_timekeeping_env { example.run } }
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    arrange_forwarded_timekeeping(fake, company:, users: { admin => "admin" }, project:)
+    sign_in admin
+  end
+
+  it "resends a forwarded bulk delete naming one already deleted id with the same key and deletes the rest without 422" do
+    first_id, second_id = Array.new(2) do
+      fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                     work_date: Date.current.iso8601).fetch("id")
+    end
+    client_key = "9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d"
+
+    send_request :delete, api_v1_bulk_action_path, params: { source: { ids: [first_id] } },
+      headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => "bulk-partial-first")
+    expect(response).to have_http_status(:ok)
+    first_discarded_at = fake.stored_entry(first_id)["discarded_at"]
+
+    send_request :delete, api_v1_bulk_action_path, params: { source: { ids: [first_id, second_id] } },
+      headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => "bulk-partial-second")
+
+    expect(response).to have_http_status(:ok)
+    expect(fake.stored_entry(second_id)["discarded_at"]).not_to be_nil
+    expect(fake.stored_entry(first_id)["discarded_at"]).to eq(first_discarded_at)
+  end
+end
+
+RSpec.describe "Api::V1::TimesheetEntry::BulkActionController#destroy forwarded client key retry", type: :request do
+  let(:company) { create(:company) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around { |example| with_forwarded_timekeeping_env { example.run } }
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    arrange_forwarded_timekeeping(fake, company:, users: { admin => "admin" }, project:)
+    sign_in admin
+  end
+
+  # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
+  it "a forwarded bulk delete retried after every entry was deleted answers 200 from the stored receipt and deletes nothing more" do
+    first_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                              work_date: Date.current.iso8601).fetch("id")
+    second_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                               work_date: Date.current.iso8601).fetch("id")
+    headers = auth_headers(admin).merge("Idempotency-Key" => SecureRandom.uuid)
+    params = { source: { ids: [first_id, second_id] } }
+
+    send_request :delete, api_v1_bulk_action_path, params:, headers: headers
+    expect(response).to have_http_status(:ok)
+
+    send_request :delete, api_v1_bulk_action_path, params:, headers: headers
+    expect(response).to have_http_status(:ok)
+    expect(json_response["notice"]).to eq(I18n.t("timesheet_entry.destroy.message"))
+
+    bulk_calls = fake.requests.select { |request| request[:method] == "POST" && request[:path].to_s.end_with?("/entries/bulk-delete") }
+    expect(bulk_calls.size).to eq(2)
+    original, replay = bulk_calls
+    expect(original[:headers]["Idempotency-Replay"]).to be_nil
+    expect(replay[:headers]["Idempotency-Replay"]).to eq("only")
+    expect(replay[:headers]["Idempotency-Key"]).to eq(original[:headers]["Idempotency-Key"])
+    expect(fake.stored_entry(first_id)["discarded_at"]).not_to be_nil
+    expect(fake.stored_entry(second_id)["discarded_at"]).not_to be_nil
+  end
+end
