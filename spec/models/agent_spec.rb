@@ -365,3 +365,163 @@ RSpec.describe Agent do
     expect(fake.stored_entry(remote["id"])["agent_id"]).to eq(agent.id)
   end
 end
+
+RSpec.describe Agent, "prepared destroy refused by the local owner" do
+  # A refusal must raise so the destroy rolls back; a swallowed refusal would delete the agent while
+  # entries still name it.
+  it "a forbidden answer from the local owner on a prepared detach aborts the agent destroy and keeps entries attached" do
+    agent = create(:agent)
+    prepare_local_ownership!
+    project = create(:project, client: create(:client, company: agent.company))
+    entry = Timekeeping::LocalEntry.create!(company_id: agent.company_id, user_id: agent.user_id,
+                                            project_id: project.id, work_date: Date.current, duration: 30.0,
+                                            note: "n", bill_status: "unbilled", agent_id: agent.id)
+    allow(Timekeeping::LocalOwner).to receive(:call)
+      .and_return(Timekeeping::LocalOwner::Outcome.new(status: 403, body: { "reason" => "forbidden" }))
+
+    expect { agent.destroy! }.to raise_error(StandardError) { |error|
+      expect(error).not_to be_a(Timekeeping::Gateway::OwnershipMoving)
+    }
+
+    expect(Timekeeping::LocalOwner).to have_received(:call).with(hash_including(operation: :detach_entries))
+    expect(Agent.exists?(agent.id)).to be(true)
+    expect(entry.reload.agent_id).to eq(agent.id)
+  end
+end
+
+RSpec.describe Agent, "destroy while the prepared store owns entries" do
+  # "With ownership prepared, deleting an agent calls LocalOwner.call(operation: :detach_entries, ...) with a service actor and clears agent_id on its entries instead of answering 503 ownership_moving."
+  it "destroying an agent while the prepared store owns entries removes the agent and clears agent_id on its local entries" do
+    agent = create(:agent)
+    key = create(:agent_key, agent:)
+    prepare_local_ownership!
+    project = create(:project, client: create(:client, company: agent.company))
+    entry = Timekeeping::LocalEntry.create!(company_id: agent.company_id, user_id: agent.user_id,
+                                            project_id: project.id, work_date: Date.current, duration: 30.0,
+                                            note: "n", bill_status: "unbilled", agent_id: agent.id)
+
+    expect { agent.destroy! }.not_to raise_error
+
+    expect(Agent.exists?(agent.id)).to be(false)
+    expect(AgentKey.exists?(key.id)).to be(false)
+    expect(Timekeeping::LocalEntry.unscoped.find(entry.id).agent_id).to be_nil
+  end
+end
+
+RSpec.describe Agent, "prepared destroy refused by the local owner" do
+  it "a stale_generation refusal from the local owner rolls back a prepared agent destroy and leaves the entry attached" do
+    agent = create(:agent)
+    key = create(:agent_key, agent:)
+    prepare_local_ownership!
+    project = create(:project, client: create(:client, company: agent.company))
+    entry = Timekeeping::LocalEntry.create!(company_id: agent.company_id, user_id: agent.user_id,
+                                            project_id: project.id, work_date: Date.current, duration: 30.0,
+                                            note: "n", bill_status: "unbilled", agent_id: agent.id)
+    allow(Timekeeping::LocalOwner).to receive(:call).and_return(
+      Timekeeping::LocalOwner::Outcome.new(status: 409, body: { "reason" => "stale_generation" })
+    )
+
+    expect { agent.destroy! }.to raise_error(Timekeeping::Gateway::StaleGeneration)
+
+    expect(Timekeeping::LocalOwner).to have_received(:call).with(hash_including(operation: :detach_entries))
+    expect(Agent.exists?(agent.id)).to be(true)
+    expect(AgentKey.exists?(key.id)).to be(true)
+    expect(Timekeeping::LocalEntry.unscoped.find(entry.id).agent_id).to eq(agent.id)
+  end
+end
+
+RSpec.describe Agent, "prepared destroy tenant scope" do
+  # "With ownership prepared, deleting an agent calls LocalOwner.call(operation: :detach_entries, ...) with a service
+  # actor and clears agent_id on its entries instead of answering 503 ownership_moving."
+  it "a prepared agent destroy clears agent_id only on its own company's local entries and leaves another company's entry with the same agent id untouched" do
+    agent = create(:agent)
+    other_agent = create(:agent)
+    prepare_local_ownership!
+    project = create(:project, client: create(:client, company: agent.company))
+    other_project = create(:project, client: create(:client, company: other_agent.company))
+    own_entry = Timekeeping::LocalEntry.create!(
+      company_id: agent.company_id, user_id: agent.user_id, project_id: project.id, work_date: Date.current,
+      duration: 30.0, note: "n", bill_status: "unbilled", agent_id: agent.id
+    )
+    # Another company's entry that carries the same agent id value: only the company bound to the
+    # destroyed agent may be touched by the detach.
+    foreign_entry = Timekeeping::LocalEntry.create!(
+      company_id: other_agent.company_id, user_id: other_agent.user_id, project_id: other_project.id,
+      work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled", agent_id: agent.id
+    )
+    foreign_version = foreign_entry.reload.version
+
+    expect { agent.destroy! }.not_to raise_error
+
+    expect(Agent.exists?(agent.id)).to be(false)
+    expect(Timekeeping::LocalEntry.unscoped.find(own_entry.id).agent_id).to be_nil
+    kept = Timekeeping::LocalEntry.unscoped.find(foreign_entry.id)
+    expect(kept.agent_id).to eq(agent.id)
+    expect(kept.version).to eq(foreign_version)
+  end
+end
+
+RSpec.describe Agent, "destroy while the prepared store owns entries" do
+  # "With ownership prepared, deleting an agent calls LocalOwner.call(operation: :detach_entries, ...) with a service actor and clears agent_id on its entries instead of answering 503 ownership_moving."
+  it "destroying an agent while the prepared store owns entries succeeds and clears agent_id on its local entries" do
+    agent = create(:agent)
+    key = create(:agent_key, agent:)
+    prepare_local_ownership!
+    project = create(:project, client: create(:client, company: agent.company))
+    entry = Timekeeping::LocalEntry.create!(company_id: agent.company_id, user_id: agent.user_id, project_id: project.id,
+                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled",
+                                            agent_id: agent.id)
+
+    expect { agent.destroy! }.not_to raise_error
+
+    expect(Agent.exists?(agent.id)).to be(false)
+    expect(AgentKey.exists?(key.id)).to be(false)
+    expect(entry.reload.agent_id).to be_nil
+    audits = Timekeeping::LocalOwner::AuditRow.where(entry_id: entry.id, action: "detach_entries")
+    expect(audits.pluck(:actor_type, :actor_name)).to eq([["service", Timekeeping::ServiceToken::SUBJECT]])
+  end
+end
+
+RSpec.describe Agent, "prepared-store destroy refused by the local owner" do
+  it "a prepared-store agent destroy that the local owner refuses as forbidden rolls back and keeps the entry attached" do
+    agent = create(:agent)
+    prepare_local_ownership!
+    project = create(:project, client: create(:client, company: agent.company))
+    entry = Timekeeping::LocalEntry.create!(company_id: agent.company_id, user_id: agent.user_id, project_id: project.id,
+                                            work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled",
+                                            agent_id: agent.id)
+    allow(Timekeeping::LocalOwner).to receive(:call)
+      .and_return(Timekeeping::LocalOwner::Outcome.new(status: 403, body: { "reason" => "forbidden" }))
+
+    expect { agent.destroy! }.to raise_error(Timekeeping::EntryWriteClient::Forbidden)
+
+    expect(Timekeeping::LocalOwner).to have_received(:call).with(hash_including(operation: :detach_entries))
+    expect(Agent.exists?(agent.id)).to be(true)
+    expect(entry.reload.agent_id).to eq(agent.id)
+  end
+end
+
+RSpec.describe Agent, "prepared destroy refused by the local owner" do
+  # "With ownership prepared, deleting an agent calls LocalOwner.call(operation: :detach_entries, ...) with a service actor and clears agent_id on its entries instead of answering 503 ownership_moving."
+  # A refusal from the local owner must raise its own error and roll the destroy back, never leave a deleted
+  # agent with entries that still point at it.
+  it "rolls back a prepared agent destroy when the local owner refuses the detach with a stale generation" do
+    agent = create(:agent)
+    key = create(:agent_key, agent:)
+    prepare_local_ownership!
+    project = create(:project, client: create(:client, company: agent.company))
+    entry = Timekeeping::LocalEntry.create!(company_id: agent.company_id, user_id: agent.user_id, project_id: project.id,
+                                            work_date: Date.current, duration: 30.0, note: "n",
+                                            bill_status: "unbilled", agent_id: agent.id)
+    allow(Timekeeping::LocalOwner).to receive(:call).and_return(
+      Timekeeping::LocalOwner::Outcome.new(status: 409, body: { "reason" => "stale_generation" })
+    )
+
+    expect { agent.destroy! }.to raise_error(Timekeeping::Gateway::StaleGeneration)
+
+    expect(Timekeeping::LocalOwner).to have_received(:call).with(hash_including(operation: :detach_entries))
+    expect(Agent.exists?(agent.id)).to be(true)
+    expect(AgentKey.exists?(key.id)).to be(true)
+    expect(entry.reload.agent_id).to eq(agent.id)
+  end
+end
