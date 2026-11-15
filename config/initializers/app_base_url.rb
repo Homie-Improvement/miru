@@ -1,8 +1,10 @@
 # frozen_string_literal: true
 
 # The one place that decides the app's base URL for links and callbacks: APP_BASE_URL when it is
-# non-blank, otherwise the environment's required `config.x.default_base_url`. Every reader calls
-# `AppBaseUrl.current` so none keeps its own fallback or falls back to the request's Host header.
+# non-blank, otherwise the environment's required `config.x.default_base_url`. OmniAuth, the
+# QuickBooks configuration, the MCP API proxy, the mailers and their views call `AppBaseUrl.current`
+# so none keeps its own fallback. app/models/stripe_connected_account.rb still reads APP_BASE_URL
+# directly and does not get this fallback or validation.
 #
 # It lives in an initializer rather than lib/ because lib/ is reloadable, and Rails refuses
 # reloadable constants during boot, while config/initializers/omniauth_full_host.rb needs it then.
