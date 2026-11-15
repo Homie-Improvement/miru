@@ -477,3 +477,243 @@ RSpec.describe Timekeeping::LocalOwner, "answers and snapshots" do
     expect(entries.map { |entry| entry.reload.discarded_at }).to all(be_present)
   end
 end
+
+RSpec.describe Timekeeping::LocalOwner, "entry write against a detach of its agent" do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, client: create(:client, company:)) }
+  let(:employee) { timekeeping_member(company, "employee") }
+  let(:agent) { create(:agent, company:, user: employee) }
+  let(:detach_actor) do
+    described_class::Actor.service(name: "agent-destroy", company_id: company.id, operations: ["agents.detach_entries"])
+  end
+
+  before { prepare_local_ownership! }
+
+  # "Local create_entry and update_entry that name an agent take the (company, "agent", agent_id) lock and refuse
+  # when the agent is detached, and a test shows such a write cannot land just after a local detach_entries."
+  # The detach runs inside the write's checkpoint after the write began and before it takes the agent lock, so it
+  # commits ahead of the write on the same connection. The refusal must look like an unknown agent: it must not
+  # tell the user that a detach ran or which service ran it.
+  it "a create naming an agent whose entries are detached after the write began answers only not_found and stores no entry or user receipt" do
+    generation = TimekeepingOwnership.current.generation.to_s
+    detach = nil
+    checkpoint = lambda do |step|
+      next unless step == :receipt_key_locked && detach.nil?
+
+      detach = described_class.call(
+        operation: :detach_entries, company_id: company.id, generation:, actor: detach_actor,
+        params: { "agent_id" => agent.id, "operation_id" => SecureRandom.uuid }
+      )
+    end
+    entries_before = Timekeeping::LocalEntry.where(company_id: company.id).count
+
+    outcome = described_class.call(
+      operation: :create, company_id: company.id, generation:,
+      actor: described_class::Actor.user(user_id: employee.id, role: "employee"),
+      params: { "idempotency_key" => "create-after-detach",
+                "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 10.0,
+                            "note" => "x", "source" => TimesheetEntry::SOURCES.first, "agent_id" => agent.id } },
+      checkpoint:
+    )
+
+    expect(detach&.status).to eq(200)
+    expect(outcome.status).to eq(404)
+    expect(outcome.body).to eq("reason" => "not_found")
+    expect(outcome.body.to_json).not_to include("agent-destroy")
+    expect(Timekeeping::LocalEntry.where(company_id: company.id).count).to eq(entries_before)
+    expect(Timekeeping::LocalEntry.where(agent_id: agent.id)).to be_empty
+    expect(described_class::Receipt.where(company_id: company.id, actor_type: "user").count).to eq(0)
+  end
+end
+
+RSpec.describe Timekeeping::LocalOwner, "entry update against a detach of the agent it sets" do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, client: create(:client, company:)) }
+  let(:employee) { timekeeping_member(company, "employee") }
+  let(:agent) { create(:agent, company:, user: employee) }
+  let(:detach_actor) do
+    described_class::Actor.service(name: "agent-destroy", company_id: company.id, operations: ["agents.detach_entries"])
+  end
+
+  before { prepare_local_ownership! }
+
+  # "Local create_entry and update_entry that name an agent take the (company, "agent", agent_id) lock and refuse
+  # when the agent is detached, and a test shows such a write cannot land just after a local detach_entries."
+  it "an update that sets an agent detached after the write began answers only not_found and keeps the stored row" do
+    generation = TimekeepingOwnership.current.generation.to_s
+    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: employee.id, project_id: project.id,
+                                            work_date: Date.current, duration: 5.0, note: "seeded", bill_status: "unbilled")
+    attributes_before = entry.reload.attributes
+    detach = nil
+    checkpoint = lambda do |step|
+      next unless step == :receipt_key_locked && detach.nil?
+
+      detach = described_class.call(
+        operation: :detach_entries, company_id: company.id, generation:, actor: detach_actor,
+        params: { "agent_id" => agent.id, "operation_id" => SecureRandom.uuid }
+      )
+    end
+
+    outcome = described_class.call(
+      operation: :update, company_id: company.id, generation:,
+      actor: described_class::Actor.user(user_id: employee.id, role: "employee"),
+      params: { "idempotency_key" => "update-after-detach", "entry_id" => entry.id,
+                "body" => { "agent_id" => agent.id } },
+      checkpoint:
+    )
+
+    expect(detach&.status).to eq(200)
+    expect(outcome.status).to eq(404)
+    expect(outcome.body).to eq("reason" => "not_found")
+    expect(entry.reload.attributes).to eq(attributes_before)
+    expect(entry.agent_id).to be_nil
+    expect(described_class::Receipt.where(company_id: company.id, actor_type: "user").count).to eq(0)
+  end
+end
+
+RSpec.describe Timekeeping::LocalOwner, "detach markers stay within their company" do
+  let(:company) { create(:company) }
+  let(:other_company) { create(:company) }
+  let(:project) { create(:project, client: create(:client, company:)) }
+  let(:employee) { timekeeping_member(company, "employee") }
+  let(:agent) { create(:agent, company:, user: employee) }
+  let(:other_detach_actor) do
+    described_class::Actor.service(name: "agent-destroy", company_id: other_company.id,
+                                   operations: ["agents.detach_entries"])
+  end
+
+  before { prepare_local_ownership! }
+
+  # A detach receipt is stored under the company that ran it. If the write's marker check ignored the company,
+  # one company's detach would refuse another company's writes. The other company's detach runs after this write
+  # began, the same timing that refuses a write in its own company.
+  it "a detach recorded in another company for the same agent id does not refuse a create in this company" do
+    generation = TimekeepingOwnership.current.generation.to_s
+    detach = nil
+    checkpoint = lambda do |step|
+      next unless step == :receipt_key_locked && detach.nil?
+
+      detach = described_class.call(
+        operation: :detach_entries, company_id: other_company.id, generation:, actor: other_detach_actor,
+        params: { "agent_id" => agent.id, "operation_id" => SecureRandom.uuid }
+      )
+    end
+
+    outcome = described_class.call(
+      operation: :create, company_id: company.id, generation:,
+      actor: described_class::Actor.user(user_id: employee.id, role: "employee"),
+      params: { "idempotency_key" => "create-beside-other-company-detach",
+                "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 10.0,
+                            "note" => "x", "source" => TimesheetEntry::SOURCES.first, "agent_id" => agent.id } },
+      checkpoint:
+    )
+
+    expect(detach&.status).to eq(200)
+    expect(outcome.status).to eq(201)
+    expect(Timekeeping::LocalEntry.where(company_id: company.id, agent_id: agent.id).count).to eq(1)
+  end
+end
+
+RSpec.describe Timekeeping::LocalOwner, "agent lock and detach marker on the entry path" do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, client: create(:client, company:)) }
+  let(:employee) { timekeeping_member(company, "employee") }
+  let(:agent) { create(:agent, company:, user: employee) }
+  let(:detach_actor) do
+    described_class::Actor.service(name: "agent-destroy", company_id: company.id, operations: ["agents.detach_entries"])
+  end
+  let(:user_actor) { described_class::Actor.user(user_id: employee.id, role: "employee") }
+  let!(:generation) { prepare_local_ownership!.generation.to_s }
+
+  def detach_agent_entries
+    described_class.call(operation: :detach_entries, company_id: company.id, generation:, actor: detach_actor,
+                         params: { "agent_id" => agent.id, "operation_id" => SecureRandom.uuid })
+  end
+
+  def create_body(extra = {})
+    { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 10.0, "note" => "x",
+      "source" => TimesheetEntry::SOURCES.first }.merge(extra)
+  end
+
+  def write_entry(operation, key, body, entry: nil, checkpoint: ->(_step) { })
+    params = { "idempotency_key" => key, "body" => body }
+    params["entry_id"] = entry.id if entry
+    described_class.call(operation:, company_id: company.id, generation:, actor: user_actor, params:, checkpoint:)
+  end
+
+  def seeded_entry(agent_id: nil)
+    Timekeeping::LocalEntry.create!(company_id: company.id, user_id: employee.id, project_id: project.id,
+                                    work_date: Date.current, duration: 5.0, note: "seeded", bill_status: "unbilled",
+                                    agent_id:)
+  end
+
+  # The advisory lock detach-entries takes for this agent, as pg_locks lists
+  # it: the two signed halves of the key digest, read as unsigned oids.
+  def agent_lock_held_by_this_session?
+    classid, objid = Digest::SHA256.digest([company.id, "agent", agent.id].join(described_class::KEY_SEPARATOR))
+      .unpack("l>l>").map { |half| half & 0xFFFFFFFF }
+    ApplicationRecord.connection.select_value(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, classid, objid]))
+      SELECT EXISTS (
+        SELECT 1 FROM pg_locks
+        WHERE locktype = 'advisory' AND classid = ? AND objid = ? AND objsubid = 2 AND pid = pg_backend_pid()
+      )
+    SQL
+  end
+
+  # The body cast refuses a string agent_id later, but the lock is taken
+  # before the request checks, so its key must match detach's for both.
+  it "takes the detach lock of the agent for a body agent_id sent as a string or as an Integer" do
+    held = {}
+    statuses = [agent.id.to_s, agent.id].each_with_index.map do |agent_id, index|
+      checkpoint = ->(step) { held[agent_id] = agent_lock_held_by_this_session? if step == :generation_checked }
+
+      write_entry(:create, "agent-lock-#{index}", create_body("agent_id" => agent_id), checkpoint:).status
+    end
+
+    expect(held).to eq(agent.id.to_s => true, agent.id => true)
+    expect(statuses).to eq([400, 201])
+  end
+
+  it "answers a malformed body agent_id with the existing invalid_request refusal and takes no agent lock" do
+    allow(described_class::ServiceCommands).to receive(:lock_agent).and_call_original
+
+    [[1], {}, "abc"].each_with_index do |agent_id, index|
+      outcome = write_entry(:create, "malformed-agent-#{index}", create_body("agent_id" => agent_id))
+
+      expect(outcome.status).to eq(400)
+      expect(outcome.body).to eq("reason" => "invalid_request")
+    end
+    expect(described_class::ServiceCommands).not_to have_received(:lock_agent)
+    expect(Timekeeping::LocalEntry.where(company_id: company.id)).to be_empty
+  end
+
+  it "accepts a create with agent_id nil after a detach as an unassigned entry, and an update with nil clears the agent" do
+    expect(detach_agent_entries.status).to eq(200)
+
+    created = write_entry(:create, "create-unassigned", create_body("agent_id" => nil))
+    entry = seeded_entry(agent_id: agent.id)
+    cleared = write_entry(:update, "clear-agent", { "agent_id" => nil }, entry:)
+
+    expect([created.status, created.body["agent_id"]]).to eq([201, nil])
+    expect([cleared.status, entry.reload.agent_id]).to eq([200, nil])
+  end
+
+  it "accepts an update that does not name an agent after its stored agent was detached and keeps agent_id nil" do
+    entry = seeded_entry(agent_id: agent.id)
+    expect(detach_agent_entries.body).to eq("detached" => 1)
+
+    outcome = write_entry(:update, "update-after-detach", { "note" => "changed" }, entry:)
+
+    expect(outcome.status).to eq(200)
+    expect(entry.reload.attributes.values_at("note", "agent_id")).to eq(["changed", nil])
+  end
+
+  it "accepts a create naming an agent that still exists after an older committed detach" do
+    expect(detach_agent_entries.status).to eq(200)
+
+    outcome = write_entry(:create, "create-after-old-detach", create_body("agent_id" => agent.id))
+
+    expect(outcome.status).to eq(201)
+    expect(Timekeeping::LocalEntry.find(outcome.body.fetch("id")).agent_id).to eq(agent.id)
+  end
+end

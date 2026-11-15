@@ -69,7 +69,7 @@ module Timekeeping
         }.freeze,
         detach_entries: {
           target_param: "agent_id",
-          lock: ->(company_id, agent_id) { WriteSteps.lock_key(company_id, AGENT_LOCK, agent_id) },
+          lock: ->(company_id, agent_id) { ServiceCommands.lock_agent(company_id, agent_id) },
           # Every entry of the company that names the agent, discarded ones
           # included, so none keeps a reference to it.
           targets: ->(company_id, agent_id) { LocalEntry.where(company_id:, agent_id:) },
@@ -81,9 +81,8 @@ module Timekeeping
       # One request, its values checked: target_id is a positive Integer and
       # operation_id a UUID string.
       Request = Data.define(:route, :actor_name, :target_id, :operation_id) do
-        # The target is part of the receipt's operation, as in the service.
         def operation_name
-          "#{route} #{target_id}"
+          ServiceCommands.operation_name(route, target_id)
         end
 
         def fingerprint
@@ -91,6 +90,39 @@ module Timekeeping
         end
       end
       private_constant :Request
+
+      # Takes the lock a detach-entries command of this agent takes, so an
+      # entry write naming the agent and the detach run one after the other.
+      def self.lock_agent(company_id, agent_id)
+        WriteSteps.lock_key(company_id, AGENT_LOCK, agent_id)
+      end
+
+      # The target is part of the receipt's operation, as in the service. Here
+      # an operation id reused for another target is refused as
+      # idempotency_key_reused (see find_receipt).
+      def self.operation_name(route, target_id)
+        "#{route} #{target_id}"
+      end
+
+      # The id of the newest committed detach-entries receipt of this agent
+      # in the company, or 0 when there is none. An entry write reads it
+      # before it takes the agent lock: a detach still in flight then holds
+      # that lock, and its receipt, once committed, has a higher id.
+      def self.detach_marker(company_id, agent_id)
+        detach_receipts(company_id, agent_id).maximum(:id) || 0
+      end
+
+      # Whether a detach-entries command of this agent in the company stored
+      # its receipt after the marker the write read. An older detach does not
+      # refuse writes for an agent that still exists.
+      def self.agent_detached?(company_id, agent_id, after:)
+        detach_receipts(company_id, agent_id).where("id > ?", after).exists?
+      end
+
+      def self.detach_receipts(company_id, agent_id)
+        Receipt.where(company_id:, actor_type: ACTOR_TYPE, operation: operation_name(:detach_entries, agent_id))
+      end
+      private_class_method :detach_receipts
 
       # :reek:LongParameterList
       def initialize(operation:, company_id:, generation:, actor:, params:, checkpoint:)

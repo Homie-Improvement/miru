@@ -15,7 +15,13 @@ module Timekeeping
   #
   # Each entry write runs in one transaction, in this order:
   #
-  # 1. Lock the receipt key (company, actor, operation, key).
+  # 1. When a create or update body names an agent, read that agent's detach
+  #    marker: the newest committed detach-entries receipt of the agent in
+  #    the company. Then lock the receipt key (company, actor, operation,
+  #    key), then the agent with the lock detach-entries takes, so the write
+  #    and a detach of its agent run one after the other. The agent lock comes
+  #    before the ownership read, as in detach-entries, so a handoff queued on
+  #    the ownership row cannot leave the two waiting on each other.
   # 2. Read the stored generation FOR SHARE. Any other generation, or any
   #    generation while ownership is not :prepared or a handoff step is set,
   #    is stale_generation. This comes before every other check, so a fenced
@@ -24,7 +30,11 @@ module Timekeeping
   #    service writer replays first; this order is deliberately the reverse.
   # 3. Check the request itself: the key, the actor kind, the body's shape,
   #    the credential scan and the field values a snapshot must accept.
-  # 4. Replay the stored receipt, or answer idempotency_key_reused.
+  # 4. Replay the stored receipt, or answer idempotency_key_reused. Then
+  #    answer not_found, as for an unknown agent, when a detach of the named
+  #    agent stored its receipt after the marker read in step 1. A detach
+  #    still in flight at that read held the agent lock, so its receipt is
+  #    seen here; an older detach does not refuse an agent that still exists.
   # 5. Read the reference facts: the acting user must be a user of the
   #    company, and a named project must be the company's.
   # 6. Lock the target entries FOR UPDATE, by company, in id order, then check
@@ -86,6 +96,8 @@ module Timekeeping
     }.freeze
     PROJECT_ROUTES = { create: :required, update: :optional, bulk_move: :required }.freeze
     ENTRY_ROUTES = %i[update destroy].freeze
+    # The routes whose body can set an entry's agent.
+    AGENT_ROUTES = %i[create update].freeze
     BULK_ROUTES = %i[bulk_move bulk_delete].freeze
     BULK_ACTIONS = { bulk_move: :move, bulk_delete: :delete }.freeze
     BULK_RESULTS = { bulk_move: "moved", bulk_delete: "deleted" }.freeze
@@ -163,8 +175,11 @@ module Timekeeping
       end
 
       def write
+        agent_id = named_agent_id
+        detach_marker = ServiceCommands.detach_marker(company_id, agent_id) if agent_id
         lock_receipt_key unless key.empty?
         checkpoint.call(:receipt_key_locked)
+        ServiceCommands.lock_agent(company_id, agent_id) if agent_id
         stored_generation = admitted_generation
         refusal = admission_refusal(stored_generation)
         return refusal if refusal
@@ -172,8 +187,21 @@ module Timekeeping
         receipt = find_receipt
         checkpoint.call(:receipt_checked)
         return answer_from(receipt) if receipt
+        return Outcome.refusal(:not_found) if agent_id && agent_detached?(agent_id, detach_marker)
 
         write_change(stored_generation)
+      end
+
+      # The agent a create or update body sets, as the Integer detach-entries
+      # locks on, so "5" and 5 take the same lock. nil when the body sets none,
+      # clears it with nil, or sends a value that is not an id: those take no
+      # agent lock and go through the usual checks.
+      def named_agent_id
+        id_value(body["agent_id"]) if AGENT_ROUTES.include?(operation) && body.is_a?(Hash)
+      end
+
+      def agent_detached?(agent_id, detach_marker)
+        ServiceCommands.agent_detached?(company_id, agent_id, after: detach_marker)
       end
 
       # The generation fence, then the checks on the request itself. Both come
