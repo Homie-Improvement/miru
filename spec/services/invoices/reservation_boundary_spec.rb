@@ -383,6 +383,21 @@ RSpec.describe Invoices::ReservationBoundary do
     expect([held_only_entry, line_entry].map { |entry| entry.reload.bill_status }).to eq(%w[unbilled billed])
   end
 
+  it "mark_billed raises a retryable error for an aborted billing answer and for a retryable one with no reason" do
+    invoice = create(:invoice, company: boundary_flush_company, client: boundary_flush_client, status: :sent)
+    adapter = instance_double(Invoices::LegacyReservations)
+    allow(Invoices::ReservationAdapters).to receive(:for).and_return(adapter)
+
+    allow(adapter).to receive(:mark_billed)
+      .and_return(Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {}))
+    expect { described_class.mark_billed(invoice) }.to raise_error(Invoices::OperationErrors::PrepareRetryable)
+
+    allow(adapter).to receive(:mark_billed)
+      .and_return(Invoices::ReservationOutcome.new(state: "retryable", conflicts: [], counts: {}))
+    expect { described_class.mark_billed(invoice) }
+      .to raise_error(Invoices::OperationErrors::PrepareRetryable, "prepare_retryable")
+  end
+
   # "A discarded draft (L2): \"Its reservations are released.\""
   it "unlocks a discarded draft's entries with one intent, and the invoice-number rename adds none" do
     entry = boundary_flush_entry

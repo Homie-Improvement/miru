@@ -37,11 +37,18 @@ module Invoices
       Registry.on(transaction).record_status(invoice.id, Invoice.where(id: invoice.id).pick(:status))
     end
 
+    # What each billing answer leads to. Only `committed` returns; a state
+    # not listed raises PrepareRetryable with the outcome's reason.
+    MARK_BILLED_ROUTES = {
+      "committed" => :billed,
+      "refused" => OperationErrors::Refused
+    }.freeze
+
     # Bills the entries the invoice's lines reference. An entry its holding
     # still lists after a line was removed stays reserved, but it is no longer
-    # on the invoice, so it is not billed. A refused billing raises, so the
-    # caller's transaction rolls back the sent status with it and the invoice
-    # is never sent with its entries left unbilled.
+    # on the invoice, so it is not billed. Every answer but `committed`
+    # raises, so the caller's transaction rolls back the sent status with it
+    # and the invoice is never sent with its entries left unbilled.
     def mark_billed(invoice)
       holding = InvoiceEntryHolding.find_by(company_id: invoice.company_id, invoice_id: invoice.id)
       ownership = TimekeepingOwnership.current
@@ -54,9 +61,18 @@ module Invoices
         entries: CompanyEntries.on_lines(invoice.id, invoice.company_id)
       )
       outcome = ReservationAdapters.for(ownership).mark_billed(request)
-      raise OperationErrors::Refused.new(outcome) if outcome.state == "refused"
+      raise_unless_billed!(outcome)
 
       outcome
+    end
+
+    def raise_unless_billed!(outcome)
+      route = MARK_BILLED_ROUTES.fetch(outcome.state, OperationErrors::PrepareRetryable)
+      return if route == :billed
+      raise route.new(outcome) if route == OperationErrors::Refused
+      raise route.new(outcome.reason) if outcome.reason
+
+      raise route
     end
 
     # Commit callbacks fire only on the transaction whose parent is not
