@@ -3,20 +3,13 @@
 require "rails_helper"
 
 RSpec.describe AppBaseUrl do
+  # The test environment declares http://example.com, which a hard-coded literal could also
+  # produce, so these swap in a distinct value to show the setting is what gets read.
   around do |example|
-    original_app_base_url = ENV["APP_BASE_URL"]
-    original_default_base_url = Rails.configuration.x.default_base_url
-    example.run
-  ensure
-    original_app_base_url.nil? ? ENV.delete("APP_BASE_URL") : ENV["APP_BASE_URL"] = original_app_base_url
-    Rails.configuration.x.default_base_url = original_default_base_url
+    with_app_base_url(env: nil, default: "https://boot-check.test") { example.run }
   end
 
   describe ".current" do
-    # The test environment declares http://example.com, which a hard-coded literal could also
-    # produce, so these swap in a distinct value to show the setting is what gets read.
-    before { Rails.configuration.x.default_base_url = "https://boot-check.test" }
-
     # An ENV.fetch-style read would keep "   " and build broken links.
     it "AppBaseUrl.current treats a blank or whitespace APP_BASE_URL as unset and uses config.x.default_base_url" do
       [nil, "", "   "].each do |unset_value|

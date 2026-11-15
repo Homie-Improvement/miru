@@ -7,12 +7,7 @@ RSpec.describe MCP::Miru::ApiProxy do
     let(:sent_hosts) { [] }
 
     around do |example|
-      original_app_base_url = ENV["APP_BASE_URL"]
-      original_default_base_url = Rails.configuration.x.default_base_url
-      example.run
-    ensure
-      original_app_base_url.nil? ? ENV.delete("APP_BASE_URL") : ENV["APP_BASE_URL"] = original_app_base_url
-      Rails.configuration.x.default_base_url = original_default_base_url
+      with_app_base_url(env: nil, default: "https://boot-check.test") { example.run }
     end
 
     before do
