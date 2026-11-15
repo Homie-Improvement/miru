@@ -82,16 +82,7 @@ module QuickBooks
         end
 
         def default_redirect_uri
-          base_url = ENV["APP_BASE_URL"].presence || local_redirect_base_url
-          return if base_url.blank?
-
-          "#{base_url.delete_suffix('/')}/api/v1/integrations/quickbooks/callback"
-        end
-
-        def local_redirect_base_url
-          return "http://localhost:3000" if Rails.env.development? || Rails.env.test?
-
-          nil
+          "#{AppBaseUrl.current}/api/v1/integrations/quickbooks/callback"
         end
     end
   end
