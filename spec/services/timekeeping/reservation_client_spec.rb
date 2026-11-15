@@ -158,7 +158,7 @@ RSpec.describe Timekeeping::ReservationClient do
     # "A prepare that arrives after its abort reserves nothing, including a delayed copy that arrives after a conflict clears"
     late = client.prepare(request)
 
-    expect(late.state).not_to eq("prepared")
+    expect(late.state).to eq("aborted")
     expect(fake.entry_locked?(entry_id)).to be(false)
     expect(fake.reservations_for(entry_id)).to eq([])
 
