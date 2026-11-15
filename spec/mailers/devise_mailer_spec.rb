@@ -36,8 +36,6 @@ RSpec.describe Devise::Mailer, type: :mailer do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Devise::Mailer, type: :mailer do
   # "app/services/quick_books/configuration.rb, app/mcp/api_proxy.rb and the mailers no longer carry their own
   # APP_BASE_URL fallback literals; each reads the one per-environment base URL (APP_BASE_URL, else config.x.default_base_url)."

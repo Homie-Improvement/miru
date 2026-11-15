@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "rails_helper"
 
 RSpec.describe "AppBaseUrl" do
@@ -13,8 +15,6 @@ RSpec.describe "AppBaseUrl" do
     original_app_base_url.nil? ? ENV.delete("APP_BASE_URL") : ENV["APP_BASE_URL"] = original_app_base_url
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "AppBaseUrl" do
   # "each reads the one per-environment base URL (APP_BASE_URL, else config.x.default_base_url)."

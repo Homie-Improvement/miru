@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "rails_helper"
 
 RSpec.describe MCP::Miru::ApiProxy do
@@ -24,8 +26,6 @@ RSpec.describe MCP::Miru::ApiProxy do
     Rails.configuration.x.default_base_url = original_default_base_url
   end
 end
-
-require "rails_helper"
 
 RSpec.describe MCP::Miru::ApiProxy do
   # "each reads the one per-environment base URL (APP_BASE_URL, else config.x.default_base_url)."

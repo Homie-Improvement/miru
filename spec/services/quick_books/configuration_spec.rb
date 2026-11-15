@@ -114,13 +114,11 @@ RSpec.describe QuickBooks::Configuration do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe QuickBooks::Configuration do
   # "app/services/quick_books/configuration.rb, app/mcp/api_proxy.rb and the mailers no longer carry their own
   # APP_BASE_URL fallback literals; each reads the one per-environment base URL (APP_BASE_URL, else config.x.default_base_url)."
   it "builds the redirect uri from the swapped config.x.default_base_url in and outside local Rails environments when APP_BASE_URL is unset" do
-    saved_env = %w[APP_BASE_URL INTUIT_REDIRECT_URI QUICKBOOKS_REDIRECT_URI].to_h { |key| [key, ENV[key]] }
+    saved_env = %w[APP_BASE_URL INTUIT_REDIRECT_URI QUICKBOOKS_REDIRECT_URI].index_with { |key| ENV[key] }
     original_default_base_url = Rails.configuration.x.default_base_url
     saved_env.each_key { |key| ENV.delete(key) }
     Rails.configuration.x.default_base_url = "https://boot-check.test"
@@ -136,13 +134,11 @@ RSpec.describe QuickBooks::Configuration do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe QuickBooks::Configuration do
   # Disclosed behaviour change: with APP_BASE_URL unset, production now builds a redirect uri from
   # config.x.default_base_url, so the integration counts as configured; that uri must match the one registered with Intuit.
   it "is configured outside local Rails environments from client credentials and the per-environment base URL alone" do
-    saved_env = %w[APP_BASE_URL INTUIT_REDIRECT_URI QUICKBOOKS_REDIRECT_URI].to_h { |key| [key, ENV[key]] }
+    saved_env = %w[APP_BASE_URL INTUIT_REDIRECT_URI QUICKBOOKS_REDIRECT_URI].index_with { |key| ENV[key] }
     original_default_base_url = Rails.configuration.x.default_base_url
     saved_env.each_key { |key| ENV.delete(key) }
     Rails.configuration.x.default_base_url = "https://boot-check.test"
@@ -158,11 +154,9 @@ RSpec.describe QuickBooks::Configuration do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe QuickBooks::Configuration do
   it "treats a whitespace APP_BASE_URL as unset when building the redirect uri" do
-    saved_env = %w[APP_BASE_URL INTUIT_REDIRECT_URI QUICKBOOKS_REDIRECT_URI].to_h { |key| [key, ENV[key]] }
+    saved_env = %w[APP_BASE_URL INTUIT_REDIRECT_URI QUICKBOOKS_REDIRECT_URI].index_with { |key| ENV[key] }
     original_default_base_url = Rails.configuration.x.default_base_url
     ENV.delete("INTUIT_REDIRECT_URI")
     ENV.delete("QUICKBOOKS_REDIRECT_URI")
@@ -199,7 +193,7 @@ RSpec.describe QuickBooks::Configuration do
   # config.x.default_base_url)." Disclosed behaviour change: outside development and test this
   # now yields a redirect URI where it used to yield nil.
   it "builds the callback from config.x.default_base_url outside local environments when APP_BASE_URL is whitespace" do
-    saved_env = %w[APP_BASE_URL INTUIT_REDIRECT_URI QUICKBOOKS_REDIRECT_URI].to_h { |key| [key, ENV[key]] }
+    saved_env = %w[APP_BASE_URL INTUIT_REDIRECT_URI QUICKBOOKS_REDIRECT_URI].index_with { |key| ENV[key] }
     original_default_base_url = Rails.configuration.x.default_base_url
     ENV["APP_BASE_URL"] = "  "
     ENV.delete("INTUIT_REDIRECT_URI")
