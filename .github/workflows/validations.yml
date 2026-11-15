@@ -106,6 +106,9 @@ jobs:
       - name: Run ESLint
         run: pnpm lint
 
+      - name: Run JavaScript unit tests
+        run: pnpm test:js
+
       - name: Setup test database
         run: |
           bundle exec rake "parallel:create[2]" "parallel:load_schema[2]"

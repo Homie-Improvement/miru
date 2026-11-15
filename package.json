@@ -140,6 +140,7 @@
   "scripts": {
     "prepare": "node -e \"if (process.env.NODE_ENV !== 'production') { require('child_process').execSync('lefthook install', {stdio: 'inherit'}); }\"",
     "lint": "eslint ./app/javascript",
+    "test:js": "node --experimental-strip-types --no-warnings --test \"app/javascript/src/**/*.test.ts\"",
     "mobile:start": "pnpm --dir apps/mobile start",
     "mobile:android": "pnpm --dir apps/mobile android",
     "mobile:ios": "pnpm --dir apps/mobile ios",
