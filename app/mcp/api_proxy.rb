@@ -31,9 +31,9 @@ module MCP
       end
 
       class << self
-        def request(method:, path:, authorization:, params: nil, body: nil, headers: {})
+        def request(method:, path:, authorization:, params: nil, body: nil)
           full_path = build_path(path:, params:)
-          request_options = normalize_headers(default_headers(authorization:).merge(headers))
+          request_options = request_headers(authorization:)
           request_options["miru.event_source"] = "mcp"
           request_options[:input] = JSON.generate(body) if body.present?
 
@@ -59,19 +59,19 @@ module MCP
             "#{path}?#{query}"
           end
 
-          def default_headers(authorization:)
-            headers = {
+          # Callers cannot add headers: the Host always comes from the configured base URL,
+          # never from the request that triggered the tool call.
+          def request_headers(authorization:)
+            {
               "HTTP_AUTHORIZATION" => authorization.to_s,
               "HTTP_ACCEPT" => "application/json",
-              "CONTENT_TYPE" => "application/json"
+              "CONTENT_TYPE" => "application/json",
+              "HTTP_HOST" => configured_host
             }
-
-            headers["HTTP_HOST"] = default_host
-            headers
           end
 
           # AppBaseUrl.current is already validated as an absolute URL with a host.
-          def default_host
+          def configured_host
             uri = URI.parse(AppBaseUrl.current)
 
             if uri.port != uri.default_port
@@ -79,21 +79,6 @@ module MCP
             else
               uri.host
             end
-          end
-
-          def normalize_headers(headers)
-            headers.each_with_object({}) do |(key, value), acc|
-              normalized = normalize_header_key(key)
-              acc[normalized] = value
-            end
-          end
-
-          def normalize_header_key(key)
-            key = key.to_s
-            return key if key.start_with?("HTTP_")
-            return key if %w[CONTENT_TYPE CONTENT_LENGTH].include?(key)
-
-            "HTTP_#{key.upcase.tr("-", "_")}"
           end
 
           def parse_json(response_body)
