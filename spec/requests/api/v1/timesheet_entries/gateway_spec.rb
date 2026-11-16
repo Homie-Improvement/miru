@@ -275,36 +275,58 @@ RSpec.describe "Api::V1::TimesheetEntry gateway refusal event", type: :request d
   let(:project) { create(:project, billable: true, client: create(:client, company:)) }
   let(:admin) { create(:user, current_workspace_id: company.id) }
 
-  around do |example|
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
-  end
-
   before do
     create(:employment, company:, user: admin)
     admin.add_role :admin, company
-    TimekeepingOwnership.current.update!(handoff_step: "close_admission")
     sign_in admin
   end
 
-  it "reports a refused entry write with only reason, company_id, request_id and actor_kind, and no token" do
-    event = assert_event_reported("Timekeeping::EntryWriteRefused") do
-      send_request :post, api_v1_timesheet_entry_index_path, params: {
-        project_id: project.id, user_id: admin.id,
-        timesheet_entry: { duration: 30, work_date: Date.current, note: "Private note text", bill_status: :unbilled }
-      }, headers: auth_headers(admin)
+  # The gateway refuses any set handoff_step the same way, so both steps share one refusal contract.
+  # Each row keeps the setup its original example had: only the close_admission row installs a token
+  # signing key, which is what lets the no-token check catch a token leaking into the event.
+  [
+    { handoff_step: "close_admission", signing_key: true },
+    { handoff_step: "settle", signing_key: false }
+  ].each do |row|
+    context "during #{row[:handoff_step]} #{row[:signing_key] ? 'with' : 'without'} a token signing key" do
+      around do |example|
+        if row[:signing_key]
+          with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+        else
+          example.run
+        end
+      end
+
+      before { TimekeepingOwnership.current.update!(handoff_step: row[:handoff_step]) }
+
+      # "Emit `503 ownership_moving` and `409 stale_generation` counts with `company_id`, `request_id` and actor kind."
+      # "It carries reason, company_id, request_id and actor_kind from the context, and never the token or the body."
+      it "reports a refused entry write with only reason, company_id, request_id and actor_kind, and no token" do
+        event = assert_event_reported("Timekeeping::EntryWriteRefused") do
+          send_request :post, api_v1_timesheet_entry_index_path, params: {
+            project_id: project.id, user_id: admin.id,
+            timesheet_entry: { duration: 30, work_date: Date.current, note: "Private note text", bill_status: :unbilled }
+          }, headers: auth_headers(admin)
+        end
+
+        expect(response).to have_http_status(:service_unavailable)
+        data = event[:payload].to_h[:data]
+
+        expect(data.keys).to contain_exactly(:reason, :company_id, :request_id, :actor_kind)
+        expect(data[:reason].to_s).to eq("ownership_moving")
+        expect(data[:company_id]).to eq(company.id)
+        expect(data[:request_id]).to eq(response.headers["X-Request-Id"])
+        expect(data[:actor_kind].to_s).to eq("user")
+        expect(data.to_h.transform_keys(&:to_sym)).to eq(
+          reason: "ownership_moving",
+          company_id: company.id,
+          request_id: response.headers["X-Request-Id"],
+          actor_kind: "user"
+        )
+        expect(event[:payload].to_h.to_s).not_to include("Private note text")
+        expect(event[:payload].to_h.to_s).not_to match(/eyJ[\w-]+\.[\w-]+\.[\w-]+/)
+      end
     end
-
-    expect(response).to have_http_status(:service_unavailable)
-    data = event[:payload].to_h[:data]
-
-    # "It carries reason, company_id, request_id and actor_kind from the context, and never the token or the body."
-    expect(data.keys).to contain_exactly(:reason, :company_id, :request_id, :actor_kind)
-    expect(data[:reason].to_s).to eq("ownership_moving")
-    expect(data[:company_id]).to eq(company.id)
-    expect(data[:request_id]).to eq(response.headers["X-Request-Id"])
-    expect(data[:actor_kind].to_s).to eq("user")
-    expect(event[:payload].to_h.to_s).not_to include("Private note text")
-    expect(event[:payload].to_h.to_s).not_to match(/eyJ[\w-]+\.[\w-]+\.[\w-]+/)
   end
 end
 
@@ -998,41 +1020,6 @@ RSpec.describe "Api::V1::TimesheetEntry gateway legacy at raised generation", ty
     expect(WebMock).not_to have_requested(:any, /timekeeping/)
   end
 end
-
-RSpec.describe "Api::V1::TimesheetEntry gateway refusal event during settle", type: :request do
-  let(:company) { create(:company) }
-  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
-  let(:user) { create(:user, current_workspace_id: company.id) }
-
-  before do
-    create(:employment, company:, user:)
-    user.add_role(:admin, company)
-    TimekeepingOwnership.current.update!(handoff_step: "settle")
-    sign_in user
-  end
-
-  # "Emit `503 ownership_moving` and `409 stale_generation` counts with `company_id`, `request_id` and actor kind."
-  # "It carries reason, company_id, request_id and actor_kind from the context, and never the token or the body."
-  it "reports a refused entry write with reason, company_id, request_id and actor kind only" do
-    event = assert_event_reported("Timekeeping::EntryWriteRefused") do
-      send_request :post, api_v1_timesheet_entry_index_path, params: {
-        project_id: project.id, user_id: user.id,
-        timesheet_entry: { duration: 20, work_date: Date.current, note: "Secret note", bill_status: :unbilled }
-      }, headers: auth_headers(user)
-    end
-
-    expect(response).to have_http_status(:service_unavailable)
-    data = event[:payload].to_h.fetch(:data).to_h.transform_keys(&:to_sym)
-    expect(data).to eq(
-      reason: "ownership_moving",
-      company_id: company.id,
-      request_id: response.headers["X-Request-Id"],
-      actor_kind: "user"
-    )
-    expect(event[:payload].to_h.to_s).not_to include("Secret note")
-  end
-end
-
 
 RSpec.describe "Api::V1::TimesheetEntry gateway provider stale generation", type: :request do
   let(:company) { create(:company) }
