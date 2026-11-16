@@ -2413,3 +2413,323 @@ RSpec.describe Timekeeping::Gateway, "prepared agent detach retried by a new att
     expect(late.reload.agent_id).to be_nil
   end
 end
+
+RSpec.describe Timekeeping::Gateway, "forwarded bulk delete replay under a client Idempotency-Key" do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) do
+    create(:user, current_workspace_id: company.id).tap do |user|
+      create(:employment, company:, user:)
+      user.add_role :admin, company
+    end
+  end
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+  end
+
+  before do
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: admin.id, company_id: company.id, role: "admin")
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+  end
+
+  def bulk_replay_gateway(request_id:, idempotency_key:)
+    context = Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id:, idempotency_key:)
+    described_class.new(context:, write_client: Timekeeping::EntryWriteClient.new(base_url:),
+                                  read_client: Timekeeping::EntryApiClient.new(base_url:))
+  end
+
+  def bulk_replay_entry
+    fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                   work_date: Date.current.iso8601, duration: 30)["id"]
+  end
+
+  def bulk_delete_posts
+    fake.requests.select { |request| request[:method] == "POST" && request[:path].end_with?("/bulk-delete") }
+  end
+
+  it "reports a same-key retry of a forwarded bulk delete that deleted every requested entry as written through one replay-only call" do
+    first_id = bulk_replay_entry
+    second_id = bulk_replay_entry
+    first = bulk_replay_gateway(request_id: "req-bulk-replay-1", idempotency_key: "bulk-replay-key")
+                .bulk_delete(entry_ids: [second_id, first_id], check: ->(_entries) { nil }, expected_generation: 2)
+    expect(first.written).to be(true)
+    first_call = bulk_delete_posts.last
+    discarded = [first_id, second_id].map { |id| fake.stored_entry(id)["discarded_at"] }
+
+    # "A forwarded bulk delete retried under the same Idempotency-Key after its first attempt deleted every requested entry replays the stored answer with 200 instead of answering 422."
+    retry_result = bulk_replay_gateway(request_id: "req-bulk-replay-2", idempotency_key: "bulk-replay-key")
+                     .bulk_delete(entry_ids: [first_id, second_id], check: ->(_entries) { nil }, expected_generation: 2)
+
+    expect(retry_result.refusal).to be_nil
+    expect(retry_result.written).to be(true)
+    calls = bulk_delete_posts
+    expect(calls.size).to eq(2)
+    replay = calls.last
+    expect(replay[:headers]["Idempotency-Replay"]).to eq("only")
+    expect(replay[:headers]["Ownership-Generation"]).to eq("replay-only")
+    expect(replay[:headers]["Idempotency-Key"]).to eq(first_call[:headers]["Idempotency-Key"])
+    expect(replay[:body]).to eq(first_call[:body])
+    expect([first_id, second_id].map { |id| fake.stored_entry(id)["discarded_at"] }).to eq(discarded)
+  end
+end
+
+RSpec.describe Timekeeping::Gateway, "forwarded bulk delete replay with no stored answer" do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) do
+    create(:user, current_workspace_id: company.id).tap do |user|
+      create(:employment, company:, user:)
+      user.add_role :admin, company
+    end
+  end
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+  end
+
+  before do
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: admin.id, company_id: company.id, role: "admin")
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+  end
+
+  def unreplayed_gateway(request_id:, idempotency_key:)
+    context = Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id:, idempotency_key:)
+    described_class.new(context:, write_client: Timekeeping::EntryWriteClient.new(base_url:),
+                                  read_client: Timekeeping::EntryApiClient.new(base_url:))
+  end
+
+  it "reports a forwarded bulk delete of already deleted entries under a key with no stored answer as not written and deletes nothing" do
+    entry_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                              work_date: Date.current.iso8601, duration: 30)["id"]
+    unreplayed_gateway(request_id: "req-unreplayed-1", idempotency_key: "unreplayed-first")
+      .bulk_delete(entry_ids: [entry_id], check: ->(_entries) { nil }, expected_generation: 2)
+    discarded_at = fake.stored_entry(entry_id)["discarded_at"]
+    expect(discarded_at).not_to be_nil
+
+    # Only a stored answer under the same key may turn the retry into a success; a fresh key has none.
+    result = unreplayed_gateway(request_id: "req-unreplayed-2", idempotency_key: "unreplayed-other")
+               .bulk_delete(entry_ids: [entry_id], check: ->(_entries) { nil }, expected_generation: 2)
+
+    expect(result.written).to be(false)
+    expect(fake.stored_entry(entry_id)["discarded_at"]).to eq(discarded_at)
+  end
+end
+
+RSpec.describe Timekeeping::Gateway, "forwarded bulk delete replayed under one client key" do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) do
+    create(:user, current_workspace_id: company.id).tap do |user|
+      create(:employment, company:, user:)
+      user.add_role :admin, company
+    end
+  end
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+  end
+
+  before do
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: admin.id, company_id: company.id, role: "admin")
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+  end
+
+  def bulk_replay_gateway(request_id)
+    context = Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id:,
+                                            idempotency_key: "bulk-replay-key")
+    described_class.new(context:, write_client: Timekeeping::EntryWriteClient.new(base_url:),
+                                  read_client: Timekeeping::EntryApiClient.new(base_url:))
+  end
+
+  def bulk_replay_entry
+    fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                   work_date: Date.current.iso8601, duration: 30)["id"]
+  end
+
+  def bulk_delete_posts
+    fake.requests.select { |request| request[:method] == "POST" && request[:path].end_with?("/bulk-delete") }
+  end
+
+  # "A forwarded bulk delete retried under the same Idempotency-Key after its first attempt deleted every
+  # requested entry replays the stored answer with 200 instead of answering 422."
+  it "a forwarded bulk delete delivered twice under one client Idempotency-Key replays the stored answer as written and deletes nothing more" do
+    first_id = bulk_replay_entry
+    second_id = bulk_replay_entry
+
+    first = bulk_replay_gateway("req-bulk-first").bulk_delete(entry_ids: [first_id, second_id],
+                                                              check: ->(_entries) { nil }, expected_generation: 2)
+    expect(first.written).to be(true)
+    discarded_after_first = [first_id, second_id].map { |id| fake.stored_entry(id)["discarded_at"] }
+    first_post = bulk_delete_posts.first
+
+    retried = bulk_replay_gateway("req-bulk-retry").bulk_delete(entry_ids: [second_id, first_id],
+                                                                check: ->(_entries) { nil }, expected_generation: 2)
+
+    expect(retried.written).to be(true)
+    posts = bulk_delete_posts
+    expect(posts.size).to eq(2)
+    replay = posts.last
+    expect(replay[:headers]["Idempotency-Replay"]).to eq("only")
+    expect(replay[:headers]["Ownership-Generation"]).to eq("replay-only")
+    expect(replay[:headers]["Idempotency-Key"]).to eq(first_post[:headers]["Idempotency-Key"])
+    expect(replay[:body]).to eq(first_post[:body])
+    expect([first_id, second_id].map { |id| fake.stored_entry(id)["discarded_at"] }).to eq(discarded_after_first)
+  end
+end
+
+RSpec.describe Timekeeping::Gateway, "forwarded bulk delete retries that must not replay a success" do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) do
+    create(:user, current_workspace_id: company.id).tap do |user|
+      create(:employment, company:, user:)
+      user.add_role :admin, company
+    end
+  end
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+  let(:bulk_retry_write_client) { Timekeeping::EntryWriteClient.new(base_url:) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+  end
+
+  before do
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: admin.id, company_id: company.id, role: "admin")
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+  end
+
+  def bulk_retry_delete(entry_ids, request_id:, idempotency_key: "bulk-retry-key")
+    context = Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id:, idempotency_key:)
+    described_class.new(context:, write_client: bulk_retry_write_client,
+                                  read_client: Timekeeping::EntryApiClient.new(base_url:))
+      .bulk_delete(entry_ids:, check: ->(_entries) { nil }, expected_generation: 2)
+  end
+
+  def bulk_retry_entry
+    fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                   work_date: Date.current.iso8601, duration: 30)["id"]
+  end
+
+  def bulk_retry_posts
+    fake.requests.select { |request| request[:method] == "POST" && request[:path].end_with?("/bulk-delete") }
+  end
+
+  def bulk_retry_refusals
+    events = []
+    subscriber = Object.new
+    subscriber.define_singleton_method(:emit) do |event|
+      events << event if event[:name] == "Timekeeping::EntryWriteRefused"
+    end
+    Rails.event.subscribe(subscriber)
+    begin
+      yield
+    ensure
+      Rails.event.unsubscribe(subscriber)
+    end
+    events
+  end
+
+  it "keeps a retry unwritten when the first attempt named an id it did not find, since its key covered fewer ids" do
+    entry_id = bulk_retry_entry
+    expect(bulk_retry_delete([entry_id, 0], request_id: "req-missing-1").written).to be(true)
+
+    retried = bulk_retry_delete([entry_id, 0], request_id: "req-missing-2")
+
+    expect(retried.written).to be(false)
+    expect(bulk_retry_posts.last[:headers]["Idempotency-Replay"]).to eq("only")
+  end
+
+  it "sends no replay for a retry without a client Idempotency-Key and leaves it unwritten" do
+    entry_id = bulk_retry_entry
+    expect(bulk_retry_delete([entry_id], request_id: "req-keyless-1", idempotency_key: nil).written).to be(true)
+
+    retried = bulk_retry_delete([entry_id], request_id: "req-keyless-2", idempotency_key: nil)
+
+    expect(retried.written).to be(false)
+    expect(bulk_retry_posts.size).to eq(1)
+  end
+
+  it "keeps a retry unwritten and emits no refusal event when an older Timekeeping refuses the replay as stale_generation" do
+    entry_id = bulk_retry_entry
+    bulk_retry_delete([entry_id], request_id: "req-old-1")
+    allow(bulk_retry_write_client).to receive(:replay_bulk_delete).and_raise(Timekeeping::Gateway::StaleGeneration)
+
+    retried = nil
+    refusals = bulk_retry_refusals { retried = bulk_retry_delete([entry_id], request_id: "req-old-2") }
+
+    expect(retried.written).to be(false)
+    expect(refusals).to be_empty
+  end
+
+  it "keeps a retry unwritten when Timekeeping has no stored answer for its key" do
+    entry_id = bulk_retry_entry
+    bulk_retry_delete([entry_id], request_id: "req-miss-1", idempotency_key: "bulk-retry-first")
+
+    retried = nil
+    refusals = bulk_retry_refusals do
+      retried = bulk_retry_delete([entry_id], request_id: "req-miss-2", idempotency_key: "bulk-retry-second")
+    end
+
+    expect(retried.written).to be(false)
+    expect(refusals).to be_empty
+  end
+
+  it "keeps a retry unwritten when the stored answer reports one requested id as not_found" do
+    first_id = bulk_retry_entry
+    second_id = bulk_retry_entry
+    bulk_retry_delete([first_id, second_id], request_id: "req-partial-1")
+    allow(bulk_retry_write_client).to receive(:replay_bulk_delete).and_return(
+      "results" => [{ "entry_id" => first_id, "result" => "deleted" }, { "entry_id" => second_id, "result" => "not_found" }]
+    )
+
+    expect(bulk_retry_delete([first_id, second_id], request_id: "req-partial-2").written).to be(false)
+  end
+
+  it "sends an ordinary bulk delete for the entries a retry still finds live" do
+    deleted_id = bulk_retry_entry
+    live_id = bulk_retry_entry
+    bulk_retry_delete([deleted_id], request_id: "req-live-1")
+
+    retried = bulk_retry_delete([deleted_id, live_id], request_id: "req-live-2")
+
+    expect(retried.written).to be(true)
+    last = bulk_retry_posts.last
+    expect(last[:headers]["Idempotency-Replay"]).to be_nil
+    expect(last[:body]).to eq("entry_ids" => [live_id])
+    expect(fake.stored_entry(live_id)["discarded_at"]).not_to be_nil
+  end
+end
+
+RSpec.describe Timekeeping::Gateway, ".all_reported?" do
+  it "is true only when every requested id is reported with the result" do
+    answer = { "results" => [{ "entry_id" => 3, "result" => "deleted" }, { "entry_id" => 5, "result" => "not_found" }] }
+
+    expect(described_class.all_reported?(answer, entry_ids: [3], result: "deleted")).to be(true)
+    expect(described_class.all_reported?(answer, entry_ids: [3, 5], result: "deleted")).to be(false)
+    expect(described_class.all_reported?({}, entry_ids: [3], result: "deleted")).to be(false)
+  end
+end
