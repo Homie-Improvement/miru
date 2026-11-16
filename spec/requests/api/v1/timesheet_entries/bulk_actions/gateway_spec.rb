@@ -1313,3 +1313,115 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded bulk mov
     entry_ids.each { |entry_id| expect(fake.stored_entry(entry_id)["project_id"]).to eq(target_project.id) }
   end
 end
+
+RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded bulk delete replay after a partial first attempt",
+               type: :request do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, base_url) do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: admin.id, company_id: company.id, role: "admin")
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+    sign_in admin
+  end
+
+  it "a forwarded bulk delete whose first attempt named a missing id is not replayed as success when resent under the same Idempotency-Key" do
+    entry_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                              work_date: Date.current.iso8601, note: "Partial first attempt").fetch("id")
+    headers = auth_headers(admin).merge("Idempotency-Key" => "7b1e2c3d-4f5a-4b6c-8d7e-9f0a1b2c3d4e")
+    params = { source: { ids: [entry_id, 0] } }
+
+    send_request :delete, api_v1_bulk_action_path, params:, headers: headers
+    expect(response).to have_http_status(:ok)
+    discarded_at = fake.stored_entry(entry_id)["discarded_at"]
+    expect(discarded_at).to be_present
+
+    send_request :delete, api_v1_bulk_action_path, params:, headers: headers
+
+    # "A forwarded bulk delete retried under the same Idempotency-Key after its first attempt deleted every requested entry replays the stored answer with 200 instead of answering 422."
+    # The first attempt did not delete every requested entry (id 0 never existed), so the resend may only ask
+    # Timekeeping for a stored answer, find none, and keep the 422.
+    replays = fake.requests.select do |request|
+      request[:path].to_s.end_with?("/entries/bulk-delete") && request[:headers]["Idempotency-Replay"] == "only"
+    end
+    expect(replays.size).to eq(1)
+    expect(response).to have_http_status(:unprocessable_content)
+    expect(json_response["error"]).to eq("Failed to delete timesheet entries")
+    expect(fake.stored_entry(entry_id)["discarded_at"]).to eq(discarded_at)
+  end
+end
+
+RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded bulk delete replay under another actor's key",
+               type: :request do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:second_admin) { create(:user, current_workspace_id: company.id) }
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, base_url) do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  before do
+    [admin, second_admin].each do |user|
+      create(:employment, company:, user:)
+      user.add_role :admin, company
+      fake.register_user(id: user.id, company_id: company.id, role: "admin")
+    end
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+  end
+
+  it "a second admin resending another admin's committed bulk delete under the same Idempotency-Key is refused, not replayed" do
+    entry_ids = Array.new(2) do |index|
+      fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                     work_date: Date.current.iso8601, note: "Owned by the first admin #{index}").fetch("id")
+    end
+    client_key = "2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d"
+    params = { source: { ids: entry_ids } }
+
+    sign_in admin
+    send_request :delete, api_v1_bulk_action_path, params:,
+      headers: auth_headers(admin).merge("Idempotency-Key" => client_key)
+    expect(response).to have_http_status(:ok)
+    discarded = entry_ids.map { |id| fake.stored_entry(id)["discarded_at"] }
+    expect(discarded).to all(be_present)
+
+    sign_in second_admin
+    send_request :delete, api_v1_bulk_action_path, params:,
+      headers: auth_headers(second_admin).merge("Idempotency-Key" => client_key)
+
+    # "A forwarded bulk delete retried under the same Idempotency-Key after its first attempt deleted every requested entry replays the stored answer with 200 instead of answering 422."
+    # A stored answer belongs to the user who stored it, so another user's resend reaches Timekeeping as a
+    # replay, finds no receipt of its own, and keeps the 422 with nothing changed.
+    replays = fake.requests.select do |request|
+      request[:path].to_s.end_with?("/entries/bulk-delete") && request[:headers]["Idempotency-Replay"] == "only"
+    end
+    expect(replays.size).to eq(1)
+    expect(response).to have_http_status(:unprocessable_content)
+    expect(json_response["error"]).to eq("Failed to delete timesheet entries")
+    expect(entry_ids.map { |id| fake.stored_entry(id)["discarded_at"] }).to eq(discarded)
+  end
+end

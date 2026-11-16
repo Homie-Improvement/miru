@@ -408,7 +408,7 @@ module Timekeeping
       # requested id deleted. A first attempt that named an id it did not find
       # was keyed over fewer ids, so it has no receipt here and stays unwritten.
       # A miss (no receipt, or an older Timekeeping refusing the replay's fixed
-      # generation or version) is rescued here, before perform would count it
+      # generation) is rescued here, before perform would count it
       # as a refused write.
       def replay_timekeeping_bulk_delete(entry_ids)
         requested = self.class.requested_entry_ids(entry_ids)
