@@ -1006,9 +1006,9 @@ RSpec.describe Timekeeping::EntryWriteClient, "replay-only bulk delete" do
     route_timekeeping_to_fake(bulk_replay_fake, base_url: bulk_replay_base_url)
   end
 
-  def bulk_replay_context(request_id)
+  def bulk_replay_context(request_id, idempotency_key: "bulk-replay-client-key")
     Timekeeping::WriteContext.new(company: bulk_replay_company, actor: bulk_replay_admin, actor_kind: "user",
-                                  request_id:, idempotency_key: "bulk-replay-client-key")
+                                  request_id:, idempotency_key:)
   end
 
   def bulk_replay_entry(note)
@@ -1033,42 +1033,15 @@ RSpec.describe Timekeeping::EntryWriteClient, "replay-only bulk delete" do
     # The replay writes nothing: each entry keeps the discard the first attempt made.
     expect(entry_ids.map { |id| bulk_replay_fake.stored_entry(id)["discarded_at"] }).to eq(discarded_after_first)
   end
-end
-
-RSpec.describe Timekeeping::EntryWriteClient, "replay-only bulk delete without a receipt" do
-  let(:bulk_miss_base_url) { "http://timekeeping.test" }
-  let(:bulk_miss_company) { create(:company) }
-  let(:bulk_miss_admin) { create(:user, current_workspace_id: bulk_miss_company.id) }
-  let(:bulk_miss_project) { create(:project, billable: true, client: create(:client, company: bulk_miss_company)) }
-  let(:bulk_miss_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-
-  around do |example|
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
-      with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, bulk_miss_base_url) { example.run }
-    end
-  end
-
-  before do
-    create(:employment, company: bulk_miss_company, user: bulk_miss_admin)
-    bulk_miss_admin.add_role :admin, bulk_miss_company
-    bulk_miss_fake.register_company(id: bulk_miss_company.id, edit_days: bulk_miss_company.timesheet_edit_days)
-    bulk_miss_fake.register_user(id: bulk_miss_admin.id, company_id: bulk_miss_company.id, role: "admin")
-    bulk_miss_fake.register_project(id: bulk_miss_project.id, company_id: bulk_miss_company.id)
-    route_timekeeping_to_fake(bulk_miss_fake, base_url: bulk_miss_base_url)
-  end
 
   # A replay only reads a stored answer; with none it must never run an ordinary bulk delete.
   it "replay_bulk_delete with no stored answer raises RecordNotFound and leaves every live entry undeleted" do
-    entry_ids = %w[one two].map do |note|
-      bulk_miss_fake.add_entry(company_id: bulk_miss_company.id, user_id: bulk_miss_admin.id,
-                               project_id: bulk_miss_project.id, work_date: Date.current.iso8601, note:).fetch("id")
-    end
-    context = Timekeeping::WriteContext.new(company: bulk_miss_company, actor: bulk_miss_admin, actor_kind: "user",
-                                            request_id: "req-bulk-miss", idempotency_key: "bulk-miss-never-sent")
+    entry_ids = %w[one two].map { |note| bulk_replay_entry(note) }
+    context = bulk_replay_context("req-bulk-miss", idempotency_key: "bulk-miss-never-sent")
 
     expect do
       described_class.new.replay_bulk_delete(context:, entry_ids:)
     end.to raise_error(ActiveRecord::RecordNotFound)
-    expect(entry_ids.map { |id| bulk_miss_fake.stored_entry(id)["discarded_at"] }).to eq([nil, nil])
+    expect(entry_ids.map { |id| bulk_replay_fake.stored_entry(id)["discarded_at"] }).to eq([nil, nil])
   end
 end

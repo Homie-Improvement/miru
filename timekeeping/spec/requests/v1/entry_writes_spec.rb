@@ -857,6 +857,31 @@ RSpec.describe "Entry write routes", "agent ownership" do
   end
 end
 
+RSpec.describe "Entry write routes, replay-only bulk delete" do
+  include_context "timekeeping entry writes"
+  include_context "timekeeping entry writes without transactional fixtures"
+
+  let(:company) { timekeeping_arrange.company }
+  let(:project) { timekeeping_arrange.project(company:) }
+  let(:owner) { timekeeping_arrange.user(company:, role: "owner") }
+  let(:employee) { timekeeping_arrange.user(company:, role: "employee") }
+
+  # A provider that does not read Idempotency-Replay sees an ordinary bulk delete;
+  # the generation value is never a generation, so it refuses without writing.
+  it "refuses a bulk delete whose Ownership-Generation is replay-only with stale_generation and discards nothing" do
+    entry_ids = [timekeeping_arrange.entry(company:, user: employee, project:)]
+    before = entry_write_counts
+    headers = { "Content-Type" => "application/json", "Authorization" => "Bearer #{timekeeping_arrange.token_for(owner)}",
+                "Idempotency-Key" => SecureRandom.uuid, "Ownership-Generation" => "replay-only" }
+
+    post "/v1/companies/#{company}/entries/bulk-delete", params: JSON.generate("entry_ids" => entry_ids), headers: headers
+
+    expect([response.status, response.parsed_body]).to eq([409, { "reason" => "stale_generation" }])
+    expect(Entry.where(id: entry_ids).pluck(:discarded_at)).to eq([nil])
+    expect(entry_write_counts).to eq(before)
+  end
+end
+
 RSpec.describe "Entry write routes, replay-only delete" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
