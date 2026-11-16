@@ -5,7 +5,8 @@ import { v4 as uuidv4 } from "uuid";
 import {
   BULK_MOVE_TARGET,
   entryTarget,
-  type FailedKeys,
+  type KeyState,
+  NO_HELD_KEYS,
   sendWithHeldKey,
 } from "../apis/idempotencyKey";
 
@@ -22,7 +23,7 @@ interface UseIdempotencyKeyReturn {
 // Holds the Idempotency-Keys for the user action a component owns, such as
 // one entry form. A ref is used so that holding the keys never re-renders.
 export const useIdempotencyKey = (): UseIdempotencyKeyReturn => {
-  const held = useRef<FailedKeys>([]);
+  const held = useRef<KeyState>(NO_HELD_KEYS);
 
   const sendWithKey = useCallback(
     // The type parameter carries a constraint because the build parses this

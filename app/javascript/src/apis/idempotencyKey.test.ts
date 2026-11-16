@@ -3,9 +3,11 @@ import { describe, it } from "node:test";
 
 import {
   entryTarget,
+  type FailedKey,
   type HeldKeys,
   isEntryGatewayWrite,
   keyForSend,
+  NO_HELD_KEYS,
   sendWithHeldKey,
   takeKey,
 } from "./idempotencyKey.ts";
@@ -53,12 +55,19 @@ describe("keyForSend", () => {
   });
 });
 
+// A failed create's key, as a send that started first left it.
+const failedCreateKey = (body: unknown, newKey: () => string): FailedKey => ({
+  ...keyForSend(null, body, newKey),
+  target: undefined,
+  sequence: 1,
+});
+
 describe("takeKey", () => {
   it("takes the failed key with an unchanged body out of the list", () => {
     const newKey = sequentialKeys();
     const failed = [
-      keyForSend(null, entryBody(45), newKey),
-      keyForSend(null, entryBody(60), newKey),
+      failedCreateKey(entryBody(45), newKey),
+      failedCreateKey(entryBody(60), newKey),
     ];
 
     const taken = takeKey(failed, entryBody(60), newKey);
@@ -69,7 +78,7 @@ describe("takeKey", () => {
 
   it("makes a fresh key and keeps the list when no failed body matches", () => {
     const newKey = sequentialKeys();
-    const failed = [keyForSend(null, entryBody(45), newKey)];
+    const failed = [failedCreateKey(entryBody(45), newKey)];
 
     const taken = takeKey(failed, entryBody(60), newKey);
 
@@ -93,7 +102,7 @@ const pendingWrite = () => {
 
 describe("sendWithHeldKey", () => {
   it("gives two equal sends in flight at once their own keys", async () => {
-    const held: HeldKeys = { current: [] };
+    const held: HeldKeys = { current: NO_HELD_KEYS };
     const newKey = sequentialKeys();
     const { sentKeys, settlers, write } = pendingWrite();
 
@@ -106,7 +115,7 @@ describe("sendWithHeldKey", () => {
   });
 
   it("keeps a failed send's key when an earlier send succeeds after it", async () => {
-    const held: HeldKeys = { current: [] };
+    const held: HeldKeys = { current: NO_HELD_KEYS };
     const newKey = sequentialKeys();
     const { sentKeys, settlers, write } = pendingWrite();
 
@@ -125,7 +134,7 @@ describe("sendWithHeldKey", () => {
   });
 
   it("reuses the key for an unchanged retry after a failure and drops it after a success", async () => {
-    const held: HeldKeys = { current: [] };
+    const held: HeldKeys = { current: NO_HELD_KEYS };
     const newKey = sequentialKeys();
     const { sentKeys, settlers, write } = pendingWrite();
 
@@ -141,11 +150,11 @@ describe("sendWithHeldKey", () => {
 
     assert.equal(sentKeys[1], sentKeys[0]);
     assert.notEqual(sentKeys[2], sentKeys[0]);
-    assert.deepEqual(held.current, []);
+    assert.deepEqual(held.current.failed, []);
   });
 
   it("retires a failed edit's key once a later edit of the same entry succeeds", async () => {
-    const held: HeldKeys = { current: [] };
+    const held: HeldKeys = { current: NO_HELD_KEYS };
     const newKey = sequentialKeys();
     const { sentKeys, settlers, write } = pendingWrite();
     const saveEdit = (duration: number) =>
@@ -168,11 +177,64 @@ describe("sendWithHeldKey", () => {
     await newEdit;
 
     assert.notEqual(sentKeys[2], sentKeys[0]);
-    assert.deepEqual(held.current, []);
+    assert.deepEqual(held.current.failed, []);
+  });
+
+  it("does not keep a failed edit's key whose failure arrives after a later edit of the same entry succeeded", async () => {
+    const held: HeldKeys = { current: NO_HELD_KEYS };
+    const newKey = sequentialKeys();
+    const { sentKeys, settlers, write } = pendingWrite();
+    const saveEdit = (duration: number) =>
+      sendWithHeldKey(
+        held,
+        { entryId: 42, body: entryBody(duration) },
+        newKey,
+        write,
+        entryTarget(42)
+      );
+
+    const lostLate = saveEdit(60);
+    const later = saveEdit(90);
+    settlers[1].resolve();
+    await later;
+    settlers[0].reject();
+    await assert.rejects(lostLate);
+    const newEdit = saveEdit(60);
+    settlers[2].resolve();
+    await newEdit;
+
+    assert.notEqual(sentKeys[2], sentKeys[0]);
+    assert.deepEqual(held.current.failed, []);
+  });
+
+  it("keeps a failed edit's key when an edit of the same entry started before it succeeds", async () => {
+    const held: HeldKeys = { current: NO_HELD_KEYS };
+    const newKey = sequentialKeys();
+    const { sentKeys, settlers, write } = pendingWrite();
+    const saveEdit = (duration: number) =>
+      sendWithHeldKey(
+        held,
+        { entryId: 42, body: entryBody(duration) },
+        newKey,
+        write,
+        entryTarget(42)
+      );
+
+    const earlier = saveEdit(90);
+    const lost = saveEdit(60);
+    settlers[1].reject();
+    await assert.rejects(lost);
+    settlers[0].resolve();
+    await earlier;
+    const retry = saveEdit(60);
+    settlers[2].resolve();
+    await retry;
+
+    assert.equal(sentKeys[2], sentKeys[1]);
   });
 
   it("keeps a failed edit's key when an edit of another entry succeeds", async () => {
-    const held: HeldKeys = { current: [] };
+    const held: HeldKeys = { current: NO_HELD_KEYS };
     const newKey = sequentialKeys();
     const { sentKeys, settlers, write } = pendingWrite();
 
@@ -193,7 +255,7 @@ describe("sendWithHeldKey", () => {
   });
 
   it("keeps each overlapping failed send's key, so retrying both replays both", async () => {
-    const held: HeldKeys = { current: [] };
+    const held: HeldKeys = { current: NO_HELD_KEYS };
     const newKey = sequentialKeys();
     const { sentKeys, settlers, write } = pendingWrite();
 
