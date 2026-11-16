@@ -14,8 +14,9 @@ module Timekeeping
   # answer body may describe other users' data and is never passed on.
   #
   # It never retries. A call whose answer was lost may still have committed in
-  # Timekeeping; a resend under the same request id carries the same
-  # Idempotency-Key, so Timekeeping replays its answer instead of writing twice.
+  # Timekeeping; a resend under the same client Idempotency-Key, or with none
+  # under the same request id, carries the same forwarded key, so Timekeeping
+  # replays its answer instead of writing twice.
   # A committed destroy hides its entry from the lookup before the write, so its
   # resend goes through replay_destroy_entry, which only ever reads the stored
   # answer.
@@ -167,7 +168,7 @@ module Timekeeping
     end
 
     # Returns the created entry Hash. idempotency_key replaces the key derived
-    # from the request id, for a caller whose retries run under a new request
+    # from the request, for a caller whose retries run under a new request
     # id, such as an import rerun, and must still be recognised as the same
     # create.
     def create_entry(context:, generation:, body:, idempotency_key: nil)
@@ -215,7 +216,7 @@ module Timekeeping
                                      body: { "entry_ids" => ids })
     end
 
-    # Returns the stored answer of a destroy this request id already committed.
+    # Returns the stored answer of a destroy this request's key already committed.
     # Timekeeping never deletes on this call: with no stored answer for the
     # same company, actor and key it answers 404, raised as RecordNotFound.
     def replay_destroy_entry(context:, generation:, entry_id:)
@@ -228,7 +229,15 @@ module Timekeeping
     private
 
       def request_key(context, operation, entry_id = nil)
-        self.class.idempotency_key(request_id: context.request_id, operation:, entry_id:)
+        self.class.idempotency_key(request_id: key_seed(context), operation:, entry_id:)
+      end
+
+      # The request's own Idempotency-Key when it sent one, so a client's retry
+      # under a new request id forwards the same key and is replayed; otherwise
+      # the request id. The key is still derived per operation and entry, so
+      # one client key never names two different forwarded writes.
+      def key_seed(context)
+        context.idempotency_key || context.request_id
       end
 
       # Timekeeping fingerprints the body as serialized, so the ids go in the
@@ -239,7 +248,7 @@ module Timekeeping
       end
 
       def bulk_key(context, operation, entry_ids)
-        self.class.bulk_idempotency_key(request_id: context.request_id, operation:, entry_ids:)
+        self.class.bulk_idempotency_key(request_id: key_seed(context), operation:, entry_ids:)
       end
 
       def forward(request_class, path, operation:, context:, generation:, idempotency_key:, version: nil, body: nil,

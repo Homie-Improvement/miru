@@ -1707,3 +1707,792 @@ RSpec.describe "Api::V1::TimesheetEntry gateway prepared state", type: :request 
     end
   end
 end
+
+RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client key tenant scope", type: :request do
+  let(:company) { create(:company) }
+  let(:other_company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:other_project) { create(:project, billable: true, client: create(:client, company: other_company)) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:other_admin) { create(:user, current_workspace_id: other_company.id) }
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, base_url) do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  before do
+    [[company, admin, project], [other_company, other_admin, other_project]].each do |member_company, member, member_project|
+      create(:employment, company: member_company, user: member)
+      member.add_role :admin, member_company
+      fake.register_company(id: member_company.id, edit_days: member_company.timesheet_edit_days)
+      fake.register_user(id: member.id, company_id: member_company.id, role: "admin")
+      fake.register_project(id: member_project.id, company_id: member_company.id)
+    end
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+  end
+
+  def client_key_forwarded_header(request, name)
+    request.fetch(:headers).find { |key, _value| key.to_s.casecmp?(name) }&.last
+  end
+
+  # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
+  # A replay belongs to the company and user that stored it: a second tenant sending the same key is a new write.
+  it "forwards one shared client Idempotency-Key from two companies yet writes each company its own Timekeeping entry and never replays the other's" do
+    shared_key = "8b0f4c1a-2d3e-4f5a-9b6c-7d8e9f0a1b2c"
+
+    sign_in admin
+    send_request :post, api_v1_timesheet_entry_index_path, params: {
+      project_id: project.id,
+      timesheet_entry: { duration: 30, work_date: Date.current, note: "Company A", bill_status: :unbilled }
+    }, headers: auth_headers(admin).merge("Idempotency-Key" => shared_key)
+    expect(response).to be_successful
+    first_id = json_response["entry"]["id"]
+    sign_out admin
+
+    sign_in other_admin
+    send_request :post, api_v1_timesheet_entry_index_path, params: {
+      project_id: other_project.id,
+      timesheet_entry: { duration: 30, work_date: Date.current, note: "Company B", bill_status: :unbilled }
+    }, headers: auth_headers(other_admin).merge("Idempotency-Key" => shared_key)
+    expect(response).to be_successful
+    second_id = json_response["entry"]["id"]
+
+    creates = fake.requests.select { |request| request.fetch(:method) == "POST" }
+    expect(creates.size).to eq(2)
+    forwarded_keys = creates.map { |request| client_key_forwarded_header(request, "Idempotency-Key") }
+    # Both requests carry the client's key, so the forwarded key is derived from it, not from each request id.
+    expect(forwarded_keys.uniq.size).to eq(1)
+
+    expect(second_id).not_to eq(first_id)
+    expect(fake.stored_entry(first_id).values_at("company_id", "user_id", "note")).to eq([company.id, admin.id, "Company A"])
+    expect(fake.stored_entry(second_id).values_at("company_id", "user_id", "note"))
+      .to eq([other_company.id, other_admin.id, "Company B"])
+    expect(response.body).not_to include("Company A")
+  end
+end
+
+RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client key actor scope", type: :request do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:second_admin) { create(:user, current_workspace_id: company.id) }
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, base_url) do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  before do
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    [admin, second_admin].each do |member|
+      create(:employment, company:, user: member)
+      member.add_role :admin, company
+      fake.register_user(id: member.id, company_id: company.id, role: "admin")
+    end
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+  end
+
+  def actor_scope_forwarded_header(request, name)
+    request.fetch(:headers).find { |key, _value| key.to_s.casecmp?(name) }&.last
+  end
+
+  # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
+  # Only the user who stored an answer may have it replayed; another user's identical key must write that user's own entry.
+  it "forwards one shared client Idempotency-Key from two users of one company yet never replays one user's entry to the other" do
+    shared_key = "3f2e1d0c-9b8a-4c7d-8e6f-5a4b3c2d1e0f"
+    params = {
+      project_id: project.id,
+      timesheet_entry: { duration: 45, work_date: Date.current, note: "Same body", bill_status: :unbilled }
+    }
+
+    sign_in admin
+    send_request :post, api_v1_timesheet_entry_index_path, params:,
+                                                          headers: auth_headers(admin).merge("Idempotency-Key" => shared_key)
+    expect(response).to be_successful
+    first_id = json_response["entry"]["id"]
+    sign_out admin
+
+    sign_in second_admin
+    send_request :post, api_v1_timesheet_entry_index_path, params:,
+                                                          headers: auth_headers(second_admin).merge("Idempotency-Key" => shared_key)
+    expect(response).to be_successful
+    second_id = json_response["entry"]["id"]
+
+    creates = fake.requests.select { |request| request.fetch(:method) == "POST" }
+    expect(creates.map { |request| actor_scope_forwarded_header(request, "Idempotency-Key") }.uniq.size).to eq(1)
+
+    expect(second_id).not_to eq(first_id)
+    expect(fake.stored_entry(first_id)["user_id"]).to eq(admin.id)
+    expect(fake.stored_entry(second_id)["user_id"]).to eq(second_admin.id)
+  end
+end
+
+require "rails_helper"
+require_relative "../../../../support/timekeeping/fake_timekeeping"
+
+RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client key replay", type: :request do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, base_url) do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: admin.id, company_id: company.id, role: "admin")
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+    sign_in admin
+  end
+
+  # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
+  it "replays a forwarded create retried under a new request id with the same Idempotency-Key and writes the entry once" do
+    params = {
+      project_id: project.id,
+      timesheet_entry: { duration: 30, work_date: Date.current, note: "Retried create", bill_status: :unbilled }
+    }
+    client_key = "8b0f5c64-3a2e-4f0e-9d7a-1c2b3d4e5f60"
+
+    send_request :post, api_v1_timesheet_entry_index_path, params:,
+                 headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => "retry-create-attempt-1")
+    expect(response).to be_successful
+    outbox_after_first = fake.outbox.size
+
+    send_request :post, api_v1_timesheet_entry_index_path, params:,
+                 headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => "retry-create-attempt-2")
+    expect(response).to be_successful
+
+    creates = fake.requests.select { |request| request[:method] == "POST" }
+    expect(creates.size).to eq(2)
+    expect(creates.map { |request| request[:headers]["Idempotency-Key"] }.uniq.size).to eq(1)
+    expect(fake.outbox.size).to eq(outbox_after_first)
+  end
+end
+
+require "rails_helper"
+require_relative "../../../../support/timekeeping/fake_timekeeping"
+
+RSpec.describe "Api::V1::TimesheetEntry gateway forwarded distinct client keys", type: :request do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, base_url) do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: admin.id, company_id: company.id, role: "admin")
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+    sign_in admin
+  end
+
+  # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
+  # Two separate actions carry two keys, so the second must be a new write, never a replay of the first.
+  it "writes two forwarded entries when two user actions send two different Idempotency-Keys with the same body" do
+    params = {
+      project_id: project.id,
+      timesheet_entry: { duration: 45, work_date: Date.current, note: "Same body twice", bill_status: :unbilled }
+    }
+    outbox_before = fake.outbox.size
+
+    send_request :post, api_v1_timesheet_entry_index_path, params:,
+                 headers: auth_headers(admin).merge("Idempotency-Key" => "0c6a1f5e-7d2b-4a9e-8f31-5b6c7d8e9f01")
+    expect(response).to be_successful
+    send_request :post, api_v1_timesheet_entry_index_path, params:,
+                 headers: auth_headers(admin).merge("Idempotency-Key" => "f4e3d2c1-b0a9-4876-9543-210fedcba987")
+    expect(response).to be_successful
+
+    forwarded_keys = fake.requests.select { |request| request[:method] == "POST" }
+                         .map { |request| request[:headers]["Idempotency-Key"] }
+    expect(forwarded_keys.size).to eq(2)
+    expect(forwarded_keys.uniq.size).to eq(2)
+    expect(fake.outbox.size - outbox_before).to eq(2)
+  end
+end
+
+require "rails_helper"
+require_relative "../../../../support/timekeeping/fake_timekeeping"
+
+RSpec.describe "Api::V1::TimesheetEntry gateway forwarded fallback key", type: :request do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, base_url) do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: admin.id, company_id: company.id, role: "admin")
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+    sign_in admin
+  end
+
+  # A request that sends no Idempotency-Key keeps the key derived from its request id, operation and entry id.
+  it "forwards a create with no Idempotency-Key under the key derived from its own request id" do
+    send_request :post, api_v1_timesheet_entry_index_path, params: {
+      project_id: project.id,
+      timesheet_entry: { duration: 15, work_date: Date.current, note: "No client key", bill_status: :unbilled }
+    }, headers: auth_headers(admin).merge("X-Request-Id" => "no-client-key-request")
+
+    expect(response).to be_successful
+    create_request = fake.requests.find { |request| request[:method] == "POST" }
+    expect(create_request[:headers]["Idempotency-Key"]).to eq(
+      Timekeeping::EntryWriteClient.idempotency_key(request_id: "no-client-key-request", operation: "create")
+    )
+  end
+end
+
+require "rails_helper"
+require_relative "../../../../support/timekeeping/fake_timekeeping"
+
+RSpec.describe "Api::V1::TimesheetEntry gateway forwarded mobile route client key", type: :request do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, base_url) do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: admin.id, company_id: company.id, role: "admin")
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+    sign_in admin
+  end
+
+  # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
+  # The mobile app has no entry write yet; this proves the route it would write through replays a same-key resend.
+  it "replays a forwarded mobile-route create retried with the same Idempotency-Key and writes the entry once" do
+    params = {
+      project_id: project.id,
+      timesheet_entry: { duration: 20, work_date: Date.current, note: "Mobile retry", bill_status: :unbilled }
+    }
+    client_key = "5d9e2a71-c3b4-4e8f-a1d2-6f7e8d9c0b1a"
+
+    send_request :post, "/api/v1/mobile/timesheet_entries", params:,
+                 headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => "mobile-retry-1")
+    expect(response).to be_successful
+    outbox_after_first = fake.outbox.size
+
+    send_request :post, "/api/v1/mobile/timesheet_entries", params:,
+                 headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => "mobile-retry-2")
+    expect(response).to be_successful
+
+    forwarded_keys = fake.requests.select { |request| request[:method] == "POST" }
+                         .map { |request| request[:headers]["Idempotency-Key"] }
+    expect(forwarded_keys.size).to eq(2)
+    expect(forwarded_keys.uniq.size).to eq(1)
+    expect(fake.outbox.size).to eq(outbox_after_first)
+  end
+end
+
+RSpec.describe "Api::V1::TimesheetEntry gateway forwarded delete retried with a client key", type: :request do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, base_url) do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: admin.id, company_id: company.id, role: "admin")
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+    sign_in admin
+  end
+
+  it "replays a forwarded delete retried under a new request id with the same Idempotency-Key and discards the entry once" do
+    entry_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                              work_date: Date.current.iso8601).fetch("id")
+    client_key = "8f2b6c1e-3d4a-4b5c-9e0f-1a2b3c4d5e6f"
+
+    send_request :delete, api_v1_timesheet_entry_path(entry_id),
+      headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => "forwarded-delete-try-1")
+    expect(response).to be_successful
+    expect(fake.stored_entry(entry_id)["discarded_at"]).not_to be_nil
+
+    # The resend is a retry of the same user action under a new request id, as the 401 recovery sends it.
+    send_request :delete, api_v1_timesheet_entry_path(entry_id),
+      headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => "forwarded-delete-try-2")
+
+    # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
+    expect(response).to be_successful
+    deletes = fake.requests.select { |request| request[:method] == "DELETE" }
+    expect(deletes.size).to eq(2)
+    expect(deletes.map { |request| request[:headers]["Idempotency-Key"] }.uniq.size).to eq(1)
+    expect(deletes.last[:headers]["Idempotency-Key"]).not_to eq(
+      Timekeeping::EntryWriteClient.idempotency_key(request_id: "forwarded-delete-try-2", operation: "destroy",
+                                                    entry_id:)
+    )
+  end
+end
+
+RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client key across companies", type: :request do
+  let(:company) { create(:company) }
+  let(:other_company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:other_project) { create(:project, billable: true, client: create(:client, company: other_company)) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:other_admin) { create(:user, current_workspace_id: other_company.id) }
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, base_url) do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  before do
+    [[company, admin, project], [other_company, other_admin, other_project]].each do |member_company, member, member_project|
+      create(:employment, company: member_company, user: member)
+      member.add_role :admin, member_company
+      fake.register_company(id: member_company.id, edit_days: member_company.timesheet_edit_days)
+      fake.register_user(id: member.id, company_id: member_company.id, role: "admin")
+      fake.register_project(id: member_project.id, company_id: member_company.id)
+    end
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+  end
+
+  # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
+  # A replay belongs to the company that stored it: another company's identical key is a new write in its own company.
+  it "replays a forwarded create retried with one Idempotency-Key inside its company and writes a separate entry when another company sends the same key" do
+    shared_key = "forwarded-tenant-shared-key-1"
+    entry_params = lambda do |entry_project, note|
+      { project_id: entry_project.id,
+        timesheet_entry: { duration: 30, work_date: Date.current, note:, bill_status: :unbilled } }
+    end
+
+    sign_in admin
+    first_ids = Array.new(2) do
+      send_request :post, api_v1_timesheet_entry_index_path, params: entry_params.call(project, "Company A"),
+                                                              headers: auth_headers(admin).merge("Idempotency-Key" => shared_key)
+      expect(response).to be_successful
+      json_response["entry"]["id"]
+    end
+    sign_out admin
+
+    forwarded_keys = fake.requests.select { |request| request[:method] == "POST" }
+                         .map { |request| request[:headers]["Idempotency-Key"] }
+    expect(forwarded_keys.size).to eq(2)
+    expect(forwarded_keys.uniq.size).to eq(1)
+    expect(first_ids.uniq.size).to eq(1)
+    expect(fake.stored_entry(first_ids.first)).to include("company_id" => company.id, "user_id" => admin.id,
+                                                          "note" => "Company A")
+
+    sign_in other_admin
+    send_request :post, api_v1_timesheet_entry_index_path, params: entry_params.call(other_project, "Company B"),
+                                                            headers: auth_headers(other_admin).merge("Idempotency-Key" => shared_key)
+
+    expect(response).to be_successful
+    other_id = json_response["entry"]["id"]
+    expect(other_id).not_to eq(first_ids.first)
+    expect(fake.stored_entry(other_id)).to include("company_id" => other_company.id, "user_id" => other_admin.id,
+                                                   "note" => "Company B", "project_id" => other_project.id)
+    expect(response.body).not_to include("Company A")
+  end
+end
+
+RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client idempotency key on create", type: :request do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, base_url) do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: admin.id, company_id: company.id, role: "admin")
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+    sign_in admin
+  end
+
+  it "forwards one client Idempotency-Key for a create retried under a new request id and replays the first answer" do
+    params = { project_id: project.id,
+               timesheet_entry: { duration: 30, work_date: Date.current, note: "Retried create", bill_status: :unbilled } }
+    client_key = "3b2f7c1e-6a4d-4f0e-9c1a-0d5e8b7a6c41"
+    answers = %w[client-key-create-attempt-1 client-key-create-attempt-2].map do |request_id|
+      send_request :post, api_v1_timesheet_entry_index_path, params:,
+        headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => request_id)
+      expect(response).to be_successful
+      response.parsed_body
+    end
+
+    # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write
+    # replays the stored answer instead of using the per-request fallback key."
+    creates = fake.requests.select { |request| request[:method] == "POST" }
+    expect(creates.size).to eq(2)
+    expect(creates.map { |request| request[:headers]["Idempotency-Key"] }.uniq.size).to eq(1)
+    expect(answers.second).to eq(answers.first)
+
+    send_request :post, api_v1_timesheet_entry_index_path, params:,
+      headers: auth_headers(admin).merge("Idempotency-Key" => "9d0c4b2a-1e3f-4a5b-8c6d-7e8f9a0b1c2d",
+                                         "X-Request-Id" => "client-key-create-other-action")
+    expect(response).to be_successful
+    other_action = fake.requests.select { |request| request[:method] == "POST" }.last
+    expect(other_action[:headers]["Idempotency-Key"]).not_to eq(creates.first[:headers]["Idempotency-Key"])
+    expect(response.parsed_body).not_to eq(answers.first)
+  end
+end
+
+RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client idempotency key on the mobile route", type: :request do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, base_url) do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: admin.id, company_id: company.id, role: "admin")
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+    sign_in admin
+  end
+
+  it "mobile entry route forwards one client Idempotency-Key for a retried create and replays the first answer" do
+    params = { project_id: project.id,
+               timesheet_entry: { duration: 45, work_date: Date.current, note: "Mobile retry", bill_status: :unbilled } }
+    client_key = "5e6f7a8b-9c0d-4e1f-a2b3-c4d5e6f7a8b9"
+    answers = %w[mobile-client-key-attempt-1 mobile-client-key-attempt-2].map do |request_id|
+      send_request :post, api_v1_mobile_timesheet_entries_path, params:,
+        headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => request_id)
+      expect(response).to be_successful
+      response.parsed_body
+    end
+
+    # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write
+    # replays the stored answer instead of using the per-request fallback key."
+    creates = fake.requests.select { |request| request[:method] == "POST" }
+    expect(creates.size).to eq(2)
+    expect(creates.map { |request| request[:headers]["Idempotency-Key"] }.uniq.size).to eq(1)
+    expect(answers.second).to eq(answers.first)
+  end
+end
+
+RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client idempotency key on update", type: :request do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, base_url) do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: admin.id, company_id: company.id, role: "admin")
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+    sign_in admin
+  end
+
+  it "forwards one client Idempotency-Key for an update retried under a new request id" do
+    entry_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                              work_date: Date.current.iso8601, note: "Before").fetch("id")
+    params = { project_id: project.id, timesheet_entry: { duration: 60, note: "After" } }
+    client_key = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+    %w[client-key-update-attempt-1 client-key-update-attempt-2].each do |request_id|
+      send_request :put, api_v1_timesheet_entry_path(entry_id), params:,
+        headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => request_id)
+      expect(response).to be_successful
+    end
+
+    # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write
+    # replays the stored answer instead of using the per-request fallback key."
+    updates = fake.requests.select { |request| request[:method] == "PATCH" }
+    expect(updates.size).to eq(2)
+    expect(updates.map { |request| request[:headers]["Idempotency-Key"] }.uniq.size).to eq(1)
+    expect(fake.stored_entry(entry_id)["note"]).to eq("After")
+  end
+end
+
+require "rails_helper"
+require_relative "../../../../support/timekeeping/fake_timekeeping"
+
+RSpec.describe "Api::V1::TimesheetEntry forwarded create resent with one client Idempotency-Key", type: :request do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, base_url) do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: admin.id, company_id: company.id, role: "admin")
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+    sign_in admin
+  end
+
+  it "a forwarded create delivered twice with one Idempotency-Key writes one Timekeeping entry and replays its answer" do
+    params = {
+      project_id: project.id, user_id: admin.id,
+      timesheet_entry: { duration: 25, work_date: Date.current, note: "Saved once", bill_status: :unbilled }
+    }
+    headers = auth_headers(admin).merge("Idempotency-Key" => "2b0f7a52-6c1e-4f43-9a51-7d0c1f8e9a10")
+
+    send_request :post, api_v1_timesheet_entry_index_path, params:, headers: headers
+    expect(response).to be_successful
+    first_id = json_response.fetch("entry").fetch("id")
+
+    # The same request delivered again, as the client's own retry resends it, under a new request id.
+    send_request :post, api_v1_timesheet_entry_index_path, params:, headers: headers
+    expect(response).to be_successful
+
+    # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
+    expect(json_response.fetch("entry").fetch("id")).to eq(first_id)
+    forwarded_keys = fake.requests.select { |request| request[:method] == "POST" }
+                         .map { |request| request[:headers]["Idempotency-Key"] }
+    expect(forwarded_keys.size).to eq(2)
+    expect(forwarded_keys.uniq.size).to eq(1)
+  end
+end
+
+require "rails_helper"
+require_relative "../../../../support/timekeeping/fake_timekeeping"
+
+RSpec.describe "Api::V1::TimesheetEntry forwarded delete resent with one client Idempotency-Key", type: :request do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, base_url) do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: admin.id, company_id: company.id, role: "admin")
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+    sign_in admin
+  end
+
+  it "a forwarded delete resent with one Idempotency-Key after it committed replays success instead of answering not found" do
+    entry_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                              work_date: Date.current.iso8601, note: "Delete once").fetch("id")
+    headers = auth_headers(admin).merge("Idempotency-Key" => "8d3c1e4a-0b7f-4c2d-8e6a-5f1b2c3d4e5f")
+
+    send_request :delete, api_v1_timesheet_entry_path(entry_id), headers: headers
+    expect(response).to be_successful
+    expect(fake.stored_entry(entry_id)["discarded_at"]).not_to be_nil
+
+    # The first answer was lost and the client resends the same delete with the same key.
+    send_request :delete, api_v1_timesheet_entry_path(entry_id), headers: headers
+
+    # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
+    expect(response).to be_successful
+    expect(json_response.keys).to eq(["notice"])
+  end
+end
+
+require "rails_helper"
+require_relative "../../../../support/timekeeping/fake_timekeeping"
+
+RSpec.describe "Api::V1::TimesheetEntry forwarded mobile-route create resent with one client Idempotency-Key", type: :request do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, base_url) do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: admin.id, company_id: company.id, role: "admin")
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+    sign_in admin
+  end
+
+  it "a forwarded mobile-route create delivered twice with one Idempotency-Key answers the same entry both times" do
+    params = {
+      project_id: project.id, user_id: admin.id,
+      timesheet_entry: { duration: 40, work_date: Date.current, note: "Mobile save", bill_status: :unbilled }
+    }
+    headers = auth_headers(admin).merge("Idempotency-Key" => "c4a9e2f1-3d5b-4a7c-9e8f-0a1b2c3d4e6f")
+
+    send_request :post, "/api/v1/mobile/timesheet_entries", params:, headers: headers
+    expect(response).to be_successful
+    first_id = json_response.fetch("entry").fetch("id")
+
+    send_request :post, "/api/v1/mobile/timesheet_entries", params:, headers: headers
+    expect(response).to be_successful
+
+    # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
+    # The mobile app in this repository has no entry write, so this proves only that the route it would use replays a resent key.
+    expect(json_response.fetch("entry").fetch("id")).to eq(first_id)
+  end
+end
+
+RSpec.describe "Api::V1::TimesheetEntry gateway forwarded update retried with one client key", type: :request do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, base_url) do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: admin.id, company_id: company.id, role: "admin")
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+    sign_in admin
+  end
+
+  it "a forwarded update delivered twice with one Idempotency-Key forwards one key and replays the first answer" do
+    entry_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                              work_date: Date.current.iso8601, note: "Before").fetch("id")
+    params = { project_id: project.id,
+               timesheet_entry: { duration: 45, work_date: Date.current, note: "After", bill_status: :unbilled } }
+    headers = auth_headers(admin).merge("Idempotency-Key" => "7d1f4c2a-9b3e-4f6a-8c1d-2e5f7a9b0c31")
+
+    send_request :put, api_v1_timesheet_entry_path(entry_id), params:, headers: headers
+    expect(response).to be_successful
+    first_answer = json_response
+
+    # The same request delivered again, as the client's automatic retry sends it.
+    send_request :put, api_v1_timesheet_entry_path(entry_id), params:, headers: headers
+    expect(response).to be_successful
+
+    # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
+    patch_keys = fake.requests.select { |request| request[:method] == "PATCH" }
+                     .map { |request| request[:headers]["Idempotency-Key"] }
+    expect(patch_keys.size).to eq(2)
+    expect(patch_keys.uniq.size).to eq(1)
+    expect(json_response).to eq(first_answer)
+  end
+end

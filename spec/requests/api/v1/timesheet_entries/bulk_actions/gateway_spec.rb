@@ -1211,3 +1211,154 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController legacy skips throu
     expect(entry.reload.project_id).to eq(to_project.id)
   end
 end
+
+RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded bulk delete with a client key", type: :request do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, base_url) do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: admin.id, company_id: company.id, role: "admin")
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+    sign_in admin
+  end
+
+  it "forwards a bulk delete sent with an Idempotency-Key under a key derived from that client key, not from its request id" do
+    ids = Array.new(2) do
+      fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                     work_date: Date.current.iso8601).fetch("id")
+    end
+    client_key = "3c9d7e2f-6a1b-4c8d-8e9f-0a1b2c3d4e5f"
+
+    send_request :delete, api_v1_bulk_action_path, params: { source: { ids: } },
+      headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => "bulk-delete-client-key")
+
+    expect(response).to have_http_status(:ok)
+    bulk_delete = fake.requests.find { |request| request[:path].to_s.end_with?("/entries/bulk-delete") }
+    forwarded_key = bulk_delete[:headers]["Idempotency-Key"]
+
+    # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
+    expect(forwarded_key).to eq(
+      Timekeeping::EntryWriteClient.bulk_idempotency_key(request_id: client_key, operation: "bulk_delete", entry_ids: ids)
+    )
+    expect(forwarded_key).not_to eq(
+      Timekeeping::EntryWriteClient.bulk_idempotency_key(request_id: "bulk-delete-client-key", operation: "bulk_delete",
+                                                         entry_ids: ids)
+    )
+    expect(ids.map { |id| fake.stored_entry(id)["discarded_at"] }).to all(be_present)
+  end
+end
+
+require "rails_helper"
+require_relative "../../../../../support/timekeeping/fake_timekeeping"
+
+RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded bulk move resent with one client Idempotency-Key",
+               type: :request do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:target_project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, base_url) do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: admin.id, company_id: company.id, role: "admin")
+    fake.register_project(id: project.id, company_id: company.id)
+    fake.register_project(id: target_project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+    sign_in admin
+  end
+
+  it "a forwarded bulk move delivered twice with one Idempotency-Key forwards the same key both times" do
+    entry_ids = Array.new(2) do |index|
+      fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                     work_date: Date.current.iso8601, note: "Bulk #{index}").fetch("id")
+    end
+    headers = auth_headers(admin).merge("Idempotency-Key" => "5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b")
+
+    2.times do
+      send_request :patch, api_v1_bulk_action_path, params: { ids: entry_ids, project_id: target_project.id },
+                                                    headers: headers
+      expect(response).to be_successful
+    end
+
+    # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
+    forwarded_keys = fake.requests.select { |request| request[:path].to_s.include?("bulk-move") }
+                         .map { |request| request[:headers]["Idempotency-Key"] }
+    expect(forwarded_keys.size).to eq(2)
+    expect(forwarded_keys.uniq.size).to eq(1)
+    entry_ids.each { |entry_id| expect(fake.stored_entry(entry_id)["project_id"]).to eq(target_project.id) }
+  end
+end
+
+RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded bulk delete retried with one client key",
+               type: :request do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, base_url) do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  before do
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_user(id: admin.id, company_id: company.id, role: "admin")
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+    sign_in admin
+  end
+
+  it "a forwarded bulk delete delivered twice with one Idempotency-Key answers success again instead of a failure" do
+    entry_ids = Array.new(2) do |index|
+      fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                     work_date: Date.current.iso8601, note: "Bulk #{index}").fetch("id")
+    end
+    headers = auth_headers(admin).merge("Idempotency-Key" => "3a8e6b1f-4c2d-4e9a-b7f0-5d1c9e2a6b48")
+
+    send_request :delete, api_v1_bulk_action_path, params: { source: { ids: entry_ids } }, headers: headers
+    expect(response).to be_successful
+    entry_ids.each { |id| expect(fake.stored_entry(id)["discarded_at"]).not_to be_nil }
+
+    # The same request delivered again after the first one committed, as when its answer was lost.
+    send_request :delete, api_v1_bulk_action_path, params: { source: { ids: entry_ids } }, headers: headers
+
+    # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
+    # The plan discloses that a forwarded bulk delete whose first attempt deleted every entry finds none on retry and
+    # is answered 422 without reaching Timekeeping; this asserts the issue's rule, so that gap must be closed or disclosed.
+    expect(response).to be_successful
+  end
+end
