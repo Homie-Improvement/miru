@@ -1730,10 +1730,12 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client Idempotency-Key
   end
 
   def client_key_forwarded_keys(method)
-    # Mapped after selecting, not with filter_map, so a request sent without a key
-    # still counts and shows up as nil instead of vanishing from the list.
+    # Every forwarded write must carry a key; a missing one would read as nil, and
+    # two nils would otherwise pass the examples' same-key checks.
     requests = fake.requests.select { |request| request[:method] == method }
-    requests.map { |request| forwarded_idempotency_key(request) }
+    keys = requests.map { |request| forwarded_idempotency_key(request) }
+    expect(keys).to all(be_present)
+    keys
   end
 
   context "with a single company" do

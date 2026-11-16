@@ -1272,6 +1272,7 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded client I
     bulk_moves = fake.requests.select { |request| request[:path].to_s.include?("bulk-move") }
     forwarded_keys = bulk_moves.map { |request| forwarded_idempotency_key(request) }
     expect(forwarded_keys.size).to eq(2)
+    expect(forwarded_keys).to all(be_present)
     expect(forwarded_keys.uniq.size).to eq(1)
     entry_ids.each { |entry_id| expect(fake.stored_entry(entry_id)["project_id"]).to eq(target_project.id) }
   end
