@@ -3,7 +3,7 @@
 require_relative "contract_example_helpers"
 
 # Replay-only deletes (contracts/timekeeping/entry_api.yml rules.replay_only):
-# a DELETE carrying Idempotency-Replay: only is answered from the caller's own
+# a DELETE or bulk-delete carrying Idempotency-Replay: only is answered from the caller's own
 # stored receipt, read before the generation check, and otherwise answers
 # not_found without discarding anything. Needs the timekeeping_client and
 # timekeeping_arrange lets. Kept apart from the idempotency group because the
@@ -79,6 +79,39 @@ RSpec.shared_examples "timekeeping entry replay contract" do
     expect(first.status).to eq(200)
     expect([replay.status, replay.body]).to eq([first.status, first.body])
     expect(replay_stored_state(entry_id)).to eq(after_first)
+  end
+
+  # A replay-only bulk delete also carries Ownership-Generation: replay-only, a
+  # value that is never a generation, as the monolith sends it.
+  def replay_bulk_delete(entry_ids, token, key:, replay_only: false)
+    headers = user_headers(token, key:)
+    headers = headers.merge("Idempotency-Replay" => "only", "Ownership-Generation" => "replay-only") if replay_only
+    timekeeping_request("POST", timekeeping_path(:entry_api, :bulk_delete, company_id: replay_company),
+                        headers:, body: { "entry_ids" => entry_ids })
+  end
+
+  it "returns the first bulk delete's answer for a replay-only bulk delete with the same key and the sentinel generation" do
+    entry_ids = Array.new(2) { timekeeping_arrange.entry(company: replay_company, user: replay_owner, project: replay_project) }
+    key = new_key
+    first = replay_bulk_delete(entry_ids, replay_owner_token, key:)
+    after_first = entry_ids.map { |entry_id| replay_stored_state(entry_id) }
+
+    replay = replay_bulk_delete(entry_ids, replay_owner_token, key:, replay_only: true)
+
+    expect(first.status).to eq(200)
+    expect([replay.status, replay.body]).to eq([first.status, first.body])
+    expect(entry_ids.map { |entry_id| replay_stored_state(entry_id) }).to eq(after_first)
+  end
+
+  it "answers a replay-only bulk delete with no stored answer as not_found and keeps every entry" do
+    entry_ids = Array.new(2) { timekeeping_arrange.entry(company: replay_company, user: replay_owner, project: replay_project) }
+    seeded = entry_ids.map { |entry_id| replay_stored_state(entry_id) }
+
+    response = replay_bulk_delete(entry_ids, replay_owner_token, key: new_key, replay_only: true)
+
+    expect([response.status, response.body]).to eq([replay_not_found.fetch("status"), replay_not_found.fetch("body")])
+    expect(entry_ids.map { |entry_id| replay_stored_state(entry_id) }).to eq(seeded)
+    expect(replay_listed_ids).to match_array(entry_ids)
   end
 
   it "does not replay another actor's stored delete under the same key" do

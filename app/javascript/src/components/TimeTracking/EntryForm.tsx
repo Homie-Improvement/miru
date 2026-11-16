@@ -214,33 +214,39 @@ const AddEntry: React.FC<Iprops> = ({
       timesheet_entry: getPayload(),
     };
 
-    const res = await saveKey.sendWithKey(
-      { body, userId: selectedEmployeeId },
-      idempotencyKey =>
-        timesheetEntryApi.create(body, selectedEmployeeId, idempotencyKey)
-    );
+    // Save is disabled while submitting; re-enabling it after a failed
+    // request lets the user resubmit unchanged under the held key.
+    try {
+      const res = await saveKey.sendWithKey(
+        { body, userId: selectedEmployeeId },
+        idempotencyKey =>
+          timesheetEntryApi.create(body, selectedEmployeeId, idempotencyKey)
+      );
 
-    if (res.status === 200) {
-      // After successful save, store the last used values for next time
-      setToLocalStorage("client", savedClient);
-      setToLocalStorage("project", savedProject);
-      setToLocalStorage("projectId", savedProjectId.toString());
-      setToLocalStorage("taskType", savedTaskType);
-      // Clear only the note and duration for new entry
-      setToLocalStorage("note", "");
-      setToLocalStorage("duration", "");
+      if (res.status === 200) {
+        // After successful save, store the last used values for next time
+        setToLocalStorage("client", savedClient);
+        setToLocalStorage("project", savedProject);
+        setToLocalStorage("projectId", savedProjectId.toString());
+        setToLocalStorage("taskType", savedTaskType);
+        // Clear only the note and duration for new entry
+        setToLocalStorage("note", "");
+        setToLocalStorage("duration", "");
 
-      const fetchEntriesRes = await refreshVisibleEntries();
+        const fetchEntriesRes = await refreshVisibleEntries();
 
-      if (!fetchEntriesRes) {
-        await handleRelocateEntry(selectedFullDate, res.data.entry);
+        if (!fetchEntriesRes) {
+          await handleRelocateEntry(selectedFullDate, res.data.entry);
+        }
+
+        if (fetchEntriesRes) {
+          setNewEntryView(false);
+          setUpdateView(true);
+          handleAddEntryDateChange(dayjs(selectedFullDate));
+        }
       }
-
-      if (fetchEntriesRes) {
-        setNewEntryView(false);
-        setUpdateView(true);
-        handleAddEntryDateChange(dayjs(selectedFullDate));
-      }
+    } finally {
+      setSubmitting(false);
     }
   };
 

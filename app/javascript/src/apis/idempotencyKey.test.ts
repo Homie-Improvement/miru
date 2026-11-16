@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
-  afterAnswer,
-  type HeldKey,
+  type HeldKeys,
   isEntryGatewayWrite,
   keyForSend,
   sendWithHeldKey,
+  takeKey,
 } from "./idempotencyKey.ts";
 
 const sequentialKeys = () => {
@@ -52,23 +52,28 @@ describe("keyForSend", () => {
   });
 });
 
-describe("afterAnswer", () => {
-  it("clears the held value after a success, so an identical next submit gets a new key", () => {
+describe("takeKey", () => {
+  it("takes the failed key with an unchanged body out of the list", () => {
     const newKey = sequentialKeys();
-    const held = keyForSend(null, entryBody(60), newKey);
-    const cleared = afterAnswer(held, true);
+    const failed = [
+      keyForSend(null, entryBody(45), newKey),
+      keyForSend(null, entryBody(60), newKey),
+    ];
 
-    assert.equal(cleared, null);
-    assert.notEqual(keyForSend(cleared, entryBody(60), newKey).key, held.key);
+    const taken = takeKey(failed, entryBody(60), newKey);
+
+    assert.equal(taken.action.key, "key-2");
+    assert.deepEqual(taken.failed, [failed[0]]);
   });
 
-  it("keeps the held value after a failure or a lost answer", () => {
+  it("makes a fresh key and keeps the list when no failed body matches", () => {
     const newKey = sequentialKeys();
-    const held = keyForSend(null, entryBody(60), newKey);
-    const kept = afterAnswer(held, false);
+    const failed = [keyForSend(null, entryBody(45), newKey)];
 
-    assert.equal(kept, held);
-    assert.equal(keyForSend(kept, entryBody(60), newKey).key, held.key);
+    const taken = takeKey(failed, entryBody(60), newKey);
+
+    assert.equal(taken.action.key, "key-2");
+    assert.deepEqual(taken.failed, failed);
   });
 });
 
@@ -87,7 +92,7 @@ const pendingWrite = () => {
 
 describe("sendWithHeldKey", () => {
   it("gives two equal sends in flight at once their own keys", async () => {
-    const held: HeldKey = { current: null };
+    const held: HeldKeys = { current: [] };
     const newKey = sequentialKeys();
     const { sentKeys, settlers, write } = pendingWrite();
 
@@ -100,7 +105,7 @@ describe("sendWithHeldKey", () => {
   });
 
   it("keeps a failed send's key when an earlier send succeeds after it", async () => {
-    const held: HeldKey = { current: null };
+    const held: HeldKeys = { current: [] };
     const newKey = sequentialKeys();
     const { sentKeys, settlers, write } = pendingWrite();
 
@@ -119,7 +124,7 @@ describe("sendWithHeldKey", () => {
   });
 
   it("reuses the key for an unchanged retry after a failure and drops it after a success", async () => {
-    const held: HeldKey = { current: null };
+    const held: HeldKeys = { current: [] };
     const newKey = sequentialKeys();
     const { sentKeys, settlers, write } = pendingWrite();
 
@@ -135,7 +140,32 @@ describe("sendWithHeldKey", () => {
 
     assert.equal(sentKeys[1], sentKeys[0]);
     assert.notEqual(sentKeys[2], sentKeys[0]);
-    assert.equal(held.current, null);
+    assert.deepEqual(held.current, []);
+  });
+
+  it("keeps each overlapping failed send's key, so retrying both replays both", async () => {
+    const held: HeldKeys = { current: [] };
+    const newKey = sequentialKeys();
+    const { sentKeys, settlers, write } = pendingWrite();
+
+    const first = sendWithHeldKey(held, entryBody(60), newKey, write);
+    const second = sendWithHeldKey(held, entryBody(60), newKey, write);
+    settlers[0].reject();
+    await assert.rejects(first);
+    settlers[1].reject();
+    await assert.rejects(second);
+
+    const firstRetry = sendWithHeldKey(held, entryBody(60), newKey, write);
+    settlers[2].resolve();
+    await firstRetry;
+    const secondRetry = sendWithHeldKey(held, entryBody(60), newKey, write);
+    settlers[3].resolve();
+    await secondRetry;
+
+    assert.deepEqual(
+      [sentKeys[2], sentKeys[3]].sort(),
+      [sentKeys[0], sentKeys[1]].sort()
+    );
   });
 });
 

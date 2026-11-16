@@ -118,23 +118,29 @@ const AddEntry = () => {
       timesheet_entry: getPayload(),
     };
 
-    const res = await saveKey.sendWithKey(
-      { body, userId: selectedEmployeeId },
-      idempotencyKey =>
-        timesheetEntryApi.create(body, selectedEmployeeId, idempotencyKey)
-    );
+    // Save is disabled while submitting; re-enabling it after a failed
+    // request lets the user resubmit unchanged under the held key.
+    try {
+      const res = await saveKey.sendWithKey(
+        { body, userId: selectedEmployeeId },
+        idempotencyKey =>
+          timesheetEntryApi.create(body, selectedEmployeeId, idempotencyKey)
+      );
 
-    if (res.status === 200) {
-      const fetchEntriesRes = await fetchEntries(selectedDate, selectedDate);
-      if (!isDesktop) {
-        fetchEntriesOfMonths();
-      }
+      if (res.status === 200) {
+        const fetchEntriesRes = await fetchEntries(selectedDate, selectedDate);
+        if (!isDesktop) {
+          fetchEntriesOfMonths();
+        }
 
-      if (fetchEntriesRes) {
-        setNewEntryView(false);
-        setUpdateView(true);
-        handleAddEntryDateChange(dayjs(selectedDate));
+        if (fetchEntriesRes) {
+          setNewEntryView(false);
+          setUpdateView(true);
+          handleAddEntryDateChange(dayjs(selectedDate));
+        }
       }
+    } finally {
+      setSubmitting(false);
     }
   };
 

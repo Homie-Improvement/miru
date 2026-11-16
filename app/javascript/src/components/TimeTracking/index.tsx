@@ -568,8 +568,10 @@ const TimeTracking: React.FC<Iprops> = ({ user, isAdminUser }) => {
       timesheet_entry: data,
     };
 
+    // The source entry is part of the action's identity, so duplicating a
+    // different entry with equal contents never replays this copy's answer.
     const res = await duplicateKey.sendWithKey(
-      { body, userId: selectedEmployeeId },
+      { body, sourceEntryId: id, userId: selectedEmployeeId },
       idempotencyKey =>
         timesheetEntryApi.create(body, selectedEmployeeId, idempotencyKey)
     );

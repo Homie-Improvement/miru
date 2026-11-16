@@ -35,37 +35,49 @@ export const keyForSend = (
   return { key: newKey(), fingerprint };
 };
 
-// What the action holds after its answer: nothing after a success, so the
-// next identical submit is written as a new entry; the same key after a
-// failure or a lost answer, so an unchanged resubmit is a retry.
-export const afterAnswer = (
-  held: ActionKey | null,
-  succeeded: boolean
-): ActionKey | null => (succeeded ? null : held);
+// The keys of an action's sends that failed or lost their answer, each kept
+// for an unchanged retry, so several overlapping failed sends each keep
+// their own key.
+export type FailedKeys = readonly ActionKey[];
 
-// Where one user action keeps its key between sends, such as a React ref.
-export type HeldKey = { current: ActionKey | null };
+// The key for one send and the failed keys left once it is taken: the first
+// failed key with an unchanged body, so the retry replays that send's answer,
+// or a fresh key. A taken key leaves the list while its send is in flight,
+// so a second send started before it settles gets its own key even with an
+// equal body: two distinct writes never share a receipt.
+export const takeKey = (
+  failed: FailedKeys,
+  body: unknown,
+  newKey: () => string
+): { action: ActionKey; failed: FailedKeys } => {
+  const fingerprint = fingerprintOf(body);
+  const index = failed.findIndex(held => held.fingerprint === fingerprint);
+  const action = keyForSend(index === -1 ? null : failed[index], body, newKey);
 
-// Runs one write of the action under its key. While the write is in flight
-// nothing is held, so a second send started before it settles gets its own
-// key even with an equal body: two distinct writes never share a receipt.
-// Only this send's own outcome decides what is held afterwards: a success
-// leaves nothing, and a failure puts this send's key back for an unchanged
-// retry. The caller's write resolves only on a 2xx answer.
+  return { action, failed: failed.filter((_, at) => at !== index) };
+};
+
+// Where one user action keeps its failed keys between sends, such as a React ref.
+export type HeldKeys = { current: FailedKeys };
+
+// Runs one write of the action under its key. Only this send's own outcome
+// decides what happens to its key: a success drops it, so the next identical
+// submit is written as a new entry, and a failure puts it back for an
+// unchanged retry. The caller's write resolves only on a 2xx answer.
 // A function declaration, because the build parses this file as TSX, where a
 // generic arrow function's <T> reads as a JSX tag.
 export async function sendWithHeldKey<T>(
-  held: HeldKey,
+  held: HeldKeys,
   body: unknown,
   newKey: () => string,
   write: (idempotencyKey: string) => Promise<T>
 ): Promise<T> {
-  const action = keyForSend(held.current, body, newKey);
-  held.current = null;
+  const taken = takeKey(held.current, body, newKey);
+  held.current = taken.failed;
   try {
-    return await write(action.key);
+    return await write(taken.action.key);
   } catch (error) {
-    held.current = afterAnswer(action, false);
+    held.current = [...held.current, taken.action];
     throw error;
   }
 }
