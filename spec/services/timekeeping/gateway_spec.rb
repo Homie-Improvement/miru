@@ -13,20 +13,17 @@ RSpec.describe Timekeeping::Gateway do
       user.add_role :owner, prepared_company
     end
   end
-  let(:prepared_base_url) { "http://timekeeping.test" }
 
   # "With ownership in the prepared state, the gateway's entry writes go to Timekeeping::LocalOwner and make no HTTP call to Timekeeping"
   it "a prepared-state create writes one local entry, audit and outbox row and sends nothing to Timekeeping" do
     TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
-    fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
-    route_timekeeping_to_fake(fake, base_url: prepared_base_url)
     context = Timekeeping::WriteContext.new(
       company: prepared_company, actor: prepared_user, actor_kind: "user", request_id: "req-prepared-1"
     )
+    # Doubles with no allowed methods: any forwarded write or remote lookup fails the example.
     gateway = described_class.new(
-      context:,
-      write_client: Timekeeping::EntryWriteClient.new(base_url: prepared_base_url),
-      read_client: Timekeeping::EntryApiClient.new(base_url: prepared_base_url)
+      context:, write_client: instance_double(Timekeeping::EntryWriteClient),
+      read_client: instance_double(Timekeeping::EntryApiClient)
     )
     before = timekeeping_row_counts
 
@@ -42,9 +39,10 @@ RSpec.describe Timekeeping::Gateway do
     expect(after["entries"] - before["entries"]).to eq(1)
     expect(after["entry_outbox_items"] - before["entry_outbox_items"]).to eq(1)
     expect(after["entry_audits"] - before["entry_audits"]).to eq(1)
+    stored = Timekeeping::LocalEntry.find_by(company_id: prepared_company.id, user_id: prepared_user.id)
+    expect([entry.id, entry.note, stored.note]).to eq([stored.id, "Prepared", "Prepared"])
     audit = Timekeeping::LocalOwner::AuditRow.find_by(entry_id: entry.id)
     expect([audit.actor_type, audit.actor_id]).to eq(["user", prepared_user.id])
-    expect(fake.requests).to be_empty
   end
 end
 
@@ -2225,43 +2223,6 @@ RSpec.describe Timekeeping::Gateway, "prepared ownership generation" do
     outbox_generations = Timekeeping::LocalOutboxEntry.where(sent_at: nil).map(&:generation)
     expect(outbox_generations).to eq([7])
     expect(TimekeepingOwnership.current.generation).to eq(7)
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, "prepared branch default local owner" do
-  # "With ownership in the prepared state, the gateway's entry writes go to Timekeeping::LocalOwner and make no HTTP call to Timekeeping"
-  it "writes a prepared create through the default local owner into entries and calls neither Timekeeping client" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    admin = timekeeping_member(company, "admin")
-    prepare_local_ownership!
-    context = Timekeeping::WriteContext.new(
-      company:, actor: admin, actor_kind: "user", request_id: "req-prepared-default-1",
-      idempotency_key: "k-prepared-default-1"
-    )
-    # Doubles with no allowed methods: any forwarded write or remote lookup fails the example.
-    gateway = described_class.new(
-      context:, write_client: instance_double(Timekeeping::EntryWriteClient),
-      read_client: instance_double(Timekeeping::EntryApiClient)
-    )
-    before_counts = timekeeping_row_counts
-
-    entry = nil
-    expect do
-      entry = gateway.create(
-        user: admin, project:,
-        attributes: { duration: 30, work_date: Date.current, note: "Prepared default", bill_status: "unbilled" }
-      )
-    end.not_to change(TimesheetEntry, :count)
-
-    after_counts = timekeeping_row_counts
-    expect(after_counts["entries"] - before_counts["entries"]).to eq(1)
-    expect(after_counts["entry_outbox_items"] - before_counts["entry_outbox_items"]).to eq(1)
-    expect(after_counts["entry_audits"] - before_counts["entry_audits"]).to eq(1)
-    stored = Timekeeping::LocalEntry.find_by(company_id: company.id, user_id: admin.id)
-    expect(stored.note).to eq("Prepared default")
-    expect(entry.note).to eq("Prepared default")
-    expect(entry.id).to eq(stored.id)
   end
 end
 
