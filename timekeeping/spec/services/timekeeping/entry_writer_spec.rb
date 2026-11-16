@@ -466,6 +466,18 @@ RSpec.describe Timekeeping::EntryWriter do
     expect(entry_write_counts).to eq(before)
   end
 
+  it "answers a replay-only bulk delete with no stored receipt as not_found before discarding any entry" do
+    kept_ids = [entry_id, timekeeping_arrange.entry(company:, user: owner, project:)]
+    before = entry_write_counts
+
+    replay = build_entry_command(:bulk_delete, token: owner_token, body: { "entry_ids" => kept_ids }).with(replay_only: true)
+    outcome = described_class.new.call(replay)
+
+    expect([outcome.status, JSON.parse(outcome.body)]).to eq([404, { "reason" => "not_found" }])
+    expect(Entry.where(id: kept_ids).pluck(:discarded_at)).to eq([nil, nil])
+    expect(entry_write_counts).to eq(before)
+  end
+
   it "refuses a bulk move of an entry whose stored metadata nests 97 levels, leaving it on its project" do
     other_project = timekeeping_arrange.project(company:)
     Entry.find(entry_id).update_column(:proof_metadata, metadata_nested_97_levels)
