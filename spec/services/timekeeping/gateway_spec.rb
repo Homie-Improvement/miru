@@ -2414,7 +2414,200 @@ RSpec.describe Timekeeping::Gateway, "prepared agent detach retried by a new att
   end
 end
 
-RSpec.describe Timekeeping::Gateway, committed_data: true do
+RSpec.describe Timekeeping::Gateway, "legacy create replay by idempotency key", committed_data: true do
+  def legacy_replay_admin_for(company)
+    create(:user, current_workspace_id: company.id).tap do |user|
+      create(:employment, company:, user:)
+      user.add_role :admin, company
+    end
+  end
+
+  def legacy_replay_context(company:, actor:, request_id:, key: nil)
+    Timekeeping::WriteContext.new(company:, actor:, actor_kind: "user", request_id:, idempotency_key: key)
+  end
+
+  # "Start with the initial ownership state, save a timer entry, and lose the response after commit. React Query retries with the planned stable key and body."
+  # "Test a committed create followed by the same key under initial ownership."
+  it "a committed legacy create retried with the same idempotency key and body returns the first entry and records the time once" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = legacy_replay_admin_for(company)
+    attributes = { duration: 30, work_date: Date.current, note: "Timer stop", bill_status: "unbilled" }
+    create_with = lambda do |request_id|
+      described_class.new(context: legacy_replay_context(company:, actor: user, request_id:, key: "timer-key-retry-1"))
+        .create(user:, project:, attributes:)
+    end
+    expect(TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).monolith_store)
+      .to eq(TimekeepingOwnership::INITIAL_MONOLITH_STORE)
+
+    first = create_with.call("req-timer-attempt-1")
+    retried = create_with.call("req-timer-attempt-2")
+
+    expect(TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).monolith_store).to eq("legacy")
+    expect(TimesheetEntry.unscoped.where(project_id: project.id, user_id: user.id).count).to eq(1)
+    expect(retried.id).to eq(first.id)
+    expect(retried.snippet[:note]).to eq("Timer stop")
+  end
+
+  # "so a retried write replays the stored answer instead of using the per-request fallback key"
+  it "a legacy create retried after the entry was edited replays the answer the first attempt committed" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    admin = legacy_replay_admin_for(company)
+    employee = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user: employee)
+    employee.add_role :employee, company
+    attributes = { duration: 45, work_date: Date.current, note: "original note", bill_status: "unbilled" }
+    create_with = lambda do |request_id|
+      described_class.new(context: legacy_replay_context(company:, actor: admin, request_id:,
+                                                         key: "timer-key-legacy-edited"))
+        .create(user: employee, project:, attributes:)
+    end
+
+    first = create_with.call("req-legacy-edit-1")
+    admin.remove_role :admin, company
+    admin.add_role :employee, company
+    TimesheetEntry.unscoped.where(id: first.id).update_all(note: "confidential later note")
+    retried = create_with.call("req-legacy-edit-2")
+
+    expect(retried.id).to eq(first.id)
+    expect(retried.note).to eq("original note")
+    expect(retried.snippet[:note]).to eq("original note")
+    expect(TimesheetEntry.unscoped.where(project_id: project.id).count).to eq(1)
+  end
+
+  # Ordering: create, delete, then the retried create must not revive the deleted time.
+  it "a legacy create retried after its entry was deleted replays the first answer and does not recreate the entry" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = legacy_replay_admin_for(company)
+    attributes = { duration: 20, work_date: Date.current, note: "Deleted later", bill_status: "unbilled" }
+    create_with = lambda do |request_id|
+      described_class.new(context: legacy_replay_context(company:, actor: user, request_id:, key: "timer-key-deleted-1"))
+        .create(user:, project:, attributes:)
+    end
+
+    first = create_with.call("req-deleted-attempt-1")
+    TimesheetEntry.where(id: first.id).update_all(discarded_at: Time.current)
+    retried = create_with.call("req-deleted-attempt-2")
+
+    expect(TimesheetEntry.unscoped.where(project_id: project.id).count).to eq(1)
+    expect(TimesheetEntry.where(project_id: project.id, discarded_at: nil)).not_to exist
+    expect(retried.id).to eq(first.id)
+    expect(retried.note).to eq("Deleted later")
+    expect(retried.snippet[:note]).to eq("Deleted later")
+  end
+
+  # A key reused for a different request must neither replay the first entry nor record a second one.
+  it "a legacy create reusing an idempotency key with a different body is rejected and records no second entry" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = legacy_replay_admin_for(company)
+    create_with = lambda do |request_id, note|
+      described_class.new(context: legacy_replay_context(company:, actor: user, request_id:, key: "timer-key-reused-1"))
+        .create(user:, project:, attributes: { duration: 30, work_date: Date.current, note:, bill_status: "unbilled" })
+    end
+
+    first = create_with.call("req-reused-attempt-1", "First body")
+
+    expect { create_with.call("req-reused-attempt-2", "Different body") }
+      .to raise_error(Timekeeping::EntryWriteClient::Rejected)
+    expect(TimesheetEntry.unscoped.where(project_id: project.id).pluck(:id)).to eq([first.id])
+    expect(TimesheetEntry.find(first.id).note).to eq("First body")
+  end
+
+  # "Both attempts therefore create an entry, duplicating recorded time."
+  # A React Query retry can arrive while the first request is still committing.
+  it "two concurrent legacy creates with the same idempotency key record one entry and both answer it" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = legacy_replay_admin_for(company)
+    attributes = { duration: 30, work_date: Date.current, note: "Overlapping retry", bill_status: "unbilled" }
+    results = Queue.new
+    threads = %w[req-overlap-1 req-overlap-2].map do |request_id|
+      committed_data_thread do
+        context = legacy_replay_context(company:, actor: user, request_id:, key: "timer-key-overlap-1")
+        results << described_class.new(context:).create(user:, project:, attributes:).id
+      rescue StandardError => error
+        results << error
+      end
+    end
+    threads.each { |thread| thread.join(10) }
+
+    answers = Array.new(results.size) { results.pop }
+    expect(answers.size).to eq(2)
+    expect(answers).to all(be_a(Integer))
+    expect(answers.uniq.size).to eq(1)
+    expect(TimesheetEntry.where(project_id: project.id).count).to eq(1)
+  end
+
+  it "the same idempotency key from another user or another company creates its own legacy entry" do
+    company = create(:company)
+    other_company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    other_project = create(:project, billable: true, client: create(:client, company: other_company))
+    first_user = legacy_replay_admin_for(company)
+    second_user = legacy_replay_admin_for(company)
+    foreign_user = legacy_replay_admin_for(other_company)
+    attributes = { duration: 30, work_date: Date.current, note: "Shared key", bill_status: "unbilled" }
+    create_for = lambda do |actor, actor_company, actor_project, request_id|
+      context = legacy_replay_context(company: actor_company, actor:, request_id:, key: "timer-key-shared-1")
+      described_class.new(context:).create(user: actor, project: actor_project, attributes:)
+    end
+
+    first = create_for.call(first_user, company, project, "req-shared-1")
+    second = create_for.call(second_user, company, project, "req-shared-2")
+    foreign = create_for.call(foreign_user, other_company, other_project, "req-shared-3")
+
+    expect([first.id, second.id, foreign.id].uniq.size).to eq(3)
+    expect(second.user_id).to eq(second_user.id)
+    expect(foreign.snippet[:project_id]).to eq(other_project.id)
+    expect(TimesheetEntry.where(project_id: project.id).pluck(:user_id)).to contain_exactly(first_user.id, second_user.id)
+    expect(TimesheetEntry.where(project_id: other_project.id).pluck(:user_id)).to eq([foreign_user.id])
+  end
+
+  it "legacy creates sent without an idempotency key still record a new entry each time" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = legacy_replay_admin_for(company)
+    attributes = { duration: 30, work_date: Date.current, note: "No key", bill_status: "unbilled" }
+    create_with = lambda do |request_id|
+      described_class.new(context: legacy_replay_context(company:, actor: user, request_id:))
+        .create(user:, project:, attributes:)
+    end
+
+    first = create_with.call("req-nokey-1")
+    second = create_with.call("req-nokey-2")
+
+    expect(second.id).not_to eq(first.id)
+    expect(TimesheetEntry.unscoped.where(project_id: project.id).count).to eq(2)
+  end
+
+  # Only a committed create stores a receipt, so a corrected retry with the same key still writes.
+  it "a legacy create that fails validation stores no receipt and a corrected retry with the same key records the entry" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = legacy_replay_admin_for(company)
+    gateway_for = lambda do |request_id|
+      described_class.new(context: legacy_replay_context(company:, actor: user, request_id:,
+                                                         key: "timer-key-invalid-then-fixed"))
+    end
+
+    expect do
+      gateway_for.call("req-invalid-1").create(
+        user:, project:, attributes: { duration: nil, work_date: Date.current, note: "fixed", bill_status: "unbilled" }
+      )
+    end.to raise_error(ActiveRecord::RecordInvalid)
+    expect(Timekeeping::LegacyCreateReceipt.where(company_id: company.id)).not_to exist
+
+    created = gateway_for.call("req-invalid-2").create(
+      user:, project:, attributes: { duration: 30, work_date: Date.current, note: "fixed", bill_status: "unbilled" }
+    )
+
+    expect(TimesheetEntry.where(project_id: project.id).pluck(:id)).to eq([created.id])
+    expect(Timekeeping::LegacyCreateReceipt.where(company_id: company.id).pluck(:timesheet_entry_id)).to eq([created.id])
+  end
+
   it "legacy create retried with the same key after the creator lost access and the entry was edited returns the committed answer, not the later note" do
     company = create(:company)
     project = create(:project, billable: true, client: create(:client, company:))
@@ -2460,492 +2653,6 @@ RSpec.describe Timekeeping::Gateway, committed_data: true do
   end
 end
 
-RSpec.describe Timekeeping::Gateway, committed_data: true do
-  it "legacy create with another company's idempotency key creates its own entry and never returns the other company's entry" do
-    key = "legacy-shared-key-#{SecureRandom.uuid}"
-    attributes = { duration: 30, work_date: Date.current, note: "same body", bill_status: "unbilled" }
-
-    first_company = create(:company)
-    first_project = create(:project, billable: true, client: create(:client, company: first_company))
-    first_user = create(:user, current_workspace_id: first_company.id)
-    create(:employment, company: first_company, user: first_user)
-    first_user.add_role :admin, first_company
-
-    second_company = create(:company)
-    second_project = create(:project, billable: true, client: create(:client, company: second_company))
-    second_user = create(:user, current_workspace_id: second_company.id)
-    create(:employment, company: second_company, user: second_user)
-    second_user.add_role :admin, second_company
-
-    first_context = Timekeeping::WriteContext.new(
-      company: first_company, actor: first_user, actor_kind: "user", request_id: "req-legacy-co-1", idempotency_key: key
-    )
-    first = described_class.new(context: first_context).create(user: first_user, project: first_project, attributes:)
-
-    second_context = Timekeeping::WriteContext.new(
-      company: second_company, actor: second_user, actor_kind: "user", request_id: "req-legacy-co-2", idempotency_key: key
-    )
-    second = nil
-    expect do
-      second = described_class.new(context: second_context).create(user: second_user, project: second_project, attributes:)
-    end.to change(TimesheetEntry, :count).by(1)
-
-    expect(second.id).not_to eq(first.id)
-    expect(TimesheetEntry.find(second.id).project_id).to eq(second_project.id)
-    expect(second.snippet[:project_id]).to eq(second_project.id)
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, committed_data: true do
-  it "legacy create with another user's idempotency key in the same company creates a new entry instead of replaying theirs" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    first_user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user: first_user)
-    first_user.add_role :admin, company
-    second_user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user: second_user)
-    second_user.add_role :admin, company
-    key = "legacy-same-company-key-#{SecureRandom.uuid}"
-    attributes = { duration: 20, work_date: Date.current, note: "shared key", bill_status: "unbilled" }
-
-    first_context = Timekeeping::WriteContext.new(
-      company:, actor: first_user, actor_kind: "user", request_id: "req-legacy-actor-1", idempotency_key: key
-    )
-    first = described_class.new(context: first_context).create(user: first_user, project:, attributes:)
-
-    second_context = Timekeeping::WriteContext.new(
-      company:, actor: second_user, actor_kind: "user", request_id: "req-legacy-actor-2", idempotency_key: key
-    )
-    second = nil
-    expect do
-      second = described_class.new(context: second_context).create(user: second_user, project:, attributes:)
-    end.to change(TimesheetEntry, :count).by(1)
-
-    expect(second.id).not_to eq(first.id)
-    expect(TimesheetEntry.find(second.id).user_id).to eq(second_user.id)
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, "legacy create retried after commit", committed_data: true do
-  # "Test a committed create followed by the same key under initial ownership."
-  it "a committed legacy create retried with the same idempotency key and body returns the first entry and records the time once" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    attributes = { duration: 30, work_date: Date.current, note: "Timer stop", bill_status: "unbilled" }
-    create_with = lambda do |request_id|
-      context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id:,
-                                              idempotency_key: "timer-key-retry-1")
-      described_class.new(context:).create(user:, project:, attributes:)
-    end
-
-    first = create_with.call("req-timer-attempt-1")
-    retried = create_with.call("req-timer-attempt-2")
-
-    expect(TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).monolith_store).to eq("legacy")
-    expect(TimesheetEntry.where(project_id: project.id).count).to eq(1)
-    expect(retried.id).to eq(first.id)
-    expect(retried.snippet[:note]).to eq("Timer stop")
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, "legacy create replay after a later edit", committed_data: true do
-  # The retry must replay the stored answer, never the entry as it reads now:
-  # a later edit made after the creator lost access must not be shown to them.
-  it "a legacy create replay returns the answer committed first even after the entry was edited and the creator lost admin" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    admin = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user: admin)
-    admin.add_role :admin, company
-    employee = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user: employee)
-    employee.add_role :employee, company
-    attributes = { duration: 45, work_date: Date.current, note: "Original note", bill_status: "unbilled" }
-    create_with = lambda do |request_id|
-      context = Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id:,
-                                              idempotency_key: "timer-key-edited-1")
-      described_class.new(context:).create(user: employee, project:, attributes:)
-    end
-
-    first = create_with.call("req-edited-attempt-1")
-    TimesheetEntry.where(id: first.id).update_all(note: "Confidential later note")
-    admin.remove_role :admin, company
-    admin.add_role :employee, company
-    retried = create_with.call("req-edited-attempt-2")
-
-    expect(TimesheetEntry.where(project_id: project.id).count).to eq(1)
-    expect(retried.id).to eq(first.id)
-    expect(retried.snippet[:note]).to eq("Original note")
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, "legacy create replay after a delete", committed_data: true do
-  it "a legacy create retried after its entry was deleted replays the first answer and does not recreate the entry" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    attributes = { duration: 20, work_date: Date.current, note: "Deleted later", bill_status: "unbilled" }
-    create_with = lambda do |request_id|
-      context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id:,
-                                              idempotency_key: "timer-key-deleted-1")
-      described_class.new(context:).create(user:, project:, attributes:)
-    end
-
-    first = create_with.call("req-deleted-attempt-1")
-    TimesheetEntry.where(id: first.id).update_all(discarded_at: Time.current)
-    retried = create_with.call("req-deleted-attempt-2")
-
-    expect(TimesheetEntry.where(project_id: project.id).count).to eq(1)
-    expect(TimesheetEntry.where(project_id: project.id, discarded_at: nil)).not_to exist
-    expect(retried.id).to eq(first.id)
-    expect(retried.snippet[:note]).to eq("Deleted later")
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, "legacy create key reused with another body", committed_data: true do
-  it "a legacy create reusing an idempotency key with a different body is rejected and records no second entry" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    create_with = lambda do |request_id, note|
-      context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id:,
-                                              idempotency_key: "timer-key-reused-1")
-      described_class.new(context:).create(
-        user:, project:, attributes: { duration: 30, work_date: Date.current, note:, bill_status: "unbilled" }
-      )
-    end
-
-    first = create_with.call("req-reused-attempt-1", "First body")
-
-    expect { create_with.call("req-reused-attempt-2", "Different body") }
-      .to raise_error(Timekeeping::EntryWriteClient::Rejected)
-    expect(TimesheetEntry.where(project_id: project.id).pluck(:id)).to eq([first.id])
-    expect(TimesheetEntry.find(first.id).note).to eq("First body")
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, "concurrent legacy creates with one key", committed_data: true do
-  it "two concurrent legacy creates with the same idempotency key record one entry and both answer it" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    attributes = { duration: 30, work_date: Date.current, note: "Overlapping retry", bill_status: "unbilled" }
-    results = Queue.new
-    threads = %w[req-overlap-1 req-overlap-2].map do |request_id|
-      committed_data_thread do
-        context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id:,
-                                                idempotency_key: "timer-key-overlap-1")
-        results << described_class.new(context:).create(user:, project:, attributes:).id
-      rescue StandardError => error
-        results << error
-      end
-    end
-    threads.each { |thread| thread.join(10) }
-
-    answers = Array.new(results.size) { results.pop }
-    expect(answers.size).to eq(2)
-    expect(answers).to all(be_a(Integer))
-    expect(answers.uniq.size).to eq(1)
-    expect(TimesheetEntry.where(project_id: project.id).count).to eq(1)
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, "legacy create key scoped to company and actor", committed_data: true do
-  it "the same idempotency key from another user or another company creates its own legacy entry" do
-    build_admin = lambda do |company|
-      create(:user, current_workspace_id: company.id).tap do |user|
-        create(:employment, company:, user:)
-        user.add_role :admin, company
-      end
-    end
-    company = create(:company)
-    other_company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    other_project = create(:project, billable: true, client: create(:client, company: other_company))
-    first_user = build_admin.call(company)
-    second_user = build_admin.call(company)
-    foreign_user = build_admin.call(other_company)
-    attributes = { duration: 30, work_date: Date.current, note: "Shared key", bill_status: "unbilled" }
-    create_for = lambda do |actor, actor_company, actor_project, request_id|
-      context = Timekeeping::WriteContext.new(company: actor_company, actor:, actor_kind: "user", request_id:,
-                                              idempotency_key: "timer-key-shared-1")
-      described_class.new(context:).create(user: actor, project: actor_project, attributes:)
-    end
-
-    first = create_for.call(first_user, company, project, "req-shared-1")
-    second = create_for.call(second_user, company, project, "req-shared-2")
-    foreign = create_for.call(foreign_user, other_company, other_project, "req-shared-3")
-
-    expect([first.id, second.id, foreign.id].uniq.size).to eq(3)
-    expect(TimesheetEntry.where(project_id: project.id).pluck(:user_id)).to contain_exactly(first_user.id, second_user.id)
-    expect(TimesheetEntry.where(project_id: other_project.id).pluck(:user_id)).to eq([foreign_user.id])
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, "legacy create without a client key", committed_data: true do
-  it "legacy creates sent without an idempotency key still record a new entry each time" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    attributes = { duration: 30, work_date: Date.current, note: "No key", bill_status: "unbilled" }
-    create_with = lambda do |request_id|
-      context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id:)
-      described_class.new(context:).create(user:, project:, attributes:)
-    end
-
-    first = create_with.call("req-nokey-1")
-    second = create_with.call("req-nokey-2")
-
-    expect(second.id).not_to eq(first.id)
-    expect(TimesheetEntry.where(project_id: project.id).count).to eq(2)
-  end
-end
-
-RSpec.describe Timekeeping::Gateway do
-  def legacy_tenant_admin_for(company)
-    create(:user, current_workspace_id: company.id).tap do |user|
-      create(:employment, company:, user:)
-      user.add_role :admin, company
-    end
-  end
-
-  it "a legacy create keyed like another company's committed create writes its own entry and never returns the other company's entry" do
-    shared_key = "timer-key-shared-across-companies"
-    first_company = create(:company)
-    first_project = create(:project, billable: true, client: create(:client, company: first_company))
-    first_user = legacy_tenant_admin_for(first_company)
-    second_company = create(:company)
-    second_project = create(:project, billable: true, client: create(:client, company: second_company))
-    second_user = legacy_tenant_admin_for(second_company)
-    attributes = { duration: 30, work_date: Date.current, note: "Timer", bill_status: "unbilled" }
-
-    first_entry = described_class.new(
-      context: Timekeeping::WriteContext.new(
-        company: first_company, actor: first_user, actor_kind: "user",
-        request_id: "req-tenant-company-1", idempotency_key: shared_key
-      )
-    ).create(user: first_user, project: first_project, attributes:)
-
-    second_entry = described_class.new(
-      context: Timekeeping::WriteContext.new(
-        company: second_company, actor: second_user, actor_kind: "user",
-        request_id: "req-tenant-company-2", idempotency_key: shared_key
-      )
-    ).create(user: second_user, project: second_project, attributes:)
-
-    expect(second_entry.id).not_to eq(first_entry.id)
-    expect([second_entry.user_id, second_entry.project_id]).to eq([second_user.id, second_project.id])
-    expect(TimesheetEntry.where(project_id: second_project.id).count).to eq(1)
-    expect(TimesheetEntry.where(project_id: first_project.id).count).to eq(1)
-  end
-end
-
-RSpec.describe Timekeeping::Gateway do
-  def legacy_tenant_member_for(company)
-    create(:user, current_workspace_id: company.id).tap do |user|
-      create(:employment, company:, user:)
-      user.add_role :admin, company
-    end
-  end
-
-  it "a legacy create keyed like another user's committed create in the same company writes its own entry and never replays the other user's answer" do
-    shared_key = "timer-key-shared-across-users"
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    first_user = legacy_tenant_member_for(company)
-    second_user = legacy_tenant_member_for(company)
-
-    first_entry = described_class.new(
-      context: Timekeeping::WriteContext.new(
-        company:, actor: first_user, actor_kind: "user",
-        request_id: "req-tenant-user-1", idempotency_key: shared_key
-      )
-    ).create(user: first_user, project:,
-             attributes: { duration: 30, work_date: Date.current, note: "First user's private note", bill_status: "unbilled" })
-
-    second_entry = described_class.new(
-      context: Timekeeping::WriteContext.new(
-        company:, actor: second_user, actor_kind: "user",
-        request_id: "req-tenant-user-2", idempotency_key: shared_key
-      )
-    ).create(user: second_user, project:,
-             attributes: { duration: 30, work_date: Date.current, note: "First user's private note", bill_status: "unbilled" })
-
-    expect(second_entry.id).not_to eq(first_entry.id)
-    expect(second_entry.user_id).to eq(second_user.id)
-    expect(TimesheetEntry.where(project_id: project.id, user_id: second_user.id).count).to eq(1)
-    expect(TimesheetEntry.where(project_id: project.id, user_id: first_user.id).count).to eq(1)
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, "legacy create replay by idempotency key", committed_data: true do
-  # "Start with the initial ownership state, save a timer entry, and lose the response after commit. React Query retries with the planned stable key and body."
-  # "Test a committed create followed by the same key under initial ownership."
-  it "a legacy create retried with the same key and body after commit returns the first entry and records the time once" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    expect(TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).monolith_store)
-      .to eq(TimekeepingOwnership::INITIAL_MONOLITH_STORE)
-    attributes = { duration: 30, work_date: Date.current, note: "timer", bill_status: "unbilled" }
-    context_for = lambda do |request_id|
-      Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id:,
-                                    idempotency_key: "timer-key-legacy-1")
-    end
-
-    first = described_class.new(context: context_for.call("req-legacy-timer-1")).create(user:, project:, attributes:)
-    retried = described_class.new(context: context_for.call("req-legacy-timer-2")).create(user:, project:, attributes:)
-
-    expect(retried.id).to eq(first.id)
-    expect(TimesheetEntry.unscoped.where(project_id: project.id, user_id: user.id).count).to eq(1)
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, "legacy create replay returns the stored answer", committed_data: true do
-  # "so a retried write replays the stored answer instead of using the per-request fallback key"
-  it "a legacy create retried after the entry was edited replays the answer the first attempt committed" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    admin = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user: admin)
-    admin.add_role :admin, company
-    employee = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user: employee)
-    employee.add_role :employee, company
-    attributes = { duration: 45, work_date: Date.current, note: "original note", bill_status: "unbilled" }
-    context_for = lambda do |request_id|
-      Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id:,
-                                    idempotency_key: "timer-key-legacy-edited")
-    end
-
-    first = described_class.new(context: context_for.call("req-legacy-edit-1"))
-      .create(user: employee, project:, attributes:)
-    admin.remove_role :admin, company
-    admin.add_role :employee, company
-    TimesheetEntry.unscoped.where(id: first.id).update_all(note: "confidential later note")
-
-    retried = described_class.new(context: context_for.call("req-legacy-edit-2"))
-      .create(user: employee, project:, attributes:)
-
-    expect(retried.id).to eq(first.id)
-    expect(retried.note).to eq("original note")
-    expect(retried.snippet[:note]).to eq("original note")
-    expect(TimesheetEntry.unscoped.where(project_id: project.id).count).to eq(1)
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, "legacy create replay after delete", committed_data: true do
-  # "so a retried write replays the stored answer instead of using the per-request fallback key"
-  it "a legacy create retried after the entry was deleted replays the original answer and creates no new entry" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    attributes = { duration: 20, work_date: Date.current, note: "deleted later", bill_status: "unbilled" }
-    context_for = lambda do |request_id|
-      Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id:,
-                                    idempotency_key: "timer-key-legacy-deleted")
-    end
-
-    first = described_class.new(context: context_for.call("req-legacy-del-1")).create(user:, project:, attributes:)
-    TimesheetEntry.unscoped.where(id: first.id).update_all(discarded_at: Time.current)
-
-    retried = described_class.new(context: context_for.call("req-legacy-del-2")).create(user:, project:, attributes:)
-
-    expect(retried.id).to eq(first.id)
-    expect(retried.note).to eq("deleted later")
-    expect(TimesheetEntry.unscoped.where(project_id: project.id).count).to eq(1)
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, "legacy create key reuse", committed_data: true do
-  it "a legacy create that reuses a key with a different body is rejected and adds no entry" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    context_for = lambda do |request_id|
-      Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id:,
-                                    idempotency_key: "timer-key-legacy-reused")
-    end
-
-    described_class.new(context: context_for.call("req-legacy-reuse-1")).create(
-      user:, project:, attributes: { duration: 30, work_date: Date.current, note: "first", bill_status: "unbilled" }
-    )
-
-    expect do
-      described_class.new(context: context_for.call("req-legacy-reuse-2")).create(
-        user:, project:, attributes: { duration: 30, work_date: Date.current, note: "second", bill_status: "unbilled" }
-      )
-    end.to raise_error(Timekeeping::EntryWriteClient::Rejected)
-    expect(TimesheetEntry.unscoped.where(project_id: project.id).pluck(:note)).to eq(["first"])
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, "legacy create without a key", committed_data: true do
-  it "legacy creates without an idempotency key still create a new entry on each call" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    attributes = { duration: 30, work_date: Date.current, note: "keyless", bill_status: "unbilled" }
-
-    first = described_class.new(
-      context: Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: "req-keyless-1")
-    ).create(user:, project:, attributes:)
-    second = described_class.new(
-      context: Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: "req-keyless-2")
-    ).create(user:, project:, attributes:)
-
-    expect(second.id).not_to eq(first.id)
-    expect(TimesheetEntry.unscoped.where(project_id: project.id).count).to eq(2)
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, "legacy create key scope", committed_data: true do
-  it "the same key sent by another user in the same company creates that user's own legacy entry" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    first_user, second_user = Array.new(2) do
-      create(:user, current_workspace_id: company.id).tap do |user|
-        create(:employment, company:, user:)
-        user.add_role :admin, company
-      end
-    end
-    attributes = { duration: 30, work_date: Date.current, note: "shared key", bill_status: "unbilled" }
-
-    first = described_class.new(
-      context: Timekeeping::WriteContext.new(company:, actor: first_user, actor_kind: "user",
-                                             request_id: "req-scope-1", idempotency_key: "timer-key-shared")
-    ).create(user: first_user, project:, attributes:)
-    second = described_class.new(
-      context: Timekeeping::WriteContext.new(company:, actor: second_user, actor_kind: "user",
-                                             request_id: "req-scope-2", idempotency_key: "timer-key-shared")
-    ).create(user: second_user, project:, attributes:)
-
-    expect(second.id).not_to eq(first.id)
-    expect(second.user_id).to eq(second_user.id)
-    expect(TimesheetEntry.unscoped.where(project_id: project.id).count).to eq(2)
-  end
-end
-
 RSpec.describe Timekeeping::Gateway do
   let(:retry_delete_company) { create(:company) }
   let(:retry_delete_project) do
@@ -2987,150 +2694,5 @@ RSpec.describe Timekeeping::Gateway do
       .to raise_error(ActiveRecord::RecordNotFound)
     expect(TimesheetEntry.find(entry.id).discarded_at).to be_present
     expect(TimesheetEntry.where(project_id: retry_delete_project.id).count).to eq(1)
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, committed_data: true do
-  # "Both attempts therefore create an entry, duplicating recorded time."
-  # A React Query retry can arrive while the first request is still committing.
-  it "legacy retry racing the first attempt with one key records one entry" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    attributes = { duration: 30, work_date: Date.current, note: "race", bill_status: "unbilled" }
-
-    results = Queue.new
-    threads = %w[req-race-1 req-race-2].map do |request_id|
-      committed_data_thread do
-        context = Timekeeping::WriteContext.new(
-          company:, actor: user, actor_kind: "user", request_id:, idempotency_key: "race-key-1"
-        )
-        results << described_class.new(context:).create(user:, project:, attributes:).id
-      rescue StandardError => error
-        results << error
-      end
-    end
-    threads.each(&:join)
-
-    answers = Array.new(2) { results.pop }
-    expect(answers).to all(be_a(Integer))
-    expect(answers.uniq.size).to eq(1)
-    expect(TimesheetEntry.where(company_id: company.id, note: "race").count).to eq(1)
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, committed_data: true do
-  # The issue rests on: "so a retried write replays the stored answer instead of using the per-request fallback key"
-  it "legacy retry after the entry was edited replays the committed answer, not the edit" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    admin = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user: admin)
-    admin.add_role :admin, company
-    member = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user: member)
-    attributes = { duration: 30, work_date: Date.current, note: "original", bill_status: "unbilled" }
-    build_context = lambda do |request_id|
-      Timekeeping::WriteContext.new(
-        company:, actor: admin, actor_kind: "user", request_id:, idempotency_key: "edited-key-1"
-      )
-    end
-
-    first = described_class.new(context: build_context.call("req-edit-1")).create(user: member, project:, attributes:)
-    TimesheetEntry.find(first.id).update_columns(note: "confidential later note")
-
-    replayed = nil
-    expect do
-      replayed = described_class.new(context: build_context.call("req-edit-2"))
-        .create(user: member, project:, attributes:)
-    end.not_to change(TimesheetEntry, :count)
-
-    expect(replayed.id).to eq(first.id)
-    expect(replayed.snippet[:note]).to eq("original")
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, committed_data: true do
-  # "Both attempts therefore create an entry, duplicating recorded time."
-  # Ordering: create, delete, then the retried create must not revive the deleted time.
-  it "legacy retry after the entry was discarded creates no new entry" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    attributes = { duration: 45, work_date: Date.current, note: "discarded", bill_status: "unbilled" }
-    build_context = lambda do |request_id|
-      Timekeeping::WriteContext.new(
-        company:, actor: user, actor_kind: "user", request_id:, idempotency_key: "discard-key-1"
-      )
-    end
-
-    first = described_class.new(context: build_context.call("req-discard-1")).create(user:, project:, attributes:)
-    TimesheetEntry.find(first.id).update_columns(discarded_at: Time.current)
-
-    replayed = described_class.new(context: build_context.call("req-discard-2")).create(user:, project:, attributes:)
-
-    expect(replayed.id).to eq(first.id)
-    expect(TimesheetEntry.unscoped.where(company_id: company.id, note: "discarded").count).to eq(1)
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, "legacy create refused before its save", committed_data: true do
-  # Only a committed create stores a receipt, so a corrected retry with the same key still writes.
-  it "a legacy create that fails validation stores no receipt and a corrected retry with the same key records the entry" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    gateway_for = lambda do |request_id|
-      context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id:,
-                                              idempotency_key: "timer-key-invalid-then-fixed")
-      described_class.new(context:)
-    end
-
-    expect do
-      gateway_for.call("req-invalid-1").create(
-        user:, project:, attributes: { duration: nil, work_date: Date.current, note: "fixed", bill_status: "unbilled" }
-      )
-    end.to raise_error(ActiveRecord::RecordInvalid)
-    expect(Timekeeping::LegacyCreateReceipt.where(company_id: company.id)).not_to exist
-
-    created = gateway_for.call("req-invalid-2").create(
-      user:, project:, attributes: { duration: 30, work_date: Date.current, note: "fixed", bill_status: "unbilled" }
-    )
-
-    expect(TimesheetEntry.where(project_id: project.id).pluck(:id)).to eq([created.id])
-    expect(Timekeeping::LegacyCreateReceipt.where(company_id: company.id).pluck(:timesheet_entry_id)).to eq([created.id])
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, committed_data: true do
-  # A key reused for a different request must neither replay the first entry nor record a second one.
-  it "legacy create reusing a key with a different body is rejected and writes nothing" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    build_context = lambda do |request_id|
-      Timekeeping::WriteContext.new(
-        company:, actor: user, actor_kind: "user", request_id:, idempotency_key: "reused-key-1"
-      )
-    end
-
-    described_class.new(context: build_context.call("req-reuse-1")).create(
-      user:, project:, attributes: { duration: 30, work_date: Date.current, note: "first", bill_status: "unbilled" }
-    )
-
-    expect do
-      described_class.new(context: build_context.call("req-reuse-2")).create(
-        user:, project:, attributes: { duration: 90, work_date: Date.current, note: "second", bill_status: "unbilled" }
-      )
-    end.to raise_error(Timekeeping::EntryWriteClient::Rejected)
-    expect(TimesheetEntry.where(company_id: company.id).pluck(:note)).to eq(["first"])
   end
 end
