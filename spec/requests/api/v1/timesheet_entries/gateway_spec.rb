@@ -541,6 +541,8 @@ RSpec.describe "Api::V1::TimesheetEntry gateway missing ownership row", type: :r
     expect(TimekeepingOwnership.count).to eq(0)
   end
 
+  # "A missing row or an unknown owner also refuses (fail closed). It never falls back to legacy and never answers 404."
+  # Each verb is its own example: only update and destroy look the entry up, so only they could answer 404.
   it "refuses a create by an employee with 503 ownership_moving and writes no entry" do
     delete_missing_row_ownership
     sign_in missing_row_employee
