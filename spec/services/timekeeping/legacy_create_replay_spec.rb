@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "rails_helper"
 
 RSpec.describe Timekeeping::LegacyCreateReplay do
@@ -14,11 +16,7 @@ RSpec.describe Timekeeping::LegacyCreateReplay do
     expect(described_class.decision(stored_fingerprint: described_class.fingerprint(changed), fingerprint:))
       .to eq(:key_reused)
   end
-end
 
-require "rails_helper"
-
-RSpec.describe Timekeeping::LegacyCreateReplay do
   it "decision answers write with no receipt, replay on a matching fingerprint and key_reused on a different one" do
     stored = described_class.fingerprint({ "user_id" => 1, "project_id" => 2, "fields" => { "note" => "a" } })
     changed = described_class.fingerprint({ "user_id" => 1, "project_id" => 2, "fields" => { "note" => "b" } })
@@ -27,11 +25,7 @@ RSpec.describe Timekeeping::LegacyCreateReplay do
     expect(described_class.decision(stored_fingerprint: stored, fingerprint: stored)).to eq(:replay)
     expect(described_class.decision(stored_fingerprint: stored, fingerprint: changed)).to eq(:key_reused)
   end
-end
 
-require "rails_helper"
-
-RSpec.describe Timekeeping::LegacyCreateReplay do
   it "fingerprint is stable for the same identity and changes when one request value changes" do
     identity = { "user_id" => 7, "project_id" => 9, "fields" => { "duration" => 30, "note" => "timer" } }
     other = { "user_id" => 7, "project_id" => 9, "fields" => { "duration" => 31, "note" => "timer" } }
