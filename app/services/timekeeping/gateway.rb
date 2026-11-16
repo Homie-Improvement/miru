@@ -124,9 +124,7 @@ module Timekeeping
         when :legacy
           agent.timesheet_entries.update_all(agent_id: nil)
         when :prepared
-          # The local owner detaches only for a background service actor,
-          # which this context does not carry, so the prepared store refuses.
-          raise OwnershipMoving
+          local_detach(ownership:, agent:)
         when :timekeeping
           service_client.detach_agent_entries(
             company_id: agent.company_id, agent_id: agent.id, generation: ownership.generation,
@@ -523,6 +521,22 @@ module Timekeeping
       # grants nothing: the local owner decides access from its own facts.
       def local_actor
         LocalOwner::Actor.user(user_id: context.actor.id, role: context.actor.primary_role(context.company))
+      end
+
+      # The local owner admits detach_entries only from a service actor. The
+      # actor is bound to the agent's own company and to the detach operation
+      # alone, and is named as the forwarded detach's token names the
+      # monolith, so both stores record the same service on their audit rows.
+      def local_detach(ownership:, agent:)
+        actor = LocalOwner::Actor.service(name: ServiceToken::SUBJECT, company_id: agent.company_id,
+                                          operations: [ServiceToken::DETACH_ENTRIES])
+        outcome = local_owner.call(
+          operation: :detach_entries, company_id: agent.company_id, generation: ownership.generation, actor:,
+          params: { "agent_id" => agent.id,
+                    "operation_id" => self.class.detach_operation_id(request_id: context.request_id,
+                                                                     agent_id: agent.id) }
+        )
+        local_answer(:detach_entries, outcome).fetch("detached")
       end
 
       # The request's own Idempotency-Key, or the key a forwarded write derives

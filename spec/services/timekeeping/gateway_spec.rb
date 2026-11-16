@@ -792,14 +792,18 @@ RSpec.describe Timekeeping::Gateway, "agent entry detach routing" do
     expect(entry.reload.agent_id).to eq(agent.id)
   end
 
-  it "refuses a detach in the prepared store and sends nothing to Timekeeping" do
+  it "raises Forbidden when the local owner refuses a prepared detach and sends nothing to Timekeeping" do
     agent = create(:agent)
     TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+    local_owner = class_double(Timekeeping::LocalOwner)
+    allow(local_owner).to receive(:call)
+      .and_return(Timekeeping::LocalOwner::Outcome.new(status: 403, body: { "reason" => "forbidden" }))
     # A double with no allowed methods: any forwarded call fails the example.
     service_client = instance_double(Timekeeping::ServiceCommandClient)
-    gateway = described_class.new(context: detach_routing_context(agent, "req-detach-prepared"), service_client:)
+    gateway = described_class.new(context: detach_routing_context(agent, "req-detach-prepared"), local_owner:,
+                                  service_client:)
 
-    expect { gateway.detach_agent_entries(agent:) }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
+    expect { gateway.detach_agent_entries(agent:) }.to raise_error(Timekeeping::EntryWriteClient::Forbidden)
   end
 
   it "forwards the generation it read and the attempt's operation id and request id" do
@@ -2260,5 +2264,152 @@ RSpec.describe Timekeeping::Gateway, "prepared branch call shape" do
     # The request's own If-Match wins over the version the lookup read.
     expect(kwargs[:params]["if_match"]).to eq("7")
     expect(kwargs[:params]["entry_id"].to_s).to eq(entry.id.to_s)
+  end
+end
+
+RSpec.describe Timekeeping::Gateway, "prepared agent detach replay" do
+  it "repeating a prepared detach with the same request id replays its count and writes no second audit or outbox row" do
+    agent = create(:agent)
+    prepare_local_ownership!
+    project = create(:project, client: create(:client, company: agent.company))
+    entry = Timekeeping::LocalEntry.create!(company_id: agent.company_id, user_id: agent.user_id,
+                                            project_id: project.id, work_date: Date.current, duration: 30.0,
+                                            note: "n", bill_status: "unbilled", agent_id: agent.id)
+    context = Timekeeping::WriteContext.new(company: agent.company, actor: agent.user, actor_kind: "agent_destroy",
+                                            request_id: "req-prepared-detach-replay")
+    gateway = described_class.new(context:, service_client: instance_double(Timekeeping::ServiceCommandClient))
+
+    first = gateway.detach_agent_entries(agent:)
+    counts_after_first = timekeeping_row_counts
+    second = gateway.detach_agent_entries(agent:)
+
+    expect(first).to eq(1)
+    expect(second).to eq(first)
+    expect(timekeeping_row_counts).to eq(counts_after_first)
+    expect(entry.reload.agent_id).to be_nil
+  end
+end
+
+RSpec.describe Timekeeping::Gateway, "prepared agent entry detach call" do
+  # "With ownership prepared, deleting an agent calls LocalOwner.call(operation: :detach_entries, ...) with a service actor and clears agent_id on its entries instead of answering 503 ownership_moving."
+  it "prepared detach calls the local owner's detach_entries with a company-bound service actor and returns its count" do
+    agent = create(:agent)
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "monolith", monolith_store: "prepared",
+                                                                                 handoff_step: nil, generation: 2)
+    local_owner = class_double(Timekeeping::LocalOwner)
+    allow(local_owner).to receive(:call)
+      .and_return(Timekeeping::LocalOwner::Outcome.new(status: 200, body: { "detached" => 3 }))
+    # A double with no allowed methods: any forwarded call fails the example.
+    service_client = instance_double(Timekeeping::ServiceCommandClient)
+    context = Timekeeping::WriteContext.new(company: agent.company, actor: agent.user, actor_kind: "agent_destroy",
+                                            request_id: "req-prepared-detach-call")
+    gateway = described_class.new(context:, local_owner:, service_client:)
+
+    expect(gateway.detach_agent_entries(agent:)).to eq(3)
+    expect(local_owner).to have_received(:call).once do |**kwargs|
+      expect(kwargs[:operation]).to eq(:detach_entries)
+      expect(kwargs[:company_id]).to eq(agent.company_id)
+      expect(Integer(kwargs[:generation])).to eq(2)
+      actor = kwargs[:actor]
+      expect(actor.kind).to eq(:service)
+      expect(actor.user_id).to be_nil
+      expect(actor.company_id).to eq(agent.company_id)
+      expect(actor.operations).to eq([Timekeeping::ServiceToken::DETACH_ENTRIES])
+      expect(actor.name).to eq(Timekeeping::ServiceToken::SUBJECT)
+      expect(kwargs[:params]).to eq(
+        "agent_id" => agent.id,
+        "operation_id" => described_class.detach_operation_id(request_id: "req-prepared-detach-call", agent_id: agent.id)
+      )
+    end
+  end
+end
+
+RSpec.describe Timekeeping::Gateway, "prepared agent entry detach through the local owner" do
+  # "With ownership prepared, deleting an agent calls LocalOwner.call(operation: :detach_entries, ...) with a service actor and clears agent_id on its entries instead of answering 503 ownership_moving."
+  it "prepared detach through the real local owner clears only the agent's entries in its company, discarded ones included" do
+    agent = create(:agent)
+    prepare_local_ownership!
+    project = create(:project, client: create(:client, company: agent.company))
+    live = Timekeeping::LocalEntry.create!(company_id: agent.company_id, user_id: agent.user_id, project_id: project.id,
+                                           work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled",
+                                           agent_id: agent.id)
+    discarded = Timekeeping::LocalEntry.create!(company_id: agent.company_id, user_id: agent.user_id,
+                                                project_id: project.id, work_date: Date.current, duration: 30.0,
+                                                note: "n", bill_status: "unbilled", agent_id: agent.id,
+                                                discarded_at: Time.current)
+    other_company = create(:company)
+    other_project = create(:project, client: create(:client, company: other_company))
+    foreign = Timekeeping::LocalEntry.create!(company_id: other_company.id, user_id: agent.user_id,
+                                              project_id: other_project.id, work_date: Date.current, duration: 30.0,
+                                              note: "n", bill_status: "unbilled", agent_id: agent.id)
+    versions = [live, discarded].to_h { |entry| [entry.id, entry.reload.version] }
+    service_client = instance_double(Timekeeping::ServiceCommandClient)
+    context = Timekeeping::WriteContext.new(company: agent.company, actor: agent.user, actor_kind: "agent_destroy",
+                                            request_id: "req-prepared-detach-real")
+    audits_before = timekeeping_row_counts(%w[entry_audits]).fetch("entry_audits")
+
+    detached = described_class.new(context:, service_client:).detach_agent_entries(agent:)
+
+    expect(detached).to eq(2)
+    expect(timekeeping_row_counts(%w[entry_audits]).fetch("entry_audits")).to eq(audits_before + 2)
+    [live, discarded].each do |entry|
+      entry.reload
+      expect(entry.agent_id).to be_nil
+      expect(entry.version).to eq(versions[entry.id] + 1)
+      expect(Timekeeping::LocalOwner::AuditRow.where(entry_id: entry.id, action: "detach_entries").count).to eq(1)
+    end
+    expect(foreign.reload.agent_id).to eq(agent.id)
+    expect(Timekeeping::LocalOwner::AuditRow.where(entry_id: foreign.id, action: "detach_entries").count).to eq(0)
+  end
+end
+
+RSpec.describe Timekeeping::Gateway, "prepared agent entry detach refusal" do
+  it "a prepared detach the local owner answers with stale_generation raises StaleGeneration and emits one refusal event" do
+    agent = create(:agent)
+    prepare_local_ownership!
+    local_owner = class_double(Timekeeping::LocalOwner)
+    allow(local_owner).to receive(:call)
+      .and_return(Timekeeping::LocalOwner::Outcome.new(status: 409, body: { "reason" => "stale_generation" }))
+    context = Timekeeping::WriteContext.new(company: agent.company, actor: agent.user, actor_kind: "agent_destroy",
+                                            request_id: "req-prepared-detach-stale")
+    gateway = described_class.new(context:, local_owner:)
+    events = []
+    subscriber = Object.new
+    subscriber.define_singleton_method(:emit) do |event|
+      events << event if event[:name] == "Timekeeping::EntryWriteRefused"
+    end
+    Rails.event.subscribe(subscriber)
+    begin
+      expect { gateway.detach_agent_entries(agent:) }.to raise_error(Timekeeping::Gateway::StaleGeneration)
+    ensure
+      Rails.event.unsubscribe(subscriber)
+    end
+
+    expect(local_owner).to have_received(:call).once
+    expect(events.size).to eq(1)
+  end
+end
+
+RSpec.describe Timekeeping::Gateway, "prepared agent detach retried by a new attempt" do
+  # "With ownership prepared, deleting an agent calls LocalOwner.call(operation: :detach_entries, ...) with a service actor and clears agent_id on its entries instead of answering 503 ownership_moving."
+  it "a retried prepared detach with a new request id clears an entry that named the agent after the first attempt" do
+    agent = create(:agent)
+    prepare_local_ownership!
+    project = create(:project, client: create(:client, company: agent.company))
+    seed_entry = lambda do
+      Timekeeping::LocalEntry.create!(company_id: agent.company_id, user_id: agent.user_id, project_id: project.id,
+                                      work_date: Date.current, duration: 30.0, note: "n",
+                                      bill_status: "unbilled", agent_id: agent.id)
+    end
+    context_for = lambda do |request_id|
+      Timekeeping::WriteContext.new(company: agent.company, actor: agent.user, actor_kind: "agent_destroy", request_id:)
+    end
+    seed_entry.call
+
+    expect(described_class.new(context: context_for.call("req-attempt-1")).detach_agent_entries(agent:)).to eq(1)
+    late = seed_entry.call
+    expect(described_class.new(context: context_for.call("req-attempt-2")).detach_agent_entries(agent:)).to eq(1)
+
+    expect(late.reload.agent_id).to be_nil
   end
 end
