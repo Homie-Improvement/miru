@@ -1811,6 +1811,25 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client Idempotency-Key
       expect(answers.second).to eq(answers.first)
     end
 
+    # A partial body names only some fields; the resend must forward the same partial body under the same key.
+    it "replays a forwarded partial-body update resent under a new request id with the same Idempotency-Key" do
+      entry_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                                work_date: Date.current.iso8601, note: "Before").fetch("id")
+      params = { project_id: project.id, timesheet_entry: { duration: 60, note: "After" } }
+      client_key = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+
+      %w[client-key-partial-update-attempt-1 client-key-partial-update-attempt-2].each do |request_id|
+        send_request :put, api_v1_timesheet_entry_path(entry_id), params:,
+          headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => request_id)
+        expect(response).to be_successful
+      end
+
+      forwarded_keys = client_key_forwarded_keys("PATCH")
+      expect(forwarded_keys.size).to eq(2)
+      expect(forwarded_keys.uniq.size).to eq(1)
+      expect(fake.stored_entry(entry_id)["note"]).to eq("After")
+    end
+
     it "replays a forwarded delete resent under a new request id with the same Idempotency-Key and discards the entry once" do
       entry_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
                                 work_date: Date.current.iso8601, note: "Delete once").fetch("id")
