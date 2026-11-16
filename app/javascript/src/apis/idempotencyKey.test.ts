@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+  entryTarget,
   type HeldKeys,
   isEntryGatewayWrite,
   keyForSend,
@@ -141,6 +142,54 @@ describe("sendWithHeldKey", () => {
     assert.equal(sentKeys[1], sentKeys[0]);
     assert.notEqual(sentKeys[2], sentKeys[0]);
     assert.deepEqual(held.current, []);
+  });
+
+  it("retires a failed edit's key once a later edit of the same entry succeeds", async () => {
+    const held: HeldKeys = { current: [] };
+    const newKey = sequentialKeys();
+    const { sentKeys, settlers, write } = pendingWrite();
+    const saveEdit = (duration: number) =>
+      sendWithHeldKey(
+        held,
+        { entryId: 42, body: entryBody(duration) },
+        newKey,
+        write,
+        entryTarget(42)
+      );
+
+    const lost = saveEdit(60);
+    settlers[0].reject();
+    await assert.rejects(lost);
+    const later = saveEdit(90);
+    settlers[1].resolve();
+    await later;
+    const newEdit = saveEdit(60);
+    settlers[2].resolve();
+    await newEdit;
+
+    assert.notEqual(sentKeys[2], sentKeys[0]);
+    assert.deepEqual(held.current, []);
+  });
+
+  it("keeps a failed edit's key when an edit of another entry succeeds", async () => {
+    const held: HeldKeys = { current: [] };
+    const newKey = sequentialKeys();
+    const { sentKeys, settlers, write } = pendingWrite();
+
+    const saveEdit = (entryId: number) =>
+      sendWithHeldKey(held, { entryId }, newKey, write, entryTarget(entryId));
+
+    const lost = saveEdit(1);
+    settlers[0].reject();
+    await assert.rejects(lost);
+    const other = saveEdit(2);
+    settlers[1].resolve();
+    await other;
+    const retry = saveEdit(1);
+    settlers[2].resolve();
+    await retry;
+
+    assert.equal(sentKeys[2], sentKeys[0]);
   });
 
   it("keeps each overlapping failed send's key, so retrying both replays both", async () => {

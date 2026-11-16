@@ -2,12 +2,20 @@ import { useCallback, useRef } from "react";
 
 import { v4 as uuidv4 } from "uuid";
 
-import { type FailedKeys, sendWithHeldKey } from "../apis/idempotencyKey";
+import {
+  BULK_MOVE_TARGET,
+  entryTarget,
+  type FailedKeys,
+  sendWithHeldKey,
+} from "../apis/idempotencyKey";
+
+export { BULK_MOVE_TARGET, entryTarget };
 
 interface UseIdempotencyKeyReturn {
   sendWithKey: <T extends object>(
     body: unknown,
-    write: (idempotencyKey: string) => Promise<T>
+    write: (idempotencyKey: string) => Promise<T>,
+    target?: string
   ) => Promise<T>;
 }
 
@@ -21,8 +29,9 @@ export const useIdempotencyKey = (): UseIdempotencyKeyReturn => {
     // file as TSX, where a bare <T> before an arrow reads as a JSX tag.
     <T extends object>(
       body: unknown,
-      write: (idempotencyKey: string) => Promise<T>
-    ): Promise<T> => sendWithHeldKey(held, body, uuidv4, write),
+      write: (idempotencyKey: string) => Promise<T>,
+      target?: string
+    ): Promise<T> => sendWithHeldKey(held, body, uuidv4, write, target),
     []
   );
 

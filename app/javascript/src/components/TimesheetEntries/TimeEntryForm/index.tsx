@@ -6,7 +6,7 @@ import { TimeEntryFormContext } from "context/TimesheetEntries/TimeEntryFormCont
 import { useUserContext } from "context/UserContext";
 import dayjs from "dayjs";
 import { minFromHHMM, minToHHMM, useDebounce, useOutsideClick } from "helpers";
-import { useIdempotencyKey } from "~/hooks/useIdempotencyKey";
+import { entryTarget, useIdempotencyKey } from "~/hooks/useIdempotencyKey";
 import { getValueFromLocalStorage, setToLocalStorage } from "utils/storage";
 
 import DesktopTimeEntryForm from "./DesktopTimeEntryForm";
@@ -153,7 +153,8 @@ const AddEntry = () => {
     const updateRes = await editKey.sendWithKey(
       { body, entryId: editEntryId },
       idempotencyKey =>
-        timesheetEntryApi.update(editEntryId, body, idempotencyKey)
+        timesheetEntryApi.update(editEntryId, body, idempotencyKey),
+      entryTarget(editEntryId)
     );
 
     if (updateRes.status >= 200 && updateRes.status < 300) {

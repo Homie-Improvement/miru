@@ -2,7 +2,7 @@ import React, { useState, useEffect } from "react";
 import { Briefcase, Warning } from "phosphor-react";
 import { timesheetEntryApi } from "apis/api";
 import { Toastr } from "StyledComponents";
-import { useIdempotencyKey } from "~/hooks/useIdempotencyKey";
+import { BULK_MOVE_TARGET, useIdempotencyKey } from "~/hooks/useIdempotencyKey";
 import { Card, CardContent } from "../ui/card";
 import { Alert, AlertDescription } from "../ui/alert";
 import { i18n } from "../../i18n";
@@ -116,8 +116,10 @@ const WeeklyEntries: React.FC<Props> = ({
         return;
       }
 
-      const res = await bulkUpdateKey.sendWithKey(ids, idempotencyKey =>
-        timesheetEntryApi.updateBulk(ids, idempotencyKey)
+      const res = await bulkUpdateKey.sendWithKey(
+        ids,
+        idempotencyKey => timesheetEntryApi.updateBulk(ids, idempotencyKey),
+        BULK_MOVE_TARGET
       );
 
       if (res.status === 200) {

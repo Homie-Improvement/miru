@@ -12,7 +12,7 @@ import Loader from "common/Loader/index";
 import withLayout from "common/Mobile/HOC/withLayout";
 import SearchTimeEntries from "common/SearchTimeEntries";
 import { useUserContext } from "context/UserContext";
-import { useIdempotencyKey } from "~/hooks/useIdempotencyKey";
+import { entryTarget, useIdempotencyKey } from "~/hooks/useIdempotencyKey";
 import { sendGAPageView } from "utils/googleAnalytics";
 
 import DatesInWeek from "./DatesInWeek";
@@ -329,8 +329,10 @@ const TimesheetEntries = ({ user, isAdminUser }: Iprops) => {
   };
 
   const handleDeleteEntry = async id => {
-    const res = await deleteKey.sendWithKey({ entryId: id }, idempotencyKey =>
-      timesheetEntryApi.destroy(id, idempotencyKey)
+    const res = await deleteKey.sendWithKey(
+      { entryId: id },
+      idempotencyKey => timesheetEntryApi.destroy(id, idempotencyKey),
+      entryTarget(id)
     );
     if (!(res.status === 200)) return;
     await handleFilterEntry(selectedFullDate, id);

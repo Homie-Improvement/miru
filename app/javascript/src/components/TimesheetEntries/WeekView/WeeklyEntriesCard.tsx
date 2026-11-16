@@ -16,7 +16,7 @@ import { Badge } from "../../ui/badge";
 import { Separator } from "../../ui/separator";
 import { cn } from "../../../lib/utils";
 import { timesheetEntryApi } from "apis/api";
-import { useIdempotencyKey } from "~/hooks/useIdempotencyKey";
+import { entryTarget, useIdempotencyKey } from "~/hooks/useIdempotencyKey";
 
 const WeeklyEntriesCard = ({
   client,
@@ -129,7 +129,8 @@ const WeeklyEntriesCard = ({
       const res = await updateKey.sendWithKey(
         { body: payload, entryId: timesheetEntryId },
         idempotencyKey =>
-          timesheetEntryApi.update(timesheetEntryId, payload, idempotencyKey)
+          timesheetEntryApi.update(timesheetEntryId, payload, idempotencyKey),
+        entryTarget(timesheetEntryId)
       );
       const updatedEntry = res.data.entry;
       handleUpdateRow(updatedEntry);

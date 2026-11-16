@@ -15,7 +15,7 @@ import customParseFormat from "dayjs/plugin/customParseFormat";
 import updateLocale from "dayjs/plugin/updateLocale";
 import weekday from "dayjs/plugin/weekday";
 import { buildDateParseFormats, minToHHMM } from "helpers";
-import { useIdempotencyKey } from "~/hooks/useIdempotencyKey";
+import { entryTarget, useIdempotencyKey } from "~/hooks/useIdempotencyKey";
 import Logger from "js-logger";
 import { sendGAPageView } from "utils/googleAnalytics";
 import { Button } from "../ui/button";
@@ -512,8 +512,10 @@ const TimeTracking: React.FC<Iprops> = ({ user, isAdminUser }) => {
   };
 
   const handleDeleteEntry = async id => {
-    const res = await deleteKey.sendWithKey({ entryId: id }, idempotencyKey =>
-      timesheetEntryApi.destroy(id, idempotencyKey)
+    const res = await deleteKey.sendWithKey(
+      { entryId: id },
+      idempotencyKey => timesheetEntryApi.destroy(id, idempotencyKey),
+      entryTarget(id)
     );
     if (!(res.status === 200)) return;
     await handleFilterEntry(selectedFullDate, id);

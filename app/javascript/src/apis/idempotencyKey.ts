@@ -35,10 +35,33 @@ export const keyForSend = (
   return { key: newKey(), fingerprint };
 };
 
+// A failed send's key with the record it overwrites, such as "entry:42" for
+// an edit or delete of entry 42. A create overwrites nothing, so its target
+// is undefined.
+export type FailedKey = ActionKey & { readonly target: string | undefined };
+
 // The keys of an action's sends that failed or lost their answer, each kept
 // for an unchanged retry, so several overlapping failed sends each keep
 // their own key.
-export type FailedKeys = readonly ActionKey[];
+export type FailedKeys = readonly FailedKey[];
+
+// The target of an edit or delete of one entry.
+export const entryTarget = (entryId: number | string): string =>
+  `entry:${entryId}`;
+
+// The target of a bulk move: a later successful move decides where the
+// entries are, so it supersedes every earlier failed one from that screen.
+export const BULK_MOVE_TARGET = "bulk-move";
+
+// The failed keys left once a write to target succeeds. That write now
+// decides the record's state, so an older failed write to the same record
+// is no longer a retry: resending its body is a new edit and must not
+// replay the older answer over the newer state.
+export const retireTarget = (
+  failed: FailedKeys,
+  target: string | undefined
+): FailedKeys =>
+  target === undefined ? failed : failed.filter(held => held.target !== target);
 
 // The key for one send and the failed keys left once it is taken: the first
 // failed key with an unchanged body, so the retry replays that send's answer,
@@ -60,26 +83,32 @@ export const takeKey = (
 // Where one user action keeps its failed keys between sends, such as a React ref.
 export type HeldKeys = { current: FailedKeys };
 
-// Runs one write of the action under its key. Only this send's own outcome
-// decides what happens to its key: a success drops it, so the next identical
-// submit is written as a new entry, and a failure puts it back for an
-// unchanged retry. The caller's write resolves only on a 2xx answer.
+// Runs one write of the action under its key. A success drops the key, so
+// the next identical submit is written as a new entry, and also retires the
+// failed keys of earlier writes to the same target. A failure puts the key
+// back for an unchanged retry. The caller's write resolves only on a 2xx
+// answer.
 // A function declaration, because the build parses this file as TSX, where a
 // generic arrow function's <T> reads as a JSX tag.
 export async function sendWithHeldKey<T>(
   held: HeldKeys,
   body: unknown,
   newKey: () => string,
-  write: (idempotencyKey: string) => Promise<T>
+  write: (idempotencyKey: string) => Promise<T>,
+  target?: string
 ): Promise<T> {
   const taken = takeKey(held.current, body, newKey);
   held.current = taken.failed;
+  let result: T;
   try {
-    return await write(taken.action.key);
+    result = await write(taken.action.key);
   } catch (error) {
-    held.current = [...held.current, taken.action];
+    held.current = [...held.current, { ...taken.action, target }];
     throw error;
   }
+  held.current = retireTarget(held.current, target);
+
+  return result;
 }
 
 export const isEntryGatewayWrite = (method: string, url: string): boolean =>

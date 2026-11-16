@@ -2,7 +2,7 @@ import React, { useState, useEffect } from "react";
 
 import { timesheetEntryApi } from "apis/api";
 import { Toastr } from "StyledComponents";
-import { useIdempotencyKey } from "~/hooks/useIdempotencyKey";
+import { BULK_MOVE_TARGET, useIdempotencyKey } from "~/hooks/useIdempotencyKey";
 
 import WeeklyEntriesCard from "./WeeklyEntriesCard";
 
@@ -55,8 +55,10 @@ const WeeklyEntries = ({
     try {
       const ids = getIds();
       const payload = { project_id: setProjectId(), ids };
-      const res = await bulkUpdateKey.sendWithKey(payload, idempotencyKey =>
-        timesheetEntryApi.updateBulk(payload, idempotencyKey)
+      const res = await bulkUpdateKey.sendWithKey(
+        payload,
+        idempotencyKey => timesheetEntryApi.updateBulk(payload, idempotencyKey),
+        BULK_MOVE_TARGET
       );
       if (res.status === 200) {
         setEntryList(prevState => {

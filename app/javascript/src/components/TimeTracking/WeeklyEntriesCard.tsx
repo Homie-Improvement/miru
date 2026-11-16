@@ -2,7 +2,7 @@ import React, { useState, useEffect } from "react";
 
 import { timesheetEntryApi } from "apis/api";
 import { minFromHHMM, minToHHMM, validateTimesheetEntry } from "helpers";
-import { useIdempotencyKey } from "~/hooks/useIdempotencyKey";
+import { entryTarget, useIdempotencyKey } from "~/hooks/useIdempotencyKey";
 import { PencilSimple } from "phosphor-react";
 import { TimeInput } from "../ui/time-input";
 import { Toastr } from "../ui/toastr";
@@ -131,7 +131,8 @@ const WeeklyEntriesCard = ({
       const res = await updateKey.sendWithKey(
         { body: payload, entryId: timesheetEntryId },
         idempotencyKey =>
-          timesheetEntryApi.update(timesheetEntryId, payload, idempotencyKey)
+          timesheetEntryApi.update(timesheetEntryId, payload, idempotencyKey),
+        entryTarget(timesheetEntryId)
       );
       if (res.status === 200) {
         setEntryList(prevState => {

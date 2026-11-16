@@ -9,7 +9,7 @@ import {
   useDebounce,
   validateTimesheetEntry,
 } from "helpers";
-import { useIdempotencyKey } from "~/hooks/useIdempotencyKey";
+import { entryTarget, useIdempotencyKey } from "~/hooks/useIdempotencyKey";
 import { TimeInput } from "../ui/time-input";
 import { Toastr } from "../ui/toastr";
 import { Textarea } from "../ui/textarea";
@@ -261,7 +261,8 @@ const AddEntry: React.FC<Iprops> = ({
       const updateRes = await editKey.sendWithKey(
         { body, entryId: editEntryId },
         idempotencyKey =>
-          timesheetEntryApi.update(editEntryId, body, idempotencyKey)
+          timesheetEntryApi.update(editEntryId, body, idempotencyKey),
+        entryTarget(editEntryId)
       );
 
       if (updateRes.status >= 200 && updateRes.status < 300) {
