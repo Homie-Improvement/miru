@@ -68,6 +68,11 @@ module Timekeeping
 
     REFUSAL_REASONS = { OwnershipMoving => "ownership_moving", StaleGeneration => "stale_generation" }.freeze
 
+    # Names the legacy create receipt lock, so it never shares a lock with
+    # the prepared store's receipts for the same company, actor and key.
+    LEGACY_CREATE_LOCK = "legacy_create"
+    KEY_REUSED_REASON = "idempotency_key_reused"
+
     # Fixed namespace for the version 5 UUIDs used as detach operation ids.
     DETACH_OPERATION_NAMESPACE = "3d0f7a52-8c1e-4b6a-9f2d-5e7c1a9b4d60"
 
@@ -143,16 +148,14 @@ module Timekeeping
     # unchanged and the block is not called; the legacy store and Timekeeping
     # write for the user the block resolves. Returns the created
     # TimesheetEntry: saved on the legacy branch, unsaved when another store
-    # owns the entries.
+    # owns the entries. A legacy retry with the client's own key returns a
+    # read-only copy of the entry the first attempt committed.
     # :reek:LongParameterList
     def create(project:, attributes:, user: nil, requested_user_id: nil, expected_generation: nil, &resolve_user)
       perform(expected_generation) do |ownership, owner|
         case owner
         when :legacy
-          project.timesheet_entries.new(attributes).tap do |entry|
-            entry.user = user || resolve_user.call
-            entry.save!
-          end
+          legacy_create(project:, attributes:, user:, requested_user_id:, resolve_user:)
         when :prepared
           local_create(ownership:, project:, attributes:, user:, requested_user_id:)
         when :timekeeping
@@ -569,6 +572,51 @@ module Timekeeping
 
       def reported?(answer, result)
         Array(answer["results"]).any? { |entry_result| entry_result["result"] == result }
+      end
+
+      # The legacy store has no request receipts of its own, so a create the
+      # client sent with its own Idempotency-Key stores one beside the entry,
+      # in the same transaction. A retry whose first attempt committed then
+      # replays the entry as that attempt committed it instead of recording
+      # the time again; the copy is rebuilt from the receipt, never read from
+      # the live row, so a later edit or delete never reaches the retry. A
+      # key reused for different request values is refused. The lock makes a
+      # retry that overlaps the first attempt wait for it; the receipt's
+      # unique index backs that up.
+      # :reek:LongParameterList
+      def legacy_create(project:, attributes:, user:, requested_user_id:, resolve_user:)
+        key = context.idempotency_key
+        return save_legacy_entry(project:, attributes:, user: user || resolve_user.call) if key.nil?
+
+        scope = { company_id: context.company.id, actor_kind: context.actor_kind, actor_id: context.actor.id, key: }
+        LocalOwner::WriteSteps.lock_key(LEGACY_CREATE_LOCK, *scope.values)
+        receipt = LegacyCreateReceipt.find_by(scope)
+        fingerprint = legacy_create_fingerprint(project:, attributes:, user_id: user ? user.id : requested_user_id)
+
+        case LegacyCreateReplay.decision(stored_fingerprint: receipt&.fingerprint, fingerprint:)
+        when :replay
+          TimesheetEntry.instantiate(receipt.entry_attributes).tap(&:readonly!)
+        when :key_reused
+          raise EntryWriteClient.refusal_error(operation: :create, status: 422, reason: KEY_REUSED_REASON)
+        when :write
+          save_legacy_entry(project:, attributes:, user: user || resolve_user.call).tap do |entry|
+            LegacyCreateReceipt.create!(**scope, fingerprint:, timesheet_entry_id: entry.id,
+                                                 entry_attributes: entry.attributes_for_database, created_at: Time.current)
+          end
+        end
+      end
+
+      def save_legacy_entry(project:, attributes:, user:)
+        project.timesheet_entries.new(attributes).tap do |entry|
+          entry.user = user
+          entry.save!
+        end
+      end
+
+      # The same request values a prepared create's receipt fingerprints.
+      def legacy_create_fingerprint(project:, attributes:, user_id:)
+        fields = EntryWriteClient.forwarded_fields(attributes, actor_kind: context.actor_kind, operation: :create)
+        LegacyCreateReplay.fingerprint(as_json_value(create_identity(user_id:, project:, fields:)))
       end
 
       # The legacy model refuses a create already marked billed, so a billed

@@ -508,3 +508,35 @@ RSpec.describe Timekeeping::Handoff::LegacySource do
     end
   end
 end
+
+RSpec.describe Timekeeping::Handoff::LegacySource do
+  context "with a keyed legacy create before the first cutover", :two_tenant_seed, :seeded_without_transaction do
+    it "a keyed legacy create leaves the first cutover checkpoint with no idempotency records and the prepared receipts table untouched" do
+      expect(TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).monolith_store)
+        .to eq(TimekeepingOwnership::INITIAL_MONOLITH_STORE)
+      seeded = TimesheetEntry.joins(project: :client).where(clients: { company_id: fork_and_leaf.id }).order(:id).first
+      receipts_before = Timekeeping::LocalOwner::Receipt.count
+      context = Timekeeping::WriteContext.new(
+        company: fork_and_leaf, actor: seeded.user, actor_kind: "user",
+        request_id: "req-legacy-receipt-handoff", idempotency_key: "legacy-handoff-key-1"
+      )
+
+      created = Timekeeping::Gateway.new(context:).create(
+        user: seeded.user, project: seeded.project,
+        attributes: { duration: 45, work_date: Date.current, note: "legacy keyed create", bill_status: "unbilled" }
+      )
+
+      result = described_class.new(
+        connection: ActiveRecord::Base.connection,
+        recorded_disposition: YAML.load_file(Timekeeping::SeedDispositionRecorder::DEFAULT_PATH)
+      ).export(generation: 7, captured_at: Time.utc(2026, 10, 25, 12))
+
+      rows = result.fetch(:checkpoint).rows
+      # Legacy create receipts live in their own table, so the cutover still exports no receipts and
+      # the prepared receipts table stays empty until a rollback loads it.
+      expect(rows.fetch("idempotency_records")).to eq([])
+      expect(Timekeeping::LocalOwner::Receipt.count).to eq(receipts_before)
+      expect(rows.fetch("entries").count { |row| row["id"] == created.id }).to eq(1)
+    end
+  end
+end
