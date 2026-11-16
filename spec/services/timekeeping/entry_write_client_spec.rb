@@ -916,3 +916,68 @@ RSpec.describe Timekeeping::EntryWriteClient, "refusal mapping" do
     expect(failed.message).to eq("Timekeeping entry create answered 500")
   end
 end
+
+RSpec.describe Timekeeping::EntryWriteClient, "client idempotency key" do
+  let(:client_key_base_url) { "http://timekeeping.test" }
+  let(:client_key_company) { create(:company) }
+  let(:client_key_admin) { create(:user, current_workspace_id: client_key_company.id) }
+  let(:client_key_project) { create(:project, billable: true, client: create(:client, company: client_key_company)) }
+  let(:client_key_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+  let(:client_key_body) do
+    { "project_id" => client_key_project.id, "user_id" => client_key_admin.id, "work_date" => Date.current.iso8601,
+      "duration" => 30.0, "note" => "client keyed", "source" => "manual", "source_metadata" => {} }
+  end
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+  end
+
+  before do
+    create(:employment, company: client_key_company, user: client_key_admin)
+    client_key_admin.add_role :admin, client_key_company
+    client_key_fake.register_company(id: client_key_company.id, edit_days: client_key_company.timesheet_edit_days)
+    client_key_fake.register_user(id: client_key_admin.id, company_id: client_key_company.id, role: "admin")
+    client_key_fake.register_project(id: client_key_project.id, company_id: client_key_company.id)
+    route_timekeeping_to_fake(client_key_fake, base_url: client_key_base_url)
+  end
+
+  def client_key_context(request_id, idempotency_key)
+    Timekeeping::WriteContext.new(company: client_key_company, actor: client_key_admin, actor_kind: "user",
+                                  request_id:, idempotency_key:)
+  end
+
+  def client_key_sent(method)
+    client_key_fake.requests.filter_map { |request| request[:headers]["Idempotency-Key"] if request[:method] == method }
+  end
+
+  # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
+  it "forwards one key per operation and entry for a client key sent under two request ids, and replays the create" do
+    client = described_class.new(base_url: client_key_base_url)
+    created = %w[req-client-key-1 req-client-key-2].map do |request_id|
+      client.create_entry(context: client_key_context(request_id, "k"), generation: client_key_fake.generation,
+                          body: client_key_body)
+    end
+    entry_id = created.first.fetch("id")
+    version = client_key_fake.stored_entry(entry_id).fetch("version").to_s
+    %w[req-client-key-3 req-client-key-4].each do |request_id|
+      client.update_entry(context: client_key_context(request_id, "k"), generation: client_key_fake.generation,
+                          entry_id:, version:, body: { "note" => "edited once" })
+    end
+
+    expect(created.pluck("id").uniq).to eq([entry_id])
+    expect(client_key_sent("POST").uniq).to eq([described_class.idempotency_key(request_id: "k", operation: "create")])
+    expect(client_key_sent("PATCH").uniq).to eq(
+      [described_class.idempotency_key(request_id: "k", operation: "update", entry_id:)]
+    )
+    expect(client_key_sent("PATCH").size).to eq(2)
+  end
+
+  it "forwards an explicit create idempotency_key in place of the one derived from the client key" do
+    described_class.new(base_url: client_key_base_url).create_entry(
+      context: client_key_context("req-client-key-import", "k"), generation: client_key_fake.generation,
+      body: client_key_body, idempotency_key: "import-row-override"
+    )
+
+    expect(client_key_sent("POST")).to eq(["import-row-override"])
+  end
+end

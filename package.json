@@ -105,6 +105,7 @@
     "eslint-plugin-react-hooks": "^5.2.0",
     "eslint-plugin-unused-imports": "^4.2.0",
     "glob": "^11.1.0",
+    "jsdom": "^26.1.0",
     "lefthook": "^1.12.2",
     "lint-staged": "^12.1.2",
     "playwright": "1.58.2",
@@ -115,7 +116,8 @@
     "tailwindcss": "^3.4.0",
     "tailwindcss-animate": "^1.0.7",
     "vite": "^6.4.3",
-    "vite-plugin-ruby": "^5.2.5"
+    "vite-plugin-ruby": "^5.2.5",
+    "vitest": "^3.2.7"
   },
   "lint-staged": {
     "app/**/*.{js,jsx,json,ts,tsx}": [
@@ -140,6 +142,7 @@
   "scripts": {
     "prepare": "node -e \"if (process.env.NODE_ENV !== 'production') { require('child_process').execSync('lefthook install', {stdio: 'inherit'}); }\"",
     "lint": "eslint ./app/javascript",
+    "test:js": "vitest run",
     "mobile:start": "pnpm --dir apps/mobile start",
     "mobile:android": "pnpm --dir apps/mobile android",
     "mobile:ios": "pnpm --dir apps/mobile ios",
