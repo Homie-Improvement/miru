@@ -8,6 +8,7 @@ import { minToHHMM } from "helpers";
 import Logger from "js-logger";
 
 import { timesheetEntryApi, timeTrackingApi } from "apis/api";
+import { newIdempotencyKey } from "apis/idempotency";
 import Loader from "common/Loader/index";
 import withLayout from "common/Mobile/HOC/withLayout";
 import SearchTimeEntries from "common/SearchTimeEntries";
@@ -326,7 +327,7 @@ const TimesheetEntries = ({ user, isAdminUser }: Iprops) => {
   };
 
   const handleDeleteEntry = async id => {
-    const res = await timesheetEntryApi.destroy(id);
+    const res = await timesheetEntryApi.destroy(id, newIdempotencyKey());
     if (!(res.status === 200)) return;
     await handleFilterEntry(selectedFullDate, id);
   };
@@ -358,6 +359,7 @@ const TimesheetEntries = ({ user, isAdminUser }: Iprops) => {
         project_id: entry.project_id,
         timesheet_entry: data,
       },
+      newIdempotencyKey(),
       selectedEmployeeId
     );
     if (res.status === 200) {

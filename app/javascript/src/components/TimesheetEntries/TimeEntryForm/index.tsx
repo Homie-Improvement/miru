@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, MutableRefObject } from "react";
 
 import { timesheetEntryApi } from "apis/api";
+import { newIdempotencyKey } from "apis/idempotency";
 import { useTimesheetEntries } from "context/TimesheetEntries";
 import { TimeEntryFormContext } from "context/TimesheetEntries/TimeEntryFormContext";
 import { useUserContext } from "context/UserContext";
@@ -116,6 +117,7 @@ const AddEntry = () => {
         project_id: projectId,
         timesheet_entry: tse,
       },
+      newIdempotencyKey(),
       selectedEmployeeId
     );
 
@@ -135,10 +137,14 @@ const AddEntry = () => {
 
   const handleEdit = async () => {
     const tsEntry = getPayload();
-    const updateRes = await timesheetEntryApi.update(editEntryId, {
-      project_id: projectId,
-      timesheet_entry: tsEntry,
-    });
+    const updateRes = await timesheetEntryApi.update(
+      editEntryId,
+      {
+        project_id: projectId,
+        timesheet_entry: tsEntry,
+      },
+      newIdempotencyKey()
+    );
 
     if (updateRes.status >= 200 && updateRes.status < 300) {
       if (selectedDate !== selectedFullDate) {

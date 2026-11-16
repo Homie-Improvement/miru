@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { Briefcase, Warning } from "phosphor-react";
 import { timesheetEntryApi } from "apis/api";
+import { newIdempotencyKey } from "apis/idempotency";
 import { Toastr } from "StyledComponents";
 import { Card, CardContent } from "../ui/card";
 import { Alert, AlertDescription } from "../ui/alert";
@@ -114,11 +115,7 @@ const WeeklyEntries: React.FC<Props> = ({
         return;
       }
 
-      const res = await timesheetEntryApi.updateBulk(
-        ids,
-        { project_id: currentProjectId },
-        selectedEmployeeId
-      );
+      const res = await timesheetEntryApi.updateBulk(ids, newIdempotencyKey());
 
       if (res.status === 200) {
         const updatedEntries = res.data.entries;

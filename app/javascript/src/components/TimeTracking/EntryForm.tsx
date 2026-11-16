@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
 
 import { timesheetEntryApi } from "apis/api";
+import { newIdempotencyKey } from "apis/idempotency";
 import { useUserContext } from "context/UserContext";
 import dayjs from "dayjs";
 import {
@@ -211,6 +212,7 @@ const AddEntry: React.FC<Iprops> = ({
         project_id: projectId,
         timesheet_entry: tse,
       },
+      newIdempotencyKey(),
       selectedEmployeeId
     );
 
@@ -242,10 +244,14 @@ const AddEntry: React.FC<Iprops> = ({
     try {
       setSubmitting(true);
       const tse = getPayload();
-      const updateRes = await timesheetEntryApi.update(editEntryId, {
-        project_id: projectId,
-        timesheet_entry: tse,
-      });
+      const updateRes = await timesheetEntryApi.update(
+        editEntryId,
+        {
+          project_id: projectId,
+          timesheet_entry: tse,
+        },
+        newIdempotencyKey()
+      );
 
       if (updateRes.status >= 200 && updateRes.status < 300) {
         await refreshVisibleEntries();
@@ -335,6 +341,7 @@ const AddEntry: React.FC<Iprops> = ({
                 : latestTrackedEntry.bill_status,
           },
         },
+        newIdempotencyKey(),
         selectedEmployeeId
       );
 

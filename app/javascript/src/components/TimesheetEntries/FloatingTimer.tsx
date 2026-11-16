@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
-import axios, { desktopCurrentTimerApi, timesheetEntryApi } from "apis/api";
+import axios, { desktopCurrentTimerApi } from "apis/api";
+import { newIdempotencyKey } from "apis/idempotency";
+import { saveTimerEntry } from "./saveTimerEntry";
 import { Card, CardContent } from "../ui/card";
 import { Button } from "../ui/button";
 import { Label } from "../ui/label";
@@ -381,30 +383,7 @@ const FloatingTimer: React.FC<FloatingTimerProps> = ({
   };
 
   const saveTimerMutation = useMutation({
-    mutationFn: async () => {
-      const duration = Math.floor(timer.elapsedTime / 1000 / 60); // Convert to minutes
-      if (duration < 1) {
-        throw new Error(i18n.t("timer.durationAtLeastOneMinute"));
-      }
-
-      const entry = {
-        project_id: timer.projectId,
-        timesheet_entry: {
-          work_date: new Date().toISOString().split("T")[0],
-          duration,
-          note: timer.description,
-          bill_status: projectsData?.projects.find(
-            p => p.id === timer.projectId
-          )?.billable
-            ? "unbilled"
-            : "non_billable",
-        },
-      };
-
-      const response = await timesheetEntryApi.create(entry, user?.id);
-
-      return response.data;
-    },
+    mutationFn: saveTimerEntry,
     onSuccess: data => {
       queryClient.invalidateQueries({ queryKey: ["timeEntries"] });
       toast.success(i18n.t("timer.timeEntrySavedSuccessfully"));
@@ -419,8 +398,26 @@ const FloatingTimer: React.FC<FloatingTimerProps> = ({
     },
   });
 
+  // The body and key are fixed here, at the click, so the mutation's automatic
+  // retry resends exactly what the first attempt sent.
   const handleSaveEntry = () => {
-    saveTimerMutation.mutate();
+    const isBillable = projectsData?.projects.find(
+      p => p.id === timer.projectId
+    )?.billable;
+
+    saveTimerMutation.mutate({
+      entry: {
+        project_id: timer.projectId,
+        timesheet_entry: {
+          work_date: new Date().toISOString().split("T")[0],
+          duration: Math.floor(timer.elapsedTime / 1000 / 60), // Convert to minutes
+          note: timer.description,
+          bill_status: isBillable ? "unbilled" : "non_billable",
+        },
+      },
+      userId: user?.id,
+      idempotencyKey: newIdempotencyKey(),
+    });
   };
 
   const handleProjectChange = (projectName: string) => {
