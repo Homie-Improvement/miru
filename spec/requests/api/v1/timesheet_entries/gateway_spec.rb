@@ -358,31 +358,6 @@ RSpec.describe "Gateway refusal leaves no trace", type: :request do
   end
 end
 
-RSpec.describe "Gateway missing ownership row", type: :request do
-  let(:company) { create(:company) }
-  let(:user) { create(:user, current_workspace_id: company.id) }
-  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
-
-  before do
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    sign_in user
-  end
-
-  it "a destroy with no ownership row answers 503 and keeps the legacy entry undiscarded" do
-    entry = create(:timesheet_entry, user:, project:)
-    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).delete_all
-
-    # "A missing ownership row gives 503."
-    send_request :delete, api_v1_timesheet_entry_path(entry.id), headers: auth_headers(user)
-
-    expect(response).to have_http_status(:service_unavailable)
-    expect(entry.reload.discarded_at).to be_nil
-  ensure
-    TimekeepingOwnership.ensure_initial!
-  end
-end
-
 RSpec.describe "Gateway forwarded lifecycle persists only in Timekeeping", type: :request do
   let(:company) { create(:company) }
   let(:user) { create(:user, current_workspace_id: company.id) }
@@ -538,33 +513,79 @@ RSpec.describe "Gateway forwarded destroy honours the looked-up version", type: 
   end
 end
 
+# "A missing row or an unknown owner also refuses (fail closed). It never falls back to legacy and never answers 404."
+# Create, update and destroy each reach the refusal through their own gateway method, and only update and destroy
+# look an entry up, so each verb keeps its own example of the one missing-row contract.
 RSpec.describe "Api::V1::TimesheetEntry gateway missing ownership row", type: :request do
   let(:missing_row_company) { create(:company) }
   let(:missing_row_project) { create(:project, billable: true, client: create(:client, company: missing_row_company)) }
-  let(:missing_row_user) do
+  let(:missing_row_employee) { missing_row_member(:employee) }
+  let(:missing_row_admin) { missing_row_member(:admin) }
+
+  def missing_row_member(role)
     create(:user, current_workspace_id: missing_row_company.id).tap do |user|
       create(:employment, company: missing_row_company, user:)
-      user.add_role :employee, missing_row_company
+      user.add_role role, missing_row_company
     end
   end
 
-  # "A missing row or an unknown owner also refuses (fail closed). It never falls back to legacy and never answers 404."
-  it "a create with no ownership row answers 503 ownership_moving and writes no entry" do
+  def delete_missing_row_ownership
     TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).delete_all
-    sign_in missing_row_user
+  end
+
+  def expect_missing_row_refusal
+    expect(response).to have_http_status(:service_unavailable)
+    expect(json_response["reason"]).to eq("ownership_moving")
+    expect(response.headers["Retry-After"]).to be_present
+    expect(TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)).to be_empty
+    expect(TimekeepingOwnership.count).to eq(0)
+  end
+
+  it "refuses a create by an employee with 503 ownership_moving and writes no entry" do
+    delete_missing_row_ownership
+    sign_in missing_row_employee
     params = {
       project_id: missing_row_project.id,
       timesheet_entry: { duration: 30, work_date: Date.current, note: "No row", bill_status: :unbilled }
     }
 
     expect do
-      send_request :post, api_v1_timesheet_entry_index_path, params:, headers: auth_headers(missing_row_user)
+      send_request :post, api_v1_timesheet_entry_index_path, params:, headers: auth_headers(missing_row_employee)
     end.not_to change(TimesheetEntry, :count)
 
-    expect(response).to have_http_status(503)
-    expect(json_response["reason"]).to eq("ownership_moving")
-    expect(response.headers["Retry-After"]).to be_present
-    expect(TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)).to be_empty
+    expect_missing_row_refusal
+  end
+
+  it "refuses an update by an admin with 503 and not 404, leaving the note unchanged" do
+    entry = create(:timesheet_entry, user: missing_row_admin, project: missing_row_project,
+      work_date: Date.current, note: "Before")
+    delete_missing_row_ownership
+    sign_in missing_row_admin
+
+    expect do
+      send_request :patch, api_v1_timesheet_entry_path(entry), params: {
+        project_id: missing_row_project.id,
+        timesheet_entry: { duration: 30, work_date: Date.current, note: "After", bill_status: :unbilled }
+      }, headers: auth_headers(missing_row_admin)
+    end.not_to change(TimesheetEntry, :count)
+
+    expect_missing_row_refusal
+    expect(entry.reload.note).to eq("Before")
+    expect(entry).not_to be_discarded
+  end
+
+  it "refuses a destroy by an admin with 503 and not 404, leaving the entry undiscarded" do
+    entry = create(:timesheet_entry, user: missing_row_admin, project: missing_row_project, work_date: Date.current)
+    delete_missing_row_ownership
+    sign_in missing_row_admin
+
+    expect do
+      send_request :delete, api_v1_timesheet_entry_path(entry), headers: auth_headers(missing_row_admin)
+    end.not_to change(TimesheetEntry, :count)
+
+    expect_missing_row_refusal
+    expect(entry.reload).not_to be_discarded
+    expect(entry.discarded_at).to be_nil
   end
 end
 
@@ -965,33 +986,6 @@ RSpec.describe "Api::V1::TimesheetEntry gateway handoff refusal", type: :request
   end
 end
 
-RSpec.describe "Api::V1::TimesheetEntry gateway missing ownership row on update", type: :request do
-  let(:company) { create(:company) }
-  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
-  let(:user) { create(:user, current_workspace_id: company.id) }
-  let!(:entry) { create(:timesheet_entry, user:, project:, work_date: Date.current, note: "Before") }
-
-  before do
-    create(:employment, company:, user:)
-    user.add_role(:admin, company)
-    TimekeepingOwnership.delete_all
-    sign_in user
-  end
-
-  # "A missing row or an unknown owner also refuses (fail closed). It never falls back to legacy and never answers 404."
-  it "refuses an update with 503 and not 404 when the ownership row is missing" do
-    send_request :patch, api_v1_timesheet_entry_path(entry), params: {
-      project_id: project.id,
-      timesheet_entry: { duration: 30, work_date: Date.current, note: "After", bill_status: :unbilled }
-    }, headers: auth_headers(user)
-
-    expect(response).to have_http_status(:service_unavailable)
-    expect(json_response["reason"]).to eq("ownership_moving")
-    expect(entry.reload.note).to eq("Before")
-    expect(TimekeepingOwnership.count).to eq(0)
-  end
-end
-
 RSpec.describe "Api::V1::TimesheetEntry gateway legacy at raised generation", type: :request do
   let(:company) { create(:company) }
   let(:project) { create(:project, billable: true, client: create(:client, company:)) }
@@ -1120,30 +1114,6 @@ RSpec.describe "Api::V1::TimesheetEntry gateway handoff refusal on update", type
       "reason" => "ownership_moving", "company_id" => company.id,
       "request_id" => response.headers["X-Request-Id"], "actor_kind" => "user"
     )
-  end
-end
-
-RSpec.describe "Api::V1::TimesheetEntry gateway with a missing ownership row", type: :request do
-  let(:company) { create(:company) }
-  let(:admin) { create(:user, current_workspace_id: company.id) }
-  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
-  let!(:entry) { create(:timesheet_entry, user: admin, project:, work_date: Time.current) }
-
-  before do
-    create(:employment, company:, user: admin)
-    admin.add_role :admin, company
-    sign_in admin
-  end
-
-  # "A missing row or an unknown owner also refuses (fail closed). It never falls back to legacy and never answers 404."
-  it "answers a delete with 503 ownership_moving, never 404, when the ownership row is missing" do
-    TimekeepingOwnership.delete_all
-
-    send_request :delete, api_v1_timesheet_entry_path(entry), headers: auth_headers(admin)
-
-    expect(response).to have_http_status(503)
-    expect(json_response["reason"]).to eq("ownership_moving")
-    expect(entry.reload).not_to be_discarded
   end
 end
 
