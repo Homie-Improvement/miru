@@ -1839,9 +1839,6 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client key actor scope
   end
 end
 
-require "rails_helper"
-require_relative "../../../../support/timekeeping/fake_timekeeping"
-
 RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client key replay", type: :request do
   let(:company) { create(:company) }
   let(:project) { create(:project, billable: true, client: create(:client, company:)) }
@@ -1891,9 +1888,6 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client key replay", ty
   end
 end
 
-require "rails_helper"
-require_relative "../../../../support/timekeeping/fake_timekeeping"
-
 RSpec.describe "Api::V1::TimesheetEntry gateway forwarded distinct client keys", type: :request do
   let(:company) { create(:company) }
   let(:project) { create(:project, billable: true, client: create(:client, company:)) }
@@ -1935,16 +1929,14 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded distinct client keys",
                  headers: auth_headers(admin).merge("Idempotency-Key" => "f4e3d2c1-b0a9-4876-9543-210fedcba987")
     expect(response).to be_successful
 
-    forwarded_keys = fake.requests.select { |request| request[:method] == "POST" }
-                         .map { |request| request[:headers]["Idempotency-Key"] }
+    forwarded_keys = fake.requests.filter_map do |request|
+      request[:headers].fetch("Idempotency-Key") if request[:method] == "POST"
+    end
     expect(forwarded_keys.size).to eq(2)
     expect(forwarded_keys.uniq.size).to eq(2)
     expect(fake.outbox.size - outbox_before).to eq(2)
   end
 end
-
-require "rails_helper"
-require_relative "../../../../support/timekeeping/fake_timekeeping"
 
 RSpec.describe "Api::V1::TimesheetEntry gateway forwarded fallback key", type: :request do
   let(:company) { create(:company) }
@@ -1985,9 +1977,6 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded fallback key", type: :
     )
   end
 end
-
-require "rails_helper"
-require_relative "../../../../support/timekeeping/fake_timekeeping"
 
 RSpec.describe "Api::V1::TimesheetEntry gateway forwarded mobile route client key", type: :request do
   let(:company) { create(:company) }
@@ -2032,8 +2021,9 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded mobile route client ke
                  headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => "mobile-retry-2")
     expect(response).to be_successful
 
-    forwarded_keys = fake.requests.select { |request| request[:method] == "POST" }
-                         .map { |request| request[:headers]["Idempotency-Key"] }
+    forwarded_keys = fake.requests.filter_map do |request|
+      request[:headers].fetch("Idempotency-Key") if request[:method] == "POST"
+    end
     expect(forwarded_keys.size).to eq(2)
     expect(forwarded_keys.uniq.size).to eq(1)
     expect(fake.outbox.size).to eq(outbox_after_first)
@@ -2138,8 +2128,9 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client key across comp
     end
     sign_out admin
 
-    forwarded_keys = fake.requests.select { |request| request[:method] == "POST" }
-                         .map { |request| request[:headers]["Idempotency-Key"] }
+    forwarded_keys = fake.requests.filter_map do |request|
+      request[:headers].fetch("Idempotency-Key") if request[:method] == "POST"
+    end
     expect(forwarded_keys.size).to eq(2)
     expect(forwarded_keys.uniq.size).to eq(1)
     expect(first_ids.uniq.size).to eq(1)
@@ -2302,9 +2293,6 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client idempotency key
   end
 end
 
-require "rails_helper"
-require_relative "../../../../support/timekeeping/fake_timekeeping"
-
 RSpec.describe "Api::V1::TimesheetEntry forwarded create resent with one client Idempotency-Key", type: :request do
   let(:company) { create(:company) }
   let(:project) { create(:project, billable: true, client: create(:client, company:)) }
@@ -2347,15 +2335,13 @@ RSpec.describe "Api::V1::TimesheetEntry forwarded create resent with one client 
 
     # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
     expect(json_response.fetch("entry").fetch("id")).to eq(first_id)
-    forwarded_keys = fake.requests.select { |request| request[:method] == "POST" }
-                         .map { |request| request[:headers]["Idempotency-Key"] }
+    forwarded_keys = fake.requests.filter_map do |request|
+      request[:headers].fetch("Idempotency-Key") if request[:method] == "POST"
+    end
     expect(forwarded_keys.size).to eq(2)
     expect(forwarded_keys.uniq.size).to eq(1)
   end
 end
-
-require "rails_helper"
-require_relative "../../../../support/timekeeping/fake_timekeeping"
 
 RSpec.describe "Api::V1::TimesheetEntry forwarded delete resent with one client Idempotency-Key", type: :request do
   let(:company) { create(:company) }
@@ -2399,9 +2385,6 @@ RSpec.describe "Api::V1::TimesheetEntry forwarded delete resent with one client 
     expect(json_response.keys).to eq(["notice"])
   end
 end
-
-require "rails_helper"
-require_relative "../../../../support/timekeeping/fake_timekeeping"
 
 RSpec.describe "Api::V1::TimesheetEntry forwarded mobile-route create resent with one client Idempotency-Key", type: :request do
   let(:company) { create(:company) }
@@ -2489,8 +2472,9 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded update retried with on
     expect(response).to be_successful
 
     # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
-    patch_keys = fake.requests.select { |request| request[:method] == "PATCH" }
-                     .map { |request| request[:headers]["Idempotency-Key"] }
+    patch_keys = fake.requests.filter_map do |request|
+      request[:headers].fetch("Idempotency-Key") if request[:method] == "PATCH"
+    end
     expect(patch_keys.size).to eq(2)
     expect(patch_keys.uniq.size).to eq(1)
     expect(json_response).to eq(first_answer)
