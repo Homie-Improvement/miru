@@ -1,6 +1,6 @@
 import { v4 as uuidv4 } from "uuid";
 
-export const IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
+const IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
 
 // The server replays a write whose key matches a stored success, so a key
 // must be random: a predictable one could replay another action's answer.
