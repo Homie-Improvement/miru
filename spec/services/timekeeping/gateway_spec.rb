@@ -2897,58 +2897,6 @@ RSpec.describe Timekeeping::Gateway, ".all_reported?" do
   end
 end
 
-RSpec.describe Timekeeping::Gateway, "legacy create receipt scope after the first cutover", committed_data: true do
-  def cutover_scope_admin_for(company)
-    create(:user, current_workspace_id: company.id).tap do |user|
-      create(:employment, company:, user:)
-      user.add_role :admin, company
-    end
-  end
-
-  # A legacy receipt answers only the company, actor kind, actor and key it was
-  # stored for, so a colleague who happens to send the same key must never be
-  # handed the first user's entry or its note.
-  it "after the first cutover another user's create under the same client key is forwarded as its own request and never answered with the first user's legacy entry" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    first_user = cutover_scope_admin_for(company)
-    second_user = cutover_scope_admin_for(company)
-    client_key = "shared-client-key-after-cutover"
-    context_for = lambda do |actor, request_id|
-      Timekeeping::WriteContext.new(company:, actor:, actor_kind: "user", request_id:, idempotency_key: client_key)
-    end
-
-    legacy = described_class.new(context: context_for.call(first_user, "req-scope-legacy-1"))
-      .create(user: first_user, project:, attributes: { duration: 30, work_date: Date.current, note: "First user's private note",
-                                                        bill_status: "unbilled" })
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
-
-    forwarded = []
-    stub_request(:post, %r{\Ahttp://timekeeping\.test/v1/companies/\d+/entries\z}).to_return do |request|
-      body = JSON.parse(request.body)
-      forwarded << { key: request.headers.find { |name, _| name.to_s.casecmp?("Idempotency-Key") }&.last, body: }
-      answer = body.merge("id" => legacy.id + 1000, "company_id" => company.id, "version" => 1,
-                          "review_status" => "pending", "locked" => false)
-      { status: 201, body: JSON.generate(answer), headers: { "Content-Type" => "application/json" } }
-    end
-
-    created = with_forwarded_timekeeping_env do
-      described_class.new(context: context_for.call(second_user, "req-scope-after-flip-1"))
-        .create(user: second_user, project:, attributes: { duration: 45, work_date: Date.current,
-                                                           note: "Second user's note", bill_status: "unbilled" })
-    end
-
-    expect(forwarded.size).to eq(1)
-    expect(forwarded.first[:key])
-      .to eq(Timekeeping::EntryWriteClient.idempotency_key(request_id: client_key, operation: "create"))
-    expect(forwarded.first[:body]["note"]).to eq("Second user's note")
-    expect(forwarded.first[:body]["user_id"]).to eq(second_user.id)
-    expect(created.id).not_to eq(legacy.id)
-    expect(created.note).to eq("Second user's note")
-    expect(created.user_id).to eq(second_user.id)
-  end
-end
-
 RSpec.describe Timekeeping::Gateway, "legacy create key reuse after the first cutover", committed_data: true do
   # A key reused for different request values must neither replay the first
   # entry nor record a second one, on either side of the flip.
@@ -3034,199 +2982,239 @@ RSpec.describe Timekeeping::Gateway do
   end
 end
 
-RSpec.describe Timekeeping::Gateway, "legacy create forwarded body", committed_data: true do
-  def forwarded_body_admin_for(company)
+RSpec.describe Timekeeping::Gateway, "legacy create receipts across the first cutover", committed_data: true do
+  def legacy_receipt_admin_for(company)
     create(:user, current_workspace_id: company.id).tap do |user|
       create(:employment, company:, user:)
       user.add_role :admin, company
     end
   end
 
-  def forwarded_body_create(company:, user:, project:, attributes:, key:)
-    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: SecureRandom.uuid,
-                                            idempotency_key: key)
-    described_class.new(context:).create(user:, project:, attributes:)
-  end
-
-  # The first cutover carries this body into Timekeeping, which matches a retry by a hash of the body as sent,
-  # so it must be the forwarded create body of the same request, keys in the same order.
-  it "a keyed legacy create stores the body a forwarded create of the same request would send" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    user = forwarded_body_admin_for(company)
-    attributes = { duration: 30, work_date: Date.current, note: "Forwarded body", bill_status: "unbilled" }
-
-    entry = forwarded_body_create(company:, user:, project:, attributes:, key: "forwarded-body-key-1")
-
-    receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: entry.id)
-    expected = JSON.generate(Timekeeping::EntryWriteClient.create_body(user:, project:, attributes:))
-    expect(receipt.forwarded_body).to eq(expected)
-    expect(JSON.parse(receipt.forwarded_body).keys).to eq(JSON.parse(expected).keys)
-  end
-
-  it "a keyed legacy create on a non-billable project with no bill_status stores the project's default in the body" do
-    company = create(:company)
-    project = create(:project, billable: false, client: create(:client, company:))
-    user = forwarded_body_admin_for(company)
-
-    entry = forwarded_body_create(company:, user:, project:, key: "forwarded-body-key-2",
-                                  attributes: { duration: 30, work_date: Date.current, note: "No status" })
-
-    receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: entry.id)
-    expect(JSON.parse(receipt.forwarded_body)["bill_status"]).to eq("non_billable")
-    expect(entry.bill_status).to eq("non_billable")
-  end
-end
-
-RSpec.describe Timekeeping::Gateway, "forwarding a legacy create retry after the first cutover", committed_data: true do
-  def carried_retry_admin_for(company)
-    create(:user, current_workspace_id: company.id).tap do |user|
-      create(:employment, company:, user:)
-      user.add_role :admin, company
-    end
-  end
-
-  def carried_retry_create(company:, user:, project:, attributes:, key:, actor_kind: "user")
-    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind:, request_id: SecureRandom.uuid,
-                                            idempotency_key: key)
-    described_class.new(context:).create(user:, project:, attributes:)
-  end
-
-  def carried_retry_flip!
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
-  end
-
-  # Records each forwarded create as sent and answers it as a new entry.
-  def carried_retry_stub(company)
-    sent = []
-    stub_request(:post, %r{\Ahttp://timekeeping\.test/v1/companies/\d+/entries\z}).to_return do |request|
-      key = request.headers.find { |name, _| name.to_s.casecmp?("Idempotency-Key") }&.last
-      sent << { key:, raw_body: request.body }
-      answer = JSON.parse(request.body).merge("id" => 9_200_000 + sent.size, "company_id" => company.id,
-                                              "version" => 1, "review_status" => "pending", "locked" => false)
-      { status: 201, body: JSON.generate(answer), headers: { "Content-Type" => "application/json" } }
-    end
-    sent
-  end
-
-  let(:company) { create(:company) }
-  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
-  let(:user) { carried_retry_admin_for(company) }
-  let(:attributes) { { duration: 30, work_date: Date.current, note: "Carried retry", bill_status: "unbilled" } }
-
-  it "resends the stored body byte for byte under the carried key when the retry matches an unexpired receipt" do
-    entry = carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-match")
-    receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: entry.id)
-    carried_retry_flip!
-    sent = carried_retry_stub(company)
-
-    with_forwarded_timekeeping_env { carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-match") }
-
-    expect(sent.size).to eq(1)
-    expect(sent.first[:raw_body]).to eq(receipt.forwarded_body)
-    expect(sent.first[:key]).to eq(Timekeeping::LegacyCreateReplay.carried_key(actor_kind: "user", key: "carried-retry-match"))
-  end
-
-  it "resends the stored body when the project's billing default changed after the first attempt" do
-    no_status = attributes.except(:bill_status)
-    entry = carried_retry_create(company:, user:, project:, attributes: no_status, key: "carried-retry-default")
-    receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: entry.id)
-    project.update_columns(billable: false)
-    carried_retry_flip!
-    sent = carried_retry_stub(company)
-
-    with_forwarded_timekeeping_env do
-      carried_retry_create(company:, user:, project: project.reload, attributes: no_status, key: "carried-retry-default")
-    end
-
-    expect(sent.first[:raw_body]).to eq(receipt.forwarded_body)
-    expect(JSON.parse(sent.first[:raw_body])["bill_status"]).to eq("unbilled")
-  end
-
-  # The resolver stands in for an API controller's target-user check, which
-  # refuses an employee naming a colleague; a committed create's retry must
-  # replay before that check runs, as it does before the flip.
-  it "resends a create made for a colleague without resolving the target again after the creator lost the right to name one" do
-    colleague = create(:user, current_workspace_id: company.id).tap do |member|
-      create(:employment, company:, user: member)
-      member.add_role :employee, company
-    end
-    key = "carried-retry-colleague"
-    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: SecureRandom.uuid,
-                                            idempotency_key: key)
-    entry = described_class.new(context:).create(project:, attributes:, requested_user_id: colleague.id) { colleague }
-    receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: entry.id)
-    carried_retry_flip!
-    sent = carried_retry_stub(company)
-    retry_context = context.with(request_id: SecureRandom.uuid)
-
-    replayed = with_forwarded_timekeeping_env do
-      described_class.new(context: retry_context).create(project:, attributes:, requested_user_id: colleague.id) do
-        raise Pundit::NotAuthorizedError, "the creator may no longer name another user"
+  describe "legacy create receipt scope after the first cutover" do
+    # A legacy receipt answers only the company, actor kind, actor and key it was
+    # stored for, so a colleague who happens to send the same key must never be
+    # handed the first user's entry or its note.
+    it "after the first cutover another user's create under the same client key is forwarded as its own request and never answered with the first user's legacy entry" do
+      company = create(:company)
+      project = create(:project, billable: true, client: create(:client, company:))
+      first_user = legacy_receipt_admin_for(company)
+      second_user = legacy_receipt_admin_for(company)
+      client_key = "shared-client-key-after-cutover"
+      context_for = lambda do |actor, request_id|
+        Timekeeping::WriteContext.new(company:, actor:, actor_kind: "user", request_id:, idempotency_key: client_key)
       end
+
+      legacy = described_class.new(context: context_for.call(first_user, "req-scope-legacy-1"))
+        .create(user: first_user, project:, attributes: { duration: 30, work_date: Date.current, note: "First user's private note",
+                                                          bill_status: "unbilled" })
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+
+      forwarded = []
+      stub_request(:post, %r{\Ahttp://timekeeping\.test/v1/companies/\d+/entries\z}).to_return do |request|
+        body = JSON.parse(request.body)
+        forwarded << { key: request.headers.find { |name, _| name.to_s.casecmp?("Idempotency-Key") }&.last, body: }
+        answer = body.merge("id" => legacy.id + 1000, "company_id" => company.id, "version" => 1,
+                            "review_status" => "pending", "locked" => false)
+        { status: 201, body: JSON.generate(answer), headers: { "Content-Type" => "application/json" } }
+      end
+
+      created = with_forwarded_timekeeping_env do
+        described_class.new(context: context_for.call(second_user, "req-scope-after-flip-1"))
+          .create(user: second_user, project:, attributes: { duration: 45, work_date: Date.current,
+                                                             note: "Second user's note", bill_status: "unbilled" })
+      end
+
+      expect(forwarded.size).to eq(1)
+      expect(forwarded.first[:key])
+        .to eq(Timekeeping::EntryWriteClient.idempotency_key(request_id: client_key, operation: "create"))
+      expect(forwarded.first[:body]["note"]).to eq("Second user's note")
+      expect(forwarded.first[:body]["user_id"]).to eq(second_user.id)
+      expect(created.id).not_to eq(legacy.id)
+      expect(created.note).to eq("Second user's note")
+      expect(created.user_id).to eq(second_user.id)
+    end
+  end
+
+  describe "legacy create forwarded body" do
+    def forwarded_body_create(company:, user:, project:, attributes:, key:)
+      context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: SecureRandom.uuid,
+                                              idempotency_key: key)
+      described_class.new(context:).create(user:, project:, attributes:)
     end
 
-    expect(sent.size).to eq(1)
-    expect(sent.first[:raw_body]).to eq(receipt.forwarded_body)
-    expect(sent.first[:key]).to eq(Timekeeping::LegacyCreateReplay.carried_key(actor_kind: "user", key:))
-    expect(replayed.user_id).to eq(colleague.id)
-  end
+    # The first cutover carries this body into Timekeeping, which matches a retry by a hash of the body as sent,
+    # so it must be the forwarded create body of the same request, keys in the same order.
+    it "a keyed legacy create stores the body a forwarded create of the same request would send" do
+      company = create(:company)
+      project = create(:project, billable: true, client: create(:client, company:))
+      user = legacy_receipt_admin_for(company)
+      attributes = { duration: 30, work_date: Date.current, note: "Forwarded body", bill_status: "unbilled" }
 
-  # Timekeeping refuses a work_date that is not YYYY-MM-DD before it reads its
-  # receipt, so a timestamp the legacy model accepted must not reach it as sent.
-  it "resends a legacy create sent with a timestamp work_date with the saved date in YYYY-MM-DD form" do
-    timestamp_attributes = attributes.merge(work_date: "#{Date.current.iso8601}T00:00:00Z")
-    entry = carried_retry_create(company:, user:, project:, attributes: timestamp_attributes,
-                                 key: "carried-retry-timestamp")
-    receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: entry.id)
-    carried_retry_flip!
-    sent = carried_retry_stub(company)
+      entry = forwarded_body_create(company:, user:, project:, attributes:, key: "forwarded-body-key-1")
 
-    with_forwarded_timekeeping_env do
-      carried_retry_create(company:, user:, project:, attributes: timestamp_attributes, key: "carried-retry-timestamp")
+      receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: entry.id)
+      expected = JSON.generate(Timekeeping::EntryWriteClient.create_body(user:, project:, attributes:))
+      expect(receipt.forwarded_body).to eq(expected)
+      expect(JSON.parse(receipt.forwarded_body).keys).to eq(JSON.parse(expected).keys)
     end
 
-    expect(JSON.parse(receipt.forwarded_body)["work_date"]).to eq(Date.current.iso8601)
-    expect(sent.first[:raw_body]).to eq(receipt.forwarded_body)
-    expect(JSON.parse(sent.first[:raw_body])["work_date"]).to match(TimekeepingRules::EntryDecision::DATE)
-    expect(JSON.parse(receipt.forwarded_body).keys)
-      .to eq(Timekeeping::EntryWriteClient.create_body(user:, project:, attributes: timestamp_attributes).keys)
+    it "a keyed legacy create on a non-billable project with no bill_status stores the project's default in the body" do
+      company = create(:company)
+      project = create(:project, billable: false, client: create(:client, company:))
+      user = legacy_receipt_admin_for(company)
+
+      entry = forwarded_body_create(company:, user:, project:, key: "forwarded-body-key-2",
+                                    attributes: { duration: 30, work_date: Date.current, note: "No status" })
+
+      receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: entry.id)
+      expect(JSON.parse(receipt.forwarded_body)["bill_status"]).to eq("non_billable")
+      expect(entry.bill_status).to eq("non_billable")
+    end
   end
 
-  it "forwards as a new request under the derived key once the legacy receipt has expired" do
-    entry = carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-expired")
-    Timekeeping::LegacyCreateReceipt.where(timesheet_entry_id: entry.id).update_all(expires_at: 1.minute.ago)
-    carried_retry_flip!
-    sent = carried_retry_stub(company)
-
-    with_forwarded_timekeeping_env { carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-expired") }
-
-    expect(sent.first[:key])
-      .to eq(Timekeeping::EntryWriteClient.idempotency_key(request_id: "carried-retry-expired", operation: "create"))
-  end
-
-  it "forwards a create sent without a key under the key derived from its request id" do
-    carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-unkeyed")
-    carried_retry_flip!
-    sent = carried_retry_stub(company)
-    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: "req-carried-unkeyed")
-
-    with_forwarded_timekeeping_env { described_class.new(context:).create(user:, project:, attributes:) }
-
-    expect(sent.first[:key])
-      .to eq(Timekeeping::EntryWriteClient.idempotency_key(request_id: "req-carried-unkeyed", operation: "create"))
-  end
-
-  it "forwards a create of another actor kind under the same client key as its own request" do
-    carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-kind")
-    carried_retry_flip!
-    sent = carried_retry_stub(company)
-
-    with_forwarded_timekeeping_env do
-      carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-kind", actor_kind: "cli")
+  describe "forwarding a legacy create retry after the first cutover" do
+    def carried_retry_create(company:, user:, project:, attributes:, key:, actor_kind: "user")
+      context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind:, request_id: SecureRandom.uuid,
+                                              idempotency_key: key)
+      described_class.new(context:).create(user:, project:, attributes:)
     end
 
-    expect(sent.first[:key])
-      .to eq(Timekeeping::EntryWriteClient.idempotency_key(request_id: "carried-retry-kind", operation: "create"))
+    def carried_retry_flip!
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+    end
+
+    # Records each forwarded create as sent and answers it as a new entry.
+    def carried_retry_stub(company)
+      sent = []
+      stub_request(:post, %r{\Ahttp://timekeeping\.test/v1/companies/\d+/entries\z}).to_return do |request|
+        key = request.headers.find { |name, _| name.to_s.casecmp?("Idempotency-Key") }&.last
+        sent << { key:, raw_body: request.body }
+        answer = JSON.parse(request.body).merge("id" => 9_200_000 + sent.size, "company_id" => company.id,
+                                                "version" => 1, "review_status" => "pending", "locked" => false)
+        { status: 201, body: JSON.generate(answer), headers: { "Content-Type" => "application/json" } }
+      end
+      sent
+    end
+
+    let(:company) { create(:company) }
+    let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+    let(:user) { legacy_receipt_admin_for(company) }
+    let(:attributes) { { duration: 30, work_date: Date.current, note: "Carried retry", bill_status: "unbilled" } }
+
+    it "resends the stored body byte for byte under the carried key when the retry matches an unexpired receipt" do
+      entry = carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-match")
+      receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: entry.id)
+      carried_retry_flip!
+      sent = carried_retry_stub(company)
+
+      with_forwarded_timekeeping_env { carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-match") }
+
+      expect(sent.size).to eq(1)
+      expect(sent.first[:raw_body]).to eq(receipt.forwarded_body)
+      expect(sent.first[:key]).to eq(Timekeeping::LegacyCreateReplay.carried_key(actor_kind: "user", key: "carried-retry-match"))
+    end
+
+    it "resends the stored body when the project's billing default changed after the first attempt" do
+      no_status = attributes.except(:bill_status)
+      entry = carried_retry_create(company:, user:, project:, attributes: no_status, key: "carried-retry-default")
+      receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: entry.id)
+      project.update_columns(billable: false)
+      carried_retry_flip!
+      sent = carried_retry_stub(company)
+
+      with_forwarded_timekeeping_env do
+        carried_retry_create(company:, user:, project: project.reload, attributes: no_status, key: "carried-retry-default")
+      end
+
+      expect(sent.first[:raw_body]).to eq(receipt.forwarded_body)
+      expect(JSON.parse(sent.first[:raw_body])["bill_status"]).to eq("unbilled")
+    end
+
+    # The resolver stands in for an API controller's target-user check, which
+    # refuses an employee naming a colleague; a committed create's retry must
+    # replay before that check runs, as it does before the flip.
+    it "resends a create made for a colleague without resolving the target again after the creator lost the right to name one" do
+      colleague = create(:user, current_workspace_id: company.id).tap do |member|
+        create(:employment, company:, user: member)
+        member.add_role :employee, company
+      end
+      key = "carried-retry-colleague"
+      context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: SecureRandom.uuid,
+                                              idempotency_key: key)
+      entry = described_class.new(context:).create(project:, attributes:, requested_user_id: colleague.id) { colleague }
+      receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: entry.id)
+      carried_retry_flip!
+      sent = carried_retry_stub(company)
+      retry_context = context.with(request_id: SecureRandom.uuid)
+
+      replayed = with_forwarded_timekeeping_env do
+        described_class.new(context: retry_context).create(project:, attributes:, requested_user_id: colleague.id) do
+          raise Pundit::NotAuthorizedError, "the creator may no longer name another user"
+        end
+      end
+
+      expect(sent.size).to eq(1)
+      expect(sent.first[:raw_body]).to eq(receipt.forwarded_body)
+      expect(sent.first[:key]).to eq(Timekeeping::LegacyCreateReplay.carried_key(actor_kind: "user", key:))
+      expect(replayed.user_id).to eq(colleague.id)
+    end
+
+    # Timekeeping refuses a work_date that is not YYYY-MM-DD before it reads its
+    # receipt, so a timestamp the legacy model accepted must not reach it as sent.
+    it "resends a legacy create sent with a timestamp work_date with the saved date in YYYY-MM-DD form" do
+      timestamp_attributes = attributes.merge(work_date: "#{Date.current.iso8601}T00:00:00Z")
+      entry = carried_retry_create(company:, user:, project:, attributes: timestamp_attributes,
+                                   key: "carried-retry-timestamp")
+      receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: entry.id)
+      carried_retry_flip!
+      sent = carried_retry_stub(company)
+
+      with_forwarded_timekeeping_env do
+        carried_retry_create(company:, user:, project:, attributes: timestamp_attributes, key: "carried-retry-timestamp")
+      end
+
+      expect(JSON.parse(receipt.forwarded_body)["work_date"]).to eq(Date.current.iso8601)
+      expect(sent.first[:raw_body]).to eq(receipt.forwarded_body)
+      expect(JSON.parse(sent.first[:raw_body])["work_date"]).to match(TimekeepingRules::EntryDecision::DATE)
+      expect(JSON.parse(receipt.forwarded_body).keys)
+        .to eq(Timekeeping::EntryWriteClient.create_body(user:, project:, attributes: timestamp_attributes).keys)
+    end
+
+    it "forwards as a new request under the derived key once the legacy receipt has expired" do
+      entry = carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-expired")
+      Timekeeping::LegacyCreateReceipt.where(timesheet_entry_id: entry.id).update_all(expires_at: 1.minute.ago)
+      carried_retry_flip!
+      sent = carried_retry_stub(company)
+
+      with_forwarded_timekeeping_env { carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-expired") }
+
+      expect(sent.first[:key])
+        .to eq(Timekeeping::EntryWriteClient.idempotency_key(request_id: "carried-retry-expired", operation: "create"))
+    end
+
+    it "forwards a create sent without a key under the key derived from its request id" do
+      carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-unkeyed")
+      carried_retry_flip!
+      sent = carried_retry_stub(company)
+      context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: "req-carried-unkeyed")
+
+      with_forwarded_timekeeping_env { described_class.new(context:).create(user:, project:, attributes:) }
+
+      expect(sent.first[:key])
+        .to eq(Timekeeping::EntryWriteClient.idempotency_key(request_id: "req-carried-unkeyed", operation: "create"))
+    end
+
+    it "forwards a create of another actor kind under the same client key as its own request" do
+      carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-kind")
+      carried_retry_flip!
+      sent = carried_retry_stub(company)
+
+      with_forwarded_timekeeping_env do
+        carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-kind", actor_kind: "cli")
+      end
+
+      expect(sent.first[:key])
+        .to eq(Timekeeping::EntryWriteClient.idempotency_key(request_id: "carried-retry-kind", operation: "create"))
+    end
   end
 end
