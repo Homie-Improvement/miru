@@ -4,10 +4,12 @@ module Timekeeping
   module Handoff
     # The first cutover's checkpoint source, per docs/architecture/timekeeping-soa.md
     # sections 10.3 and 10.4. The legacy monolith has no reservation rows, so
-    # this source reads timesheet_entries, the invoice links and the entry
-    # audits, runs the pre-flight for every company, and derives reservations
-    # and the listed corrections. The decisions live in ReservationDerivation
-    # and LegacyAuditConversion; this class only reads.
+    # this source reads timesheet_entries, the invoice links, the entry
+    # audits and the legacy create receipts, runs the pre-flight for every
+    # company, and derives reservations, the listed corrections and the
+    # carried receipts. The decisions live in ReservationDerivation,
+    # LegacyAuditConversion and LegacyCreateReceiptConversion; this class
+    # only reads.
     #
     # Everything is read in one REPEATABLE READ, read only transaction, so the
     # pre-flight and the copy see one state and no table can be written.
@@ -49,6 +51,10 @@ module Timekeeping
         SELECT id, action, associated_type, associated_id, auditable_id, user_type, user_id, username,
           audited_changes, created_at
         FROM audits WHERE auditable_type = 'TimesheetEntry' ORDER BY id
+      SQL
+      LEGACY_CREATE_RECEIPTS_SQL = <<~SQL.squish
+        SELECT id, company_id, actor_kind, actor_id, key, forwarded_body, entry_attributes, created_at, expires_at
+        FROM legacy_create_receipts ORDER BY id
       SQL
       # The legacy table stores these enums as integers; the checkpoint holds
       # their names.
@@ -93,6 +99,8 @@ module Timekeeping
           entry_rows = entries.pluck(:row)
           audits = LegacyAuditConversion.convert(audits: read_audits, entries_by_id: entry_rows.index_by { |row| row["id"] })
           audits[:refusals].each { |company, messages| refusals[company].concat(messages) }
+          receipts = LegacyCreateReceiptConversion.convert(receipts: read_legacy_create_receipts, captured_at:)
+          receipts[:refusals].each { |company, messages| refusals[company].concat(messages) }
           raise Refused, refusals.to_h if refusals.any?
 
           {
@@ -101,7 +109,7 @@ module Timekeeping
               "reservations" => derived.flat_map { |result| result[:reservations] },
               "invoice_operations" => [],
               "entry_audits" => audits[:rows],
-              "idempotency_records" => []
+              "idempotency_records" => receipts[:rows]
             }),
             corrections: derived.flat_map { |result| result[:corrections] }
           }
@@ -161,6 +169,24 @@ module Timekeeping
 
         def cast_rows(sql)
           connection.select_all(sql).cast_values
+        end
+
+        # The receipt holds the entry as the create committed it, in database
+        # form; it is rebuilt with the model's casts, which run no query, so
+        # the answer carries enum names and JSON dates as the entry API does.
+        def read_legacy_create_receipts
+          cast_records(LEGACY_CREATE_RECEIPTS_SQL).map do |receipt|
+            entry = TimesheetEntry.instantiate(receipt.fetch("entry_attributes"))
+            entry_values = LocalOwner::RESPONSE_FIELDS.index_with do |field|
+              EntryOutbox.json_value(entry.read_attribute(field))
+            end
+            receipt.except("entry_attributes").symbolize_keys.merge(entry_values:)
+          end
+        end
+
+        def cast_records(sql)
+          result = connection.select_all(sql)
+          result.cast_values.map { |values| result.columns.zip(values).to_h }
         end
 
         def read_audits
