@@ -828,10 +828,10 @@ RSpec.describe Timekeeping::LocalOwner, "stored service command receipts" do
   end
 end
 
-RSpec.describe Timekeeping::LocalOwner::ServiceCommands, "detach marker scoped by company" do
+RSpec.describe Timekeeping::LocalOwner::ServiceCommands, "detach marker and agent_detached? scoped by company" do
   # Receipts of every company share the idempotency_records table, so a lookup
   # without its company filter would let one company's detach refuse another's writes.
-  it "detach_marker finds a detach receipt only in the company the detach ran in" do
+  it "detach_marker and agent_detached? see a detach only in the company it ran in" do
     generation = prepare_local_ownership!.generation.to_s
     company_a = create(:company)
     company_b = create(:company)
@@ -848,24 +848,8 @@ RSpec.describe Timekeeping::LocalOwner::ServiceCommands, "detach marker scoped b
 
     expect(described_class.detach_marker(company_a.id, 77)).to eq(receipt_id)
     expect(described_class.detach_marker(company_b.id, 77)).to eq(0)
-  end
-end
-
-RSpec.describe Timekeeping::LocalOwner::ServiceCommands, "agent_detached? scoped by company" do
-  it "agent_detached? reports a detach only for the company the detach ran in" do
-    generation = prepare_local_ownership!.generation.to_s
-    company_a = create(:company)
-    company_b = create(:company)
-    actor = Timekeeping::LocalOwner::Actor.service(name: "agent-destroy", company_id: company_a.id,
-                                                   operations: ["agents.detach_entries"])
-    outcome = Timekeeping::LocalOwner.call(
-      operation: :detach_entries, company_id: company_a.id, generation:, actor:,
-      params: { "agent_id" => 88, "operation_id" => SecureRandom.uuid }
-    )
-    expect(outcome.status).to eq(200)
-
-    expect(described_class.agent_detached?(company_a.id, 88, after: 0)).to be(true)
-    expect(described_class.agent_detached?(company_b.id, 88, after: 0)).to be(false)
+    expect(described_class.agent_detached?(company_a.id, 77, after: 0)).to be(true)
+    expect(described_class.agent_detached?(company_b.id, 77, after: 0)).to be(false)
   end
 end
 
