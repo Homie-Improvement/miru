@@ -1943,6 +1943,45 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client Idempotency-Key
       expect(response.body).not_to include("Company A")
     end
 
+    # The user and the key are the same in both companies, so only the company keeps the stored answers apart.
+    # Each request names its own company's project, because naming the other company's project is refused
+    # before anything is forwarded.
+    it "writes a separate entry when one user employed in two companies resends a create with the same Idempotency-Key in the other company" do
+      employ_client_key_admin(admin, other_company)
+      fake.register_company(id: other_company.id, edit_days: other_company.timesheet_edit_days)
+      fake.register_project(id: other_project.id, company_id: other_company.id)
+      shared_key = "6d5c4b3a-2f1e-4d0c-9b8a-7f6e5d4c3b2a"
+      entry_params = lambda do |entry_project|
+        { project_id: entry_project.id,
+          timesheet_entry: { duration: 30, work_date: Date.current, note: "One user, two companies",
+                             bill_status: :unbilled } }
+      end
+
+      sign_in admin
+      send_request :post, api_v1_timesheet_entry_index_path, params: entry_params.call(project),
+                                                              headers: auth_headers(admin).merge("Idempotency-Key" => shared_key)
+      expect(response).to be_successful
+      first_id = json_response["entry"]["id"]
+      first_entry = fake.stored_entry(first_id)
+      expect(first_entry.values_at("company_id", "user_id", "project_id"))
+        .to eq([company.id, admin.id, project.id])
+
+      admin.update!(current_workspace_id: other_company.id)
+      send_request :post, api_v1_timesheet_entry_index_path, params: entry_params.call(other_project),
+                                                              headers: auth_headers(admin).merge("Idempotency-Key" => shared_key)
+
+      # A replay would answer with the first company's entry, and a store that ignored the company would
+      # refuse the reused key; either way this request would not write its own entry.
+      expect(response).to be_successful
+      second_id = json_response["entry"]["id"]
+      expect(second_id).not_to eq(first_id)
+      expect(fake.stored_entry(second_id).values_at("company_id", "user_id", "project_id"))
+        .to eq([other_company.id, admin.id, other_project.id])
+      expect(fake.stored_entry(first_id)).to eq(first_entry)
+      expect(client_key_forwarded_keys("POST").size).to eq(2)
+      expect(client_key_forwarded_keys("POST").uniq.size).to eq(1)
+    end
+
     # Only the user who stored an answer may have it replayed; another user's identical key must write that user's own entry.
     it "forwards one shared client Idempotency-Key from two users of one company yet never replays one user's entry to the other" do
       employ_client_key_admin(second_admin, company)
