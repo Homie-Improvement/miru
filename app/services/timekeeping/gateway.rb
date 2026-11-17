@@ -612,7 +612,9 @@ module Timekeeping
       # the live row, so a later edit or delete never reaches the retry. A
       # key reused for different request values is refused. The lock makes a
       # retry that overlaps the first attempt wait for it; the receipt's
-      # unique index backs that up.
+      # unique index backs that up. The receipt also keeps the body a
+      # forwarded create of the same request would send, so a retry that
+      # reaches Timekeeping after the first cutover can be answered there.
       # :reek:LongParameterList
       def legacy_create(project:, attributes:, user:, requested_user_id:, resolve_user:)
         key = context.idempotency_key
@@ -633,9 +635,13 @@ module Timekeeping
         when :key_reused
           raise EntryWriteClient.refusal_error(operation: :create, status: 422, reason: KEY_REUSED_REASON)
         when :write
-          save_legacy_entry(project:, attributes:, user: user || resolve_user.call).tap do |entry|
+          target = user || resolve_user.call
+          # Built before the save, so its defaults are read from the state the
+          # save itself reads.
+          forwarded_body = JSON.generate(create_body(user: target, project:, attributes:))
+          save_legacy_entry(project:, attributes:, user: target).tap do |entry|
             now = Time.current
-            LegacyCreateReceipt.create!(**scope, fingerprint:, timesheet_entry_id: entry.id,
+            LegacyCreateReceipt.create!(**scope, fingerprint:, forwarded_body:, timesheet_entry_id: entry.id,
                                                  entry_attributes: entry.attributes_for_database,
                                                  created_at: now, expires_at: now + LegacyCreateReceipt::RETENTION)
           end
