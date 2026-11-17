@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "rails_helper"
+require "digest"
 
 RSpec.describe Timekeeping::LegacyCreateReplay do
   it "decision answers write with no receipt, replay for a matching fingerprint and key_reused for a different one" do
@@ -29,8 +30,6 @@ RSpec.describe Timekeeping::LegacyCreateReplay do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LegacyCreateReplay do
   # "A create whose first attempt committed in the legacy store with an Idempotency-Key, retried with the same key
   # and body after the first cutover flip, replays the original entry from Timekeeping, and the test shows no second
@@ -50,9 +49,6 @@ RSpec.describe Timekeeping::LegacyCreateReplay do
     expect(described_class.carried_key(actor_kind: "user", key: client_key)).to eq(user_key)
   end
 end
-
-require "rails_helper"
-require "digest"
 
 RSpec.describe Timekeeping::LegacyCreateReplay do
   # "A create whose first attempt committed in the legacy store with an Idempotency-Key, retried with the same key

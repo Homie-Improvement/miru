@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "rails_helper"
 
 RSpec.describe Timekeeping::LegacyCreateReceiptConversion do
@@ -38,8 +40,6 @@ RSpec.describe Timekeeping::LegacyCreateReceiptConversion do
     end
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LegacyCreateReceiptConversion do
   def legacy_create_receipt_for_conversion(id:, actor_kind:, note:, captured_at:)
@@ -88,8 +88,6 @@ RSpec.describe Timekeeping::LegacyCreateReceiptConversion do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LegacyCreateReceiptConversion do
   def legacy_create_receipt_without_body(id:, company_id:, expires_at:, captured_at:)
     {
@@ -117,8 +115,6 @@ RSpec.describe Timekeeping::LegacyCreateReceiptConversion do
     expect(refusals.fetch(2).join(" ")).to include("41")
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LegacyCreateReceiptConversion do
   def legacy_create_receipt_expiring(id:, expires_at:, captured_at:)
@@ -149,6 +145,6 @@ RSpec.describe Timekeeping::LegacyCreateReceiptConversion do
     result = described_class.convert(receipts: [at_boundary, just_after], captured_at:)
 
     expect(result.fetch(:refusals)).to be_empty
-    expect(result.fetch(:rows).map { |row| row["id"] }).to eq([2])
+    expect(result.fetch(:rows).pluck("id")).to eq([2])
   end
 end

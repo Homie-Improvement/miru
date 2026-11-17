@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "rails_helper"
 require "tmpdir"
 
@@ -58,9 +60,6 @@ RSpec.describe Timekeeping::Handoff::Runner, "legacy create replayed after the f
   end
 end
 
-require "rails_helper"
-require "tmpdir"
-
 RSpec.describe Timekeeping::Handoff::Runner, "legacy create replayed after a billing default change", :two_tenant_seed,
                :seeded_without_transaction do
   # "A create whose first attempt committed in the legacy store with an Idempotency-Key, retried with the same key and body after the first cutover flip, replays the original entry from Timekeeping, and the test shows no second entry was recorded."
@@ -116,9 +115,6 @@ RSpec.describe Timekeeping::Handoff::Runner, "legacy create replayed after a bil
   end
 end
 
-require "rails_helper"
-require "tmpdir"
-
 RSpec.describe Timekeeping::Handoff::Runner, "legacy creates of two actor kinds replayed after the first cutover",
                :two_tenant_seed, :seeded_without_transaction do
   # "A create whose first attempt committed in the legacy store with an Idempotency-Key, retried with the same key and body after the first cutover flip, replays the original entry from Timekeeping, and the test shows no second entry was recorded."
@@ -134,7 +130,7 @@ RSpec.describe Timekeeping::Handoff::Runner, "legacy creates of two actor kinds 
       Timekeeping::Gateway.new(context:).create(user:, project:, attributes:)
     end
 
-    first_by_kind = notes.keys.to_h { |actor_kind| [actor_kind, create_once.call(actor_kind, "legacy-#{actor_kind}-1")] }
+    first_by_kind = notes.keys.index_with { |actor_kind| create_once.call(actor_kind, "legacy-#{actor_kind}-1") }
     expect(first_by_kind.values.map(&:id).uniq.size).to eq(2)
 
     timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
@@ -166,7 +162,7 @@ RSpec.describe Timekeeping::Handoff::Runner, "legacy creates of two actor kinds 
     entries_before_retry = TimesheetEntry.unscoped.count
 
     retried_by_kind = with_forwarded_timekeeping_env do
-      notes.keys.to_h { |actor_kind| [actor_kind, create_once.call(actor_kind, "retry-#{actor_kind}-after-flip")] }
+      notes.keys.index_with { |actor_kind| create_once.call(actor_kind, "retry-#{actor_kind}-after-flip") }
     end
 
     notes.each do |actor_kind, note|
@@ -177,10 +173,6 @@ RSpec.describe Timekeeping::Handoff::Runner, "legacy creates of two actor kinds 
     expect(TimesheetEntry.unscoped.count).to eq(entries_before_retry)
   end
 end
-
-# frozen_string_literal: true
-require "rails_helper"
-require "tmpdir"
 
 RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
   def legacy_replay_seeded_actor
@@ -250,10 +242,6 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   end
 end
 
-# frozen_string_literal: true
-require "rails_helper"
-require "tmpdir"
-
 RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
   def legacy_replay_billing_actor
     company = Company.order(:id).find { |candidate| candidate.projects.where(billable: true).exists? }
@@ -319,10 +307,6 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     expect(TimesheetEntry.unscoped.where(note: "Billing default changed later").count).to eq(1)
   end
 end
-
-# frozen_string_literal: true
-require "rails_helper"
-require "tmpdir"
 
 RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
   def legacy_replay_kinds_actor
@@ -399,10 +383,6 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     expect(TimesheetEntry.unscoped.where(note: ["Browser create, shared key", "CLI create, shared key"]).count).to eq(2)
   end
 end
-
-# frozen_string_literal: true
-require "rails_helper"
-require "tmpdir"
 
 RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
   def legacy_replay_reuse_actor
