@@ -1277,3 +1277,224 @@ RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded client I
     entry_ids.each { |entry_id| expect(fake.stored_entry(entry_id)["project_id"]).to eq(target_project.id) }
   end
 end
+
+RSpec.describe "Api::V1::TimesheetEntry::BulkActionController forwarded bulk delete replay", type: :request do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:second_admin) { create(:user, current_workspace_id: company.id) }
+  let(:other_company) { create(:company) }
+  let(:other_admin) { create(:user, current_workspace_id: other_company.id) }
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  around do |example|
+    with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, base_url) do
+      with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+    end
+  end
+
+  before do
+    { admin => company, second_admin => company, other_admin => other_company }.each do |user, user_company|
+      create(:employment, company: user_company, user:)
+      user.add_role :admin, user_company
+      fake.register_user(id: user.id, company_id: user_company.id, role: "admin")
+    end
+    fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
+    fake.register_company(id: other_company.id, edit_days: other_company.timesheet_edit_days)
+    fake.register_project(id: project.id, company_id: company.id)
+    route_timekeeping_to_fake(fake, base_url:)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", generation: 2, handoff_step: nil)
+    fake.generation = 2
+  end
+
+  def add_bulk_replay_entries(note)
+    Array.new(2) do |index|
+      fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                     work_date: Date.current.iso8601, note: "#{note} #{index}").fetch("id")
+    end
+  end
+
+  def bulk_delete_requests
+    fake.requests.select { |request| request[:path].to_s.end_with?("/entries/bulk-delete") }
+  end
+
+  it "replays a fully committed forwarded bulk delete resent with the same Idempotency-Key as 200 and writes nothing more" do
+    entry_ids = add_bulk_replay_entries("Bulk replay")
+    params = { source: { ids: entry_ids } }
+    headers = auth_headers(admin).merge("Idempotency-Key" => "3a7e9c21-4b5d-4f60-9a81-2c3d4e5f6a7b")
+    sign_in admin
+
+    send_request :delete, api_v1_bulk_action_path, params:, headers: headers
+    expect(response).to be_successful
+    entry_ids.each { |entry_id| expect(fake.stored_entry(entry_id)["discarded_at"]).not_to be_nil }
+    stored_after_first = entry_ids.map { |entry_id| fake.stored_entry(entry_id) }
+    outbox_after_first = fake.outbox.size
+
+    # The first answer was lost and the client resends the same bulk delete with the same key.
+    send_request :delete, api_v1_bulk_action_path, params:, headers: headers
+
+    # "A forwarded bulk delete retried under the same Idempotency-Key after its first attempt deleted every requested entry replays the stored answer with 200 instead of answering 422."
+    expect(response).to have_http_status(:ok)
+    # The stored per-entry results are never passed back to the client.
+    expect(json_response).to eq("notice" => I18n.t("timesheet_entry.destroy.message"))
+    # The replay reads the stored answer only: no entry, outbox row or second discard changes.
+    expect(entry_ids.map { |entry_id| fake.stored_entry(entry_id) }).to eq(stored_after_first)
+    expect(fake.outbox.size).to eq(outbox_after_first)
+
+    expect(bulk_delete_requests.size).to eq(2)
+    first_attempt, replay = bulk_delete_requests
+    expect(replay[:headers]["Idempotency-Replay"]).to eq("only")
+    expect(replay[:headers]["Idempotency-Key"]).to eq(first_attempt[:headers]["Idempotency-Key"])
+    expect(replay[:body]).to eq(first_attempt[:body])
+  end
+
+  it "answers 422 for a bulk delete of already deleted entries under a key with no stored answer and sends only a replay-only probe" do
+    entry_ids = add_bulk_replay_entries("Gone")
+    params = { source: { ids: entry_ids } }
+    sign_in admin
+    send_request :delete, api_v1_bulk_action_path, params:,
+                 headers: auth_headers(admin).merge("Idempotency-Key" => "5e6f7a8b-1c2d-4e3f-8a9b-0c1d2e3f4a5b")
+    expect(response).to be_successful
+    stored_after_first = entry_ids.map { |entry_id| fake.stored_entry(entry_id) }
+    outbox_after_first = fake.outbox.size
+    fake.requests.clear
+
+    # A different key has no stored answer, so the success of another request is never borrowed.
+    send_request :delete, api_v1_bulk_action_path, params:,
+                 headers: auth_headers(admin).merge("Idempotency-Key" => "9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d")
+
+    expect(response).to have_http_status(:unprocessable_entity)
+    expect(json_response).to eq("error" => "Failed to delete timesheet entries")
+    expect(entry_ids.map { |entry_id| fake.stored_entry(entry_id) }).to eq(stored_after_first)
+    expect(fake.outbox.size).to eq(outbox_after_first)
+    expect(bulk_delete_requests.size).to eq(1)
+    # The probe must be one a Timekeeping release without bulk replay refuses before writing.
+    expect(bulk_delete_requests.first[:headers]["Idempotency-Replay"]).to eq("only")
+    expect(bulk_delete_requests.first[:headers]["Ownership-Generation"]).to eq("replay-only")
+  end
+
+  it "does not replay a fully committed forwarded bulk delete resent without a client Idempotency-Key but does replay it under the key" do
+    entry_ids = add_bulk_replay_entries("Keyed")
+    params = { source: { ids: entry_ids } }
+    keyed_headers = auth_headers(admin).merge("Idempotency-Key" => "c4d5e6f7-8a9b-4c0d-9e1f-2a3b4c5d6e7f")
+    sign_in admin
+    send_request :delete, api_v1_bulk_action_path, params:, headers: keyed_headers
+    expect(response).to be_successful
+    fake.requests.clear
+
+    # Only the client's own key survives a resend; a fresh request id can never name the first attempt's answer.
+    send_request :delete, api_v1_bulk_action_path, params:, headers: auth_headers(admin)
+    expect(response).to have_http_status(:unprocessable_entity)
+    expect(bulk_delete_requests).to be_empty
+
+    # "A forwarded bulk delete retried under the same Idempotency-Key after its first attempt deleted every requested entry replays the stored answer with 200 instead of answering 422."
+    send_request :delete, api_v1_bulk_action_path, params:, headers: keyed_headers
+    expect(response).to have_http_status(:ok)
+    expect(json_response.keys).to eq(["notice"])
+  end
+
+  it "answers 422 and sends no replay for a forwarded bulk delete resent without an Idempotency-Key after it deleted every requested entry" do
+    entry_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                              work_date: Date.current.iso8601, note: "No client key").fetch("id")
+    params = { source: { ids: [entry_id] } }
+    sign_in admin
+
+    send_request :delete, api_v1_bulk_action_path, params:, headers: auth_headers(admin)
+    expect(response).to be_successful
+
+    send_request :delete, api_v1_bulk_action_path, params:, headers: auth_headers(admin)
+
+    # The replay is owed only to a retry "under the same Idempotency-Key"; a resend with none is a new request.
+    expect(response).to have_http_status(:unprocessable_entity)
+    expect(bulk_delete_requests.size).to eq(1)
+    expect(bulk_delete_requests.first[:headers]["Idempotency-Replay"]).to be_nil
+  end
+
+  it "replays a committed forwarded bulk delete to the actor who sent it and answers another user of the company resending the same key and ids with 422" do
+    entry_ids = add_bulk_replay_entries("Bulk actor")
+    params = { source: { ids: entry_ids } }
+    shared_key = "bulk-delete-actor-scope-key-1"
+
+    sign_in admin
+    send_request :delete, api_v1_bulk_action_path, params:,
+                                                   headers: auth_headers(admin).merge("Idempotency-Key" => shared_key)
+    expect(response).to have_http_status(:ok)
+    entry_ids.each { |entry_id| expect(fake.stored_entry(entry_id)["discarded_at"]).not_to be_nil }
+
+    # "A forwarded bulk delete retried under the same Idempotency-Key after its first attempt deleted every requested entry replays the stored answer with 200 instead of answering 422."
+    send_request :delete, api_v1_bulk_action_path, params:,
+                                                   headers: auth_headers(admin).merge("Idempotency-Key" => shared_key)
+    expect(response).to have_http_status(:ok)
+    expect(json_response.keys).to eq(["notice"])
+    sign_out admin
+
+    # A stored answer belongs to the actor who stored it: another user's resend reaches Timekeeping as a
+    # replay, finds no receipt of its own, and keeps the 422 with nothing changed.
+    stored_before = entry_ids.map { |entry_id| fake.stored_entry(entry_id) }
+    fake.requests.clear
+    sign_in second_admin
+    send_request :delete, api_v1_bulk_action_path, params:,
+                                                   headers: auth_headers(second_admin).merge("Idempotency-Key" => shared_key)
+
+    expect(response).to have_http_status(:unprocessable_content)
+    expect(json_response).to eq("error" => "Failed to delete timesheet entries")
+    expect(bulk_delete_requests.map { |request| request[:headers]["Idempotency-Replay"] }).to eq(["only"])
+    expect(entry_ids.map { |entry_id| fake.stored_entry(entry_id) }).to eq(stored_before)
+  end
+
+  it "replays a committed forwarded bulk delete inside its company and answers another company sending the same key and ids with 422" do
+    entry_ids = add_bulk_replay_entries("Bulk company")
+    params = { source: { ids: entry_ids } }
+    shared_key = "bulk-delete-company-scope-key-1"
+
+    sign_in admin
+    send_request :delete, api_v1_bulk_action_path, params:,
+                                                   headers: auth_headers(admin).merge("Idempotency-Key" => shared_key)
+    expect(response).to have_http_status(:ok)
+
+    # "A forwarded bulk delete retried under the same Idempotency-Key after its first attempt deleted every requested entry replays the stored answer with 200 instead of answering 422."
+    send_request :delete, api_v1_bulk_action_path, params:,
+                                                   headers: auth_headers(admin).merge("Idempotency-Key" => shared_key)
+    expect(response).to have_http_status(:ok)
+    sign_out admin
+
+    # Another company naming the first company's entry ids under the same key must
+    # get the ordinary refusal, never the first company's stored success.
+    stored_before = entry_ids.map { |entry_id| fake.stored_entry(entry_id) }
+    sign_in other_admin
+    send_request :delete, api_v1_bulk_action_path, params:,
+                                                   headers: auth_headers(other_admin).merge("Idempotency-Key" => shared_key)
+
+    expect(response).to have_http_status(:unprocessable_entity)
+    expect(json_response).not_to have_key("notice")
+    expect(json_response["error"]).to be_present
+    expect(entry_ids.map { |entry_id| fake.stored_entry(entry_id) }).to eq(stored_before)
+  end
+
+  it "a forwarded bulk delete whose first attempt named a missing id is not replayed as success when resent under the same Idempotency-Key" do
+    sign_in admin
+    entry_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                              work_date: Date.current.iso8601, note: "Partial first attempt").fetch("id")
+    headers = auth_headers(admin).merge("Idempotency-Key" => "7b1e2c3d-4f5a-4b6c-8d7e-9f0a1b2c3d4e")
+    params = { source: { ids: [entry_id, 0] } }
+
+    send_request :delete, api_v1_bulk_action_path, params:, headers: headers
+    expect(response).to have_http_status(:ok)
+    discarded_at = fake.stored_entry(entry_id)["discarded_at"]
+    expect(discarded_at).to be_present
+
+    send_request :delete, api_v1_bulk_action_path, params:, headers: headers
+
+    # "A forwarded bulk delete retried under the same Idempotency-Key after its first attempt deleted every requested entry replays the stored answer with 200 instead of answering 422."
+    # The first attempt did not delete every requested entry (id 0 never existed), so the resend may only ask
+    # Timekeeping for a stored answer, find none, and keep the 422.
+    replays = fake.requests.select do |request|
+      request[:path].to_s.end_with?("/entries/bulk-delete") && request[:headers]["Idempotency-Replay"] == "only"
+    end
+    expect(replays.size).to eq(1)
+    expect(response).to have_http_status(:unprocessable_content)
+    expect(json_response["error"]).to eq("Failed to delete timesheet entries")
+    expect(fake.stored_entry(entry_id)["discarded_at"]).to eq(discarded_at)
+  end
+end
