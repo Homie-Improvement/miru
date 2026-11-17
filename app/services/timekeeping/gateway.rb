@@ -117,6 +117,16 @@ module Timekeeping
       Array(entry_ids).filter_map { |entry_id| ENTRY_ID_TYPE.cast(entry_id) }.uniq
     end
 
+    # Pure: whether a bulk answer reports every one of entry_ids with result.
+    # An id missing from the answer, or reported with any other result, makes
+    # it false.
+    def self.all_reported?(answer, entry_ids:, result:)
+      reported_ids = Array(answer["results"]).filter_map do |entry_result|
+        ENTRY_ID_TYPE.cast(entry_result["entry_id"]) if entry_result["result"] == result
+      end
+      entry_ids.all? { |entry_id| reported_ids.include?(entry_id) }
+    end
+
     # Clears agent_id on every entry that names the agent, in the store that
     # owns the entries. The agent row is locked after the ownership row and
     # before the detach, so a concurrent entry save that names the agent
@@ -313,7 +323,7 @@ module Timekeeping
         when :prepared
           local_bulk_delete(ownership:, entries:, identity:)
         when :timekeeping
-          forward_bulk_delete(ownership:, entries:)
+          forward_bulk_delete(ownership:, entries:, entry_ids:)
         end
       end
     end
@@ -386,11 +396,31 @@ module Timekeeping
         reported?(answer, MOVED_RESULT)
       end
 
-      def forward_bulk_delete(ownership:, entries:)
-        return false if entries.empty?
+      def forward_bulk_delete(ownership:, entries:, entry_ids:)
+        return replay_timekeeping_bulk_delete(entry_ids) if entries.empty?
 
         answer = write_client.bulk_delete(context:, generation: ownership.generation, entry_ids: entries.map(&:id))
         reported?(answer, DELETED_RESULT)
+      end
+
+      # The lookup hides every entry a committed delete discarded, so a retry
+      # whose first attempt deleted all the requested entries finds none. Only
+      # the client's own Idempotency-Key survives a resend, so only then is
+      # Timekeeping asked for that attempt's stored answer; it never deletes
+      # on this call. The answer counts as written only when it reports every
+      # requested id deleted. A first attempt that named an id it did not find
+      # was keyed over fewer ids, so it has no receipt here and stays unwritten.
+      # A miss (no receipt, or an older Timekeeping refusing the replay's fixed
+      # generation) is rescued here, before perform would count it
+      # as a refused write.
+      def replay_timekeeping_bulk_delete(entry_ids)
+        requested = self.class.requested_entry_ids(entry_ids)
+        return false if context.idempotency_key.nil? || requested.empty?
+
+        answer = write_client.replay_bulk_delete(context:, entry_ids: requested)
+        self.class.all_reported?(answer, entry_ids: requested, result: DELETED_RESULT)
+      rescue ActiveRecord::RecordNotFound, StaleGeneration, EntryWriteClient::Conflict
+        false
       end
 
       # Skips the same entries as forward_bulk_move. With nothing to write no
