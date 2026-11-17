@@ -145,8 +145,7 @@ module Subscriptions
           plan_label: target_company.current_plan_label.to_s.humanize.titleize,
           stripe_subscription_id: subscription_value(stripe_subscription, :id),
           subscription_interval: stripe_subscription_interval(stripe_subscription),
-          seat_quantity: target_company.billable_team_seats,
-          billing_url: "#{ENV['APP_BASE_URL']}/settings/billing"
+          seat_quantity: target_company.billable_team_seats
         ).plan_purchased.deliver_later
       end
   end

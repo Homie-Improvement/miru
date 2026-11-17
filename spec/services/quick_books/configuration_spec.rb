@@ -26,23 +26,71 @@ RSpec.describe QuickBooks::Configuration do
   end
 
   describe ".redirect_uri" do
+    around do |example|
+      with_app_base_url(env: nil, default: "https://boot-check.test") { example.run }
+    end
+
     before do
-      ENV.delete("APP_BASE_URL")
       ENV.delete("INTUIT_REDIRECT_URI")
       ENV.delete("QUICKBOOKS_REDIRECT_URI")
     end
 
-    it "uses localhost only in local Rails environments" do
+    it "uses config.x.default_base_url when APP_BASE_URL is unset" do
       expect(described_class.redirect_uri).to eq(
-        "http://localhost:3000/api/v1/integrations/quickbooks/callback"
+        "https://boot-check.test/api/v1/integrations/quickbooks/callback"
       )
     end
 
-    it "does not fall back to localhost outside local Rails environments" do
+    it "uses config.x.default_base_url outside local Rails environments too" do
       allow(Rails.env).to receive(:development?).and_return(false)
       allow(Rails.env).to receive(:test?).and_return(false)
 
-      expect(described_class.redirect_uri).to be_nil
+      expect(described_class.redirect_uri).to eq(
+        "https://boot-check.test/api/v1/integrations/quickbooks/callback"
+      )
+    end
+
+    it "prefers a set APP_BASE_URL over config.x.default_base_url" do
+      ENV["APP_BASE_URL"] = "https://app.miru.so"
+
+      expect(described_class.redirect_uri).to eq(
+        "https://app.miru.so/api/v1/integrations/quickbooks/callback"
+      )
+    end
+
+    it "prefers QUICKBOOKS_REDIRECT_URI over both base URL sources" do
+      ENV["APP_BASE_URL"] = "https://app.miru.so"
+      ENV["QUICKBOOKS_REDIRECT_URI"] = "https://quickbooks.example/callback"
+
+      expect(described_class.redirect_uri).to eq("https://quickbooks.example/callback")
+    end
+
+    it "treats a whitespace APP_BASE_URL as unset when building the redirect uri" do
+      ENV["APP_BASE_URL"] = "   "
+
+      expect(described_class.redirect_uri).to eq("https://boot-check.test/api/v1/integrations/quickbooks/callback")
+    end
+
+    it "builds the callback from config.x.default_base_url outside local environments when APP_BASE_URL is whitespace" do
+      ENV["APP_BASE_URL"] = "  "
+      Rails.configuration.x.default_base_url = "https://boot-check.test/"
+      allow(Rails.env).to receive(:development?).and_return(false)
+      allow(Rails.env).to receive(:test?).and_return(false)
+
+      expect(described_class.redirect_uri).to eq("https://boot-check.test/api/v1/integrations/quickbooks/callback")
+    end
+
+    it "builds the redirect uri from a set APP_BASE_URL ahead of config.x.default_base_url and strips every trailing slash" do
+      ENV["APP_BASE_URL"] = "https://app.miru.so//"
+
+      expect(described_class.redirect_uri).to eq("https://app.miru.so/api/v1/integrations/quickbooks/callback")
+    end
+
+    # A malformed APP_BASE_URL raises rather than sending users to a relative OAuth callback.
+    it "redirect_uri refuses a schemeless APP_BASE_URL instead of building a relative OAuth callback" do
+      ENV["APP_BASE_URL"] = "evil.example"
+
+      expect { described_class.redirect_uri }.to raise_error(AppBaseUrl::InvalidBaseUrl)
     end
   end
 
@@ -57,8 +105,10 @@ RSpec.describe QuickBooks::Configuration do
       allow(described_class).to receive(:client_secret).and_return("client-secret")
     end
 
-    it "requires an explicit redirect uri outside local Rails environments" do
-      expect(described_class.configured?).to be(false)
+    # With APP_BASE_URL unset, the redirect uri now comes from config.x.default_base_url, so client
+    # credentials alone make the integration configured. That uri must match the one registered with Intuit.
+    it "needs no explicit redirect uri outside local Rails environments" do
+      expect(described_class.configured?).to be(true)
     end
   end
 

@@ -131,13 +131,32 @@ module Timekeeping
       .merge(ServiceCommands::COMMANDS.keys.index_with { ServiceCommands })
       .freeze
 
-    def self.call(operation:, company_id:, generation:, actor:, params:, checkpoint: ->(_step) { })
+    # identity, when given, is what an entry route's receipt fingerprints in
+    # place of the body: the request values a caller derives the body from.
+    # A caller whose body also holds values read from current state (a
+    # default, a stored field) passes it, so a retry of the same request
+    # still matches its receipt after that state changed.
+    # :reek:LongParameterList
+    def self.call(operation:, company_id:, generation:, actor:, params:, checkpoint: ->(_step) { }, identity: nil)
       writer = WRITERS.fetch(operation.to_sym) { raise ArgumentError, "unknown operation #{operation.inspect}" }
-      writer.new(operation:, company_id:, generation:, actor:, params:, checkpoint:).call
+      arguments = { operation:, company_id:, generation:, actor:, params:, checkpoint: }
+      arguments[:identity] = identity unless identity.nil?
+      writer.new(**arguments).call
+    end
+
+    # The stored answer to an earlier entry write with the same company,
+    # actor, operation, target and key, or nil when none is stored. It writes
+    # nothing, so a caller can replay a committed write before running checks
+    # that the write itself may have changed the answer to. A stale
+    # generation is still refused first, and a stored answer to different
+    # request values is refused as idempotency_key_reused.
+    # :reek:LongParameterList
+    def self.replay(operation:, company_id:, generation:, actor:, params:, identity: nil)
+      new(operation:, company_id:, generation:, actor:, params:, checkpoint: ->(_step) { }, identity:).stored_answer
     end
 
     # :reek:LongParameterList
-    def initialize(operation:, company_id:, generation:, actor:, params:, checkpoint:)
+    def initialize(operation:, company_id:, generation:, actor:, params:, checkpoint:, identity: nil)
       @operation = operation.to_sym
       raise ArgumentError, "unknown operation #{operation.inspect}" unless ROUTE_WRITERS.key?(@operation)
 
@@ -146,6 +165,7 @@ module Timekeeping
       @actor = actor
       @params = params
       @checkpoint = checkpoint
+      @identity = identity
       @today = Date.current
     end
 
@@ -164,9 +184,20 @@ module Timekeeping
       attempt
     end
 
+    def stored_answer
+      ApplicationRecord.transaction(requires_new: true) do
+        lock_receipt_key unless key.empty?
+        next Outcome.refusal(:stale_generation) unless generation_matches?(admitted_generation)
+        next if key.empty? || !actor.user?
+
+        receipt = find_receipt
+        answer_from(receipt) if receipt
+      end
+    end
+
     private
 
-      attr_reader :operation, :company_id, :generation, :actor, :params, :checkpoint, :today
+      attr_reader :operation, :company_id, :generation, :actor, :params, :checkpoint, :identity, :today
 
       # Each attempt runs in its own savepoint, so a failure rolls back this
       # write even when the caller has a transaction open and rescues the error.
@@ -258,7 +289,7 @@ module Timekeeping
       end
 
       def fingerprint
-        Digest::SHA256.hexdigest(JSON.generate(body))
+        Digest::SHA256.hexdigest(JSON.generate(identity.nil? ? body : identity))
       end
 
       def target_id

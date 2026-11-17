@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
 
 import { timesheetEntryApi } from "apis/api";
+import { newIdempotencyKey } from "apis/idempotency";
 import { minFromHHMM, minToHHMM, validateTimesheetEntry } from "helpers";
 import { PencilSimple } from "phosphor-react";
 import { TimeInput } from "../ui/time-input";
@@ -84,7 +85,11 @@ const WeeklyEntriesCard = ({
         return;
       }
       payload["work_date"] = dayInfo[selectedInputBox]["fullDate"];
-      const res = await timesheetEntryApi.create(payload, selectedEmployeeId);
+      const res = await timesheetEntryApi.create(
+        payload,
+        newIdempotencyKey(),
+        selectedEmployeeId
+      );
       if (res.status === 200) {
         setEntryList(prevState => {
           const newState: any = { ...prevState };
@@ -120,7 +125,12 @@ const WeeklyEntriesCard = ({
 
         return;
       }
-      const res = await timesheetEntryApi.update(timesheetEntryId, payload);
+
+      const res = await timesheetEntryApi.update(
+        timesheetEntryId,
+        payload,
+        newIdempotencyKey()
+      );
       if (res.status === 200) {
         setEntryList(prevState => {
           const newState: any = { ...prevState };

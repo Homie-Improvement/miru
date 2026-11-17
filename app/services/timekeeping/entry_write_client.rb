@@ -14,11 +14,12 @@ module Timekeeping
   # answer body may describe other users' data and is never passed on.
   #
   # It never retries. A call whose answer was lost may still have committed in
-  # Timekeeping; a resend under the same request id carries the same
-  # Idempotency-Key, so Timekeeping replays its answer instead of writing twice.
-  # A committed destroy hides its entry from the lookup before the write, so its
-  # resend goes through replay_destroy_entry, which only ever reads the stored
-  # answer.
+  # Timekeeping; a resend under the same client Idempotency-Key, or with none
+  # under the same request id, carries the same forwarded key, so Timekeeping
+  # replays its answer instead of writing twice.
+  # A committed destroy or bulk delete hides its entries from the lookup before
+  # the write, so its resend goes through replay_destroy_entry or
+  # replay_bulk_delete, which only ever read the stored answer.
   class EntryWriteClient
     ENTRIES_PATH = "/v1/companies/%<company_id>d/entries"
     ENTRY_PATH = "/v1/companies/%<company_id>d/entries/%<entry_id>d"
@@ -58,7 +59,7 @@ module Timekeeping
     # not forward its own records a manual entry.
     CREATE_SOURCE = { "source" => "manual", "source_metadata" => {} }.freeze
 
-    # Asks Timekeeping to answer a DELETE only from its stored receipt
+    # Asks Timekeeping to answer a DELETE or a bulk delete only from its stored receipt
     # (contracts/timekeeping/entry_api.yml headers.idempotency_replay).
     REPLAY_ONLY_HEADER = "Idempotency-Replay"
     REPLAY_ONLY_VALUE = "only"
@@ -67,6 +68,13 @@ module Timekeeping
     # Timekeeping instance that predates the replay header refuses the delete
     # as version_conflict instead of discarding an entry the lookup hid.
     REPLAY_ONLY_IF_MATCH = "replay-only"
+
+    # Sent as Ownership-Generation on a replay-only bulk delete. The bulk
+    # route never reads If-Match, but every Timekeeping instance checks the
+    # generation before it writes, and this value is never a generation, so an
+    # instance that predates bulk replay refuses the call as stale_generation
+    # instead of discarding the entries it names.
+    REPLAY_ONLY_GENERATION = "replay-only"
 
     # Timekeeping could not be reached, refused the monolith's own token, or
     # answered something unexpected. A subclass of the read client's error, so
@@ -102,6 +110,17 @@ module Timekeeping
     # yet and is keyed as "new".
     def self.idempotency_key(request_id:, operation:, entry_id: nil)
       Digest::UUID.uuid_v5(IDEMPOTENCY_NAMESPACE, "#{request_id}/#{operation}/#{entry_id || "new"}")
+    end
+
+    # Pure: the error an entry owner's refusal is raised as, by its status
+    # and reason. Shared by Timekeeping's HTTP answers and the prepared
+    # monolith's local owner, so both refusals render alike.
+    def self.refusal_error(operation:, status:, reason:)
+      return ActiveRecord::RecordNotFound.new("Couldn't find TimesheetEntry", "TimesheetEntry") if status == 404
+      return CONFLICT_ERRORS.fetch(reason, Conflict).new if status == 409
+
+      error_class = STATUS_ERRORS.fetch(status) { (400..499).cover?(status) ? Rejected : Error }
+      error_class.new("Timekeeping entry #{operation} answered #{status}")
     end
 
     # Pure: the key of one bulk call, derived from the request id, the
@@ -156,7 +175,7 @@ module Timekeeping
     end
 
     # Returns the created entry Hash. idempotency_key replaces the key derived
-    # from the request id, for a caller whose retries run under a new request
+    # from the request, for a caller whose retries run under a new request
     # id, such as an import rerun, and must still be recognised as the same
     # create.
     def create_entry(context:, generation:, body:, idempotency_key: nil)
@@ -204,7 +223,7 @@ module Timekeeping
                                      body: { "entry_ids" => ids })
     end
 
-    # Returns the stored answer of a destroy this request id already committed.
+    # Returns the stored answer of a destroy this request's key already committed.
     # Timekeeping never deletes on this call: with no stored answer for the
     # same company, actor and key it answers 404, raised as RecordNotFound.
     def replay_destroy_entry(context:, generation:, entry_id:)
@@ -214,10 +233,31 @@ module Timekeeping
                                        version: REPLAY_ONLY_IF_MATCH, replay_only: true)
     end
 
+    # Returns the stored answer of a bulk delete this request's key already
+    # committed over exactly these entry_ids. The key and body are the ones
+    # bulk_delete sends for the same ids, so only a first attempt that named
+    # these ids has a receipt to replay. Timekeeping never deletes on this
+    # call: with no stored answer it answers 404, raised as RecordNotFound.
+    def replay_bulk_delete(context:, entry_ids:)
+      path = format(BULK_DELETE_PATH, company_id: context.company.id)
+      ids = bulk_body_ids(entry_ids)
+      forward(Net::HTTP::Post, path, operation: "bulk_delete", context:, generation: REPLAY_ONLY_GENERATION,
+                                     idempotency_key: bulk_key(context, "bulk_delete", ids),
+                                     body: { "entry_ids" => ids }, replay_only: true)
+    end
+
     private
 
       def request_key(context, operation, entry_id = nil)
-        self.class.idempotency_key(request_id: context.request_id, operation:, entry_id:)
+        self.class.idempotency_key(request_id: key_seed(context), operation:, entry_id:)
+      end
+
+      # The request's own Idempotency-Key when it sent one, so a client's retry
+      # under a new request id forwards the same key and is replayed; otherwise
+      # the request id. The key is still derived per operation and entry, so
+      # one client key never names two different forwarded writes.
+      def key_seed(context)
+        context.idempotency_key || context.request_id
       end
 
       # Timekeeping fingerprints the body as serialized, so the ids go in the
@@ -228,7 +268,7 @@ module Timekeeping
       end
 
       def bulk_key(context, operation, entry_ids)
-        self.class.bulk_idempotency_key(request_id: context.request_id, operation:, entry_ids:)
+        self.class.bulk_idempotency_key(request_id: key_seed(context), operation:, entry_ids:)
       end
 
       def forward(request_class, path, operation:, context:, generation:, idempotency_key:, version: nil, body: nil,
@@ -267,13 +307,7 @@ module Timekeeping
       end
 
       def refusal_for(operation, response)
-        status = response.code.to_i
-        message = "Timekeeping entry #{operation} answered #{status}"
-        return ActiveRecord::RecordNotFound.new("Couldn't find TimesheetEntry", "TimesheetEntry") if status == 404
-        return CONFLICT_ERRORS.fetch(reason_of(response), Conflict).new if status == 409
-
-        error_class = STATUS_ERRORS.fetch(status) { (400..499).cover?(status) ? Rejected : Error }
-        error_class.new(message)
+        self.class.refusal_error(operation:, status: response.code.to_i, reason: reason_of(response))
       end
 
       # The contract's error bodies carry only a reason. Anything unreadable

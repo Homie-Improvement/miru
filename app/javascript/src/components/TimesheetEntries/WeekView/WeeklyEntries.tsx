@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
 
 import { timesheetEntryApi } from "apis/api";
+import { newIdempotencyKey } from "apis/idempotency";
 import { Toastr } from "StyledComponents";
 
 import WeeklyEntriesCard from "./WeeklyEntriesCard";
@@ -52,10 +53,13 @@ const WeeklyEntries = ({
   const handleEditEntries = async () => {
     try {
       const ids = getIds();
-      const res = await timesheetEntryApi.updateBulk({
-        project_id: setProjectId(),
-        ids,
-      });
+      const res = await timesheetEntryApi.updateBulk(
+        {
+          project_id: setProjectId(),
+          ids,
+        },
+        newIdempotencyKey()
+      );
       if (res.status === 200) {
         setEntryList(prevState => {
           const newState = { ...prevState, ...res.data.entries };

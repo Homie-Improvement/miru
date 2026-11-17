@@ -28,19 +28,17 @@ That spec also passes if the initializer hard-codes `"http://example.com"` and i
 
 ## Solution
 
-Keep the check against the declared test value. Add one example that sets the setting to a value no code path holds as a literal, reloads the initializer, and expects that value. Restore the setting in `ensure`:
+Keep the check against the declared test value. Add one example that sets the setting to a value no code path holds as a literal, reloads the initializer, and expects that value. Set and restore both base URL sources through `with_app_base_url` in `spec/support/app_base_url_helpers.rb`, which puts them back even when the example raises:
 
 ```ruby
-original = Rails.configuration.x.default_base_url
-ENV.delete("APP_BASE_URL")
-Rails.configuration.x.default_base_url = "https://boot-check.test"
+with_app_base_url(env: nil, default: "https://boot-check.test") do
+  load initializer_path
 
-load initializer_path
-
-expect(OmniAuth.config.full_host).to eq("https://boot-check.test")
-ensure
-  Rails.configuration.x.default_base_url = original
+  expect(OmniAuth.config.full_host).to eq("https://boot-check.test")
+end
 ```
+
+PR #288 wrote this example with a hand-written save and an `ensure` restore; the spec has since moved onto the shared helper.
 
 The same idea holds for any code under test that should read a setting: when its test value equals the expected literal, the spec needs a second, distinct value.
 

@@ -42,3 +42,19 @@ RSpec.describe SendReminderMailer, type: :mailer do
     end
   end
 end
+
+RSpec.describe SendReminderMailer, "base URL", type: :mailer do
+  # "each reads the one per-environment base URL (APP_BASE_URL, else config.x.default_base_url)."
+  it "links the invoice reminder to the swapped config.x.default_base_url when APP_BASE_URL is unset" do
+    with_app_base_url(env: nil, default: "https://boot-check.test") do
+      company = create(:company)
+      client = create(:client, company:)
+      invoice = create(:invoice, client:, company:)
+
+      mail = SendReminderMailer.with(invoice:, subject: "Reminder", recipients: [client.email]).send_reminder
+      body = mail.html_part&.body&.decoded || mail.body.decoded
+
+      expect(body).to include("https://boot-check.test/invoices/#{invoice.external_view_key}/view")
+    end
+  end
+end

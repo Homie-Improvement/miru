@@ -23,9 +23,8 @@ class Api::V1::Agent::TimesheetEntriesController < Api::V1::Agent::BaseControlle
     # agent and its user, and is refused when they do not match.
     def entry_gateway
       Timekeeping::Gateway.new(
-        context: Timekeeping::WriteContext.new(
-          company: current_company, actor: current_agent.user, actor_kind: "agent",
-          request_id: request.request_id, agent: current_agent
+        context: Timekeeping::WriteContext.for_request(
+          request, company: current_company, actor: current_agent.user, actor_kind: "agent", agent: current_agent
         )
       )
     end

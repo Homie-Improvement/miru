@@ -12,7 +12,7 @@
   <p style="margin-bottom: 0;"><%= t("mailers.devise.unlock.warning_body") %></p>
 </div>
 
-<%= render "shared/mailer/button", href: "#{ENV.fetch("APP_BASE_URL", "http://127.0.0.1:3000")}/password/new", label: t("mailers.devise.unlock.cta") %>
+<%= render "shared/mailer/button", href: "#{AppBaseUrl.current}/password/new", label: t("mailers.devise.unlock.cta") %>
 
 <div class="email-divider"></div>
 

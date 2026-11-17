@@ -56,3 +56,18 @@ RSpec.describe MonthlyReportsMailer, type: :mailer do
     end
   end
 end
+
+RSpec.describe MonthlyReportsMailer, "base URL", type: :mailer do
+  # "each reads the one per-environment base URL (APP_BASE_URL, else config.x.default_base_url)."
+  it "links the cash flow digest to the swapped config.x.default_base_url reports page when APP_BASE_URL is unset" do
+    with_app_base_url(env: nil, default: "https://boot-check.test") do
+      company = create(:company, name: "Saeloun Inc", base_currency: "USD")
+      user = create(:user, current_workspace: company, locale: "en-US")
+
+      mail = described_class.with(company_id: company.id, recipient_id: user.id, month: "2026-03-01").cash_flow_digest
+      body = mail.html_part&.body&.decoded || mail.body.decoded
+
+      expect(body).to include("https://boot-check.test/reports")
+    end
+  end
+end

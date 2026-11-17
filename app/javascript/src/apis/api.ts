@@ -6,6 +6,8 @@ import { clearCredentialsFromLocalStorage } from "utils/storage";
 import { getCsrfToken, getSessionRequestHeaders } from "utils/authHeaders";
 import { reportClientError } from "utils/runtimeRecovery";
 
+import { idempotencyHeaders, type IdempotencyKey } from "./idempotency";
+
 const AUTH_PATH_PREFIXES = [
   "/user/sign_in",
   "/login",
@@ -737,12 +739,18 @@ export const timesheetEntryApi = {
 
     return http.get(url);
   },
-  create: (params: any, userId?: string | number) => {
+  create: (
+    params: any,
+    idempotencyKey: IdempotencyKey,
+    userId?: string | number
+  ) => {
     const url = userId
       ? `/timesheet_entry?user_id=${userId}`
       : `/timesheet_entry`;
 
-    return http.post(url, params);
+    return http.post(url, params, {
+      headers: idempotencyHeaders(idempotencyKey),
+    });
   },
   list: (from: string, to: string, uid?: string | number) =>
     http.get(`/timesheet_entry`, {
@@ -752,13 +760,23 @@ export const timesheetEntryApi = {
         ...(uid ? { user_id: uid } : {}),
       },
     }),
-  update: (id: string | number, payload: any) =>
-    http.put(`/timesheet_entry/${id}`, payload),
-  destroy: (id: string | number) => http.delete(`/timesheet_entry/${id}`),
-  destroyBulk: (payload: any) =>
-    http.delete(`/timesheet_entry/bulk_action/`, { data: { source: payload } }),
-  updateBulk: (payload: any) =>
-    http.patch(`/timesheet_entry/bulk_action/`, payload),
+  update: (id: string | number, payload: any, idempotencyKey: IdempotencyKey) =>
+    http.put(`/timesheet_entry/${id}`, payload, {
+      headers: idempotencyHeaders(idempotencyKey),
+    }),
+  destroy: (id: string | number, idempotencyKey: IdempotencyKey) =>
+    http.delete(`/timesheet_entry/${id}`, {
+      headers: idempotencyHeaders(idempotencyKey),
+    }),
+  destroyBulk: (payload: any, idempotencyKey: IdempotencyKey) =>
+    http.delete(`/timesheet_entry/bulk_action/`, {
+      data: { source: payload },
+      headers: idempotencyHeaders(idempotencyKey),
+    }),
+  updateBulk: (payload: any, idempotencyKey: IdempotencyKey) =>
+    http.patch(`/timesheet_entry/bulk_action/`, payload, {
+      headers: idempotencyHeaders(idempotencyKey),
+    }),
 };
 
 // Time Tracking

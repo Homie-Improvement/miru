@@ -78,6 +78,10 @@ RSpec.describe "Api::V1::Team#index", type: :request do
     end
 
     it "can search a user from the team" do
+      # The pending invitation's random email can contain a random first name,
+      # and invitations match the search by email, so search for a name no
+      # generated email can hold.
+      user.update!(first_name: "Zyxsearchable")
       send_request :get, api_v1_team_index_path(
         q: { first_name_or_last_name_or_email_cont: user.first_name }
       ), headers: auth_headers(user)

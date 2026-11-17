@@ -5,6 +5,7 @@ import {
   timesheetEntryApi,
   timeTrackingApi,
 } from "apis/api";
+import { newIdempotencyKey } from "apis/idempotency";
 import Loader from "common/Loader/index";
 import withLayout from "common/Mobile/HOC/withLayout";
 import SearchTimeEntries from "common/SearchTimeEntries";
@@ -31,6 +32,7 @@ import EntryDetailsModal from "./EntryDetailsModal";
 import TimeEntriesDisplay from "./TimeEntriesDisplay";
 import AddEntryButton from "./AddEntryButton";
 import MonthCalendar from "./MonthCalendar";
+import { createEntriesWithOwnKeys } from "./createEntriesWithOwnKeys";
 
 dayjs.extend(updateLocale);
 dayjs.extend(weekday);
@@ -509,7 +511,7 @@ const TimeTracking: React.FC<Iprops> = ({ user, isAdminUser }) => {
   };
 
   const handleDeleteEntry = async id => {
-    const res = await timesheetEntryApi.destroy(id);
+    const res = await timesheetEntryApi.destroy(id, newIdempotencyKey());
     if (!(res.status === 200)) return;
     await handleFilterEntry(selectedFullDate, id);
 
@@ -563,6 +565,7 @@ const TimeTracking: React.FC<Iprops> = ({ user, isAdminUser }) => {
         project_id: entry.project_id,
         timesheet_entry: data,
       },
+      newIdempotencyKey(),
       selectedEmployeeId
     );
     if (res.status === 200) {
@@ -764,27 +767,21 @@ const TimeTracking: React.FC<Iprops> = ({ user, isAdminUser }) => {
         return;
       }
 
-      await Promise.all(
-        entriesToCreate.map((entry: any) =>
-          timesheetEntryApi.create(
-            {
-              project_id: entry.project_id,
-              timesheet_entry: {
-                work_date: dayjs(entry.work_date)
-                  .add(7, "day")
-                  .format("YYYY-MM-DD"),
-                duration: entry.duration,
-                note: entry.note,
-                task_type: entry.task_type || "development",
-                bill_status:
-                  entry.bill_status === "billed"
-                    ? "unbilled"
-                    : entry.bill_status,
-              },
-            },
-            selectedEmployeeId
-          )
-        )
+      await createEntriesWithOwnKeys(
+        entriesToCreate.map((entry: any) => ({
+          project_id: entry.project_id,
+          timesheet_entry: {
+            work_date: dayjs(entry.work_date)
+              .add(7, "day")
+              .format("YYYY-MM-DD"),
+            duration: entry.duration,
+            note: entry.note,
+            task_type: entry.task_type || "development",
+            bill_status:
+              entry.bill_status === "billed" ? "unbilled" : entry.bill_status,
+          },
+        })),
+        selectedEmployeeId
       );
 
       await refreshVisibleEntries();

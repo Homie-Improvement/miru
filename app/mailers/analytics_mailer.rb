@@ -4,7 +4,7 @@ class AnalyticsMailer < ApplicationMailer
   def threshold_alert
     @company = Company.find(params[:company_id])
     @alert = params[:alert].deep_symbolize_keys
-    @analytics_url = "#{ENV['APP_BASE_URL']}/reports"
+    @analytics_url = "#{AppBaseUrl.current}/reports"
     recipient = params[:recipient] || Array(params[:recipients]).first
     @recipient = recipient_user_from([recipient])
 

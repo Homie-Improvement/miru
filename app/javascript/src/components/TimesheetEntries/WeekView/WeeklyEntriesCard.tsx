@@ -16,6 +16,7 @@ import { Badge } from "../../ui/badge";
 import { Separator } from "../../ui/separator";
 import { cn } from "../../../lib/utils";
 import { timesheetEntryApi } from "apis/api";
+import { newIdempotencyKey } from "apis/idempotency";
 
 const WeeklyEntriesCard = ({
   client,
@@ -83,7 +84,11 @@ const WeeklyEntriesCard = ({
         return;
       }
       payload["work_date"] = dayInfo[selectedInputBox]["fullDate"];
-      const res = await timesheetEntryApi.create(payload, selectedEmployeeId);
+      const res = await timesheetEntryApi.create(
+        payload,
+        newIdempotencyKey(),
+        selectedEmployeeId
+      );
       handleUpdateRow(res.data.entry);
       setDataChanged(false);
       setShowNote(false);
@@ -119,7 +124,11 @@ const WeeklyEntriesCard = ({
 
         return;
       }
-      const res = await timesheetEntryApi.update(timesheetEntryId, payload);
+      const res = await timesheetEntryApi.update(
+        timesheetEntryId,
+        payload,
+        newIdempotencyKey()
+      );
       const updatedEntry = res.data.entry;
       handleUpdateRow(updatedEntry);
       setDataChanged(false);

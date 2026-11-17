@@ -85,7 +85,7 @@ RSpec.describe "Api::V1::MCP#handle", type: :request do
         expect(json_response.dig("result", "protocolVersion")).to be_a(String).and be_present
       end
 
-      it "forwards request host to proxy-backed tool calls" do
+      it "proxies tool calls without passing the request host to the proxy" do
         allow(MCP::Miru::ApiProxy).to receive(:request).and_call_original
 
         post mcp_path, params: tool_call_payload(name: "miru.workspace.whoami").to_json, headers: mcp_headers(cli_token:, mcp_method: "tools/call")
@@ -94,11 +94,7 @@ RSpec.describe "Api::V1::MCP#handle", type: :request do
         expect(json_response["id"]).to eq("tool-1")
         expect(json_response.dig("result", "content")).to be_an(Array).and be_present
         expect(MCP::Miru::ApiProxy).to have_received(:request).once.with(
-          hash_including(
-            method: :get,
-            path: "/api/v1/users/_me",
-            headers: hash_including("Host" => "www.example.com")
-          )
+          method: :get, path: "/api/v1/users/_me", params: nil, body: nil, authorization: "Bearer #{cli_token}"
         )
       end
 
@@ -112,6 +108,42 @@ RSpec.describe "Api::V1::MCP#handle", type: :request do
         expect(json_response["id"]).to eq("tool-1")
         tool_error = json_response["error"].present? || json_response.dig("result", "isError") == true
         expect(tool_error).to be(true)
+      end
+
+      # "A BaseTool invocation whose server_context host differs from AppBaseUrl.current sends the configured host,
+      # not the request host, as HTTP_HOST in the internal Rack request."
+      context "with a configured base URL that differs from the request host" do
+        let(:internal_hosts) { [] }
+
+        around do |example|
+          with_app_base_url(env: nil, default: "https://configured-host.test") { example.run }
+        end
+
+        before do
+          allow_any_instance_of(Rack::MockRequest).to receive(:request).and_wrap_original do |original, verb, path, options|
+            internal_hosts << options["HTTP_HOST"]
+            original.call(verb, path, options)
+          end
+        end
+
+        it "proxies a tools/call sent to a forged request Host with the configured host instead" do
+          host! "attacker.test"
+
+          post mcp_path, params: tool_call_payload(name: "miru.workspace.whoami").to_json, headers: mcp_headers(cli_token:, mcp_method: "tools/call")
+
+          expect(response).to have_http_status(:ok)
+          expect(json_response["id"]).to eq("tool-1")
+          expect(internal_hosts).to eq(["configured-host.test"])
+        end
+
+        it "sends the configured host, not the request host, on the internal request of a tools/call" do
+          post mcp_path, params: tool_call_payload(name: "miru.workspace.whoami").to_json, headers: mcp_headers(cli_token:, mcp_method: "tools/call")
+
+          expect(response).to have_http_status(:ok)
+          expect(json_response["id"]).to eq("tool-1")
+          expect(internal_hosts).to eq(["configured-host.test"])
+          expect(internal_hosts).not_to include("www.example.com")
+        end
       end
     end
 

@@ -573,3 +573,65 @@ RSpec.describe Invoices::ReservationBoundary do
     expect(entry.reload.locked).to be(false)
   end
 end
+
+RSpec.describe Invoices::ReservationBoundary, "mark_billed decision" do
+  it "mark_billed raises a retryable error with the reason for every answer that is not committed or refused" do
+    invoice = create(:invoice)
+    answers = {
+      "committed" => Invoices::ReservationOutcome.new(state: "committed", conflicts: [], counts: { billed: 0 }),
+      "retryable" => Invoices::ReservationOutcome.new(state: "retryable", conflicts: [], counts: {}, reason: "stale_generation"),
+      "prepared" => Invoices::ReservationOutcome.new(state: "prepared", conflicts: [], counts: {}),
+      "refused" => Invoices::ReservationOutcome.new(state: "refused", conflicts: [{ entry_id: 3, reason: "on_another_invoice" }], counts: {}),
+      "aborted" => Invoices::ReservationOutcome.new(state: "aborted", conflicts: [], counts: {}),
+      "retryable without a reason" => Invoices::ReservationOutcome.new(state: "retryable", conflicts: [], counts: {})
+    }
+    adapter = Object.new
+    current = nil
+    adapter.define_singleton_method(:mark_billed) { |_request| answers.fetch(current) }
+    allow(Invoices::ReservationAdapters).to receive(:for).and_return(adapter)
+
+    # "Make it decide from a table: `committed` returns, `refused` raises `OperationErrors::Refused`, and every other state raises `OperationErrors::PrepareRetryable` with the reason."
+    current = "committed"
+    expect(described_class.mark_billed(invoice).state).to eq("committed")
+
+    current = "retryable"
+    expect { described_class.mark_billed(invoice) }
+      .to raise_error(Invoices::OperationErrors::PrepareRetryable, "stale_generation")
+
+    current = "prepared"
+    expect { described_class.mark_billed(invoice) }.to raise_error(Invoices::OperationErrors::PrepareRetryable)
+
+    current = "refused"
+    expect { described_class.mark_billed(invoice) }.to raise_error(Invoices::OperationErrors::Refused)
+
+    current = "aborted"
+    expect { described_class.mark_billed(invoice) }.to raise_error(Invoices::OperationErrors::PrepareRetryable)
+
+    current = "retryable without a reason"
+    expect { described_class.mark_billed(invoice) }
+      .to raise_error(Invoices::OperationErrors::PrepareRetryable, "prepare_retryable")
+  end
+end
+
+RSpec.describe Invoices::ReservationBoundary, "mark_billed with an undeliverable commit row" do
+  # A row marked undeliverable never reaches the service, so its entries are
+  # never committed there and billing would send the invoice with them unbilled.
+  it "under the timekeeping owner still refuses billing while the invoice's commit row is marked undeliverable" do
+    invoice = create(:invoice)
+    TimekeepingOwnership.current.update!(owner: "timekeeping", handoff_step: nil)
+    operation_id = SecureRandom.uuid
+    InvoiceOperationOutboxItem.create!(
+      company_id: invoice.company_id, invoice_id: invoice.id, operation_id:, kind: "commit",
+      undeliverable_at: Time.current,
+      payload: { company_id: invoice.company_id, invoice_id: invoice.id, operation_id:, generation: 1,
+                 disposition: "active", desired_entry_ids: [1] }
+    )
+    adapter = instance_double(Timekeeping::ReservationClient)
+    allow(Invoices::ReservationAdapters).to receive(:for).and_return(adapter)
+    allow(adapter).to receive(:mark_billed)
+
+    expect { described_class.mark_billed(invoice) }
+      .to raise_error(Invoices::OperationErrors::PrepareRetryable, Invoices::ReservationBoundary::COMMIT_UNDELIVERED_REASON)
+    expect(adapter).not_to have_received(:mark_billed)
+  end
+end

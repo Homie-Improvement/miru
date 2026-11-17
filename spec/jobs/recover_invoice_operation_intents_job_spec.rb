@@ -409,3 +409,62 @@ RSpec.describe RecoverInvoiceOperationIntentsJob do
     end
   end
 end
+
+RSpec.describe RecoverInvoiceOperationIntentsJob do
+  # "`OutboxDelivery#deliver` and `RecoverInvoiceOperationIntentsJob#deliver_undelivered` skip rows that have `undeliverable_at` set."
+  # "a stale_generation answer sets `undeliverable_at`, keeps the row and emits one event, and a later recovery run sends no request for that row."
+  # The ordinary row of each kind proves the sweep ran, so "no request for the undeliverable row" cannot pass by the sweep doing nothing.
+  it "a recovery run sends no request for an undeliverable commit or abort row and still delivers the ordinary undelivered row of each kind", :aggregate_failures, committed_data: true do
+    company_id = 8850
+    # Each kind settles only against its own intent state: commit against committed, abort against failed.
+    create_row = lambda do |kind:, intent_state:, invoice_id:, undeliverable_at: nil|
+      operation_id = SecureRandom.uuid
+      InvoiceOperationIntent.create!(
+        company_id:, invoice_id:, operation_id:, state: intent_state, generation: 1,
+        disposition: "active", desired_entry_ids: [61], finished_at: Time.current
+      )
+      InvoiceOperationOutboxItem.create!(
+        company_id:, invoice_id:, operation_id:, kind:, undeliverable_at:,
+        payload: {
+          "company_id" => company_id, "invoice_id" => invoice_id, "operation_id" => operation_id,
+          "generation" => 1, "disposition" => "active", "desired_entry_ids" => [61]
+        }
+      )
+    end
+    marked_at = { "commit" => 1.hour.ago.change(usec: 0), "abort" => 5.minutes.ago.change(usec: 0) }
+    rows = {
+      "commit" => {
+        stale: create_row.call(kind: "commit", intent_state: "committed", invoice_id: 88_501),
+        ordinary: create_row.call(kind: "commit", intent_state: "committed", invoice_id: 88_502)
+      },
+      "abort" => {
+        # The abort row is marked when it is written; the commit row is marked after it is written.
+        stale: create_row.call(kind: "abort", intent_state: "failed", invoice_id: 88_503, undeliverable_at: marked_at["abort"]),
+        ordinary: create_row.call(kind: "abort", intent_state: "failed", invoice_id: 88_504)
+      }
+    }
+    rows.dig("commit", :stale).update_column(:undeliverable_at, marked_at["commit"])
+    requested_operation_ids = { "commit" => [], "abort" => [] }
+    recording = lambda do |kind, state|
+      outcome = Invoices::ReservationOutcome.new(state:, conflicts: [], counts: {})
+      ->(request) { requested_operation_ids[kind] << request.operation_id; outcome }
+    end
+    adapter = RecordingReservationAdapter.new(
+      prepare: Invoices::ReservationOutcome.new(state: "prepared", conflicts: [], counts: {}),
+      commit: recording.call("commit", "committed"),
+      abort: recording.call("abort", "aborted")
+    )
+
+    described_class.perform_now(reservations: adapter)
+
+    rows.each do |kind, by_role|
+      stale_row = by_role[:stale].reload
+      expect(requested_operation_ids[kind]).to eq([by_role[:ordinary].operation_id]),
+        "expected only the ordinary #{kind} row to be requested through #{kind}"
+      expect(by_role[:ordinary].reload.delivered_at).to be_present, "expected the ordinary #{kind} row to be delivered"
+      expect(stale_row.delivered_at).to be_nil, "expected the undeliverable #{kind} row to stay undelivered"
+      expect(stale_row.attempts).to eq(0), "expected the undeliverable #{kind} row to count no attempt"
+      expect(stale_row.undeliverable_at).to eq(marked_at[kind]), "expected the undeliverable #{kind} row to keep its mark"
+    end
+  end
+end

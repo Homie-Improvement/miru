@@ -275,36 +275,58 @@ RSpec.describe "Api::V1::TimesheetEntry gateway refusal event", type: :request d
   let(:project) { create(:project, billable: true, client: create(:client, company:)) }
   let(:admin) { create(:user, current_workspace_id: company.id) }
 
-  around do |example|
-    with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
-  end
-
   before do
     create(:employment, company:, user: admin)
     admin.add_role :admin, company
-    TimekeepingOwnership.current.update!(handoff_step: "close_admission")
     sign_in admin
   end
 
-  it "reports a refused entry write with only reason, company_id, request_id and actor_kind, and no token" do
-    event = assert_event_reported("Timekeeping::EntryWriteRefused") do
-      send_request :post, api_v1_timesheet_entry_index_path, params: {
-        project_id: project.id, user_id: admin.id,
-        timesheet_entry: { duration: 30, work_date: Date.current, note: "Private note text", bill_status: :unbilled }
-      }, headers: auth_headers(admin)
+  # The gateway refuses any set handoff_step the same way, so both steps share one refusal contract.
+  # Each row keeps the setup its original example had: only the close_admission row installs a token
+  # signing key, which is what lets the no-token check catch a token leaking into the event.
+  [
+    { handoff_step: "close_admission", signing_key: true },
+    { handoff_step: "settle", signing_key: false }
+  ].each do |row|
+    context "during #{row[:handoff_step]} #{row[:signing_key] ? 'with' : 'without'} a token signing key" do
+      around do |example|
+        if row[:signing_key]
+          with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+        else
+          example.run
+        end
+      end
+
+      before { TimekeepingOwnership.current.update!(handoff_step: row[:handoff_step]) }
+
+      # "Emit `503 ownership_moving` and `409 stale_generation` counts with `company_id`, `request_id` and actor kind."
+      # "It carries reason, company_id, request_id and actor_kind from the context, and never the token or the body."
+      it "reports a refused entry write with only reason, company_id, request_id and actor_kind, and no token" do
+        event = assert_event_reported("Timekeeping::EntryWriteRefused") do
+          send_request :post, api_v1_timesheet_entry_index_path, params: {
+            project_id: project.id, user_id: admin.id,
+            timesheet_entry: { duration: 30, work_date: Date.current, note: "Private note text", bill_status: :unbilled }
+          }, headers: auth_headers(admin)
+        end
+
+        expect(response).to have_http_status(:service_unavailable)
+        data = event[:payload].to_h[:data]
+
+        expect(data.keys).to contain_exactly(:reason, :company_id, :request_id, :actor_kind)
+        expect(data[:reason].to_s).to eq("ownership_moving")
+        expect(data[:company_id]).to eq(company.id)
+        expect(data[:request_id]).to eq(response.headers["X-Request-Id"])
+        expect(data[:actor_kind].to_s).to eq("user")
+        expect(data.to_h.transform_keys(&:to_sym)).to eq(
+          reason: "ownership_moving",
+          company_id: company.id,
+          request_id: response.headers["X-Request-Id"],
+          actor_kind: "user"
+        )
+        expect(event[:payload].to_h.to_s).not_to include("Private note text")
+        expect(event[:payload].to_h.to_s).not_to match(/eyJ[\w-]+\.[\w-]+\.[\w-]+/)
+      end
     end
-
-    expect(response).to have_http_status(:service_unavailable)
-    data = event[:payload].to_h[:data]
-
-    # "It carries reason, company_id, request_id and actor_kind from the context, and never the token or the body."
-    expect(data.keys).to contain_exactly(:reason, :company_id, :request_id, :actor_kind)
-    expect(data[:reason].to_s).to eq("ownership_moving")
-    expect(data[:company_id]).to eq(company.id)
-    expect(data[:request_id]).to eq(response.headers["X-Request-Id"])
-    expect(data[:actor_kind].to_s).to eq("user")
-    expect(event[:payload].to_h.to_s).not_to include("Private note text")
-    expect(event[:payload].to_h.to_s).not_to match(/eyJ[\w-]+\.[\w-]+\.[\w-]+/)
   end
 end
 
@@ -333,31 +355,6 @@ RSpec.describe "Gateway refusal leaves no trace", type: :request do
     expect(response).to have_http_status(:service_unavailable)
     expect(json_response["reason"]).to eq("ownership_moving")
     expect(response.headers["Retry-After"]).to be_present
-  end
-end
-
-RSpec.describe "Gateway missing ownership row", type: :request do
-  let(:company) { create(:company) }
-  let(:user) { create(:user, current_workspace_id: company.id) }
-  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
-
-  before do
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    sign_in user
-  end
-
-  it "a destroy with no ownership row answers 503 and keeps the legacy entry undiscarded" do
-    entry = create(:timesheet_entry, user:, project:)
-    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).delete_all
-
-    # "A missing ownership row gives 503."
-    send_request :delete, api_v1_timesheet_entry_path(entry.id), headers: auth_headers(user)
-
-    expect(response).to have_http_status(:service_unavailable)
-    expect(entry.reload.discarded_at).to be_nil
-  ensure
-    TimekeepingOwnership.ensure_initial!
   end
 end
 
@@ -516,33 +513,81 @@ RSpec.describe "Gateway forwarded destroy honours the looked-up version", type: 
   end
 end
 
+# "A missing row or an unknown owner also refuses (fail closed). It never falls back to legacy and never answers 404."
+# Create, update and destroy each reach the refusal through their own gateway method, and only update and destroy
+# look an entry up, so each verb keeps its own example of the one missing-row contract.
 RSpec.describe "Api::V1::TimesheetEntry gateway missing ownership row", type: :request do
   let(:missing_row_company) { create(:company) }
   let(:missing_row_project) { create(:project, billable: true, client: create(:client, company: missing_row_company)) }
-  let(:missing_row_user) do
+  let(:missing_row_employee) { missing_row_member(:employee) }
+  let(:missing_row_admin) { missing_row_member(:admin) }
+
+  def missing_row_member(role)
     create(:user, current_workspace_id: missing_row_company.id).tap do |user|
       create(:employment, company: missing_row_company, user:)
-      user.add_role :employee, missing_row_company
+      user.add_role role, missing_row_company
     end
   end
 
-  # "A missing row or an unknown owner also refuses (fail closed). It never falls back to legacy and never answers 404."
-  it "a create with no ownership row answers 503 ownership_moving and writes no entry" do
+  def delete_missing_row_ownership
     TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).delete_all
-    sign_in missing_row_user
+  end
+
+  def expect_missing_row_refusal
+    expect(response).to have_http_status(:service_unavailable)
+    expect(json_response["reason"]).to eq("ownership_moving")
+    expect(response.headers["Retry-After"]).to be_present
+    expect(TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)).to be_empty
+    expect(TimekeepingOwnership.count).to eq(0)
+  end
+
+  # "A missing row or an unknown owner also refuses (fail closed). It never falls back to legacy and never answers 404."
+  # Each verb is its own example: only update and destroy look the entry up, so only they could answer 404.
+  it "refuses a create by an employee with 503 ownership_moving and writes no entry" do
+    delete_missing_row_ownership
+    sign_in missing_row_employee
     params = {
       project_id: missing_row_project.id,
       timesheet_entry: { duration: 30, work_date: Date.current, note: "No row", bill_status: :unbilled }
     }
 
     expect do
-      send_request :post, api_v1_timesheet_entry_index_path, params:, headers: auth_headers(missing_row_user)
+      send_request :post, api_v1_timesheet_entry_index_path, params:, headers: auth_headers(missing_row_employee)
     end.not_to change(TimesheetEntry, :count)
 
-    expect(response).to have_http_status(503)
-    expect(json_response["reason"]).to eq("ownership_moving")
-    expect(response.headers["Retry-After"]).to be_present
-    expect(TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)).to be_empty
+    expect_missing_row_refusal
+  end
+
+  it "refuses an update by an admin with 503 and not 404, leaving the note unchanged" do
+    entry = create(:timesheet_entry, user: missing_row_admin, project: missing_row_project,
+      work_date: Date.current, note: "Before")
+    delete_missing_row_ownership
+    sign_in missing_row_admin
+
+    expect do
+      send_request :patch, api_v1_timesheet_entry_path(entry), params: {
+        project_id: missing_row_project.id,
+        timesheet_entry: { duration: 30, work_date: Date.current, note: "After", bill_status: :unbilled }
+      }, headers: auth_headers(missing_row_admin)
+    end.not_to change(TimesheetEntry, :count)
+
+    expect_missing_row_refusal
+    expect(entry.reload.note).to eq("Before")
+    expect(entry).not_to be_discarded
+  end
+
+  it "refuses a destroy by an admin with 503 and not 404, leaving the entry undiscarded" do
+    entry = create(:timesheet_entry, user: missing_row_admin, project: missing_row_project, work_date: Date.current)
+    delete_missing_row_ownership
+    sign_in missing_row_admin
+
+    expect do
+      send_request :delete, api_v1_timesheet_entry_path(entry), headers: auth_headers(missing_row_admin)
+    end.not_to change(TimesheetEntry, :count)
+
+    expect_missing_row_refusal
+    expect(entry.reload).not_to be_discarded
+    expect(entry.discarded_at).to be_nil
   end
 end
 
@@ -943,57 +988,6 @@ RSpec.describe "Api::V1::TimesheetEntry gateway handoff refusal", type: :request
   end
 end
 
-RSpec.describe "Api::V1::TimesheetEntry gateway missing ownership row", type: :request do
-  let(:company) { create(:company) }
-  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
-  let(:user) { create(:user, current_workspace_id: company.id) }
-  let!(:entry) { create(:timesheet_entry, user:, project:, work_date: Date.current, note: "Before") }
-
-  before do
-    create(:employment, company:, user:)
-    user.add_role(:admin, company)
-    TimekeepingOwnership.delete_all
-    sign_in user
-  end
-
-  # "A missing row or an unknown owner also refuses (fail closed). It never falls back to legacy and never answers 404."
-  it "refuses an update with 503 and not 404 when the ownership row is missing" do
-    send_request :patch, api_v1_timesheet_entry_path(entry), params: {
-      project_id: project.id,
-      timesheet_entry: { duration: 30, work_date: Date.current, note: "After", bill_status: :unbilled }
-    }, headers: auth_headers(user)
-
-    expect(response).to have_http_status(:service_unavailable)
-    expect(json_response["reason"]).to eq("ownership_moving")
-    expect(entry.reload.note).to eq("Before")
-    expect(TimekeepingOwnership.count).to eq(0)
-  end
-end
-
-RSpec.describe "Api::V1::TimesheetEntry gateway prepared state default", type: :request do
-  let(:company) { create(:company) }
-  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
-  let(:user) { create(:user, current_workspace_id: company.id) }
-  let!(:entry) { create(:timesheet_entry, user:, project:, work_date: Date.current) }
-
-  before do
-    create(:employment, company:, user:)
-    user.add_role(:admin, company)
-    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", generation: 3, handoff_step: nil)
-    sign_in user
-  end
-
-  # "Its default is a new `Timekeeping::Gateway::UnavailableLocalOwner`, which refuses with `OwnershipMoving`."
-  # The legacy row must stay untouched: the prepared store owns the data, so the legacy table is never written.
-  it "refuses a delete in the prepared state with no local owner wired and leaves the legacy row kept" do
-    send_request :delete, api_v1_timesheet_entry_path(entry), headers: auth_headers(user)
-
-    expect(response).to have_http_status(:service_unavailable)
-    expect(json_response["reason"]).to eq("ownership_moving")
-    expect(entry.reload).not_to be_discarded
-  end
-end
-
 RSpec.describe "Api::V1::TimesheetEntry gateway legacy at raised generation", type: :request do
   let(:company) { create(:company) }
   let(:project) { create(:project, billable: true, client: create(:client, company:)) }
@@ -1022,41 +1016,6 @@ RSpec.describe "Api::V1::TimesheetEntry gateway legacy at raised generation", ty
     expect(WebMock).not_to have_requested(:any, /timekeeping/)
   end
 end
-
-RSpec.describe "Api::V1::TimesheetEntry gateway refusal event", type: :request do
-  let(:company) { create(:company) }
-  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
-  let(:user) { create(:user, current_workspace_id: company.id) }
-
-  before do
-    create(:employment, company:, user:)
-    user.add_role(:admin, company)
-    TimekeepingOwnership.current.update!(handoff_step: "settle")
-    sign_in user
-  end
-
-  # "Emit `503 ownership_moving` and `409 stale_generation` counts with `company_id`, `request_id` and actor kind."
-  # "It carries reason, company_id, request_id and actor_kind from the context, and never the token or the body."
-  it "reports a refused entry write with reason, company_id, request_id and actor kind only" do
-    event = assert_event_reported("Timekeeping::EntryWriteRefused") do
-      send_request :post, api_v1_timesheet_entry_index_path, params: {
-        project_id: project.id, user_id: user.id,
-        timesheet_entry: { duration: 20, work_date: Date.current, note: "Secret note", bill_status: :unbilled }
-      }, headers: auth_headers(user)
-    end
-
-    expect(response).to have_http_status(:service_unavailable)
-    data = event[:payload].to_h.fetch(:data).to_h.transform_keys(&:to_sym)
-    expect(data).to eq(
-      reason: "ownership_moving",
-      company_id: company.id,
-      request_id: response.headers["X-Request-Id"],
-      actor_kind: "user"
-    )
-    expect(event[:payload].to_h.to_s).not_to include("Secret note")
-  end
-end
-
 
 RSpec.describe "Api::V1::TimesheetEntry gateway provider stale generation", type: :request do
   let(:company) { create(:company) }
@@ -1157,30 +1116,6 @@ RSpec.describe "Api::V1::TimesheetEntry gateway handoff refusal on update", type
       "reason" => "ownership_moving", "company_id" => company.id,
       "request_id" => response.headers["X-Request-Id"], "actor_kind" => "user"
     )
-  end
-end
-
-RSpec.describe "Api::V1::TimesheetEntry gateway with a missing ownership row", type: :request do
-  let(:company) { create(:company) }
-  let(:admin) { create(:user, current_workspace_id: company.id) }
-  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
-  let!(:entry) { create(:timesheet_entry, user: admin, project:, work_date: Time.current) }
-
-  before do
-    create(:employment, company:, user: admin)
-    admin.add_role :admin, company
-    sign_in admin
-  end
-
-  # "A missing row or an unknown owner also refuses (fail closed). It never falls back to legacy and never answers 404."
-  it "answers a delete with 503 ownership_moving, never 404, when the ownership row is missing" do
-    TimekeepingOwnership.delete_all
-
-    send_request :delete, api_v1_timesheet_entry_path(entry), headers: auth_headers(admin)
-
-    expect(response).to have_http_status(503)
-    expect(json_response["reason"]).to eq("ownership_moving")
-    expect(entry.reload).not_to be_discarded
   end
 end
 
@@ -1420,6 +1355,660 @@ RSpec.describe "Api::V1::TimesheetEntry gateway legacy create for a colleague", 
       expect { legacy_create_for_colleague(acting_user) }.to change(TimesheetEntry.where(user_id: colleague.id), :count).by(1)
       expect(response).to have_http_status(:ok)
       expect(json_response["entry"]["team_member"]).to eq(colleague.full_name)
+    end
+  end
+end
+
+
+RSpec.describe "Api::V1::TimesheetEntry gateway prepared state", type: :request do
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) { timekeeping_member(company, "admin", user: create(:user, current_workspace_id: company.id)) }
+  let(:colleague) { timekeeping_member(company, "employee", user: create(:user, current_workspace_id: company.id)) }
+  let(:other_company) { create(:company) }
+  let(:other_project) { create(:project, billable: true, client: create(:client, company: other_company)) }
+  let(:base_url) { "http://timekeeping.test" }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  def create_prepared_local_entry(owner: admin, entry_company: company, entry_project: project, note: "n")
+    Timekeeping::LocalEntry.create!(company_id: entry_company.id, user_id: owner.id, project_id: entry_project.id,
+                                    work_date: Date.current, duration: 30.0, note:, bill_status: "unbilled")
+  end
+
+  context "with ownership prepared before fixtures" do
+    around do |example|
+      with_timekeeping_env(Timekeeping::EntryApiClient::BASE_URL_ENV, base_url) do
+        with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) { example.run }
+      end
+    end
+
+    before do
+      route_timekeeping_to_fake(fake, base_url:)
+      prepare_local_ownership!
+      sign_in admin
+    end
+
+    # "The acting user recorded in entry_audits is the gateway's signed-in user, and an actor field in the request is ignored"
+    # The top-level actor is sent once as a hash and once as a scalar, each request with its own key, and the
+    # entry always carries a scalar actor, so every forged form is ignored.
+    it "audits a prepared create as the signed-in user when the request forges actor fields naming a colleague" do
+      top_level_actor_forms = { "hash" => { user_id: colleague.id }, "scalar" => colleague.id }
+
+      top_level_actor_forms.each do |form, top_level_actor|
+        send_request :post, api_v1_timesheet_entry_index_path, params: {
+          project_id: project.id, actor_id: colleague.id, actor_type: "user", actor: top_level_actor,
+          timesheet_entry: {
+            duration: 30, work_date: Date.current, note: "Forged actor #{form}", bill_status: :unbilled,
+            actor_id: colleague.id, actor_type: "user", actor: colleague.id
+          }
+        }, headers: auth_headers(admin).merge("Idempotency-Key" => "prepared-forged-actor-#{form}")
+
+        expect(response).to have_http_status(:ok)
+        entry = Timekeeping::LocalEntry.find_by!(company_id: company.id, note: "Forged actor #{form}")
+        audits = Timekeeping::LocalOwner::AuditRow.where(entry_id: entry.id)
+        expect(audits.count).to eq(1)
+        expect(audits.first.actor_type).to eq("user")
+        expect(audits.first.actor_id).to eq(admin.id)
+        expect(audits.first.actor_id).not_to eq(colleague.id)
+      end
+
+      expect(Timekeeping::LocalEntry.where(company_id: company.id).count).to eq(top_level_actor_forms.size)
+      audit_actor_ids = ActiveRecord::Base.connection.select_values(
+        ActiveRecord::Base.sanitize_sql_array(["SELECT actor_id FROM entry_audits WHERE company_id = ?", company.id])
+      ).map(&:to_i)
+      expect(audit_actor_ids).to eq([admin.id] * top_level_actor_forms.size)
+      # "With ownership in the prepared state, the gateway's entry writes go to Timekeeping::LocalOwner and make no HTTP call to Timekeeping"
+      expect(fake.requests).to be_empty
+    end
+
+    # "Idempotency-Key and If-Match from the request reach the local owner, so retries replay and stale versions answer version_conflict"
+    # A replay belongs to the user and company that stored it; a second tenant's identical key is a new write.
+    it "writes each company's own prepared entry when two companies send one Idempotency-Key and never replays the other's" do
+      other_admin = timekeeping_member(other_company, "admin", user: create(:user, current_workspace_id: other_company.id))
+      shared_key = "prepared-shared-key-1"
+
+      send_request :post, api_v1_timesheet_entry_index_path, params: {
+        project_id: project.id,
+        timesheet_entry: { duration: 30, work_date: Date.current, note: "Company A", bill_status: :unbilled }
+      }, headers: auth_headers(admin).merge("Idempotency-Key" => shared_key)
+      expect(response).to be_successful
+      sign_out admin
+
+      sign_in other_admin
+      send_request :post, api_v1_timesheet_entry_index_path, params: {
+        project_id: other_project.id,
+        timesheet_entry: { duration: 30, work_date: Date.current, note: "Company B", bill_status: :unbilled }
+      }, headers: auth_headers(other_admin).merge("Idempotency-Key" => shared_key)
+      expect(response).to be_successful
+
+      # A replay of the first company's stored answer would leave the second company with no entry.
+      first_entries = Timekeeping::LocalEntry.where(company_id: company.id)
+      second_entries = Timekeeping::LocalEntry.where(company_id: other_company.id)
+      expect(first_entries.count).to eq(1)
+      expect([first_entries.first.user_id, first_entries.first.note]).to eq([admin.id, "Company A"])
+      expect(second_entries.count).to eq(1)
+      expect([second_entries.first.user_id, second_entries.first.note]).to eq([other_admin.id, "Company B"])
+      expect(second_entries.first.project_id).to eq(other_project.id)
+      expect(Timekeeping::LocalOwner::AuditRow.where(entry_id: second_entries.first.id).pluck(:actor_id))
+        .to eq([other_admin.id])
+      expect(response.body).not_to include("Company A")
+    end
+
+    # A 403 here would tell the caller the id exists in another company.
+    it "answers 404 to a prepared PATCH and DELETE of another company's local entry and leaves every write table unchanged" do
+      other_owner = timekeeping_member(other_company, "owner", user: create(:user, current_workspace_id: other_company.id))
+      foreign_entry = create_prepared_local_entry(owner: other_owner, entry_company: other_company,
+                                                  entry_project: other_project, note: "Foreign")
+      counts_before = timekeeping_row_counts
+
+      send_request :patch, api_v1_timesheet_entry_path(foreign_entry.id), params: {
+        project_id: project.id,
+        timesheet_entry: { duration: 45, work_date: Date.current, note: "Hijacked", bill_status: :unbilled }
+      }, headers: auth_headers(admin).merge("Idempotency-Key" => "prepared-foreign-patch-1")
+      expect(response).to have_http_status(:not_found)
+
+      send_request :delete, api_v1_timesheet_entry_path(foreign_entry.id),
+                   headers: auth_headers(admin).merge("Idempotency-Key" => "prepared-foreign-delete-1")
+      expect(response).to have_http_status(:not_found)
+
+      foreign_entry.reload
+      expect(foreign_entry.note).to eq("Foreign")
+      expect(foreign_entry.discarded_at).to be_nil
+      # Only 2xx answers are stored as receipts, so a refusal leaves idempotency_records unchanged too.
+      expect(timekeeping_row_counts).to eq(counts_before)
+    end
+
+    # "Idempotency-Key and If-Match from the request reach the local owner, so retries replay and stale versions answer version_conflict"
+    it "replays a prepared create retried with the same Idempotency-Key and writes the entry, outbox, audit and receipt once" do
+      params = {
+        project_id: project.id,
+        timesheet_entry: { duration: 30, work_date: Date.current, note: "Retried create", bill_status: :unbilled }
+      }
+      headers = auth_headers(admin).merge("Idempotency-Key" => "prepared-create-retry-1")
+      before_counts = timekeeping_row_counts
+
+      # Each request gets its own Rails request id, so only the header can make the two attempts one write.
+      send_request :post, api_v1_timesheet_entry_index_path, params:, headers: headers
+      expect(response).to have_http_status(:ok)
+      first_entry = json_response["entry"]
+      send_request :post, api_v1_timesheet_entry_index_path, params:, headers: headers
+      expect(response).to have_http_status(:ok)
+
+      after_counts = timekeeping_row_counts
+      expect(after_counts["entries"] - before_counts["entries"]).to eq(1)
+      expect(after_counts["entry_outbox_items"] - before_counts["entry_outbox_items"]).to eq(1)
+      expect(after_counts["entry_audits"] - before_counts["entry_audits"]).to eq(1)
+      expect(after_counts["idempotency_records"] - before_counts["idempotency_records"]).to eq(1)
+      expect(Timekeeping::LocalEntry.where(company_id: company.id, note: "Retried create").count).to eq(1)
+      expect(TimesheetEntry.where(note: "Retried create")).not_to exist
+      expect(json_response["entry"]).to eq(first_entry)
+      expect(fake.requests).to be_empty
+    end
+
+    # "Idempotency-Key and If-Match from the request reach the local owner, so retries replay and stale versions answer version_conflict"
+    # A client whose first DELETE answer was lost retries with the same key; the lookup no longer finds the
+    # discarded entry, so only a replay of the stored receipt can answer it.
+    it "replays a prepared DELETE retried with the same Idempotency-Key as success and discards the entry once" do
+      entry = create_prepared_local_entry(note: "To delete")
+      headers = auth_headers(admin).merge("Idempotency-Key" => "prepared-delete-retry-1")
+      before_counts = timekeeping_row_counts
+
+      send_request :delete, api_v1_timesheet_entry_path(entry.id), headers: headers
+      expect(response).to have_http_status(:ok)
+      discarded_at = entry.reload.discarded_at
+      expect(discarded_at).to be_present
+      counts_after_first = timekeeping_row_counts
+
+      send_request :delete, api_v1_timesheet_entry_path(entry.id), headers: headers
+      expect(response).to have_http_status(:ok)
+
+      after_counts = timekeeping_row_counts
+      expect(after_counts).to eq(counts_after_first)
+      expect(after_counts["entry_audits"] - before_counts["entry_audits"]).to eq(1)
+      expect(after_counts["entry_outbox_items"] - before_counts["entry_outbox_items"]).to eq(1)
+      expect(after_counts["idempotency_records"] - before_counts["idempotency_records"]).to eq(1)
+      expect(entry.reload.discarded_at).to eq(discarded_at)
+    end
+
+    # "Idempotency-Key and If-Match from the request reach the local owner, so retries replay and stale versions answer version_conflict"
+    # The request's own If-Match must be compared, never the version the gateway's lookup just read.
+    it "answers 409 version_conflict to a prepared PATCH with a stale If-Match, changes nothing, and applies the current version" do
+      entry = create_prepared_local_entry(note: "Before")
+      current_version = entry.version
+      counts_before = timekeeping_row_counts
+
+      send_request :patch, api_v1_timesheet_entry_path(entry.id), params: {
+        project_id: project.id,
+        timesheet_entry: { duration: 45, work_date: Date.current, note: "Stale edit", bill_status: :unbilled }
+      }, headers: auth_headers(admin).merge("Idempotency-Key" => "prepared-stale-1",
+                                            "If-Match" => (current_version + 1).to_s)
+
+      expect(response).to have_http_status(:conflict)
+      expect(json_response["reason"]).to eq("version_conflict")
+      entry.reload
+      expect(entry.note).to eq("Before")
+      expect(entry.version).to eq(current_version)
+      expect(timekeeping_row_counts).to eq(counts_before)
+
+      send_request :patch, api_v1_timesheet_entry_path(entry.id), params: {
+        project_id: project.id,
+        timesheet_entry: { duration: 30, work_date: Date.current, note: "Current edit", bill_status: :unbilled }
+      }, headers: auth_headers(admin).merge("Idempotency-Key" => "prepared-current-1",
+                                            "If-Match" => current_version.to_s)
+
+      expect(response).to have_http_status(:ok)
+      entry.reload
+      expect(entry.note).to eq("Current edit")
+      expect(entry.version).to eq(current_version + 1)
+    end
+
+    # A billed entry is one the edit policy refuses, so its retry must replay without that policy.
+    %w[unbilled billed].each do |status|
+      it "replays a committed #{status} prepared update retried with the same key, writing nothing more" do
+        local_entry = create_prepared_local_entry(note: "Before")
+        version = local_entry.version.to_s
+        path = api_v1_timesheet_entry_path(local_entry.id)
+        request_params = {
+          project_id: project.id,
+          timesheet_entry: { duration: 30, work_date: Date.current, note: "Replay", bill_status: status }
+        }
+        request_headers = auth_headers(admin).merge("Idempotency-Key" => "prepared-replay-#{status}", "If-Match" => version)
+        send_request :patch, path, params: request_params, headers: request_headers
+        expect(response).to have_http_status(:ok)
+        original_response = json_response.deep_dup
+        counts = timekeeping_row_counts
+
+        send_request :patch, path, params: request_params, headers: request_headers
+
+        expect(response).to have_http_status(:ok)
+        expect(json_response).to eq(original_response)
+        expect(timekeeping_row_counts).to eq(counts)
+      end
+    end
+
+    # "Idempotency-Key and If-Match from the request reach the local owner, so retries replay and stale versions answer version_conflict"
+    # Only the key that wrote the delete has a stored answer; another key must not be answered as a success.
+    it "answers 404 to a prepared DELETE of a discarded entry under a new Idempotency-Key and writes nothing" do
+      entry = create_prepared_local_entry
+
+      send_request :delete, api_v1_timesheet_entry_path(entry.id),
+                   headers: auth_headers(admin).merge("Idempotency-Key" => "prepared-delete-first-key")
+      expect(response).to have_http_status(:ok)
+      counts_after_first = timekeeping_row_counts
+
+      send_request :delete, api_v1_timesheet_entry_path(entry.id),
+                   headers: auth_headers(admin).merge("Idempotency-Key" => "prepared-delete-other-key")
+
+      expect(response).to have_http_status(:not_found)
+      expect(timekeeping_row_counts).to eq(counts_after_first)
+    end
+
+    it "prepared create by an employee naming a colleague's user_id is refused and writes nothing" do
+      employee = timekeeping_member(company, "employee", user: create(:user, current_workspace_id: company.id))
+      colleague
+      sign_in employee
+      counts_before = timekeeping_row_counts
+
+      send_request :post, api_v1_timesheet_entry_index_path, params: {
+        project_id: project.id, user_id: colleague.id,
+        timesheet_entry: { duration: 30, work_date: Date.current, note: "For a colleague", bill_status: :unbilled }
+      }, headers: auth_headers(employee).merge("Idempotency-Key" => "prepared-employee-target-1")
+
+      # "The acting user comes from the gateway's signed-in user, and a target `user_id` is honoured under the same rule Timekeeping applies"
+      expect(response).to have_http_status(:forbidden)
+      expect(Timekeeping::LocalEntry.where(user_id: colleague.id)).not_to exist
+      expect(timekeeping_row_counts).to eq(counts_before)
+    end
+
+    it "prepared create by an admin passes the requested colleague user_id through and audits the admin" do
+      colleague
+
+      expect do
+        send_request :post, api_v1_timesheet_entry_index_path, params: {
+          project_id: project.id, user_id: colleague.id.to_s,
+          timesheet_entry: { duration: 30, work_date: Date.current, note: "For a colleague", bill_status: :unbilled }
+        }, headers: auth_headers(admin).merge("Idempotency-Key" => "prepared-target-user-1")
+      end.not_to change(TimesheetEntry, :count)
+
+      expect(response).to be_successful
+      # "The request's `user_id` is passed through unchanged, and the local owner decides it."
+      entry = Timekeeping::LocalEntry.find_by!(company_id: company.id)
+      expect(entry.user_id).to eq(colleague.id)
+      audit = Timekeeping::LocalOwner::AuditRow.find_by!(entry_id: entry.id)
+      expect(audit.actor_id).to eq(admin.id)
+      expect(audit.actor_id).not_to eq(colleague.id)
+    end
+
+    # "the signed-in user and that user's company, as `Timekeeping::LocalOwner::Actor.user(user_id:, role:)`;"
+    it "prepared POST naming another company_id in the request writes only into the signed-in user's company" do
+      send_request :post, api_v1_timesheet_entry_index_path, params: {
+        project_id: project.id, company_id: other_company.id,
+        timesheet_entry: {
+          duration: 30, work_date: Date.current, note: "Scoped", bill_status: :unbilled,
+          company_id: other_company.id
+        }
+      }, headers: auth_headers(admin).merge("Idempotency-Key" => "scoped-create-1")
+
+      expect(response).to be_successful
+      expect(Timekeeping::LocalEntry.where(company_id: company.id, user_id: admin.id).count).to eq(1)
+      expect(Timekeeping::LocalEntry.where(company_id: other_company.id)).not_to exist
+      expect(Timekeeping::LocalOwner::AuditRow.where(company_id: other_company.id)).not_to exist
+    end
+
+    # "With ownership in the prepared state, the gateway's entry writes go to Timekeeping::LocalOwner and make no HTTP call to Timekeeping"
+    # "Show that a controller entry write lands in `entries` with an `entry_outbox_items` row and an `entry_audits` row naming the signed-in user, and that no HTTP call goes to Timekeeping."
+    it "writes a prepared-state create to entries with one outbox row and one audit row naming the signed-in user and sends nothing to Timekeeping" do
+      before_counts = timekeeping_row_counts
+
+      expect do
+        send_request :post, api_v1_timesheet_entry_index_path, params: {
+          project_id: project.id,
+          timesheet_entry: { duration: 30, work_date: Date.current, note: "Prepared create", bill_status: :unbilled }
+        }, headers: auth_headers(admin).merge("Idempotency-Key" => "prepared-create-1")
+      end.not_to change(TimesheetEntry, :count)
+
+      expect(response).to have_http_status(:ok)
+      after_counts = timekeeping_row_counts
+      expect(after_counts["entries"] - before_counts["entries"]).to eq(1)
+      expect(after_counts["entry_outbox_items"] - before_counts["entry_outbox_items"]).to eq(1)
+      expect(after_counts["entry_audits"] - before_counts["entry_audits"]).to eq(1)
+
+      entry = Timekeeping::LocalEntry.find_by!(company_id: company.id, note: "Prepared create")
+      expect(entry.user_id).to eq(admin.id)
+      audit_actor = ActiveRecord::Base.connection.select_rows(
+        ActiveRecord::Base.sanitize_sql_array(["SELECT actor_type, actor_id FROM entry_audits WHERE entry_id = ?", entry.id])
+      )
+      expect(audit_actor).to eq([["user", admin.id.to_s]]).or eq([["user", admin.id]])
+      expect(fake.requests).to be_empty
+    end
+  end
+
+  # This example builds its legacy row before ownership turns prepared, and sets generation 3 itself, so it
+  # stays outside the context above, whose before hook would prepare ownership ahead of the row.
+  context "with a row only the legacy table holds" do
+    let!(:legacy_only_entry) { create(:timesheet_entry, user: admin, project:, work_date: Date.current) }
+
+    before do
+      TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", generation: 3, handoff_step: nil)
+      sign_in admin
+    end
+
+    # "With ownership in the prepared state, the gateway's entry writes go to Timekeeping::LocalOwner and make no HTTP call to Timekeeping"
+    it "answers 404 to a prepared delete of a row only the legacy table holds, keeps it, and sends no HTTP request" do
+      # Creating the user checks its password against an outside service; only the delete's own requests count here.
+      WebMock.reset_executed_requests!
+      send_request :delete, api_v1_timesheet_entry_path(legacy_only_entry),
+                   headers: auth_headers(admin).merge("Idempotency-Key" => "k-legacy-only-1")
+
+      expect(response).to have_http_status(:not_found)
+      expect(legacy_only_entry.reload).not_to be_discarded
+      expect(Timekeeping::LocalEntry.where(company_id: company.id)).not_to exist
+      expect(WebMock).not_to have_requested(:any, /.*/)
+    end
+  end
+end
+
+RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client Idempotency-Key replay", type: :request do
+  # "The web and mobile clients send one Idempotency-Key per user action, reused on retry, so a retried write replays the stored answer instead of using the per-request fallback key."
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:admin) { create(:user, current_workspace_id: company.id) }
+  let(:fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  # Every example here asserts on the fake's requests, entries and outbox, so this
+  # group forwards its writes to Timekeeping; the legacy-store groups above do not.
+  around { |example| with_forwarded_timekeeping_env { example.run } }
+
+  before do
+    employ_client_key_admin(admin, company)
+    arrange_forwarded_timekeeping(fake, company:, users: { admin => "admin" }, project:)
+  end
+
+  def employ_client_key_admin(user, member_company)
+    create(:employment, company: member_company, user:)
+    user.add_role :admin, member_company
+  end
+
+  def client_key_forwarded_keys(method)
+    # Every forwarded write must carry a key; a missing one would read as nil, and
+    # two nils would otherwise pass the examples' same-key checks.
+    requests = fake.requests.select { |request| request[:method] == method }
+    keys = requests.map { |request| forwarded_idempotency_key(request) }
+    expect(keys).to all(be_present)
+    keys
+  end
+
+  context "with a single company" do
+    before { sign_in admin }
+
+    it "replays a forwarded create resent under a new request id with the same Idempotency-Key and writes the entry once" do
+      params = {
+        project_id: project.id, user_id: admin.id,
+        timesheet_entry: { duration: 25, work_date: Date.current, note: "Saved once", bill_status: :unbilled }
+      }
+      client_key = "2b0f7a52-6c1e-4f43-9a51-7d0c1f8e9a10"
+      outbox_after_first = nil
+
+      answers = %w[client-key-create-attempt-1 client-key-create-attempt-2].map do |request_id|
+        send_request :post, api_v1_timesheet_entry_index_path, params:,
+          headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => request_id)
+        expect(response).to be_successful
+        outbox_after_first ||= fake.outbox.size
+        response.parsed_body
+      end
+
+      forwarded_keys = client_key_forwarded_keys("POST")
+      expect(forwarded_keys.size).to eq(2)
+      expect(forwarded_keys.uniq.size).to eq(1)
+      expect(fake.outbox.size).to eq(outbox_after_first)
+      expect(answers.second).to eq(answers.first)
+      expect(answers.second.fetch("entry").fetch("id")).to eq(answers.first.fetch("entry").fetch("id"))
+    end
+
+    # The mobile app has no entry write yet; this proves the route it would write through replays a same-key resend.
+    it "replays a forwarded mobile-route create resent with the same Idempotency-Key and writes the entry once" do
+      params = {
+        project_id: project.id, user_id: admin.id,
+        timesheet_entry: { duration: 40, work_date: Date.current, note: "Mobile save", bill_status: :unbilled }
+      }
+      client_key = "c4a9e2f1-3d5b-4a7c-9e8f-0a1b2c3d4e6f"
+      outbox_after_first = nil
+
+      answers = %w[mobile-client-key-attempt-1 mobile-client-key-attempt-2].map do |request_id|
+        send_request :post, api_v1_mobile_timesheet_entries_path, params:,
+          headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => request_id)
+        expect(response).to be_successful
+        outbox_after_first ||= fake.outbox.size
+        response.parsed_body
+      end
+
+      forwarded_keys = client_key_forwarded_keys("POST")
+      expect(forwarded_keys.size).to eq(2)
+      expect(forwarded_keys.uniq.size).to eq(1)
+      expect(fake.outbox.size).to eq(outbox_after_first)
+      expect(answers.second).to eq(answers.first)
+      expect(answers.second.fetch("entry").fetch("id")).to eq(answers.first.fetch("entry").fetch("id"))
+    end
+
+    it "replays a forwarded update resent under a new request id with the same Idempotency-Key" do
+      entry_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                                work_date: Date.current.iso8601, note: "Before").fetch("id")
+      params = { project_id: project.id,
+                 timesheet_entry: { duration: 45, work_date: Date.current, note: "After", bill_status: :unbilled } }
+      client_key = "7d1f4c2a-9b3e-4f6a-8c1d-2e5f7a9b0c31"
+
+      answers = %w[client-key-update-attempt-1 client-key-update-attempt-2].map do |request_id|
+        send_request :put, api_v1_timesheet_entry_path(entry_id), params:,
+          headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => request_id)
+        expect(response).to be_successful
+        response.parsed_body
+      end
+
+      forwarded_keys = client_key_forwarded_keys("PATCH")
+      expect(forwarded_keys.size).to eq(2)
+      expect(forwarded_keys.uniq.size).to eq(1)
+      expect(fake.stored_entry(entry_id)["note"]).to eq("After")
+      expect(answers.second).to eq(answers.first)
+    end
+
+    # A partial body names only some fields; the resend must forward the same partial body under the same key.
+    it "replays a forwarded partial-body update resent under a new request id with the same Idempotency-Key" do
+      entry_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                                work_date: Date.current.iso8601, note: "Before").fetch("id")
+      params = { project_id: project.id, timesheet_entry: { duration: 60, note: "After" } }
+      client_key = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+
+      %w[client-key-partial-update-attempt-1 client-key-partial-update-attempt-2].each do |request_id|
+        send_request :put, api_v1_timesheet_entry_path(entry_id), params:,
+          headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => request_id)
+        expect(response).to be_successful
+      end
+
+      forwarded_keys = client_key_forwarded_keys("PATCH")
+      expect(forwarded_keys.size).to eq(2)
+      expect(forwarded_keys.uniq.size).to eq(1)
+      expect(fake.stored_entry(entry_id)["note"]).to eq("After")
+    end
+
+    it "replays a forwarded delete resent under a new request id with the same Idempotency-Key and discards the entry once" do
+      entry_id = fake.add_entry(company_id: company.id, user_id: admin.id, project_id: project.id,
+                                work_date: Date.current.iso8601, note: "Delete once").fetch("id")
+      client_key = "8f2b6c1e-3d4a-4b5c-9e0f-1a2b3c4d5e6f"
+
+      send_request :delete, api_v1_timesheet_entry_path(entry_id),
+        headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => "forwarded-delete-try-1")
+      expect(response).to be_successful
+      expect(fake.stored_entry(entry_id)["discarded_at"]).not_to be_nil
+
+      # The first answer was lost and the client resends the same delete under a new request id.
+      send_request :delete, api_v1_timesheet_entry_path(entry_id),
+        headers: auth_headers(admin).merge("Idempotency-Key" => client_key, "X-Request-Id" => "forwarded-delete-try-2")
+
+      expect(response).to be_successful
+      expect(json_response.keys).to eq(["notice"])
+      forwarded_keys = client_key_forwarded_keys("DELETE")
+      expect(forwarded_keys.size).to eq(2)
+      expect(forwarded_keys.uniq.size).to eq(1)
+      expect(forwarded_keys.last).not_to eq(
+        Timekeeping::EntryWriteClient.idempotency_key(request_id: "forwarded-delete-try-2", operation: "destroy",
+                                                      entry_id:)
+      )
+    end
+
+    # Two separate actions carry two keys, so the second must be a new write, never a replay of the first.
+    it "writes two forwarded entries when two user actions send two different Idempotency-Keys with the same body" do
+      params = {
+        project_id: project.id,
+        timesheet_entry: { duration: 45, work_date: Date.current, note: "Same body twice", bill_status: :unbilled }
+      }
+      outbox_before = fake.outbox.size
+
+      answers = %w[0c6a1f5e-7d2b-4a9e-8f31-5b6c7d8e9f01 f4e3d2c1-b0a9-4876-9543-210fedcba987].map do |client_key|
+        send_request :post, api_v1_timesheet_entry_index_path, params:,
+          headers: auth_headers(admin).merge("Idempotency-Key" => client_key)
+        expect(response).to be_successful
+        response.parsed_body
+      end
+
+      forwarded_keys = client_key_forwarded_keys("POST")
+      expect(forwarded_keys.size).to eq(2)
+      expect(forwarded_keys.uniq.size).to eq(2)
+      expect(fake.outbox.size - outbox_before).to eq(2)
+      expect(answers.second).not_to eq(answers.first)
+      expect(answers.second.fetch("entry").fetch("id")).not_to eq(answers.first.fetch("entry").fetch("id"))
+    end
+
+    # A request that sends no Idempotency-Key keeps the key derived from its request id, operation and entry id.
+    it "forwards a create with no Idempotency-Key under the key derived from its own request id" do
+      send_request :post, api_v1_timesheet_entry_index_path, params: {
+        project_id: project.id,
+        timesheet_entry: { duration: 15, work_date: Date.current, note: "No client key", bill_status: :unbilled }
+      }, headers: auth_headers(admin).merge("X-Request-Id" => "no-client-key-request")
+
+      expect(response).to be_successful
+      expect(client_key_forwarded_keys("POST")).to eq(
+        [Timekeeping::EntryWriteClient.idempotency_key(request_id: "no-client-key-request", operation: "create")]
+      )
+    end
+  end
+
+  # These examples sign one user out and another in mid-example, so the context signs nobody in up front.
+  context "with a second company or a second user" do
+    let(:other_company) { create(:company) }
+    let(:other_project) { create(:project, billable: true, client: create(:client, company: other_company)) }
+    let(:other_admin) { create(:user, current_workspace_id: other_company.id) }
+    let(:second_admin) { create(:user, current_workspace_id: company.id) }
+
+    # A replay belongs to the company that stored it: another company's identical key is a new write in its own company.
+    it "replays a forwarded create inside its company and writes a separate entry when another company sends the same Idempotency-Key" do
+      employ_client_key_admin(other_admin, other_company)
+      fake.register_company(id: other_company.id, edit_days: other_company.timesheet_edit_days)
+      fake.register_user(id: other_admin.id, company_id: other_company.id, role: "admin")
+      fake.register_project(id: other_project.id, company_id: other_company.id)
+      shared_key = "8b0f4c1a-2d3e-4f5a-9b6c-7d8e9f0a1b2c"
+      entry_params = lambda do |entry_project, note|
+        { project_id: entry_project.id,
+          timesheet_entry: { duration: 30, work_date: Date.current, note:, bill_status: :unbilled } }
+      end
+
+      sign_in admin
+      first_ids = Array.new(2) do
+        send_request :post, api_v1_timesheet_entry_index_path, params: entry_params.call(project, "Company A"),
+                                                                headers: auth_headers(admin).merge("Idempotency-Key" => shared_key)
+        expect(response).to be_successful
+        json_response["entry"]["id"]
+      end
+      sign_out admin
+
+      expect(client_key_forwarded_keys("POST").size).to eq(2)
+      expect(client_key_forwarded_keys("POST").uniq.size).to eq(1)
+      expect(first_ids.uniq.size).to eq(1)
+      expect(fake.stored_entry(first_ids.first).values_at("company_id", "user_id", "note"))
+        .to eq([company.id, admin.id, "Company A"])
+
+      sign_in other_admin
+      send_request :post, api_v1_timesheet_entry_index_path, params: entry_params.call(other_project, "Company B"),
+                                                              headers: auth_headers(other_admin).merge("Idempotency-Key" => shared_key)
+
+      expect(response).to be_successful
+      other_id = json_response["entry"]["id"]
+      # Every request carries the client's key, so the forwarded key is the same in both companies.
+      expect(client_key_forwarded_keys("POST").size).to eq(3)
+      expect(client_key_forwarded_keys("POST").uniq.size).to eq(1)
+      expect(other_id).not_to eq(first_ids.first)
+      expect(fake.stored_entry(other_id)).to include("company_id" => other_company.id, "user_id" => other_admin.id,
+                                                     "note" => "Company B", "project_id" => other_project.id)
+      expect(fake.stored_entry(first_ids.first).values_at("company_id", "user_id", "note"))
+        .to eq([company.id, admin.id, "Company A"])
+      expect(response.body).not_to include("Company A")
+    end
+
+    # The user and the key are the same in both companies, so only the company keeps the stored answers apart.
+    # Each request names its own company's project, because naming the other company's project is refused
+    # before anything is forwarded.
+    it "writes a separate entry when one user employed in two companies resends a create with the same Idempotency-Key in the other company" do
+      employ_client_key_admin(admin, other_company)
+      fake.register_company(id: other_company.id, edit_days: other_company.timesheet_edit_days)
+      fake.register_project(id: other_project.id, company_id: other_company.id)
+      shared_key = "6d5c4b3a-2f1e-4d0c-9b8a-7f6e5d4c3b2a"
+      entry_params = lambda do |entry_project|
+        { project_id: entry_project.id,
+          timesheet_entry: { duration: 30, work_date: Date.current, note: "One user, two companies",
+                             bill_status: :unbilled } }
+      end
+
+      sign_in admin
+      send_request :post, api_v1_timesheet_entry_index_path, params: entry_params.call(project),
+                                                              headers: auth_headers(admin).merge("Idempotency-Key" => shared_key)
+      expect(response).to be_successful
+      first_id = json_response["entry"]["id"]
+      first_entry = fake.stored_entry(first_id)
+      expect(first_entry.values_at("company_id", "user_id", "project_id"))
+        .to eq([company.id, admin.id, project.id])
+
+      admin.update!(current_workspace_id: other_company.id)
+      send_request :post, api_v1_timesheet_entry_index_path, params: entry_params.call(other_project),
+                                                              headers: auth_headers(admin).merge("Idempotency-Key" => shared_key)
+
+      # A replay would answer with the first company's entry, and a store that ignored the company would
+      # refuse the reused key; either way this request would not write its own entry.
+      expect(response).to be_successful
+      second_id = json_response["entry"]["id"]
+      expect(second_id).not_to eq(first_id)
+      expect(fake.stored_entry(second_id).values_at("company_id", "user_id", "project_id"))
+        .to eq([other_company.id, admin.id, other_project.id])
+      expect(fake.stored_entry(first_id)).to eq(first_entry)
+      expect(client_key_forwarded_keys("POST").size).to eq(2)
+      expect(client_key_forwarded_keys("POST").uniq.size).to eq(1)
+    end
+
+    # Only the user who stored an answer may have it replayed; another user's identical key must write that user's own entry.
+    it "forwards one shared client Idempotency-Key from two users of one company yet never replays one user's entry to the other" do
+      employ_client_key_admin(second_admin, company)
+      fake.register_user(id: second_admin.id, company_id: company.id, role: "admin")
+      shared_key = "3f2e1d0c-9b8a-4c7d-8e6f-5a4b3c2d1e0f"
+      params = {
+        project_id: project.id,
+        timesheet_entry: { duration: 45, work_date: Date.current, note: "Same body", bill_status: :unbilled }
+      }
+
+      sign_in admin
+      send_request :post, api_v1_timesheet_entry_index_path, params:,
+                                                            headers: auth_headers(admin).merge("Idempotency-Key" => shared_key)
+      expect(response).to be_successful
+      first_id = json_response["entry"]["id"]
+      sign_out admin
+
+      sign_in second_admin
+      send_request :post, api_v1_timesheet_entry_index_path, params:,
+                                                            headers: auth_headers(second_admin).merge("Idempotency-Key" => shared_key)
+      expect(response).to be_successful
+      second_id = json_response["entry"]["id"]
+
+      expect(client_key_forwarded_keys("POST").uniq.size).to eq(1)
+      expect(second_id).not_to eq(first_id)
+      expect(fake.stored_entry(first_id)["user_id"]).to eq(admin.id)
+      expect(fake.stored_entry(second_id)["user_id"]).to eq(second_admin.id)
     end
   end
 end

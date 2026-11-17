@@ -57,3 +57,34 @@ RSpec.describe ClientPaymentMailer, "during a Timekeeping handoff", type: :maile
     expect(ActionMailer::Base.deliveries).to be_empty
   end
 end
+
+RSpec.describe ClientPaymentMailer, "base URL", type: :mailer do
+  # "each reads the one per-environment base URL (APP_BASE_URL, else config.x.default_base_url)."
+  it "links the client payment receipt to the swapped config.x.default_base_url when APP_BASE_URL is unset" do
+    with_app_base_url(env: nil, default: "https://boot-check.test") do
+      company = create(:company)
+      client = create(:client, company:)
+      invoice = create(:invoice, client:, company:)
+
+      mail = ClientPaymentMailer.with(invoice_id: invoice.id, subject: "Paid").payment
+      body = mail.html_part&.body&.decoded || mail.body.decoded
+
+      expect(body).to include("https://boot-check.test/invoices/#{invoice.external_view_key}/view")
+    end
+  end
+
+  # "each reads the one per-environment base URL (APP_BASE_URL, else config.x.default_base_url)."
+  it "links the client payment receipt to a set APP_BASE_URL ahead of config.x.default_base_url" do
+    with_app_base_url(env: "https://app.miru.so/", default: "https://boot-check.test") do
+      company = create(:company)
+      client = create(:client, company:)
+      invoice = create(:invoice, client:, company:)
+
+      mail = ClientPaymentMailer.with(invoice_id: invoice.id, subject: "Paid").payment
+      body = mail.html_part&.body&.decoded || mail.body.decoded
+
+      expect(body).to include("https://app.miru.so/invoices/#{invoice.external_view_key}/view")
+      expect(body).not_to include("boot-check.test")
+    end
+  end
+end

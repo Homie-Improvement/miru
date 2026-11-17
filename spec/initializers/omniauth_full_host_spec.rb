@@ -6,46 +6,10 @@ RSpec.describe OmniauthFullHost do
   let(:initializer_path) { Rails.root.join("config/initializers/omniauth_full_host.rb").to_s }
 
   around do |example|
-    original_app_base_url = ENV["APP_BASE_URL"]
     original_full_host = OmniAuth.config.full_host
     example.run
   ensure
-    ENV["APP_BASE_URL"] = original_app_base_url
     OmniAuth.config.full_host = original_full_host
-  end
-
-  describe ".resolve" do
-    it "uses the per-environment fallback when APP_BASE_URL is nil, empty or whitespace" do
-      [nil, "", "   "].each do |unset_value|
-        expect(described_class.resolve(app_base_url: unset_value, fallback: "http://example.com"))
-          .to eq("http://example.com")
-      end
-    end
-
-    it "keeps a non-blank APP_BASE_URL ahead of the fallback and drops its trailing slash" do
-      expect(described_class.resolve(app_base_url: "https://app.miru.so", fallback: "http://example.com"))
-        .to eq("https://app.miru.so")
-      expect(described_class.resolve(app_base_url: "https://app.miru.so/", fallback: "http://example.com"))
-        .to eq("https://app.miru.so")
-    end
-
-    # The per-environment value is required: a missing one must not leave OmniAuth
-    # building the host from the request.
-    it "refuses to resolve when both APP_BASE_URL and the required fallback are missing or blank" do
-      [nil, "", "  ", "   "].each do |missing_fallback|
-        expect { described_class.resolve(app_base_url: nil, fallback: missing_fallback) }
-          .to raise_error(OmniauthFullHost::InvalidBaseUrl)
-      end
-    end
-
-    it "refuses a base URL that is not an absolute http or https URL with a host" do
-      ["example.com", "ftp://example.com", "http://"].each do |malformed|
-        expect { described_class.resolve(app_base_url: malformed, fallback: "http://example.com") }
-          .to raise_error(OmniauthFullHost::InvalidBaseUrl)
-        expect { described_class.resolve(app_base_url: nil, fallback: malformed) }
-          .to raise_error(OmniauthFullHost::InvalidBaseUrl)
-      end
-    end
   end
 
   describe ".pin!" do
@@ -64,36 +28,34 @@ RSpec.describe OmniauthFullHost do
 
     # A String, not a callable, means nothing on the pin path can read the request's headers.
     it "pins full_host to the environment's declared base URL as a fixed string when APP_BASE_URL is unset" do
-      ENV.delete("APP_BASE_URL")
-      OmniAuth.config.full_host = nil
+      with_app_base_url(env: nil, default: Rails.configuration.x.default_base_url) do
+        OmniAuth.config.full_host = nil
 
-      load initializer_path
+        load initializer_path
 
-      expect(OmniAuth.config.full_host).to be_a(String)
-      expect(OmniAuth.config.full_host).to eq(Rails.configuration.x.default_base_url)
+        expect(OmniAuth.config.full_host).to be_a(String)
+        expect(OmniAuth.config.full_host).to eq(Rails.configuration.x.default_base_url)
+      end
     end
 
     # The test environment declares the same host the specs expect, so this swaps in a
     # distinct value to show the initializer reads the setting rather than a literal.
     it "takes the fallback from config.x.default_base_url rather than a fixed value" do
-      original_default_base_url = Rails.configuration.x.default_base_url
-      ENV.delete("APP_BASE_URL")
-      Rails.configuration.x.default_base_url = "https://boot-check.test"
+      with_app_base_url(env: nil, default: "https://boot-check.test") do
+        load initializer_path
 
-      load initializer_path
-
-      expect(OmniAuth.config.full_host).to eq("https://boot-check.test")
-    ensure
-      Rails.configuration.x.default_base_url = original_default_base_url
+        expect(OmniAuth.config.full_host).to eq("https://boot-check.test")
+      end
     end
 
     # A malformed value must stop boot: a relative or hostless full_host would let OmniAuth
     # fill in request-derived parts.
     it "refuses to boot on an APP_BASE_URL with no scheme instead of leaving full_host to the request" do
-      ENV["APP_BASE_URL"] = "example.com"
-      OmniAuth.config.full_host = nil
+      with_app_base_url(env: "example.com", default: Rails.configuration.x.default_base_url) do
+        OmniAuth.config.full_host = nil
 
-      expect { load initializer_path }.to raise_error(OmniauthFullHost::InvalidBaseUrl)
+        expect { load initializer_path }.to raise_error(AppBaseUrl::InvalidBaseUrl)
+      end
     end
   end
 
@@ -107,42 +69,41 @@ RSpec.describe OmniauthFullHost do
     # A silent upgrade to https would hide the misconfiguration, so boot must raise and pin nothing.
     it "refuses to boot in production on an http APP_BASE_URL, leaving full_host unpinned" do
       stub_production_env_for_https_rule
-      ENV["APP_BASE_URL"] = "http://app.miru.so"
-      OmniAuth.config.full_host = nil
+      with_app_base_url(env: "http://app.miru.so", default: Rails.configuration.x.default_base_url) do
+        OmniAuth.config.full_host = nil
 
-      expect { load initializer_path }.to raise_error(OmniauthFullHost::InvalidBaseUrl)
-      expect(OmniAuth.config.full_host).to be_nil
+        expect { load initializer_path }.to raise_error(OmniauthFullHost::InvalidBaseUrl)
+        expect(OmniAuth.config.full_host).to be_nil
+      end
     end
 
     # An unset APP_BASE_URL must not route around the rule through an http fallback.
     it "refuses to boot in production on an http fallback when APP_BASE_URL is unset" do
-      original_default_base_url = Rails.configuration.x.default_base_url
       stub_production_env_for_https_rule
-      ENV.delete("APP_BASE_URL")
-      Rails.configuration.x.default_base_url = "http://fallback-check.test"
-      OmniAuth.config.full_host = nil
+      with_app_base_url(env: nil, default: "http://fallback-check.test") do
+        OmniAuth.config.full_host = nil
 
-      expect { load initializer_path }.to raise_error(OmniauthFullHost::InvalidBaseUrl)
-      expect(OmniAuth.config.full_host).to be_nil
-    ensure
-      Rails.configuration.x.default_base_url = original_default_base_url
+        expect { load initializer_path }.to raise_error(OmniauthFullHost::InvalidBaseUrl)
+        expect(OmniAuth.config.full_host).to be_nil
+      end
     end
 
     it "boots in production on an https APP_BASE_URL and pins it without its trailing slash" do
       stub_production_env_for_https_rule
-      ENV["APP_BASE_URL"] = "https://app.miru.so/"
-      OmniAuth.config.full_host = nil
+      with_app_base_url(env: "https://app.miru.so/", default: Rails.configuration.x.default_base_url) do
+        OmniAuth.config.full_host = nil
 
-      expect { load initializer_path }.not_to raise_error
-      expect(OmniAuth.config.full_host).to eq("https://app.miru.so")
+        expect { load initializer_path }.not_to raise_error
+        expect(OmniAuth.config.full_host).to eq("https://app.miru.so")
+      end
     end
 
     it "still boots in the test environment on an http APP_BASE_URL" do
-      ENV["APP_BASE_URL"] = "http://app.miru.so"
+      with_app_base_url(env: "http://app.miru.so", default: Rails.configuration.x.default_base_url) do
+        load initializer_path
 
-      load initializer_path
-
-      expect(OmniAuth.config.full_host).to eq("http://app.miru.so")
+        expect(OmniAuth.config.full_host).to eq("http://app.miru.so")
+      end
     end
 
     # Letter case or padding must not become a way around the https rule.

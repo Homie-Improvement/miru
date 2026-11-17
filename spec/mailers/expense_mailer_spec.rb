@@ -94,3 +94,24 @@ RSpec.describe ExpenseMailer, type: :mailer do
     end
   end
 end
+
+RSpec.describe ExpenseMailer, "base URL", type: :mailer do
+  # "each reads the one per-environment base URL (APP_BASE_URL, else config.x.default_base_url)."
+  it "links the submitted expense email to the swapped config.x.default_base_url when APP_BASE_URL is unset" do
+    with_app_base_url(env: nil, default: "https://boot-check.test") do
+      company = create(:company)
+      employee = create(:user, current_workspace_id: company.id)
+      reviewer = create(:user, current_workspace_id: company.id)
+      create(:employment, company:, user: employee)
+      employee.add_role :employee, company
+      create(:employment, company:, user: reviewer)
+      reviewer.add_role :admin, company
+      expense = create(:expense, company:, category_name: "Travel", user: employee, description: "Taxi reimbursement")
+
+      mail = ExpenseMailer.with(expense_id: expense.id, recipients: [reviewer.email]).submitted
+      body = mail.html_part&.body&.decoded || mail.body.decoded
+
+      expect(body).to include("https://boot-check.test/expenses/#{expense.id}")
+    end
+  end
+end

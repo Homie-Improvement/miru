@@ -45,3 +45,21 @@ RSpec.describe PaymentMailer, type: :mailer do
     expect(ActionMailer::Base.deliveries).to be_empty
   end
 end
+
+RSpec.describe PaymentMailer, "base URL", type: :mailer do
+  # "each reads the one per-environment base URL (APP_BASE_URL, else config.x.default_base_url)."
+  it "links the payment confirmation to the swapped config.x.default_base_url when APP_BASE_URL is unset" do
+    with_app_base_url(env: nil, default: "https://boot-check.test") do
+      company = create(:company)
+      client = create(:client, company:)
+      invoice = create(:invoice, client:, company:)
+      user = create(:user, current_workspace_id: company.id, companies: [company])
+      user.add_role :admin, company
+
+      mail = PaymentMailer.with(invoice_id: invoice.id, subject: "Payment").payment
+      body = mail.html_part&.body&.decoded || mail.body.decoded
+
+      expect(body).to include("https://boot-check.test/invoices/#{invoice.external_view_key}/view")
+    end
+  end
+end
