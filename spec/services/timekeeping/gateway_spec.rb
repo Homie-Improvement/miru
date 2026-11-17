@@ -1073,6 +1073,32 @@ RSpec.describe Timekeeping::Gateway do
       .to raise_error(ActiveRecord::RecordNotFound)
     expect(entry.reload.discarded_at).to be_present
   end
+
+  it "a retried keyed legacy delete of a keyed legacy create still answers not found and sends nothing to Timekeeping" do
+    keyed_context = lambda do |request_id, key|
+      Timekeeping::WriteContext.new(company: fallback_company, actor: fallback_admin, actor_kind: "user",
+                                    request_id:, idempotency_key: key)
+    end
+    entry = described_class.new(context: keyed_context.call("req-retry-delete-create", SecureRandom.uuid)).create(
+      user: fallback_admin, project: fallback_project,
+      attributes: { duration: 45, work_date: Date.current, note: "keyed create", bill_status: "unbilled" }
+    )
+    # Doubles with no allowed methods: any forwarded call fails the example.
+    read_client = instance_double(Timekeeping::EntryApiClient)
+    write_client = instance_double(Timekeeping::EntryWriteClient)
+    delete_key = SecureRandom.uuid
+
+    first = described_class.new(context: keyed_context.call("req-retry-delete-1", delete_key), write_client:, read_client:)
+    expect(first.destroy(entry_id: entry.id, authorize: ->(_entry) { })).to be(true)
+
+    retry_gateway = described_class.new(
+      context: keyed_context.call("req-retry-delete-2", delete_key), write_client:, read_client:
+    )
+    expect { retry_gateway.destroy(entry_id: entry.id, authorize: ->(_entry) { }) }
+      .to raise_error(ActiveRecord::RecordNotFound)
+    expect(TimesheetEntry.find(entry.id).discarded_at).to be_present
+    expect(TimesheetEntry.where(project_id: fallback_project.id).count).to eq(1)
+  end
 end
 
 RSpec.describe Timekeeping::Gateway do
@@ -2449,31 +2475,28 @@ RSpec.describe Timekeeping::Gateway, "legacy create replay by idempotency key", 
     expect(retried.snippet[:note]).to eq("Timer stop")
   end
 
-  # "so a retried write replays the stored answer instead of using the per-request fallback key"
-  it "a legacy create retried after the entry was edited replays the answer the first attempt committed" do
+  # A receipt is kept only for the retry window, so a key repeated after it
+  # expired is a new create and the old receipt, with its entry copy, is gone.
+  it "a legacy create repeated after its receipt expired prunes that receipt and records a new entry" do
     company = create(:company)
     project = create(:project, billable: true, client: create(:client, company:))
-    admin = legacy_replay_admin_for(company)
-    employee = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user: employee)
-    employee.add_role :employee, company
-    attributes = { duration: 45, work_date: Date.current, note: "original note", bill_status: "unbilled" }
+    user = legacy_replay_admin_for(company)
+    attributes = { duration: 30, work_date: Date.current, note: "Expired key", bill_status: "unbilled" }
     create_with = lambda do |request_id|
-      described_class.new(context: legacy_replay_context(company:, actor: admin, request_id:,
-                                                         key: "timer-key-legacy-edited"))
-        .create(user: employee, project:, attributes:)
+      described_class.new(context: legacy_replay_context(company:, actor: user, request_id:, key: "timer-key-expired-1"))
+        .create(user:, project:, attributes:)
     end
 
-    first = create_with.call("req-legacy-edit-1")
-    admin.remove_role :admin, company
-    admin.add_role :employee, company
-    TimesheetEntry.unscoped.where(id: first.id).update_all(note: "confidential later note")
-    retried = create_with.call("req-legacy-edit-2")
+    first = create_with.call("req-expired-attempt-1")
+    receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: first.id)
+    expect(receipt.expires_at).to be_within(1.minute).of(receipt.created_at + 24.hours)
+    receipt.update_columns(expires_at: 1.second.ago)
 
-    expect(retried.id).to eq(first.id)
-    expect(retried.note).to eq("original note")
-    expect(retried.snippet[:note]).to eq("original note")
-    expect(TimesheetEntry.unscoped.where(project_id: project.id).count).to eq(1)
+    second = create_with.call("req-expired-attempt-2")
+
+    expect(second.id).not_to eq(first.id)
+    expect(TimesheetEntry.unscoped.where(project_id: project.id).count).to eq(2)
+    expect(Timekeeping::LegacyCreateReceipt.where(company_id: company.id).pluck(:timesheet_entry_id)).to eq([second.id])
   end
 
   # Ordering: create, delete, then the retried create must not revive the deleted time.
@@ -2650,49 +2673,6 @@ RSpec.describe Timekeeping::Gateway, "legacy create replay by idempotency key", 
     expect(replayed.id).to eq(first.id)
     expect(replayed.note).to eq("original note")
     expect(replayed.snippet[:note]).to eq("original note")
-  end
-end
-
-RSpec.describe Timekeeping::Gateway do
-  let(:retry_delete_company) { create(:company) }
-  let(:retry_delete_project) do
-    create(:project, billable: true, client: create(:client, company: retry_delete_company))
-  end
-  let(:retry_delete_admin) do
-    create(:user, current_workspace_id: retry_delete_company.id).tap do |user|
-      create(:employment, company: retry_delete_company, user:)
-      user.add_role :admin, retry_delete_company
-    end
-  end
-
-  def retry_delete_context(request_id, key)
-    Timekeeping::WriteContext.new(
-      company: retry_delete_company, actor: retry_delete_admin, actor_kind: "user",
-      request_id:, idempotency_key: key
-    )
-  end
-
-  # Only creates keep receipts in the legacy store; a retried legacy delete still answers not found.
-  it "a retried keyed legacy delete of a keyed legacy create still answers not found and sends nothing to Timekeeping" do
-    key = SecureRandom.uuid
-    entry = described_class.new(context: retry_delete_context("req-retry-delete-create", key)).create(
-      user: retry_delete_admin, project: retry_delete_project,
-      attributes: { duration: 45, work_date: Date.current, note: "keyed create", bill_status: "unbilled" }
-    )
-    # Doubles with no allowed methods: any forwarded call fails the example.
-    read_client = instance_double(Timekeeping::EntryApiClient)
-    write_client = instance_double(Timekeeping::EntryWriteClient)
-    delete_key = SecureRandom.uuid
-
-    first = described_class.new(context: retry_delete_context("req-retry-delete-1", delete_key), write_client:, read_client:)
-    expect(first.destroy(entry_id: entry.id, authorize: ->(_entry) { })).to be(true)
-
-    retry_gateway = described_class.new(
-      context: retry_delete_context("req-retry-delete-2", delete_key), write_client:, read_client:
-    )
-    expect { retry_gateway.destroy(entry_id: entry.id, authorize: ->(_entry) { }) }
-      .to raise_error(ActiveRecord::RecordNotFound)
-    expect(TimesheetEntry.find(entry.id).discarded_at).to be_present
-    expect(TimesheetEntry.where(project_id: retry_delete_project.id).count).to eq(1)
+    expect(TimesheetEntry.unscoped.where(project_id: project.id).count).to eq(1)
   end
 end

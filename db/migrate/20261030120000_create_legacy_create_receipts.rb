@@ -23,9 +23,13 @@ class CreateLegacyCreateReceipts < ActiveRecord::Migration[8.1]
       # answers what the first attempt answered, never later edits.
       t.jsonb :entry_attributes, null: false
       t.datetime :created_at, null: false
+      # A client retries only for a short while, so a receipt, and the copy of
+      # the entry it holds, is pruned once this time has passed.
+      t.datetime :expires_at, null: false
 
       t.index %i[company_id actor_kind actor_id key], unique: true,
                                                       name: "index_legacy_create_receipts_on_scope_and_key"
+      t.index :expires_at
     end
   end
 end

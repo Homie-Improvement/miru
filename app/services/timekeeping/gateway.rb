@@ -590,6 +590,10 @@ module Timekeeping
 
         scope = { company_id: context.company.id, actor_kind: context.actor_kind, actor_id: context.actor.id, key: }
         LocalOwner::WriteSteps.lock_key(LEGACY_CREATE_LOCK, *scope.values)
+        # Pruned here, through the expires_at index, so the receipts and the
+        # entry copies they hold do not outlive the retry window; an expired
+        # receipt under this key no longer answers.
+        LegacyCreateReceipt.expired.delete_all
         receipt = LegacyCreateReceipt.find_by(scope)
         fingerprint = legacy_create_fingerprint(project:, attributes:, user_id: user ? user.id : requested_user_id)
 
@@ -600,8 +604,10 @@ module Timekeeping
           raise EntryWriteClient.refusal_error(operation: :create, status: 422, reason: KEY_REUSED_REASON)
         when :write
           save_legacy_entry(project:, attributes:, user: user || resolve_user.call).tap do |entry|
+            now = Time.current
             LegacyCreateReceipt.create!(**scope, fingerprint:, timesheet_entry_id: entry.id,
-                                                 entry_attributes: entry.attributes_for_database, created_at: Time.current)
+                                                 entry_attributes: entry.attributes_for_database,
+                                                 created_at: now, expires_at: now + LegacyCreateReceipt::RETENTION)
           end
         end
       end
