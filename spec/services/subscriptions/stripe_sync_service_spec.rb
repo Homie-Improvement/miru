@@ -222,5 +222,53 @@ RSpec.describe Subscriptions::StripeSyncService do
       expect(company.subscription_status).to eq("canceled")
       expect(company.subscription_interval).to eq("year")
     end
+
+    context "with the plan purchase alert's billing link" do
+      include ActiveJob::TestHelper
+
+      # The service passes no billing_url; SubscriptionMailer#plan_purchased builds the link from
+      # AppBaseUrl.current. This runs the real service and mailer, so a billing_url override passed
+      # back into the service, or a raw ENV read, fails it.
+      it "sends the plan purchase alert with a billing link built from the config.x.default_base_url fallback when APP_BASE_URL is unset" do
+        original_default = Rails.configuration.x.default_base_url
+        original_env = ENV["APP_BASE_URL"]
+        original_alert = ENV["PLAN_PURCHASE_ALERT_EMAIL"]
+        ENV.delete("APP_BASE_URL")
+        ENV["PLAN_PURCHASE_ALERT_EMAIL"] = "vipul@saeloun.com"
+        Rails.configuration.x.default_base_url = "https://boot-check.test"
+        ActionMailer::Base.deliveries.clear
+
+        subscription = OpenStruct.new(
+          id: "sub_base_url_123",
+          customer: "cus_base_url_123",
+          status: "active",
+          current_period_end: Time.zone.local(2026, 4, 10, 12, 0, 0).to_i,
+          items: OpenStruct.new(
+            data: [
+              OpenStruct.new(
+                price: OpenStruct.new(recurring: OpenStruct.new(interval: "month"))
+              )
+            ]
+          )
+        )
+
+        expect do
+          expect(described_class.process(company:, subscription:, notify_plan_purchase: true)).to eq(true)
+        end.to have_enqueued_mail(SubscriptionMailer, :plan_purchased)
+          .with(params: hash_excluding(:billing_url), args: [])
+
+        perform_enqueued_jobs
+
+        mail = ActionMailer::Base.deliveries.find { |delivered| delivered.to.include?("vipul@saeloun.com") }
+        expect(mail).to be_present
+        expect(mail.html_part.body.decoded).to include("https://boot-check.test/settings/billing")
+        expect(mail.text_part.body.decoded).to include("https://boot-check.test/settings/billing")
+      ensure
+        Rails.configuration.x.default_base_url = original_default
+        original_env.nil? ? ENV.delete("APP_BASE_URL") : ENV["APP_BASE_URL"] = original_env
+        original_alert.nil? ? ENV.delete("PLAN_PURCHASE_ALERT_EMAIL") : ENV["PLAN_PURCHASE_ALERT_EMAIL"] = original_alert
+        ActionMailer::Base.deliveries.clear
+      end
+    end
   end
 end
