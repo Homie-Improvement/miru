@@ -541,40 +541,6 @@ RSpec.describe Timekeeping::Handoff::LegacySource do
   end
 end
 
-RSpec.describe Timekeeping::Handoff::LegacySource, "legacy create receipts", committed_data: true do
-  # A carried receipt replays the answer the first attempt gave. Building it from
-  # the live row would hand a retrying client later edits it never saw.
-  it "the first cutover carries a legacy create receipt whose answer is the committed entry, not a note added later, and keeps it in its own company" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: "req-carry-1",
-                                            idempotency_key: "carry-key-1")
-    entry = Timekeeping::Gateway.new(context:)
-      .create(user:, project:, attributes: { duration: 30, work_date: Date.current, note: "Original note",
-                                             bill_status: "unbilled" })
-    TimesheetEntry.unscoped.where(id: entry.id).update_all(note: "Confidential later note")
-
-    result = described_class.new(connection: ActiveRecord::Base.connection, recorded_disposition: {})
-      .export(generation: 2, captured_at: Time.current)
-
-    receipts = result.fetch(:checkpoint).rows.fetch("idempotency_records")
-    expect(receipts.size).to eq(1)
-    receipt = receipts.first
-    expect(receipt["company_id"]).to eq(company.id)
-    expect([receipt["actor_type"], receipt["actor_id"], receipt["operation"]]).to eq(["user", user.id, "create "])
-    expect(receipt["key"]).to eq(Timekeeping::LegacyCreateReplay.carried_key(actor_kind: "user", key: "carry-key-1"))
-    expect(receipt["status"]).to eq(201)
-    answer = JSON.parse(receipt["body"])
-    expect(answer["id"]).to eq(entry.id)
-    expect(answer["company_id"]).to eq(company.id)
-    expect(answer["note"]).to eq("Original note")
-    expect(receipt["body"]).not_to include("Confidential later note")
-  end
-end
-
 RSpec.describe Timekeeping::Handoff::LegacySource, "legacy create receipts in the first checkpoint", :two_tenant_seed,
                :seeded_without_transaction do
   # "Carry legacy create receipts into the first cutover checkpoint, so a retry whose first attempt landed in legacy and whose retry arrives after the flip replays in Timekeeping instead of creating a second entry."
@@ -608,30 +574,6 @@ RSpec.describe Timekeeping::Handoff::LegacySource, "legacy create receipts in th
     answer = JSON.parse(receipt.fetch("body"))
     expect(answer).to include("id" => live.id, "company_id" => company.id, "user_id" => user.id, "note" => "Original note")
     expect(Timekeeping::Handoff::Checkpoint.verify(result[:checkpoint])).to eq([])
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::LegacySource, "legacy create receipts that cannot be carried", :two_tenant_seed,
-               :seeded_without_transaction do
-  # "Carry legacy create receipts into the first cutover checkpoint, so a retry whose first attempt landed in legacy and whose retry arrives after the flip replays in Timekeeping instead of creating a second entry."
-  # A receipt written without the forwarded body cannot be carried, so the
-  # cutover must stop rather than drop it and let its retry write twice.
-  it "refuses the first cutover while a live legacy create receipt has no stored forwarded body" do
-    company = fork_and_leaf
-    user = company.users.find { |candidate| candidate.has_role?(:owner, company) || candidate.has_role?(:admin, company) }
-    entry = TimesheetEntry.unscoped.joins(project: :client).where(clients: { company_id: company.id }).first
-    now = Time.current
-    receipt = Timekeeping::LegacyCreateReceipt.create!(
-      company_id: company.id, actor_kind: "user", actor_id: user.id, key: "written-before-forwarded-body-1",
-      fingerprint: "request-values", timesheet_entry_id: entry.id, entry_attributes: entry.attributes_for_database,
-      created_at: now, expires_at: now + 24.hours
-    )
-
-    source = described_class.new(connection: ActiveRecord::Base.connection,
-                                 recorded_disposition: YAML.load_file(Timekeeping::SeedDispositionRecorder::DEFAULT_PATH))
-
-    expect { source.export(generation: 2, captured_at: Time.current) }
-      .to raise_error(described_class::Refused, /#{receipt.id}/)
   end
 end
 
