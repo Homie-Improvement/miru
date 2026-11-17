@@ -13,5 +13,6 @@ module Timekeeping
     RETENTION = SnapshotDeliveryReceipts::RETENTION
 
     scope :expired, -> { where(expires_at: ..Time.current) }
+    scope :unexpired, -> { where.not(expires_at: ..Time.current) }
   end
 end

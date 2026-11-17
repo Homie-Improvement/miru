@@ -3075,3 +3075,106 @@ RSpec.describe Timekeeping::Gateway, "legacy create forwarded body", committed_d
     expect(entry.bill_status).to eq("non_billable")
   end
 end
+
+RSpec.describe Timekeeping::Gateway, "forwarding a legacy create retry after the first cutover", committed_data: true do
+  def carried_retry_admin_for(company)
+    create(:user, current_workspace_id: company.id).tap do |user|
+      create(:employment, company:, user:)
+      user.add_role :admin, company
+    end
+  end
+
+  def carried_retry_create(company:, user:, project:, attributes:, key:, actor_kind: "user")
+    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind:, request_id: SecureRandom.uuid,
+                                            idempotency_key: key)
+    described_class.new(context:).create(user:, project:, attributes:)
+  end
+
+  def carried_retry_flip!
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+  end
+
+  # Records each forwarded create as sent and answers it as a new entry.
+  def carried_retry_stub(company)
+    sent = []
+    stub_request(:post, %r{\Ahttp://timekeeping\.test/v1/companies/\d+/entries\z}).to_return do |request|
+      key = request.headers.find { |name, _| name.to_s.casecmp?("Idempotency-Key") }&.last
+      sent << { key:, raw_body: request.body }
+      answer = JSON.parse(request.body).merge("id" => 9_200_000 + sent.size, "company_id" => company.id,
+                                              "version" => 1, "review_status" => "pending", "locked" => false)
+      { status: 201, body: JSON.generate(answer), headers: { "Content-Type" => "application/json" } }
+    end
+    sent
+  end
+
+  let(:company) { create(:company) }
+  let(:project) { create(:project, billable: true, client: create(:client, company:)) }
+  let(:user) { carried_retry_admin_for(company) }
+  let(:attributes) { { duration: 30, work_date: Date.current, note: "Carried retry", bill_status: "unbilled" } }
+
+  it "resends the stored body byte for byte under the carried key when the retry matches an unexpired receipt" do
+    entry = carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-match")
+    receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: entry.id)
+    carried_retry_flip!
+    sent = carried_retry_stub(company)
+
+    with_forwarded_timekeeping_env { carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-match") }
+
+    expect(sent.size).to eq(1)
+    expect(sent.first[:raw_body]).to eq(receipt.forwarded_body)
+    expect(sent.first[:key]).to eq(Timekeeping::LegacyCreateReplay.carried_key(actor_kind: "user", key: "carried-retry-match"))
+  end
+
+  it "resends the stored body when the project's billing default changed after the first attempt" do
+    no_status = attributes.except(:bill_status)
+    entry = carried_retry_create(company:, user:, project:, attributes: no_status, key: "carried-retry-default")
+    receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: entry.id)
+    project.update_columns(billable: false)
+    carried_retry_flip!
+    sent = carried_retry_stub(company)
+
+    with_forwarded_timekeeping_env do
+      carried_retry_create(company:, user:, project: project.reload, attributes: no_status, key: "carried-retry-default")
+    end
+
+    expect(sent.first[:raw_body]).to eq(receipt.forwarded_body)
+    expect(JSON.parse(sent.first[:raw_body])["bill_status"]).to eq("unbilled")
+  end
+
+  it "forwards as a new request under the derived key once the legacy receipt has expired" do
+    entry = carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-expired")
+    Timekeeping::LegacyCreateReceipt.where(timesheet_entry_id: entry.id).update_all(expires_at: 1.minute.ago)
+    carried_retry_flip!
+    sent = carried_retry_stub(company)
+
+    with_forwarded_timekeeping_env { carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-expired") }
+
+    expect(sent.first[:key])
+      .to eq(Timekeeping::EntryWriteClient.idempotency_key(request_id: "carried-retry-expired", operation: "create"))
+  end
+
+  it "forwards a create sent without a key under the key derived from its request id" do
+    carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-unkeyed")
+    carried_retry_flip!
+    sent = carried_retry_stub(company)
+    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: "req-carried-unkeyed")
+
+    with_forwarded_timekeeping_env { described_class.new(context:).create(user:, project:, attributes:) }
+
+    expect(sent.first[:key])
+      .to eq(Timekeeping::EntryWriteClient.idempotency_key(request_id: "req-carried-unkeyed", operation: "create"))
+  end
+
+  it "forwards a create of another actor kind under the same client key as its own request" do
+    carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-kind")
+    carried_retry_flip!
+    sent = carried_retry_stub(company)
+
+    with_forwarded_timekeeping_env do
+      carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-kind", actor_kind: "cli")
+    end
+
+    expect(sent.first[:key])
+      .to eq(Timekeeping::EntryWriteClient.idempotency_key(request_id: "carried-retry-kind", operation: "create"))
+  end
+end
