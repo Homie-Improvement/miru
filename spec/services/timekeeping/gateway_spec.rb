@@ -2546,22 +2546,80 @@ RSpec.describe Timekeeping::Gateway, "legacy create replay by idempotency key", 
     project = create(:project, billable: true, client: create(:client, company:))
     user = legacy_replay_admin_for(company)
     attributes = { duration: 30, work_date: Date.current, note: "Overlapping retry", bill_status: "unbilled" }
+    create_once = lambda do |request_id|
+      context = legacy_replay_context(company:, actor: user, request_id:, key: "timer-key-overlap-1")
+      described_class.new(context:).create(user:, project:, attributes:).id
+    rescue StandardError => error
+      error
+    end
+    first_pids = Queue.new
+    retry_pids = Queue.new
+    first_created = Queue.new
+    release_first = Queue.new
     results = Queue.new
-    threads = %w[req-overlap-1 req-overlap-2].map do |request_id|
-      committed_data_thread do
-        context = legacy_replay_context(company:, actor: user, request_id:, key: "timer-key-overlap-1")
-        results << described_class.new(context:).create(user:, project:, attributes:).id
-      rescue StandardError => error
-        results << error
+
+    # The first create runs inside a transaction the test keeps open, so its
+    # entry, its receipt and the receipt-key lock stay uncommitted while the
+    # retry starts.
+    first = committed_data_thread(first_pids) do
+      ActiveRecord::Base.transaction do
+        results << create_once.call("req-overlap-1")
+        first_created << true
+        release_first.pop(timeout: 10)
       end
     end
-    threads.each { |thread| thread.join(10) }
+    expect(first_created.pop(timeout: 10)).to be(true)
+    retried = committed_data_thread(retry_pids) { results << create_once.call("req-overlap-2") }
 
+    begin
+      retry_waited = blocked_by?(retry_pids.pop(timeout: 5), first_pids.pop(timeout: 5), within: 5)
+    ensure
+      release_first << true
+    end
+    finished = [first, retried].map { |thread| thread.join(10) }
+
+    expect(retry_waited).to be(true)
+    expect(finished).to all(be_a(Thread))
     answers = Array.new(results.size) { results.pop }
     expect(answers.size).to eq(2)
     expect(answers).to all(be_a(Integer))
     expect(answers.uniq.size).to eq(1)
     expect(TimesheetEntry.where(project_id: project.id).count).to eq(1)
+  ensure
+    # Cleanup empties every table after the example, so no writer may still
+    # hold a connection or a transaction when it starts.
+    release_first&.push(true)
+    [first, retried].compact.each do |thread|
+      thread.kill unless thread.join(10)
+      thread.join
+    end
+  end
+
+  # A user who belongs to two companies sends the same key in each, so only
+  # the company tells the receipts apart.
+  it "the same user's idempotency key in another company creates that company's own legacy entry" do
+    company = create(:company)
+    other_company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    other_project = create(:project, billable: true, client: create(:client, company: other_company))
+    user = legacy_replay_admin_for(company)
+    create(:employment, company: other_company, user:)
+    user.add_role :admin, other_company
+    attributes = { duration: 30, work_date: Date.current, note: "Shared key", bill_status: "unbilled" }
+    create_in = lambda do |actor_company, actor_project, request_id|
+      context = legacy_replay_context(company: actor_company, actor: user, request_id:, key: "timer-key-two-companies")
+      described_class.new(context:).create(user:, project: actor_project, attributes:)
+    end
+
+    first = create_in.call(company, project, "req-two-companies-1")
+    other = create_in.call(other_company, other_project, "req-two-companies-2")
+
+    expect(other.id).not_to eq(first.id)
+    expect(other.snippet[:project_id]).to eq(other_project.id)
+    expect(TimesheetEntry.where(project_id: project.id).count).to eq(1)
+    expect(TimesheetEntry.where(project_id: other_project.id).pluck(:user_id)).to eq([user.id])
+    expect(Timekeeping::LegacyCreateReceipt.where(actor_id: user.id).pluck(:company_id))
+      .to contain_exactly(company.id, other_company.id)
   end
 
   it "the same idempotency key from another user or another company creates its own legacy entry" do
