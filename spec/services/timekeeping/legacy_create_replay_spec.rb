@@ -48,6 +48,21 @@ RSpec.describe Timekeeping::LegacyCreateReplay do
     expect([user_key, cli_key]).not_to include(forwarded_key)
     expect(described_class.carried_key(actor_kind: "user", key: client_key)).to eq(user_key)
   end
+
+  # A client that sends a key shaped like a carried key's seed must still get a
+  # key of its own, or Timekeeping would answer it from another create's receipt.
+  it "carried_key is never the key a forwarded create derives from any client key, including one shaped like its seed" do
+    client_key = "6b1d3f0e-2a4c-4e8f-9b7d-1c2e3f4a5b6c"
+    carried = %w[user cli].map { |actor_kind| described_class.carried_key(actor_kind:, key: client_key) }
+    crafted = ["legacy_create/user/#{client_key}", "legacy_create/cli/#{client_key}", "user/#{client_key}",
+               "cli/#{client_key}"]
+
+    derived = crafted.map do |crafted_key|
+      Timekeeping::EntryWriteClient.idempotency_key(request_id: crafted_key, operation: "create")
+    end
+
+    expect(derived & carried).to be_empty
+  end
 end
 
 RSpec.describe Timekeeping::LegacyCreateReplay do

@@ -5,10 +5,10 @@ module Timekeeping
   # Idempotency-Key. The gateway looks up the receipt and carries out the
   # answer; this module only fingerprints the request and decides.
   module LegacyCreateReplay
-    # Prefixes the request id a carried receipt's key is derived from, so no
-    # carried key equals the key EntryWriteClient derives for a create first
-    # made in Timekeeping.
-    CARRIED_KEY_PREFIX = "legacy_create"
+    # Fixed namespace for the version 5 UUIDs used as carried receipt keys.
+    # It differs from EntryWriteClient's, so no client-chosen Idempotency-Key
+    # can make an ordinary forwarded create derive a carried key.
+    CARRIED_KEY_NAMESPACE = "b6e4c1a2-3f5d-4e7a-9c8b-2d1f0e3a4b5c"
 
     # The fingerprint covers the request values (target user, project and
     # forwarded fields), never the saved row, because the row also holds
@@ -38,7 +38,7 @@ module Timekeeping
     # is part of the key: a browser create and a command-line create sent with
     # one client key each keep their own receipt.
     def self.carried_key(actor_kind:, key:)
-      EntryWriteClient.idempotency_key(request_id: "#{CARRIED_KEY_PREFIX}/#{actor_kind}/#{key}", operation: "create")
+      Digest::UUID.uuid_v5(CARRIED_KEY_NAMESPACE, "#{actor_kind}/#{key}")
     end
   end
 end

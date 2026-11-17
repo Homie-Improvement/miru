@@ -658,19 +658,27 @@ module Timekeeping
       # receipt even when a default the body reads, such as the project's
       # billing default, changed in between. A key reused for different
       # request values is refused as in the legacy store, and nothing is sent.
+      # The receipt is matched before the target user is resolved, as in
+      # legacy_create: a resolver that checks the actor's current role would
+      # otherwise refuse the retry of a create that already committed.
       # :reek:LongParameterList
       def forward_create(ownership:, project:, attributes:, user:, requested_user_id:, resolve_user:)
-        target = user || resolve_user.call
         receipt = carried_legacy_create(project:, attributes:, user_id: user ? user.id : requested_user_id)
-        row = if receipt.nil?
-          write_client.create_entry(context:, generation: ownership.generation,
-                                    body: create_body(user: target, project:, attributes:))
-        else
-          carried_key = LegacyCreateReplay.carried_key(actor_kind: receipt.actor_kind, key: receipt.key)
-          write_client.create_entry(context:, generation: ownership.generation, body: JSON.parse(receipt.forwarded_body),
-                                    idempotency_key: carried_key)
-        end
+        return forward_carried_create(ownership:, receipt:) if receipt
+
+        target = user || resolve_user.call
+        row = write_client.create_entry(context:, generation: ownership.generation,
+                                        body: create_body(user: target, project:, attributes:))
         hydrate(row, user_id: target.id)
+      end
+
+      # The stored body names the user the first attempt wrote for, so the
+      # answer is hydrated for that user.
+      def forward_carried_create(ownership:, receipt:)
+        body = JSON.parse(receipt.forwarded_body)
+        carried_key = LegacyCreateReplay.carried_key(actor_kind: receipt.actor_kind, key: receipt.key)
+        row = write_client.create_entry(context:, generation: ownership.generation, body:, idempotency_key: carried_key)
+        hydrate(row, user_id: body.fetch("user_id"))
       end
 
       # The unexpired legacy receipt this request retries, or nil when it

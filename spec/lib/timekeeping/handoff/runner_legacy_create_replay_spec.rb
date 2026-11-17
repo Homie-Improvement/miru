@@ -3,8 +3,9 @@
 require "rails_helper"
 require "tmpdir"
 
-RSpec.describe Timekeeping::Handoff::Runner, "legacy create replayed after the first cutover", :two_tenant_seed,
-               :seeded_without_transaction do
+# Each example commits rows over the shared seed and cuts ownership over, so
+# each runs in a group of its own (spec/support/database_cleaner.rb).
+module LegacyCreateReplayAfterCutoverSpecSupport
   def legacy_replay_seeded_actor
     company = Company.order(:id).find { |candidate| candidate.projects.where(billable: true).exists? }
     project = company.projects.where(billable: true).order(:id).first
@@ -20,7 +21,7 @@ RSpec.describe Timekeeping::Handoff::Runner, "legacy create replayed after the f
 
   def legacy_replay_cutover
     TimekeepingHandoffFakes::InMemoryTimekeepingStore.new.tap do |timekeeping|
-      described_class.run(direction: :cutover, owners: TimekeepingHandoffFakes.owners(timekeeping:),
+      Timekeeping::Handoff::Runner.run(direction: :cutover, owners: TimekeepingHandoffFakes.owners(timekeeping:),
                           report_root: Dir.mktmpdir("handoff-report"))
     end
   end
@@ -54,6 +55,11 @@ RSpec.describe Timekeeping::Handoff::Runner, "legacy create replayed after the f
     end
     recorded
   end
+end
+
+RSpec.describe Timekeeping::Handoff::Runner, "legacy create replayed after the first cutover", :two_tenant_seed,
+               :seeded_without_transaction do
+  include LegacyCreateReplayAfterCutoverSpecSupport
 
   # "A create whose first attempt committed in the legacy store with an Idempotency-Key, retried with the same key and body after the first cutover flip, replays the original entry from Timekeeping, and the test shows no second entry was recorded."
   it "a keyed legacy create retried with the same key and body after the first cutover replays the original entry from Timekeeping and records no second entry" do
@@ -75,6 +81,11 @@ RSpec.describe Timekeeping::Handoff::Runner, "legacy create replayed after the f
     expect(recorded).to eq([])
     expect(TimesheetEntry.unscoped.where(note: "Legacy timer before cutover").count).to eq(1)
   end
+end
+
+RSpec.describe Timekeeping::Handoff::Runner, "legacy create replayed after a billing default change",
+               :two_tenant_seed, :seeded_without_transaction do
+  include LegacyCreateReplayAfterCutoverSpecSupport
 
   # The request body is unchanged; only the project's billing default, which the
   # forwarded body is filled from, changed between the attempts.
@@ -96,6 +107,11 @@ RSpec.describe Timekeeping::Handoff::Runner, "legacy create replayed after the f
     expect(recorded).to eq([])
     expect(TimesheetEntry.unscoped.where(note: "Billing default changed later").count).to eq(1)
   end
+end
+
+RSpec.describe Timekeeping::Handoff::Runner, "legacy creates of two actor kinds replayed after the first cutover",
+               :two_tenant_seed, :seeded_without_transaction do
+  include LegacyCreateReplayAfterCutoverSpecSupport
 
   it "a browser create and a command-line create under one client key each replay their own entry after the first cutover" do
     company, project, user = legacy_replay_seeded_actor
@@ -126,6 +142,11 @@ RSpec.describe Timekeeping::Handoff::Runner, "legacy create replayed after the f
     expect(recorded).to eq([])
     expect(TimesheetEntry.unscoped.where(note: ["Browser create, shared key", "CLI create, shared key"]).count).to eq(2)
   end
+end
+
+RSpec.describe Timekeeping::Handoff::Runner, "legacy create key reused after the first cutover", :two_tenant_seed,
+               :seeded_without_transaction do
+  include LegacyCreateReplayAfterCutoverSpecSupport
 
   # A replay is owed only to a retry "with the same key and body"; a changed body
   # under the key must not replay or write, and a new key is a new create.

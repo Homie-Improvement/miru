@@ -3141,6 +3141,35 @@ RSpec.describe Timekeeping::Gateway, "forwarding a legacy create retry after the
     expect(JSON.parse(sent.first[:raw_body])["bill_status"]).to eq("unbilled")
   end
 
+  # The resolver stands in for an API controller's target-user check, which
+  # refuses an employee naming a colleague; a committed create's retry must
+  # replay before that check runs, as it does before the flip.
+  it "resends a create made for a colleague without resolving the target again after the creator lost the right to name one" do
+    colleague = create(:user, current_workspace_id: company.id).tap do |member|
+      create(:employment, company:, user: member)
+      member.add_role :employee, company
+    end
+    key = "carried-retry-colleague"
+    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: SecureRandom.uuid,
+                                            idempotency_key: key)
+    entry = described_class.new(context:).create(project:, attributes:, requested_user_id: colleague.id) { colleague }
+    receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: entry.id)
+    carried_retry_flip!
+    sent = carried_retry_stub(company)
+    retry_context = context.with(request_id: SecureRandom.uuid)
+
+    replayed = with_forwarded_timekeeping_env do
+      described_class.new(context: retry_context).create(project:, attributes:, requested_user_id: colleague.id) do
+        raise Pundit::NotAuthorizedError, "the creator may no longer name another user"
+      end
+    end
+
+    expect(sent.size).to eq(1)
+    expect(sent.first[:raw_body]).to eq(receipt.forwarded_body)
+    expect(sent.first[:key]).to eq(Timekeeping::LegacyCreateReplay.carried_key(actor_kind: "user", key:))
+    expect(replayed.user_id).to eq(colleague.id)
+  end
+
   it "forwards as a new request under the derived key once the legacy receipt has expired" do
     entry = carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-expired")
     Timekeeping::LegacyCreateReceipt.where(timesheet_entry_id: entry.id).update_all(expires_at: 1.minute.ago)
