@@ -169,9 +169,7 @@ module Timekeeping
         when :prepared
           local_create(ownership:, project:, attributes:, user:, requested_user_id:)
         when :timekeeping
-          target = user || resolve_user.call
-          body = create_body(user: target, project:, attributes:)
-          hydrate(write_client.create_entry(context:, generation: ownership.generation, body:), user_id: target.id)
+          forward_create(ownership:, project:, attributes:, user:, requested_user_id:, resolve_user:)
         end
       end
     end
@@ -612,13 +610,15 @@ module Timekeeping
       # the live row, so a later edit or delete never reaches the retry. A
       # key reused for different request values is refused. The lock makes a
       # retry that overlaps the first attempt wait for it; the receipt's
-      # unique index backs that up.
+      # unique index backs that up. The receipt also keeps the body a
+      # forwarded create of the same request would send, so a retry that
+      # reaches Timekeeping after the first cutover can be answered there.
       # :reek:LongParameterList
       def legacy_create(project:, attributes:, user:, requested_user_id:, resolve_user:)
         key = context.idempotency_key
         return save_legacy_entry(project:, attributes:, user: user || resolve_user.call) if key.nil?
 
-        scope = { company_id: context.company.id, actor_kind: context.actor_kind, actor_id: context.actor.id, key: }
+        scope = legacy_create_scope(key)
         LocalOwner::WriteSteps.lock_key(LEGACY_CREATE_LOCK, *scope.values)
         # Pruned here, through the expires_at index, so the receipts and the
         # entry copies they hold do not outlive the retry window; an expired
@@ -633,12 +633,78 @@ module Timekeeping
         when :key_reused
           raise EntryWriteClient.refusal_error(operation: :create, status: 422, reason: KEY_REUSED_REASON)
         when :write
-          save_legacy_entry(project:, attributes:, user: user || resolve_user.call).tap do |entry|
+          target = user || resolve_user.call
+          # Built before the save, so its defaults are read from the state the
+          # save itself reads.
+          body = create_body(user: target, project:, attributes:)
+          save_legacy_entry(project:, attributes:, user: target).tap do |entry|
             now = Time.current
-            LegacyCreateReceipt.create!(**scope, fingerprint:, timesheet_entry_id: entry.id,
+            LegacyCreateReceipt.create!(**scope, fingerprint:, forwarded_body: forwarded_body_for(body, entry),
+                                                 timesheet_entry_id: entry.id,
                                                  entry_attributes: entry.attributes_for_database,
                                                  created_at: now, expires_at: now + LegacyCreateReceipt::RETENTION)
           end
+        end
+      end
+
+      # The legacy model casts any date text it can parse, such as a full
+      # timestamp, while Timekeeping refuses a work_date that is not
+      # YYYY-MM-DD before it reads its receipt. The carried body therefore
+      # holds the date the legacy store saved, in that form, in the key's
+      # original position. Returns the body as JSON text.
+      def forwarded_body_for(body, entry)
+        saved = body.key?("work_date") ? body.merge("work_date" => entry.work_date.iso8601) : body
+        JSON.generate(saved)
+      end
+
+      def legacy_create_scope(key)
+        { company_id: context.company.id, actor_kind: context.actor_kind, actor_id: context.actor.id, key: }
+      end
+
+      # A retry of a create whose first attempt committed in the legacy store
+      # reaches Timekeeping after the first cutover, which carried that
+      # attempt's receipt under its own key. The retry is matched to the
+      # receipt by request values, as before the flip, and then resent with
+      # the body the receipt stored, so Timekeeping answers it from that
+      # receipt even when a default the body reads, such as the project's
+      # billing default, changed in between. A key reused for different
+      # request values is refused as in the legacy store, and nothing is sent.
+      # The receipt is matched before the target user is resolved, as in
+      # legacy_create: a resolver that checks the actor's current role would
+      # otherwise refuse the retry of a create that already committed.
+      # :reek:LongParameterList
+      def forward_create(ownership:, project:, attributes:, user:, requested_user_id:, resolve_user:)
+        receipt = carried_legacy_create(project:, attributes:, user_id: user ? user.id : requested_user_id)
+        return forward_carried_create(ownership:, receipt:) if receipt
+
+        target = user || resolve_user.call
+        row = write_client.create_entry(context:, generation: ownership.generation,
+                                        body: create_body(user: target, project:, attributes:))
+        hydrate(row, user_id: target.id)
+      end
+
+      # The stored body names the user the first attempt wrote for, so the
+      # answer is hydrated for that user.
+      def forward_carried_create(ownership:, receipt:)
+        body = JSON.parse(receipt.forwarded_body)
+        carried_key = LegacyCreateReplay.carried_key(actor_kind: receipt.actor_kind, key: receipt.key)
+        row = write_client.create_entry(context:, generation: ownership.generation, body:, idempotency_key: carried_key)
+        hydrate(row, user_id: body.fetch("user_id"))
+      end
+
+      # The unexpired legacy receipt this request retries, or nil when it
+      # sent no key of its own or none was stored for it. An expired receipt
+      # was never carried into Timekeeping, so it answers nothing here either.
+      def carried_legacy_create(project:, attributes:, user_id:)
+        key = context.idempotency_key
+        return if key.nil?
+
+        receipt = LegacyCreateReceipt.unexpired.find_by(legacy_create_scope(key))
+        fingerprint = legacy_create_fingerprint(project:, attributes:, user_id:)
+        case LegacyCreateReplay.decision(stored_fingerprint: receipt&.fingerprint, fingerprint:)
+        when :replay then receipt
+        when :key_reused then raise EntryWriteClient.refusal_error(operation: :create, status: 422,
+                                                                   reason: KEY_REUSED_REASON)
         end
       end
 

@@ -511,7 +511,7 @@ end
 
 RSpec.describe Timekeeping::Handoff::LegacySource do
   context "with a keyed legacy create before the first cutover", :two_tenant_seed, :seeded_without_transaction do
-    it "a keyed legacy create leaves the first cutover checkpoint with no idempotency records and the prepared receipts table untouched" do
+    it "a keyed legacy create is carried into the first cutover checkpoint as one receipt and leaves the prepared receipts table untouched" do
       expect(TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).monolith_store)
         .to eq(TimekeepingOwnership::INITIAL_MONOLITH_STORE)
       seeded = TimesheetEntry.joins(project: :client).where(clients: { company_id: fork_and_leaf.id }).order(:id).first
@@ -529,14 +529,84 @@ RSpec.describe Timekeeping::Handoff::LegacySource do
       result = described_class.new(
         connection: ActiveRecord::Base.connection,
         recorded_disposition: YAML.load_file(Timekeeping::SeedDispositionRecorder::DEFAULT_PATH)
-      ).export(generation: 7, captured_at: Time.utc(2026, 10, 25, 12))
+      ).export(generation: 7, captured_at: Time.current)
 
       rows = result.fetch(:checkpoint).rows
-      # Legacy create receipts live in their own table, so the cutover still exports no receipts and
-      # the prepared receipts table stays empty until a rollback loads it.
-      expect(rows.fetch("idempotency_records")).to eq([])
+      # The legacy receipt is carried into the checkpoint for Timekeeping, while the prepared
+      # receipts table stays empty until a rollback loads it.
+      expect(rows.fetch("idempotency_records").map { |row| JSON.parse(row["body"])["id"] }).to eq([created.id])
       expect(Timekeeping::LocalOwner::Receipt.count).to eq(receipts_before)
       expect(rows.fetch("entries").count { |row| row["id"] == created.id }).to eq(1)
+    end
+  end
+end
+
+RSpec.describe Timekeeping::Handoff::LegacySource, "legacy create receipts in the first checkpoint", :two_tenant_seed,
+               :seeded_without_transaction do
+  # "Carry legacy create receipts into the first cutover checkpoint, so a retry whose first attempt landed in legacy and whose retry arrives after the flip replays in Timekeeping instead of creating a second entry."
+  it "exports a live keyed legacy create receipt as one Timekeeping create receipt holding the committed entry and leaves an expired one out" do
+    company = fork_and_leaf
+    user = company.users.find { |candidate| candidate.has_role?(:owner, company) || candidate.has_role?(:admin, company) }
+    project = company.projects.find_by!(billable: true)
+    create_with_key = lambda do |key, note|
+      context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: "export-#{key}",
+                                              idempotency_key: key)
+      Timekeeping::Gateway.new(context:)
+        .create(user:, project:, attributes: { duration: 25.0, work_date: Date.current.iso8601, note:, bill_status: "unbilled" })
+    end
+    live = create_with_key.call("export-live-key-1", "Original note")
+    expired = create_with_key.call("export-expired-key-1", "Expired note")
+    Timekeeping::LegacyCreateReceipt.where(timesheet_entry_id: expired.id).update_all(expires_at: 1.minute.ago)
+    TimesheetEntry.unscoped.where(id: live.id).update_all(note: "Edited after the create")
+
+    result = described_class.new(connection: ActiveRecord::Base.connection,
+                                 recorded_disposition: YAML.load_file(Timekeeping::SeedDispositionRecorder::DEFAULT_PATH))
+      .export(generation: 2, captured_at: Time.current)
+
+    receipts = result[:checkpoint].rows.fetch("idempotency_records")
+    expect(receipts.size).to eq(1)
+    receipt = receipts.first
+    expect(receipt).to include(
+      "company_id" => company.id, "actor_type" => "user", "actor_id" => user.id, "operation" => "create ",
+      "key" => Timekeeping::LegacyCreateReplay.carried_key(actor_kind: "user", key: "export-live-key-1"),
+      "status" => 201
+    )
+    answer = JSON.parse(receipt.fetch("body"))
+    expect(answer).to include("id" => live.id, "company_id" => company.id, "user_id" => user.id, "note" => "Original note")
+    expect(Timekeeping::Handoff::Checkpoint.verify(result[:checkpoint])).to eq([])
+  end
+end
+
+RSpec.describe Timekeeping::Handoff::LegacySource do
+  context "with a legacy create receipt written before the forwarded body was stored", :two_tenant_seed,
+          :seeded_without_transaction do
+    # A receipt without the forwarded body cannot be carried into Timekeeping, so
+    # its retry after the flip would record a second entry; the cutover stops instead.
+    it "refuses the first cutover export while an unexpired legacy create receipt has no forwarded body and ignores an expired one" do
+      company = Company.order(:id).first
+      user = company.users.order(:id).first
+      entry_id = TimesheetEntry.unscoped.order(:id).first.id
+      captured_at = Time.current
+      recorded = YAML.load_file(Timekeeping::SeedDispositionRecorder::DEFAULT_PATH)
+      receipt = Timekeeping::LegacyCreateReceipt.create!(
+        company_id: company.id, actor_kind: "user", actor_id: user.id, key: "pre-change-receipt-1",
+        fingerprint: "pre-change", timesheet_entry_id: entry_id, entry_attributes: {}, forwarded_body: nil,
+        created_at: captured_at - 1.hour, expires_at: captured_at + 23.hours
+      )
+
+      expect do
+        described_class.new(connection: ActiveRecord::Base.connection, recorded_disposition: recorded)
+          .export(generation: 2, captured_at:)
+      end.to raise_error(described_class::Refused) { |error|
+        expect(error.refusals.keys).to include(company.id)
+        expect(error.message).to include(receipt.id.to_s)
+      }
+
+      receipt.update_columns(expires_at: captured_at)
+      result = described_class.new(connection: ActiveRecord::Base.connection, recorded_disposition: recorded)
+        .export(generation: 2, captured_at:)
+
+      expect(result.fetch(:checkpoint).rows.fetch("idempotency_records")).to eq([])
     end
   end
 end
