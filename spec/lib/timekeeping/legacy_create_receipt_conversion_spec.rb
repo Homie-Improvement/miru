@@ -3,27 +3,29 @@
 require "rails_helper"
 
 RSpec.describe Timekeeping::LegacyCreateReceiptConversion do
+  let(:captured_at) { Time.utc(2026, 11, 17, 12) }
+
+  # One live, keyed legacy create receipt with a forwarded body and the committed entry it answers with. Examples
+  # pass as keywords the values their assertions read; `overrides` replaces whole receipt fields, such as
+  # forwarded_body or expires_at.
+  def legacy_create_receipt(id:, entry_id:, key:, note: "n#{id}", company_id: 1, actor_kind: "user", **overrides)
+    body = { "project_id" => 3, "duration" => 30.0, "work_date" => "2026-11-02", "note" => note,
+             "bill_status" => "unbilled", "user_id" => 7, "source" => "manual", "source_metadata" => {} }
+    entry_values = body.merge(
+      "id" => entry_id, "company_id" => company_id, "version" => 0, "review_status" => "approved", "agent_id" => nil,
+      "proof_url" => nil, "proof_metadata" => {}, "external_run_id" => nil, "external_session_id" => nil,
+      "locked" => false
+    )
+    {
+      id:, company_id:, actor_kind:, actor_id: 7, key:, forwarded_body: JSON.generate(body), entry_values:,
+      created_at: captured_at - 3600, expires_at: captured_at + 3600
+    }.merge(overrides)
+  end
+
   it "receipts of two companies under one client key each convert into a row and answer scoped to their own company" do
-    captured_at = Time.utc(2026, 11, 17, 12)
     shared_key = "3f2a9c1e-7b4d-4e8f-9a0b-1c2d3e4f5a6b"
-    receipt_for = lambda do |id:, company_id:, note:|
-      body = { "project_id" => 10 + company_id, "duration" => 30.0, "work_date" => "2026-11-16", "note" => note,
-               "bill_status" => "unbilled", "user_id" => 7, "source" => "manual", "source_metadata" => {} }
-      {
-        id:, company_id:, actor_kind: "user", actor_id: 7, key: shared_key,
-        forwarded_body: JSON.generate(body),
-        entry_values: {
-          "id" => 500 + id, "company_id" => company_id, "version" => 0, "project_id" => 10 + company_id, "user_id" => 7,
-          "work_date" => "2026-11-16", "duration" => 30.0, "note" => note, "bill_status" => "unbilled",
-          "review_status" => "approved", "source" => "manual", "source_metadata" => {}, "agent_id" => nil,
-          "proof_url" => nil, "proof_metadata" => nil, "external_run_id" => nil, "external_session_id" => nil,
-          "locked" => false
-        },
-        created_at: captured_at - 3600, expires_at: captured_at + 3600
-      }
-    end
-    receipts = [receipt_for.call(id: 1, company_id: 1, note: "first company"),
-                receipt_for.call(id: 2, company_id: 2, note: "second company")]
+    receipts = [legacy_create_receipt(id: 1, entry_id: 501, key: shared_key, company_id: 1, note: "first company"),
+                legacy_create_receipt(id: 2, entry_id: 502, key: shared_key, company_id: 2, note: "second company")]
 
     result = described_class.convert(receipts:, captured_at:)
 
@@ -39,24 +41,6 @@ RSpec.describe Timekeeping::LegacyCreateReceiptConversion do
       expect(answer["note"]).to eq(receipt[:entry_values]["note"])
     end
   end
-end
-
-RSpec.describe Timekeeping::LegacyCreateReceiptConversion do
-  def legacy_create_receipt_for_conversion(id:, actor_kind:, note:, captured_at:)
-    entry_values = {
-      "id" => 500 + id, "company_id" => 1, "version" => 0, "project_id" => 3, "user_id" => 7,
-      "work_date" => "2026-11-02", "duration" => 30.0, "note" => note, "bill_status" => "unbilled",
-      "review_status" => "approved", "source" => "manual", "source_metadata" => {}, "agent_id" => nil,
-      "proof_url" => nil, "proof_metadata" => {}, "external_run_id" => nil, "external_session_id" => nil,
-      "locked" => false
-    }
-    body = JSON.generate("duration" => 30.0, "note" => note, "project_id" => 3, "user_id" => 7,
-                         "source" => "manual", "source_metadata" => {})
-    {
-      id:, company_id: 1, actor_kind:, actor_id: 7, key: "shared-client-key", forwarded_body: body,
-      entry_values:, created_at: captured_at - 3600 + id, expires_at: captured_at + 3600
-    }
-  end
 
   # "A create whose first attempt committed in the legacy store with an Idempotency-Key, retried with the same key
   # and body after the first cutover flip, replays the original entry from Timekeeping, and the test shows no second
@@ -64,9 +48,10 @@ RSpec.describe Timekeeping::LegacyCreateReceiptConversion do
   # A browser create and a command-line create by one user with one client key both committed in the legacy store;
   # dropping either receipt, or giving both one Timekeeping key, leaves one of the two retries unable to replay.
   it "convert carries both receipts that differ only by actor kind under distinct keys with their own fingerprints" do
-    captured_at = Time.utc(2026, 11, 17, 12)
-    web = legacy_create_receipt_for_conversion(id: 1, actor_kind: "user", note: "from the browser", captured_at:)
-    cli = legacy_create_receipt_for_conversion(id: 2, actor_kind: "cli", note: "from the CLI", captured_at:)
+    web = legacy_create_receipt(id: 1, entry_id: 501, key: "shared-client-key", actor_kind: "user",
+                                note: "from the browser", created_at: captured_at - 3600 + 1)
+    cli = legacy_create_receipt(id: 2, entry_id: 502, key: "shared-client-key", actor_kind: "cli",
+                                note: "from the CLI", created_at: captured_at - 3600 + 2)
 
     result = described_class.convert(receipts: [web, cli], captured_at:)
     rows = result.fetch(:rows)
@@ -86,16 +71,6 @@ RSpec.describe Timekeeping::LegacyCreateReceiptConversion do
       .to eq([[1, "user", 7, "create "]])
     expect(JSON.parse(by_id.fetch(2)["body"])["note"]).to eq("from the CLI")
   end
-end
-
-RSpec.describe Timekeeping::LegacyCreateReceiptConversion do
-  def legacy_create_receipt_without_body(id:, company_id:, expires_at:, captured_at:)
-    {
-      id:, company_id:, actor_kind: "user", actor_id: 7, key: "key-#{id}", forwarded_body: nil,
-      entry_values: { "id" => 700 + id, "company_id" => company_id, "note" => "before the change" },
-      created_at: captured_at - 7200, expires_at:
-    }
-  end
 
   # "A create whose first attempt committed in the legacy store with an Idempotency-Key, retried with the same key
   # and body after the first cutover flip, replays the original entry from Timekeeping, and the test shows no second
@@ -103,9 +78,14 @@ RSpec.describe Timekeeping::LegacyCreateReceiptConversion do
   # A receipt written before the forwarded body was stored cannot be carried; skipping it quietly would let its retry
   # record a second entry after the flip, so the cutover must be refused while it can still be retried.
   it "convert refuses an unexpired receipt written without a forwarded body instead of silently leaving it behind" do
-    captured_at = Time.utc(2026, 11, 17, 12)
-    live = legacy_create_receipt_without_body(id: 41, company_id: 2, expires_at: captured_at + 60, captured_at:)
-    expired = legacy_create_receipt_without_body(id: 42, company_id: 3, expires_at: captured_at - 60, captured_at:)
+    live = legacy_create_receipt(
+      id: 41, entry_id: 741, key: "key-41", company_id: 2, forwarded_body: nil, expires_at: captured_at + 60,
+      entry_values: { "id" => 741, "company_id" => 2, "note" => "before the change" }, created_at: captured_at - 7200
+    )
+    expired = legacy_create_receipt(
+      id: 42, entry_id: 742, key: "key-42", company_id: 3, forwarded_body: nil, expires_at: captured_at - 60,
+      entry_values: { "id" => 742, "company_id" => 3, "note" => "before the change" }, created_at: captured_at - 7200
+    )
 
     result = described_class.convert(receipts: [live, expired], captured_at:)
 
@@ -114,23 +94,6 @@ RSpec.describe Timekeeping::LegacyCreateReceiptConversion do
     expect(refusals.keys).to eq([2])
     expect(refusals.fetch(2).join(" ")).to include("41")
   end
-end
-
-RSpec.describe Timekeeping::LegacyCreateReceiptConversion do
-  def legacy_create_receipt_expiring(id:, expires_at:, captured_at:)
-    {
-      id:, company_id: 1, actor_kind: "user", actor_id: 7, key: "expiry-key-#{id}",
-      forwarded_body: JSON.generate("duration" => 15.0, "note" => "n#{id}", "project_id" => 3, "user_id" => 7),
-      entry_values: {
-        "id" => 800 + id, "company_id" => 1, "version" => 0, "project_id" => 3, "user_id" => 7,
-        "work_date" => "2026-11-02", "duration" => 15.0, "note" => "n#{id}", "bill_status" => "unbilled",
-        "review_status" => "approved", "source" => "manual", "source_metadata" => {}, "agent_id" => nil,
-        "proof_url" => nil, "proof_metadata" => {}, "external_run_id" => nil, "external_session_id" => nil,
-        "locked" => false
-      },
-      created_at: captured_at - 3600, expires_at:
-    }
-  end
 
   # "A create whose first attempt committed in the legacy store with an Idempotency-Key, retried with the same key
   # and body after the first cutover flip, replays the original entry from Timekeeping, and the test shows no second
@@ -138,9 +101,8 @@ RSpec.describe Timekeeping::LegacyCreateReceiptConversion do
   # The legacy store treats a receipt with expires_at at or before now as expired, so the checkpoint must use the same
   # boundary: carrying the expired one would revive a receipt the legacy store no longer answers.
   it "convert leaves out a receipt that expires exactly at the capture time and keeps one that expires a second later" do
-    captured_at = Time.utc(2026, 11, 17, 12)
-    at_boundary = legacy_create_receipt_expiring(id: 1, expires_at: captured_at, captured_at:)
-    just_after = legacy_create_receipt_expiring(id: 2, expires_at: captured_at + 1, captured_at:)
+    at_boundary = legacy_create_receipt(id: 1, entry_id: 801, key: "expiry-key-1", expires_at: captured_at)
+    just_after = legacy_create_receipt(id: 2, entry_id: 802, key: "expiry-key-2", expires_at: captured_at + 1)
 
     result = described_class.convert(receipts: [at_boundary, just_after], captured_at:)
 
