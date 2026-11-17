@@ -2994,10 +2994,11 @@ RSpec.describe Timekeeping::Gateway do
     end
     second_company = create(:company)
     second_project = create(:project, billable: true, client: create(:client, company: second_company))
-    second_user = create(:user, current_workspace_id: second_company.id).tap do |user|
-      create(:employment, company: second_company, user:)
-      user.add_role :owner, second_company
-    end
+    # The same person in both companies, so only the company tells the two
+    # requests apart and the retry lookup must filter on it.
+    second_user = first_user
+    create(:employment, company: second_company, user: second_user)
+    second_user.add_role :owner, second_company
     attributes = { duration: 30, work_date: Date.current, note: "Same request", bill_status: "unbilled" }
 
     legacy_context = Timekeeping::WriteContext.new(company: first_company, actor: first_user, actor_kind: "user",
@@ -3026,8 +3027,9 @@ RSpec.describe Timekeeping::Gateway do
     # A legacy receipt is scoped to the company that wrote it: another company's retry under the
     # same client key must never be sent under that receipt's carried key, or Timekeeping could
     # answer it with the first company's entry.
-    expect(forwarded.first[:idempotency_key])
-      .not_to eq(Timekeeping::LegacyCreateReplay.carried_key(actor_kind: "user", key: shared_key))
+    # No key override means the write client derives its ordinary key from the client key.
+    expect(forwarded.first).not_to have_key(:idempotency_key)
+    expect(forwarded.first[:body]["project_id"]).to eq(second_project.id)
     expect(forwarded.first[:context].company).to eq(second_company)
   end
 end
@@ -3168,6 +3170,27 @@ RSpec.describe Timekeeping::Gateway, "forwarding a legacy create retry after the
     expect(sent.first[:raw_body]).to eq(receipt.forwarded_body)
     expect(sent.first[:key]).to eq(Timekeeping::LegacyCreateReplay.carried_key(actor_kind: "user", key:))
     expect(replayed.user_id).to eq(colleague.id)
+  end
+
+  # Timekeeping refuses a work_date that is not YYYY-MM-DD before it reads its
+  # receipt, so a timestamp the legacy model accepted must not reach it as sent.
+  it "resends a legacy create sent with a timestamp work_date with the saved date in YYYY-MM-DD form" do
+    timestamp_attributes = attributes.merge(work_date: "#{Date.current.iso8601}T00:00:00Z")
+    entry = carried_retry_create(company:, user:, project:, attributes: timestamp_attributes,
+                                 key: "carried-retry-timestamp")
+    receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: entry.id)
+    carried_retry_flip!
+    sent = carried_retry_stub(company)
+
+    with_forwarded_timekeeping_env do
+      carried_retry_create(company:, user:, project:, attributes: timestamp_attributes, key: "carried-retry-timestamp")
+    end
+
+    expect(JSON.parse(receipt.forwarded_body)["work_date"]).to eq(Date.current.iso8601)
+    expect(sent.first[:raw_body]).to eq(receipt.forwarded_body)
+    expect(JSON.parse(sent.first[:raw_body])["work_date"]).to match(TimekeepingRules::EntryDecision::DATE)
+    expect(JSON.parse(receipt.forwarded_body).keys)
+      .to eq(Timekeeping::EntryWriteClient.create_body(user:, project:, attributes: timestamp_attributes).keys)
   end
 
   it "forwards as a new request under the derived key once the legacy receipt has expired" do

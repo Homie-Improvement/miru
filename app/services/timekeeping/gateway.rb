@@ -636,14 +636,25 @@ module Timekeeping
           target = user || resolve_user.call
           # Built before the save, so its defaults are read from the state the
           # save itself reads.
-          forwarded_body = JSON.generate(create_body(user: target, project:, attributes:))
+          body = create_body(user: target, project:, attributes:)
           save_legacy_entry(project:, attributes:, user: target).tap do |entry|
             now = Time.current
-            LegacyCreateReceipt.create!(**scope, fingerprint:, forwarded_body:, timesheet_entry_id: entry.id,
+            LegacyCreateReceipt.create!(**scope, fingerprint:, forwarded_body: forwarded_body_for(body, entry),
+                                                 timesheet_entry_id: entry.id,
                                                  entry_attributes: entry.attributes_for_database,
                                                  created_at: now, expires_at: now + LegacyCreateReceipt::RETENTION)
           end
         end
+      end
+
+      # The legacy model casts any date text it can parse, such as a full
+      # timestamp, while Timekeeping refuses a work_date that is not
+      # YYYY-MM-DD before it reads its receipt. The carried body therefore
+      # holds the date the legacy store saved, in that form, in the key's
+      # original position. Returns the body as JSON text.
+      def forwarded_body_for(body, entry)
+        saved = body.key?("work_date") ? body.merge("work_date" => entry.work_date.iso8601) : body
+        JSON.generate(saved)
       end
 
       def legacy_create_scope(key)
