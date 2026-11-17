@@ -113,6 +113,9 @@ module TimekeepingContract
     }.freeze
 
     ENTRY_WRITE_ROUTES = %w[create update destroy bulk_move bulk_delete].freeze
+    # The entry routes that honour Idempotency-Replay: only, as
+    # Timekeeping::EntryCommand::REPLAY_ROUTES does.
+    REPLAY_ROUTES = %w[destroy bulk_delete].freeze
 
     attr_reader :generation, :outbox, :requests
 
@@ -298,10 +301,11 @@ module TimekeepingContract
         end
       end
 
-      # A replay-only DELETE is answered only from a stored receipt; with none
-      # it is not_found and nothing is written (entry_api.yml headers).
+      # A replay-only DELETE or bulk delete is answered only from a stored
+      # receipt; with none it is not_found and nothing is written
+      # (entry_api.yml rules.replay_only).
       def replay_only?(route, headers)
-        route == "destroy" && headers["Idempotency-Replay"] == "only"
+        REPLAY_ROUTES.include?(route) && headers["Idempotency-Replay"] == "only"
       end
 
       # In token mode, which stands in for the real service, a duration must be

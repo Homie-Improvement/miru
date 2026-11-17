@@ -204,6 +204,23 @@ RSpec.describe Timekeeping::EntryCommand, "replay-only header" do
     expect(replay.fingerprint).to eq(plain.fingerprint)
     expect([plain, other_value, empty_value, patch, create].map(&:replay_only)).to eq([false, false, false, false, false])
   end
+
+  # A retried bulk delete whose first attempt discarded every entry can only reach that attempt's
+  # stored answer through a replay-only call; bulk move keeps its entries visible and never needs one.
+  it "marks a bulk delete carrying Idempotency-Replay only as replay-only, and no bulk move or other header value" do
+    replay_header = { "Idempotency-Replay" => "only", "Ownership-Generation" => "replay-only" }
+    bulk_body = JSON.generate("entry_ids" => [41, 42])
+    replay = build_replay(:bulk_delete, replay_header, raw_body: bulk_body, entry_id: nil)
+    plain = build_replay(:bulk_delete, {}, raw_body: bulk_body, entry_id: nil)
+    other_value = build_replay(:bulk_delete, { "Idempotency-Replay" => "yes" }, raw_body: bulk_body, entry_id: nil)
+    move = build_replay(:bulk_move, replay_header, entry_id: nil,
+                                                   raw_body: JSON.generate("entry_ids" => [41, 42], "project_id" => 11))
+
+    expect(replay).to have_attributes(replay_only: true, actor_id: 7, company_id: 3, operation: "bulk_delete ",
+                                      key: "key-1", generation: "replay-only")
+    expect(replay.fingerprint).to eq(plain.fingerprint)
+    expect([plain, other_value, move].map(&:replay_only)).to eq([false, false, false])
+  end
 end
 
 RSpec.describe Timekeeping::EntryCommand do
