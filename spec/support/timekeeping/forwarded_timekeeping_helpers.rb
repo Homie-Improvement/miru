@@ -20,6 +20,12 @@ module TimekeepingForwardingHelpers
     route_timekeeping_to_fake(fake, base_url:)
   end
 
+  # The Idempotency-Key header of a request the fake recorded, matched without
+  # regard to case because the HTTP client may send the name in any case.
+  def forwarded_idempotency_key(request)
+    request.fetch(:headers).find { |key, _value| key.to_s.casecmp?("Idempotency-Key") }&.last
+  end
+
   # Sets the Timekeeping base URL and the user token signing key for the block,
   # so the importer forwards its writes, and puts both back afterwards.
   def with_forwarded_timekeeping_env(base_url = FORWARDED_TIMEKEEPING_BASE_URL, &block)
