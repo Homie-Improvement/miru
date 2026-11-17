@@ -509,42 +509,13 @@ RSpec.describe Timekeeping::Handoff::LegacySource do
   end
 end
 
-RSpec.describe Timekeeping::Handoff::LegacySource do
-  context "with a keyed legacy create before the first cutover", :two_tenant_seed, :seeded_without_transaction do
-    it "a keyed legacy create is carried into the first cutover checkpoint as one receipt and leaves the prepared receipts table untouched" do
-      expect(TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).monolith_store)
-        .to eq(TimekeepingOwnership::INITIAL_MONOLITH_STORE)
-      seeded = TimesheetEntry.joins(project: :client).where(clients: { company_id: fork_and_leaf.id }).order(:id).first
-      receipts_before = Timekeeping::LocalOwner::Receipt.count
-      context = Timekeeping::WriteContext.new(
-        company: fork_and_leaf, actor: seeded.user, actor_kind: "user",
-        request_id: "req-legacy-receipt-handoff", idempotency_key: "legacy-handoff-key-1"
-      )
-
-      created = Timekeeping::Gateway.new(context:).create(
-        user: seeded.user, project: seeded.project,
-        attributes: { duration: 45, work_date: Date.current, note: "legacy keyed create", bill_status: "unbilled" }
-      )
-
-      result = described_class.new(
-        connection: ActiveRecord::Base.connection,
-        recorded_disposition: YAML.load_file(Timekeeping::SeedDispositionRecorder::DEFAULT_PATH)
-      ).export(generation: 7, captured_at: Time.current)
-
-      rows = result.fetch(:checkpoint).rows
-      # The legacy receipt is carried into the checkpoint for Timekeeping, while the prepared
-      # receipts table stays empty until a rollback loads it.
-      expect(rows.fetch("idempotency_records").map { |row| JSON.parse(row["body"])["id"] }).to eq([created.id])
-      expect(Timekeeping::LocalOwner::Receipt.count).to eq(receipts_before)
-      expect(rows.fetch("entries").count { |row| row["id"] == created.id }).to eq(1)
-    end
-  end
-end
-
 RSpec.describe Timekeeping::Handoff::LegacySource, "legacy create receipts in the first checkpoint", :two_tenant_seed,
                :seeded_without_transaction do
   # "Carry legacy create receipts into the first cutover checkpoint, so a retry whose first attempt landed in legacy and whose retry arrives after the flip replays in Timekeeping instead of creating a second entry."
   it "exports a live keyed legacy create receipt as one Timekeeping create receipt holding the committed entry and leaves an expired one out" do
+    expect(TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).monolith_store)
+      .to eq(TimekeepingOwnership::INITIAL_MONOLITH_STORE)
+    receipts_before = Timekeeping::LocalOwner::Receipt.count
     company = fork_and_leaf
     user = company.users.find { |candidate| candidate.has_role?(:owner, company) || candidate.has_role?(:admin, company) }
     project = company.projects.find_by!(billable: true)
@@ -574,6 +545,10 @@ RSpec.describe Timekeeping::Handoff::LegacySource, "legacy create receipts in th
     answer = JSON.parse(receipt.fetch("body"))
     expect(answer).to include("id" => live.id, "company_id" => company.id, "user_id" => user.id, "note" => "Original note")
     expect(Timekeeping::Handoff::Checkpoint.verify(result[:checkpoint])).to eq([])
+    # The legacy receipt goes to Timekeeping in the checkpoint; the prepared receipts table stays
+    # empty until a rollback loads it.
+    expect(Timekeeping::LocalOwner::Receipt.count).to eq(receipts_before)
+    expect(result[:checkpoint].rows.fetch("entries").count { |row| row["id"] == live.id }).to eq(1)
   end
 end
 
