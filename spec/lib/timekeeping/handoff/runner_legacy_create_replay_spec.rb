@@ -153,7 +153,7 @@ RSpec.describe Timekeeping::Handoff::Runner, "legacy create key reused after the
   it "after the first cutover the same key with a different note is refused and a new key records exactly one entry" do
     company, project, user = legacy_replay_seeded_actor
     attributes = { duration: 30, work_date: Date.current, note: "Original legacy note", bill_status: "unbilled" }
-    legacy_replay_create(company:, project:, user:, key: "legacy-cutover-reuse-1", attributes:)
+    first = legacy_replay_create(company:, project:, user:, key: "legacy-cutover-reuse-1", attributes:)
 
     timekeeping = legacy_replay_cutover
 
@@ -164,11 +164,16 @@ RSpec.describe Timekeeping::Handoff::Runner, "legacy create key reused after the
                              attributes: attributes.merge(note: "Changed after the flip"))
       end.to raise_error(Timekeeping::EntryWriteClient::Rejected)
       expect(recorded).to eq([])
+      # The stub would also answer 422, so only the absence of any request shows
+      # the refusal was made locally, before anything was sent to Timekeeping.
+      expect(a_request(:post, %r{\Ahttp://timekeeping\.test/v1/companies/\d+/entries\z})).not_to have_been_made
 
       legacy_replay_create(company:, project:, user:, key: "legacy-cutover-reuse-2", attributes:)
     end
 
     expect(recorded.size).to eq(1)
     expect(recorded.first["note"]).to eq("Original legacy note")
+    expect(TimesheetEntry.unscoped.where(note: ["Original legacy note", "Changed after the flip"]).pluck(:id))
+      .to eq([first.id])
   end
 end

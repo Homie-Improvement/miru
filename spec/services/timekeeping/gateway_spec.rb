@@ -2897,40 +2897,6 @@ RSpec.describe Timekeeping::Gateway, ".all_reported?" do
   end
 end
 
-RSpec.describe Timekeeping::Gateway, "legacy create key reuse after the first cutover", committed_data: true do
-  # A key reused for different request values must neither replay the first
-  # entry nor record a second one, on either side of the flip.
-  it "after the first cutover a legacy client key reused with a different note is refused as idempotency_key_reused and nothing is sent to Timekeeping" do
-    company = create(:company)
-    project = create(:project, billable: true, client: create(:client, company:))
-    user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user:)
-    user.add_role :admin, company
-    context_for = lambda do |request_id|
-      Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id:,
-                                    idempotency_key: "reused-key-after-cutover")
-    end
-
-    first = described_class.new(context: context_for.call("req-reuse-legacy-1"))
-      .create(user:, project:, attributes: { duration: 30, work_date: Date.current, note: "First body",
-                                             bill_status: "unbilled" })
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
-    create_route = stub_request(:post, %r{\Ahttp://timekeeping\.test/v1/companies/\d+/entries\z})
-      .to_return(status: 500, body: "{}", headers: { "Content-Type" => "application/json" })
-
-    expect do
-      with_forwarded_timekeeping_env do
-        described_class.new(context: context_for.call("req-reuse-after-flip-1"))
-          .create(user:, project:, attributes: { duration: 30, work_date: Date.current, note: "Different body",
-                                                 bill_status: "unbilled" })
-      end
-    end.to raise_error(Timekeeping::EntryWriteClient::Rejected)
-
-    expect(create_route).not_to have_been_requested
-    expect(TimesheetEntry.unscoped.where(project_id: project.id).pluck(:id)).to eq([first.id])
-  end
-end
-
 RSpec.describe Timekeeping::Gateway do
   it "after the flip a keyed create in another company is not forwarded under a legacy receipt of the first company" do
     shared_key = "9b8a7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
