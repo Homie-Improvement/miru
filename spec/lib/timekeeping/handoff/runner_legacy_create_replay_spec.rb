@@ -158,12 +158,16 @@ RSpec.describe Timekeeping::Handoff::Runner, "legacy create key reused after the
     timekeeping = legacy_replay_cutover
 
     recorded = stub_legacy_replay_timekeeping(timekeeping, actor_id: user.id)
+    project_entry_ids = TimesheetEntry.unscoped.where(project_id: project.id).order(:id).pluck(:id)
+    expect(project_entry_ids).to include(first.id)
     with_forwarded_timekeeping_env do
       expect do
         legacy_replay_create(company:, project:, user:, key: "legacy-cutover-reuse-1",
                              attributes: attributes.merge(note: "Changed after the flip"))
       end.to raise_error(Timekeeping::EntryWriteClient::Rejected)
       expect(recorded).to eq([])
+      # The refused retry writes no legacy entry of any note to the project.
+      expect(TimesheetEntry.unscoped.where(project_id: project.id).order(:id).pluck(:id)).to eq(project_entry_ids)
       # The stub would also answer 422, so only the absence of any request shows
       # the refusal was made locally, before anything was sent to Timekeeping.
       expect(a_request(:post, %r{\Ahttp://timekeeping\.test/v1/companies/\d+/entries\z})).not_to have_been_made
