@@ -13,7 +13,10 @@ module HandoffRequests
     outbox_position: [:get, "/internal/v1/handoff/outbox_position", nil],
     correction_snapshots: [:put, "/internal/v1/handoff/correction_snapshots", { generation: 2, version: 1, snapshots: [] }],
     admission_fence: [:post, "/internal/v1/handoff/admission/fence", nil],
-    admission_admit: [:post, "/internal/v1/handoff/admission/admit", { generation: 7 }]
+    admission_admit: [:post, "/internal/v1/handoff/admission/admit", { generation: 7 }],
+    settle: [:post, "/internal/v1/handoff/settle", { generation: 7 }],
+    stop_applying: [:post, "/internal/v1/handoff/stop_applying", { generation: 7 }],
+    drain: [:post, "/internal/v1/handoff/drain", { through: 0 }]
   }.transform_values(&:freeze).freeze
 
   # A fresh service token per example, so no spec depends on another's value.
