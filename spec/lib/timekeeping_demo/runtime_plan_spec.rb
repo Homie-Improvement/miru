@@ -140,7 +140,13 @@ RSpec.describe TimekeepingDemo::RuntimePlan do
       "TIMEKEEPING_DATABASE_URL" => "postgres://shared_user@127.0.0.1:5432/timekeeping_demo"
     }
 
-    [shared_by_url, shared_by_db_user].each do |caller_env|
+    # libpq and Active Record also read the user from a `user` query parameter.
+    shared_by_query_user = {
+      "DATABASE_URL" => "postgres://shared_user@127.0.0.1:5432/miru_demo",
+      "TIMEKEEPING_DATABASE_URL" => "postgres://127.0.0.1:5432/timekeeping_demo?sslmode=disable&user=shared_user"
+    }
+
+    [shared_by_url, shared_by_db_user, shared_by_query_user].each do |caller_env|
       expect do
         described_class.build(root: Rails.root.to_s, procfile:, caller_env:, credentials:,
                               ports: { monolith: 3000, timekeeping: 3100 })

@@ -153,11 +153,21 @@ module TimekeepingDemo
       from_url || caller_env[MONOLITH_DATABASE_USER].then { |user| blank?(user) ? nil : user }
     end
 
+    # A database URL may name its user before the host or as a `user` query
+    # parameter; both libpq and Active Record read either form.
     def url_user(url)
-      user = URI.parse(url).user
-      blank?(user) ? nil : URI.decode_uri_component(user)
-    rescue URI::InvalidURIError
+      uri = URI.parse(url)
+      user = uri.user.then { |name| blank?(name) ? nil : URI.decode_uri_component(name) }
+      user || query_user(uri.query)
+    rescue URI::InvalidURIError, ArgumentError
       raise ConfigurationError, "A database URL could not be parsed"
+    end
+
+    def query_user(query)
+      return nil if query.nil?
+
+      user = URI.decode_www_form(query).assoc("user")&.last
+      blank?(user) ? nil : user
     end
 
     def blank?(value)
