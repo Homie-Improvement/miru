@@ -8,12 +8,12 @@ class Timekeeping::Internal::V1::Handoff::SettlingController < Timekeeping::Inte
 
   before_action :require_generation
 
-  # Answers whether a settle step is open, read back from the row, because
-  # begin_settling! changes nothing when writes are still admitted or the
-  # generation was already stopped.
+  # Answers whether this generation's settle step is open, read back from the
+  # row, because begin_settling! changes nothing when writes are still
+  # admitted, the generation was already stopped, or a newer one is settling.
   def settle
     Timekeeping::Admission.begin_settling!(generation:)
-    render json: { settling: Timekeeping::Admission.settling?,
+    render json: { settling: Timekeeping::Admission.current.settling_generation == generation,
                    prepared_operations: InvoiceOperation.where(state: "prepared").count }
   end
 

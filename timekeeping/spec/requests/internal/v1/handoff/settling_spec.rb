@@ -370,3 +370,23 @@ RSpec.describe "POST /internal/v1/handoff/settle and stop_applying without an ad
     end
   end
 end
+
+RSpec.describe "POST /internal/v1/handoff/settle for an older generation than the one settling", type: :request do
+  include_context "timekeeping entry writes without transactional fixtures"
+
+  around { |example| with_handoff_env(public_key: false) { example.run } }
+
+  # A late settle for generation 4 opens nothing while generation 5 settles, so
+  # it must not tell the runner its own step is open.
+  it "answers settling false and leaves the newer settle step open" do
+    Timekeeping::Admission.fence!
+    Timekeeping::Admission.begin_settling!(generation: 5)
+
+    post "/internal/v1/handoff/settle", params: JSON.generate(generation: 4),
+                                        headers: { "Content-Type" => "application/json",
+                                                   "Authorization" => "Bearer #{handoff_service_token}" }
+
+    expect([response.status, response.parsed_body]).to eq([200, { "settling" => false, "prepared_operations" => 0 }])
+    expect(Timekeeping::Admission.current.settling_generation).to eq(5)
+  end
+end
