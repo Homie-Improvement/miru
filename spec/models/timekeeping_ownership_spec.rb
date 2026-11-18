@@ -370,3 +370,17 @@ RSpec.describe TimekeepingOwnership, type: :model do
     expect(ownership.reload.handoff_begun?).to be(false)
   end
 end
+
+require "rails_helper"
+
+RSpec.describe TimekeepingOwnership, type: :model do
+  # "It is true when `handoff_step` is set or `admission_fenced_at` is set."
+  it "admission_closed? is true when handoff_step is set or admission_fenced_at is set, and false only when both are nil" do
+    fenced_at = Time.current
+
+    expect(described_class.new(handoff_step: nil, admission_fenced_at: nil).admission_closed?).to be(false)
+    expect(described_class.new(handoff_step: "close_admission", admission_fenced_at: nil).admission_closed?).to be(true)
+    expect(described_class.new(handoff_step: nil, admission_fenced_at: fenced_at).admission_closed?).to be(true)
+    expect(described_class.new(handoff_step: "settle", admission_fenced_at: fenced_at).admission_closed?).to be(true)
+  end
+end
