@@ -48,8 +48,9 @@ module TimekeepingDatabaseReset
     return nil unless env.key?(DATABASE_URL_KEY)
 
     url = env.fetch(DATABASE_URL_KEY)
-    TestDatabaseGuard.require_test_database!(database_name(url))
-    connection = connect(url)
+    name = database_name(url)
+    TestDatabaseGuard.require_test_database!(name)
+    connection = connect(url, name)
     return nil unless connection
 
     connection.transaction do
@@ -76,10 +77,15 @@ module TimekeepingDatabaseReset
   end
 
   # nil when the database does not exist yet, so there is nothing to empty.
-  def connect(url)
+  # Any other connection failure (server down, wrong password) raises, so a
+  # caller never runs on rows that were not reset. The new error names only the
+  # database and drops the original as its cause, which can carry the URL's host.
+  def connect(url, name)
     PG.connect(url)
-  rescue PG::ConnectionBad
-    nil
+  rescue PG::ConnectionBad => e
+    return nil if e.message.include?("database #{PG::Connection.quote_ident(name)} does not exist")
+
+    raise PG::ConnectionBad, "could not connect to the Timekeeping database #{name.inspect}", cause: nil
   end
 
   # One statement, so foreign keys between the tables need no ordering.

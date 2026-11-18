@@ -342,10 +342,11 @@ RSpec.describe "TimekeepingDatabaseReset.reset! on a non-test database" do
       [option[:keyword], option[:val]] if option[:val]
     end.to_h
     TestDatabaseGuard.require_test_database!(options["dbname"])
-    scratch_name = "timekeeping_owner_state_guard_scratch"
+    # A unique name, so this example never drops a database it did not create.
+    scratch_name = "timekeeping_owner_state_guard_scratch_#{SecureRandom.hex(6)}"
     admin = PG.connect(url)
-    admin.exec("DROP DATABASE IF EXISTS #{scratch_name}")
-    admin.exec("CREATE DATABASE #{scratch_name}")
+    admin.exec("CREATE DATABASE #{admin.quote_ident(scratch_name)}")
+    scratch_created = true
     scratch_options = options.merge("dbname" => scratch_name)
     scratch = PG.connect(scratch_options)
     scratch.exec("CREATE TABLE kept_rows (id integer)")
@@ -358,7 +359,7 @@ RSpec.describe "TimekeepingDatabaseReset.reset! on a non-test database" do
     expect(scratch.exec("SELECT count(*) FROM kept_rows").getvalue(0, 0).to_i).to eq(1)
   ensure
     scratch&.close
-    admin&.exec("DROP DATABASE IF EXISTS #{scratch_name}") if scratch_name
+    admin.exec("DROP DATABASE #{admin.quote_ident(scratch_name)}") if scratch_created
     admin&.close
   end
 end
@@ -528,6 +529,19 @@ RSpec.describe "Timekeeping owner state harness" do
     expect do
       TimekeepingDatabaseReset.reset!("bogus", env: { "TIMEKEEPING_DATABASE_URL" => "dbname=timekeeping_test" })
     end.to raise_error(ArgumentError)
+  end
+
+  it "reset! raises, naming only the database, when a _test database cannot be reached" do
+    password = "unreachable-secret-7d1e"
+    conninfo = "host=127.0.0.1 port=1 user=harness_user password=#{password} dbname=timekeeping_unreachable_test"
+
+    expect { TimekeepingDatabaseReset.reset!("legacy", env: { "TIMEKEEPING_DATABASE_URL" => conninfo }) }
+      .to raise_error(PG::ConnectionBad) { |error|
+        expect(error.message).to include("timekeeping_unreachable_test")
+        expect(error.message).not_to include(password)
+        expect(error.message).not_to include("127.0.0.1")
+        expect(error.cause).to be_nil
+      }
   end
 end
 
