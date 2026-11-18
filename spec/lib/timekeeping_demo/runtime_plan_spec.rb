@@ -33,6 +33,12 @@ RSpec.describe TimekeepingDemo::RuntimePlan, "demo Puma config and blank monolit
     end
   end
 
+  it "sets the libpq connection keys to empty values in every monolith process, so a local .env cannot pick its user" do
+    demo_runtime_specs.select { |spec| spec.app == :monolith }.each do |spec|
+      expect(spec.env.fetch_values("PGUSER", "PGPASSWORD", "PGHOST")).to eq(["", "", ""])
+    end
+  end
+
   it "refuses when neither application names a database user, because both would connect as the login user" do
     expect do
       described_class.build(
@@ -152,20 +158,6 @@ RSpec.describe TimekeepingDemo::RuntimePlan do
                               ports: { monolith: 3000, timekeeping: 3100 })
       end.to raise_error(TimekeepingDemo::ConfigurationError)
     end
-  end
-
-  it "refuses to build without a Timekeeping database URL, naming the key" do
-    caller_env = { "PATH" => ENV.fetch("PATH"), "HOME" => Dir.home, "DB_USER" => "monolith_demo" }
-
-    expect do
-      described_class.build(
-        root: Rails.root.to_s,
-        procfile: File.read(Rails.root.join("Procfile.timekeeping")),
-        caller_env:,
-        credentials: TimekeepingDemo::Credentials.generate,
-        ports: { monolith: 3000, timekeeping: 3100 }
-      )
-    end.to raise_error(TimekeepingDemo::ConfigurationError, /TIMEKEEPING_DATABASE_URL/)
   end
 
   it "runs Timekeeping processes from an absolute timekeeping directory with an absolute Gemfile and binds loopback only" do

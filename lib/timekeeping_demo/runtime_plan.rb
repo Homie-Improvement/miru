@@ -21,6 +21,9 @@ module TimekeepingDemo
     TIMEKEEPING_DATABASE_URL = "TIMEKEEPING_DATABASE_URL"
     MONOLITH_DATABASE_URL = "DATABASE_URL"
     MONOLITH_DATABASE_USER = "DB_USER"
+    # libpq reads an empty value of these as unset. PGSERVICE is left out on
+    # purpose: libpq looks up a service named "" and refuses to connect.
+    LIBPQ_CONNECTION_KEYS = %w[PGUSER PGPASSWORD PGHOST].freeze
 
     # directory: relative to the checkout root.
     # copied: caller keys passed on only when the caller sets them.
@@ -35,7 +38,9 @@ module TimekeepingDemo
         directory: ".",
         copied: %w[DB_HOST DB_POOL],
         always_set: [MONOLITH_DATABASE_URL, MONOLITH_DATABASE_USER, "DB_PASS"],
-        blanked: [TIMEKEEPING_DATABASE_URL],
+        # libpq falls back to the PG* keys when config/database.yml leaves the
+        # user or host blank, so a .env must not supply them either.
+        blanked: [TIMEKEEPING_DATABASE_URL, *LIBPQ_CONNECTION_KEYS],
         required: []
       },
       timekeeping: {

@@ -33,14 +33,20 @@ module TimekeepingDemo
     def run(specs, stop_signals:)
       stop_pipe, previous_handlers = trap_stop_signals(stop_signals)
       running = {}
+      # Each process leads its own group, whose id is the leader's pid. The
+      # groups are kept apart from the unreaped leaders because a leader can
+      # exit while processes it forked, such as queue workers, keep running.
+      groups = []
       specs.each do |spec|
-        running[spawn(spec, spec.argv, pgroup: true)] = spec.name
+        pid = spawn(spec, spec.argv, pgroup: true)
+        running[pid] = spec.name
+        groups << pid
         @output.puts "timekeeping-demo: started #{spec.name}"
       end
       exited = wait_for_stop_or_exit(running, stop_pipe.first)
       raise ProcessFailed, "#{exited.fetch(:name)} exited (#{exited.fetch(:status)}); stopped the rest" if exited
     ensure
-      stop(running) if running
+      stop(groups, running) if groups
       previous_handlers&.each { |signal, handler| Signal.trap(signal, handler) }
       stop_pipe&.each(&:close)
     end
@@ -72,26 +78,37 @@ module TimekeepingDemo
         end
       end
 
-      # Sends TERM to every process group, waits up to STOP_GRACE_SECONDS for
-      # them, then KILLs any group still running.
-      def stop(running)
-        running.each_key { |pid| signal_group("TERM", pid) }
+      # Sends TERM to every process group started, waits up to
+      # STOP_GRACE_SECONDS for every member of every group to exit, then KILLs
+      # any group still holding a process. A leader that was already reaped
+      # does not end its group: the processes it forked are still signalled.
+      def stop(groups, running)
+        groups.each { |group| signal_group("TERM", group) }
         deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + STOP_GRACE_SECONDS
-        until running.empty? || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+        loop do
+          # Reaping keeps an exited leader from staying in its group as a zombie.
           running.delete_if { |pid, _name| reaped?(pid) }
-          sleep POLL_SECONDS unless running.empty?
+          break if groups.none? { |group| group_alive?(group) }
+          break if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+
+          sleep POLL_SECONDS
         end
-        running.each_key do |pid|
-          signal_group("KILL", pid)
-          reap(pid)
-        end
+        groups.each { |group| signal_group("KILL", group) }
+        running.each_key { |pid| reap(pid) }
         running.clear
       end
 
-      def signal_group(signal, pid)
-        Process.kill(signal, -pid)
+      def signal_group(signal, group)
+        Process.kill(signal, -group)
       rescue Errno::ESRCH
         nil
+      end
+
+      def group_alive?(group)
+        Process.kill(0, -group)
+        true
+      rescue Errno::ESRCH
+        false
       end
 
       def reaped?(pid)

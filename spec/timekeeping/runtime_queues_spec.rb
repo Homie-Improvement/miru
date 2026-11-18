@@ -98,6 +98,13 @@ RSpec.describe "Timekeeping demo runtime queues", :two_tenant_seed, :seeded_with
       end
       expect(worker_queues.flatten.uniq).to match_array(dedicated_queues)
 
+      # Timekeeping runs only its relay worker, so no other queue (and no "*") has a worker there.
+      timekeeping_worker_queues = timekeeping.exec("SELECT metadata FROM solid_queue_processes WHERE kind = 'Worker'")
+        .column_values(0).flat_map do |metadata|
+          Array(JSON.parse(metadata || "{}")["queues"]).flat_map { |queues| queues.to_s.split(",") }.map(&:strip)
+        end
+      expect(timekeeping_worker_queues.uniq).to eq(["timekeeping_relay"])
+
       versions = JSON.parse(Rails.root.join("tmp/timekeeping-demo/versions.json").read)
       expect(versions.keys).to include("monolith", "timekeeping")
     ensure
