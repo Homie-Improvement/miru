@@ -309,6 +309,8 @@ RSpec.describe "TimekeepingDatabaseReset.reset! on the live Timekeeping database
 
     connection = PG.connect(url)
     migrations = connection.exec("SELECT count(*) FROM schema_migrations").getvalue(0, 0).to_i
+    metadata = connection.exec("SELECT key, value FROM ar_internal_metadata ORDER BY key").to_a
+    expect(metadata).not_to be_empty
     # "Use the column default (generation 1) when no state is set and for legacy, generation 2 for timekeeping,
     # and null (fenced, because the monolith owns) for rollback."
     { nil => 1, "legacy" => 1, "timekeeping" => 2, "rollback" => nil }.each do |state, generation|
@@ -322,6 +324,7 @@ RSpec.describe "TimekeepingDatabaseReset.reset! on the live Timekeeping database
       # "`reset!` deletes every table except ar_internal_metadata and schema_migrations."
       expect(connection.exec("SELECT count(*) FROM owner_state_reset_probe_rows").getvalue(0, 0).to_i).to eq(0)
       expect(connection.exec("SELECT count(*) FROM schema_migrations").getvalue(0, 0).to_i).to eq(migrations)
+      expect(connection.exec("SELECT key, value FROM ar_internal_metadata ORDER BY key").to_a).to eq(metadata)
       rows = connection.exec("SELECT id, generation FROM admission").to_a
       expect(rows.size).to eq(1), state.inspect
       expect(rows.first["id"].to_i).to eq(1)
@@ -409,6 +412,16 @@ RSpec.describe "Timekeeping owner state selection across cleaner resets", :witho
       expect(status.success?).to be(true), "#{state} probe failed:\n#{output}\n#{errors}"
       expect(output).to include("2 examples, 0 failures")
     end
+  end
+
+  # "An unset value leaves the suite unchanged."
+  it "with TIMEKEEPING_OWNER_STATE unset no hook rewrites the ownership row" do
+    probe = Rails.root.join("spec/fixtures/timekeeping_harness/unset_owner_state_probe.rb").to_s
+
+    output, errors, status = Open3.capture3({ "TIMEKEEPING_OWNER_STATE" => nil }, "bundle", "exec", "rspec", probe)
+
+    expect(status.success?).to be(true), "unset probe failed:\n#{output}\n#{errors}"
+    expect(output).to include("1 example, 0 failures")
   end
 end
 
