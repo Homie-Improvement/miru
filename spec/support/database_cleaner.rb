@@ -101,7 +101,8 @@ RSpec.configure do |config|
   end
 
   # Before as well as after (the after step is in spec/support/committed_data.rb):
-  # a tagged example starts from committed-empty tables whatever ran before it.
+  # a tagged example starts from committed-empty tables whatever ran before it,
+  # or, when it is also tagged :two_tenant_seed, from a freshly loaded seed.
   config.before(:each, committed_data: true) do |example|
     if TestDatabaseCleanup.seeded_committed?(example.metadata)
       TestDatabaseCleanup.reset_seeded_committed!(as_of: TestDatabaseCleanup.seed_as_of)
