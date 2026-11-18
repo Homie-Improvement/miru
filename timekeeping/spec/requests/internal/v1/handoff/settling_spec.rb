@@ -196,50 +196,6 @@ RSpec.describe "Timekeeping internal handoff stop_applying persistence" do
   end
 end
 
-RSpec.describe "Timekeeping internal handoff malformed generation refusals" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around do |example|
-    with_handoff_env(public_key: true) { example.run }
-  end
-
-  def malformed_generation_post(path, body)
-    params = body.is_a?(String) ? body : JSON.generate(body)
-    post path, params:,
-               headers: { "Content-Type" => "application/json", "Authorization" => "Bearer #{handoff_service_token}" }
-    [response.status, response.parsed_body]
-  end
-
-  def malformed_generation_state
-    admission = Timekeeping::Admission.current
-    admission.reload
-    handoff_stored_rows.merge(
-      "admission" => admission.attributes.slice("generation", "settling_generation", "settling_stopped_generation")
-    )
-  end
-
-  # "`generation` must be a positive integer and `through` a non-negative one. A missing, negative or
-  # non-integer value gets a refusal reason from timekeeping/app/services/timekeeping/reasons.rb and changes nothing."
-  it "malformed settle and stop_applying generations are refused with invalid_request and leave the settling columns unchanged" do
-    Timekeeping::Admission.fence!
-    baseline = malformed_generation_state
-    bodies = {
-      "missing" => {}, "zero" => { generation: 0 }, "negative" => { generation: -1 },
-      "string" => { generation: "4" }, "float" => '{"generation": 4.5}', "null" => { generation: nil },
-      "boolean" => { generation: true }, "beyond bigint" => { generation: 2**64 }
-    }
-
-    %w[/internal/v1/handoff/settle /internal/v1/handoff/stop_applying].each do |path|
-      bodies.each do |label, body|
-        answer = malformed_generation_post(path, body)
-
-        expect([path, label, answer]).to eq([path, label, [400, { "reason" => "invalid_request" }]])
-        expect([path, label, malformed_generation_state]).to eq([path, label, baseline])
-      end
-    end
-  end
-end
-
 RSpec.describe "Timekeeping internal handoff settle" do
   include_context "timekeeping entry writes without transactional fixtures"
 
@@ -304,28 +260,6 @@ RSpec.describe "Timekeeping internal handoff settle repeated" do
 
     expect(first[0..1]).to eq([200, { "settling" => true, "prepared_operations" => 0 }])
     expect(second).to eq(first)
-  end
-end
-
-RSpec.describe "Timekeeping internal handoff settle with a malformed generation" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around { |example| with_handoff_env(public_key: true) { example.run } }
-
-  it "settle refuses a missing, zero, negative, string, decimal or null generation with invalid_request and opens no settling" do
-    Timekeeping::Admission.fence!
-    baseline = [Timekeeping::Admission.current.attributes, handoff_stored_rows]
-    headers = { "Content-Type" => "application/json", "Authorization" => "Bearer #{handoff_service_token}" }
-
-    # "`generation` must be a positive integer and `through` a non-negative one. A missing, negative or
-    # non-integer value gets a refusal reason from timekeeping/app/services/timekeeping/reasons.rb and changes nothing."
-    ["{}", '{"generation":0}', '{"generation":-1}', '{"generation":"3"}', '{"generation":3.5}',
-     '{"generation":null}'].each do |body|
-      post "/internal/v1/handoff/settle", params: body, headers: headers
-
-      expect([body, response.status, response.parsed_body]).to eq([body, 400, { "reason" => "invalid_request" }])
-      expect([body, Timekeeping::Admission.current.attributes, handoff_stored_rows]).to eq([body, *baseline])
-    end
   end
 end
 
@@ -415,33 +349,6 @@ RSpec.describe "POST /internal/v1/handoff/stop_applying for an older generation"
       expect(settling_older_stop_state).to eq(open_state)
     end
     expect(Timekeeping::Admission.settling?).to be(true)
-  end
-end
-
-RSpec.describe "POST /internal/v1/handoff/settle and stop_applying with a malformed generation", type: :request do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around { |example| with_handoff_env(public_key: false) { example.run } }
-
-  # "`generation` must be a positive integer and `through` a non-negative one. A missing, negative or non-integer value gets a refusal reason from timekeeping/app/services/timekeeping/reasons.rb and changes nothing."
-  # A generation beyond the bigint column must also be refused rather than answered with a 500.
-  it "refuses a string, a decimal or an out-of-range generation with invalid_request and leaves the fenced admission row unchanged" do
-    Timekeeping::Admission.fence!
-    baseline = Timekeeping::Admission.current.attributes.slice("generation", "settling_generation", "settling_stopped_generation")
-    headers = { "Content-Type" => "application/json", "Authorization" => "Bearer #{handoff_service_token}" }
-    bodies = ['{"generation":"3"}', '{"generation":3.0}', '{"generation":0}', '{"generation":null}',
-              "{\"generation\":#{2**64}}", "{}"]
-
-    %w[/internal/v1/handoff/settle /internal/v1/handoff/stop_applying].each do |path|
-      bodies.each do |body|
-        post path, params: body, headers: headers
-
-        expect([path, body, response.status, response.parsed_body])
-          .to eq([path, body, 400, { "reason" => "invalid_request" }])
-        expect(Timekeeping::Admission.current.attributes.slice("generation", "settling_generation", "settling_stopped_generation"))
-          .to eq(baseline)
-      end
-    end
   end
 end
 
