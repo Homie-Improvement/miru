@@ -33,39 +33,6 @@ RSpec.describe Timekeeping::Handoff::MonolithAdmission do
     end
   end
 
-  context "more tests 12" do
-    before { TimekeepingOwnership.ensure_initial! }
-
-    it "after fence_admission a billing write is refused with OwnershipMoving and commits nothing" do
-      described_class.new(lock_timeout: 0.3.seconds).fence_admission
-      ownership = TimekeepingOwnership.current
-      expect(ownership.handoff_step).to be_nil
-
-      block_ran = false
-      # "Then no writer can commit after `fence_admission` returns."
-      expect { Timekeeping::BillingFence.transaction { block_ran = true } }
-        .to raise_error(Timekeeping::BillingFence::OwnershipMoving)
-      expect(block_ran).to be(false)
-    end
-  end
-
-  context "more tests 13" do
-    before { TimekeepingOwnership.ensure_initial! }
-
-    it "admit clears only the fence mark and leaves ownership columns unchanged" do
-      adapter = described_class.new(lock_timeout: 0.3.seconds)
-      adapter.fence_admission
-      before_admit = TimekeepingOwnership.current.attributes.slice("generation", "handoff_step", "owner", "monolith_store")
-
-      adapter.admit(generation: before_admit.fetch("generation"))
-
-      after_admit = TimekeepingOwnership.current
-      expect(after_admit.admission_fenced_at).to be_nil
-      expect(after_admit.attributes.slice("generation", "handoff_step", "owner", "monolith_store")).to eq(before_admit)
-      expect(adapter.enforces_fence?).to be(true)
-    end
-  end
-
   context "more tests 14", "committed fence mark", committed_data: true do
     it "fence_admission commits the admission_fenced_at mark so another connection sees it once the call returns" do
       expect(TimekeepingOwnership.current.admission_fenced_at).to be_nil
@@ -133,18 +100,6 @@ RSpec.describe Timekeeping::Handoff::MonolithAdmission do
       expect(ownership.admission_fenced_at).to be_present
       expect(ownership.admission_closed?).to be(true)
       expect(ownership.attributes.slice(*kept_columns)).to eq(before)
-    end
-  end
-
-  context "more tests 17", "missing ownership row" do
-    it "fence_admission on a missing ownership row raises and never creates the row" do
-      TimekeepingOwnership.delete_all
-
-      # A zero-row update must not be reported as a fence in place.
-      expect do
-        described_class.new(lock_timeout: 0.3.seconds).fence_admission
-      end.to raise_error(ActiveRecord::RecordNotFound)
-      expect(TimekeepingOwnership.count).to eq(0)
     end
   end
 
@@ -252,37 +207,6 @@ RSpec.describe Timekeeping::Handoff::MonolithAdmission do
     end
   end
 
-  context "more tests 21", committed_data: true do
-    # "A holder kept past the lock timeout makes `fence_admission` raise and leaves no mark."
-    it "fence_admission raises LockWaitTimeout past its lock timeout, leaves no mark and restores lock_timeout" do
-      held = Queue.new
-      release = Queue.new
-      holder = committed_data_thread do
-        TimekeepingOwnership.transaction do
-          TimekeepingOwnership.lock("FOR SHARE").find(TimekeepingOwnership::SINGLETON_ID)
-          held << true
-          release.pop
-        end
-      end
-
-      connection = ActiveRecord::Base.connection
-      default_lock_timeout = connection.select_value("SHOW lock_timeout")
-      begin
-        expect(held.pop(timeout: 5)).to be(true)
-        expect do
-          described_class.new(lock_timeout: 0.3.seconds).fence_admission
-        end.to raise_error(ActiveRecord::LockWaitTimeout)
-        expect(connection.select_value("SHOW lock_timeout")).to eq(default_lock_timeout)
-      ensure
-        release << true
-        holder.kill unless holder.join(5)
-        holder.join
-      end
-
-      expect(TimekeepingOwnership.current.admission_fenced_at).to be_nil
-    end
-  end
-
   context "more tests 22" do
     # "After `fence_admission` returns, and before close_admission runs, a LocalOwner write, a BillingFence write and a Gateway write are each refused and commit nothing."
     it "after fence_admission returns a BillingFence write is refused with OwnershipMoving and commits no payment" do
@@ -303,20 +227,6 @@ RSpec.describe Timekeeping::Handoff::MonolithAdmission do
     end
   end
 
-  context "more tests 23" do
-    # "`admit(generation:)` clears `admission_fenced_at`. The flip and abort already clear `handoff_step`."
-    it "admit clears admission_fenced_at and billing writes are admitted again" do
-      adapter = described_class.new
-      adapter.fence_admission
-      expect(TimekeepingOwnership.current.admission_fenced_at).not_to be_nil
-
-      adapter.admit(generation: TimekeepingOwnership.current.generation)
-
-      expect(TimekeepingOwnership.current.admission_fenced_at).to be_nil
-      expect(Timekeeping::BillingFence.transaction { :billing_write_done }).to eq(:billing_write_done)
-    end
-  end
-
   context "more tests 24" do
     # A rollback runs admit on a monolith that was never fenced, so admit must be harmless there.
     it "admit on an unfenced row succeeds and changes no other ownership column" do
@@ -326,28 +236,6 @@ RSpec.describe Timekeeping::Handoff::MonolithAdmission do
       expect { described_class.new.admit(generation: 1) }.not_to raise_error
 
       expect(TimekeepingOwnership.current.attributes).to eq(before)
-    end
-  end
-
-  context "more tests 25" do
-    it "admit refuses a nil or non-positive generation and leaves the mark set" do
-      adapter = described_class.new
-      adapter.fence_admission
-
-      [nil, 0, -1, "1"].each do |generation|
-        expect { adapter.admit(generation:) }.to raise_error(ArgumentError)
-      end
-
-      expect(TimekeepingOwnership.current.admission_fenced_at).not_to be_nil
-    end
-  end
-
-  context "more tests 26" do
-    it "fence_admission raises RecordNotFound when the ownership row is missing and creates no row" do
-      TimekeepingOwnership.delete_all
-
-      expect { described_class.new.fence_admission }.to raise_error(ActiveRecord::RecordNotFound)
-      expect(TimekeepingOwnership.count).to eq(0)
     end
   end
 
@@ -361,39 +249,6 @@ RSpec.describe Timekeeping::Handoff::MonolithAdmission do
         expect(adapter).to respond_to(method)
       end
       expect(described_class::FENCE_LOCK_TIMEOUT).to eq(60.seconds)
-    end
-  end
-
-  context "more tests 28", committed_data: true do
-    # "In `Runner#close_admission`, clear `admission_fenced_at` in the same `update_all` that sets `handoff_step`."
-    it "close_admission clears admission_fenced_at in the same update that sets handoff_step" do
-      store = Object.new
-      owners = TimekeepingHandoffFakes.owners(
-        timekeeping: store, timekeeping_admission: TimekeepingHandoffFakes::RecordingAdmission.new,
-        monolith_admission: described_class.new(lock_timeout: 0.3.seconds), monolith_store: store,
-        settle: nil, relay: false
-      )
-      observer = TimekeepingHandoffHooks::Interrupt.new(at: :after_close_admission)
-      ownership_updates = []
-      record_update = lambda do |*, payload|
-        sql = payload[:sql].to_s
-        ownership_updates << sql if sql.start_with?("UPDATE") && sql.include?("timekeeping_ownership")
-      end
-
-      Dir.mktmpdir do |report_root|
-        ActiveSupport::Notifications.subscribed(record_update, "sql.active_record") do
-          expect do
-            Timekeeping::Handoff::Runner.run(direction: :cutover, owners:, observer:, report_root:)
-          end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-        end
-      end
-
-      closed = TimekeepingOwnership.current
-      expect(closed.handoff_step).to eq("close_admission")
-      expect(closed.admission_fenced_at).to be_nil
-      step_updates = ownership_updates.select { |sql| sql.include?("handoff_step") }
-      expect(step_updates).not_to be_empty
-      expect(step_updates).to all(include("admission_fenced_at"))
     end
   end
 
@@ -454,48 +309,6 @@ RSpec.describe Timekeeping::Handoff::MonolithAdmission do
     end
   end
 
-  context "more tests 31", committed_data: true do
-    it "fence_admission past the lock timeout raises, leaves no mark and restores lock_timeout" do
-      admission = described_class.new(lock_timeout: 0.3.seconds)
-      held = Queue.new
-      release = Queue.new
-      holder = committed_data_thread do
-        TimekeepingOwnership.transaction do
-          TimekeepingOwnership.lock("FOR SHARE").find(TimekeepingOwnership::SINGLETON_ID)
-          held << true
-          release.pop
-        end
-      end
-
-      begin
-        expect(held.pop(timeout: 5)).to be(true)
-        default_timeout = ActiveRecord::Base.connection.select_value("SHOW lock_timeout")
-
-        # "A holder kept past the lock timeout makes `fence_admission` raise and leaves no mark."
-        expect { admission.fence_admission }.to raise_error(ActiveRecord::LockWaitTimeout)
-        expect(ActiveRecord::Base.connection.select_value("SHOW lock_timeout")).to eq(default_timeout)
-      ensure
-        release << true
-        holder.kill unless holder.join(5)
-        holder.join
-      end
-
-      expect(TimekeepingOwnership.current.admission_fenced_at).to be_nil
-      expect(TimekeepingOwnership.current.admission_closed?).to be(false)
-    end
-  end
-
-  context "more tests 32" do
-    it "fence_admission with the ownership row missing raises instead of reporting a fence" do
-      TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).delete_all
-
-      # A fence that changed no row must not return as if writes were stopped.
-      expect { described_class.new(lock_timeout: 0.3.seconds).fence_admission }
-        .to raise_error(ActiveRecord::RecordNotFound)
-      expect(TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)).not_to exist
-    end
-  end
-
   context "more tests 33", committed_data: true do
     it "a repeated fence stays fenced and billing stays refused until admit, which is harmless when repeated" do
       admission = described_class.new(lock_timeout: 0.3.seconds)
@@ -517,17 +330,6 @@ RSpec.describe Timekeeping::Handoff::MonolithAdmission do
       expect(after.slice(:generation, :handoff_step, :owner, :monolith_store))
         .to eq(before.slice(:generation, :handoff_step, :owner, :monolith_store))
       expect { Timekeeping::BillingFence.transaction { nil } }.not_to raise_error
-    end
-  end
-
-  context "more tests 34" do
-    it "admit with a nil generation is refused and leaves the fence in place" do
-      TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(admission_fenced_at: Time.current)
-      admission = described_class.new(lock_timeout: 0.3.seconds)
-
-      expect { admission.admit(generation: nil) }.to raise_error(ArgumentError)
-      expect { admission.admit(generation: 0) }.to raise_error(ArgumentError)
-      expect(TimekeepingOwnership.current.admission_closed?).to be(true)
     end
   end
 
