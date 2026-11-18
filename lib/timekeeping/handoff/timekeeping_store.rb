@@ -22,6 +22,19 @@ module Timekeeping
       CORRECTION_SNAPSHOTS_PATH = "/internal/v1/handoff/correction_snapshots"
       FENCE_PATH = "/internal/v1/handoff/admission/fence"
       ADMIT_PATH = "/internal/v1/handoff/admission/admit"
+      SETTLE_PATH = "/internal/v1/handoff/settle"
+      STOP_APPLYING_PATH = "/internal/v1/handoff/stop_applying"
+      DRAIN_PATH = "/internal/v1/handoff/drain"
+
+      # A refusal reason is copied into Store::Error only in the shape every
+      # Timekeeping reason has, so an answer that echoes the bearer or any
+      # other text never puts it into a message or a log.
+      REASON_FORMAT = /\A[a-z_]{1,64}\z/
+
+      # What Timekeeping answered to a settle request: whether its settle step
+      # is open after the call, and how many invoice operations are still
+      # prepared.
+      SettleAnswer = Data.define(:settling, :prepared_operations)
 
       OPEN_TIMEOUT_SECONDS = 5
       # A whole checkpoint loads in one request, and a fence waits up to 60 s
@@ -86,6 +99,22 @@ module Timekeeping
         nil
       end
 
+      def settle(generation:)
+        body = request(:post, SETTLE_PATH, JSON.generate("generation" => generation))
+        SettleAnswer.new(settling: boolean_field(body, "settling"),
+                         prepared_operations: integer_field(body, "prepared_operations"))
+      end
+
+      def stop_applying(generation:)
+        request(:post, STOP_APPLYING_PATH, JSON.generate("generation" => generation))
+        nil
+      end
+
+      # Whether every outbox snapshot at or below through has been sent.
+      def drain(through:)
+        boolean_field(request(:post, DRAIN_PATH, JSON.generate("through" => through)), "drained")
+      end
+
       private
 
         # Returns the body of a 200 answer.
@@ -119,7 +148,8 @@ module Timekeeping
           request
         end
 
-        # Names the reason Timekeeping answered with, when the body holds one.
+        # Names the reason Timekeeping answered with, when the body holds one
+        # in REASON_FORMAT.
         def refuse_answer!(method, path, response)
           reason = begin
             JSON.parse(response.body.to_s)["reason"] if response.body.present?
@@ -127,16 +157,31 @@ module Timekeeping
             nil
           end
           message = "Timekeeping #{method.upcase} #{path} answered #{response.code}"
-          message += " #{reason}" if reason.is_a?(String)
+          message += " #{reason}" if reason.is_a?(String) && reason.match?(REASON_FORMAT)
           raise Store::Error, message
         end
 
         def integer_field(body, key)
-          answer = JSON.parse(body)
-          value = answer[key] if answer.is_a?(Hash)
+          value = answer_field(body, key)
           return value if value.is_a?(Integer)
 
           raise Store::Error, "Timekeeping answered without an integer #{key}"
+        end
+
+        # Only a JSON true or false: a quoted "true" or a 1 is refused, so a
+        # garbled answer is never read as a yes.
+        def boolean_field(body, key)
+          value = answer_field(body, key)
+          return value if [true, false].include?(value)
+
+          raise Store::Error, "Timekeeping answered without a boolean #{key}"
+        end
+
+        # The key's value in a JSON object answer, or nil when the answer is
+        # not an object.
+        def answer_field(body, key)
+          answer = JSON.parse(body)
+          answer[key] if answer.is_a?(Hash)
         rescue JSON::ParserError => error
           raise Store::Error, "Timekeeping answered an unreadable body: #{error.class}"
         end
