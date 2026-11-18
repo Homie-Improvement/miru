@@ -168,6 +168,22 @@ RSpec.describe "IntegratedRuntime" do
     expect(Process).not_to have_received(:spawn)
     expect(TimekeepingDatabaseReset).not_to have_received(:reset!)
   end
+
+  it "start refuses a caller DATABASE_URL naming a non-test monolith database before anything is spawned" do
+    allow(TimekeepingDatabaseReset).to receive(:reset!)
+    allow(Process).to receive(:spawn).and_call_original
+    env = {
+      "PATH" => ENV.fetch("PATH", ""),
+      "DATABASE_URL" => "postgres://harness_child_monolith_user@127.0.0.1:5432/miru_web_development",
+      "TIMEKEEPING_DATABASE_URL" => "postgres://harness_child_timekeeping_user@127.0.0.1:5432/timekeeping_child_guard_test"
+    }
+
+    # The launcher's monolith uses the caller's DATABASE_URL, so that database is the one that must end in _test.
+    expect { IntegratedRuntime.start(root: Rails.root.to_s, env:) }
+      .to raise_error(TestDatabaseGuard::NotATestDatabase, /miru_web_development/)
+    expect(Process).not_to have_received(:spawn)
+    expect(TimekeepingDatabaseReset).not_to have_received(:reset!)
+  end
 end
 
 RSpec.describe "IntegratedRuntime" do

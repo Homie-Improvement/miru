@@ -256,7 +256,7 @@ RSpec.describe TimekeepingDemo::CLI, "up with caller-supplied credentials" do
       supplied.to_env.each_value do |value|
         expect((monolith.values + timekeeping.values).include?(value)).to be(false)
       end
-      expect(monolith[token] == timekeeping[token]).to be(true)
+      expect(monolith.fetch(token) == timekeeping.fetch(token)).to be(true)
       signer = OpenSSL::PKey::RSA.new(monolith.fetch(private_key))
       verifier = OpenSSL::PKey::RSA.new(timekeeping.fetch(public_key))
       signature = signer.sign("SHA256", "timekeeping-demo")
@@ -476,7 +476,8 @@ RSpec.describe TimekeepingDemo::CLI, "up with an incomplete caller credential se
       public_key = OpenSSL::PKey::RSA.new(public_pem)
       signature = private_key.sign("SHA256", "timekeeping harness check")
       expect(public_key.verify("SHA256", signature, "timekeeping harness check")).to be(true)
-      expect(monolith.env["TIMEKEEPING_SERVICE_TOKEN"] == timekeeping.env["TIMEKEEPING_SERVICE_TOKEN"]).to be(true)
+      # fetch, so a token missing from both apps fails here instead of comparing nil to nil.
+      expect(monolith.env.fetch("TIMEKEEPING_SERVICE_TOKEN") == timekeeping.env.fetch("TIMEKEEPING_SERVICE_TOKEN")).to be(true)
 
       supplied_values = complete.values
       all_values = started.flat_map { |spec| spec.env.values }

@@ -50,6 +50,10 @@ class IntegratedRuntime
   def self.start(root:, env:, owner_state: TimekeepingOwnerState::SELECTED)
     refuse_if_running!(root:)
     TestDatabaseGuard.require_test_database!(monolith_database_name)
+    # The launcher's monolith prefers a caller DATABASE_URL over the test
+    # process's own database, so that target is checked as well.
+    child_monolith_url = env[TimekeepingDemo::RuntimePlan::MONOLITH_DATABASE_URL].to_s
+    TestDatabaseGuard.require_test_database!(TimekeepingDatabaseReset.database_name(child_monolith_url)) unless child_monolith_url.strip.empty?
     TestDatabaseGuard.require_test_database!(timekeeping_database_name(env))
     credentials = TimekeepingDemo::Credentials.generate
     ports = { monolith: free_port, timekeeping: free_port }
@@ -77,7 +81,7 @@ class IntegratedRuntime
   def self.parse_groups(text)
     # A last line with no newline may be a partial write ("424" of "4242"),
     # which could name a group this harness never started.
-    text.each_line.select { |line| line.end_with?("\n") }.map(&:chomp).grep(GROUP_LINE).map { |line| Integer(line, 10) }.select { |id| id >= SMALLEST_GROUP }
+    text.each_line.filter_map { |line| line.chomp if line.end_with?("\n") }.grep(GROUP_LINE).map { |line| Integer(line, 10) }.select { |id| id >= SMALLEST_GROUP }
   end
 
   # The launcher's spawn environment, arguments and options. The credentials

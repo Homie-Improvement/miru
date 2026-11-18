@@ -4,7 +4,10 @@ require "rails_helper"
 require "json"
 require "open3"
 
-RSpec.describe "IntegratedRuntime live examples without TIMEKEEPING_LIVE" do
+# Outside the example transaction: the child rspec truncates this same test
+# database in its before(:suite), and an open transaction holding the
+# ownership row lock would make that truncation wait on this example forever.
+RSpec.describe "IntegratedRuntime live examples without TIMEKEEPING_LIVE", :without_transaction do
   # "Live tests skip unless `TIMEKEEPING_LIVE=1`. They live in spec/lib/timekeeping_demo."
   it "the live harness examples report skipped and never fail when TIMEKEEPING_LIVE is unset" do
     live_spec = Rails.root.join("spec/lib/timekeeping_demo/integrated_runtime_live_spec.rb").to_s
