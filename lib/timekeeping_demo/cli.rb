@@ -5,9 +5,9 @@ require "json"
 
 module TimekeepingDemo
   # The `bin/timekeeping-demo` command. `up` takes the caller's complete
-  # credential set or makes a fresh one, plans
-  # the processes from Procfile.timekeeping, prepares both databases, records
-  # the running versions and hands the processes to the supervisor.
+  # credential set or makes a fresh one, plans the processes from
+  # Procfile.timekeeping, prepares both databases, records the running
+  # versions and hands the processes to the supervisor.
   module CLI
     EX_OK = 0
     EX_FAILURE = 1
