@@ -584,4 +584,98 @@ RSpec.describe Timekeeping::Handoff::MonolithAdmission do
     expect(TimekeepingOwnership.current.admission_fenced_at).not_to be_nil
   end
   end
+
+  context "close admission that does not complete", committed_data: true do
+    # The real adapter, plus a step run right after its fence commits, so an
+    # example can change the row between the fence and the runner's update.
+    let(:after_fence_admission_class) do
+      Class.new(SimpleDelegator) do
+        def initialize(adapter, after_fence)
+          super(adapter)
+          @after_fence = after_fence
+        end
+
+        def fence_admission
+          __getobj__.fence_admission
+          @after_fence.call
+          nil
+        end
+      end
+    end
+
+    def close_admission_owners(monolith_admission)
+      store = Object.new
+      {
+        monolith: Timekeeping::Handoff::Owner.new(name: "monolith", store:, admission: monolith_admission,
+                                                  settle: nil, drain: nil),
+        timekeeping: Timekeeping::Handoff::Owner.new(name: "timekeeping", store:,
+                                                     admission: TimekeepingHandoffFakes::RecordingAdmission.new,
+                                                     settle: nil, drain: nil)
+      }
+    end
+
+    it "keeps admission_fenced_at when the close_admission update matches no row" do
+      step_set_elsewhere = lambda do
+        TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(handoff_step: "settle")
+      end
+      monolith_admission = after_fence_admission_class.new(described_class.new(lock_timeout: 0.3.seconds),
+                                                           step_set_elsewhere)
+
+      Dir.mktmpdir do |report_root|
+        expect do
+          Timekeeping::Handoff::Runner.run(direction: :cutover, owners: close_admission_owners(monolith_admission),
+                                           report_root:, close_admission_lock_timeout: 0.3.seconds)
+        end.to raise_error(Timekeeping::Handoff::Runner::Refused)
+      end
+
+      # "It fails closed, not open."
+      ownership = TimekeepingOwnership.current
+      expect(ownership.admission_fenced_at).not_to be_nil
+      expect(ownership.handoff_step).to eq("settle")
+      expect(ownership.generation).to eq(1)
+    end
+
+    it "keeps admission_fenced_at after a close_admission lock timeout until an abort run admits the monolith" do
+      held = Queue.new
+      release = Queue.new
+      billing_write = nil
+      # The holder starts only after the fence commits, so only the runner's own update waits on it.
+      start_holder = lambda do
+        billing_write = committed_data_thread do
+          TimekeepingOwnership.transaction do
+            TimekeepingOwnership.lock("FOR SHARE").find(TimekeepingOwnership::SINGLETON_ID)
+            held << true
+            release.pop
+          end
+        end
+        raise "the FOR SHARE holder did not start" unless held.pop(timeout: 5)
+      end
+      monolith_admission = after_fence_admission_class.new(described_class.new(lock_timeout: 0.3.seconds), start_holder)
+      owners = close_admission_owners(monolith_admission)
+
+      Dir.mktmpdir do |report_root|
+        begin
+          expect do
+            Timekeeping::Handoff::Runner.run(direction: :cutover, owners:, report_root:,
+                                             close_admission_lock_timeout: 0.3.seconds)
+          end.to raise_error(Timekeeping::Handoff::Runner::Refused)
+        ensure
+          release << true
+          billing_write&.join(5) || billing_write&.kill&.join
+        end
+
+        # "if close_admission fails after the fence, the monolith stays closed until a later run succeeds or `admit` runs"
+        timed_out = TimekeepingOwnership.current
+        expect(timed_out.handoff_step).to be_nil
+        expect(timed_out.admission_fenced_at).not_to be_nil
+        expect(timed_out.admission_closed?).to be(true)
+
+        Timekeeping::Handoff::Runner.run(direction: :cutover, abort: true, owners:, report_root:)
+      end
+
+      reopened = TimekeepingOwnership.current
+      expect(reopened.admission_fenced_at).to be_nil
+      expect(reopened.attributes.slice("generation", "handoff_step")).to eq("generation" => 1, "handoff_step" => nil)
+    end
+  end
 end

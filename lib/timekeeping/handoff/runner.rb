@@ -161,8 +161,10 @@ module Timekeeping
         # at generation 1; then the monolith adapter when the monolith is
         # outgoing. Fencing again is harmless. The row update then waits for
         # billing writes holding the row FOR SHARE, for at most the lock
-        # timeout, and raises the generation, records the step and clears P
-        # in one transaction, so a timeout changes none of them.
+        # timeout, and raises the generation, records the step, clears P and
+        # lifts the monolith adapter's admission_fenced_at mark in one
+        # statement, so a timeout changes none of them and admission moves
+        # from the mark to handoff_step with no moment open between them.
         def close_admission
           owner("timekeeping").admission.fence_admission
           outgoing.admission.fence_admission if outgoing.equal?(owner("monolith"))
@@ -173,7 +175,7 @@ module Timekeeping
             TimekeepingOwnership.connection.execute("SET LOCAL lock_timeout = '#{timeout_ms}ms'")
             TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID, handoff_step: nil, generation: read_generation)
               .update_all(generation: read_generation + 1, handoff_step: "close_admission", final_outbox_position: nil,
-                          changed_at: Time.current, changed_by: CHANGED_BY)
+                          admission_fenced_at: nil, changed_at: Time.current, changed_by: CHANGED_BY)
           end
           raise Refused, "The ownership row changed while admission was closing; run again" unless updated == 1
 
