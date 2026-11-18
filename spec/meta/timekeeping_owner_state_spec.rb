@@ -1,4 +1,8 @@
+# frozen_string_literal: true
+
 require "rails_helper"
+require "open3"
+require "pg"
 
 RSpec.describe "Timekeeping owner state harness" do
   # "So `reset!` refuses unless the database name in `TIMEKEEPING_DATABASE_URL` ends in `_test`, as every CI database in .github/workflows/validations.yml does. The error names only the database, never the URL."
@@ -23,8 +27,6 @@ RSpec.describe "Timekeeping owner state harness" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping owner state harness" do
   # "So `reset!` refuses unless the database name in `TIMEKEEPING_DATABASE_URL` ends in `_test`, as every CI database in .github/workflows/validations.yml does. The error names only the database, never the URL."
   it "reset! with no state set still refuses a non _test database given in keyword form" do
@@ -40,8 +42,6 @@ RSpec.describe "Timekeeping owner state harness" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping owner state harness" do
   # "So `reset!` refuses unless the database name in `TIMEKEEPING_DATABASE_URL` ends in `_test`, as every CI database in .github/workflows/validations.yml does."
   it "require_test_database! accepts only names ending in _test" do
@@ -55,8 +55,6 @@ RSpec.describe "Timekeeping owner state harness" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping owner state harness" do
   # "`reset!` does nothing when `TIMEKEEPING_DATABASE_URL` is unset or the database does not exist yet."
   it "reset! does nothing when TIMEKEEPING_DATABASE_URL is unset" do
@@ -66,8 +64,6 @@ RSpec.describe "Timekeeping owner state harness" do
     expect(PG).not_to have_received(:connect)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "TimekeepingOwnerState.apply! persistence" do
   it "apply! of each state over a row with handoff_step freeze persists exactly that state's columns, and repeating it changes nothing" do
@@ -107,8 +103,6 @@ RSpec.describe "TimekeepingOwnerState.apply! persistence" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "TimekeepingOwnerState.apply! refusal" do
   it "apply! of an unknown name raises ArgumentError and leaves the stored ownership row unchanged" do
     TimekeepingOwnership.ensure_initial!
@@ -123,9 +117,6 @@ RSpec.describe "TimekeepingOwnerState.apply! refusal" do
     expect(TimekeepingOwnership.current.attributes).to eq(before)
   end
 end
-
-require "rails_helper"
-require "pg"
 
 RSpec.describe "TimekeepingDatabaseReset.reset! guard" do
   it "reset! refuses a database whose name does not end in _test before connecting, naming only the database" do
@@ -144,10 +135,6 @@ RSpec.describe "TimekeepingDatabaseReset.reset! guard" do
     expect(PG).not_to have_received(:connect)
   end
 end
-
-require "rails_helper"
-require "open3"
-require "pg"
 
 RSpec.describe "TimekeepingDatabaseReset.reset! admission row" do
   it "reset! leaves exactly one admission row at each state's generation, and a repeated reset gives the same row" do
@@ -187,8 +174,6 @@ RSpec.describe "TimekeepingDatabaseReset.reset! admission row" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "TimekeepingOwnerState.selected" do
   it "selected accepts only the exact state names and returns nil only when the key is absent" do
     # "`TimekeepingOwnerState.selected(env)` returns nil only when the key is absent. Any value other than exactly
@@ -208,8 +193,6 @@ RSpec.describe "TimekeepingOwnerState.selected" do
     end
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "TimekeepingOwnerState.apply!" do
   it "apply! of each state over a row mid-handoff writes exactly that state's columns" do
@@ -243,8 +226,6 @@ RSpec.describe "TimekeepingOwnerState.apply!" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "TimekeepingOwnerState.apply! row handling" do
   it "apply! creates a missing row and refuses an unknown name without touching the row" do
     # "When the row is missing, it creates it first with `ensure_initial!`."
@@ -262,8 +243,6 @@ RSpec.describe "TimekeepingOwnerState.apply! row handling" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "TimekeepingOwnerState.fetch" do
   it "fetch gives each state's admission generation and frozen rows" do
     # "Use the column default (generation 1) when no state is set and for legacy, generation 2 for timekeeping,
@@ -279,8 +258,6 @@ RSpec.describe "TimekeepingOwnerState.fetch" do
     expect { TimekeepingOwnerState.fetch("bogus") }.to raise_error(ArgumentError, /legacy.*timekeeping.*rollback/m)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "expect_owner_state!" do
   it "expect_owner_state! passes on the applied state and fails once the generation changes" do
@@ -301,9 +278,6 @@ RSpec.describe "expect_owner_state!" do
     expect { expect_owner_state!("timekeeping") }.to raise_error(RSpec::Expectations::ExpectationNotMetError)
   end
 end
-
-require "rails_helper"
-require "pg"
 
 RSpec.describe "TimekeepingDatabaseReset.reset! guard" do
   it "reset! refuses a database not ending in _test before connecting and names only the database" do
@@ -327,10 +301,6 @@ RSpec.describe "TimekeepingDatabaseReset.reset! guard" do
     expect(TestDatabaseGuard.require_test_database!("timekeeping_test")).to be_nil
   end
 end
-
-require "rails_helper"
-require "open3"
-require "pg"
 
 RSpec.describe "TimekeepingDatabaseReset.reset! on the live Timekeeping database" do
   it "reset! empties the Timekeeping tables and leaves the admission row at each state's generation" do
@@ -373,9 +343,6 @@ RSpec.describe "TimekeepingDatabaseReset.reset! on the live Timekeeping database
   end
 end
 
-require "rails_helper"
-require "pg"
-
 RSpec.describe "TimekeepingDatabaseReset.reset! on a non-test database" do
   it "reset! refuses a real non-test database and leaves its rows in place" do
     skip "set TIMEKEEPING_LIVE=1 to use the Timekeeping test database" unless ENV["TIMEKEEPING_LIVE"] == "1"
@@ -406,9 +373,6 @@ RSpec.describe "TimekeepingDatabaseReset.reset! on a non-test database" do
   end
 end
 
-require "rails_helper"
-require "open3"
-
 RSpec.describe "TIMEKEEPING_OWNER_STATE probe run", :without_transaction do
   it "with TIMEKEEPING_OWNER_STATE=rollback an example after a committed_data example sees the rollback row" do
     probe = Rails.root.join("spec/fixtures/timekeeping_harness/owner_state_probe.rb").to_s
@@ -424,9 +388,6 @@ RSpec.describe "TIMEKEEPING_OWNER_STATE probe run", :without_transaction do
     expect([rollback[:owner], rollback[:monolith_store], rollback[:generation]]).to eq(["monolith", "prepared", 3])
   end
 end
-
-require "rails_helper"
-require "open3"
 
 RSpec.describe "TIMEKEEPING_OWNER_STATE bogus probe run", :without_transaction do
   it "with TIMEKEEPING_OWNER_STATE=bogus the run fails at load naming the three values" do
@@ -446,9 +407,6 @@ RSpec.describe "TIMEKEEPING_OWNER_STATE bogus probe run", :without_transaction d
   end
 end
 
-require "rails_helper"
-require "open3"
-
 RSpec.describe "Timekeeping owner state selection across cleaner resets", :without_transaction do
   # "`TIMEKEEPING_OWNER_STATE` selects the legacy, timekeeping or rollback ownership state, an unknown value fails loudly, and the selected state survives every cleaner reset"
   it "the timekeeping and legacy states each survive the committed_data cleaner reset in a probe run" do
@@ -462,8 +420,6 @@ RSpec.describe "Timekeeping owner state selection across cleaner resets", :witho
     end
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "Timekeeping owner state harness" do
   it "reset! refuses a demo database name before connecting and never prints the URL or its password" do
@@ -484,8 +440,6 @@ RSpec.describe "Timekeeping owner state harness" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping owner state harness" do
   it "require_test_database! refuses names that only contain _test or have no name at all" do
     # "So `reset!` refuses unless the database name in `TIMEKEEPING_DATABASE_URL` ends in `_test`, as every CI database in .github/workflows/validations.yml does."
@@ -497,8 +451,6 @@ RSpec.describe "Timekeeping owner state harness" do
     expect(TestDatabaseGuard.require_test_database!("timekeeping_live_test")).to be_nil
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "Timekeeping owner state harness" do
   it "selected refuses blank, mixed-case and padded TIMEKEEPING_OWNER_STATE values and names the three states" do
@@ -515,8 +467,6 @@ RSpec.describe "Timekeeping owner state harness" do
     expect(TimekeepingOwnerState.selected({ "TIMEKEEPING_OWNER_STATE" => "rollback" })).to eq("rollback")
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "Timekeeping owner state harness" do
   it "apply! over a mid-handoff row leaves no stale handoff column from the earlier state" do
@@ -546,8 +496,6 @@ RSpec.describe "Timekeeping owner state harness" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping owner state harness" do
   it "apply! with an unknown or nil name raises and leaves the ownership row untouched" do
     TimekeepingOwnership.ensure_initial!
@@ -563,8 +511,6 @@ RSpec.describe "Timekeeping owner state harness" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping owner state harness" do
   it "expect_owner_state! fails when only the generation differs from the rollback state" do
     TimekeepingOwnership.ensure_initial!
@@ -579,8 +525,6 @@ RSpec.describe "Timekeeping owner state harness" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping owner state harness" do
   it "reset! does nothing when TIMEKEEPING_DATABASE_URL is absent, even for an unset state" do
     expect(PG).not_to receive(:connect)
@@ -592,9 +536,6 @@ RSpec.describe "Timekeeping owner state harness" do
     end
   end
 end
-
-require "rails_helper"
-require "pg"
 
 RSpec.describe "TimekeepingDatabaseReset.reset! before the database exists" do
   it "reset! does nothing when the named _test database does not exist yet" do
