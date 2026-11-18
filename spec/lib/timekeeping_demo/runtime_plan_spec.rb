@@ -77,9 +77,7 @@ RSpec.describe TimekeepingDemo::RuntimePlan do
       expect(spec.argv.join(" ")).not_to match(/\bqueues?\b.*\bdefault\b/)
     end
   end
-end
 
-RSpec.describe TimekeepingDemo::RuntimePlan do
   # "In the local demo each application reads these keys from its own process environment, and the two
   # applications share no database credential."
   it "gives each application only its own database credential and keeps the private key in the monolith" do
@@ -110,6 +108,7 @@ RSpec.describe TimekeepingDemo::RuntimePlan do
     timekeeping.each do |spec|
       expect(spec.env["TIMEKEEPING_DATABASE_URL"]).to eq(caller_env["TIMEKEEPING_DATABASE_URL"])
       expect(spec.env).not_to include("DATABASE_URL", "DB_USER", "DB_PASS", "TIMEKEEPING_TOKEN_PRIVATE_KEY")
+      expect(spec.env.values.join("\n")).not_to include("monolith-pass")
       expect(spec.env["TIMEKEEPING_TOKEN_PUBLIC_KEY"]).to eq(credentials.public_key_pem)
       expect(spec.env["TIMEKEEPING_SERVICE_TOKEN"]).to eq(credentials.service_token)
     end
@@ -125,32 +124,30 @@ RSpec.describe TimekeepingDemo::RuntimePlan do
       expect(spec.env).not_to include("TIMEKEEPING_TEST_HOOKS", "UNRELATED_SECRET_FOR_DEMO_SPEC")
     end
   end
-end
 
-RSpec.describe TimekeepingDemo::RuntimePlan do
-  # "In the local demo each application reads these keys from its own process environment, and the two
-  # applications share no database credential."
   it "refuses to build when both applications would connect as the same database user" do
-    caller_env = {
-      "PATH" => ENV.fetch("PATH"),
-      "HOME" => Dir.home,
-      "DB_USER" => "root",
-      "TIMEKEEPING_DATABASE_URL" => "postgres://root@127.0.0.1/timekeeping_demo"
+    procfile = Rails.root.join("Procfile.timekeeping").read
+    credentials = TimekeepingDemo::Credentials.generate
+
+    # "In the local demo each application reads these keys from its own process environment, and the two applications share no database credential."
+    shared_by_url = {
+      "DATABASE_URL" => "postgres://shared_user@127.0.0.1:5432/miru_demo",
+      "TIMEKEEPING_DATABASE_URL" => "postgres://shared_user@127.0.0.1:5432/timekeeping_demo"
+    }
+    shared_by_db_user = {
+      "DB_USER" => "shared_user",
+      "DB_PASS" => "pw",
+      "TIMEKEEPING_DATABASE_URL" => "postgres://shared_user@127.0.0.1:5432/timekeeping_demo"
     }
 
-    expect do
-      described_class.build(
-        root: Rails.root.to_s,
-        procfile: File.read(Rails.root.join("Procfile.timekeeping")),
-        caller_env:,
-        credentials: TimekeepingDemo::Credentials.generate,
-        ports: { monolith: 3000, timekeeping: 3100 }
-      )
-    end.to raise_error(TimekeepingDemo::ConfigurationError)
+    [shared_by_url, shared_by_db_user].each do |caller_env|
+      expect do
+        described_class.build(root: Rails.root.to_s, procfile:, caller_env:, credentials:,
+                              ports: { monolith: 3000, timekeeping: 3100 })
+      end.to raise_error(TimekeepingDemo::ConfigurationError)
+    end
   end
-end
 
-RSpec.describe TimekeepingDemo::RuntimePlan do
   it "refuses to build without a Timekeeping database URL, naming the key" do
     caller_env = { "PATH" => ENV.fetch("PATH"), "HOME" => Dir.home, "DB_USER" => "monolith_demo" }
 
@@ -164,9 +161,7 @@ RSpec.describe TimekeepingDemo::RuntimePlan do
       )
     end.to raise_error(TimekeepingDemo::ConfigurationError, /TIMEKEEPING_DATABASE_URL/)
   end
-end
 
-RSpec.describe TimekeepingDemo::RuntimePlan do
   it "runs Timekeeping processes from an absolute timekeeping directory with an absolute Gemfile and binds loopback only" do
     root = Rails.root.to_s
     specs = described_class.build(
@@ -201,9 +196,35 @@ RSpec.describe TimekeepingDemo::RuntimePlan do
     expect(timekeeping_env.fetch("MONOLITH_SNAPSHOT_URL")).to start_with("http://127.0.0.1:3000")
     expect(timekeeping_env.fetch("MONOLITH_REFERENCE_URL")).to start_with("http://127.0.0.1:3000")
   end
-end
 
-RSpec.describe TimekeepingDemo::RuntimePlan do
+  it "passes no test hooks or unrelated caller secrets and binds every process to loopback" do
+    specs = described_class.build(
+      root: Rails.root.to_s,
+      procfile: File.read(Rails.root.join("Procfile.timekeeping")),
+      caller_env: {
+        "PATH" => ENV.fetch("PATH", "/usr/bin"),
+        "DB_USER" => "monolith_user",
+        "TIMEKEEPING_DATABASE_URL" => "postgres://timekeeping_user@127.0.0.1:5432/timekeeping_development",
+        "TIMEKEEPING_TEST_HOOKS" => "1",
+        "SECRET_X" => "unrelated-caller-secret"
+      },
+      credentials: TimekeepingDemo::Credentials.generate,
+      ports: { monolith: 3000, timekeeping: 3100 }
+    )
+    expect(specs).not_to be_empty
+
+    url_keys = %w[TIMEKEEPING_BASE_URL MONOLITH_REFERENCE_URL MONOLITH_SNAPSHOT_URL TIMEKEEPING_PROJECTION_URL]
+    specs.each do |spec|
+      expect(spec.env).not_to have_key("TIMEKEEPING_TEST_HOOKS")
+      expect(spec.env).not_to have_key("SECRET_X")
+      expect(spec.env.values.join("\n")).not_to include("unrelated-caller-secret")
+      spec.env.slice(*url_keys).each_value do |url|
+        expect(URI.parse(url).host).to eq("127.0.0.1")
+      end
+      expect(spec.argv.join(" ")).not_to include("0.0.0.0")
+    end
+  end
+
   it "keeps a caller environment holding both credentials and test hooks from crossing between the applications" do
     procfile = Rails.root.join("Procfile.timekeeping").read
     credentials = TimekeepingDemo::Credentials.generate
@@ -244,9 +265,7 @@ RSpec.describe TimekeepingDemo::RuntimePlan do
       expect(spec.env.fetch("TIMEKEEPING_TOKEN_PRIVATE_KEY")).to eq(credentials.private_key_pem)
     end
   end
-end
 
-RSpec.describe TimekeepingDemo::RuntimePlan do
   it "refuses a process table line that belongs to neither application or uses an unknown placeholder" do
     credentials = TimekeepingDemo::Credentials.generate
     caller_env = {
@@ -266,13 +285,11 @@ RSpec.describe TimekeepingDemo::RuntimePlan do
       end.to raise_error(TimekeepingDemo::ConfigurationError)
     end
   end
-end
 
-RSpec.describe TimekeepingDemo::RuntimePlan do
   it "refuses to build when TIMEKEEPING_DATABASE_URL is missing instead of handing Timekeeping another credential" do
     procfile = Rails.root.join("Procfile.timekeeping").read
     credentials = TimekeepingDemo::Credentials.generate
-    caller_env = { "DATABASE_URL" => "postgres://monolith_user:pw@127.0.0.1:5432/miru_demo" }
+    caller_env = { "DATABASE_URL" => "postgres://monolith_user:monolith_pw@127.0.0.1:5432/miru_demo" }
 
     # "In the local demo each application reads these keys from its own process environment, and the two applications share no database credential."
     expect do
