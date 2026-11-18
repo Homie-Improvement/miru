@@ -20,8 +20,15 @@ module TimekeepingDemo
     # application's own environment. Raises ProcessFailed when one fails.
     def prepare(specs)
       specs.uniq(&:app).each do |spec|
-        pid = spawn(spec, PREPARE_COMMAND, pgroup: false)
-        _, status = Process.wait2(pid)
+        pid = spawn(spec, PREPARE_COMMAND, pgroup: true)
+        status = nil
+        begin
+          _, status = Process.wait2(pid)
+        ensure
+          # Reached without a status when the wait was interrupted, such as by
+          # Ctrl-C or a TERM to the launcher: stop db:prepare with it.
+          stop([pid], { pid => "db:prepare" }) unless status
+        end
         raise ProcessFailed, "db:prepare failed for #{spec.app} (#{status})" unless status.success?
       end
     end

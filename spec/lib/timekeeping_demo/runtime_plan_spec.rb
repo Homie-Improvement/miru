@@ -39,6 +39,30 @@ RSpec.describe TimekeepingDemo::RuntimePlan, "demo Puma config and blank monolit
     end
   end
 
+  it "points the libpq service files at a path with no service, so a PGSERVICE from a local .env cannot pick a user" do
+    demo_runtime_specs.select { |spec| spec.app == :monolith }.each do |spec|
+      expect(spec.env.fetch_values("PGSERVICEFILE", "PGSYSCONFDIR")).to eq([File::NULL, File::NULL])
+    end
+  end
+
+  it "refuses a database URL that names its user in more than one place" do
+    # libpq lets the query user win, Active Record the one before the host, so neither can be checked alone.
+    ["postgresql://timekeeping_role@127.0.0.1/timekeeping_demo?user=monolith_role",
+     "postgres://timekeeping_role@127.0.0.1/timekeeping_demo?username=monolith_role",
+     "postgres://127.0.0.1/timekeeping_demo?user=timekeeping_role&user=monolith_role"].each do |url|
+      expect do
+        described_class.build(
+          root: Rails.root.to_s,
+          procfile: Rails.root.join("Procfile.timekeeping").read,
+          caller_env: { "DB_USER" => "monolith_role", "TIMEKEEPING_DATABASE_URL" => url },
+          credentials: TimekeepingDemo::Credentials.generate,
+          ports: { monolith: 3000, timekeeping: 3100 },
+          login_user: "demo_login_user"
+        )
+      end.to raise_error(TimekeepingDemo::ConfigurationError, /more than one user/)
+    end
+  end
+
   it "refuses when neither application names a database user, because both would connect as the login user" do
     expect do
       described_class.build(

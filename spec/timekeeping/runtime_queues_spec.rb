@@ -63,9 +63,13 @@ RSpec.describe "Timekeeping demo runtime queues", :two_tenant_seed, :seeded_with
     finished_here = lambda do |class_name|
       SolidQueue::Job.where(class_name:).where("created_at > ?", started_at).where.not(finished_at: nil).exists?
     end
-    answers = lambda do |port|
-      Net::HTTP.get_response(URI("http://127.0.0.1:#{port}/")).code.to_i.positive?
-    rescue SystemCallError, IOError, Net::ProtocolError
+    # Any HTTP answer shows the server is up. The monolith's /health renders
+    # no page, so it answers even when no front-end build is present.
+    answers = lambda do |port, path|
+      Net::HTTP.start("127.0.0.1", port, open_timeout: 5, read_timeout: 15) do |http|
+        http.get(path).code.to_i.positive?
+      end
+    rescue SystemCallError, IOError, Net::ProtocolError, Timeout::Error
       false
     end
 
@@ -82,15 +86,26 @@ RSpec.describe "Timekeeping demo runtime queues", :two_tenant_seed, :seeded_with
                          AND created_at > $1::timestamptz AND finished_at IS NOT NULL)
         SQL
       end
-      wait_for.call("both web apps answering", 120) { answers.call(monolith_port) && answers.call(timekeeping_port) }
+      wait_for.call("both web apps answering", 120) { answers.call(monolith_port, "/health") && answers.call(timekeeping_port, "/") }
 
       # "Add `spec/timekeeping/runtime_queues_spec.rb`, which starts the runtime against a seeded database and fails if a job from `default` or any other non-dedicated queue runs."
       expect(SolidQueue::Job.where(id: forbidden_ids).where.not(finished_at: nil)).to be_empty
       expect(SolidQueue::ClaimedExecution.where(job_id: forbidden_ids)).to be_empty
       expect(SolidQueue::FailedExecution.where(job_id: forbidden_ids)).to be_empty
       expect(SolidQueue::Job.where.not(queue_name: dedicated_queues).where.not(finished_at: nil)).to be_empty
-      expect(timekeeping.exec("SELECT count(*) FROM solid_queue_jobs WHERE queue_name <> 'timekeeping_relay' AND finished_at IS NOT NULL")
-        .getvalue(0, 0).to_i).to eq(0)
+      # A job is claimed while it runs and failed once it raised, so neither may
+      # exist for any job outside the dedicated queues, in either database.
+      outside_dedicated = SolidQueue::Job.where.not(queue_name: dedicated_queues).select(:id)
+      expect(SolidQueue::ClaimedExecution.where(job_id: outside_dedicated)).to be_empty
+      expect(SolidQueue::FailedExecution.where(job_id: outside_dedicated)).to be_empty
+      ran_outside_relay = timekeeping.exec(<<~SQL).getvalue(0, 0).to_i
+        SELECT count(*) FROM solid_queue_jobs
+        WHERE queue_name <> 'timekeeping_relay'
+          AND (finished_at IS NOT NULL
+               OR EXISTS (SELECT 1 FROM solid_queue_claimed_executions claimed WHERE claimed.job_id = solid_queue_jobs.id)
+               OR EXISTS (SELECT 1 FROM solid_queue_failed_executions failed WHERE failed.job_id = solid_queue_jobs.id))
+      SQL
+      expect(ran_outside_relay).to eq(0)
 
       worker_queues = SolidQueue::Process.where(kind: "Worker").map do |process|
         metadata = process.metadata.is_a?(String) ? JSON.parse(process.metadata) : process.metadata

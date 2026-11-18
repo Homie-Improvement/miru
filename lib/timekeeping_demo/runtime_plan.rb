@@ -21,14 +21,21 @@ module TimekeepingDemo
     TIMEKEEPING_DATABASE_URL = "TIMEKEEPING_DATABASE_URL"
     MONOLITH_DATABASE_URL = "DATABASE_URL"
     MONOLITH_DATABASE_USER = "DB_USER"
-    # libpq reads an empty value of these as unset. PGSERVICE is left out on
-    # purpose: libpq looks up a service named "" and refuses to connect.
-    LIBPQ_CONNECTION_KEYS = %w[PGUSER PGPASSWORD PGHOST].freeze
+    URL_USER_PARAMETERS = %w[user username].freeze
+    # libpq falls back to these when config/database.yml leaves the user or
+    # host blank, and reads an empty value as unset. PGSERVICE cannot be
+    # blanked (libpq looks up a service named "" and refuses to connect), so
+    # the service files point at a path with no service in it instead: a
+    # PGSERVICE from a local .env then fails to connect rather than choosing
+    # an unchecked user.
+    LIBPQ_BLANKED_KEYS = %w[PGUSER PGPASSWORD PGHOST].freeze
+    LIBPQ_SERVICE_FILE_KEYS = %w[PGSERVICEFILE PGSYSCONFDIR].freeze
 
     # directory: relative to the checkout root.
     # copied: caller keys passed on only when the caller sets them.
     # always_set: caller keys passed on, or set to "" when the caller has none.
     # blanked: keys always set to "", whatever the caller holds.
+    # no_service_files: libpq service-file keys pointed at File::NULL.
     #   The monolith loads dotenv-rails, which fills only absent keys, so a set
     #   key keeps a local .env from adding a database credential after the
     #   check in this module. Timekeeping loads no .env.
@@ -38,9 +45,8 @@ module TimekeepingDemo
         directory: ".",
         copied: %w[DB_HOST DB_POOL],
         always_set: [MONOLITH_DATABASE_URL, MONOLITH_DATABASE_USER, "DB_PASS"],
-        # libpq falls back to the PG* keys when config/database.yml leaves the
-        # user or host blank, so a .env must not supply them either.
-        blanked: [TIMEKEEPING_DATABASE_URL, *LIBPQ_CONNECTION_KEYS],
+        blanked: [TIMEKEEPING_DATABASE_URL, *LIBPQ_BLANKED_KEYS],
+        no_service_files: LIBPQ_SERVICE_FILE_KEYS,
         required: []
       },
       timekeeping: {
@@ -48,6 +54,7 @@ module TimekeepingDemo
         copied: [],
         always_set: [],
         blanked: [],
+        no_service_files: [],
         required: [TIMEKEEPING_DATABASE_URL]
       }
     }.freeze
@@ -106,6 +113,7 @@ module TimekeepingDemo
       env = caller_env.slice(*TOOLCHAIN_KEYS, *settings.fetch(:copied))
       settings.fetch(:always_set).each { |key| env[key] = caller_env.fetch(key, "") }
       settings.fetch(:blanked).each { |key| env[key] = "" }
+      settings.fetch(:no_service_files).each { |key| env[key] = File::NULL }
       env.merge(
         "RAILS_ENV" => caller_env.fetch("RAILS_ENV", DEFAULT_RAILS_ENV),
         "BUNDLE_GEMFILE" => File.join(directory, "Gemfile")
@@ -158,21 +166,21 @@ module TimekeepingDemo
       from_url || caller_env[MONOLITH_DATABASE_USER].then { |user| blank?(user) ? nil : user }
     end
 
-    # A database URL may name its user before the host or as a `user` query
-    # parameter; both libpq and Active Record read either form.
+    # A database URL may name its user before the host or in a `user` or
+    # `username` query parameter. libpq and Active Record disagree on which
+    # one wins when there are several, so a URL that names more than one user
+    # is refused rather than guessed at.
     def url_user(url)
       uri = URI.parse(url)
-      user = uri.user.then { |name| blank?(name) ? nil : URI.decode_uri_component(name) }
-      user || query_user(uri.query)
+      query = uri.query ? URI.decode_www_form(uri.query) : []
+      named = [uri.user && URI.decode_uri_component(uri.user)]
+      named += query.filter_map { |key, value| value if URL_USER_PARAMETERS.include?(key) }
+      users = named.reject { |user| blank?(user) }.uniq
+      raise ConfigurationError, "A database URL names more than one user: name it once" if users.size > 1
+
+      users.first
     rescue URI::InvalidURIError, ArgumentError
       raise ConfigurationError, "A database URL could not be parsed"
-    end
-
-    def query_user(query)
-      return nil if query.nil?
-
-      user = URI.decode_www_form(query).assoc("user")&.last
-      blank?(user) ? nil : user
     end
 
     def blank?(value)
