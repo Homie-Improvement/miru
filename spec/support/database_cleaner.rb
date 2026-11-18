@@ -30,8 +30,13 @@ module TestDatabaseCleanup
   # group loaded once survives between its examples. The group's own
   # truncation cleans up when it finishes; an example that writes rows needs
   # a group of its own.
+  #
+  # Examples tagged :integrated_runtime run beside a started demo runtime whose
+  # processes read rows over their own connections, so nothing may stay
+  # uncommitted; spec/support/timekeeping/integrated_runtime.rb cleans for them.
   def committed?(example)
-    example.metadata[:type] == :system ||
+    example.metadata[:integrated_runtime] ||
+      example.metadata[:type] == :system ||
       example.metadata[:without_transaction] ||
       example.metadata[:seeded_without_transaction] ||
       CommittedDataMode.example?(example)
