@@ -167,7 +167,7 @@ module Timekeeping
         # from the mark to handoff_step with no moment open between them.
         def close_admission
           owner("timekeeping").admission.fence_admission
-          outgoing.admission.fence_admission if outgoing.equal?(owner("monolith"))
+          fence_monolith_admission if outgoing.equal?(owner("monolith"))
 
           read_generation = TimekeepingOwnership.current.generation
           updated = TimekeepingOwnership.transaction do
@@ -183,6 +183,16 @@ module Timekeeping
         rescue ActiveRecord::LockWaitTimeout
           raise Refused, "Billing writes still hold the ownership row after #{@close_admission_lock_timeout.inspect}; " \
                          "resume or abort the handoff"
+        end
+
+        # The adapter's fence waits under its own lock timeout, not
+        # close_admission's, so its timeout gets its own message: quoting the
+        # runner's timeout would send an operator to tune the wrong setting.
+        def fence_monolith_admission
+          outgoing.admission.fence_admission
+        rescue ActiveRecord::LockWaitTimeout
+          raise Refused, "Monolith writes still hold the ownership row past the monolith admission fence's lock " \
+                         "timeout; resume or abort the handoff"
         end
 
         def admission_closed?
