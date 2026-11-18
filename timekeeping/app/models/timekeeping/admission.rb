@@ -53,8 +53,9 @@ module Timekeeping
 
     # Admits writes at generation only, and ends any open settle step. A nil
     # here would fence unannounced, so check_generation! refuses it before the
-    # row is touched. The stop mark is kept, so a late settle for a stopped
-    # generation still cannot reopen its step.
+    # row is touched. Ending a step raises the stop mark to its generation,
+    # and the mark never falls, so a late settle for that generation or an
+    # earlier one cannot reopen a step after a later fence.
     #
     # Admitting the held generation releases its correction snapshots to the
     # relay. Admitting any other generation means the handoff that wrote them
@@ -65,7 +66,12 @@ module Timekeeping
 
       transaction do
         set_generation(generation)
-        where(id: SINGLETON_ID).update_all(settling_generation: nil)
+        # GREATEST ignores NULLs, so the mark rises to the open step's
+        # generation when there is one and otherwise stays as it was.
+        where(id: SINGLETON_ID).update_all(
+          "settling_stopped_generation = GREATEST(settling_stopped_generation, settling_generation), " \
+          "settling_generation = NULL"
+        )
         held = where(id: SINGLETON_ID).pick(:held_generation)
         next if held.nil?
 

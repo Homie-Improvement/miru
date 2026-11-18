@@ -201,7 +201,7 @@ RSpec.describe Timekeeping::Admission, "settle step" do
     expect(described_class.current.settling_stopped_generation).to be_nil
   end
 
-  it "a late stop_applying! for generation 3 leaves generation 5 settling and never lowers the stop mark" do
+  it "a stop_applying! for an earlier handoff's generation leaves the newer step open and later stops never lower the mark" do
     described_class.admit!(generation: 3)
     described_class.fence!(lock_timeout: 1)
     described_class.begin_settling!(generation: 3)
@@ -223,7 +223,7 @@ RSpec.describe Timekeeping::Admission, "settle step" do
     expect(described_class.current.settling_stopped_generation).to eq(7)
   end
 
-  it "a late stop_applying! for generation 3 leaves generation 5 settling and does not lower the stop mark" do
+  it "a stop mark of 7 blocks a settle at 7, lets a newer handoff settle at 8, and a late stop at 3 leaves 8 settling" do
     described_class.admit!(generation: 7)
     described_class.fence!(lock_timeout: 1)
     described_class.begin_settling!(generation: 7)
@@ -262,6 +262,24 @@ RSpec.describe Timekeeping::Admission, "settle step" do
     described_class.fence!(lock_timeout: 1)
     described_class.begin_settling!(generation: 6)
     expect(described_class.settling?).to be(false)
+  end
+
+  # A step that admit! ended without a stop_applying! must stay closed when a
+  # later handoff fences and a late settle for its generation arrives.
+  it "admit! ending an unstopped settle step keeps a late begin_settling! for that generation from reopening it" do
+    described_class.fence!(lock_timeout: 1)
+    described_class.begin_settling!(generation: 5)
+    described_class.admit!(generation: 6)
+    expect(described_class.current.settling_stopped_generation).to eq(5)
+
+    described_class.fence!(lock_timeout: 1)
+    described_class.begin_settling!(generation: 5)
+
+    expect(described_class.settling?).to be(false)
+    expect(described_class.current.settling_stopped_generation).to eq(5)
+
+    described_class.begin_settling!(generation: 6)
+    expect(described_class.settling?).to be(true)
   end
 
   # admit! also ends the settle step; the held generation's release must
