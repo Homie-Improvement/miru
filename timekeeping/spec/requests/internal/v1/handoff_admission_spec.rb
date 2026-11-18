@@ -133,8 +133,6 @@ RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
   include_context "timekeeping entry writes without transactional fixtures"
 
@@ -179,8 +177,6 @@ RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
   include_context "timekeeping entry writes without transactional fixtures"
 
@@ -221,8 +217,6 @@ RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
     end
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
   include_context "timekeeping entry writes without transactional fixtures"
