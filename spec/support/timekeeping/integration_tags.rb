@@ -65,12 +65,9 @@ module TimekeepingIntegrationTags
   def walk_call(node, tagged, fake_roots, &report)
     report.call(node, :loads_handoff_fakes, node.slice) if loads_handoff_fakes?(node)
 
-    if group_call?(node)
-      tagged = tag_setting(node).fetch(:value, tagged)
-    elsif example_call?(node)
-      tagged = tag_setting(node).fetch(:value, tagged)
-      report.call(node, :missing_committed_data, "example lacks committed_data: true") unless tagged
-    end
+    example = example_call?(node)
+    tagged = tag_setting(node).fetch(:value, tagged) if example || group_call?(node)
+    report.call(node, :missing_committed_data, "example lacks committed_data: true") if example && !tagged
     node.compact_child_nodes.each { |child| walk(child, tagged, fake_roots, &report) }
   end
 
