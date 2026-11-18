@@ -134,42 +134,6 @@ RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
 
   # "The internal handoff admission endpoints have routes that call
   # `Admission.begin_settling!(generation:)` and `Admission.stop_applying!(generation:)`"
-  # A user token that reached these routes could open or stop the settle step
-  # for every company's writes, so only the service bearer may call them.
-  it "refuses begin_settling and stop_applying without the service bearer and leaves the fenced row with no settle step" do
-    Timekeeping::Admission.admit!(generation: 3)
-    Timekeeping::Admission.fence!
-    settling_columns = lambda do
-      row = Timekeeping::Admission.current
-      [row.generation, row.settling_generation, row.settling_stopped_generation]
-    end
-    expect(settling_columns.call).to eq([nil, nil, nil])
-
-    callers = {
-      "no bearer" => nil,
-      "near-miss service token" => "Bearer #{handoff_service_token}x",
-      "owner token" => "Bearer #{mint_token({ sub: 7, company_id: 1, role: 'owner' })}",
-      "admin token" => "Bearer #{mint_token({ sub: 7, company_id: 1, role: 'admin' })}",
-      "employee token" => "Bearer #{mint_token}"
-    }
-    paths = %w[/internal/v1/handoff/admission/begin_settling /internal/v1/handoff/admission/stop_applying]
-
-    paths.each do |path|
-      callers.each do |caller_name, authorization|
-        headers = { "Content-Type" => "application/json" }
-        headers["Authorization"] = authorization if authorization
-        post path, params: JSON.generate(generation: 3), headers: headers
-
-        expect([path, caller_name, response.status, response.parsed_body])
-          .to eq([path, caller_name, 401, { "reason" => "unauthorized" }])
-        expect(response.body).not_to include(handoff_service_token)
-        expect([path, caller_name, settling_columns.call]).to eq([path, caller_name, [nil, nil, nil]])
-      end
-    end
-  end
-
-  # "The internal handoff admission endpoints have routes that call
-  # `Admission.begin_settling!(generation:)` and `Admission.stop_applying!(generation:)`"
   # The body is caller input: coercing "4" or 4.5 into 4 would open or stop a
   # step the caller never named, so every value but a positive Integer is
   # refused before the row is touched.

@@ -47,9 +47,10 @@ class Timekeeping::Internal::V1::Handoff::AdmissionsController < Timekeeping::In
       render json: { generation: Timekeeping::Admission.current.generation }
     end
 
-    # The model ignores a settle call it cannot apply (not fenced, or a step
-    # already stopped) without raising, so the answer carries the row as it
-    # now stands and the caller can tell whether the step opened or stopped.
+    # begin_settling! ignores a call while writes are admitted or once that
+    # generation's step was stopped, and stop_applying! leaves a newer open
+    # step alone. Neither raises, so the answer carries the row as it now
+    # stands and the caller can tell whether the step opened or stopped.
     def render_settling_state
       admission = Timekeeping::Admission.current
       render json: {

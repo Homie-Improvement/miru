@@ -66,6 +66,7 @@ RSpec.describe "Timekeeping internal handoff routes refuse callers without the s
 
         expect([route, caller_name, response.status, response.parsed_body])
           .to eq([route, caller_name, 401, { "reason" => "unauthorized" }])
+        expect(response.body).not_to include(handoff_service_token)
         expect([route, caller_name, refused_handoff_state]).to eq([route, caller_name, baseline])
       end
     end
