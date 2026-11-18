@@ -1,0 +1,26 @@
+# The monolith relay worker of the local Timekeeping demo
+# (docs/architecture/timekeeping-soa.md section 11.1), started by
+# bin/timekeeping-demo-queue. Only the dedicated timekeeping_relay worker runs,
+# never a default worker, because the seeded data already holds queued
+# integration jobs that a default worker would run. The dispatcher schedules
+# only the relay task, with the class and schedule config/solid_queue.yml uses.
+default: &default
+  dispatchers:
+    - polling_interval: 1
+      batch_size: 500
+      recurring_tasks:
+        timekeeping_relay:
+          class: Timekeeping::RelayJob
+          schedule: every 10 seconds
+  workers:
+    # One thread, so batches of one run are never posted out of position order.
+    - queues: timekeeping_relay
+      threads: 1
+      processes: 1
+      polling_interval: 0.5
+
+development:
+  <<: *default
+
+test:
+  <<: *default
