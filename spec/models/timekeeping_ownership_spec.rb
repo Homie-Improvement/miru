@@ -371,8 +371,6 @@ RSpec.describe TimekeepingOwnership, type: :model do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe TimekeepingOwnership, type: :model do
   # "It is true when `handoff_step` is set or `admission_fenced_at` is set."
   it "admission_closed? is true when handoff_step is set or admission_fenced_at is set, and false only when both are nil" do
