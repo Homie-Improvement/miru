@@ -592,3 +592,22 @@ RSpec.describe "Timekeeping owner state harness" do
     end
   end
 end
+
+require "rails_helper"
+require "pg"
+
+RSpec.describe "TimekeepingDatabaseReset.reset! before the database exists" do
+  it "reset! does nothing when the named _test database does not exist yet" do
+    skip "set TIMEKEEPING_LIVE=1 to use the Timekeeping test database" unless ENV["TIMEKEEPING_LIVE"] == "1"
+
+    options = PG::Connection.conninfo_parse(ENV.fetch("TIMEKEEPING_DATABASE_URL")).filter_map do |option|
+      next if option[:val].nil? || option[:keyword] == "dbname"
+
+      "#{option[:keyword]}='#{option[:val].gsub(/['\\]/) { |char| "\\#{char}" }}'"
+    end
+    missing = (options + ["dbname='timekeeping_owner_state_never_created_test'"]).join(" ")
+
+    # "`reset!` does nothing when `TIMEKEEPING_DATABASE_URL` is unset or the database does not exist yet."
+    expect(TimekeepingDatabaseReset.reset!("timekeeping", env: { "TIMEKEEPING_DATABASE_URL" => missing })).to be_nil
+  end
+end
