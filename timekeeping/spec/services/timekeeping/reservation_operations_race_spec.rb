@@ -123,10 +123,10 @@ RSpec.describe Timekeeping::ReservationOperations, "under concurrent requests" d
 
   # Holds a reservation operation at hold_at, runs other_writer on its own
   # connection until the server reports it blocked by the held operation,
-  # then lets both finish. The held operation is always released before the
-  # joins, so a failed wait check cannot leave it holding its locks while the
-  # tables are truncated. Returns the held operation's outcome and
-  # other_writer's.
+  # then lets both finish. The held operation is always released, and both
+  # threads are joined (and stopped if a join times out), even when the wait
+  # check raises, so neither can hold locks while the after hooks truncate the
+  # tables. Returns the held operation's outcome and other_writer's.
   def race_held_reservation_against(held_request, hold_at:, &other_writer)
     reached = Queue.new
     release = Queue.new
@@ -145,8 +145,9 @@ RSpec.describe Timekeeping::ReservationOperations, "under concurrent requests" d
       blocked = reservation_blocked_by?(other_pid.pop(timeout: wait_seconds), held_pid.pop(timeout: wait_seconds))
     ensure
       release << true
+      [held, other].each { |thread| thread.kill unless thread.join(wait_seconds) }
     end
-    results = [held.join(wait_seconds)&.value, other.join(wait_seconds)&.value]
+    results = [held.value, other.value]
     expect(blocked).to be(true), "the other writer never waited on the held operation's lock"
     results
   end
@@ -279,25 +280,10 @@ RSpec.describe Timekeeping::ReservationOperations, "under concurrent requests" d
     Timekeeping::Admission.begin_settling!(generation: 5)
     commit = race_request(:commit, operation_id:)
 
-    reached = Queue.new
-    release = Queue.new
-    commit_pid = Queue.new
-    stop_pid = Queue.new
-    checkpoint = lambda do |step|
-      next unless step == :generation_checked
-
-      reached << true
-      release.pop
+    committed, = race_held_reservation_against(commit, hold_at: :generation_checked) do
+      Timekeeping::Admission.stop_applying!(generation: 5)
     end
-    committing = on_own_reservation_connection(commit_pid) { described_class.new(checkpoint:).call(commit) }
-    expect(reached.pop(timeout: wait_seconds)).to be(true)
-    stopping = on_own_reservation_connection(stop_pid) { Timekeeping::Admission.stop_applying!(generation: 5) }
-    blocked = reservation_blocked_by?(stop_pid.pop(timeout: wait_seconds), commit_pid.pop(timeout: wait_seconds))
-    release << true
-    committed = committing.join(wait_seconds)&.value
-    stopping.join(wait_seconds)
 
-    expect(blocked).to be(true), "stop_applying! never waited on the settling commit"
     expect(answer(committed)).to eq([200, { "reserved" => 1, "released" => 0 }])
     expect(Timekeeping::Admission.settling?).to be(false)
     expect(Timekeeping::Admission.current.settling_stopped_generation).to eq(5)
