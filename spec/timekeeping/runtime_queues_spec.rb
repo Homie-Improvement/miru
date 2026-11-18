@@ -11,11 +11,18 @@ RSpec.describe "Timekeeping demo runtime queues", :two_tenant_seed, :seeded_with
   dedicated_queues = %w[invoice_operations timekeeping_relay].freeze
 
   after do
+    # A skipped example started nothing, and may run without a Timekeeping database.
+    next unless ENV["TIMEKEEPING_LIVE"] == "1"
+
     queue_tables = ActiveRecord::Base.connection.tables.grep(/\Asolid_queue_/)
     ActiveRecord::Base.connection.execute("TRUNCATE #{queue_tables.join(', ')}") if queue_tables.any?
     timekeeping = PG.connect(ENV.fetch("TIMEKEEPING_DATABASE_URL"))
     tables = timekeeping.exec("SELECT tablename FROM pg_tables WHERE tablename LIKE 'solid_queue_%'").column_values(0)
     timekeeping.exec("TRUNCATE #{tables.join(', ')}") if tables.any?
+  rescue PG::ConnectionBad
+    # The runtime failed before db:prepare created the Timekeeping database,
+    # so it holds no queue rows to remove.
+    nil
   ensure
     timekeeping&.close
   end
@@ -39,7 +46,7 @@ RSpec.describe "Timekeeping demo runtime queues", :two_tenant_seed, :seeded_with
     monolith_port = free_port.call
     timekeeping_port = free_port.call
     log = Tempfile.new("timekeeping-demo")
-    timekeeping = PG.connect(ENV.fetch("TIMEKEEPING_DATABASE_URL"))
+    timekeeping = nil
     pid = Process.spawn(ENV.to_h.merge("RAILS_ENV" => "test", "MONOLITH_PORT" => monolith_port.to_s,
                                        "TIMEKEEPING_PORT" => timekeeping_port.to_s),
                         Rails.root.join("bin/timekeeping-demo").to_s, "up",
@@ -66,6 +73,9 @@ RSpec.describe "Timekeeping demo runtime queues", :two_tenant_seed, :seeded_with
       # Positive proof first: every dedicated worker ran in this window.
       wait_for.call("a finished monolith relay run", 180) { finished_here.call("Timekeeping::RelayJob") }
       wait_for.call("a finished invoice-operation recovery run", 180) { finished_here.call("RecoverInvoiceOperationIntentsJob") }
+      # Connected only now: `up` creates the Timekeeping database with db:prepare
+      # before it starts any process, so it may not exist before the runtime starts.
+      timekeeping = PG.connect(ENV.fetch("TIMEKEEPING_DATABASE_URL"))
       wait_for.call("a finished Timekeeping relay run", 180) do
         timekeeping.exec_params(<<~SQL, [started_at.utc.iso8601(6)]).getvalue(0, 0) == "t"
           SELECT EXISTS (SELECT 1 FROM solid_queue_jobs WHERE class_name = 'RelayJob'
@@ -100,7 +110,7 @@ RSpec.describe "Timekeeping demo runtime queues", :two_tenant_seed, :seeded_with
       rescue Errno::ESRCH, Errno::ECHILD
         nil
       end
-      timekeeping.close
+      timekeeping&.close
       log.close!
     end
 
