@@ -574,7 +574,7 @@ RSpec.describe "TimekeepingDatabaseReset.reset! before the database exists" do
   end
 end
 
-RSpec.describe "Seeded committed_data owner state probe run (rollback)", :without_transaction do
+RSpec.describe "Seeded committed_data owner state probe run (rollback)", :without_transaction, committed_data: true do
   it "the seeded committed_data probe ends in the rollback state with both seeded companies" do
     probe = Rails.root.join("spec/fixtures/timekeeping_harness/seeded_owner_state_probe.rb").to_s
     expect(File).to exist(probe)
@@ -593,7 +593,7 @@ RSpec.describe "Seeded committed_data owner state probe run (rollback)", :withou
   end
 end
 
-RSpec.describe "Seeded committed_data owner state probe run (timekeeping)", :without_transaction do
+RSpec.describe "Seeded committed_data owner state probe run (timekeeping)", :without_transaction, committed_data: true do
   it "the seeded committed_data probe ends in the timekeeping state with both seeded companies" do
     probe = Rails.root.join("spec/fixtures/timekeeping_harness/seeded_owner_state_probe.rb").to_s
     expect(File).to exist(probe)

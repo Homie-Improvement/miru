@@ -155,6 +155,23 @@ RSpec.describe TimekeepingIntegrationTags do
         expect(described_class.violations("x_spec.rb", source)).to eq([]), line
       end
     end
+
+    it "matches a fake declared compactly inside a real namespace by its full name only" do
+      compact_fakes = described_class.handoff_fake_constants("class Timekeeping::IntegrationTagsCompactFake\nend\n")
+      source_using = lambda do |reference|
+        "RSpec.describe \"relay\", committed_data: true do\n  it \"runs\" do\n    #{reference}\n  end\nend\n"
+      end
+
+      flagged = described_class.violations(
+        "x_spec.rb", source_using.call("Timekeeping::IntegrationTagsCompactFake.new"), fake_constants: compact_fakes
+      )
+      real = described_class.violations(
+        "x_spec.rb", source_using.call("Timekeeping::SeedDispositionRecorder::DEFAULT_PATH"), fake_constants: compact_fakes
+      )
+
+      expect(flagged.map { |v| [v.kind, v.line] }).to eq([[:loads_handoff_fakes, 3]])
+      expect(real).to eq([])
+    end
   end
 
   describe ".handoff_fake_constants" do

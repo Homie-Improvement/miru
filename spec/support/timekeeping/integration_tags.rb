@@ -31,9 +31,8 @@ module TimekeepingIntegrationTags
 
   # Every violation in one spec file's source, in source order.
   def violations(path, source, fake_constants: handoff_fake_constants)
-    fake_roots = fake_constants.reject { |name| name.include?("::") }.to_set
     found = []
-    walk(Prism.parse(source).value, false, fake_roots) do |node, kind, detail|
+    walk(Prism.parse(source).value, false, fake_constants) do |node, kind, detail|
       found << Violation.new(path:, line: node.location.start_line, kind:, detail:)
     end
     found.sort_by(&:line).freeze
@@ -50,25 +49,27 @@ module TimekeepingIntegrationTags
   end
 
   # tagged is whether the nearest committed_data setting above node is true.
-  def walk(node, tagged, fake_roots, &report)
+  def walk(node, tagged, fake_constants, &report)
     case node
     when Prism::CallNode
-      walk_call(node, tagged, fake_roots, &report)
+      walk_call(node, tagged, fake_constants, &report)
     when Prism::ConstantReadNode, Prism::ConstantPathNode
       # A path is checked whole; its parent segments are not separate references.
-      report.call(node, :loads_handoff_fakes, "references #{node.slice}") if fake_reference?(node, fake_roots)
+      if fake_reference?(node, fake_constants)
+        report.call(node, :loads_handoff_fakes, "references #{node.slice}")
+      end
     else
-      node.compact_child_nodes.each { |child| walk(child, tagged, fake_roots, &report) }
+      node.compact_child_nodes.each { |child| walk(child, tagged, fake_constants, &report) }
     end
   end
 
-  def walk_call(node, tagged, fake_roots, &report)
+  def walk_call(node, tagged, fake_constants, &report)
     report.call(node, :loads_handoff_fakes, node.slice) if loads_handoff_fakes?(node)
 
     example = example_call?(node)
     tagged = tag_setting(node).fetch(:value, tagged) if example || group_call?(node)
     report.call(node, :missing_committed_data, "example lacks committed_data: true") if example && !tagged
-    node.compact_child_nodes.each { |child| walk(child, tagged, fake_roots, &report) }
+    node.compact_child_nodes.each { |child| walk(child, tagged, fake_constants, &report) }
   end
 
   def group_call?(node)
@@ -114,12 +115,16 @@ module TimekeepingIntegrationTags
     target.is_a?(Prism::StringNode) && File.basename(target.unescaped, ".rb") == HANDOFF_FAKES_BASENAME
   end
 
-  def fake_reference?(node, fake_roots)
+  # True when the reference names a declared fake, or something inside one
+  # such as TimekeepingHandoffFakeRelay::ENUM_COLUMNS. Comparing whole
+  # qualified names, not only top-level ones, also catches a fake declared
+  # compactly as `class Outer::Fake`, without flagging Outer's other constants.
+  def fake_reference?(node, fake_constants)
     segments = constant_segments(node)
     return false if segments.nil?
 
     segments = segments.drop(1) if segments.first == TOP_LEVEL_NAMESPACE && segments.size > 1
-    fake_roots.include?(segments.first.to_s)
+    (1..segments.size).any? { |length| fake_constants.include?(segments.first(length).join("::")) }
   end
 
   # The names along a constant path, or nil when it starts from an expression
