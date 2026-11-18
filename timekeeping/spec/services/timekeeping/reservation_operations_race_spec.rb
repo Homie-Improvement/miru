@@ -123,10 +123,10 @@ RSpec.describe Timekeeping::ReservationOperations, "under concurrent requests" d
 
   # Holds a reservation operation at hold_at, runs other_writer on its own
   # connection until the server reports it blocked by the held operation,
-  # then lets both finish. The held operation is always released before the
-  # joins, so a failed wait check cannot leave it holding its locks while the
-  # tables are truncated. Returns the held operation's outcome and
-  # other_writer's.
+  # then lets both finish. The held operation is always released, and both
+  # threads are joined (and stopped if a join times out), even when the wait
+  # check raises, so neither can hold locks while the after hooks truncate the
+  # tables. Returns the held operation's outcome and other_writer's.
   def race_held_reservation_against(held_request, hold_at:, &other_writer)
     reached = Queue.new
     release = Queue.new
@@ -145,8 +145,9 @@ RSpec.describe Timekeeping::ReservationOperations, "under concurrent requests" d
       blocked = reservation_blocked_by?(other_pid.pop(timeout: wait_seconds), held_pid.pop(timeout: wait_seconds))
     ensure
       release << true
+      [held, other].each { |thread| thread.kill unless thread.join(wait_seconds) }
     end
-    results = [held.join(wait_seconds)&.value, other.join(wait_seconds)&.value]
+    results = [held.value, other.value]
     expect(blocked).to be(true), "the other writer never waited on the held operation's lock"
     results
   end
@@ -266,5 +267,27 @@ RSpec.describe Timekeeping::ReservationOperations, "under concurrent requests" d
     expect(AuditEvent.where(entry_id:).order(:id).pluck(:action, :after))
       .to eq([["prepare", { "locked" => true }], ["abort", { "locked" => false }], ["prepare", { "locked" => true }]])
     expect(OutboxSnapshot.where(id: entry_id).order(:outbox_position).pluck(:locked)).to eq([true, false, true])
+  end
+
+  # The settle check holds the admission row FOR SHARE until the commit's
+  # transaction ends, so stop_applying! cannot return while a commit it would
+  # refuse is still being applied.
+  it "makes stop_applying! wait for a settling commit parked after its check, then refuses that commit when re-sent" do
+    timekeeping_arrange.set_generation(5)
+    operation_id = SecureRandom.uuid
+    expect(described_class.new.call(race_request(:prepare, operation_id:, entry_ids: [entry_id])).status).to eq(200)
+    Timekeeping::Admission.fence!(lock_timeout: 1)
+    Timekeeping::Admission.begin_settling!(generation: 5)
+    commit = race_request(:commit, operation_id:)
+
+    committed, = race_held_reservation_against(commit, hold_at: :generation_checked) do
+      Timekeeping::Admission.stop_applying!(generation: 5)
+    end
+
+    expect(answer(committed)).to eq([200, { "reserved" => 1, "released" => 0 }])
+    expect(Timekeeping::Admission.settling?).to be(false)
+    expect(Timekeeping::Admission.current.settling_stopped_generation).to eq(5)
+    expect(answer(described_class.new.call(commit))).to eq([409, { "reason" => "stale_generation" }])
+    expect(InvoiceOperation.pluck(:state)).to eq(["committed"])
   end
 end
