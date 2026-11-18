@@ -97,3 +97,220 @@ RSpec.describe Timekeeping::Admission do
     expect(described_class.current.generation).to be_nil
   end
 end
+
+RSpec.describe Timekeeping::Admission, "settle step" do
+  # A nil or malformed generation would compare as "no stop mark" and could
+  # open a phase or wipe the mark, so it is refused before the row is touched.
+  it "begin_settling! and stop_applying! reject nil, zero, negative and non-integer generations and leave the settling columns unchanged" do
+    invalid_generations = [nil, 0, -1, "5", 5.0]
+    described_class.admit!(generation: 5)
+    described_class.fence!(lock_timeout: 1)
+    described_class.begin_settling!(generation: 5)
+    settled = described_class.current.attributes.slice("generation", "settling_generation", "settling_stopped_generation")
+    expect(settled).to eq("generation" => nil, "settling_generation" => 5, "settling_stopped_generation" => nil)
+
+    invalid_generations.each do |generation|
+      expect { described_class.begin_settling!(generation:) }.to raise_error(ArgumentError)
+      expect { described_class.stop_applying!(generation:) }.to raise_error(ArgumentError)
+      expect(described_class.current.attributes.slice("generation", "settling_generation", "settling_stopped_generation"))
+        .to eq(settled), "changed by generation #{generation.inspect}"
+    end
+    expect(described_class.settling?).to be(true)
+  end
+
+  # A missing gate row must fail closed: recreating it would silently admit
+  # or settle a generation nobody chose.
+  it "begin_settling! and stop_applying! raise RecordNotFound on a missing admission row, never create it, and settling? reads false" do
+    described_class.delete_all
+
+    expect { described_class.begin_settling!(generation: 5) }.to raise_error(ActiveRecord::RecordNotFound)
+    expect { described_class.stop_applying!(generation: 5) }.to raise_error(ActiveRecord::RecordNotFound)
+    expect(described_class.settling?).to be(false)
+    expect(described_class.count).to eq(0)
+  end
+
+  # "It sets `settling_generation` only while fenced (`generation` is NULL) and only when `settling_stopped_generation` is NULL or lower than the given generation. A repeat at the same generation is a no-op."
+  it "begin_settling! while admitted, and a late begin_settling! for a lower generation, leave the settling state unchanged" do
+    described_class.admit!(generation: 5)
+
+    described_class.begin_settling!(generation: 5)
+    expect(described_class.settling?).to be(false)
+    expect(described_class.current.settling_generation).to be_nil
+
+    described_class.fence!(lock_timeout: 1)
+    described_class.begin_settling!(generation: 5)
+    described_class.begin_settling!(generation: 5)
+    expect(described_class.settling?).to be(true)
+    expect(described_class.current.settling_generation).to eq(5)
+
+    # A late settle for a lower generation does not replace the higher open
+    # phase.
+    described_class.begin_settling!(generation: 3)
+    expect(described_class.current.settling_generation).to eq(5)
+  end
+
+  # "A repeated or late begin_settling! cannot reopen a stopped phase, and a late stop_applying! for an older generation does not end a newer one"
+  it "a repeated or late begin_settling! after stop_applying! at the same generation does not reopen the stopped phase" do
+    described_class.admit!(generation: 5)
+    described_class.fence!(lock_timeout: 1)
+
+    described_class.begin_settling!(generation: 5)
+    expect(described_class.settling?).to be(true)
+
+    described_class.stop_applying!(generation: 5)
+    expect(described_class.settling?).to be(false)
+
+    # A settle request that timed out and ran late on the server.
+    described_class.begin_settling!(generation: 5)
+    expect(described_class.settling?).to be(false)
+    expect(described_class.current.settling_generation).to be_nil
+    expect(described_class.current.settling_stopped_generation).to eq(5)
+
+    # A settle for an even older generation cannot reopen it either.
+    described_class.begin_settling!(generation: 4)
+    expect(described_class.settling?).to be(false)
+
+    # A late stop for an older generation does not lower the mark.
+    described_class.stop_applying!(generation: 4)
+    expect(described_class.current.settling_stopped_generation).to eq(5)
+  end
+
+  # "It sets `settling_generation` only while fenced (`generation` is NULL) and only when `settling_stopped_generation` is NULL or lower than the given generation."
+  it "a stop_applying! that arrives before its begin_settling! keeps that generation from ever settling" do
+    described_class.admit!(generation: 5)
+    described_class.fence!(lock_timeout: 1)
+
+    described_class.stop_applying!(generation: 5)
+    described_class.begin_settling!(generation: 5)
+
+    expect(described_class.settling?).to be(false)
+    expect(described_class.current.settling_generation).to be_nil
+    expect(described_class.current.settling_stopped_generation).to eq(5)
+  end
+
+  # "`stop_applying!(generation: n)` clears `settling_generation` and raises `settling_stopped_generation` to n.
+  # It never lowers that mark, and it is a no-op when a higher generation is settling."
+  it "a late stop_applying! for generation 3 leaves generation 5 settling" do
+    described_class.fence!(lock_timeout: 1)
+    described_class.begin_settling!(generation: 5)
+
+    described_class.stop_applying!(generation: 3)
+
+    expect(described_class.settling?).to be(true)
+    expect(described_class.current.settling_generation).to eq(5)
+    expect(described_class.current.settling_stopped_generation).to be_nil
+  end
+
+  it "a stop_applying! for an earlier handoff's generation leaves the newer step open and later stops never lower the mark" do
+    described_class.admit!(generation: 3)
+    described_class.fence!(lock_timeout: 1)
+    described_class.begin_settling!(generation: 3)
+    described_class.stop_applying!(generation: 3)
+    described_class.admit!(generation: 5)
+    described_class.fence!(lock_timeout: 1)
+    described_class.begin_settling!(generation: 5)
+
+    # The earlier handoff's stop, delivered again after a timeout.
+    described_class.stop_applying!(generation: 3)
+
+    expect(described_class.settling?).to be(true)
+    expect(described_class.current.settling_generation).to eq(5)
+    expect(described_class.current.settling_stopped_generation).to eq(3)
+
+    described_class.stop_applying!(generation: 7)
+    described_class.stop_applying!(generation: 4)
+    expect(described_class.settling?).to be(false)
+    expect(described_class.current.settling_stopped_generation).to eq(7)
+  end
+
+  it "a stop mark of 7 blocks a settle at 7, lets a newer handoff settle at 8, and a late stop at 3 leaves 8 settling" do
+    described_class.admit!(generation: 7)
+    described_class.fence!(lock_timeout: 1)
+    described_class.begin_settling!(generation: 7)
+    described_class.stop_applying!(generation: 7)
+    described_class.admit!(generation: 8)
+    described_class.fence!(lock_timeout: 1)
+
+    # The stop mark is 7, so a settle at 7 cannot open, and a later stop at 4 must not lower the mark.
+    described_class.stop_applying!(generation: 4)
+    described_class.begin_settling!(generation: 7)
+    expect(described_class.settling?).to be(false)
+
+    described_class.begin_settling!(generation: 8)
+    expect(described_class.settling?).to be(true)
+
+    described_class.stop_applying!(generation: 3)
+    expect(described_class.settling?).to be(true)
+    expect(described_class.current.settling_generation).to eq(8)
+    expect(described_class.current.settling_stopped_generation).to eq(7)
+  end
+
+  # "`admit!` clears `settling_generation`."
+  it "admit! ends the settling phase and keeps the stop mark" do
+    described_class.fence!(lock_timeout: 1)
+    described_class.begin_settling!(generation: 5)
+    described_class.admit!(generation: 6)
+    expect(described_class.settling?).to be(false)
+    expect(described_class.current.settling_generation).to be_nil
+
+    described_class.fence!(lock_timeout: 1)
+    described_class.begin_settling!(generation: 6)
+    described_class.stop_applying!(generation: 6)
+    described_class.admit!(generation: 7)
+    expect(described_class.current.settling_stopped_generation).to eq(6)
+
+    described_class.fence!(lock_timeout: 1)
+    described_class.begin_settling!(generation: 6)
+    expect(described_class.settling?).to be(false)
+  end
+
+  # A step that admit! ended without a stop_applying! must stay closed when a
+  # later handoff fences and a late settle for its generation arrives.
+  it "admit! ending an unstopped settle step keeps a late begin_settling! for that generation from reopening it" do
+    described_class.fence!(lock_timeout: 1)
+    described_class.begin_settling!(generation: 5)
+    described_class.admit!(generation: 6)
+    expect(described_class.current.settling_stopped_generation).to eq(5)
+
+    described_class.fence!(lock_timeout: 1)
+    described_class.begin_settling!(generation: 5)
+
+    expect(described_class.settling?).to be(false)
+    expect(described_class.current.settling_stopped_generation).to eq(5)
+
+    described_class.begin_settling!(generation: 6)
+    expect(described_class.settling?).to be(true)
+  end
+
+  # admit! also ends the settle step; the held generation's release must
+  # still happen in the same call.
+  it "admit! ends an open settle step and still releases the held generation" do
+    described_class.fence!(lock_timeout: 1)
+    described_class.transaction { described_class.hold_generation!(5) }
+    described_class.begin_settling!(generation: 4)
+
+    described_class.admit!(generation: 5)
+
+    expect(described_class.current.attributes.slice("generation", "held_generation", "settling_generation"))
+      .to eq("generation" => 5, "held_generation" => nil, "settling_generation" => nil)
+  end
+end
+
+RSpec.describe Timekeeping::Admission, "settle step across connections" do
+  include_context "timekeeping entry writes"
+  include_context "timekeeping entry writes without transactional fixtures"
+
+  # "The settling state survives a new connection"
+  it "settling? holds when read on a new connection after begin_settling! commits" do
+    described_class.admit!(generation: 5)
+    described_class.fence!(lock_timeout: 1)
+    described_class.begin_settling!(generation: 5)
+
+    read_elsewhere = Thread.new { ApplicationRecord.connection_pool.with_connection { described_class.settling? } }.value
+    expect(read_elsewhere).to be(true)
+
+    described_class.stop_applying!(generation: 5)
+    stopped_elsewhere = Thread.new { ApplicationRecord.connection_pool.with_connection { described_class.settling? } }.value
+    expect(stopped_elsewhere).to be(false)
+  end
+end
