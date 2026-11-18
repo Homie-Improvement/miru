@@ -43,9 +43,10 @@ module TimekeepingDatabaseReset
   # state_name nil means no owner state is selected; the admission row then
   # takes its column default, as it does for legacy.
   def reset!(state_name, env:)
+    # Checked first, so an unknown state name fails whether or not a database is configured.
+    generation = admission_generation(state_name)
     return nil unless env.key?(DATABASE_URL_KEY)
 
-    generation = admission_generation(state_name)
     url = env.fetch(DATABASE_URL_KEY)
     TestDatabaseGuard.require_test_database!(database_name(url))
     connection = connect(url)
