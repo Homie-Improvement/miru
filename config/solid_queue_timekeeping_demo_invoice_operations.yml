@@ -1,0 +1,26 @@
+# The invoice-operation worker of the local Timekeeping demo
+# (docs/architecture/timekeeping-soa.md section 11.1), started by
+# bin/timekeeping-demo-queue. Only the dedicated invoice_operations worker runs,
+# never a default worker, because the seeded data already holds queued
+# integration jobs that a default worker would run. The dispatcher schedules
+# only the recovery sweep, with the class and schedule config/solid_queue.yml
+# uses.
+default: &default
+  dispatchers:
+    - polling_interval: 1
+      batch_size: 500
+      recurring_tasks:
+        recover_invoice_operation_intents:
+          class: RecoverInvoiceOperationIntentsJob
+          schedule: '* * * * *'  # Every minute, so a crashed invoice save converges soon after the 60 s pickup age
+  workers:
+    - queues: invoice_operations
+      threads: 1
+      processes: 1
+      polling_interval: 0.5
+
+development:
+  <<: *default
+
+test:
+  <<: *default

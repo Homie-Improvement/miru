@@ -12,6 +12,12 @@ require "active_storage/reflection"
 
 module MiruWeb
   class Application < Rails::Application
+    # bin/timekeeping-demo sets DATABASE_URL to "" when it has none to give, so
+    # that dotenv (loaded just above, when this class is defined) cannot fill
+    # it from a local .env. Active Record would read "" as a URL and refuse to
+    # boot, so an empty value means unset: config/database.yml applies instead.
+    ENV.delete("DATABASE_URL") if ENV["DATABASE_URL"] == ""
+
     config.active_storage ||= ActiveSupport::OrderedOptions.new
     config.active_storage.queues ||= ActiveSupport::OrderedOptions.new
 

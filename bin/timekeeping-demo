@@ -1,0 +1,21 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Starts the local Timekeeping demo runtime (docs/architecture/timekeeping-soa.md
+# section 11.1) from Procfile.timekeeping:
+#
+#   TIMEKEEPING_DATABASE_URL=... bin/timekeeping-demo up
+#
+# It runs in the foreground; Ctrl-C stops every process it started. The
+# running versions are written to tmp/timekeeping-demo/versions.json.
+#
+# Rails is not loaded here, so the launcher's files are required directly, in
+# the order they depend on each other.
+
+root = File.expand_path("..", __dir__)
+
+%w[configuration_error process_spec credentials runtime_plan version_record supervisor cli].each do |file|
+  require File.join(root, "lib", "timekeeping_demo", file)
+end
+
+exit TimekeepingDemo::CLI.run(ARGV, root:)

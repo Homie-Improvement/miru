@@ -1,0 +1,28 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Starts one Solid Queue supervisor of the local Timekeeping demo from the
+# config file named as the only argument, for example
+#
+#   bin/timekeeping-demo-queue config/solid_queue_timekeeping_demo_relay.yml
+#
+# A relative path is read from the application root.
+
+EX_USAGE = 64
+
+app_root = File.expand_path("..", __dir__)
+config_path = ARGV.first && File.expand_path(ARGV.first, app_root)
+
+unless config_path && File.file?(config_path)
+  warn "usage: bin/timekeeping-demo-queue CONFIG_PATH (an existing Solid Queue config file)"
+  exit EX_USAGE
+end
+
+require File.expand_path("../config/environment", __dir__)
+
+# The test environment selects the :test adapter, under which recurring tasks
+# are handed to that adapter and never reach the queue tables. The forked
+# workers and dispatcher inherit this setting.
+ActiveJob::Base.queue_adapter = :solid_queue
+
+SolidQueue::Supervisor.start(load_configuration_from: config_path)
