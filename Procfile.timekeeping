@@ -1,0 +1,17 @@
+# The local Timekeeping demo runtime (docs/architecture/timekeeping-soa.md
+# section 11.1). Start it with `bin/timekeeping-demo up`, not with foreman:
+# foreman hands every process one shared environment, and each application
+# here must receive only its own keys and database credential.
+#
+# A process name starts with the application it belongs to (monolith_ or
+# timekeeping_). Commands are split into arguments and never run through a
+# shell; ${MONOLITH_PORT} and ${TIMEKEEPING_PORT} are the only placeholders.
+#
+# Only the dedicated workers run: each application's relay worker and the
+# monolith's invoice-operation worker. No default worker is started, because the
+# seeded data already holds queued jobs that it would run.
+monolith_web: bundle exec puma -C config/puma_timekeeping_demo.rb -b tcp://127.0.0.1:${MONOLITH_PORT} config.ru
+monolith_relay: bin/timekeeping-demo-queue config/solid_queue_timekeeping_demo_relay.yml
+monolith_invoice_operations: bin/timekeeping-demo-queue config/solid_queue_timekeeping_demo_invoice_operations.yml
+timekeeping_web: bin/rails server -b 127.0.0.1 -p ${TIMEKEEPING_PORT} -P tmp/pids/timekeeping-demo.pid
+timekeeping_relay: bundle exec rake solid_queue:start
