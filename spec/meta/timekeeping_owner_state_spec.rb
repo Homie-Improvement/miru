@@ -55,16 +55,6 @@ RSpec.describe "Timekeeping owner state harness" do
   end
 end
 
-RSpec.describe "Timekeeping owner state harness" do
-  # "`reset!` does nothing when `TIMEKEEPING_DATABASE_URL` is unset or the database does not exist yet."
-  it "reset! does nothing when TIMEKEEPING_DATABASE_URL is unset" do
-    allow(PG).to receive(:connect).and_call_original
-
-    expect(TimekeepingDatabaseReset.reset!("rollback", env: {})).to be_nil
-    expect(PG).not_to have_received(:connect)
-  end
-end
-
 RSpec.describe "TimekeepingOwnerState.apply! persistence" do
   it "apply! of each state over a row with handoff_step freeze persists exactly that state's columns, and repeating it changes nothing" do
     # "`legacy` is owner monolith, `monolith_store` legacy, generation 1. `timekeeping` is owner timekeeping,
@@ -534,6 +524,10 @@ RSpec.describe "Timekeeping owner state harness" do
     [nil, "legacy", "timekeeping", "rollback"].each do |state|
       expect(TimekeepingDatabaseReset.reset!(state, env: {})).to be_nil
     end
+
+    expect do
+      TimekeepingDatabaseReset.reset!("bogus", env: { "TIMEKEEPING_DATABASE_URL" => "dbname=timekeeping_test" })
+    end.to raise_error(ArgumentError)
   end
 end
 
