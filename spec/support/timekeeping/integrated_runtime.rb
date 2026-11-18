@@ -75,7 +75,9 @@ class IntegratedRuntime
   end
 
   def self.parse_groups(text)
-    text.each_line.map(&:chomp).grep(GROUP_LINE).map { |line| Integer(line, 10) }.select { |id| id >= SMALLEST_GROUP }
+    # A last line with no newline may be a partial write ("424" of "4242"),
+    # which could name a group this harness never started.
+    text.each_line.select { |line| line.end_with?("\n") }.map(&:chomp).grep(GROUP_LINE).map { |line| Integer(line, 10) }.select { |id| id >= SMALLEST_GROUP }
   end
 
   # The launcher's spawn environment, arguments and options. The credentials

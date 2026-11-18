@@ -270,7 +270,8 @@ RSpec.describe IntegratedRuntime do
     # and Process.kill(sig, -0) would hit the rspec process group, -1 every user process.
     text = "4242\n\n0\n1\n-7\nabc\n12x\n 99\n31337\n5"
 
-    expect(described_class.parse_groups(text)).to eq([4242, 31_337, 5])
+    # The final "5" has no newline, so it may be a partial write and is skipped.
+    expect(described_class.parse_groups(text)).to eq([4242, 31_337])
   end
 end
 
