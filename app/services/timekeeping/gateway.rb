@@ -785,7 +785,7 @@ module Timekeeping
 
       def admissible?(ownership)
         !ownership.nil? &&
-          ownership.handoff_step.blank? &&
+          !ownership.admission_closed? &&
           TimekeepingOwnership::OWNERS.include?(ownership.owner) &&
           TimekeepingOwnership::MONOLITH_STORES.include?(ownership.monolith_store)
       end
