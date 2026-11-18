@@ -35,7 +35,6 @@ class IntegratedRuntime
   # Procfile.timekeeping starts the Timekeeping server with this fixed pid file.
   # A server killed with KILL leaves it, and the next server refuses to boot.
   TIMEKEEPING_PID_FILE = File.join("timekeeping", "tmp", "pids", "timekeeping-demo.pid")
-  TIMEKEEPING_DIRECTORY = "timekeeping"
   TIMEKEEPING_DATABASE_URL = TimekeepingDatabaseReset::DATABASE_URL_KEY
   # A group id of 0 or 1 would make Process.kill signal the caller's own group
   # or every process the user owns, so only larger whole numbers are read.
