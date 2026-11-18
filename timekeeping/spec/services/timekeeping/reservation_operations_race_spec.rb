@@ -267,4 +267,41 @@ RSpec.describe Timekeeping::ReservationOperations, "under concurrent requests" d
       .to eq([["prepare", { "locked" => true }], ["abort", { "locked" => false }], ["prepare", { "locked" => true }]])
     expect(OutboxSnapshot.where(id: entry_id).order(:outbox_position).pluck(:locked)).to eq([true, false, true])
   end
+
+  # The settle check holds the admission row FOR SHARE until the commit's
+  # transaction ends, so stop_applying! cannot return while a commit it would
+  # refuse is still being applied.
+  it "makes stop_applying! wait for a settling commit parked after its check, then refuses that commit when re-sent" do
+    timekeeping_arrange.set_generation(5)
+    operation_id = SecureRandom.uuid
+    expect(described_class.new.call(race_request(:prepare, operation_id:, entry_ids: [entry_id])).status).to eq(200)
+    Timekeeping::Admission.fence!(lock_timeout: 1)
+    Timekeeping::Admission.begin_settling!(generation: 5)
+    commit = race_request(:commit, operation_id:)
+
+    reached = Queue.new
+    release = Queue.new
+    commit_pid = Queue.new
+    stop_pid = Queue.new
+    checkpoint = lambda do |step|
+      next unless step == :generation_checked
+
+      reached << true
+      release.pop
+    end
+    committing = on_own_reservation_connection(commit_pid) { described_class.new(checkpoint:).call(commit) }
+    expect(reached.pop(timeout: wait_seconds)).to be(true)
+    stopping = on_own_reservation_connection(stop_pid) { Timekeeping::Admission.stop_applying!(generation: 5) }
+    blocked = reservation_blocked_by?(stop_pid.pop(timeout: wait_seconds), commit_pid.pop(timeout: wait_seconds))
+    release << true
+    committed = committing.join(wait_seconds)&.value
+    stopping.join(wait_seconds)
+
+    expect(blocked).to be(true), "stop_applying! never waited on the settling commit"
+    expect(answer(committed)).to eq([200, { "reserved" => 1, "released" => 0 }])
+    expect(Timekeeping::Admission.settling?).to be(false)
+    expect(Timekeeping::Admission.current.settling_stopped_generation).to eq(5)
+    expect(answer(described_class.new.call(commit))).to eq([409, { "reason" => "stale_generation" }])
+    expect(InvoiceOperation.pluck(:state)).to eq(["committed"])
+  end
 end
