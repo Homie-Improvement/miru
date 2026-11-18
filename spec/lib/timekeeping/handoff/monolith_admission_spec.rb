@@ -173,30 +173,33 @@ RSpec.describe Timekeeping::Handoff::MonolithAdmission do
       backend_pids = Queue.new
       held = Queue.new
       release = Queue.new
-      holder = committed_data_thread(backend_pids) do
-        TimekeepingOwnership.transaction do
-          TimekeepingOwnership.lock("FOR SHARE").find(TimekeepingOwnership::SINGLETON_ID)
-          held << true
-          release.pop
-        end
-      end
-      expect(held.pop(timeout: 5)).to be(true)
-      holder_pid = backend_pids.pop
-
+      holder = nil
+      fencer = nil
       fence_error = nil
-      fencer = committed_data_thread(backend_pids) do
-        described_class.new(lock_timeout: 10.seconds).fence_admission
-      rescue StandardError => error
-        fence_error = error
-      end
-      fencer_pid = backend_pids.pop(timeout: 5)
 
       begin
+        holder = committed_data_thread(backend_pids) do
+          TimekeepingOwnership.transaction do
+            TimekeepingOwnership.lock("FOR SHARE").find(TimekeepingOwnership::SINGLETON_ID)
+            held << true
+            release.pop
+          end
+        end
+        expect(held.pop(timeout: 5)).to be(true)
+        holder_pid = backend_pids.pop
+
+        fencer = committed_data_thread(backend_pids) do
+          described_class.new(lock_timeout: 10.seconds).fence_admission
+        rescue StandardError => error
+          fence_error = error
+        end
+        fencer_pid = backend_pids.pop(timeout: 5)
+
         expect(blocked_by?(fencer_pid, holder_pid, within: 3)).to be(true)
         expect(TimekeepingOwnership.current.admission_fenced_at).to be_nil
       ensure
         release << true
-        [holder, fencer].each do |thread|
+        [holder, fencer].compact.each do |thread|
           thread.kill unless thread.join(5)
           thread.join
         end
@@ -334,55 +337,66 @@ RSpec.describe Timekeeping::Handoff::MonolithAdmission do
   end
 
   context "when a billing write starts while the fence waits", committed_data: true do
-    it "a billing write that starts while fence_admission waits is refused or ends before the fence returns" do
-      admission = described_class.new(lock_timeout: 5.seconds)
+    it "a billing write admitted while fence_admission waits keeps the fence waiting until it commits" do
+      admission = described_class.new(lock_timeout: 10.seconds)
       holder_pids = Queue.new
       fence_pids = Queue.new
+      late_pids = Queue.new
       held = Queue.new
       release = Queue.new
-      holder = committed_data_thread(holder_pids) do
-        TimekeepingOwnership.transaction do
-          TimekeepingOwnership.lock("FOR SHARE").find(TimekeepingOwnership::SINGLETON_ID)
-          held << true
-          release.pop
-        end
-      end
+      late_admitted = Queue.new
+      release_late = Queue.new
+      holder = nil
       fence = nil
       late_writer = nil
 
       begin
+        holder = committed_data_thread(holder_pids) do
+          TimekeepingOwnership.transaction do
+            TimekeepingOwnership.lock("FOR SHARE").find(TimekeepingOwnership::SINGLETON_ID)
+            held << true
+            release.pop
+          end
+        end
         expect(held.pop(timeout: 5)).to be(true)
         holder_pid = holder_pids.pop
-        fence = committed_data_thread(fence_pids) do
-          admission.fence_admission
-          Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        end
-        fence_pid = fence_pids.pop
+        fence = committed_data_thread(fence_pids) { admission.fence_admission }
+        fence_pid = fence_pids.pop(timeout: 5)
 
         # "closing takes an exclusive lock on that row, so it waits for the transactions already admitted and none can commit after it"
         expect(blocked_by?(fence_pid, holder_pid, within: 3)).to be(true)
 
         # PostgreSQL still grants FOR SHARE beside the holder while the fence's
-        # UPDATE waits, so this writer may be admitted. Admitted or not, it must
-        # not commit after the fence returns. Its clock is read inside the
-        # transaction, while it still holds the row, so an admitted write's
-        # reading is earlier than the fence's return.
-        late_writer = committed_data_thread do
-          Timekeeping::BillingFence.transaction { Process.clock_gettime(Process::CLOCK_MONOTONIC) }
-        rescue Timekeeping::BillingFence::OwnershipMoving
-          :refused
+        # UPDATE waits, so this billing write is admitted before the mark exists.
+        # It pauses inside its transaction to show the fence cannot finish first.
+        late_writer = committed_data_thread(late_pids) do
+          Timekeeping::BillingFence.transaction do
+            late_admitted << true
+            release_late.pop
+            :committed
+          end
         end
+        late_pid = late_pids.pop(timeout: 5)
+        expect(late_admitted.pop(timeout: 5)).to be(true)
+
+        release << true
+        holder.join(5)
+        expect(blocked_by?(fence_pid, late_pid, within: 3)).to be(true)
+        expect(TimekeepingOwnership.current.admission_fenced_at).to be_nil
+
+        release_late << true
+        expect(late_writer.join(5)&.value).to eq(:committed)
+        expect(fence.join(5)).to be(fence)
+        expect(fence.value).to be_nil
       ensure
         release << true
+        release_late << true
         [holder, fence, late_writer].compact.each do |thread|
           thread.kill unless thread.join(10)
           thread.join
         end
       end
 
-      fence_returned_at = fence.value
-      late_result = late_writer.value
-      expect(late_result == :refused || late_result < fence_returned_at).to be(true)
       expect(TimekeepingOwnership.current.admission_fenced_at).not_to be_nil
     end
   end
