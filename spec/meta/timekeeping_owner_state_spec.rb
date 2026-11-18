@@ -311,10 +311,10 @@ RSpec.describe "Timekeeping owner state harness" do
       it "refuses a real non-test database and leaves its rows in place" do
         # A unique name, so this example never drops a database it did not create.
         scratch_name = "timekeeping_owner_state_guard_scratch_#{SecureRandom.hex(6)}"
+        scratch_options = live_options.merge("dbname" => scratch_name) # refuses a non-_test URL before connecting
         admin = PG.connect(live_url)
         admin.exec("CREATE DATABASE #{admin.quote_ident(scratch_name)}")
         scratch_created = true
-        scratch_options = live_options.merge("dbname" => scratch_name)
         scratch = PG.connect(scratch_options)
         scratch.exec("CREATE TABLE kept_rows (id integer)")
         scratch.exec("INSERT INTO kept_rows (id) VALUES (1)")
