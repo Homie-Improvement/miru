@@ -573,3 +573,40 @@ RSpec.describe "TimekeepingDatabaseReset.reset! before the database exists" do
     expect(TimekeepingDatabaseReset.reset!("timekeeping", env: { "TIMEKEEPING_DATABASE_URL" => missing })).to be_nil
   end
 end
+
+RSpec.describe "Seeded committed_data owner state probe run (rollback)", :without_transaction do
+  it "the seeded committed_data probe ends in the rollback state with both seeded companies" do
+    probe = Rails.root.join("spec/fixtures/timekeeping_harness/seeded_owner_state_probe.rb").to_s
+    expect(File).to exist(probe)
+    expect(File.basename(probe)).not_to end_with("_spec.rb")
+    probe_source = File.read(probe)
+    expect(probe_source).to include("two_tenant_seed").and include("committed_data: true")
+    expect(probe_source).to include("Fork & Leaf Salads").and include("Copper Kettle Bakery")
+    expect(probe_source).to include("expect_owner_state!")
+
+    # "The seeded path ends in the selected state under `TIMEKEEPING_OWNER_STATE=rollback` and `=timekeeping`"
+    stdout, stderr, status = Open3.capture3({ "TIMEKEEPING_OWNER_STATE" => "rollback" },
+                                            "bundle", "exec", "rspec", probe, chdir: Rails.root.to_s)
+
+    expect(status).to be_success, "#{stdout}\n#{stderr}"
+    expect(stdout).to include("1 example, 0 failures")
+  end
+end
+
+RSpec.describe "Seeded committed_data owner state probe run (timekeeping)", :without_transaction do
+  it "the seeded committed_data probe ends in the timekeeping state with both seeded companies" do
+    probe = Rails.root.join("spec/fixtures/timekeeping_harness/seeded_owner_state_probe.rb").to_s
+    expect(File).to exist(probe)
+
+    # "The seeded path ends in the selected state under `TIMEKEEPING_OWNER_STATE=rollback` and `=timekeeping`"
+    # Under timekeeping a seed loaded after the state was applied raises HandoffBegun, so this run also
+    # fails if the state is applied before the seed loads.
+    stdout, stderr, status = Open3.capture3({ "TIMEKEEPING_OWNER_STATE" => "timekeeping" },
+                                            "bundle", "exec", "rspec", probe, chdir: Rails.root.to_s)
+
+    expect(status).to be_success, "#{stdout}\n#{stderr}"
+    expect(stdout).to include("1 example, 0 failures")
+    expect("#{stdout}\n#{stderr}").not_to include("HandoffBegun")
+    expect("#{stdout}\n#{stderr}").not_to include("SeedDispositionRecorder::Error")
+  end
+end
