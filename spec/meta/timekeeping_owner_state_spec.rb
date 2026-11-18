@@ -100,20 +100,25 @@ RSpec.describe "Timekeeping owner state harness" do
     end
 
     describe ".apply!" do
-      # Two starting rows, so each owner column apply! must write starts from a different value: a row still owned
-      # by the monolith, and one whose owner and store already differ from the defaults.
+      mid_handoff = { handoff_step: "freeze", generation: 9, final_outbox_position: 5 }.freeze
+
+      # Starting rows: the state applied first (nil for the column defaults), then the columns written over it.
+      # Each owner column apply! must write starts from a value other than its target in at least one row; the row
+      # after timekeeping makes rollback change owner and store together.
       apply_seeds = {
-        "a mid-handoff monolith-owned row" => { handoff_step: "freeze", generation: 9, final_outbox_position: 5 },
+        "a mid-handoff monolith-owned row" => { applied: nil, columns: mid_handoff },
         "a mid-handoff timekeeping-owned row with legacy_retired_at nil" => {
-          handoff_step: "freeze", generation: 9, final_outbox_position: 5,
-          owner: "timekeeping", monolith_store: "prepared", legacy_retired_at: nil
+          applied: nil,
+          columns: mid_handoff.merge(owner: "timekeeping", monolith_store: "prepared", legacy_retired_at: nil)
         },
-        "the applied rollback row" => :rollback
+        "the applied rollback row" => { applied: "rollback", columns: {} },
+        "a mid-handoff row after timekeeping was applied" => { applied: "timekeeping", columns: mid_handoff }
       }
 
       def seed_ownership(seed)
         TimekeepingOwnership.ensure_initial!
-        seed == :rollback ? TimekeepingOwnerState.apply!("rollback") : update_ownership(**seed)
+        TimekeepingOwnerState.apply!(seed[:applied]) if seed[:applied]
+        update_ownership(**seed[:columns]) unless seed[:columns].empty?
       end
 
       apply_seeds.except("the applied rollback row").each do |seed_name, seed|
