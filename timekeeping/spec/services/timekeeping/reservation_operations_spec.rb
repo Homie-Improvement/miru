@@ -348,58 +348,6 @@ RSpec.describe Timekeeping::ReservationOperations do
   include_context "timekeeping entry writes"
 
   let(:company) { timekeeping_arrange.company }
-  let(:other_company) { timekeeping_arrange.company }
-  let(:user) { timekeeping_arrange.user(company:, role: "employee") }
-  let(:project) { timekeeping_arrange.project(company:) }
-  let(:x) { timekeeping_arrange.entry(company:, user:, project:) }
-
-  def settling_request(route, operation_id:, generation:, company_id: company, actor_name: "invoice-boundary", entry_ids: [])
-    Timekeeping::ReservationOperations::Request.new(
-      route:, company_id:, actor_name:, invoice_id: 501, operation_id:, generation:, disposition: "active", entry_ids:
-    )
-  end
-
-  def settling_outcome(request)
-    outcome = described_class.new.call(request)
-    [outcome.status, JSON.parse(outcome.body)]
-  end
-
-  # "In `Timekeeping::ReservationOperations` (timekeeping/app/services/timekeeping/reservation_operations.rb), while admission is fenced, apply a request only when all three hold: it is a commit or abort; it carries exactly `settling_generation`; and it names an operation in Timekeeping's own invoice_operations, found by company, actor and operation id, stored at that generation."
-  # "Everything else is refused as stale_generation, with no stored change and no new invoice_operations row."
-  it "while settling, refuses a commit naming the operation under another actor or company, or with a malformed generation, and then applies the owner's exact commit" do
-    timekeeping_arrange.set_generation(5)
-    operation_id = SecureRandom.uuid
-    expect(settling_outcome(settling_request(:prepare, operation_id:, generation: 5, entry_ids: [x])).first).to eq(200)
-    other_company
-    Timekeeping::Admission.fence!(lock_timeout: 1)
-    Timekeeping::Admission.begin_settling!(generation: 5)
-
-    baseline = reservation_row_counts
-    expect(baseline).to include(operations: 1, reservations: 1, receipts: 0)
-    stale = [409, { "reason" => "stale_generation" }]
-
-    refused = {
-      "another actor" => settling_request(:commit, operation_id:, generation: 5, actor_name: "agent-destroy"),
-      "another company" => settling_request(:commit, operation_id:, generation: 5, company_id: other_company),
-      "decimal generation" => settling_request(:commit, operation_id:, generation: "5.0"),
-      "padded generation" => settling_request(:commit, operation_id:, generation: " 5"),
-      "missing generation" => settling_request(:commit, operation_id:, generation: nil)
-    }
-    refused.each do |label, request|
-      expect(settling_outcome(request)).to eq(stale), "#{label} was not refused as stale"
-      expect(reservation_row_counts).to eq(baseline), "#{label} changed stored rows"
-      expect(InvoiceOperation.find_by!(company_id: company, operation_id:).state).to eq("prepared"), "#{label} moved the operation"
-    end
-
-    expect(settling_outcome(settling_request(:commit, operation_id:, generation: 5)).first).to eq(200)
-    expect(InvoiceOperation.find_by!(company_id: company, operation_id:).state).to eq("committed")
-  end
-end
-
-RSpec.describe Timekeeping::ReservationOperations do
-  include_context "timekeeping entry writes"
-
-  let(:company) { timekeeping_arrange.company }
   let(:user) { timekeeping_arrange.user(company:, role: "employee") }
   let(:project) { timekeeping_arrange.project(company:) }
   let(:settling_entry) { timekeeping_arrange.entry(company:, user:, project:) }
@@ -441,64 +389,6 @@ RSpec.describe Timekeeping::ReservationOperations do
     expect(settling_call(commit)).to eq([409, { "reason" => "stale_generation" }])
     expect(reservation_row_counts).to eq(after_commit)
     expect(InvoiceOperation.find_by!(operation_id:).state).to eq("committed")
-  end
-end
-
-RSpec.describe Timekeeping::ReservationOperations do
-  include_context "timekeeping entry writes"
-
-  let(:company) { timekeeping_arrange.company }
-  let(:user) { timekeeping_arrange.user(company:, role: "employee") }
-  let(:project) { timekeeping_arrange.project(company:) }
-  let(:older_entry) { timekeeping_arrange.entry(company:, user:, project:) }
-  let(:current_entry) { timekeeping_arrange.entry(company:, user:, project:) }
-  let(:fresh_entry) { timekeeping_arrange.entry(company:, user:, project:) }
-
-  def settling_refusal_request(route, operation_id:, generation:, invoice_id: 501, entry_ids: [])
-    Timekeeping::ReservationOperations::Request.new(
-      route:, company_id: company, actor_name: "invoice-boundary", invoice_id:, operation_id:,
-      generation:, disposition: "active", entry_ids:
-    )
-  end
-
-  def settling_refusal_call(request)
-    outcome = described_class.new.call(request)
-    [outcome.status, JSON.parse(outcome.body)]
-  end
-
-  it "while settling, a new prepare, an unknown operation, the raised generation and an operation stored at an older generation are refused as stale and store nothing" do
-    timekeeping_arrange.set_generation(4)
-    older_operation = SecureRandom.uuid
-    expect(settling_refusal_call(settling_refusal_request(:prepare, operation_id: older_operation, generation: 4,
-                                                          invoice_id: 601, entry_ids: [older_entry])).first).to eq(200)
-    timekeeping_arrange.set_generation(5)
-    current_operation = SecureRandom.uuid
-    expect(settling_refusal_call(settling_refusal_request(:prepare, operation_id: current_operation, generation: 5,
-                                                          entry_ids: [current_entry])).first).to eq(200)
-    fresh_entry
-    Timekeeping::Admission.fence!(lock_timeout: 1)
-    Timekeeping::Admission.begin_settling!(generation: 5)
-    baseline = reservation_row_counts
-    expect(baseline.fetch(:operations)).to eq(2)
-    expect(baseline.fetch(:reservations)).to eq(2)
-
-    # "Everything else is refused as stale_generation, with no stored change and no new invoice_operations row."
-    refused = {
-      new_prepare: settling_refusal_request(:prepare, operation_id: SecureRandom.uuid, generation: 5, invoice_id: 701,
-                                                      entry_ids: [fresh_entry]),
-      unknown_operation: settling_refusal_request(:commit, operation_id: SecureRandom.uuid, generation: 5),
-      raised_generation: settling_refusal_request(:commit, operation_id: current_operation, generation: 6),
-      older_generation_operation: settling_refusal_request(:commit, operation_id: older_operation, generation: 5,
-                                                                    invoice_id: 601),
-      older_generation_abort: settling_refusal_request(:abort, operation_id: older_operation, generation: 4,
-                                                                invoice_id: 601)
-    }
-    refused.each do |label, request|
-      expect([label, settling_refusal_call(request)]).to eq([label, [409, { "reason" => "stale_generation" }]])
-      expect([label, reservation_row_counts]).to eq([label, baseline])
-    end
-    expect(InvoiceOperation.order(:generation).pluck(:generation, :state)).to eq([[4, "prepared"], [5, "prepared"]])
-    expect(Timekeeping::Admission.settling?).to be(true)
   end
 end
 
@@ -639,67 +529,6 @@ RSpec.describe Timekeeping::ReservationOperations do
     expect(Reservation.where(entry_id: settling_entry).pluck(:invoice_id, :state)).to eq([[501, "committed"]])
     expect(ServiceIdempotencyReceipt.where(key: operation_id, operation: "commit").count).to eq(1)
   end
-end
-
-RSpec.describe Timekeeping::ReservationOperations do
-  include_context "timekeeping entry writes"
-
-  let(:company) { timekeeping_arrange.company }
-  let(:user) { timekeeping_arrange.user(company:, role: "employee") }
-  let(:project) { timekeeping_arrange.project(company:) }
-  let(:settling_entry) { timekeeping_arrange.entry(company:, user:, project:) }
-
-  def settling_request(route, operation_id:, generation:, entry_ids: [])
-    Timekeeping::ReservationOperations::Request.new(
-      route:, company_id: company, actor_name: "invoice-boundary", invoice_id: 501, operation_id:,
-      generation:, disposition: "active", entry_ids:
-    )
-  end
-
-  def settling_call(request)
-    outcome = described_class.new.call(request)
-    [outcome.status, JSON.parse(outcome.body)]
-  end
-
-  # "While fenced, decide this BEFORE `stored_answer` replays a receipt. Today the receipt is replayed
-  # first, so a commit re-sent after stop would get its old 200."
-  it "refuses as stale the exact commit applied during settling once stop_applying! has run, despite its stored receipt" do
-    timekeeping_arrange.set_generation(5)
-    operation_id = SecureRandom.uuid
-    settling_call(settling_request(:prepare, operation_id:, generation: 5, entry_ids: [settling_entry]))
-    Timekeeping::Admission.fence!(lock_timeout: 1)
-    Timekeeping::Admission.begin_settling!(generation: 5)
-    commit = settling_request(:commit, operation_id:, generation: 5)
-    expect(settling_call(commit)).to eq([200, { "reserved" => 1, "released" => 0 }])
-    expect(ServiceIdempotencyReceipt.where(key: operation_id, operation: "commit").count).to eq(1)
-
-    Timekeeping::Admission.stop_applying!(generation: 5)
-    baseline = reservation_row_counts
-
-    expect(settling_call(commit)).to eq([409, { "reason" => "stale_generation" }])
-    expect(reservation_row_counts).to eq(baseline)
-  end
-end
-
-RSpec.describe Timekeeping::ReservationOperations do
-  include_context "timekeeping entry writes"
-
-  let(:company) { timekeeping_arrange.company }
-  let(:user) { timekeeping_arrange.user(company:, role: "employee") }
-  let(:project) { timekeeping_arrange.project(company:) }
-  let(:settling_entry) { timekeeping_arrange.entry(company:, user:, project:) }
-
-  def settling_request(route, operation_id:, generation:, entry_ids: [])
-    Timekeeping::ReservationOperations::Request.new(
-      route:, company_id: company, actor_name: "invoice-boundary", invoice_id: 501, operation_id:,
-      generation:, disposition: "active", entry_ids:
-    )
-  end
-
-  def settling_call(request)
-    outcome = described_class.new.call(request)
-    [outcome.status, JSON.parse(outcome.body)]
-  end
 
   # "During this step only, the outgoing owner still applies a commit or abort that carries the old
   # generation, and only for an operation it registered in its own invoice_operations."
@@ -717,83 +546,6 @@ RSpec.describe Timekeeping::ReservationOperations do
     expect(Reservation.where(entry_id: settling_entry).count).to eq(0)
     expect(OutboxSnapshot.count).to eq(snapshots_before + 1)
     expect(OutboxSnapshot.where(generation: 5).count).to eq(at_five_before + 1)
-  end
-end
-
-RSpec.describe Timekeeping::ReservationOperations do
-  include_context "timekeeping entry writes"
-
-  let(:company) { timekeeping_arrange.company }
-  let(:user) { timekeeping_arrange.user(company:, role: "employee") }
-  let(:project) { timekeeping_arrange.project(company:) }
-  let(:settling_entry) { timekeeping_arrange.entry(company:, user:, project:) }
-  let(:older_entry) { timekeeping_arrange.entry(company:, user:, project:) }
-  let(:spare_entry) { timekeeping_arrange.entry(company:, user:, project:) }
-
-  def settling_request(route, operation_id:, generation:, invoice_id: 501, entry_ids: [], actor_name: "invoice-boundary")
-    Timekeeping::ReservationOperations::Request.new(
-      route:, company_id: company, actor_name:, invoice_id:, operation_id:,
-      generation:, disposition: "active", entry_ids:
-    )
-  end
-
-  def settling_call(request)
-    outcome = described_class.new.call(request)
-    [outcome.status, JSON.parse(outcome.body)]
-  end
-
-  # "Everything else is refused as stale_generation, with no stored change and no new invoice_operations row."
-  it "refuses a new prepare, an unknown operation, the raised generation, an older-generation operation and another actor while settling, changing nothing" do
-    timekeeping_arrange.set_generation(4)
-    older_id = SecureRandom.uuid
-    settling_call(settling_request(:prepare, operation_id: older_id, generation: 4, invoice_id: 502, entry_ids: [older_entry]))
-    timekeeping_arrange.set_generation(5)
-    operation_id = SecureRandom.uuid
-    settling_call(settling_request(:prepare, operation_id:, generation: 5, entry_ids: [settling_entry]))
-    spare_entry
-    Timekeeping::Admission.fence!(lock_timeout: 1)
-    Timekeeping::Admission.begin_settling!(generation: 5)
-    baseline = reservation_row_counts
-    expect(baseline.fetch(:operations)).to eq(2)
-    expect(InvoiceOperation.pluck(:state)).to eq(%w[prepared prepared])
-
-    refused = {
-      "new prepare" => settling_request(:prepare, operation_id: SecureRandom.uuid, generation: 5, invoice_id: 503,
-                                                  entry_ids: [spare_entry]),
-      "unknown operation" => settling_request(:commit, operation_id: SecureRandom.uuid, generation: 5),
-      "raised generation" => settling_request(:commit, operation_id:, generation: 6),
-      "older-generation operation at 5" => settling_request(:commit, operation_id: older_id, generation: 5, invoice_id: 502),
-      "older-generation operation at 4" => settling_request(:commit, operation_id: older_id, generation: 4, invoice_id: 502),
-      "another actor" => settling_request(:commit, operation_id:, generation: 5, actor_name: "other-boundary"),
-      "abort by another actor" => settling_request(:abort, operation_id:, generation: 5, actor_name: "other-boundary")
-    }
-    refused.each do |label, request|
-      expect(settling_call(request)).to eq([409, { "reason" => "stale_generation" }]), label
-      expect(reservation_row_counts).to eq(baseline), label
-      expect(InvoiceOperation.pluck(:state)).to eq(%w[prepared prepared]), label
-      expect(Timekeeping::Admission.settling?).to be(true), label
-    end
-  end
-end
-
-RSpec.describe Timekeeping::ReservationOperations do
-  include_context "timekeeping entry writes"
-
-  let(:company) { timekeeping_arrange.company }
-  let(:user) { timekeeping_arrange.user(company:, role: "employee") }
-  let(:project) { timekeeping_arrange.project(company:) }
-  let(:settling_entry) { timekeeping_arrange.entry(company:, user:, project:) }
-
-  def settling_request(route, operation_id:, generation:, entry_ids: [])
-    Timekeeping::ReservationOperations::Request.new(
-      route:, company_id: company, actor_name: "invoice-boundary", invoice_id: 501, operation_id:,
-      generation:, disposition: "active", entry_ids:
-    )
-  end
-
-  def settling_call(request)
-    outcome = described_class.new.call(request)
-    [outcome.status, JSON.parse(outcome.body)]
   end
 
   # "Settle, then stop, then settle again at the same generation: the same commit is still refused."
@@ -1037,7 +789,13 @@ RSpec.describe Timekeeping::ReservationOperations do
       "unknown operation" => guarded_settling_request(:commit, operation_id: SecureRandom.uuid, generation: 5),
       "new prepare at the settling generation" =>
         guarded_settling_request(:prepare, operation_id: SecureRandom.uuid, generation: 5, invoice_id: 503,
-                                           entry_ids: [unreserved_entry])
+                                           entry_ids: [unreserved_entry]),
+      "operation stored at generation 4, sent at 4" =>
+        guarded_settling_request(:commit, operation_id: older_id, generation: 4, invoice_id: 502),
+      "abort of operation stored at generation 4, sent at 4" =>
+        guarded_settling_request(:abort, operation_id: older_id, generation: 4, invoice_id: 502),
+      "abort by another actor" =>
+        guarded_settling_request(:abort, operation_id:, generation: 5, actor_name: "other-boundary")
     }
 
     refused.each do |label, request|
