@@ -124,12 +124,6 @@ RSpec.describe "Timekeeping internal handoff routes refuse callers without the s
       )
     end
   end
-end
-
-RSpec.describe "Timekeeping internal handoff routes refuse callers without the service token" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around { |example| with_handoff_env(public_key: true) { example.run } }
 
   # The admission row is one row for every company, so a token that holds one
   # company must not open or stop the settle step that governs all of them.

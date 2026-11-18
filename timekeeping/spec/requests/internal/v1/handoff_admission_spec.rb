@@ -131,14 +131,6 @@ RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
     # "Outbox position: report the highest `outbox_snapshots.outbox_position`."
     expect(handoff_answer_for_spec(:outbox_position)).to eq([200, { "outbox_position" => 42 }])
   end
-end
-
-RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around do |example|
-    with_handoff_env(public_key: true) { example.run }
-  end
 
   # "The internal handoff admission endpoints have routes that call
   # `Admission.begin_settling!(generation:)` and `Admission.stop_applying!(generation:)`"
@@ -174,55 +166,6 @@ RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
         expect([path, caller_name, settling_columns.call]).to eq([path, caller_name, [nil, nil, nil]])
       end
     end
-  end
-end
-
-RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around do |example|
-    with_handoff_env(public_key: true) { example.run }
-  end
-
-  # "The internal handoff admission endpoints have routes that call
-  # `Admission.begin_settling!(generation:)` and `Admission.stop_applying!(generation:)`"
-  # An unauthorized stop would freeze the outgoing owner mid-handoff, so a
-  # refused call must leave an open settle step open.
-  it "refuses stop_applying without the service bearer and keeps an open settle step at generation 3 open" do
-    Timekeeping::Admission.admit!(generation: 3)
-    Timekeeping::Admission.fence!
-    Timekeeping::Admission.begin_settling!(generation: 3)
-    settling_columns = lambda do
-      row = Timekeeping::Admission.current
-      [row.generation, row.settling_generation, row.settling_stopped_generation]
-    end
-    expect(settling_columns.call).to eq([nil, 3, nil])
-
-    callers = {
-      "no bearer" => nil,
-      "near-miss service token" => "Bearer #{handoff_service_token}x",
-      "owner token" => "Bearer #{mint_token({ sub: 7, company_id: 1, role: 'owner' })}",
-      "employee token" => "Bearer #{mint_token}"
-    }
-
-    callers.each do |caller_name, authorization|
-      headers = { "Content-Type" => "application/json" }
-      headers["Authorization"] = authorization if authorization
-      post "/internal/v1/handoff/admission/stop_applying", params: JSON.generate(generation: 3), headers: headers
-
-      expect([caller_name, response.status, response.parsed_body])
-        .to eq([caller_name, 401, { "reason" => "unauthorized" }])
-      expect([caller_name, settling_columns.call]).to eq([caller_name, [nil, 3, nil]])
-      expect(Timekeeping::Admission.settling?).to be(true)
-    end
-  end
-end
-
-RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around do |example|
-    with_handoff_env(public_key: true) { example.run }
   end
 
   # "The internal handoff admission endpoints have routes that call
@@ -261,114 +204,6 @@ RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
       end
     end
   end
-end
-
-RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around do |example|
-    with_handoff_env(public_key: true) { example.run }
-  end
-
-  def settle_answer_for_spec(route, generation)
-    handoff_request(route, body: { generation: })
-    [response.status, response.parsed_body]
-  end
-
-  def settle_row_for_spec
-    row = Timekeeping::Admission.current
-    [row.generation, row.settling_generation, row.settling_stopped_generation]
-  end
-
-  # "a request spec shows the monolith's handoff runner can open and stop the settle step over HTTP."
-  it "opens the settle step at the outgoing generation 4 and stops it over HTTP, and the admission row keeps each state" do
-    Timekeeping::Admission.admit!(generation: 4)
-    Timekeeping::Admission.fence!
-
-    expect(settle_answer_for_spec(:admission_begin_settling, 4)).to eq(
-      [200, { "generation" => nil, "settling_generation" => 4, "settling_stopped_generation" => nil }]
-    )
-    expect(settle_row_for_spec).to eq([nil, 4, nil])
-    expect(Timekeeping::Admission.settling?).to be(true)
-
-    expect(settle_answer_for_spec(:admission_stop_applying, 4)).to eq(
-      [200, { "generation" => nil, "settling_generation" => nil, "settling_stopped_generation" => 4 }]
-    )
-    expect(settle_row_for_spec).to eq([nil, nil, 4])
-    expect(Timekeeping::Admission.settling?).to be(false)
-  end
-end
-
-RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around do |example|
-    with_handoff_env(public_key: true) { example.run }
-  end
-
-  def repeated_settle_answer_for_spec(route, generation)
-    handoff_request(route, body: { generation: })
-    [response.status, response.parsed_body]
-  end
-
-  def repeated_settle_row_for_spec
-    row = Timekeeping::Admission.current
-    [row.generation, row.settling_generation, row.settling_stopped_generation]
-  end
-
-  # A runner that resumes after a crash sends a step again, so a repeat must
-  # leave the row as the first call left it, and a stop must stay stopped.
-  it "repeated begin and stop requests over HTTP never reopen a stopped settle step or lower its stop mark" do
-    Timekeeping::Admission.admit!(generation: 4)
-    Timekeeping::Admission.fence!
-    open_answer = [200, { "generation" => nil, "settling_generation" => 4, "settling_stopped_generation" => nil }]
-    stopped_answer = [200, { "generation" => nil, "settling_generation" => nil, "settling_stopped_generation" => 4 }]
-
-    expect(repeated_settle_answer_for_spec(:admission_begin_settling, 4)).to eq(open_answer)
-    expect(repeated_settle_answer_for_spec(:admission_begin_settling, 4)).to eq(open_answer)
-    expect(repeated_settle_row_for_spec).to eq([nil, 4, nil])
-
-    expect(repeated_settle_answer_for_spec(:admission_stop_applying, 4)).to eq(stopped_answer)
-    expect(repeated_settle_answer_for_spec(:admission_stop_applying, 4)).to eq(stopped_answer)
-    expect(repeated_settle_row_for_spec).to eq([nil, nil, 4])
-
-    expect(repeated_settle_answer_for_spec(:admission_begin_settling, 4)).to eq(stopped_answer)
-    expect(repeated_settle_row_for_spec).to eq([nil, nil, 4])
-
-    expect(repeated_settle_answer_for_spec(:admission_stop_applying, 3)).to eq(stopped_answer)
-    expect(repeated_settle_row_for_spec).to eq([nil, nil, 4])
-  end
-end
-
-RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around do |example|
-    with_handoff_env(public_key: true) { example.run }
-  end
-
-  # The model ignores a begin before the fence, so only the answered row tells
-  # the caller that no settle step is open.
-  it "begin_settling while writes are admitted answers the unchanged row, so the caller sees no settle step opened" do
-    Timekeeping::Admission.admit!(generation: 4)
-
-    handoff_request(:admission_begin_settling, body: { generation: 4 })
-
-    expect([response.status, response.parsed_body]).to eq(
-      [200, { "generation" => 4, "settling_generation" => nil, "settling_stopped_generation" => nil }]
-    )
-    row = Timekeeping::Admission.current
-    expect([row.generation, row.settling_generation, row.settling_stopped_generation]).to eq([4, nil, nil])
-    expect(Timekeeping::Admission.settling?).to be(false)
-  end
-end
-
-RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around do |example|
-    with_handoff_env(public_key: true) { example.run }
-  end
 
   # "The internal handoff admission endpoints have routes that call `Admission.begin_settling!(generation:)` and
   # `Admission.stop_applying!(generation:)`, and a request spec shows the monolith's handoff runner can open and
@@ -394,14 +229,6 @@ RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
     row = Timekeeping::Admission.current
     expect([row.generation, row.settling_generation, row.settling_stopped_generation]).to eq([nil, nil, 4])
     expect(Timekeeping::Admission.settling?).to be(false)
-  end
-end
-
-RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around do |example|
-    with_handoff_env(public_key: true) { example.run }
   end
 
   # A runner may repeat a step after a crash; a repeat must answer success and leave the row as the first call
@@ -432,37 +259,6 @@ RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
     end
     expect(Timekeeping::Admission.settling?).to be(false)
   end
-end
-
-RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around do |example|
-    with_handoff_env(public_key: true) { example.run }
-  end
-
-  # A begin that the model ignores because Timekeeping is not fenced must be visible in the answer, so a runner
-  # that called it too early cannot read it as an open settle step.
-  it "begin_settling while generation 4 is still admitted answers the unopened state and leaves the row unchanged" do
-    Timekeeping::Admission.admit!(generation: 4)
-
-    handoff_request(:admission_begin_settling, body: { generation: 4 })
-
-    expect([response.status, response.parsed_body]).to eq(
-      [200, { "generation" => 4, "settling_generation" => nil, "settling_stopped_generation" => nil }]
-    )
-    row = Timekeeping::Admission.current
-    expect([row.generation, row.settling_generation, row.settling_stopped_generation]).to eq([4, nil, nil])
-    expect(Timekeeping::Admission.settling?).to be(false)
-  end
-end
-
-RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around do |example|
-    with_handoff_env(public_key: true) { example.run }
-  end
 
   # The generation is passed through without coercion, so "4" or 4.5 can never open or stop a step a caller did
   # not name exactly.
@@ -488,14 +284,6 @@ RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
       end
     end
   end
-end
-
-RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around do |example|
-    with_handoff_env(public_key: true) { example.run }
-  end
 
   # A runner whose settle or freeze hit a missing row must never be told the step happened.
   it "both settle routes answer admission_missing and never recreate the row after the admission row is deleted" do
@@ -508,65 +296,6 @@ RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
       expect([route, Timekeeping::Admission.count]).to eq([route, 0])
     end
   end
-end
-
-RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around do |example|
-    with_handoff_env(public_key: true) { example.run }
-  end
-
-  def settle_retry_answer_for_spec(route, generation)
-    handoff_request(route, body: { generation: })
-    [response.status, response.parsed_body]
-  end
-
-  def settle_retry_columns_for_spec
-    Timekeeping::Admission.current.slice(:generation, :settling_generation, :settling_stopped_generation).symbolize_keys
-  end
-
-  # Acceptance: "a request spec shows the monolith's handoff runner can open and stop the settle step over HTTP".
-  # A runner that repeats a step after a crash must never reopen settling after freeze.
-  it "a retried begin_settling after stop_applying over HTTP never reopens the stopped settle step" do
-    Timekeeping::Admission.admit!(generation: 4)
-    Timekeeping::Admission.fence!
-
-    expect(settle_retry_answer_for_spec(:admission_begin_settling, 4)).to eq(
-      [200, { "generation" => nil, "settling_generation" => 4, "settling_stopped_generation" => nil }]
-    )
-    expect(settle_retry_answer_for_spec(:admission_begin_settling, 4)).to eq(
-      [200, { "generation" => nil, "settling_generation" => 4, "settling_stopped_generation" => nil }]
-    )
-    expect(settle_retry_answer_for_spec(:admission_stop_applying, 4)).to eq(
-      [200, { "generation" => nil, "settling_generation" => nil, "settling_stopped_generation" => 4 }]
-    )
-    expect(settle_retry_answer_for_spec(:admission_stop_applying, 4)).to eq(
-      [200, { "generation" => nil, "settling_generation" => nil, "settling_stopped_generation" => 4 }]
-    )
-
-    expect(settle_retry_answer_for_spec(:admission_begin_settling, 4)).to eq(
-      [200, { "generation" => nil, "settling_generation" => nil, "settling_stopped_generation" => 4 }]
-    )
-    expect(settle_retry_answer_for_spec(:admission_stop_applying, 3)).to eq(
-      [200, { "generation" => nil, "settling_generation" => nil, "settling_stopped_generation" => 4 }]
-    )
-    expect(settle_retry_columns_for_spec).to eq(generation: nil, settling_generation: nil, settling_stopped_generation: 4)
-    expect(Timekeeping::Admission.settling?).to be(false)
-  end
-end
-
-RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around do |example|
-    with_handoff_env(public_key: true) { example.run }
-  end
-
-  def settle_order_answer_for_spec(route, generation)
-    handoff_request(route, body: { generation: })
-    [response.status, response.parsed_body]
-  end
 
   # Acceptance: "a request spec shows the monolith's handoff runner can open and stop the settle step over HTTP".
   # A begin sent before the fence must not read as an open step, and the raised
@@ -574,68 +303,15 @@ RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
   it "begin_settling before the fence or with the raised generation answers the real settling state, not a bare success" do
     Timekeeping::Admission.admit!(generation: 4)
 
-    expect(settle_order_answer_for_spec(:admission_begin_settling, 4)).to eq(
+    expect(handoff_answer_for_spec(:admission_begin_settling, body: { generation: 4 })).to eq(
       [200, { "generation" => 4, "settling_generation" => nil, "settling_stopped_generation" => nil }]
     )
     expect(Timekeeping::Admission.settling?).to be(false)
 
     Timekeeping::Admission.fence!
-    expect(settle_order_answer_for_spec(:admission_begin_settling, 5)).to eq(
+    expect(handoff_answer_for_spec(:admission_begin_settling, body: { generation: 5 })).to eq(
       [200, { "generation" => nil, "settling_generation" => 5, "settling_stopped_generation" => nil }]
     )
     expect(Timekeeping::Admission.current.settling_generation).not_to eq(4)
-  end
-end
-
-RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around do |example|
-    with_handoff_env(public_key: true) { example.run }
-  end
-
-  # Acceptance: "The internal handoff admission endpoints have routes that call `Admission.begin_settling!(generation:)` and `Admission.stop_applying!(generation:)`".
-  # A coerced generation ("4", 4.5, true) would open or stop a step the caller never meant.
-  it "begin_settling and stop_applying refuse a malformed generation with invalid_request and leave the open settle step as it was" do
-    Timekeeping::Admission.admit!(generation: 3)
-    Timekeeping::Admission.fence!
-    Timekeeping::Admission.begin_settling!(generation: 3)
-
-    bodies = {
-      "string" => { generation: "4" }, "zero" => { generation: 0 }, "negative" => { generation: -1 },
-      "float" => { generation: 4.5 }, "boolean" => { generation: true }, "null" => { generation: nil }, "missing" => {}
-    }
-    %i[admission_begin_settling admission_stop_applying].each do |route|
-      bodies.each do |row, body|
-        handoff_request(route, body:)
-
-        expect([route, row, response.status, response.parsed_body])
-          .to eq([route, row, 400, { "reason" => "invalid_request" }])
-        admission = Timekeeping::Admission.current
-        expect([route, row, admission.settling_generation, admission.settling_stopped_generation])
-          .to eq([route, row, 3, nil])
-      end
-    end
-  end
-end
-
-RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around do |example|
-    with_handoff_env(public_key: true) { example.run }
-  end
-
-  # Acceptance: "The internal handoff admission endpoints have routes that call `Admission.begin_settling!(generation:)` and `Admission.stop_applying!(generation:)`".
-  # A runner that read a missing row as success would treat settle or freeze as done.
-  it "begin_settling and stop_applying answer admission_missing for a deleted admission row and never recreate it" do
-    Timekeeping::Admission.delete_all
-
-    %i[admission_begin_settling admission_stop_applying].each do |route|
-      handoff_request(route, body: { generation: 4 })
-
-      expect([route, response.status, response.parsed_body]).to eq([route, 409, { "reason" => "admission_missing" }])
-      expect([route, Timekeeping::Admission.count]).to eq([route, 0])
-    end
   end
 end
