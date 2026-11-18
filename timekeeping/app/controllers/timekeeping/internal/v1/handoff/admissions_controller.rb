@@ -1,12 +1,13 @@
 # frozen_string_literal: true
 
-# Fences and admits entry writes. It only calls Timekeeping::Admission, and
-# never answers success when the fence or admit did not happen: a caller that
+# Fences and admits entry writes, and opens and stops the settle step of a
+# handoff away from Timekeeping. It only calls Timekeeping::Admission, and
+# never answers success when the call did not reach the row: a caller that
 # read a failed fence as success would go on with a handoff while writes are
 # still admitted.
 class Timekeeping::Internal::V1::Handoff::AdmissionsController < Timekeeping::Internal::V1::Handoff::BaseController
-  # Only these two calls give the errors this meaning: the fence waited past
-  # its lock timeout, or the admission row is gone.
+  # Only these calls give the errors this meaning: the row lock waited past
+  # its timeout, or the admission row is gone.
   rescue_from ActiveRecord::LockWaitTimeout, with: :render_fence_timeout
   rescue_from ActiveRecord::RecordNotFound, with: :render_admission_missing
 
@@ -24,10 +25,38 @@ class Timekeeping::Internal::V1::Handoff::AdmissionsController < Timekeeping::In
     render_invalid_request
   end
 
+  # The generation is the outgoing one, admitted before the fence. Like
+  # admit!, begin_settling! refuses anything but a positive Integer.
+  def begin_settling
+    Timekeeping::Admission.begin_settling!(generation: json_body["generation"])
+    render_settling_state
+  rescue ArgumentError
+    render_invalid_request
+  end
+
+  def stop_applying
+    Timekeeping::Admission.stop_applying!(generation: json_body["generation"])
+    render_settling_state
+  rescue ArgumentError
+    render_invalid_request
+  end
+
   private
 
     def render_generation
       render json: { generation: Timekeeping::Admission.current.generation }
+    end
+
+    # The model ignores a settle call it cannot apply (not fenced, or a step
+    # already stopped) without raising, so the answer carries the row as it
+    # now stands and the caller can tell whether the step opened or stopped.
+    def render_settling_state
+      admission = Timekeeping::Admission.current
+      render json: {
+        generation: admission.generation,
+        settling_generation: admission.settling_generation,
+        settling_stopped_generation: admission.settling_stopped_generation
+      }
     end
 
     def render_fence_timeout
