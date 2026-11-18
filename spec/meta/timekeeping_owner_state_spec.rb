@@ -100,22 +100,38 @@ RSpec.describe "Timekeeping owner state harness" do
     end
 
     describe ".apply!" do
-      owner_state_names.each do |name|
-        it "writes exactly the #{name.inspect} columns over a mid-handoff row, and repeating it changes nothing" do
-          TimekeepingOwnership.ensure_initial!
-          update_ownership(handoff_step: "freeze", generation: 9, final_outbox_position: 5,
-                           owner: "timekeeping", monolith_store: "prepared", legacy_retired_at: nil)
+      # Two starting rows, so each owner column apply! must write starts from a different value: a row still owned
+      # by the monolith, and one whose owner and store already differ from the defaults.
+      apply_seeds = {
+        "a mid-handoff monolith-owned row" => { handoff_step: "freeze", generation: 9, final_outbox_position: 5 },
+        "a mid-handoff timekeeping-owned row with legacy_retired_at nil" => {
+          handoff_step: "freeze", generation: 9, final_outbox_position: 5,
+          owner: "timekeeping", monolith_store: "prepared", legacy_retired_at: nil
+        },
+        "the applied rollback row" => :rollback
+      }
 
-          TimekeepingOwnerState.apply!(name)
-          first = ownership_snapshot
+      def seed_ownership(seed)
+        TimekeepingOwnership.ensure_initial!
+        seed == :rollback ? TimekeepingOwnerState.apply!("rollback") : update_ownership(**seed)
+      end
 
-          expect(first.except(:legacy_retired_at))
-            .to eq(expected_owner_states.fetch(name).merge(handoff_step: nil, final_outbox_position: nil))
+      apply_seeds.except("the applied rollback row").each do |seed_name, seed|
+        owner_state_names.each do |name|
+          it "writes exactly the #{name.inspect} columns over #{seed_name}, and repeating it changes nothing" do
+            seed_ownership(seed)
 
-          TimekeepingOwnerState.apply!(name)
+            TimekeepingOwnerState.apply!(name)
+            first = ownership_snapshot
 
-          expect(TimekeepingOwnership.count).to eq(1)
-          expect(ownership_snapshot).to eq(first)
+            expect(first.except(:legacy_retired_at))
+              .to eq(expected_owner_states.fetch(name).merge(handoff_step: nil, final_outbox_position: nil))
+
+            TimekeepingOwnerState.apply!(name)
+
+            expect(TimekeepingOwnership.count).to eq(1)
+            expect(ownership_snapshot).to eq(first)
+          end
         end
       end
 
@@ -131,16 +147,17 @@ RSpec.describe "Timekeeping owner state harness" do
       end
 
       # "`TimekeepingOwnerState.apply!(state_name)` writes the row and raises `ArgumentError` on an unknown name."
-      ["bogus", "", "ROLLBACK", nil].each do |name|
-        it "refuses #{name.inspect}, names the three states and leaves the row unchanged" do
-          TimekeepingOwnership.ensure_initial!
-          update_ownership(handoff_step: "freeze", generation: 9)
-          before = TimekeepingOwnership.current.attributes
+      apply_seeds.slice("a mid-handoff monolith-owned row", "the applied rollback row").each do |seed_name, seed|
+        ["bogus", "", "ROLLBACK", nil].each do |name|
+          it "refuses #{name.inspect} over #{seed_name}, names the three states and leaves the row unchanged" do
+            seed_ownership(seed)
+            before = TimekeepingOwnership.current.attributes
 
-          expect { TimekeepingOwnerState.apply!(name) }
-            .to raise_error(ArgumentError, /legacy.*timekeeping.*rollback/m)
+            expect { TimekeepingOwnerState.apply!(name) }
+              .to raise_error(ArgumentError, /legacy.*timekeeping.*rollback/m)
 
-          expect(TimekeepingOwnership.current.attributes).to eq(before)
+            expect(TimekeepingOwnership.current.attributes).to eq(before)
+          end
         end
       end
     end
