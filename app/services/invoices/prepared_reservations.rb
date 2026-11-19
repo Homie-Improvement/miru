@@ -27,6 +27,14 @@ module Invoices
   # published: the call rolls back and answers refused (prepare, mark_billed)
   # or retryable (commit, abort). Every query is limited to the request's
   # company.
+  #
+  # Each call first reads the ownership row FOR SHARE in its own savepoint,
+  # before any operation or entry lock. While a handoff step is recorded,
+  # prepare, admit and mark_billed are refused, and commit or abort is applied
+  # only during the settle step, for an operation stored at the settling
+  # generation and a request carrying it (docs/architecture/timekeeping-soa.md
+  # section 10.5). Every other call answers retryable with reason
+  # stale_generation and changes nothing.
   class PreparedReservations
     # The actor every invoice_operations row of this adapter carries; the
     # operation key is (company_id, actor_name, operation_id).
@@ -49,8 +57,20 @@ module Invoices
     ABORTED = "aborted"
     BILLED = "billed"
 
-    UNRESOLVED_REASON = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/reservations.yml"))
-      .dig("errors", "unresolved_operation", "reason").freeze
+    CONTRACT_ERRORS = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/reservations.yml")).fetch("errors")
+    UNRESOLVED_REASON = CONTRACT_ERRORS.dig("unresolved_operation", "reason").freeze
+    # The reason the Timekeeping service gives for a request at a generation
+    # it no longer applies. This adapter answers it as retryable, as
+    # Timekeeping::ReservationClient maps the service's answer.
+    STALE_GENERATION_REASON = CONTRACT_ERRORS.dig("stale_generation", "body", "reason").freeze
+
+    # The ownership row is read with this lock in each call's own savepoint,
+    # so a handoff update of the row (stop_applying! included) waits for the
+    # call to commit, and a call that reads the row after it sees the update.
+    OWNERSHIP_LOCK = "FOR SHARE"
+
+    # The settle-step route each finishing state answers for.
+    FINISH_ROUTES = { COMMITTED => :commit, ABORTED => :abort }.freeze
     # The reason the Timekeeping service gives for the same refusal.
     UNPUBLISHABLE_REASON = "unpublishable_entry"
 
@@ -75,10 +95,12 @@ module Invoices
       self.table_name = "invoice_operations"
     end
 
-    private_constant :Reservation, :Operation, :UnpublishableEntries
+    private_constant :Reservation, :Operation, :UnpublishableEntries, :CONTRACT_ERRORS
 
     def prepare(request)
       ApplicationRecord.transaction(requires_new: true) do
+        next stale unless open_for_new_work?(locked_ownership)
+
         replay = find_operation(request).first
         next outcome(replay.state) if replay
         next unresolved if Operation.exists?(company_id: request.company_id, invoice_id: request.invoice_id, state: PREPARED)
@@ -112,6 +134,8 @@ module Invoices
     # writes nothing.
     def admit(request)
       ApplicationRecord.transaction(requires_new: true) do
+        next stale unless open_for_new_work?(locked_ownership)
+
         entries = lock_entries(request.company_id, request.entries)
         conflicts = conflicts_in(decide(request, entries))
         next outcome("refused", conflicts:) if conflicts.any?
@@ -158,6 +182,8 @@ module Invoices
     # writes from the snapshots. A repeated call finds nothing left to bill.
     def mark_billed(request)
       ApplicationRecord.transaction(requires_new: true) do
+        next stale unless open_for_new_work?(locked_ownership)
+
         entries = lock_entries(request.company_id, request.entries)
         billable_ids = entries.filter_map { |entry| entry.id if entry.discarded_at.nil? && entry.bill_status != BILLED }
         if billable_ids.any?
@@ -186,7 +212,11 @@ module Invoices
       # stored entry is repaired.
       def finish(request, settled_state)
         ApplicationRecord.transaction(requires_new: true) do
+          ownership = locked_ownership
           operation = find_operation(request).lock.first
+          # Decided before the answer for a finished operation, so a commit
+          # re-sent after stop_applying! is refused, not answered committed.
+          next stale unless finish_admitted?(ownership, request, settled_state, operation)
           next outcome(settled_state) unless operation&.state == PREPARED
 
           counts = yield operation
@@ -335,6 +365,34 @@ module Invoices
 
       def unresolved
         outcome("retryable", reason: UNRESOLVED_REASON)
+      end
+
+      def stale
+        outcome("retryable", reason: STALE_GENERATION_REASON)
+      end
+
+      def locked_ownership
+        TimekeepingOwnership.lock(OWNERSHIP_LOCK).find_by(id: TimekeepingOwnership::SINGLETON_ID)
+      end
+
+      # Prepare, admit and mark_billed run only while no handoff step is
+      # recorded. A missing row refuses too: lost ownership state must never
+      # admit a write.
+      def open_for_new_work?(ownership)
+        !ownership.nil? && ownership.handoff_step.nil?
+      end
+
+      # Outside a handoff every commit and abort is applied, as before. During
+      # one, only the settle step's own requests are (WriteSteps.settling_generation),
+      # so the money snapshot taken at the freeze cannot move afterwards.
+      def finish_admitted?(ownership, request, settled_state, operation)
+        return false if ownership.nil?
+        return true if ownership.handoff_step.nil?
+
+        !Timekeeping::LocalOwner::WriteSteps.settling_generation(
+          ownership, route: FINISH_ROUTES.fetch(settled_state), generation: request.generation,
+                     operation_generation: operation&.generation
+        ).nil?
       end
 
       def outcome(state, conflicts: [], counts: {}, reason: nil)
