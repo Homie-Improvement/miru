@@ -61,6 +61,13 @@ RSpec.describe TimekeepingDemo::Supervisor do
     Integer(File.read(path).strip, 10)
   end
 
+  def demo_supervisor_group_alive?(group)
+    Process.kill(0, -group)
+    true
+  rescue Errno::ESRCH
+    false
+  end
+
   it "stops every process group, including a child that ignores TERM, when the launcher receives TERM" do
     Dir.mktmpdir("timekeeping-demo-supervisor") do |dir|
       child_pid_file = File.join(dir, "child.pid")
@@ -115,9 +122,7 @@ RSpec.describe TimekeepingDemo::Supervisor do
       end
     end
   end
-end
 
-RSpec.describe TimekeepingDemo::Supervisor do
   it "run appends and flushes each group id to groups_path before the next spawn" do
     Dir.mktmpdir("timekeeping-demo-groups") do |dir|
       groups_path = File.join(dir, "process_groups")
@@ -147,9 +152,7 @@ RSpec.describe TimekeepingDemo::Supervisor do
       expect(File.read(groups_path)).to eq(spawned.map { |pid| "#{pid}\n" }.join)
     end
   end
-end
 
-RSpec.describe TimekeepingDemo::Supervisor do
   it "prepare records each db:prepare group id before waiting on it" do
     Dir.mktmpdir("timekeeping-demo-groups") do |dir|
       groups_path = File.join(dir, "process_groups")
@@ -164,96 +167,25 @@ RSpec.describe TimekeepingDemo::Supervisor do
         TimekeepingDemo::ProcessSpec.new(name: "timekeeping_web", app: :timekeeping, argv: [],
                                          chdir: File.join(dir, "timekeeping"), env: { "PATH" => ENV.fetch("PATH") })
       ]
+      waited = []
       recorded_at_wait = []
       allow(Process).to receive(:wait2).and_wrap_original do |original, pid, *rest|
-        lines = File.exist?(groups_path) ? File.read(groups_path).lines.map(&:strip) : []
-        recorded_at_wait << lines.include?(pid.to_s)
+        waited << pid
+        # Kept as text, so a line such as "+4242" never passes as the pid it would convert to.
+        recorded_at_wait << (File.exist?(groups_path) ? File.read(groups_path).lines.map(&:strip) : [])
         original.call(pid, *rest)
       end
 
       # "Right after each spawn in `prepare` and `run`, it appends the group id on its own line and flushes it."
       described_class.new(output: StringIO.new, groups_path:).prepare(specs)
 
-      expect(recorded_at_wait).to eq([true, true])
+      expect(waited.size).to eq(2)
+      expect(waited.zip(recorded_at_wait).map { |pid, recorded| recorded.include?(pid.to_s) }).to eq([true, true])
+      # The id being waited on is the newest line, so each id is written before its own wait.
+      expect(waited.zip(recorded_at_wait).map { |pid, recorded| recorded.last == pid.to_s }).to eq([true, true])
       expect(File.read(groups_path).lines.size).to eq(2)
+      expect(File.read(groups_path)).to eq(waited.map { |pid| "#{pid}\n" }.join)
     end
-  end
-end
-
-RSpec.describe TimekeepingDemo::Supervisor, "groups_path during run" do
-  it "run with groups_path records each group id in the file before the next spawn" do
-    Dir.mktmpdir("timekeeping-demo-groups") do |dir|
-      groups_path = File.join(dir, "process_groups")
-      env = { "PATH" => ENV.fetch("PATH") }
-      specs = [
-        TimekeepingDemo::ProcessSpec.new(name: "monolith_web", app: :monolith, argv: ["sleep", "60"], chdir: dir, env:),
-        TimekeepingDemo::ProcessSpec.new(name: "timekeeping_web", app: :timekeeping, argv: ["sleep", "60"], chdir: dir, env:),
-        # Exits at once, so run stops every group and returns.
-        TimekeepingDemo::ProcessSpec.new(name: "timekeeping_relay", app: :timekeeping, argv: ["sh", "-c", "exit 0"],
-                                         chdir: dir, env:)
-      ]
-      seen_at_spawn = []
-      spawned = []
-      allow(Process).to receive(:spawn).and_wrap_original do |original, *args, **kwargs|
-        seen_at_spawn << (File.exist?(groups_path) ? File.read(groups_path).lines.map { |line| Integer(line, 10) } : [])
-        original.call(*args, **kwargs).tap { |pid| spawned << pid }
-      end
-
-      supervisor = described_class.new(output: StringIO.new, groups_path:)
-      expect { supervisor.run(specs, stop_signals: []) }.to raise_error(TimekeepingDemo::Supervisor::ProcessFailed)
-
-      # "Right after each spawn in `prepare` and `run`, it appends the group id on its own line and flushes it."
-      expect(seen_at_spawn).to eq([[], spawned.first(1), spawned.first(2)])
-      expect(File.read(groups_path).lines.map { |line| Integer(line, 10) }).to eq(spawned)
-      expect(File.read(groups_path).lines.count).to eq(3)
-    end
-  end
-end
-
-RSpec.describe TimekeepingDemo::Supervisor, "groups_path during prepare" do
-  it "prepare with groups_path records each db:prepare group id before waiting on it" do
-    Dir.mktmpdir("timekeeping-demo-groups") do |dir|
-      groups_path = File.join(dir, "process_groups")
-      FileUtils.mkdir_p(File.join(dir, "bin"))
-      File.write(File.join(dir, "bin", "rails"), "#!/bin/sh\nexit 0\n")
-      File.chmod(0o755, File.join(dir, "bin", "rails"))
-      env = { "PATH" => ENV.fetch("PATH") }
-      specs = [
-        TimekeepingDemo::ProcessSpec.new(name: "monolith_web", app: :monolith, argv: [], chdir: dir, env:),
-        TimekeepingDemo::ProcessSpec.new(name: "timekeeping_web", app: :timekeeping, argv: [], chdir: dir, env:)
-      ]
-      recorded_at_wait = {}
-      allow(Process).to receive(:wait2).and_wrap_original do |original, pid, *rest|
-        recorded_at_wait[pid] = File.read(groups_path).lines.map { |line| Integer(line, 10) }
-        original.call(pid, *rest)
-      end
-
-      described_class.new(output: StringIO.new, groups_path:).prepare(specs)
-
-      # "Right after each spawn in `prepare` and `run`, it appends the group id on its own line and flushes it."
-      expect(recorded_at_wait.size).to eq(2)
-      recorded_at_wait.each { |pid, recorded| expect(recorded.last).to eq(pid) }
-      expect(File.read(groups_path).lines.map { |line| Integer(line, 10) }).to eq(recorded_at_wait.keys)
-    end
-  end
-end
-
-RSpec.describe TimekeepingDemo::Supervisor do
-  def groups_path_demo_process_ended?(pid)
-    Process.kill(0, pid)
-    File.read("/proc/#{pid}/stat").split[2] == "Z"
-  rescue Errno::ESRCH, Errno::ENOENT
-    true
-  end
-
-  def groups_path_demo_wait_for_pid(path)
-    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
-    until File.exist?(path) && !File.read(path).strip.empty?
-      raise "#{path} was not written" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-
-      sleep 0.05
-    end
-    Integer(File.read(path).strip, 10)
   end
 
   # "Do not change how the supervisor stops processes on Ctrl-C or TERM."
@@ -271,37 +203,23 @@ RSpec.describe TimekeepingDemo::Supervisor do
                                                 chdir: ARGV[1], env: { "PATH" => ENV.fetch("PATH") })
         TimekeepingDemo::Supervisor.new(output: StringIO.new, groups_path: ARGV[2]).run([spec], stop_signals: %w[TERM])
       RUBY
-      lib = Rails.root.join("lib").to_s
-      launcher = Process.spawn(RbConfig.ruby, "-I", lib, "-rstringio", "-rtimekeeping_demo/process_spec",
-                               "-rtimekeeping_demo/supervisor", "-e", code, script, dir, groups_path)
+      launcher = spawn_demo_supervisor_launcher(code, script, dir, groups_path)
       child_pid = nil
       begin
-        child_pid = groups_path_demo_wait_for_pid(child_pid_file)
+        child_pid = wait_for_demo_supervisor_file(child_pid_file)
         Process.kill("TERM", launcher)
         _, status = Process.wait2(launcher)
 
         expect(status).to be_success
-        expect(groups_path_demo_process_ended?(child_pid)).to be(true)
+        expect(demo_supervisor_process_ended?(child_pid)).to be(true)
         recorded = File.read(groups_path).lines.map(&:strip).reject(&:empty?).map { |line| Integer(line, 10) }
         expect(recorded.size).to eq(1)
-        expect(recorded.none? { |group| begin Process.kill(0, -group); true; rescue Errno::ESRCH; false; end }).to be(true)
+        expect(recorded.none? { |group| demo_supervisor_group_alive?(group) }).to be(true)
       ensure
-        [launcher, child_pid].compact.each do |pid|
-          Process.kill("KILL", pid)
-        rescue Errno::ESRCH
-          nil
-        end
+        kill_demo_supervisor_leftover(launcher)
+        kill_demo_supervisor_leftover(child_pid)
       end
     end
-  end
-end
-
-RSpec.describe TimekeepingDemo::Supervisor, "groups_path when the launcher is killed" do
-  def killed_launcher_group_alive?(group)
-    Process.kill(0, -group)
-    true
-  rescue Errno::ESRCH
-    false
   end
 
   it "leaves every spawned group id in the file, so the groups can be killed after a KILLed launcher" do
@@ -315,9 +233,7 @@ RSpec.describe TimekeepingDemo::Supervisor, "groups_path when the launcher is ki
         end
         TimekeepingDemo::Supervisor.new(output: StringIO.new, groups_path: ARGV[1]).run(specs, stop_signals: %w[TERM])
       RUBY
-      lib = Rails.root.join("lib").to_s
-      launcher = Process.spawn(RbConfig.ruby, "-I", lib, "-rstringio", "-rtimekeeping_demo/process_spec",
-                               "-rtimekeeping_demo/supervisor", "-e", code, dir, groups_path)
+      launcher = spawn_demo_supervisor_launcher(code, dir, groups_path)
       recorded = []
       begin
         deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
@@ -329,18 +245,14 @@ RSpec.describe TimekeepingDemo::Supervisor, "groups_path when the launcher is ki
         Process.wait(launcher)
 
         expect(recorded.size).to eq(2)
-        expect(recorded.all? { |group| killed_launcher_group_alive?(group) }).to be(true)
+        expect(recorded.all? { |group| demo_supervisor_group_alive?(group) }).to be(true)
         recorded.each { |group| Process.kill("KILL", -group) }
         deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
-        sleep 0.05 until recorded.none? { |group| killed_launcher_group_alive?(group) } ||
+        sleep 0.05 until recorded.none? { |group| demo_supervisor_group_alive?(group) } ||
                          Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-        expect(recorded.none? { |group| killed_launcher_group_alive?(group) }).to be(true)
+        expect(recorded.none? { |group| demo_supervisor_group_alive?(group) }).to be(true)
       ensure
-        [launcher, *recorded.map { |group| -group }].each do |target|
-          Process.kill("KILL", target)
-        rescue Errno::ESRCH
-          nil
-        end
+        [launcher, *recorded.map { |group| -group }].each { |target| kill_demo_supervisor_leftover(target) }
       end
     end
   end
