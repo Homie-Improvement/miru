@@ -55,6 +55,29 @@ RSpec.describe "bin/parallel_test" do
     expect(tokens[tokens.index("--exclude-pattern") + 1]).to eq(pattern.source)
   end
 
+  # A plain run is what developers use locally, so it must keep excluding only the system specs.
+  it "excludes only the system spec directories when no --exclude-dir is given" do
+    output, status, recorded_args = run_parallel_test_with_fake_bundle("-n", "2")
+
+    expect(status).to be_success, output
+    expect(recorded_args).to include("spec")
+    pattern = exclude_pattern_from(recorded_args)
+
+    expect(pattern).to match("spec/system/x_spec.rb")
+    expect(pattern).to match("spec/system_skip/x_spec.rb")
+    expect(pattern).not_to match("spec/lib/timekeeping/handoff/x_spec.rb")
+    expect(pattern).not_to match("spec/models/x_spec.rb")
+  end
+
+  # With nothing to exclude, an empty pattern would match every path and run no specs.
+  it "passes no exclude pattern when system specs are included and no --exclude-dir is given" do
+    output, status, recorded_args = run_parallel_test_with_fake_bundle("-n", "2", "-i")
+
+    expect(status).to be_success, output
+    expect(recorded_args).to include("spec")
+    expect(recorded_args).not_to include("--exclude-pattern")
+  end
+
   # Explicit paths run as given, so an --exclude-dir beside them would be ignored without a word.
   it "refuses --exclude-dir together with explicit spec paths, and runs nothing" do
     output, status, recorded_args = run_parallel_test_with_fake_bundle(
