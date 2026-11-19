@@ -553,10 +553,31 @@ RSpec.describe TestDatabaseCleanup do
   end
 end
 
-RSpec.describe "Timekeeping queue ledger file at suite start", :without_transaction do
-  it "a clean probe run deletes a stale ledger file at suite start, so a record from an earlier run neither survives nor fails it" do
-    skip "set TIMEKEEPING_LIVE=1 to run the queue ledger probes" unless ENV["TIMEKEEPING_LIVE"] == "1"
+# Every example here that starts a child `bundle exec rspec` runs outside a transaction, because a parent
+# transaction can hold locks the child's database cleaner waits on. Each child gets its own ledger path, because
+# a child's suite start deletes whatever ledger file it inherits.
+RSpec.describe "Timekeeping queue ledger probes", :without_transaction do
+  let(:queue_ledger_probe) { Rails.root.join("spec/fixtures/timekeeping_harness/queue_ledger_probe.rb").to_s }
 
+  before do |example|
+    next unless example.metadata[:live_probe]
+
+    skip "set TIMEKEEPING_LIVE=1 to run the queue ledger probes" unless ENV["TIMEKEEPING_LIVE"] == "1"
+  end
+
+  def run_queue_ledger_probe(mode, ledger_path)
+    Open3.capture3({ "QUEUE_LEDGER_PROBE" => mode, TimekeepingQueueLedger::PATH_KEY => ledger_path },
+                   "bundle", "exec", "rspec", queue_ledger_probe, chdir: Rails.root.to_s)
+  end
+
+  it "keeps the queue ledger probe out of a normal suite run" do
+    probe = Pathname.new(queue_ledger_probe)
+
+    expect(probe).to exist
+    expect(probe.basename.to_s).not_to end_with("_spec.rb")
+  end
+
+  it "a clean probe run deletes a stale ledger file at suite start, so a record from an earlier run neither survives nor fails it", :live_probe do
     Dir.mktmpdir("queue-ledger-suite-start") do |dir|
       ledger_path = File.join(dir, "queue_ledger.json")
       stale_active_job_id = "stale-#{SecureRandom.uuid}"
@@ -567,9 +588,7 @@ RSpec.describe "Timekeeping queue ledger file at suite start", :without_transact
       }
       File.write(ledger_path, JSON.generate({ "records" => [stale_record], "controls" => [] }))
 
-      probe = Rails.root.join("spec/fixtures/timekeeping_harness/queue_ledger_probe.rb").to_s
-      stdout, stderr, status = Open3.capture3({ "QUEUE_LEDGER_PROBE" => "clean", "TIMEKEEPING_QUEUE_LEDGER_PATH" => ledger_path },
-                                              "bundle", "exec", "rspec", probe, chdir: Rails.root.to_s)
+      stdout, stderr, status = run_queue_ledger_probe("clean", ledger_path)
       output = "#{stdout}\n#{stderr}"
 
       # "Delete the ledger file at suite start."
@@ -578,16 +597,10 @@ RSpec.describe "Timekeeping queue ledger file at suite start", :without_transact
       expect(File.exist?(ledger_path) && File.read(ledger_path).include?(stale_active_job_id)).to be(false)
     end
   end
-end
 
-RSpec.describe "Timekeeping queue ledger probe run: control ran", :without_transaction do
-  it "a probe that marks its default control finished between resets exits non-zero naming the control" do
-    skip "set TIMEKEEPING_LIVE=1 to run the queue ledger probes" unless ENV["TIMEKEEPING_LIVE"] == "1"
-
+  it "a probe that marks its default control finished between resets exits non-zero naming the control", :live_probe do
     Dir.mktmpdir("queue-ledger-probe") do |dir|
-      probe = Rails.root.join("spec/fixtures/timekeeping_harness/queue_ledger_probe.rb").to_s
-      env = { "QUEUE_LEDGER_PROBE" => "control_ran", "TIMEKEEPING_QUEUE_LEDGER_PATH" => File.join(dir, "queue_ledger.json") }
-      stdout, stderr, status = Open3.capture3(env, "bundle", "exec", "rspec", probe, chdir: Rails.root.to_s)
+      stdout, stderr, status = run_queue_ledger_probe("control_ran", File.join(dir, "queue_ledger.json"))
       output = "#{stdout}\n#{stderr}"
 
       # "A probe that marks its `default` control finished between resets exits non-zero."
@@ -596,17 +609,11 @@ RSpec.describe "Timekeeping queue ledger probe run: control ran", :without_trans
       expect(output).to include("UpdateInvoiceStatusToOverdueJob")
     end
   end
-end
 
-RSpec.describe "Timekeeping queue ledger probe run: non-dedicated job", :without_transaction do
-  it "a probe with a completed non-dedicated job exits non-zero and records it in its own ledger file" do
-    skip "set TIMEKEEPING_LIVE=1 to run the queue ledger probes" unless ENV["TIMEKEEPING_LIVE"] == "1"
-
+  it "a probe with a completed non-dedicated job exits non-zero and records it in its own ledger file", :live_probe do
     Dir.mktmpdir("queue-ledger-probe") do |dir|
       ledger_path = File.join(dir, "queue_ledger.json")
-      probe = Rails.root.join("spec/fixtures/timekeeping_harness/queue_ledger_probe.rb").to_s
-      env = { "QUEUE_LEDGER_PROBE" => "non_dedicated", "TIMEKEEPING_QUEUE_LEDGER_PATH" => ledger_path }
-      stdout, stderr, status = Open3.capture3(env, "bundle", "exec", "rspec", probe, chdir: Rails.root.to_s)
+      stdout, stderr, status = run_queue_ledger_probe("non_dedicated", ledger_path)
       output = "#{stdout}\n#{stderr}"
 
       # "A completed job on any non-dedicated queue fails it, in either database"
@@ -616,16 +623,10 @@ RSpec.describe "Timekeeping queue ledger probe run: non-dedicated job", :without
       expect(records.any? { |record| record["queue"] == "default" && record["database"] == "monolith" }).to be(true)
     end
   end
-end
 
-RSpec.describe "Timekeeping queue ledger probe run: clean", :without_transaction do
-  it "a clean queue ledger probe exits zero" do
-    skip "set TIMEKEEPING_LIVE=1 to run the queue ledger probes" unless ENV["TIMEKEEPING_LIVE"] == "1"
-
+  it "a clean queue ledger probe exits zero", :live_probe do
     Dir.mktmpdir("queue-ledger-probe") do |dir|
-      probe = Rails.root.join("spec/fixtures/timekeeping_harness/queue_ledger_probe.rb").to_s
-      env = { "QUEUE_LEDGER_PROBE" => "clean", "TIMEKEEPING_QUEUE_LEDGER_PATH" => File.join(dir, "queue_ledger.json") }
-      stdout, stderr, status = Open3.capture3(env, "bundle", "exec", "rspec", probe, chdir: Rails.root.to_s)
+      stdout, stderr, status = run_queue_ledger_probe("clean", File.join(dir, "queue_ledger.json"))
       output = "#{stdout}\n#{stderr}"
 
       # "A clean probe exits zero."
@@ -633,41 +634,9 @@ RSpec.describe "Timekeeping queue ledger probe run: clean", :without_transaction
       expect(output).to include("0 failures")
     end
   end
-end
 
-RSpec.describe "Timekeeping queue ledger Solid Queue row examples", :without_transaction do
-  # Examples that finish, claim and fail default-queue jobs on purpose run in their own rspec process with a
-  # private ledger path, so an active suite ledger here never records their rows as a stray worker's executions.
-  it "pass in their own run, which never touches this run's ledger" do
-    probe = Rails.root.join("spec/fixtures/timekeeping_harness/queue_ledger_rows_probe.rb")
-    expect(probe.basename.to_s).not_to end_with("_spec.rb")
-
-    Dir.mktmpdir("queue-ledger-rows") do |dir|
-      stdout, stderr, status = Open3.capture3(
-        { TimekeepingQueueLedger::PATH_KEY => File.join(dir, "rows_ledger.json") },
-        "bundle", "exec", "rspec", probe.to_s, chdir: Rails.root.to_s
-      )
-
-      expect(status).to be_success, "#{stdout}\n#{stderr}"
-      expect(stdout).to include("7 examples, 0 failures")
-    end
-  end
-end
-
-RSpec.describe "Timekeeping queue ledger probe fixture" do
-  it "keeps the queue ledger probe out of a normal suite run" do
-    probe = Rails.root.join("spec/fixtures/timekeeping_harness/queue_ledger_probe.rb")
-
-    expect(probe).to exist
-    expect(probe.basename.to_s).not_to end_with("_spec.rb")
-  end
-end
-
-RSpec.describe "Timekeeping queue ledger probe isolation", :without_transaction do
   # "Every probe subprocess sets it to its own temporary file, so a probe never touches the parent run's ledger."
-  it "a clean probe run leaves the parent's inherited ledger file byte for byte unchanged" do
-    skip "set TIMEKEEPING_LIVE=1 to run the queue ledger probes" unless ENV["TIMEKEEPING_LIVE"] == "1"
-
+  it "a clean probe run leaves the parent's inherited ledger file byte for byte unchanged", :live_probe do
     Dir.mktmpdir("queue-ledger-parent") do |dir|
       parent_path = File.join(dir, "parent_ledger.json")
       child_path = File.join(dir, "child_ledger.json")
@@ -679,21 +648,34 @@ RSpec.describe "Timekeeping queue ledger probe isolation", :without_transaction 
         "controls" => []
       )
       File.write(parent_path, violation)
-      previous = ENV.fetch("TIMEKEEPING_QUEUE_LEDGER_PATH", nil)
+      previous = ENV.fetch(TimekeepingQueueLedger::PATH_KEY, nil)
       begin
-        ENV["TIMEKEEPING_QUEUE_LEDGER_PATH"] = parent_path
-        probe = Rails.root.join("spec/fixtures/timekeeping_harness/queue_ledger_probe.rb").to_s
-        stdout, stderr, status = Open3.capture3(
-          { "QUEUE_LEDGER_PROBE" => "clean", "TIMEKEEPING_QUEUE_LEDGER_PATH" => child_path },
-          "bundle", "exec", "rspec", probe, chdir: Rails.root.to_s
-        )
+        ENV[TimekeepingQueueLedger::PATH_KEY] = parent_path
+        stdout, stderr, status = run_queue_ledger_probe("clean", child_path)
       ensure
-        ENV["TIMEKEEPING_QUEUE_LEDGER_PATH"] = previous
+        ENV[TimekeepingQueueLedger::PATH_KEY] = previous
       end
 
       expect(status).to be_success, "#{stdout}\n#{stderr}"
       expect(File.binread(parent_path)).to eq(violation.b)
       expect(File.exist?(child_path)).to be(true)
+    end
+  end
+
+  # Examples that finish, claim and fail default-queue jobs on purpose run in their own rspec process with a
+  # private ledger path, so an active suite ledger here never records their rows as a stray worker's executions.
+  it "Solid Queue row examples pass in their own run, which never touches this run's ledger" do
+    probe = Rails.root.join("spec/fixtures/timekeeping_harness/queue_ledger_rows_probe.rb")
+    expect(probe.basename.to_s).not_to end_with("_spec.rb")
+
+    Dir.mktmpdir("queue-ledger-rows") do |dir|
+      stdout, stderr, status = Open3.capture3(
+        { TimekeepingQueueLedger::PATH_KEY => File.join(dir, "rows_ledger.json") },
+        "bundle", "exec", "rspec", probe.to_s, chdir: Rails.root.to_s
+      )
+
+      expect(status).to be_success, "#{stdout}\n#{stderr}"
+      expect(stdout).to include("7 examples, 0 failures")
     end
   end
 end
