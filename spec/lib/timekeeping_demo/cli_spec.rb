@@ -157,26 +157,15 @@ RSpec.describe TimekeepingDemo::CLI, "up with a recording supervisor" do
 end
 
 RSpec.describe TimekeepingDemo::CLI, "up with caller-supplied credentials" do
-  let(:caller_credentials_supervisor_class) do
-    Class.new do
-      attr_reader :specs
-
-      def initialize
-        @specs = []
-      end
-
-      def method_missing(_name, *args, **_kwargs, &)
-        args.flatten.each { |arg| @specs << arg if arg.is_a?(TimekeepingDemo::ProcessSpec) }
-        0
-      end
-
-      def respond_to_missing?(*)
-        true
-      end
-    end
+  # Starts nothing: collects the process specs the CLI hands the supervisor.
+  def caller_credentials_recording_supervisor(started)
+    supervisor = instance_double(TimekeepingDemo::Supervisor)
+    allow(supervisor).to receive(:prepare)
+    allow(supervisor).to receive(:run) { |specs, **| started.concat(specs) }
+    supervisor
   end
 
-  it "up with caller credentials gives each app exactly its permitted values and writes none to versions.json or output" do
+  it "up with all three caller credentials gives each app exactly its permitted values and writes none of them out" do
     supplied = TimekeepingDemo::Credentials.generate
     keys = TimekeepingDemo::Credentials::ENV_KEYS
     private_key = keys.fetch(:private_key_pem)
@@ -186,7 +175,8 @@ RSpec.describe TimekeepingDemo::CLI, "up with caller-supplied credentials" do
       "TIMEKEEPING_DATABASE_URL" => "postgres://timekeeping_demo_role@127.0.0.1/timekeeping_demo",
       "DB_USER" => "monolith_demo_role"
     ).merge(supplied.to_env)
-    supervisor = caller_credentials_supervisor_class.new
+    started = []
+    supervisor = caller_credentials_recording_supervisor(started)
     captured_out = StringIO.new
     captured_err = StringIO.new
     original_out = $stdout
@@ -203,28 +193,34 @@ RSpec.describe TimekeepingDemo::CLI, "up with caller-supplied credentials" do
       end
       expect(status).to eq(0)
 
-      monolith_envs = supervisor.specs.filter_map { |spec| spec.env if spec.app == :monolith }
-      timekeeping_envs = supervisor.specs.filter_map { |spec| spec.env if spec.app == :timekeeping }
-      expect(monolith_envs).not_to be_empty
-      expect(timekeeping_envs).not_to be_empty
+      monolith = started.select { |spec| spec.app == :monolith }
+      timekeeping = started.select { |spec| spec.app == :timekeeping }
+      expect(monolith).not_to be_empty
+      expect(timekeeping).not_to be_empty
 
-      # "`CLI.up` with all three keys in caller_env gives each app exactly its permitted values, byte for byte. The Timekeeping env holds no private key. Comparisons report booleans, never the values."
-      monolith_envs.each do |env|
-        expect(env[private_key] == supplied.private_key_pem).to be(true)
-        expect(env[token] == supplied.service_token).to be(true)
-        expect(env.key?(public_key)).to be(false)
+      # "`CLI.up` uses credentials from `caller_env` when all are present, and otherwise generates them as before."
+      # "`CLI.up` with all three keys in caller_env gives each app exactly its permitted values, byte for byte.
+      # The Timekeeping env holds no private key. Comparisons report booleans, never the values."
+      monolith.each do |spec|
+        expect(spec.env[private_key] == supplied.private_key_pem).to be(true)
+        expect(spec.env[token] == supplied.service_token).to be(true)
+        expect(spec.env.key?(public_key)).to be(false)
       end
-      timekeeping_envs.each do |env|
-        expect(env[public_key] == supplied.public_key_pem).to be(true)
-        expect(env[token] == supplied.service_token).to be(true)
+      timekeeping.each do |spec|
+        expect(spec.env[public_key] == supplied.public_key_pem).to be(true)
+        expect(spec.env[token] == supplied.service_token).to be(true)
         # "Timekeeping gets the public key and the token, and never the private key."
-        expect(env.key?(private_key)).to be(false)
-        expect(env.values.any? { |value| value == supplied.private_key_pem }).to be(false)
+        expect(spec.env.key?(private_key)).to be(false)
+        expect(spec.env.values.any? { |value| value == supplied.private_key_pem }).to be(false)
       end
 
+      # "Never log, print or write them to versions.json."
       # "versions.json, the captured stdout and stderr, and the runtime output hold none of the values."
-      written = [File.read(File.join(state_dir, "versions.json")), captured_out.string, captured_err.string].join
-      supplied.to_env.each_value { |value| expect(written.include?(value)).to be(false) }
+      versions_text = File.read(File.join(state_dir, "versions.json"))
+      secrets = supplied.to_env.values
+      [versions_text, captured_out.string, captured_err.string].each do |text|
+        expect(secrets.any? { |secret| text.include?(secret) }).to be(false)
+      end
     end
   end
 
@@ -233,36 +229,49 @@ RSpec.describe TimekeepingDemo::CLI, "up with caller-supplied credentials" do
     private_key = keys.fetch(:private_key_pem)
     public_key = keys.fetch(:public_key_pem)
     token = keys.fetch(:service_token)
-    supplied = TimekeepingDemo::Credentials.generate
-    base_env = ENV.to_h.slice("PATH", "HOME", "GEM_HOME", "GEM_PATH").merge(
-      "TIMEKEEPING_DATABASE_URL" => "postgres://timekeeping_demo_role@127.0.0.1/timekeeping_demo",
-      "DB_USER" => "monolith_demo_role"
+    supplied = TimekeepingDemo::Credentials.generate.to_env
+    # The inherited environment minus the credential keys, so every other caller value is in play.
+    base_env = ENV.to_h.except(*keys.values).merge(
+      "DB_USER" => "monolith_user",
+      "TIMEKEEPING_DATABASE_URL" => "postgres://timekeeping_user@127.0.0.1:5432/timekeeping_test"
     )
-    partial_sets = keys.values.flat_map do |key|
-      [supplied.to_env.except(key), supplied.to_env.merge(key => " ")]
+    variants = keys.values.flat_map do |key|
+      [["#{key} missing", supplied.except(key)],
+       ["#{key} empty", supplied.merge(key => "")],
+       ["#{key} whitespace", supplied.merge(key => "  ")]]
     end
 
-    partial_sets.each do |partial|
-      supervisor = caller_credentials_supervisor_class.new
-      Dir.mktmpdir("timekeeping-demo-state") do |state_dir|
-        expect(described_class.run(["up"], root: Rails.root.to_s, supervisor:, state_dir:,
-                                           caller_env: base_env.merge(partial))).to eq(0)
+    variants.each do |label, credential_env|
+      started = []
+      supervisor = caller_credentials_recording_supervisor(started)
+      status = Dir.mktmpdir("timekeeping-demo-state") do |state_dir|
+        described_class.run(["up"], root: Rails.root.to_s, supervisor:, state_dir:,
+                                    caller_env: base_env.merge(credential_env))
       end
 
-      monolith = supervisor.specs.find { |spec| spec.app == :monolith }.env
-      timekeeping = supervisor.specs.find { |spec| spec.app == :timekeeping }.env
+      expect(status).to eq(0), "expected status 0 with #{label}"
+      monolith = started.select { |spec| spec.app == :monolith }
+      timekeeping = started.select { |spec| spec.app == :timekeeping }
+      expect(monolith.empty? || timekeeping.empty?).to be(false), "expected both apps to start with #{label}"
 
-      # "A partial or blank set therefore gets a whole fresh set and is never mixed with supplied values."
-      supplied.to_env.each_value do |value|
-        expect((monolith.values + timekeeping.values).include?(value)).to be(false)
-      end
-      expect(monolith.fetch(token) == timekeeping.fetch(token)).to be(true)
-      signer = OpenSSL::PKey::RSA.new(monolith.fetch(private_key))
-      verifier = OpenSSL::PKey::RSA.new(timekeeping.fetch(public_key))
+      # "`CLI.up` uses `Credentials.from_env(caller_env) || Credentials.generate`. A partial or blank set therefore
+      # gets a whole fresh set and is never mixed with supplied values."
+      all_values = started.flat_map { |spec| spec.env.values }
+      mixed_in = supplied.values.any? { |value| all_values.include?(value) }
+      expect(mixed_in).to be(false), "expected no supplied value with #{label}"
+      monolith_env = monolith.first.env
+      timekeeping_env = timekeeping.first.env
+      # fetch, so a token missing from both apps fails here instead of comparing nil to nil.
+      shared_token = monolith_env.fetch(token) == timekeeping_env.fetch(token)
+      expect(shared_token).to be(true), "expected one shared token with #{label}"
+      signer = OpenSSL::PKey::RSA.new(monolith_env.fetch(private_key))
+      verifier = OpenSSL::PKey::RSA.new(timekeeping_env.fetch(public_key))
       signature = signer.sign("SHA256", "timekeeping-demo")
-      expect(verifier.verify("SHA256", signature, "timekeeping-demo")).to be(true)
+      paired = verifier.verify("SHA256", signature, "timekeeping-demo")
+      expect(paired).to be(true), "expected a matching key pair with #{label}"
       # "Timekeeping gets the public key and the token, and never the private key."
-      expect(timekeeping.key?(private_key)).to be(false)
+      private_key_in_timekeeping = timekeeping.any? { |spec| spec.env.key?(private_key) }
+      expect(private_key_in_timekeeping).to be(false), "expected no private key in Timekeeping with #{label}"
     end
   end
 end
@@ -300,57 +309,6 @@ RSpec.describe TimekeepingDemo::CLI do
 end
 
 RSpec.describe TimekeepingDemo::CLI do
-  it "up with all three caller credentials starts the apps with them and writes none to versions.json or the output" do
-    started = []
-    supervisor = instance_double(TimekeepingDemo::Supervisor)
-    allow(supervisor).to receive(:prepare) { |*_args, **_kwargs| true }
-    allow(supervisor).to receive(:run) do |specs, *_rest, **_kwargs|
-      started.concat(specs)
-      0
-    end
-    supplied = TimekeepingDemo::Credentials.generate
-    caller_env = {
-      "PATH" => ENV.fetch("PATH"),
-      "DB_USER" => "monolith_user",
-      "TIMEKEEPING_DATABASE_URL" => "postgres://timekeeping_user@127.0.0.1:5432/timekeeping_test"
-    }.merge(supplied.to_env)
-    secrets = [supplied.private_key_pem, supplied.public_key_pem, supplied.service_token]
-    keys = TimekeepingDemo::Credentials::ENV_KEYS
-
-    Dir.mktmpdir("timekeeping-demo-state") do |state_dir|
-      captured_out = StringIO.new
-      captured_err = StringIO.new
-      original_out = $stdout
-      original_err = $stderr
-      begin
-        $stdout = captured_out
-        $stderr = captured_err
-        described_class.run(["up"], root: Rails.root.to_s, supervisor:, state_dir:, caller_env:)
-      ensure
-        $stdout = original_out
-        $stderr = original_err
-      end
-
-      monolith = started.find { |spec| spec.app == :monolith }.env
-      timekeeping = started.find { |spec| spec.app == :timekeeping }.env
-      # "`CLI.up` uses credentials from `caller_env` when all are present, and otherwise generates them as before."
-      expect(monolith[keys.fetch(:private_key_pem)] == supplied.private_key_pem).to be(true)
-      expect(monolith[keys.fetch(:service_token)] == supplied.service_token).to be(true)
-      expect(timekeeping[keys.fetch(:public_key_pem)] == supplied.public_key_pem).to be(true)
-      expect(timekeeping[keys.fetch(:service_token)] == supplied.service_token).to be(true)
-      # "Timekeeping gets the public key and the token, and never the private key."
-      expect(timekeeping.key?(keys.fetch(:private_key_pem))).to be(false)
-
-      # "Never log, print or write them to versions.json."
-      versions_text = File.read(File.join(state_dir, "versions.json"))
-      written = [versions_text, captured_out.string, captured_err.string]
-      leaked = written.any? { |text| secrets.any? { |secret| text.include?(secret) } }
-      expect(leaked).to be(false)
-    end
-  end
-end
-
-RSpec.describe TimekeepingDemo::CLI do
   it "run without a supervisor builds one that records groups in tmp/timekeeping-demo/process_groups" do
     root = Rails.root.to_s
     built_with = []
@@ -374,117 +332,6 @@ RSpec.describe TimekeepingDemo::CLI do
     expect(built_with.size).to eq(1)
     expect(built_with.first[:groups_path]).to eq(File.join(root, "tmp", "timekeeping-demo", "process_groups"))
     expect(status).to eq(described_class::EX_FAILURE)
-  end
-end
-
-RSpec.describe TimekeepingDemo::CLI, "up with caller credentials" do
-  it "up with all three credential keys in caller_env gives each app exactly its permitted values and writes none of them out" do
-    supplied = TimekeepingDemo::Credentials.generate
-    caller_env = {
-      "PATH" => ENV.fetch("PATH"),
-      "TIMEKEEPING_DATABASE_URL" => "postgres://timekeeping_caller_role@127.0.0.1/timekeeping_caller_test",
-      "DB_USER" => "monolith_caller_role",
-      "TIMEKEEPING_TOKEN_PRIVATE_KEY" => supplied.private_key_pem,
-      "TIMEKEEPING_TOKEN_PUBLIC_KEY" => supplied.public_key_pem,
-      "TIMEKEEPING_SERVICE_TOKEN" => supplied.service_token
-    }
-    started = []
-    supervisor = instance_double(TimekeepingDemo::Supervisor)
-    allow(supervisor).to receive(:prepare)
-    allow(supervisor).to receive(:run) { |specs, **| started.concat(specs) }
-
-    Dir.mktmpdir("timekeeping-demo-state") do |state_dir|
-      captured_out = StringIO.new
-      captured_err = StringIO.new
-      original_out = $stdout
-      original_err = $stderr
-      begin
-        $stdout = captured_out
-        $stderr = captured_err
-        status = described_class.run(["up"], root: Rails.root.to_s, supervisor:, state_dir:, caller_env:)
-        expect(status).to eq(0)
-      ensure
-        $stdout = original_out
-        $stderr = original_err
-      end
-
-      monolith = started.select { |spec| spec.app == :monolith }
-      timekeeping = started.select { |spec| spec.app == :timekeeping }
-      expect(monolith).not_to be_empty
-      expect(timekeeping).not_to be_empty
-
-      # "`CLI.up` with all three keys in caller_env gives each app exactly its permitted values, byte for byte.
-      # The Timekeeping env holds no private key. Comparisons report booleans, never the values."
-      monolith.each do |spec|
-        expect(spec.env["TIMEKEEPING_TOKEN_PRIVATE_KEY"] == supplied.private_key_pem).to be(true)
-        expect(spec.env["TIMEKEEPING_SERVICE_TOKEN"] == supplied.service_token).to be(true)
-        expect(spec.env.key?("TIMEKEEPING_TOKEN_PUBLIC_KEY")).to be(false)
-      end
-      timekeeping.each do |spec|
-        expect(spec.env["TIMEKEEPING_TOKEN_PUBLIC_KEY"] == supplied.public_key_pem).to be(true)
-        expect(spec.env["TIMEKEEPING_SERVICE_TOKEN"] == supplied.service_token).to be(true)
-        expect(spec.env.key?("TIMEKEEPING_TOKEN_PRIVATE_KEY")).to be(false)
-        expect(spec.env.values.any? { |value| value == supplied.private_key_pem }).to be(false)
-      end
-
-      # "versions.json, the captured stdout and stderr, and the runtime output hold none of the values."
-      versions_text = File.read(File.join(state_dir, "versions.json"))
-      secrets = [supplied.private_key_pem, supplied.public_key_pem, supplied.service_token]
-      [versions_text, captured_out.string, captured_err.string].each do |text|
-        expect(secrets.any? { |secret| text.include?(secret) }).to be(false)
-      end
-    end
-  end
-end
-
-RSpec.describe TimekeepingDemo::CLI, "up with an incomplete caller credential set" do
-  it "up with a partial or blank credential set in caller_env starts the apps with a fresh matching set and none of the supplied values" do
-    supplied = TimekeepingDemo::Credentials.generate
-    complete = {
-      "TIMEKEEPING_TOKEN_PRIVATE_KEY" => supplied.private_key_pem,
-      "TIMEKEEPING_TOKEN_PUBLIC_KEY" => supplied.public_key_pem,
-      "TIMEKEEPING_SERVICE_TOKEN" => supplied.service_token
-    }
-    base_env = {
-      "PATH" => ENV.fetch("PATH"),
-      "TIMEKEEPING_DATABASE_URL" => "postgres://timekeeping_caller_role@127.0.0.1/timekeeping_caller_test",
-      "DB_USER" => "monolith_caller_role"
-    }
-    variants = complete.keys.flat_map do |key|
-      [complete.except(key), complete.merge(key => ""), complete.merge(key => "  ")]
-    end
-
-    variants.each do |credential_env|
-      started = []
-      supervisor = instance_double(TimekeepingDemo::Supervisor)
-      allow(supervisor).to receive(:prepare)
-      allow(supervisor).to receive(:run) { |specs, **| started.concat(specs) }
-
-      Dir.mktmpdir("timekeeping-demo-state") do |state_dir|
-        status = described_class.run(["up"], root: Rails.root.to_s, supervisor:, state_dir:,
-                                             caller_env: base_env.merge(credential_env))
-        expect(status).to eq(0)
-      end
-
-      # "`CLI.up` uses `Credentials.from_env(caller_env) || Credentials.generate`. A partial or blank set therefore
-      # gets a whole fresh set and is never mixed with supplied values."
-      monolith = started.find { |spec| spec.app == :monolith }
-      timekeeping = started.find { |spec| spec.app == :timekeeping }
-      private_pem = monolith.env.fetch("TIMEKEEPING_TOKEN_PRIVATE_KEY")
-      public_pem = timekeeping.env.fetch("TIMEKEEPING_TOKEN_PUBLIC_KEY")
-      private_key = OpenSSL::PKey::RSA.new(private_pem)
-      public_key = OpenSSL::PKey::RSA.new(public_pem)
-      signature = private_key.sign("SHA256", "timekeeping harness check")
-      expect(public_key.verify("SHA256", signature, "timekeeping harness check")).to be(true)
-      # fetch, so a token missing from both apps fails here instead of comparing nil to nil.
-      expect(monolith.env.fetch("TIMEKEEPING_SERVICE_TOKEN") == timekeeping.env.fetch("TIMEKEEPING_SERVICE_TOKEN")).to be(true)
-
-      supplied_values = complete.values
-      all_values = started.flat_map { |spec| spec.env.values }
-      expect(all_values.any? { |value| supplied_values.include?(value) }).to be(false)
-      # "Timekeeping gets the public key and the token, and never the private key."
-      expect(started.select { |spec| spec.app == :timekeeping }.any? { |spec| spec.env.key?("TIMEKEEPING_TOKEN_PRIVATE_KEY") }).to be(false)
-    end
   end
 end
 
@@ -524,38 +371,5 @@ RSpec.describe TimekeepingDemo::CLI do
     expect(timekeeping.none? { |spec| spec.env.key?(renamed_keys[:private_key_pem]) }).to be(true)
     old_names = %w[TIMEKEEPING_TOKEN_PRIVATE_KEY TIMEKEEPING_TOKEN_PUBLIC_KEY TIMEKEEPING_SERVICE_TOKEN]
     expect(started.none? { |spec| old_names.any? { |name| spec.env.key?(name) } }).to be(true)
-  end
-end
-
-RSpec.describe TimekeepingDemo::CLI do
-  it "up with a partial credential set starts both apps on one fresh matching set and never mixes in a supplied value" do
-    keys = TimekeepingDemo::Credentials::ENV_KEYS
-    supplied = TimekeepingDemo::Credentials.generate.to_env
-    supplied.delete(keys.fetch(:public_key_pem))
-    started = []
-    supervisor = instance_double(TimekeepingDemo::Supervisor)
-    allow(supervisor).to receive(:prepare)
-    allow(supervisor).to receive(:run) { |specs, **| started.concat(specs) }
-    caller_env = ENV.to_h.except(*keys.values).merge(supplied).merge(
-      "DB_USER" => "monolith_user",
-      "TIMEKEEPING_DATABASE_URL" => "postgres://timekeeping_user@127.0.0.1:5432/timekeeping_test"
-    )
-
-    Dir.mktmpdir do |state_dir|
-      described_class.run(["up"], root: Rails.root.to_s, supervisor:, state_dir:, caller_env:)
-    end
-
-    monolith = started.find { |spec| spec.app == :monolith }.env
-    timekeeping = started.find { |spec| spec.app == :timekeeping }.env
-    # "A partial or blank set therefore gets a whole fresh set and is never mixed with supplied values."
-    all_values = started.flat_map { |spec| spec.env.values }
-    expect(supplied.values.any? { |value| all_values.include?(value) }).to be(false)
-    private_key = OpenSSL::PKey::RSA.new(monolith.fetch(keys.fetch(:private_key_pem)))
-    public_key = OpenSSL::PKey::RSA.new(timekeeping.fetch(keys.fetch(:public_key_pem)))
-    signature = private_key.sign("SHA256", "pairing check")
-    expect(public_key.verify("SHA256", signature, "pairing check")).to be(true)
-    expect(monolith.fetch(keys.fetch(:service_token)) == timekeeping.fetch(keys.fetch(:service_token))).to be(true)
-    # "Timekeeping gets the public key and the token, and never the private key."
-    expect(timekeeping.key?(keys.fetch(:private_key_pem))).to be(false)
   end
 end
