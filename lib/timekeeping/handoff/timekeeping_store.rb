@@ -179,12 +179,13 @@ module Timekeeping
         end
 
         # The key's value in a JSON object answer, or nil when the answer is
-        # not an object.
+        # not an object. The parser's own message quotes the body, which can
+        # echo the token, so it is not kept as the error's cause.
         def answer_field(body, key)
           answer = JSON.parse(body)
           answer[key] if answer.is_a?(Hash)
         rescue JSON::ParserError => error
-          raise Store::Error, "Timekeeping answered an unreadable body: #{error.class}"
+          raise Store::Error, "Timekeeping answered an unreadable body: #{error.class}", cause: nil
         end
 
         # A reply cut short or changed on the way would no longer match its

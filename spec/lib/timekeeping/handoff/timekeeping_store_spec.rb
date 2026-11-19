@@ -461,6 +461,30 @@ RSpec.describe Timekeeping::Handoff::TimekeepingStore do
     end
   end
 
+  # "never put the token in a message": the JSON parser's message quotes the
+  # body it could not read, so it must not survive as the error's cause.
+  it "keeps a token echoed in an unreadable 200 answer out of the Store::Error cause and full message" do
+    base_url = "http://timekeeping-handoff-cause.test"
+    token = "servicetokenechoedinbody"
+    store = described_class.new(base_url:, token:)
+    calls = {
+      "/internal/v1/handoff/settle" => -> { store.settle(generation: 2) },
+      "/internal/v1/handoff/drain" => -> { store.drain(through: 40) }
+    }
+
+    calls.each do |path, call|
+      [%({"drained": #{token}}), token].each do |answer|
+        stub_request(:post, "#{base_url}#{path}").to_return(status: 200, body: answer)
+
+        expect { call.call }.to raise_error(Timekeeping::Handoff::Store::Error) { |error|
+          expect(error.cause).to be_nil
+          expect(error.full_message).not_to include(token)
+        }
+        WebMock.reset!
+      end
+    end
+  end
+
   # "Read answers with `integer_field` or an equivalent boolean reader. Raise `Store::Error` on non-200,
   # and never put the token in a message."
   it "settle and drain send the service bearer and refuse a drained or settling answer that is not a JSON boolean" do
