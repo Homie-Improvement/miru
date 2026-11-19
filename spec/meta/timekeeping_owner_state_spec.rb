@@ -194,6 +194,38 @@ RSpec.describe "Timekeeping owner state harness" do
 
         expect { expect_owner_state!("timekeeping") }.to raise_error(RSpec::Expectations::ExpectationNotMetError)
       end
+
+      it "fails on rollback when the row is at timekeeping generation 2" do
+        TimekeepingOwnerState.apply!("timekeeping")
+
+        expect { expect_owner_state!("rollback") }.to raise_error(RSpec::Expectations::ExpectationNotMetError)
+      end
+
+      it "defaults to TimekeepingOwnerState.current" do
+        stub_const("TimekeepingOwnerState::SELECTED", "rollback")
+        TimekeepingOwnerState.apply!("timekeeping")
+
+        expect { expect_owner_state! }.to raise_error(RSpec::Expectations::ExpectationNotMetError)
+
+        TimekeepingOwnerState.apply!("rollback")
+
+        expect { expect_owner_state! }.not_to raise_error
+      end
+    end
+
+    describe ".current" do
+      # "`TimekeepingOwnerState.current` returns `SELECTED || DEFAULT_STATE`"
+      it "returns \"legacy\" when no state is selected" do
+        stub_const("TimekeepingOwnerState::SELECTED", nil)
+
+        expect(TimekeepingOwnerState.current).to eq("legacy")
+      end
+
+      it "returns the selected state name when one is selected" do
+        stub_const("TimekeepingOwnerState::SELECTED", "rollback")
+
+        expect(TimekeepingOwnerState.current).to eq("rollback")
+      end
     end
   end
 
