@@ -27,8 +27,10 @@ module TestDatabaseCleanupResetSiteScan
              allowed: { WRAPPER_FILE => 1 }, only_in: WRAPPER_FILE),
     # A SQL TRUNCATE statement: one that opens a string or a heredoc line, so
     # truncate_tables, :truncate and %i[truncate ...] are not counted.
+    # A TRUNCATE that ends its line counts too, because SQL often puts the
+    # table names on the next line.
     # Both allowed ones clear the separate Timekeeping database after a collect.
-    Rule.new(name: "raw SQL truncate", pattern: /(?:["'`]|^\s*)truncate\s+(?:table\s+)?["#\w]/i,
+    Rule.new(name: "raw SQL truncate", pattern: /(?:["'`]|^\s*)truncate(?:\s+(?:table\s+)?["#\w]|\s*$)/i,
              allowed: { TIMEKEEPING_RESET_FILE => 1, RUNTIME_QUEUES_FILE => 1 }, only_in: nil),
     Rule.new(name: "raw SQL queue delete", pattern: /\bdelete\s+from\s+"?solid_queue_/i,
              allowed: {}, only_in: nil),
@@ -98,6 +100,17 @@ RSpec.describe TestDatabaseCleanupResetSiteScan do
     sources = { "spec/support/new_reset.rb" => "x = 1\nActiveRecord::Base.connection.execute(\"TRUNCATE users\")\n" }
 
     expect(described_class.offenses(sources)).to eq(["raw SQL truncate: spec/support/new_reset.rb:2"])
+  end
+
+  it "reports a raw SQL TRUNCATE whose table names are on the next line" do
+    sources = {
+      "spec/support/new_reset.rb" => "ActiveRecord::Base.connection.execute(<<~SQL)\n  TRUNCATE\n    solid_queue_jobs\nSQL\n" \
+                                     "connection.execute(\"TRUNCATE\n  solid_queue_jobs\")\n"
+    }
+
+    expect(described_class.offenses(sources)).to eq(
+      ["raw SQL truncate: spec/support/new_reset.rb:2", "raw SQL truncate: spec/support/new_reset.rb:5"]
+    )
   end
 
   it "reports a lower-case truncate and a raw delete from a solid_queue_ table" do
