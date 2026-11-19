@@ -442,6 +442,10 @@ jobs:
   # outside the dedicated ones runs. The launcher refuses to start when both
   # applications would connect as one database user, so Timekeeping gets a
   # role of its own here.
+  #
+  # The same job also runs the Timekeeping queue collector against real
+  # completed, claimed and failed Solid Queue rows in the Timekeeping test
+  # database. Every other job lacks that database, so it skips the spec.
   timekeeping-runtime-live:
     name: Timekeeping demo runtime starts only the dedicated workers
     runs-on: ubuntu-24.04
@@ -500,8 +504,8 @@ jobs:
       - name: Setup monolith test database
         run: bundle exec rails db:test:prepare
 
-      - name: Run the demo runtime queue spec
-        run: bundle exec rspec spec/timekeeping/runtime_queues_spec.rb
+      - name: Run the demo runtime queue spec and the Timekeeping collector row spec
+        run: bundle exec rspec spec/timekeeping/runtime_queues_spec.rb spec/timekeeping/timekeeping_collector_rows_spec.rb
 
   security-audit:
     name: Security audit
