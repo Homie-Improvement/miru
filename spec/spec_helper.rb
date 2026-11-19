@@ -69,6 +69,14 @@ end
 #
 # See http://rubydoc.info/gems/rspec-core/RSpec/Core/Configuration
 RSpec.configure do |config|
+  # A `bin/timekeeping-demo regression` state run must fail when its filters
+  # leave no example to run. rspec-core 3.13 has no --fail-if-no-examples
+  # option, and .rspec loads this file for every run, Rails or not. The key is
+  # read here, before Rails boots, so only the caller's environment counts.
+  if ENV["TIMEKEEPING_REGRESSION"] == "1" && ENV.key?("TIMEKEEPING_OWNER_STATE")
+    config.fail_if_no_examples = true
+  end
+
   config.expect_with :rspec do |expectations|
     expectations.include_chain_clauses_in_custom_matcher_descriptions = true
   end

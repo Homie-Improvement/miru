@@ -2,6 +2,7 @@
 
 require "fileutils"
 require "json"
+require "uri"
 
 module TimekeepingDemo
   # The `bin/timekeeping-demo` command. `up` takes the caller's complete
@@ -22,6 +23,7 @@ module TimekeepingDemo
     DEFAULT_PORTS = { monolith: 3000, timekeeping: 3100 }.freeze
     PORT_KEYS = { monolith: "MONOLITH_PORT", timekeeping: "TIMEKEEPING_PORT" }.freeze
     USAGE = "usage: bin/timekeeping-demo up|regression"
+    TEST_DATABASE_SUFFIX = "_test"
     # Ctrl-C in the terminal, or a TERM from whoever started the demo.
     STOP_SIGNALS = %w[INT TERM].freeze
 
@@ -37,7 +39,7 @@ module TimekeepingDemo
             regression_runner: nil)
       case argv
       in ["regression"]
-        Regression.run(runner: regression_runner || default_regression_runner(root:, caller_env:))
+        regression(root:, caller_env:, runner: regression_runner)
       in ["up"]
         start(root:, supervisor:, state_dir:, caller_env:)
       else
@@ -67,13 +69,46 @@ module TimekeepingDemo
       EX_OK
     end
 
+    def regression(root:, caller_env:, runner:)
+      Regression.run(runner: runner || default_regression_runner(root:, caller_env:))
+    rescue ConfigurationError => e
+      warn "timekeeping-demo: #{e.message}"
+      EX_CONFIG
+    end
+
+    # Active Record reads the database from the URL path and lets a `database`
+    # query parameter override it; libpq reads a `dbname` parameter. Each name
+    # any of them could open must end in _test.
+    def require_test_database_url!(url)
+      return if url.strip.empty?
+
+      uri = URI.parse(url)
+      query = URI.decode_www_form(uri.query.to_s).to_h
+      names = [URI.decode_www_form_component(uri.path.to_s.delete_prefix("/")), query["dbname"], query["database"]]
+      unsafe = names.compact.reject { |name| name.empty? || name.end_with?(TEST_DATABASE_SUFFIX) }
+      return if unsafe.empty?
+
+      raise ConfigurationError, "#{RuntimePlan::MONOLITH_DATABASE_URL} names #{unsafe.join(', ')}; " \
+                                "the regression specs empty their database, so it must end in #{TEST_DATABASE_SUFFIX}"
+    rescue URI::InvalidURIError, ArgumentError
+      raise ConfigurationError, "#{RuntimePlan::MONOLITH_DATABASE_URL} is not a valid database URL"
+    end
+
     # The child's values win over the caller's; a nil value makes system drop
     # an inherited key. The argv array is passed as separate arguments, so no
     # shell ever reads a spec path. The result is system's own: true, false,
     # or nil when rspec could not start or was killed.
+    #
+    # Every child empties its database at suite start, so a caller
+    # DATABASE_URL must name a _test database, checked here before any child
+    # can start. Without one, the key is set to "" (which config/application.rb
+    # reads as unset) so that dotenv cannot fill it from a local .env.
     def default_regression_runner(root:, caller_env:)
+      database_url = caller_env.fetch(RuntimePlan::MONOLITH_DATABASE_URL, "")
+      require_test_database_url!(database_url)
+      child_caller_env = caller_env.merge(RuntimePlan::MONOLITH_DATABASE_URL => database_url)
       lambda do |env:, argv:|
-        system(caller_env.merge(env), "bundle", "exec", "rspec", *argv, chdir: root)
+        system(child_caller_env.merge(env), "bundle", "exec", "rspec", *argv, chdir: root)
       end
     end
 

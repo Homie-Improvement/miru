@@ -397,7 +397,7 @@ RSpec.describe TimekeepingDemo::CLI do
     # "The default runner, built by `CLI.run` from `root:` and `caller_env:`, uses `system(env, "bundle", "exec", "rspec", *argv, chdir: root)` with an argv array, never a shell string."
     expect(calls.size).to eq(1)
     args, opts = calls.first
-    expect(args).to eq([{ "KEEP_ME" => "1", "TIMEKEEPING_OWNER_STATE" => "legacy" },
+    expect(args).to eq([{ "KEEP_ME" => "1", "DATABASE_URL" => "", "TIMEKEEPING_OWNER_STATE" => "legacy" },
                         "bundle", "exec", "rspec", hostile, "--tag", "~switches_owner"])
     expect(opts).to eq(chdir: root)
     expect(result).to be(false)
@@ -514,7 +514,7 @@ RSpec.describe TimekeepingDemo::CLI do
     caller_env = { "TIMEKEEPING_OWNER_STATE" => "rollback", "KEEP_ME" => "x" }
     # "The default runner, built by `CLI.run` from `root:` and `caller_env:`, uses `system(env, \"bundle\", \"exec\", \"rspec\", *argv, chdir: root)` with an argv array, never a shell string."
     expect(described_class).to receive(:system)
-      .with({ "TIMEKEEPING_OWNER_STATE" => "legacy", "KEEP_ME" => "x" },
+      .with({ "TIMEKEEPING_OWNER_STATE" => "legacy", "KEEP_ME" => "x", "DATABASE_URL" => "" },
             "bundle", "exec", "rspec", "spec/a b_spec.rb", "--tag", "~switches_owner", chdir: "/srv/app")
       .and_return(nil)
 
@@ -553,5 +553,47 @@ RSpec.describe TimekeepingDemo::CLI do
       expect(calls.map { |env, _argv| env["TIMEKEEPING_QUEUE_LEDGER_PATH"] }).not_to include("/caller/ledger.json")
       expect(Dir.children(state_dir)).to be_empty
     end
+  end
+end
+
+RSpec.describe TimekeepingDemo::CLI, "regression database guard" do
+  def run_regression_with(database_url)
+    status = nil
+    expect do
+      status = described_class.run(["regression"], root: Rails.root.to_s,
+                                                   caller_env: { "DATABASE_URL" => database_url })
+    end.to output(/timekeeping-demo: DATABASE_URL/).to_stderr
+    status
+  end
+
+  it "refuses a caller DATABASE_URL that any reader would open as a non-test database before running anything" do
+    expect(described_class).not_to receive(:system)
+
+    [
+      "postgresql://user@127.0.0.1/miru_web_development",
+      "postgresql://user@127.0.0.1/miru_web_test?dbname=miru_web_development",
+      "postgresql://user@127.0.0.1/miru_web_test?database=miru_web_development",
+      "not a url"
+    ].each do |url|
+      expect(run_regression_with(url)).to eq(described_class::EX_CONFIG)
+    end
+  end
+
+  it "passes a _test DATABASE_URL through and sets an absent one to empty so dotenv cannot fill it" do
+    envs = []
+    allow(described_class).to receive(:system) do |env, *_args, **_opts|
+      envs << env
+      true
+    end
+
+    test_url = "postgresql://user@127.0.0.1/miru_web_test"
+    expect do
+      described_class.run(["regression"], root: Rails.root.to_s, caller_env: { "DATABASE_URL" => test_url })
+    end.to output.to_stdout
+    expect(envs.pluck("DATABASE_URL").uniq).to eq([test_url])
+
+    envs.clear
+    expect { described_class.run(["regression"], root: Rails.root.to_s, caller_env: {}) }.to output.to_stdout
+    expect(envs.pluck("DATABASE_URL").uniq).to eq([""])
   end
 end

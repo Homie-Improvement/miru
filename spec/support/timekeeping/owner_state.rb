@@ -104,10 +104,6 @@ RSpec.configure do |config|
   config.include TimekeepingOwnerState::Expectations
 
   if TimekeepingOwnerState::SELECTED
-    # A `bin/timekeeping-demo regression` state run must fail when its filters
-    # leave no example to run; rspec-core offers this only as a setting.
-    config.fail_if_no_examples = true if ENV["TIMEKEEPING_REGRESSION"] == "1"
-
     config.before do
       TimekeepingOwnerState.apply!(TimekeepingOwnerState::SELECTED)
     end

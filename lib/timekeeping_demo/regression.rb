@@ -52,7 +52,7 @@ module TimekeepingDemo
     SWITCHES_OWNER_TAG = "switches_owner"
     # A state run whose filters leave nothing to run must fail rather than pass
     # while proving nothing. rspec-core 3.13 has no --fail-if-no-examples
-    # command-line option, so spec/support/timekeeping/owner_state.rb sets
+    # command-line option, so spec/spec_helper.rb sets
     # config.fail_if_no_examples for a regression child that has a state.
     STATE_FLAGS = ["--tag", "~#{SWITCHES_OWNER_TAG}"].freeze
     REPORT_HEADING = "#{SWITCHES_OWNER_TAG} examples (run once, outside the ownership states):".freeze

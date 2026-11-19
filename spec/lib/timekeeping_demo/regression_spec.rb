@@ -153,7 +153,7 @@ RSpec.describe TimekeepingDemo::Regression do
       expect do
         status = described_class.run(runner:, states: %w[legacy timekeeping rollback],
                                      specs: ["spec/models/invoice_spec.rb"])
-      end.to output(/legacy.*timekeeping.*rollback/m).to_stdout
+      end.to output(/^legacy: passed$.*^timekeeping: failed$.*^rollback: passed$/m).to_stdout
 
       expect(states_run).to eq(%w[legacy timekeeping rollback])
       expect(status).to eq(TimekeepingDemo::CLI::EX_FAILURE)
@@ -174,7 +174,7 @@ RSpec.describe TimekeepingDemo::Regression do
         expect do
           status = described_class.run(runner:, states: %w[legacy timekeeping rollback],
                                        specs: ["spec/models/invoice_spec.rb"])
-        end.to output.to_stdout
+        end.to output(/^legacy: failed$.*^timekeeping: passed$/m).to_stdout
 
         expect(status).to eq(TimekeepingDemo::CLI::EX_FAILURE), "result #{bad_result.inspect} was counted as a pass"
       end

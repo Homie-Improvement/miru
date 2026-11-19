@@ -11,11 +11,11 @@ RSpec.describe "timekeeping regression command", :without_transaction do
   let(:probe) { Rails.root.join("spec/fixtures/timekeeping_harness/switches_owner_probe.rb").to_s }
   let(:real_runner) { TimekeepingDemo::CLI.default_regression_runner(root: Rails.root.to_s, caller_env: ENV.to_h) }
 
-  def run_regression(runner)
+  def run_regression(runner, spec_file = probe)
     captured = StringIO.new
     original = $stdout
     $stdout = captured
-    status = TimekeepingDemo::Regression.run(runner:, states: %w[legacy], specs: [probe])
+    status = TimekeepingDemo::Regression.run(runner:, states: %w[legacy], specs: [spec_file])
     [status, captured.string]
   ensure
     $stdout = original
@@ -50,5 +50,13 @@ RSpec.describe "timekeeping regression command", :without_transaction do
 
       expect(real_runner.call(env:, argv: [probe, "--tag", "no_example_has_this_tag"])).to be(false)
     end
+  end
+
+  it "fails a state run over a spec file that loads no rails_helper when every example is filtered out" do
+    standalone = Rails.root.join("spec/fixtures/timekeeping_harness/standalone_switches_owner_probe.rb").to_s
+    status, stdout = run_regression(real_runner, standalone)
+
+    expect(stdout).to match(/^legacy: failed$/)
+    expect(status).to eq(TimekeepingDemo::CLI::EX_FAILURE)
   end
 end
