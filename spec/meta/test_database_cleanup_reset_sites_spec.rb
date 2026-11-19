@@ -1,4 +1,135 @@
+# frozen_string_literal: true
+
 require "rails_helper"
+
+# Finds every place in the given sources that empties monolith tables, or
+# collects queue executions, outside TestDatabaseCleanup.clean_with!. A reset
+# that skips the collect step erases Solid Queue executions with no record,
+# so each rule below lists how many matching lines a file may hold.
+module TestDatabaseCleanupResetSiteScan
+  WRAPPER_FILE = "spec/support/database_cleaner.rb"
+  TIMEKEEPING_RESET_FILE = "spec/support/timekeeping/timekeeping_database_reset.rb"
+  RUNTIME_QUEUES_FILE = "spec/timekeeping/runtime_queues_spec.rb"
+
+  Rule = Data.define(:name, :pattern, :allowed, :only_in)
+
+  RULES = [
+    # The Timekeeping database reset collects through its before_truncate: hook.
+    Rule.new(name: "direct collect", pattern: /\bTestDatabaseCleanup\.before_reset!/,
+             allowed: { TIMEKEEPING_RESET_FILE => 1 }, only_in: nil),
+    # The one call inside clean_with!.
+    Rule.new(name: "direct DatabaseCleaner.clean_with", pattern: /\bDatabaseCleaner\.clean_with\b/,
+             allowed: { WRAPPER_FILE => 1 }, only_in: nil),
+    # Inside TestDatabaseCleanup the collect step is called without the module
+    # prefix; only clean_with! may do that.
+    Rule.new(name: "bare collect", pattern: /\A(?!\s*def\b).*(?<![.\w:])before_reset!(?!\w)/,
+             allowed: { WRAPPER_FILE => 1 }, only_in: WRAPPER_FILE),
+    # A SQL TRUNCATE statement: one that opens a string or a heredoc line, so
+    # truncate_tables, :truncate and %i[truncate ...] are not counted.
+    # Both allowed ones clear the separate Timekeeping database after a collect.
+    Rule.new(name: "raw SQL truncate", pattern: /(?:["'`]|^\s*)truncate\s+(?:table\s+)?["#\w]/i,
+             allowed: { TIMEKEEPING_RESET_FILE => 1, RUNTIME_QUEUES_FILE => 1 }, only_in: nil),
+    Rule.new(name: "raw SQL queue delete", pattern: /\bdelete\s+from\s+"?solid_queue_/i,
+             allowed: {}, only_in: nil)
+  ].freeze
+
+  module_function
+
+  # sources maps a repository-relative path to its text. Returns one
+  # "rule: path:line" entry for each matching line past the file's allowance.
+  def offenses(sources)
+    RULES.flat_map do |rule|
+      sources.flat_map do |path, text|
+        next [] if rule.only_in && rule.only_in != path
+
+        hits = matching_lines(text, rule.pattern)
+        hits.drop(rule.allowed.fetch(path, 0)).map { |number| "#{rule.name}: #{path}:#{number}" }
+      end
+    end
+  end
+
+  def matching_lines(text, pattern)
+    text.each_line.with_index(1).filter_map do |line, number|
+      number if !line.lstrip.start_with?("#") && line.match?(pattern)
+    end
+  end
+
+  # Every spec file except the one that defines this scan.
+  def spec_sources(skip:)
+    Dir.glob(Rails.root.join("spec/**/*.rb")).each_with_object({}) do |absolute, sources|
+      next if File.expand_path(absolute) == File.expand_path(skip)
+
+      sources[Pathname(absolute).relative_path_from(Rails.root).to_s] = File.read(absolute)
+    end
+  end
+end
+
+RSpec.describe TestDatabaseCleanupResetSiteScan do
+  # "A new truncate site that leaves out the call erases executions with no record, and nothing catches it."
+  it "reports nothing for the spec files as they stand" do
+    expect(described_class.offenses(described_class.spec_sources(skip: __FILE__))).to eq([])
+  end
+
+  it "reports a new raw SQL TRUNCATE with its path and line" do
+    sources = { "spec/support/new_reset.rb" => "x = 1\nActiveRecord::Base.connection.execute(\"TRUNCATE users\")\n" }
+
+    expect(described_class.offenses(sources)).to eq(["raw SQL truncate: spec/support/new_reset.rb:2"])
+  end
+
+  it "reports a lower-case truncate and a raw delete from a solid_queue_ table" do
+    sources = {
+      "spec/support/new_reset.rb" => "execute(\"truncate solid_queue_jobs\")\nexecute(\"DELETE FROM solid_queue_jobs\")\n"
+    }
+
+    expect(described_class.offenses(sources)).to eq(
+      ["raw SQL truncate: spec/support/new_reset.rb:1", "raw SQL queue delete: spec/support/new_reset.rb:2"]
+    )
+  end
+
+  it "reports a direct TestDatabaseCleanup.before_reset! call in a new file" do
+    sources = { "spec/support/new_reset.rb" => "TestDatabaseCleanup.before_reset!\n" }
+
+    expect(described_class.offenses(sources)).to eq(["direct collect: spec/support/new_reset.rb:1"])
+  end
+
+  it "reports a second DatabaseCleaner.clean_with and a second bare collect in the wrapper file" do
+    text = <<~RUBY
+      def before_reset!
+      end
+
+      def clean_with!(strategy, **options)
+        before_reset!
+        DatabaseCleaner.clean_with(strategy, **options)
+      end
+
+      def another_reset!
+        before_reset!
+        DatabaseCleaner.clean_with :truncation
+      end
+    RUBY
+
+    expect(described_class.offenses("spec/support/database_cleaner.rb" => text)).to eq(
+      [
+        "direct DatabaseCleaner.clean_with: spec/support/database_cleaner.rb:11",
+        "bare collect: spec/support/database_cleaner.rb:10"
+      ]
+    )
+  end
+
+  it "reports a TRUNCATE past the one the runtime queues spec may hold" do
+    text = "timekeeping.exec(\"TRUNCATE \#{tables}\")\nconnection.execute(\"TRUNCATE \#{queue_tables}\")\n"
+
+    expect(described_class.offenses("spec/timekeeping/runtime_queues_spec.rb" => text))
+      .to eq(["raw SQL truncate: spec/timekeeping/runtime_queues_spec.rb:2"])
+  end
+
+  it "ignores words and symbols that only look like truncate" do
+    text = "truncate_tables(connection)\nsteps << :truncate }\nit \"truncates long names\" do\n" \
+           "expect(steps).to eq(%i[truncate clean_monolith example])\n"
+
+    expect(described_class.offenses("spec/support/other.rb" => text)).to eq([])
+  end
+end
 
 RSpec.describe TestDatabaseCleanup do
   context "more tests 10" do
@@ -158,8 +289,10 @@ RSpec.describe TestDatabaseCleanup do
   context "more tests 19" do
   # "A new truncate site that leaves out the call erases executions with no record, and nothing catches it."
   it "no spec file truncates monolith tables with raw SQL outside the two Timekeeping database truncates" do
-    raw_truncate = Regexp.new(["TRUN", "CATE"].join, Regexp::IGNORECASE)
-    raw_queue_delete = Regexp.new(["DELETE FROM ", "solid_queue_"].join, Regexp::IGNORECASE)
+    # SQL statements only, so method names such as truncate_tables, symbols
+    # such as :truncate and words such as "truncated" are not counted.
+    raw_truncate = TestDatabaseCleanupResetSiteScan::RULES.find { |rule| rule.name == "raw SQL truncate" }.pattern
+    raw_queue_delete = TestDatabaseCleanupResetSiteScan::RULES.find { |rule| rule.name == "raw SQL queue delete" }.pattern
     counts = Hash.new(0)
 
     Dir.glob(Rails.root.join("spec/**/*.rb")).each do |path|
