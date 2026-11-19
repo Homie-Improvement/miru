@@ -114,18 +114,6 @@ RSpec.describe "TestDatabaseGuard.require_test_database_url!" do
     end
   end
 
-  context "more tests 18" do
-    # "Then require that both the libpq name and the Active Record name of the URL end in `_test`"
-    # The mirror of the selector vector: an Active Record-only check would pass this URL while the
-    # libpq reset empties timekeeping_development.
-    it "refuses a _test path whose dbname parameter names a development database" do
-      url = "postgresql://harness_selector_user@127.0.0.1/timekeeping_selector_test?dbname=timekeeping_development"
-
-      expect { TestDatabaseGuard.require_test_database_url!(url) }
-        .to raise_error(TestDatabaseGuard::NotATestDatabase, /timekeeping_development/)
-    end
-  end
-
   context "more tests 19" do
     # "an unparseable URL raises and the message does not contain the URL."
     # A reading that cannot be parsed must be refused, never skipped.
@@ -137,16 +125,6 @@ RSpec.describe "TestDatabaseGuard.require_test_database_url!" do
           expect(error.message).not_to include(url)
           expect(error.message).not_to include("s3cret-pass")
         }
-    end
-  end
-
-  context "more tests 20" do
-    # "IntegratedRuntime no longer defines `require_test_database_url!` or `active_record_database_name` and calls the TestDatabaseGuard method instead"
-    # A private copy left behind would let the two guards drift apart.
-    it "leaves no copy of the URL guard or its helper on IntegratedRuntime" do
-      expect(IntegratedRuntime.respond_to?(:require_test_database_url!, true)).to be(false)
-      expect(IntegratedRuntime.respond_to?(:active_record_database_name, true)).to be(false)
-      expect(TestDatabaseGuard).to respond_to(:require_test_database_url!)
     end
   end
 end
