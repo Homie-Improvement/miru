@@ -480,3 +480,46 @@ RSpec.describe IntegratedRuntime do
     expect(TimekeepingDatabaseReset).not_to have_received(:reset!)
   end
 end
+
+RSpec.describe IntegratedRuntime do
+  include_context "integrated runtime on an accepted monolith test database"
+
+  it "start checks the Timekeeping URL through TestDatabaseGuard.require_test_database_url! before any spawn or reset" do
+    url = "postgresql://harness_selector_user@127.0.0.1/timekeeping_development?dbname=timekeeping_selector_test"
+    allow(TestDatabaseGuard).to receive(:require_test_database_url!).and_call_original
+    allow(TimekeepingDatabaseReset).to receive(:reset!)
+    allow(Process).to receive(:spawn).and_call_original
+    env = { "PATH" => ENV.fetch("PATH", ""), "TIMEKEEPING_DATABASE_URL" => url }
+
+    # "IntegratedRuntime no longer defines `require_test_database_url!` or `active_record_database_name`
+    # and calls the TestDatabaseGuard method instead"
+    expect { described_class.start(root: Rails.root.to_s, env:) }
+      .to raise_error(TestDatabaseGuard::NotATestDatabase, /timekeeping_development/)
+    expect(TestDatabaseGuard).to have_received(:require_test_database_url!).with(url)
+    expect(Process).not_to have_received(:spawn)
+    expect(TimekeepingDatabaseReset).not_to have_received(:reset!)
+  end
+end
+
+RSpec.describe IntegratedRuntime do
+  include_context "integrated runtime on an accepted monolith test database"
+
+  it "start checks a caller monolith DATABASE_URL through TestDatabaseGuard.require_test_database_url! before any spawn" do
+    monolith_url = "postgresql://harness_monolith_user@127.0.0.1/miru_web_development?dbname=miru_web_test"
+    allow(TestDatabaseGuard).to receive(:require_test_database_url!).and_call_original
+    allow(TimekeepingDatabaseReset).to receive(:reset!)
+    allow(Process).to receive(:spawn).and_call_original
+    env = {
+      "PATH" => ENV.fetch("PATH", ""),
+      TimekeepingDemo::RuntimePlan::MONOLITH_DATABASE_URL => monolith_url,
+      "TIMEKEEPING_DATABASE_URL" => "postgresql://harness_user@127.0.0.1/timekeeping_guard_test"
+    }
+
+    # "call `TestDatabaseGuard.require_test_database_url!` at the two places `IntegratedRuntime.start` calls it today"
+    expect { described_class.start(root: Rails.root.to_s, env:) }
+      .to raise_error(TestDatabaseGuard::NotATestDatabase, /miru_web_development/)
+    expect(TestDatabaseGuard).to have_received(:require_test_database_url!).with(monolith_url)
+    expect(Process).not_to have_received(:spawn)
+    expect(TimekeepingDatabaseReset).not_to have_received(:reset!)
+  end
+end

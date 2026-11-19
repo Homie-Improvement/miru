@@ -36,16 +36,17 @@ Resolve the target from the child's environment, then check it under every parse
 
 ```ruby
 child_monolith_url = env[TimekeepingDemo::RuntimePlan::MONOLITH_DATABASE_URL].to_s
-require_test_database_url!(child_monolith_url) unless child_monolith_url.strip.empty?
-require_test_database_url!(timekeeping_database_url(env))
+TestDatabaseGuard.require_test_database_url!(child_monolith_url) unless child_monolith_url.strip.empty?
+TestDatabaseGuard.require_test_database_url!(timekeeping_database_url(env))
 
-def self.require_test_database_url!(url)
-  TestDatabaseGuard.require_test_database!(TimekeepingDatabaseReset.database_name(url))
-  TestDatabaseGuard.require_test_database!(active_record_database_name(url))
+# spec/support/timekeeping/timekeeping_database_reset.rb, module TestDatabaseGuard
+def require_test_database_url!(url)
+  require_test_database!(TimekeepingDatabaseReset.database_name(url))
+  require_test_database!(active_record_database_name(url))
 end
 ```
 
-`active_record_database_name` builds an `ActiveRecord::DatabaseConfigurations::UrlConfig` without connecting. Run all of these checks before the first spawn, because a pending migration cannot be undone once `db:prepare` starts.
+The guard lives in `TestDatabaseGuard` so every harness that spawns a Rails child, such as one booting `TimekeepingLiveInstance`, uses the same two-reading check. `active_record_database_name` builds an `ActiveRecord::DatabaseConfigurations::UrlConfig` without connecting. Run all of these checks before the first spawn, because a pending migration cannot be undone once `db:prepare` starts.
 
 ## Why it matters
 
