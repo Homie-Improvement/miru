@@ -49,8 +49,8 @@ class IntegratedRuntime
   # answer. Anything that fails after the launcher started stops it first.
   #
   # Just before the launcher starts, the queue ledger is activated and its two
-  # control jobs are enqueued, so every reset from here on records any job a
-  # non-dedicated worker ran. Tests that boot a fake launcher pass a ledger of
+  # control jobs are enqueued, so stop! and the first reset after this runtime
+  # record any job a non-dedicated worker ran. Tests that boot a fake launcher pass a ledger of
   # their own, so the suite's shared ledger stays inactive.
   def self.start(root:, env:, owner_state: TimekeepingOwnerState::SELECTED, ledger: TimekeepingQueueLedger.session)
     refuse_if_running!(root:)

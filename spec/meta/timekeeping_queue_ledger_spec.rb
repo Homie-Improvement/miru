@@ -719,6 +719,35 @@ RSpec.describe TimekeepingQueueLedger::Session do
 end
 
 
+RSpec.describe TimekeepingQueueLedger::Session do
+  # A spec that runs after a stopped runtime may finish or fail default jobs on purpose; no worker ran them.
+  it "stops collecting after the first reset that follows activation, so later specs' own job rows are not recorded" do
+    stray = TimekeepingQueueLedger::Record.new(
+      database: "monolith", queue: "default", job_class: "QueueLedgerLaterSpecJob", kind: "completed", job_id: 9,
+      active_job_id: SecureRandom.uuid, execution_id: nil, created_at: Time.current, finished_at: Time.current
+    )
+    found = []
+
+    Dir.mktmpdir("queue-ledger-disarm") do |dir|
+      session = described_class.new(path: File.join(dir, "queue_ledger.json"),
+                                    collectors: { "monolith" => -> { found.dup } }, live: -> { false })
+      session.activate!(env: {})
+      session.before_reset!
+      found << stray
+      session.before_reset!
+
+      expect { session.finish! }.not_to raise_error
+      expect(TimekeepingQueueLedger.parse(File.read(session.path))[:records]).to eq([])
+
+      session.activate!(env: {})
+      session.before_reset!
+
+      expect { session.finish! }.to raise_error(TimekeepingQueueLedger::RunFailed, /QueueLedgerLaterSpecJob/)
+    end
+  end
+end
+
+
 RSpec.describe TimekeepingDatabaseReset do
   it "reset! refuses a non-test database before it runs the collect hook" do
     calls = []
