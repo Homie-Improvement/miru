@@ -39,6 +39,8 @@ next outcome(settled_state) unless operation&.state == PREPARED
 
 So `abort` answers `aborted` and `commit` answers `committed` for a missing, committed or aborted operation. Only a still-`prepared` operation runs the block and moves to its terminal state.
 
+One check now runs before that answer. `finish` first reads the `timekeeping_ownership` row FOR SHARE. While a handoff step is recorded, it answers `retryable` with reason `stale_generation` unless the settle-step rule (`finish_admitted?`) admits the request. That also applies to a missing or already finished operation, so a commit re-sent after `stop_applying!` is refused, not answered `committed`. Outside a handoff the rule above is unchanged.
+
 ## Why it matters
 
 The fake speaks the wire protocol, where `not_found` is a meaningful answer. The adapter speaks the port that the outbox delivery reads, where only the settled state ends retries. Copying the fake looks correct and passes unit tests that check the adapter alone. It fails only when a refused save's abort row sits in the outbox and is retried on every delivery run.
