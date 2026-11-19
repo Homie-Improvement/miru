@@ -585,8 +585,6 @@ RSpec.describe TimekeepingOwnership, type: :model do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe TimekeepingOwnership, "closing the settle step on the record" do
   it "close_settling_step changes nothing stored until the record is saved, then persists the raised stop mark" do
     ownership = described_class.current
@@ -609,8 +607,6 @@ RSpec.describe TimekeepingOwnership, "closing the settle step on the record" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe TimekeepingOwnership::SettlingPhase, "close" do
   it "close ends the open step, raises a NULL or lower mark to its generation, and never lowers the mark" do
     open_step = TimekeepingOwnership::PhaseState.new(handoff_step: "reconcile", settling_generation: 3,
@@ -629,8 +625,6 @@ RSpec.describe TimekeepingOwnership::SettlingPhase, "close" do
     expect(described_class.close(no_step)).to eq(settling_generation: nil, settling_stopped_generation: nil)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe TimekeepingOwnership, "close_settling_step" do
   it "close_settling_step assigns a cleared step and a raised stop mark to the record without saving it" do

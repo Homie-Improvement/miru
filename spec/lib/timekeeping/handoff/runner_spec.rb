@@ -453,9 +453,6 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   end
 end
 
-require "rails_helper"
-require "tmpdir"
-
 RSpec.describe Timekeeping::Handoff::Runner, "flip closes the settle step", :two_tenant_seed, :seeded_without_transaction do
   it "a flip that clears a settle step stop_applying! never stopped persists a stop mark that refuses a late begin_settling! at that generation in a later handoff" do
     TimekeepingOwnership.ensure_initial!
@@ -494,9 +491,6 @@ RSpec.describe Timekeeping::Handoff::Runner, "flip closes the settle step", :two
   end
 end
 
-require "rails_helper"
-require "tmpdir"
-
 RSpec.describe Timekeeping::Handoff::Runner, "abort closes the settle step", :two_tenant_seed, :seeded_without_transaction do
   it "an abort that clears a settle step stop_applying! never stopped persists a stop mark that refuses a late begin_settling! at that generation in a later handoff" do
     TimekeepingOwnership.ensure_initial!
@@ -530,9 +524,6 @@ RSpec.describe Timekeeping::Handoff::Runner, "abort closes the settle step", :tw
       .update_all(settling_generation: nil, settling_stopped_generation: nil, handoff_step: nil)
   end
 end
-
-require "rails_helper"
-require "tmpdir"
 
 RSpec.describe Timekeeping::Handoff::Runner, "flip closing an unstopped settle step", :two_tenant_seed, :seeded_without_transaction do
   it "a flip that clears a settle step stop_applying! never stopped raises the stop mark so a late begin_settling! at that generation stays closed" do
@@ -569,9 +560,6 @@ RSpec.describe Timekeeping::Handoff::Runner, "flip closing an unstopped settle s
   end
 end
 
-require "rails_helper"
-require "tmpdir"
-
 RSpec.describe Timekeeping::Handoff::Runner, "abort closing an unstopped settle step", :two_tenant_seed, :seeded_without_transaction do
   it "an abort that clears a settle step stop_applying! never stopped raises the stop mark so a late begin_settling! at that generation stays closed" do
     TimekeepingOwnership.ensure_initial!
@@ -604,9 +592,6 @@ RSpec.describe Timekeeping::Handoff::Runner, "abort closing an unstopped settle 
       .update_all(settling_generation: nil, settling_stopped_generation: nil, handoff_step: nil)
   end
 end
-
-require "rails_helper"
-require "tmpdir"
 
 RSpec.describe Timekeeping::Handoff::Runner, "settle steps after a flip raised the stop mark", :two_tenant_seed, :seeded_without_transaction do
   it "after a flip closes an unstopped settle step, a later handoff refuses that generation but still opens a newer one" do
