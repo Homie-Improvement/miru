@@ -127,3 +127,314 @@ module TimekeepingQueueLedger
   private_class_method :control_failure, :execution_failure, :ledger_shape?, :json_fields, :record_key,
                        :merge_controls
 end
+
+# Reads claimed, completed and failed executions on non-dedicated queues.
+# Each collector selects named columns only, so job arguments and error text
+# are never read.
+module TimekeepingQueueLedger
+  class CollectError < StandardError; end
+
+  # Reads the monolith's Solid Queue tables through Active Record.
+  module MonolithCollector
+    DATABASE = "monolith"
+
+    module_function
+
+    def collect
+      jobs = SolidQueue::Job.where.not(queue_name: DEDICATED_QUEUES.fetch(DATABASE))
+      completed = jobs.where.not(finished_at: nil).map { |job| record(job, "completed", nil) }
+      claimed = executions(SolidQueue::ClaimedExecution, jobs, "claimed")
+      failed = executions(SolidQueue::FailedExecution, jobs, "failed")
+      completed + claimed + failed
+    end
+
+    def executions(model, jobs, kind)
+      model.where(job_id: jobs.select(:id)).includes(:job).map { |execution| record(execution.job, kind, execution.id) }
+    end
+
+    def record(job, kind, execution_id)
+      Record.new(database: DATABASE, queue: job.queue_name, job_class: job.class_name, kind:, job_id: job.id,
+                 active_job_id: job.active_job_id, execution_id:, created_at: job.created_at,
+                 finished_at: job.finished_at)
+    end
+    private_class_method :executions, :record
+  end
+
+  # Reads the Timekeeping database's Solid Queue tables over its own
+  # connection, because the monolith's Active Record does not reach it.
+  module TimekeepingCollector
+    DATABASE = "timekeeping"
+    EXECUTIONS_SQL = <<~SQL
+      SELECT 'completed' AS kind, jobs.queue_name, jobs.class_name, jobs.id AS job_id, jobs.active_job_id,
+             NULL::bigint AS execution_id, jobs.created_at, jobs.finished_at
+      FROM solid_queue_jobs jobs
+      WHERE jobs.finished_at IS NOT NULL AND jobs.queue_name NOT IN (%<dedicated>s)
+      UNION ALL
+      SELECT 'claimed', jobs.queue_name, jobs.class_name, jobs.id, jobs.active_job_id, claimed.id,
+             jobs.created_at, jobs.finished_at
+      FROM solid_queue_claimed_executions claimed JOIN solid_queue_jobs jobs ON jobs.id = claimed.job_id
+      WHERE jobs.queue_name NOT IN (%<dedicated>s)
+      UNION ALL
+      SELECT 'failed', jobs.queue_name, jobs.class_name, jobs.id, jobs.active_job_id, failed.id,
+             jobs.created_at, jobs.finished_at
+      FROM solid_queue_failed_executions failed JOIN solid_queue_jobs jobs ON jobs.id = failed.job_id
+      WHERE jobs.queue_name NOT IN (%<dedicated>s)
+    SQL
+
+    module_function
+
+    # A database that does not exist yet holds no executions, as
+    # TimekeepingDatabaseReset also treats it. Every other failure raises, so
+    # an unreadable database is never mistaken for a clean one. Errors name
+    # only the database and drop their cause, which can carry the URL's host.
+    def collect(env)
+      url = env[TimekeepingDatabaseReset::DATABASE_URL_KEY].to_s
+      if url.strip.empty?
+        raise CollectError, "#{TimekeepingDatabaseReset::DATABASE_URL_KEY} must be set while the queue ledger is active"
+      end
+
+      name = TimekeepingDatabaseReset.database_name(url)
+      connection = connect(url, name)
+      return [] unless connection
+
+      rows(connection).map { |row| record(row) }
+    rescue PG::Error
+      raise CollectError, "could not read Solid Queue executions from the Timekeeping database #{name.inspect}", cause: nil
+    ensure
+      connection&.close
+    end
+
+    def connect(url, name)
+      PG.connect(url)
+    rescue PG::ConnectionBad => e
+      return nil if name && e.message.include?("database #{PG::Connection.quote_ident(name)} does not exist")
+
+      raise CollectError, "could not connect to the Timekeeping database #{name.inspect}", cause: nil
+    end
+
+    def rows(connection)
+      dedicated = DEDICATED_QUEUES.fetch(DATABASE).map { |queue| connection.escape_literal(queue) }.join(", ")
+      connection.exec(format(EXECUTIONS_SQL, dedicated:)).to_a
+    end
+
+    def record(row)
+      Record.new(database: DATABASE, queue: row.fetch("queue_name"), job_class: row.fetch("class_name"),
+                 kind: row.fetch("kind"), job_id: Integer(row.fetch("job_id"), 10),
+                 active_job_id: row.fetch("active_job_id"),
+                 execution_id: row.fetch("execution_id") && Integer(row.fetch("execution_id"), 10),
+                 created_at: row.fetch("created_at"), finished_at: row.fetch("finished_at"))
+    end
+    private_class_method :connect, :rows, :record
+  end
+
+  # Enqueues the two control jobs and reads back whether they still exist
+  # and have not run. A control is looked up only by its own active_job_id,
+  # so a job other code enqueued never stands in for it.
+  module Controls
+    # SyncStripeSubscriptionCompanyJob requires a company id. A control must
+    # never run, so no real company is named.
+    PLACEHOLDER_COMPANY_ID = 0
+
+    module_function
+
+    # Each job is enqueued on a connection of its own, so it commits even when
+    # the calling example runs inside a transaction that is rolled back later.
+    def enqueue
+      Thread.new do
+        Thread.current.report_on_exception = false
+        SolidQueue::Record.connection_pool.with_connection do
+          adapter = ActiveJob::QueueAdapters::SolidQueueAdapter.new
+          [UpdateInvoiceStatusToOverdueJob.new, SyncStripeSubscriptionCompanyJob.new(PLACEHOLDER_COMPANY_ID)].map do |job|
+            adapter.enqueue(job)
+            Control.new(queue: job.queue_name, job_class: job.class.name, job_id: job.provider_job_id,
+                        active_job_id: job.job_id, status: nil)
+          end
+        end
+      end.value
+    end
+
+    def check(controls)
+      controls.map { |control| control.with(status: status(control)) }
+    end
+
+    def status(control)
+      job = SolidQueue::Job.find_by(active_job_id: control.active_job_id)
+      return "missing" unless job
+      return "ran" if job.finished_at ||
+                      SolidQueue::ClaimedExecution.exists?(job_id: job.id) ||
+                      SolidQueue::FailedExecution.exists?(job_id: job.id)
+
+      UNRUN
+    end
+    private_class_method :status
+  end
+
+  class LiveRuntimeDuringReset < StandardError; end
+
+  class RunFailed < StandardError; end
+
+  # The side-effecting shell around the pure verdict: it remembers whether a
+  # runtime has activated the ledger, which controls are open, and which
+  # runtimes to stop at the end of the suite. Inactive, it does nothing, so a
+  # suite that never starts the integrated runtime runs unchanged.
+  class Session
+    attr_reader :path, :env, :runtime_roots
+
+    # collectors maps a database name to a callable that answers its records.
+    # live answers whether a runtime this ledger registered still has a live
+    # process group.
+    def initialize(path:, collectors:, live:)
+      @path = path
+      @collectors = collectors
+      @live = live
+      @active = false
+      @env = {}.freeze
+      @runtime_roots = []
+      @runtimes = []
+      @open_controls = []
+      @written = false
+    end
+
+    def active?
+      @active
+    end
+
+    def activate!(env:)
+      @env = env.to_h.freeze
+      @active = true
+      nil
+    end
+
+    # The runtime itself is kept only so the end of the suite can stop it.
+    def register_runtime(root, runtime: nil)
+      @runtime_roots |= [root]
+      @runtimes |= [runtime] if runtime
+      nil
+    end
+
+    # A window still open from an earlier runtime is checked first, so its
+    # controls are never dropped unchecked.
+    def open_window!
+      close_window! if @open_controls.any?
+      @open_controls = Controls.enqueue
+      nil
+    end
+
+    # Records the controls' current status after the workers stop. The window
+    # stays open: the next reset checks the controls again, so one deleted in
+    # between is still seen as missing.
+    def observe_controls!
+      return nil unless active? && @open_controls.any?
+
+      write_ledger(records: [], controls: Controls.check(@open_controls))
+    end
+
+    # The live check comes first: collecting or deleting beside a running
+    # worker would race it.
+    def before_reset!
+      return nil unless active?
+      raise LiveRuntimeDuringReset, "a demo runtime is still live; refusing to reset its databases" if @live.call
+
+      collect!
+      close_window!
+    end
+
+    def collect!
+      return nil unless active?
+
+      write_ledger(records: @collectors.flat_map { |_database, collector| collector.call }, controls: [])
+    end
+
+    # Runs every step even when an earlier one raises, so a runtime that fails
+    # to stop never hides what the ledger recorded. The live check is not run
+    # here: a runtime that failed to stop is reported through its stop error.
+    def finish!
+      return nil unless active?
+
+      errors = @runtimes.map { |runtime| step_error { runtime.stop! } }
+      errors << step_error { collect! }
+      errors << step_error { close_window! }
+      failures = []
+      errors << step_error { failures = verdict_failures }
+      problems = errors.compact.map { |error| "#{error.class}: #{error.message}" } + failures
+      raise RunFailed, "queue ledger #{path}:\n#{problems.join("\n")}" if problems.any?
+
+      nil
+    end
+
+    private
+
+      def close_window!
+        return nil if @open_controls.empty?
+
+        checked = Controls.check(@open_controls)
+        @open_controls = []
+        write_ledger(records: [], controls: checked)
+      end
+
+      def verdict_failures
+        stored = TimekeepingQueueLedger.parse(File.read(path))
+        TimekeepingQueueLedger.verdict(records: stored[:records], controls: stored[:controls],
+                                       dedicated_queues: DEDICATED_QUEUES).failures
+      end
+
+      def step_error
+        yield
+        nil
+      rescue StandardError => e
+        e
+      end
+
+      # A file this session wrote that is gone now was deleted by someone
+      # else, which would lose what it recorded.
+      def write_ledger(records:, controls:)
+        raise UnreadableLedger, "the queue ledger file disappeared during the run" if @written && !File.exist?(path)
+
+        TimekeepingQueueLedger.write(path, records:, controls:)
+        @written = true
+        nil
+      end
+  end
+
+  DEFAULT_PATH = "tmp/timekeeping-integration/queue_ledger.json"
+  PATH_KEY = "TIMEKEEPING_QUEUE_LEDGER_PATH"
+
+  module_function
+
+  def ledger_path(env = ENV)
+    override = env[PATH_KEY].to_s
+    override.strip.empty? ? Rails.root.join(DEFAULT_PATH).to_s : override
+  end
+
+  # The process-wide session the cleaner hooks and the integrated runtime use.
+  # Its collectors and live check read the session's own registered state.
+  def build_session(env = ENV)
+    session = nil
+    collectors = {
+      MonolithCollector::DATABASE => -> { MonolithCollector.collect },
+      TimekeepingCollector::DATABASE => -> { TimekeepingCollector.collect(session.env) }
+    }
+    live = lambda do
+      session.runtime_roots.any? do |root|
+        IntegratedRuntime.recorded_groups(root).any? { |group| IntegratedRuntime.group_alive?(group) }
+      end
+    end
+    session = Session.new(path: ledger_path(env), collectors:, live:)
+  end
+
+  SESSION = build_session
+
+  def session
+    SESSION
+  end
+end
+
+RSpec.configure do |config|
+  config.before(:suite) do
+    FileUtils.rm_f(TimekeepingQueueLedger.session.path)
+  end
+
+  config.after(:suite) do
+    TimekeepingQueueLedger.session.finish!
+  end
+end

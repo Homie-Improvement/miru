@@ -874,3 +874,126 @@ RSpec.describe TimekeepingQueueLedger::Session do
     end
   end
 end
+
+require "rails_helper"
+require "securerandom"
+require "tmpdir"
+
+RSpec.describe TimekeepingQueueLedger::Session do
+  # "One after(:suite) hook stops any live runtime, collects once more and calls the pure `TimekeepingQueueLedger.verdict(records:, controls:, dedicated_queues:)`."
+  it "finish! with a runtime whose stop! raises still collects, skips the live check and names the stop error and the failure" do
+    collected = []
+    stray = TimekeepingQueueLedger::Record.new(
+      database: "monolith", queue: "default", job_class: "QueueLedgerStrayJob", kind: "completed", job_id: 3,
+      active_job_id: SecureRandom.uuid, execution_id: nil, created_at: Time.current, finished_at: Time.current
+    )
+    failing_runtime = Object.new
+    def failing_runtime.stop! = raise(IntegratedRuntime::BootError, "groups still alive after KILL")
+
+    Dir.mktmpdir("queue-ledger-stop-failure") do |dir|
+      session = described_class.new(path: File.join(dir, "queue_ledger.json"),
+                                    collectors: { "monolith" => -> { collected << :monolith; [stray] } },
+                                    live: -> { true })
+      session.activate!(env: {})
+      session.register_runtime(dir, runtime: failing_runtime)
+
+      expect { session.finish! }.to raise_error(TimekeepingQueueLedger::RunFailed) { |error|
+        expect(error.message).to include("groups still alive after KILL")
+        expect(error.message).to include("QueueLedgerStrayJob")
+        expect(error.message).not_to include("still live")
+      }
+      expect(collected).to eq([:monolith])
+    end
+  end
+end
+
+require "rails_helper"
+require "tmpdir"
+
+RSpec.describe TimekeepingQueueLedger::Session, :without_transaction do
+  # "Use `ActiveJob::QueueAdapters::SolidQueueAdapter.new.enqueue`, with `UpdateInvoiceStatusToOverdueJob` on `default` and `SyncStripeSubscriptionCompanyJob` on `billing_sync`."
+  it "open_window! commits one default and one billing_sync control that a clean reset records as unrun" do
+    Dir.mktmpdir("queue-ledger-open-window") do |dir|
+      path = File.join(dir, "queue_ledger.json")
+      session = described_class.new(path:, collectors: {}, live: -> { false })
+      session.activate!(env: {})
+      session.open_window!
+
+      jobs = SolidQueue::Job.where(class_name: %w[UpdateInvoiceStatusToOverdueJob SyncStripeSubscriptionCompanyJob])
+      expect(jobs.pluck(:class_name, :queue_name)).to contain_exactly(
+        %w[UpdateInvoiceStatusToOverdueJob default], %w[SyncStripeSubscriptionCompanyJob billing_sync]
+      )
+
+      session.before_reset!
+      controls = TimekeepingQueueLedger.parse(File.read(path))[:controls]
+      expect(controls.map(&:status)).to eq(%w[unrun unrun])
+      expect(controls.map(&:active_job_id)).to match_array(jobs.pluck(:active_job_id))
+      expect { session.finish! }.not_to raise_error
+    end
+  end
+end
+
+require "rails_helper"
+require "tmpdir"
+
+RSpec.describe TimekeepingQueueLedger::Session, :without_transaction do
+  # "Before the reset it checks that both still exist and have not run."
+  it "a billing_sync control with a claimed execution and a default control with a failed execution both check as ran" do
+    Dir.mktmpdir("queue-ledger-claimed-failed") do |dir|
+      path = File.join(dir, "queue_ledger.json")
+      session = described_class.new(path:, collectors: {}, live: -> { false })
+      session.activate!(env: {})
+      session.open_window!
+      default_job = SolidQueue::Job.find_by!(class_name: "UpdateInvoiceStatusToOverdueJob")
+      billing_job = SolidQueue::Job.find_by!(class_name: "SyncStripeSubscriptionCompanyJob")
+      process = SolidQueue::Process.create!(kind: "Worker", last_heartbeat_at: Time.current, pid: Process.pid,
+                                            hostname: "queue-ledger-spec", name: "queue-ledger-spec-#{Process.pid}")
+      SolidQueue::ReadyExecution.where(job_id: billing_job.id).delete_all
+      SolidQueue::ClaimedExecution.create!(job_id: billing_job.id, process_id: process.id)
+      SolidQueue::ReadyExecution.where(job_id: default_job.id).delete_all
+      SolidQueue::FailedExecution.create!(job_id: default_job.id, error: { "message" => "boom" })
+
+      session.before_reset!
+
+      controls = TimekeepingQueueLedger.parse(File.read(path))[:controls]
+      expect(controls.map(&:status)).to eq(%w[ran ran])
+    end
+  end
+end
+
+require "rails_helper"
+
+RSpec.describe TimekeepingQueueLedger::MonolithCollector, :without_transaction do
+  # "it collects claimed, completed and failed Solid Queue executions on any queue other than the dedicated ones"
+  it "returns a finished default job and ignores a ready one" do
+    adapter = ActiveJob::QueueAdapters::SolidQueueAdapter.new
+    finished = UpdateInvoiceStatusToOverdueJob.new
+    ready = UpdateInvoiceStatusToOverdueJob.new
+    adapter.enqueue(finished)
+    adapter.enqueue(ready)
+    SolidQueue::Job.find_by!(active_job_id: finished.job_id).update!(finished_at: Time.current)
+
+    records = described_class.collect
+
+    expect(records.map(&:active_job_id)).to eq([finished.job_id])
+    expect(records.first).to have_attributes(database: "monolith", queue: "default", kind: "completed")
+  end
+end
+
+require "rails_helper"
+
+RSpec.describe TimekeepingQueueLedger::TimekeepingCollector do
+  # "Any failure, or a ledger file that cannot be parsed, raises, and the run exits non-zero."
+  it "raises when TIMEKEEPING_DATABASE_URL is unset or unreachable, naming no URL or host" do
+    expect { described_class.collect({}) }
+      .to raise_error(TimekeepingQueueLedger::CollectError, /TIMEKEEPING_DATABASE_URL must be set/)
+
+    unreachable = "postgres://queue_ledger_user@queue-ledger-unreachable.invalid:5432/queue_ledger_unreachable_test"
+    expect { described_class.collect({ "TIMEKEEPING_DATABASE_URL" => unreachable }) }
+      .to raise_error(TimekeepingQueueLedger::CollectError) { |error|
+        expect(error.message).not_to include("queue-ledger-unreachable.invalid")
+        expect(error.message).not_to include("queue_ledger_user")
+        expect(error.cause).to be_nil
+      }
+  end
+end
