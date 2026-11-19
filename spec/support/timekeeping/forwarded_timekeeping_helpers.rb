@@ -8,12 +8,21 @@ FORWARDED_TIMEKEEPING_BASE_URL = "http://timekeeping.test"
 # of the legacy store. Local employments and roles stay with each spec, because
 # they differ from one group to the next.
 module TimekeepingForwardingHelpers
-  # Hands ownership to Timekeeping at generation 2 on both the ownership row and
-  # the fake, registers the company, each user with its role and the project on
-  # the fake, and routes HTTP for base_url to it. users maps a user to its role.
-  def arrange_forwarded_timekeeping(fake, company:, users:, project:, base_url: FORWARDED_TIMEKEEPING_BASE_URL)
-    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
-    fake.generation = 2
+  # Puts the ownership row and the fake in owner_state, registers the company,
+  # each user with its role and the project on the fake, and routes HTTP for
+  # base_url to it. users maps a user to its role. With no owner_state, it
+  # hands ownership to Timekeeping at generation 2 on both sides; with one, as
+  # in a regression run, the row keeps that state so the run proves the state
+  # it selected.
+  def arrange_forwarded_timekeeping(fake, company:, users:, project:, base_url: FORWARDED_TIMEKEEPING_BASE_URL,
+                                    owner_state: TimekeepingOwnerState::SELECTED)
+    if owner_state
+      TimekeepingOwnerState.apply!(owner_state)
+      fake.generation = TimekeepingOwnerState.fetch(owner_state).fetch(:generation)
+    else
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+      fake.generation = 2
+    end
     fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
     users.each { |user, role| fake.register_user(id: user.id, company_id: company.id, role:) }
     fake.register_project(id: project.id, company_id: company.id)
