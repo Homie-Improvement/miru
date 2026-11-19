@@ -79,9 +79,8 @@ RSpec.describe "IntegratedRuntime example hooks" do
           rescue IntegratedRuntime::BootError
             true
           end
-        expected_state = TimekeepingOwnerState::SELECTED || TimekeepingOwnerState::DEFAULT_STATE
-        seen[:owner_state_kept] =
-          TimekeepingOwnership.current.generation == TimekeepingOwnerState.fetch(expected_state).fetch(:generation)
+        seen[:owner_state_kept] = TimekeepingOwnership.current.generation ==
+                                  TimekeepingOwnerState.fetch(TimekeepingOwnerState.current).fetch(:generation)
       end
     end
     passed = inner.run(RSpec::Core::NullReporter)
