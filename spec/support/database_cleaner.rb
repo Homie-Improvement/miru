@@ -46,7 +46,7 @@ module TestDatabaseCleanup
     TimekeepingDatabaseReset.reset!(state, env:)
   end
 
-  # Every reset path calls this before it deletes anything. It does nothing
+  # clean_with! calls this before it deletes anything. It does nothing
   # unless an integrated runtime has activated the queue ledger
   # (spec/support/timekeeping/queue_ledger.rb); then it records the Solid
   # Queue executions the reset would otherwise erase unobserved.
@@ -54,9 +54,17 @@ module TestDatabaseCleanup
     TimekeepingQueueLedger.session.before_reset!
   end
 
-  def delete_all_tables!
+  # The one way to empty monolith tables: it records the queue executions
+  # first, so no reset can erase them without a record. The strategy and
+  # options go to DatabaseCleaner unchanged, because each reset keeps its own
+  # list of tables.
+  def clean_with!(strategy, **options)
     before_reset!
-    DatabaseCleaner.clean_with :deletion, except: KEPT_TABLES, pre_count: true, reset_ids: false
+    DatabaseCleaner.clean_with(strategy, **options)
+  end
+
+  def delete_all_tables!
+    clean_with!(:deletion, except: KEPT_TABLES, pre_count: true, reset_ids: false)
   end
   private_class_method :delete_all_tables!
 
@@ -102,8 +110,7 @@ RSpec.configure do |config|
   config.before(:suite) do
     DatabaseCleaner.allow_remote_database_url = true
     DatabaseCleaner.url_allowlist = [ENV["DATABASE_URL"]]
-    TestDatabaseCleanup.before_reset!
-    DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
+    TestDatabaseCleanup.clean_with!(:truncation, except: %w(ar_internal_metadata))
     # Truncation empties the ownership table; restore its one row.
     TimekeepingOwnership.ensure_initial!
   end
@@ -154,16 +161,14 @@ RSpec.configure do |config|
   config.before(:each, :without_transaction) do |example|
     next if TestDatabaseCleanup.seeded_committed?(example.metadata)
 
-    TestDatabaseCleanup.before_reset!
-    DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata schema_migrations)
+    TestDatabaseCleanup.clean_with!(:truncation, except: %w(ar_internal_metadata schema_migrations))
     TimekeepingOwnership.ensure_initial!
   end
 
   config.append_after(:each, :without_transaction) do |example|
     next if TestDatabaseCleanup.reset_withheld?(example)
 
-    TestDatabaseCleanup.before_reset!
-    DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata schema_migrations)
+    TestDatabaseCleanup.clean_with!(:truncation, except: %w(ar_internal_metadata schema_migrations))
     TimekeepingOwnership.ensure_initial!
   end
 
