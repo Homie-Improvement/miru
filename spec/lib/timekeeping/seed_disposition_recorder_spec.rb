@@ -283,86 +283,17 @@ RSpec.describe Timekeeping::SeedDispositionRecorder, :without_transaction do
 end
 
 RSpec.describe Timekeeping::SeedDispositionRecorder do
-  it "with a stored capture, still refuses a database holding only a user and leaves that user unchanged" do
-    connection = ActiveRecord::Base.connection
-    store = Timekeeping::SeedCapture::Store.new
-    capture = Timekeeping::SeedCapture.take(connection:, tables: connection.tables - described_class::METADATA_TABLES)
-    store.store("2026-10-23", capture)
-
-    user = create(:user, email: "dana@forkandleaf.example", current_workspace: nil, first_name: "Existing")
-    Company.delete_all
-    before = user.reload.attributes.slice("first_name", "last_name", "encrypted_password", "current_workspace_id")
-
-    expect { described_class.load_fresh_seed!(as_of: "2026-10-23", captures: store) }
-      .to raise_error(described_class::Error, /users/)
-
-    expect(user.reload.attributes.slice("first_name", "last_name", "encrypted_password", "current_workspace_id"))
-      .to eq(before)
-    expect(User.count).to eq(1)
-    expect(Company.count).to eq(0)
-  end
-end
-
-RSpec.describe Timekeeping::SeedDispositionRecorder, :without_transaction do
-  def recorder_fallback_spec_ids
-    connection = ActiveRecord::Base.connection
-    ids = %w[users companies timesheet_entries invoices invoice_line_items].index_with do |table|
-      connection.select_values("SELECT id FROM #{connection.quote_table_name(table)} ORDER BY id").map(&:to_i)
-    end
-    users_sequence = connection.select_value("SELECT pg_get_serial_sequence('users', 'id')")
-    row = connection.select_one("SELECT last_value, is_called FROM #{users_sequence}")
-    ids.merge("users_sequence" => [row["last_value"].to_i, row["is_called"]])
-  end
-
-  it "after a restore fails having moved a sequence, falls back to a real seed load with the same ids and stores a new capture" do
-    as_of = TestDatabaseCleanup.seed_as_of
-    store = Timekeeping::SeedCapture::Store.new
-    # The :without_transaction hook leaves the ownership row in place, which
-    # the empty-table guard refuses.
-    TestDatabaseCleanup.before_reset!
-    DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
-    described_class.load_fresh_seed!(as_of:, captures: store)
-    reference = recorder_fallback_spec_ids
-    expect(store.fetch(as_of)).to be_a(Timekeeping::SeedCapture)
-
-    # setval is not undone by a rollback, so a failed restore can leave a
-    # moved sequence behind over empty tables. A capture is a frozen value, so
-    # the failing one is a stand-in with the same restore! call.
-    broken_capture = Object.new
-    broken_capture.define_singleton_method(:restore!) do |**|
-      ActiveRecord::Base.connection.select_value("SELECT setval(pg_get_serial_sequence('users', 'id'), 9999)")
-      raise Timekeeping::SeedCapture::RestoreError, "missing blob file"
-    end
-    store.store(as_of, broken_capture)
-
-    DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
-    described_class.load_fresh_seed!(as_of:, captures: store)
-
-    expect(recorder_fallback_spec_ids).to eq(reference)
-    expect(store.fetch(as_of)).to be_a(Timekeeping::SeedCapture)
-    expect(store.fetch(as_of)).not_to equal(broken_capture)
-  end
-end
-
-RSpec.describe Timekeeping::SeedDispositionRecorder do
-  # A store with the Store#fetch / Store#store shape, holding a capture that
-  # only records whether it was restored, so the guard's order is observable.
-  def guard_order_spec_store(as_of, capture)
-    Class.new do
-      def initialize(entries) = @entries = entries
-      def fetch(as_of) = @entries[as_of]
-      def store(as_of, capture) = @entries[as_of] = capture
-    end.new({ as_of => capture })
-  end
-
   # A restore over existing rows would stack the seed on data that was never
   # the seed, and the ids would no longer be "the same ids and sequence
   # values as before".
   it "refuses a lone-user database before restoring a stored capture, and leaves that user unchanged" do
+    # A stand-in that only records whether it was restored, so the guard's
+    # order is observable.
     restored = []
     capture = Object.new
     capture.define_singleton_method(:restore!) { |**| restored << :restore }
-    store = guard_order_spec_store("2026-10-23", capture)
+    store = Timekeeping::SeedCapture::Store.new
+    store.store("2026-10-23", capture)
     user = create(:user, email: "dana@forkandleaf.example", current_workspace: nil, first_name: "Existing")
     Company.delete_all
     before = user.reload.attributes.slice("first_name", "last_name", "encrypted_password", "current_workspace_id")
@@ -373,17 +304,17 @@ RSpec.describe Timekeeping::SeedDispositionRecorder do
     expect(restored).to be_empty
     expect(user.reload.attributes.slice("first_name", "last_name", "encrypted_password", "current_workspace_id"))
       .to eq(before)
+    expect(User.count).to eq(1)
     expect(Company.count).to eq(0)
   end
 end
 
 RSpec.describe Timekeeping::SeedDispositionRecorder, :two_tenant_seed, :seeded_without_transaction do
-  def failed_restore_spec_store(entries)
-    Class.new do
-      def initialize(entries) = @entries = entries
-      def fetch(as_of) = @entries[as_of]
-      def store(as_of, capture) = @entries[as_of] = capture
-    end.new(entries)
+  def failed_restore_spec_ids
+    %w[companies invoices invoice_line_items].index_with do |table|
+      connection = ActiveRecord::Base.connection
+      connection.select_values("SELECT id FROM #{connection.quote_table_name(table)} ORDER BY id").map(&:to_i)
+    end
   end
 
   def failed_restore_spec_sequence(table)
@@ -399,6 +330,7 @@ RSpec.describe Timekeeping::SeedDispositionRecorder, :two_tenant_seed, :seeded_w
     as_of = TestDatabaseCleanup.seed_as_of
     user_ids = User.order(:id).pluck(:id, :email)
     entry_ids = TimesheetEntry.order(:id).pluck(:id)
+    other_ids = failed_restore_spec_ids
     users_sequence = failed_restore_spec_sequence("users")
     entries_sequence = failed_restore_spec_sequence("timesheet_entries")
 
@@ -410,7 +342,8 @@ RSpec.describe Timekeeping::SeedDispositionRecorder, :two_tenant_seed, :seeded_w
       end
       raise Timekeeping::SeedCapture::RestoreError, "blob file missing"
     end
-    store = failed_restore_spec_store({ as_of => broken })
+    store = Timekeeping::SeedCapture::Store.new
+    store.store(as_of, broken)
 
     TestDatabaseCleanup.before_reset!
     DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
@@ -418,6 +351,7 @@ RSpec.describe Timekeeping::SeedDispositionRecorder, :two_tenant_seed, :seeded_w
 
     expect(User.order(:id).pluck(:id, :email)).to eq(user_ids)
     expect(TimesheetEntry.order(:id).pluck(:id)).to eq(entry_ids)
+    expect(failed_restore_spec_ids).to eq(other_ids)
     expect(failed_restore_spec_sequence("users")).to eq(users_sequence)
     expect(failed_restore_spec_sequence("timesheet_entries")).to eq(entries_sequence)
     expect(store.fetch(as_of)).to be_a(Timekeeping::SeedCapture)
@@ -425,14 +359,6 @@ RSpec.describe Timekeeping::SeedDispositionRecorder, :two_tenant_seed, :seeded_w
 end
 
 RSpec.describe Timekeeping::SeedDispositionRecorder, :two_tenant_seed, :seeded_without_transaction do
-  def other_as_of_spec_store(entries)
-    Class.new do
-      def initialize(entries) = @entries = entries
-      def fetch(as_of) = @entries[as_of]
-      def store(as_of, capture) = @entries[as_of] = capture
-    end.new(entries)
-  end
-
   # Seeded entries depend on as_of, so a copy taken at another as_of would
   # not give "the same ids and sequence values as before".
   it "does not restore a capture stored for a different as_of, and stores a real capture for the requested one" do
@@ -441,7 +367,8 @@ RSpec.describe Timekeeping::SeedDispositionRecorder, :two_tenant_seed, :seeded_w
     restored = []
     stale = Object.new
     stale.define_singleton_method(:restore!) { |**| restored << :restore }
-    store = other_as_of_spec_store({ "2000-01-01" => stale })
+    store = Timekeeping::SeedCapture::Store.new
+    store.store("2000-01-01", stale)
 
     TestDatabaseCleanup.before_reset!
     DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)

@@ -3,65 +3,7 @@
 require "rails_helper"
 
 RSpec.describe Timekeeping::SeedCapture do
-  context "more tests 2", :two_tenant_seed, :seeded_without_transaction do
-    def seed_capture_spec_connection
-      ActiveRecord::Base.connection
-    end
-
-    def seed_capture_spec_tables
-      seed_capture_spec_connection.tables - %w[ar_internal_metadata schema_migrations]
-    end
-
-    # Rows are sorted by their own text, not by a primary key, so tables with no
-    # key (users_roles, reservations) and duplicate rows are compared too.
-    def seed_capture_spec_digests
-      seed_capture_spec_tables.sort.to_h do |table|
-        quoted = seed_capture_spec_connection.quote_table_name(table)
-        row = seed_capture_spec_connection.select_rows(
-          "SELECT count(*), md5(coalesce(string_agg(t::text, E'\\n' ORDER BY t::text), '')) FROM #{quoted} t"
-        ).first
-        [table, row]
-      end
-    end
-
-    # Read from each sequence itself: pg_sequences has no is_called column and
-    # shows NULL last_value for a sequence that never supplied a value.
-    def seed_capture_spec_sequences
-      names = seed_capture_spec_connection.select_values(<<~SQL)
-        SELECT c.relname FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE c.relkind = 'S' AND n.nspname = current_schema()
-        ORDER BY c.relname
-      SQL
-      names.to_h do |name|
-        quoted = seed_capture_spec_connection.quote_table_name(name)
-        [name, seed_capture_spec_connection.select_rows("SELECT last_value, is_called FROM #{quoted}").first]
-      end
-    end
-
-    it "restores every seeded table's rows, key-less tables included, and every sequence's last_value and is_called exactly as the seed load left them" do
-      digests_after_seed = seed_capture_spec_digests
-      sequences_after_seed = seed_capture_spec_sequences
-      expect(digests_after_seed.fetch("users_roles").first.to_i).to be_positive
-
-      capture = described_class.take(connection: seed_capture_spec_connection, tables: seed_capture_spec_tables)
-
-      TestDatabaseCleanup.before_reset!
-      DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
-      expect(User.count).to eq(0)
-
-      # "Reloading the two-tenant seed for a handoff example group takes well under a minute, either through bulk inserts in db/seeds.rb or by restoring a captured snapshot, and gives the same ids and sequence values as before."
-      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      capture.restore!(connection: seed_capture_spec_connection)
-      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
-
-      expect(seed_capture_spec_digests).to eq(digests_after_seed)
-      expect(seed_capture_spec_sequences).to eq(sequences_after_seed)
-      expect(elapsed).to be < 20
-    end
-  end
-
-  context "more tests 3", :without_transaction do
+  context "after a real seed load", :without_transaction do
     def seed_capture_spec_connection
       ActiveRecord::Base.connection
     end
@@ -112,6 +54,7 @@ RSpec.describe Timekeeping::SeedCapture do
       # The :without_transaction hook leaves the ownership row behind, and the
       # seed load refuses any occupied table, so empty everything first as the
       # two-tenant seed context does.
+      TestDatabaseCleanup.before_reset!
       DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
       Timekeeping::SeedDispositionRecorder.load_fresh_seed!(as_of: TestDatabaseCleanup.seed_as_of)
       loaded_digests = seed_capture_spec_table_digests
@@ -123,6 +66,7 @@ RSpec.describe Timekeeping::SeedCapture do
       loaded_next_ids = seed_capture_spec_next_ids
 
       DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
+      expect(User.count).to eq(0)
       started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       capture.restore!(connection: seed_capture_spec_connection)
       elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
