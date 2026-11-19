@@ -48,7 +48,7 @@ RSpec.describe TimekeepingDemo::Credentials do
   it "to_env builds the spawn hash with each value under its own key" do
     # "Use the keys the apps already read: `TIMEKEEPING_TOKEN_PRIVATE_KEY`, `TIMEKEEPING_TOKEN_PUBLIC_KEY` and `TIMEKEEPING_SERVICE_TOKEN`."
     expect(described_class::ENV_KEYS.values).to contain_exactly(
-      "TIMEKEEPING_TOKEN_PRIVATE_KEY", "TIMEKEEPING_TOKEN_PUBLIC_KEY", "TIMEKEEPING_SERVICE_TOKEN"
+      *%w[TIMEKEEPING_TOKEN_PRIVATE_KEY TIMEKEEPING_TOKEN_PUBLIC_KEY TIMEKEEPING_SERVICE_TOKEN]
     )
     credentials = described_class.generate
 
