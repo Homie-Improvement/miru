@@ -8,19 +8,21 @@ require "rbconfig"
 RSpec.describe "bin/parallel_test" do
   # Runs bin/parallel_test with a stand-in `bundle` on PATH that records the
   # parallel_rspec arguments instead of running the suite. Returns the script's
-  # output, its exit status and the recorded arguments.
-  def run_parallel_test_with_fake_bundle(*args, runtime_log: nil)
+  # output, its exit status and the recorded arguments. The queue ledger
+  # override is unset by default because the script refuses to run with one,
+  # and an override left in this process's ENV would otherwise leak in.
+  def run_parallel_test_with_fake_bundle(*args, runtime_log: nil, env: { "TIMEKEEPING_QUEUE_LEDGER_PATH" => nil })
     Dir.mktmpdir do |fake_bin|
       args_file = File.join(fake_bin, "args")
       fake_bundle = File.join(fake_bin, "bundle")
       File.write(fake_bundle, "#!/bin/sh\nfor arg in \"$@\"; do echo \"$arg\"; done > #{args_file}\n")
       File.chmod(0o755, fake_bundle)
-      env = {
+      run_env = {
         "PATH" => [fake_bin, File.dirname(RbConfig.ruby), "/usr/bin", "/bin"].join(File::PATH_SEPARATOR),
         "PARALLEL_RUNTIME_LOG" => runtime_log || File.join(fake_bin, "missing_runtime.log")
-      }
+      }.merge(env)
 
-      output, status = Open3.capture2e(env, RbConfig.ruby, "bin/parallel_test", *args, chdir: Rails.root.to_s)
+      output, status = Open3.capture2e(run_env, RbConfig.ruby, "bin/parallel_test", *args, chdir: Rails.root.to_s)
       recorded_args = File.exist?(args_file) ? File.readlines(args_file, chomp: true) : []
       [output, status, recorded_args]
     end
@@ -123,6 +125,92 @@ RSpec.describe "bin/parallel_test" do
       expect(recorded_args.fetch(group_index + 1)).to eq("runtime")
       expect(output.lines.find { |line| line.start_with?("Command:") }).to include("--group-by runtime")
       expect(output).not_to include("Ignoring stale parallel runtime log")
+    end
+  end
+end
+
+require "rails_helper"
+require "open3"
+require "tmpdir"
+require "rbconfig"
+
+RSpec.describe "bin/parallel_test" do
+  # "Under bin/parallel_test each process resolves its own ledger path, so one process's suite-start delete cannot remove another process's ledger file."
+  it "bin/parallel_test refuses to start when one TIMEKEEPING_QUEUE_LEDGER_PATH would be shared by every process" do
+    Dir.mktmpdir do |fake_bin|
+      args_file = File.join(fake_bin, "args")
+      fake_bundle = File.join(fake_bin, "bundle")
+      File.write(fake_bundle, "#!/bin/sh\nfor arg in \"$@\"; do echo \"$arg\"; done > #{args_file}\n")
+      File.chmod(0o755, fake_bundle)
+      env = {
+        "PATH" => [fake_bin, File.dirname(RbConfig.ruby), "/usr/bin", "/bin"].join(File::PATH_SEPARATOR),
+        "PARALLEL_RUNTIME_LOG" => File.join(fake_bin, "missing_runtime.log"),
+        "TIMEKEEPING_QUEUE_LEDGER_PATH" => File.join(fake_bin, "shared_ledger.json")
+      }
+
+      output, status = Open3.capture2e(env, RbConfig.ruby, "bin/parallel_test", "-n", "2", chdir: Rails.root.to_s)
+
+      expect(status).not_to be_success, output
+      expect(output).to include("TIMEKEEPING_QUEUE_LEDGER_PATH")
+      expect(File.exist?(args_file)).to be(false)
+    end
+  end
+end
+
+require "rails_helper"
+require "open3"
+require "tmpdir"
+require "rbconfig"
+
+RSpec.describe "bin/parallel_test" do
+  # One inherited override would give every parallel process the same ledger file, so one suite-start delete could remove another's.
+  it "refuses to start when TIMEKEEPING_QUEUE_LEDGER_PATH would be shared by every process" do
+    Dir.mktmpdir do |fake_bin|
+      args_file = File.join(fake_bin, "args")
+      fake_bundle = File.join(fake_bin, "bundle")
+      File.write(fake_bundle, "#!/bin/sh\nfor arg in \"$@\"; do echo \"$arg\"; done > #{args_file}\n")
+      File.chmod(0o755, fake_bundle)
+      env = {
+        "PATH" => [fake_bin, File.dirname(RbConfig.ruby), "/usr/bin", "/bin"].join(File::PATH_SEPARATOR),
+        "PARALLEL_RUNTIME_LOG" => File.join(fake_bin, "missing_runtime.log"),
+        "TIMEKEEPING_QUEUE_LEDGER_PATH" => File.join(fake_bin, "shared_ledger.json")
+      }
+
+      output, status = Open3.capture2e(env, RbConfig.ruby, "bin/parallel_test", "-n", "2", chdir: Rails.root.to_s)
+
+      expect(status).not_to be_success
+      expect(output).to include("TIMEKEEPING_QUEUE_LEDGER_PATH")
+      expect(File.exist?(args_file)).to be(false)
+    end
+  end
+end
+
+require "rails_helper"
+require "open3"
+require "tmpdir"
+require "rbconfig"
+
+RSpec.describe "bin/parallel_test" do
+  # One override inherited by every process would make them all share one
+  # ledger file, so one process's suite-start delete would remove the others'.
+  # Acceptance: "Under bin/parallel_test each process resolves its own ledger path, so one process's suite-start delete cannot remove another process's ledger file."
+  it "refuses an inherited TIMEKEEPING_QUEUE_LEDGER_PATH that every parallel process would share, and starts nothing" do
+    Dir.mktmpdir do |fake_bin|
+      args_file = File.join(fake_bin, "args")
+      fake_bundle = File.join(fake_bin, "bundle")
+      File.write(fake_bundle, "#!/bin/sh\nfor arg in \"$@\"; do echo \"$arg\"; done > #{args_file}\n")
+      File.chmod(0o755, fake_bundle)
+      env = {
+        "PATH" => [fake_bin, File.dirname(RbConfig.ruby), "/usr/bin", "/bin"].join(File::PATH_SEPARATOR),
+        "PARALLEL_RUNTIME_LOG" => File.join(fake_bin, "missing_runtime.log"),
+        "TIMEKEEPING_QUEUE_LEDGER_PATH" => File.join(fake_bin, "shared_ledger.json")
+      }
+
+      output, status = Open3.capture2e(env, RbConfig.ruby, "bin/parallel_test", "-n", "2", chdir: Rails.root.to_s)
+
+      expect(status).not_to be_success
+      expect(output).to include("TIMEKEEPING_QUEUE_LEDGER_PATH")
+      expect(File.exist?(args_file)).to be(false)
     end
   end
 end
