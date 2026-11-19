@@ -256,3 +256,126 @@ RSpec.describe Invoices::PreparedReservations, "with competing writers", committ
     expect(prepared_spec_outbox_count(entry)).to eq(outbox_before + 1)
   end
 end
+
+RSpec.describe Invoices::PreparedReservations, "settle step racing stop_applying!", committed_data: true do
+  include PreparedReservationsSpecSupport
+
+  it "stop_applying! waits for an admitted settling commit through the prepared adapter and the next settling commit is refused as stale" do
+    prepare_local_ownership!
+    company = create(:company)
+    adapter = described_class.new
+    first_invoice = prepared_spec_invoice(company)
+    second_invoice = prepared_spec_invoice(company)
+    first_request = prepared_spec_request(company, first_invoice, [prepared_spec_entry(company).id])
+    second_request = prepared_spec_request(company, second_invoice, [prepared_spec_entry(company).id])
+    expect(adapter.prepare(first_request).state).to eq("prepared")
+    expect(adapter.prepare(second_request).state).to eq("prepared")
+    outgoing = TimekeepingOwnership.current.generation
+    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)
+      .update_all(generation: outgoing + 1, handoff_step: "settle")
+    TimekeepingOwnership.begin_settling!(generation: outgoing)
+
+    reached = Queue.new
+    release = Queue.new
+    holder_pids = Queue.new
+    stopper_pids = Queue.new
+    # The settling commit runs inside an outer transaction that stays open, so
+    # its FOR SHARE read of the ownership row is still held when the stop runs.
+    holder = committed_data_thread(holder_pids) do
+      ApplicationRecord.transaction do
+        outcome = described_class.new.commit(first_request)
+        reached << true
+        release.pop
+        outcome
+      end
+    end
+    expect(reached.pop(timeout: 5)).to be(true), "the settling commit never reached its pause"
+    stopper = committed_data_thread(stopper_pids) { TimekeepingOwnership.stop_applying!(generation: outgoing) }
+    begin
+      blocked = blocked_by?(stopper_pids.pop(timeout: 5), holder_pids.pop(timeout: 5))
+    ensure
+      release << true
+    end
+
+    # "Because `stop_applying!` is a row update, it waits for an admitted commit, and none applies after it."
+    expect(blocked).to be(true), "stop_applying! did not wait for the admitted settling commit"
+    expect(holder.value.state).to eq("committed")
+    stopper.join(5)
+    expect(TimekeepingOwnership.settling?).to be(false)
+
+    late = adapter.commit(second_request)
+    expect(late.state).to eq("retryable")
+    expect(late.reason).to eq("stale_generation")
+    expect(prepared_spec_operations(company, second_invoice).map(&:first)).to eq(["prepared"])
+  ensure
+    release&.push(true)
+    # As the after hook above: a killed worker is joined before the
+    # committed-data cleanup, and one worker's error never skips the others.
+    [holder, stopper].compact.each do |thread|
+      thread.kill unless thread.join(5)
+      thread.join
+    rescue StandardError
+      nil
+    end
+  end
+end
+
+RSpec.describe Invoices::PreparedReservations, "settle step lock order", committed_data: true do
+  include PreparedReservationsSpecSupport
+
+  it "a settling commit blocked on its operation row already holds the ownership row, so stop_applying! waits behind it" do
+    prepare_local_ownership!
+    company = create(:company)
+    invoice = prepared_spec_invoice(company)
+    request = prepared_spec_request(company, invoice, [prepared_spec_entry(company).id])
+    expect(described_class.new.prepare(request).state).to eq("prepared")
+    outgoing = TimekeepingOwnership.current.generation
+    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)
+      .update_all(generation: outgoing + 1, handoff_step: "settle")
+    TimekeepingOwnership.begin_settling!(generation: outgoing)
+    # The three threads below each lease a pooled connection, and the test
+    # pool holds three by default, so the example gives its own back first.
+    ActiveRecord::Base.connection_pool.release_connection
+
+    reached = Queue.new
+    release = Queue.new
+    holder_pids = Queue.new
+    committer_pids = Queue.new
+    stopper_pids = Queue.new
+    holder = committed_data_thread(holder_pids) do
+      ApplicationRecord.transaction do
+        ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array(
+          ["SELECT id FROM invoice_operations WHERE company_id = ? AND invoice_id = ? FOR UPDATE", company.id, invoice.id]
+        ))
+        reached << true
+        release.pop
+      end
+    end
+    expect(reached.pop(timeout: 5)).to be(true), "the operation row lock was never taken"
+    committer = committed_data_thread(committer_pids) { described_class.new.commit(request) }
+    committer_pid = committer_pids.pop(timeout: 5)
+    stopper = nil
+    begin
+      expect(blocked_by?(committer_pid, holder_pids.pop(timeout: 5))).to be(true), "the commit never waited on the operation row"
+      stopper = committed_data_thread(stopper_pids) { TimekeepingOwnership.stop_applying!(generation: outgoing) }
+      # "Lock the ownership row before the operation row, the same order `WriteSteps` uses."
+      # A commit that took the operation row first would not yet hold the ownership row, and the stop would not wait.
+      stop_waited = blocked_by?(stopper_pids.pop(timeout: 5), committer_pid)
+    ensure
+      release << true
+    end
+
+    expect(stop_waited).to be(true), "stop_applying! did not wait for the commit that was already admitted"
+    expect(committer.value.state).to eq("committed")
+    stopper.join(5)
+    expect(prepared_spec_operations(company, invoice).map(&:first)).to eq(["committed"])
+  ensure
+    release&.push(true)
+    [holder, committer, stopper].compact.each do |thread|
+      thread.kill unless thread.join(5)
+      thread.join
+    rescue StandardError
+      nil
+    end
+  end
+end

@@ -15,6 +15,8 @@ module Timekeeping
       # The ownership read of a service writer; see locked_generation_nowait
       # for why it never waits.
       NOWAIT_OWNERSHIP_LOCK = "FOR SHARE NOWAIT"
+      # The only requests the settle step still applies; see settling_generation.
+      SETTLING_ROUTES = %i[commit abort].freeze
 
       # Raised when the NOWAIT ownership read finds the row locked, so only
       # that read, and no other lock wait, is answered as stale_generation.
@@ -61,24 +63,53 @@ module Timekeeping
       # monolith is not the prepared owner, while admission is closed for a
       # handoff, or when the row is missing.
       def admitted_generation(lock: SHARED_OWNERSHIP_LOCK)
-        ownership = TimekeepingOwnership.lock(lock).find_by(id: TimekeepingOwnership::SINGLETON_ID)
+        generation_admitted_by(TimekeepingOwnership.lock(lock).find_by(id: TimekeepingOwnership::SINGLETON_ID))
+      end
+
+      # The generation a read ownership row admits, as admitted_generation
+      # describes; nil for a missing row.
+      def generation_admitted_by(ownership)
         return if ownership.nil? || ownership.admission_closed? || EntryOwner.for(ownership) != :prepared
 
         ownership.generation
       end
 
-      # The admitted generation, read FOR SHARE NOWAIT. A billing write holds
-      # the ownership row FOR SHARE before it takes the invoice lock, so with
-      # a handoff's update queued on that row a waiting read here could close
-      # a lock cycle. Raises OwnershipQueued instead of waiting, which the
-      # writer answers as stale_generation.
-      def locked_generation_nowait
-        stored_generation = admitted_generation(lock: NOWAIT_OWNERSHIP_LOCK)
+      # The ownership row, read FOR SHARE NOWAIT; nil when it is missing. A
+      # billing write holds the ownership row FOR SHARE before it takes the
+      # invoice lock, so with a handoff's update queued on that row a waiting
+      # read here could close a lock cycle. Raises OwnershipQueued instead of
+      # waiting, which the writer answers as stale_generation.
+      def locked_ownership_nowait
+        ownership = TimekeepingOwnership.lock(NOWAIT_OWNERSHIP_LOCK).find_by(id: TimekeepingOwnership::SINGLETON_ID)
         raise OwnershipQueued, "an ownership update is waiting on the row" if ownership_update_queued?
 
-        stored_generation
+        ownership
       rescue ActiveRecord::LockWaitTimeout => error
         raise OwnershipQueued, error.message
+      end
+
+      # The admitted generation, read as locked_ownership_nowait reads it.
+      def locked_generation_nowait
+        generation_admitted_by(locked_ownership_nowait)
+      end
+
+      # During a handoff's settle step the outgoing owner still finishes the
+      # commits and aborts it registered at the outgoing generation
+      # (docs/architecture/timekeeping-soa.md section 10.5), so the snapshot
+      # taken at the freeze already counts them. Returns the settling
+      # generation only for a commit or abort that carries exactly that
+      # generation, for an operation stored at it; nil for every other
+      # request, which the writer refuses as stale_generation. Admission stays
+      # closed for everything else, so entry writes and service commands,
+      # which read generation_admitted_by, are still refused.
+      def settling_generation(ownership, route:, generation:, operation_generation:)
+        return if ownership.nil? || ownership.handoff_step.nil? || EntryOwner.for(ownership) != :prepared
+        return unless SETTLING_ROUTES.include?(route)
+
+        settling = ownership.settling_generation
+        return unless generation_matches?(generation, settling) && operation_generation == settling
+
+        settling
       end
 
       # PostgreSQL grants a FOR SHARE request beside other share holders

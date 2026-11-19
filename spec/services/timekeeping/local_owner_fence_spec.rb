@@ -238,3 +238,35 @@ RSpec.describe Timekeeping::LocalOwner, "stale generation on bulk routes" do
     end
   end
 end
+
+RSpec.describe Timekeeping::LocalOwner, "entry writes during the settle step" do
+  # "While settling, the monolith also refuses new entry writes and service commands (through LocalOwner, BillingFence and Gateway), with nothing changed, and still applies a commit or abort of an operation registered at the outgoing generation"
+  it "an entry create while the settle step is open is refused as stale at both the outgoing and the raised generation and writes nothing" do
+    outgoing = prepare_local_ownership!.generation
+    company = create(:company)
+    user = timekeeping_member(company, "employee")
+    project = create(:project, client: create(:client, company:))
+    TimekeepingOwnership.current.update_columns(generation: outgoing + 1, handoff_step: "settle")
+    TimekeepingOwnership.begin_settling!(generation: outgoing)
+    expect(TimekeepingOwnership.settling?).to be(true)
+    ownership_before = TimekeepingOwnership.current.attributes
+    baseline = timekeeping_row_counts
+
+    [outgoing, outgoing + 1].each do |generation|
+      outcome = described_class.call(
+        operation: :create, company_id: company.id, generation: generation.to_s,
+        actor: described_class::Actor.user(user_id: user.id, role: "employee"),
+        params: { "idempotency_key" => "settling-entry-create-#{generation}",
+                  "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 15.0,
+                              "note" => "during settle", "source" => "manual", "source_metadata" => {} } }
+      )
+
+      expect(outcome.status).to eq(409)
+      expect(outcome.body.to_h.stringify_keys["reason"].to_s).to eq("stale_generation")
+    end
+
+    expect(timekeeping_row_counts).to eq(baseline)
+    expect(Timekeeping::LocalEntry.where(company_id: company.id).count).to eq(0)
+    expect(TimekeepingOwnership.current.attributes).to eq(ownership_before)
+  end
+end
