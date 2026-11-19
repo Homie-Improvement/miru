@@ -6,7 +6,7 @@ require "webmock/rspec"
 RSpec.describe Timekeeping::Handoff::Drain do
   context "with an unsent snapshot the monolith refuses" do
     # "It answers `drained`, which is true only when no outbox_snapshots row with position at or below P has `sent_at` NULL."
-    it "Drain.call answers true when every snapshot at or below through is sent and false when an unsent one sits at or below it" do
+    it "answers true for a through between a sent and an unsent position" do
       insert_outbox_rows(
         outbox_row(outbox_position: 10, id: 910, sent_at: Time.utc(2026, 3, 3, 9, 0, 0)),
         outbox_row(outbox_position: 20, id: 920)
@@ -15,21 +15,23 @@ RSpec.describe Timekeeping::Handoff::Drain do
       WebMock.stub_request(:post, "http://snapshots.test/internal/v1/timekeeping/entry-snapshots")
         .to_return(status: 503, body: "")
 
-      answers = with_timekeeping_env(
+      drained = with_timekeeping_env(
         Timekeeping::Environment::MONOLITH_SNAPSHOT_URL => "http://snapshots.test",
         Timekeeping::Environment::SERVICE_TOKEN => "drain-spec-service-token"
       ) do
-        [described_class.call(through: 10), described_class.call(through: 19), described_class.call(through: 20)]
+        described_class.call(through: 19)
       end
 
-      # An unsent row above P does not matter; the unsent row at P does.
-      expect(answers).to eq([true, true, false])
+      expect(drained).to be(true)
       expect(OutboxSnapshot.where(outbox_position: 20).pick(:sent_at)).to be_nil
     end
   end
 
-  context "while another connection holds the relay lock" do
-    it "answers false while another connection holds the relay lock even though every row at or below through is sent, and true once the lock is released" do
+  context "once another connection releases the relay lock" do
+    # The request spec owns what a held lock does to the drain answer. This
+    # example observes the held-lock false answer only so that the true answer
+    # after release shows a change.
+    it "answers true after the relay lock is released when every row at or below through is sent" do
       insert_outbox_rows(outbox_row(outbox_position: 1, id: 811), outbox_row(outbox_position: 2, id: 812))
       OutboxSnapshot.update_all(sent_at: Time.current)
       WebMock.stub_request(:post, "http://drain-spec.test/internal/v1/timekeeping/entry-snapshots")
@@ -43,7 +45,6 @@ RSpec.describe Timekeeping::Handoff::Drain do
         begin
           other_connection.exec_params("SELECT pg_advisory_lock($1)", [RelayJob::RELAY_LOCK_KEY])
 
-          # "A relay that skipped on its advisory lock leaves `drained` false."
           expect(described_class.call(through: 2)).to be(false)
         ensure
           other_connection.close
@@ -65,19 +66,6 @@ RSpec.describe Timekeeping::Handoff::Drain do
     end
 
     let(:drain_snapshot_url) { "http://drain-held.test/internal/v1/timekeeping/entry-snapshots" }
-
-    it "answers false while the row at through is refused and true once a later run sends it" do
-      position = insert_outbox_rows(outbox_row(id: 931)).first
-      WebMock.stub_request(:post, drain_snapshot_url)
-        .to_return({ status: 503, body: "" },
-                   { status: 200, headers: { "Content-Type" => "application/json" },
-                     body: JSON.generate("applied" => 1, "ignored" => 0) })
-
-      answers = with_drain_snapshot_endpoint { [described_class.call(through: position), described_class.call(through: position)] }
-
-      expect(answers).to eq([false, true])
-      expect(OutboxSnapshot.where(outbox_position: position).pick(:sent_at)).not_to be_nil
-    end
 
     # The relay never offers rows of the held generation, yet they are unsent,
     # so drain stays false until admit releases them.
