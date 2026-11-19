@@ -19,9 +19,9 @@ module Timekeeping
 
       PENDING_SQL = "SELECT EXISTS (SELECT 1 FROM invoice_operation_intents WHERE state = 'pending')"
 
-      # Outbox rows carry no generation of their own; delivery builds its
-      # request from the row's intent, so the intent's generation is the one
-      # that counts.
+      # Delivery builds its request from the row's intent
+      # (OutboxDelivery#request_for), not from the generation in the row's
+      # payload, so the intent's generation is the one that counts.
       OUTGOING_GENERATION_SQL = <<~SQL.squish
         EXISTS (
           SELECT 1 FROM invoice_operation_intents intents
