@@ -325,6 +325,17 @@ RSpec.describe TimekeepingQueueLedger::Session do
         expect { live.before_reset! }.to raise_error(TimekeepingQueueLedger::LiveRuntimeDuringReset)
         expect(used).to eq([])
         expect(File.exist?(live_path)).to be(false)
+
+        # The live check must hold at every reset, not only the first.
+        runtime_live = false
+        later = described_class.new(path: File.join(dir, "later_ledger.json"),
+                                    collectors: { "monolith" => -> { [] } }, live: -> { runtime_live })
+        later.activate!(env: {})
+        later.before_reset!
+        later.before_reset!
+        runtime_live = true
+
+        expect { later.before_reset! }.to raise_error(TimekeepingQueueLedger::LiveRuntimeDuringReset)
       end
     end
 
