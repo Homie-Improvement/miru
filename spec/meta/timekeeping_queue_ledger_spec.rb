@@ -1045,8 +1045,10 @@ RSpec.describe "Timekeeping queue ledger per-process probe isolation", :without_
       "controls" => []
     )
     # config/database.yml names the database from TEST_ENV_NUMBER unless DATABASE_URL is present,
-    # so the child keeps this run's prepared database while its process number changes.
-    database_url = "postgresql:///#{ActiveRecord::Base.connection_db_config.database}"
+    # so the child keeps this run's prepared database while its process number changes. A
+    # DATABASE_URL this run already uses is passed on whole, so its host and user survive.
+    database_url = ENV["DATABASE_URL"].presence ||
+                   "postgresql:///#{ActiveRecord::Base.connection_db_config.database}"
     probe = Rails.root.join("spec/fixtures/timekeeping_harness/queue_ledger_probe.rb").to_s
 
     begin

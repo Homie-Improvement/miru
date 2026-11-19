@@ -143,6 +143,27 @@ RSpec.describe "bin/parallel_test" do
     end
   end
 
+  # A worker's dotenv load would otherwise fill in an override from .env or .env.test,
+  # and dotenv leaves a key alone once it is set, even to "".
+  it "hands parallel_rspec an empty TIMEKEEPING_QUEUE_LEDGER_PATH so dotenv cannot set a shared one" do
+    Dir.mktmpdir do |fake_bin|
+      env_file = File.join(fake_bin, "ledger_env")
+      fake_bundle = File.join(fake_bin, "bundle")
+      File.write(fake_bundle, "#!/bin/sh\nprintf '%s' \"${TIMEKEEPING_QUEUE_LEDGER_PATH-unset}\" > #{env_file}\n")
+      File.chmod(0o755, fake_bundle)
+      env = {
+        "PATH" => [fake_bin, File.dirname(RbConfig.ruby), "/usr/bin", "/bin"].join(File::PATH_SEPARATOR),
+        "PARALLEL_RUNTIME_LOG" => File.join(fake_bin, "missing_runtime.log"),
+        "TIMEKEEPING_QUEUE_LEDGER_PATH" => nil
+      }
+
+      output, status = Open3.capture2e(env, RbConfig.ruby, "bin/parallel_test", "-n", "2", chdir: Rails.root.to_s)
+
+      expect(status).to be_success, output
+      expect(File.read(env_file)).to eq("")
+    end
+  end
+
   it "starts parallel_rspec when TIMEKEEPING_QUEUE_LEDGER_PATH is unset, empty or blank" do
     [nil, "", "  "].each do |blank|
       output, status, recorded_args = run_parallel_test_with_fake_bundle(

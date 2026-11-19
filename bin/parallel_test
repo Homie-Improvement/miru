@@ -132,7 +132,10 @@ command = [
 ]
 parallel_env = {
   "PARALLEL_RUNTIME_LOG" => options[:runtime_log],
-  "PARALLEL_FAILURES_LOG" => options[:failures_log]
+  "PARALLEL_FAILURES_LOG" => options[:failures_log],
+  # dotenv never replaces a key that is already set, even to "", so this stops a
+  # .env or .env.test file from giving every worker the same ledger file again.
+  QUEUE_LEDGER_PATH_KEY => ""
 }
 
 excluded = excluded_prefixes(exclude_system: options[:exclude_system], exclude_dirs: options[:exclude_dirs])
