@@ -79,3 +79,161 @@ RSpec.describe TimekeepingOwnership, committed_data: true do
     described_class.where(id: described_class::SINGLETON_ID).update_all(handoff_step: nil)
   end
 end
+
+RSpec.describe TimekeepingOwnership, committed_data: true do
+  # "...and states whether seed runs hold the ownership row FOR SHARE through their writes."
+  # The plan's answer is no: seeds check once, unlocked, before their first write.
+  it "seed runs do not hold the ownership row FOR SHARE: a fence commits while a seed transaction that passed the check is still open, and the next check refuses" do
+    checked = Queue.new
+    release = Queue.new
+    seed_pids = Queue.new
+    fence_pids = Queue.new
+    seed = committed_data_thread(seed_pids) do
+      ActiveRecord::Base.transaction do
+        described_class.refuse_if_handoff_begun!
+        checked << true
+        release.pop
+      end
+    end
+    expect(checked.pop(timeout: 5)).to be(true), "the seed check never passed on the initial row"
+
+    fence = committed_data_thread(fence_pids) do
+      Timekeeping::Handoff::MonolithAdmission.new(lock_timeout: 5.seconds).fence_admission
+    end
+
+    begin
+      blocked = blocked_by?(fence_pids.pop(timeout: 5), seed_pids.pop(timeout: 5), within: 1)
+      fence_finished = fence.join(5)
+    ensure
+      release << true
+    end
+
+    expect(blocked).to be(false)
+    expect(fence_finished).not_to be_nil
+    expect(described_class.find(described_class::SINGLETON_ID).admission_fenced_at).not_to be_nil
+    expect { described_class.refuse_if_handoff_begun! }.to raise_error(TimekeepingOwnership::HandoffBegun)
+  ensure
+    release << true
+    [seed, fence].compact.each { |thread| thread.join(5) }
+  end
+end
+
+RSpec.describe TimekeepingOwnership, committed_data: true do
+  # "A spec shows that the seed refusal and the users controller's `unless_handoff_begun` either refuse while
+  # `admission_fenced_at` is set or are documented as deliberately exempt"
+  # A user delete that reads the row while a fence update is uncommitted must wait and then refuse; otherwise it
+  # would commit after the fence that was meant to close the monolith.
+  it "refuses a guarded block that queued behind an uncommitted admission fence once the fence commits" do
+    fenced = Queue.new
+    commit = Queue.new
+    fence_pids = Queue.new
+    guarded_pids = Queue.new
+    ran = false
+    fence = committed_data_thread(fence_pids) do
+      ActiveRecord::Base.transaction do
+        Timekeeping::Handoff::MonolithAdmission.new.fence_admission
+        fenced << true
+        commit.pop
+      end
+    end
+    expect(fenced.pop(timeout: 5)).to be(true), "the fence never ran"
+
+    guarded = committed_data_thread(guarded_pids) do
+      described_class.unless_handoff_begun { ran = true }
+    end
+
+    begin
+      blocked = blocked_by?(guarded_pids.pop(timeout: 5), fence_pids.pop(timeout: 5))
+    ensure
+      commit << true
+    end
+
+    expect(blocked).to be(true), "the guarded block never waited on the uncommitted fence"
+    fence.join(5)
+    expect(guarded.join(5)&.value).to be(false)
+    expect(ran).to be(false)
+    expect(described_class.find(described_class::SINGLETON_ID).admission_fenced_at).not_to be_nil
+  ensure
+    commit << true
+    [fence, guarded].compact.each { |thread| thread.join(5) }
+  end
+end
+
+RSpec.describe TimekeepingOwnership, committed_data: true do
+  # "A spec shows that ... and states whether seed runs hold the ownership row FOR SHARE through their writes."
+  # Seed runs do not hold it: their only ownership interaction is this check, and even inside an open
+  # transaction it takes no lock a fence would wait for.
+  it "the seed check holds no share lock, so a fence commits mid-run without waiting and the next seed check refuses" do
+    checked = Queue.new
+    release = Queue.new
+    seed_pids = Queue.new
+    fence_pids = Queue.new
+    seed = committed_data_thread(seed_pids) do
+      ActiveRecord::Base.transaction do
+        described_class.refuse_if_handoff_begun!
+        checked << true
+        release.pop
+      end
+    end
+    expect(checked.pop(timeout: 5)).to be(true), "the seed check never passed on the initial row"
+
+    fence = committed_data_thread(fence_pids) do
+      Timekeeping::Handoff::MonolithAdmission.new.fence_admission
+      :fenced
+    end
+
+    begin
+      blocked = blocked_by?(fence_pids.pop(timeout: 5), seed_pids.pop(timeout: 5), within: 1)
+      fence_result = fence.join(5)&.value
+    ensure
+      release << true
+    end
+
+    expect(blocked).to be(false), "the fence waited on the seed check, so the seed run held the row"
+    expect(fence_result).to eq(:fenced)
+    expect(seed.join(5)).not_to be_nil
+    expect(described_class.find(described_class::SINGLETON_ID).admission_fenced_at).not_to be_nil
+    expect { described_class.refuse_if_handoff_begun! }.to raise_error(TimekeepingOwnership::HandoffBegun)
+  ensure
+    release << true
+    [seed, fence].compact.each { |thread| thread.join(5) }
+  end
+end
+
+RSpec.describe TimekeepingOwnership, committed_data: true do
+  # A user delete already inside unless_handoff_begun holds the row FOR SHARE, so the admission fence must
+  # wait for it to commit rather than close admission underneath it.
+  it "makes the admission fence wait until an open unless_handoff_begun block commits, then sets the mark" do
+    entered = Queue.new
+    release = Queue.new
+    guarded_pids = Queue.new
+    fence_pids = Queue.new
+    guarded = committed_data_thread(guarded_pids) do
+      described_class.unless_handoff_begun do
+        entered << true
+        release.pop
+      end
+    end
+    expect(entered.pop(timeout: 5)).to be(true), "the guarded block never ran"
+
+    fence = committed_data_thread(fence_pids) do
+      Timekeeping::Handoff::MonolithAdmission.new.fence_admission
+    end
+
+    begin
+      blocked = blocked_by?(fence_pids.pop(timeout: 5), guarded_pids.pop(timeout: 5))
+      fenced_while_open = described_class.find(described_class::SINGLETON_ID).admission_fenced_at
+    ensure
+      release << true
+    end
+
+    expect(blocked).to be(true), "the fence never waited on the guarded block's share lock"
+    expect(fenced_while_open).to be_nil
+    expect(guarded.join(5)&.value).to be(true)
+    expect(fence.join(5)).not_to be_nil
+    expect(described_class.find(described_class::SINGLETON_ID).admission_fenced_at).not_to be_nil
+  ensure
+    release << true
+    [guarded, fence].compact.each { |thread| thread.join(5) }
+  end
+end

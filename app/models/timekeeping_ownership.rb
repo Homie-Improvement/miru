@@ -82,11 +82,18 @@ class TimekeepingOwnership < ApplicationRecord
   # the legacy store at a raised generation, so handoff_step alone cannot
   # tell. An owner or store value other than the initial one counts as begun,
   # known or not.
+  #
+  # The admission fence mark counts too: the fence is the handoff's first
+  # write and leaves every other column initial, so without it the seeds and
+  # the user hard delete would run while the monolith's own writers are
+  # refused. An abort's admit clears the mark; if close_admission never
+  # raised the generation, nothing has moved and the row is initial again.
   def handoff_begun?
     generation > INITIAL_GENERATION ||
       !handoff_step.nil? ||
       owner != INITIAL_OWNER ||
-      monolith_store != INITIAL_MONOLITH_STORE
+      monolith_store != INITIAL_MONOLITH_STORE ||
+      !admission_fenced_at.nil?
   end
 
   # Whether the monolith's entry and billing writers must refuse. A handoff

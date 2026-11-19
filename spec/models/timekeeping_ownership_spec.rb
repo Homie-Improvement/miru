@@ -298,9 +298,11 @@ RSpec.describe TimekeepingOwnership, type: :model do
       generation: 2,
       handoff_step: "settle",
       owner: "timekeeping",
-      monolith_store: "prepared"
+      monolith_store: "prepared",
+      admission_fenced_at: Time.current
     }.each do |column, value|
-      ownership.update_columns(generation: 1, handoff_step: nil, owner: "monolith", monolith_store: "legacy")
+      ownership.update_columns(generation: 1, handoff_step: nil, owner: "monolith", monolith_store: "legacy",
+                               admission_fenced_at: nil)
       ownership.update_columns(column => value)
 
       expect(ownership.reload.handoff_begun?).to be(true), "expected #{column}=#{value.inspect} to count as begun"
@@ -380,5 +382,124 @@ RSpec.describe TimekeepingOwnership, type: :model do
     expect(described_class.new(handoff_step: "close_admission", admission_fenced_at: nil).admission_closed?).to be(true)
     expect(described_class.new(handoff_step: nil, admission_fenced_at: fenced_at).admission_closed?).to be(true)
     expect(described_class.new(handoff_step: "settle", admission_fenced_at: fenced_at).admission_closed?).to be(true)
+  end
+end
+
+RSpec.describe TimekeepingOwnership, type: :model do
+  # "A spec shows that the seed refusal and the users controller's `unless_handoff_begun` either refuse
+  # while `admission_fenced_at` is set or are documented as deliberately exempt, and states whether seed
+  # runs hold the ownership row FOR SHARE through their writes."
+  it "unless_handoff_begun persists nothing on a fenced-only row and runs its block once the fence is admitted" do
+    company_baseline = Company.count
+    described_class.current.update_columns(
+      generation: 1, handoff_step: nil, owner: "monolith", monolith_store: "legacy", admission_fenced_at: Time.current
+    )
+
+    refused = described_class.unless_handoff_begun { create(:company) }
+
+    expect(refused).to be(false)
+    expect(Company.count).to eq(company_baseline)
+    expect { described_class.refuse_if_handoff_begun! }.to raise_error(TimekeepingOwnership::HandoffBegun)
+    expect(described_class.current.admission_fenced_at).not_to be_nil
+
+    Timekeeping::Handoff::MonolithAdmission.new.admit(generation: 1)
+
+    expect(described_class.refuse_if_handoff_begun!).to be_nil
+    admitted = described_class.unless_handoff_begun { create(:company) }
+    expect(admitted).to be(true)
+    expect(Company.count).to eq(company_baseline + 1)
+    expect(described_class.pluck(:generation, :handoff_step, :owner, :monolith_store, :admission_fenced_at))
+      .to eq([[1, nil, "monolith", "legacy", nil]])
+  end
+end
+
+RSpec.describe TimekeepingOwnership, type: :model do
+  # "Decide whether the callers of `TimekeepingOwnership.handoff_begun?` ... should also refuse while
+  # `admission_fenced_at` is set". The plan decides they refuse, through this one predicate.
+  it "handoff_begun? is true on a row whose only departure from the initial state is admission_fenced_at, and false again once the mark is cleared" do
+    ownership = described_class.current
+    ownership.update_columns(generation: 1, handoff_step: nil, owner: "monolith", monolith_store: "legacy",
+                             admission_fenced_at: nil)
+    expect(ownership.reload.handoff_begun?).to be(false)
+
+    ownership.update_columns(admission_fenced_at: Time.current)
+    expect(ownership.reload.handoff_begun?).to be(true)
+    expect(described_class.handoff_begun?).to be(true)
+
+    ownership.update_columns(admission_fenced_at: nil)
+    expect(ownership.reload.handoff_begun?).to be(false)
+    expect(described_class.handoff_begun?).to be(false)
+  end
+end
+
+RSpec.describe TimekeepingOwnership, type: :model do
+  # "A spec shows that the seed refusal ... either refuse while `admission_fenced_at` is set or are
+  # documented as deliberately exempt". The plan chooses refusal, and an abort's admit reopens seeding.
+  it "refuse_if_handoff_begun! raises on a fenced-only row without writing the row and returns nil after admit reopens it" do
+    ownership = described_class.current
+    ownership.update_columns(generation: 1, handoff_step: nil, owner: "monolith", monolith_store: "legacy",
+                             admission_fenced_at: Time.current)
+    fenced_attributes = ownership.reload.attributes
+
+    expect { described_class.refuse_if_handoff_begun! }.to raise_error(TimekeepingOwnership::HandoffBegun)
+    expect(ownership.reload.attributes).to eq(fenced_attributes)
+
+    Timekeeping::Handoff::MonolithAdmission.new.admit(generation: 1)
+
+    expect(described_class.refuse_if_handoff_begun!).to be_nil
+    expect(described_class.current.attributes.slice("generation", "handoff_step", "owner", "monolith_store", "admission_fenced_at"))
+      .to eq("generation" => 1, "handoff_step" => nil, "owner" => "monolith", "monolith_store" => "legacy",
+             "admission_fenced_at" => nil)
+  end
+end
+
+RSpec.describe TimekeepingOwnership, type: :model do
+  # "A spec shows that ... the users controller's `unless_handoff_begun` either refuse while
+  # `admission_fenced_at` is set or are documented as deliberately exempt". The plan chooses refusal.
+  it "unless_handoff_begun skips its block and persists nothing on a fenced-only row, then runs it after admit" do
+    company_baseline = Company.count
+    described_class.current.update_columns(generation: 1, handoff_step: nil, owner: "monolith", monolith_store: "legacy",
+                                           admission_fenced_at: Time.current)
+
+    refused = described_class.unless_handoff_begun { create(:company) }
+
+    expect(refused).to be(false)
+    expect(Company.count).to eq(company_baseline)
+
+    Timekeeping::Handoff::MonolithAdmission.new.admit(generation: 1)
+    admitted = described_class.unless_handoff_begun { create(:company) }
+
+    expect(admitted).to be(true)
+    expect(Company.count).to eq(company_baseline + 1)
+  end
+end
+
+RSpec.describe TimekeepingOwnership, type: :model do
+  # "A spec shows that the seed refusal and the users controller's `unless_handoff_begun` either refuse while
+  # `admission_fenced_at` is set or are documented as deliberately exempt"
+  # A close_admission lock timeout leaves the row fenced at generation 1 until an abort admits the monolith.
+  # Refusing must last that whole time, write no ownership column, and end once admit clears the mark.
+  it "a fence left in place keeps refusing seeds and guarded deletes until admit reopens the initial row" do
+    admission = Timekeeping::Handoff::MonolithAdmission.new
+    admission.fence_admission
+    fenced_row = described_class.current.attributes.slice(
+      "generation", "handoff_step", "owner", "monolith_store", "admission_fenced_at"
+    )
+    expect(fenced_row.values_at("generation", "handoff_step", "owner", "monolith_store"))
+      .to eq([1, nil, "monolith", "legacy"])
+    company_count = Company.count
+
+    2.times do
+      expect { described_class.refuse_if_handoff_begun! }.to raise_error(TimekeepingOwnership::HandoffBegun)
+      expect(described_class.unless_handoff_begun { create(:company) }).to be(false)
+    end
+    expect(Company.count).to eq(company_count)
+    expect(described_class.current.attributes.slice(*fenced_row.keys)).to eq(fenced_row)
+
+    admission.admit(generation: 1)
+
+    expect(described_class.refuse_if_handoff_begun!).to be_nil
+    expect(described_class.unless_handoff_begun { create(:company) }).to be(true)
+    expect(Company.count).to eq(company_count + 1)
   end
 end
