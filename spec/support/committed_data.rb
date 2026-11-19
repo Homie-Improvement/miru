@@ -10,15 +10,12 @@
 # defaults (no handoff step). Without that, a handoff_step left set by one
 # example would refuse the billing writes of every later example.
 module CommittedDataMode
-  KEPT_TABLES = %w[ar_internal_metadata schema_migrations].freeze
-
   def self.example?(example)
     example.metadata[:committed_data] == true
   end
 
   def self.reset_database
-    TestDatabaseCleanup.before_reset!
-    DatabaseCleaner.clean_with(:deletion, except: KEPT_TABLES)
+    TestDatabaseCleanup.clean_with!(:deletion, except: TestDatabaseCleanup::KEPT_TABLES)
     TimekeepingOwnership.ensure_initial!
   end
 

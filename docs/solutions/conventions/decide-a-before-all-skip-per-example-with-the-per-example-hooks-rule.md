@@ -36,10 +36,12 @@ before(:all) do
   examples = self.class.descendant_filtered_examples
   next if examples.all? { |example| TestDatabaseCleanup.seeded_committed?(example.metadata) }
 
-  DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
+  TestDatabaseCleanup.clean_with!(:truncation, except: %w(ar_internal_metadata))
   Timekeeping::SeedDispositionRecorder.load_fresh_seed!(as_of: TestDatabaseCleanup.seed_as_of)
 end
 ```
+
+PR #389 called `DatabaseCleaner.clean_with` here directly. The truncate now goes through `TestDatabaseCleanup.clean_with!`, which records queue executions before it deletes rows. Every monolith reset must call it (see [Enforce a single reset wrapper with an exact-count source scan](enforce-a-single-reset-wrapper-with-an-exact-count-source-scan.md)).
 
 `descendant_filtered_examples` covers the examples in nested groups too, after filtering, so the decision matches what actually runs. The rule lives in one place, `TestDatabaseCleanup.seeded_committed?`; the group hook calls it instead of copying its logic.
 
