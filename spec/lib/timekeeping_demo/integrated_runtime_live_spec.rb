@@ -189,6 +189,10 @@ RSpec.describe "IntegratedRuntime live teardown and secrecy" do
 
   # "Kill the launcher with KILL before readiness. After `stop!`, no recorded group is alive: `Process.kill(0, -pgid)` raises `Errno::ESRCH`."
   it "start stops every recorded app group when the launcher is killed with KILL before the runtime is ready" do
+    # An earlier live example leaves its stopped groups in the file; without it
+    # the killer can only see groups recorded by this start.
+    FileUtils.rm_f(live_runtime_groups_file)
+    runtime = nil
     killer = Thread.new do
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + IntegratedRuntime::BOOT_TIMEOUT_SECONDS
       sleep 0.05 until live_runtime_app_group_recorded? || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
@@ -198,7 +202,7 @@ RSpec.describe "IntegratedRuntime live teardown and secrecy" do
       launcher
     end
 
-    expect { IntegratedRuntime.start(root: live_runtime_root, env: ENV.to_h) }
+    expect { runtime = IntegratedRuntime.start(root: live_runtime_root, env: ENV.to_h) }
       .to raise_error(IntegratedRuntime::BootError, /launcher exited before the runtime was ready/)
     launcher = killer.value
 
@@ -208,18 +212,44 @@ RSpec.describe "IntegratedRuntime live teardown and secrecy" do
     expect(([launcher] + recorded).all? { |pgid| live_runtime_group_gone?(pgid) }).to be(true)
   ensure
     killer&.kill
+    runtime&.stop!
+  end
+
+  # "A failing inner example leaves no launcher or app group alive."
+  it "a failing example tagged integrated_runtime leaves no launcher or recorded app group alive" do
+    recorded = []
+    inner = RSpec::Core::ExampleGroup.describe("failing tagged inner group", :integrated_runtime) do
+      it "fails while the runtime runs" do
+        recorded = (@integrated_runtime.process_groups +
+                    IntegratedRuntime.recorded_groups(Rails.root.to_s)).uniq
+        raise "inner example failed"
+      end
+    end
+    passed = inner.run(RSpec::Core::NullReporter)
+    RSpec.world.example_groups.delete(inner)
+
+    expect(passed).to be(false)
+    # The launcher group alone would not prove the app groups were killed by the hooks.
+    expect(recorded.size).to be > 1
+    expect(recorded.all? { |pgid| live_runtime_group_gone?(pgid) }).to be(true)
   end
 
   # "versions.json, the captured stdout and stderr, and the runtime output hold none of the values."
   it "versions.json, the runtime output and the groups file hold none of the harness credential values" do
     values = []
     outputs = {}
+    log = nil
     IntegratedRuntime.run(root: live_runtime_root, env: ENV.to_h) do |runtime|
       credentials = runtime.credentials
       values = [credentials.private_key_pem, credentials.public_key_pem, credentials.service_token]
-      # The launcher's combined stdout and stderr; the harness deletes it on stop.
-      outputs[:runtime_output] = File.read(runtime.instance_variable_get(:@log).path)
+      # The launcher's combined stdout and stderr. stop! deletes it, so the
+      # deletion is held back to read what the shutdown wrote as well.
+      log = runtime.instance_variable_get(:@log)
+      allow(log).to receive(:close!)
     end
+    outputs[:runtime_output] = File.read(log.path)
+    log.close
+    log.unlink
     outputs[:versions] = File.read(Rails.root.join("tmp", "timekeeping-demo", "versions.json"))
     outputs[:process_groups] = File.read(live_runtime_groups_file)
 

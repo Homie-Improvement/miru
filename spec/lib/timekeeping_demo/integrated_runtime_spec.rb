@@ -56,6 +56,8 @@ RSpec.describe IntegratedRuntime do
         "TIMEKEEPING_DATABASE_URL" => "postgres://timekeeping_harness_user@127.0.0.1:5432/timekeeping_harness_missing_test"
       )
       env_before = ENV.to_h
+      # The reset is not under test here; stubbing it makes sure the error comes from the launcher.
+      allow(TimekeepingDatabaseReset).to receive(:reset!)
 
       error = nil
       output = capture_harness_output do
@@ -71,7 +73,8 @@ RSpec.describe IntegratedRuntime do
       expect(message.include?("PRIVATE KEY")).to be(false)
       expect(message.include?("PUBLIC KEY")).to be(false)
       expect(message.include?("127.0.0.1:5432")).to be(false)
-      expect(message.match?(/launcher|monolith|timekeeping/)).to be(true)
+      expect(message.include?("launcher exited")).to be(true)
+      expect(message.include?("boot timeout #{IntegratedRuntime::BOOT_TIMEOUT_SECONDS} s")).to be(true)
       # "Never log, print or write them to versions.json."
       expect(output.include?(sentinel)).to be(false)
       expect(output.include?("PRIVATE KEY")).to be(false)
@@ -385,7 +388,6 @@ RSpec.describe IntegratedRuntime do
 
       begin
         runtime.stop!
-        Process.wait(app_group)
 
         # "After `stop!`, no recorded group is alive: `Process.kill(0, -pgid)` raises `Errno::ESRCH`."
         expect { Process.kill(0, -app_group) }.to raise_error(Errno::ESRCH)
@@ -432,6 +434,8 @@ RSpec.describe IntegratedRuntime do
       runtime
     end
     allow(runtime).to receive(:stop!) { steps << :stop }
+    allow(ENV).to receive(:[]).and_call_original
+    allow(ENV).to receive(:[]).with("TIMEKEEPING_LIVE").and_return("1")
 
     inner = RSpec::Core::ExampleGroup.describe("integrated runtime hook order", :integrated_runtime) do
       it("runs between the hooks") { steps << :example }
@@ -443,5 +447,107 @@ RSpec.describe IntegratedRuntime do
     #  `config.after` hook, which runs before the cleaners' `append_after` resets."
     expect(passed).to be(true)
     expect(steps).to eq(%i[refuse_if_running clean_monolith start example stop clean_monolith])
+  end
+
+  it "an integrated_runtime example refused because another runtime is live cleans and starts nothing" do
+    steps = []
+    allow(described_class).to receive(:refuse_if_running!).and_raise(IntegratedRuntime::BootError, "already running")
+    allow(TestDatabaseCleanup).to receive(:delete_all_committed!) { steps << :clean_monolith }
+    allow(described_class).to receive(:start) { steps << :start }
+    allow(ENV).to receive(:[]).and_call_original
+    allow(ENV).to receive(:[]).with("TIMEKEEPING_LIVE").and_return("1")
+
+    inner = RSpec::Core::ExampleGroup.describe("integrated runtime refused", :integrated_runtime) do
+      it("must not run") { steps << :example }
+    end
+    passed = inner.run(RSpec::Core::NullReporter)
+    RSpec.world.example_groups.delete(inner)
+
+    # "Refuse to start while the groups file lists a live group."
+    expect(passed).to be(false)
+    expect(steps).to eq([])
+  end
+
+  it "an integrated_runtime example without TIMEKEEPING_LIVE=1 is skipped before any check, clean or start" do
+    steps = []
+    allow(described_class).to receive(:refuse_if_running!) { steps << :refuse_if_running }
+    allow(TestDatabaseCleanup).to receive(:delete_all_committed!) { steps << :clean_monolith }
+    allow(described_class).to receive(:start) { steps << :start }
+    allow(ENV).to receive(:[]).and_call_original
+    allow(ENV).to receive(:[]).with("TIMEKEEPING_LIVE").and_return(nil)
+
+    inner = RSpec::Core::ExampleGroup.describe("integrated runtime without the live flag", :integrated_runtime) do
+      it("is skipped") { steps << :example }
+    end
+    inner.run(RSpec::Core::NullReporter)
+    pending_example = inner.examples.first
+    RSpec.world.example_groups.delete(inner)
+
+    # "Live tests skip unless `TIMEKEEPING_LIVE=1`."
+    expect(pending_example.execution_result.status).to eq(:pending)
+    expect(steps).to eq([])
+  end
+
+  it "boot! stops its launcher when readiness is interrupted, so the caller never holds a running orphan" do
+    Dir.mktmpdir("integrated-runtime-interrupt") do |root|
+      FileUtils.mkdir_p(File.join(root, "bin"))
+      launcher_path = File.join(root, "bin", "timekeeping-demo")
+      File.write(launcher_path, "#!/bin/sh\nexec sleep 60\n")
+      File.chmod(0o755, launcher_path)
+      runtime = described_class.new(root:, env: { "PATH" => ENV.fetch("PATH") },
+                                    credentials: TimekeepingDemo::Credentials.generate,
+                                    ports: { monolith: 40_021, timekeeping: 40_022 })
+      allow(runtime).to receive(:wait_until_ready).and_raise(Interrupt)
+      stub_const("TimekeepingDemo::Supervisor::STOP_GRACE_SECONDS", 1)
+      stub_const("IntegratedRuntime::STOP_MARGIN_SECONDS", 1)
+
+      expect { runtime.boot! }.to raise_error(Interrupt)
+      launcher = runtime.process_groups.first
+      expect(launcher.nil?).to be(false)
+      expect { Process.kill(0, -launcher) }.to raise_error(Errno::ESRCH)
+    end
+  end
+
+  it "start bounds a stalled Timekeeping db:prepare by the boot timeout and kills it" do
+    Dir.mktmpdir("integrated-runtime-prepare-timeout") do |root|
+      FileUtils.cp(Rails.root.join("Procfile.timekeeping"), root)
+      FileUtils.mkdir_p(File.join(root, "timekeeping", "bin"))
+      File.write(File.join(root, "timekeeping", "Gemfile"), "")
+      rails = File.join(root, "timekeeping", "bin", "rails")
+      File.write(rails, "#!/bin/sh\nexec sleep 60\n")
+      File.chmod(0o755, rails)
+      stub_const("IntegratedRuntime::BOOT_TIMEOUT_SECONDS", 1)
+      allow(TimekeepingDatabaseReset).to receive(:reset!)
+      spawned = []
+      allow(Process).to receive(:spawn).and_wrap_original do |original, *args, **options|
+        original.call(*args, **options).tap { |pid| spawned << pid }
+      end
+      env = ENV.to_h.except("DATABASE_URL").merge(
+        "DB_USER" => "harness_timeout_monolith_user",
+        "TIMEKEEPING_DATABASE_URL" => "postgres://harness_timeout_timekeeping_user@127.0.0.1:5432/timekeeping_timeout_test"
+      )
+
+      expect { described_class.start(root:, env:) }
+        .to raise_error(IntegratedRuntime::BootError, "timekeeping db:prepare did not finish (boot timeout 1 s)")
+      expect(spawned.size).to eq(1)
+      expect { Process.kill(0, -spawned.first) }.to raise_error(Errno::ESRCH)
+      expect(TimekeepingDatabaseReset).not_to have_received(:reset!)
+    end
+  end
+
+  it "start refuses a Timekeeping URL whose path names a non-test database behind a _test dbname parameter" do
+    allow(TimekeepingDatabaseReset).to receive(:reset!)
+    allow(Process).to receive(:spawn).and_call_original
+    env = {
+      "PATH" => ENV.fetch("PATH", ""),
+      "TIMEKEEPING_DATABASE_URL" =>
+        "postgresql://harness_selector_user@127.0.0.1/timekeeping_development?dbname=timekeeping_selector_test"
+    }
+
+    # libpq reads the parameter, Rails reads the path: db:prepare would migrate timekeeping_development.
+    expect { described_class.start(root: Rails.root.to_s, env:) }
+      .to raise_error(TestDatabaseGuard::NotATestDatabase, /timekeeping_development/)
+    expect(Process).not_to have_received(:spawn)
+    expect(TimekeepingDatabaseReset).not_to have_received(:reset!)
   end
 end

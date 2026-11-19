@@ -53,8 +53,8 @@ class IntegratedRuntime
     # The launcher's monolith prefers a caller DATABASE_URL over the test
     # process's own database, so that target is checked as well.
     child_monolith_url = env[TimekeepingDemo::RuntimePlan::MONOLITH_DATABASE_URL].to_s
-    TestDatabaseGuard.require_test_database!(TimekeepingDatabaseReset.database_name(child_monolith_url)) unless child_monolith_url.strip.empty?
-    TestDatabaseGuard.require_test_database!(timekeeping_database_name(env))
+    require_test_database_url!(child_monolith_url) unless child_monolith_url.strip.empty?
+    require_test_database_url!(timekeeping_database_url(env))
     credentials = TimekeepingDemo::Credentials.generate
     ports = { monolith: free_port, timekeeping: free_port }
     clear_leftovers!(root)
@@ -119,10 +119,24 @@ class IntegratedRuntime
     ActiveRecord::Base.connection_db_config.database
   end
 
-  def self.timekeeping_database_name(env)
+  def self.timekeeping_database_url(env)
     raise BootError, "#{TIMEKEEPING_DATABASE_URL} must name the Timekeeping test database" unless env.key?(TIMEKEEPING_DATABASE_URL)
 
-    TimekeepingDatabaseReset.database_name(env.fetch(TIMEKEEPING_DATABASE_URL))
+    env.fetch(TIMEKEEPING_DATABASE_URL)
+  end
+
+  # libpq (used by the reset) and Active Record (used by db:prepare and the
+  # apps) can read different databases from one URL, for example a path name
+  # and a dbname query parameter. Both readings must name a test database.
+  def self.require_test_database_url!(url)
+    TestDatabaseGuard.require_test_database!(TimekeepingDatabaseReset.database_name(url))
+    TestDatabaseGuard.require_test_database!(active_record_database_name(url))
+  end
+
+  def self.active_record_database_name(url)
+    ActiveRecord::DatabaseConfigurations::UrlConfig.new("test", "harness_guard", url, { adapter: "postgresql" }).database
+  rescue ActiveRecord::DatabaseConfigurations::InvalidConfigurationError, URI::Error
+    nil
   end
 
   def self.free_port
@@ -154,20 +168,41 @@ class IntegratedRuntime
       Process.spawn(spec.env, *TimekeepingDemo::Supervisor::PREPARE_COMMAND,
                     chdir: spec.chdir, unsetenv_others: true, pgroup: true, out: File::NULL, err: File::NULL)
     end
+    status = wait_for_prepare(pid)
+    raise BootError, boot_error_message("timekeeping", "db:prepare did not finish") unless status
+    raise BootError, boot_error_message("timekeeping", "db:prepare failed") unless status.success?
+  end
+
+  # Answers the exit status, or nil after killing and reaping the group when
+  # db:prepare outlives the boot timeout or the wait is interrupted.
+  def self.wait_for_prepare(pid)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + BOOT_TIMEOUT_SECONDS
     status = nil
     begin
-      _, status = Process.wait2(pid)
+      until status || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+        _, status = Process.wait2(pid, Process::WNOHANG)
+        sleep POLL_SECONDS unless status
+      end
+      status
     ensure
-      kill_group(pid) unless status
+      unless status
+        kill_group(pid)
+        Process.wait(pid)
+      end
     end
-    raise BootError, "timekeeping db:prepare failed" unless status.success?
   end
 
   # A connection error can carry the database host, so it is replaced.
   def self.reset_timekeeping!(owner_state, env)
     TimekeepingDatabaseReset.reset!(owner_state, env:)
   rescue PG::Error
-    raise BootError, "timekeeping database could not be reset", cause: nil
+    raise BootError, boot_error_message("timekeeping", "database could not be reset"), cause: nil
+  end
+
+  # Every boot error names only the app and the boot timeout: the environment
+  # and the children's output can hold credentials.
+  def self.boot_error_message(app, problem)
+    "#{app} #{problem} (boot timeout #{BOOT_TIMEOUT_SECONDS} s)"
   end
 
   def self.kill_group(group)
@@ -175,8 +210,9 @@ class IntegratedRuntime
   rescue Errno::ESRCH, Errno::EPERM
     nil
   end
-  private_class_method :monolith_database_name, :timekeeping_database_name, :free_port,
-                       :clear_leftovers!, :prepare_timekeeping!, :reset_timekeeping!
+  private_class_method :monolith_database_name, :timekeeping_database_url, :require_test_database_url!,
+                       :active_record_database_name, :free_port, :clear_leftovers!, :prepare_timekeeping!,
+                       :wait_for_prepare, :reset_timekeeping!
 
   def initialize(root:, env:, credentials:, ports:)
     @root = root
@@ -194,35 +230,35 @@ class IntegratedRuntime
     ([@launcher].compact + self.class.recorded_groups(@root)).uniq
   end
 
+  # Stops the launcher on every way out short of readiness, an Interrupt
+  # included, because the caller never receives a runtime it could stop.
   def boot!
+    ready = false
     @log = Tempfile.new(["timekeeping-demo-runtime", ".log"])
     spawn_env, argv, options = self.class.launch(root: @root, env: @env, credentials:, ports: @ports)
     @launcher = Process.spawn(spawn_env, *argv, **options, out: @log.path, err: [:child, :out])
     wait_until_ready
-  rescue StandardError
-    stop!
-    raise
+    ready = true
+  ensure
+    stop! unless ready
   end
 
   # Sends TERM to the launcher, whose supervisor then stops its apps; waits
   # past the supervisor's own grace period; then kills every recorded group
-  # still alive. Safe to call again: a call after a full stop does nothing.
+  # still alive and waits for them to be gone. Raises when a group outlives
+  # the KILL, so no database reset runs beside it. Safe to call again: a call
+  # after a full stop does nothing.
   def stop!
     return if @stopped
 
     signal_launcher("TERM")
-    deadline = monotonic_now + TimekeepingDemo::Supervisor::STOP_GRACE_SECONDS + STOP_MARGIN_SECONDS
-    loop do
-      # Reaping first: an unreaped launcher stays in its group and keeps it alive.
-      reap_launcher(Process::WNOHANG)
-      break if process_groups.none? { |group| self.class.group_alive?(group) }
-      break if monotonic_now > deadline
-
-      sleep POLL_SECONDS
-    end
+    wait_for_groups_gone(TimekeepingDemo::Supervisor::STOP_GRACE_SECONDS + STOP_MARGIN_SECONDS)
     process_groups.each { |group| self.class.kill_group(group) if self.class.group_alive?(group) }
+    gone = wait_for_groups_gone(STOP_MARGIN_SECONDS)
     reap_launcher(0)
     @log&.close!
+    raise BootError, "process groups of the demo runtime were still alive after KILL" unless gone
+
     @stopped = true
   end
 
@@ -236,14 +272,38 @@ class IntegratedRuntime
     def wait_until_ready
       deadline = monotonic_now + BOOT_TIMEOUT_SECONDS
       loop do
-        raise BootError, "the timekeeping-demo launcher exited before the runtime was ready" if reap_launcher(Process::WNOHANG)
+        if reap_launcher(Process::WNOHANG)
+          raise BootError, self.class.boot_error_message("launcher", "exited before the runtime was ready")
+        end
 
         waiting = { "monolith" => monolith_ready?, "timekeeping" => timekeeping_ready? }.reject { |_app, ready| ready }.keys
         return if waiting.empty?
-        raise BootError, "#{waiting.join(' and ')} not ready within #{BOOT_TIMEOUT_SECONDS} s" if monotonic_now > deadline
+        raise BootError, self.class.boot_error_message(waiting.join(" and "), "not ready") if monotonic_now > deadline
 
         sleep POLL_SECONDS
       end
+    end
+
+    # Answers true once no recorded group has a live member. Reaping comes
+    # first: an exited child that was not reaped still counts as a member.
+    def wait_for_groups_gone(seconds)
+      deadline = monotonic_now + seconds
+      loop do
+        reap_launcher(Process::WNOHANG)
+        process_groups.each { |group| reap_exited_members(group) }
+        return true if process_groups.none? { |group| self.class.group_alive?(group) }
+        return false if monotonic_now > deadline
+
+        sleep POLL_SECONDS
+      end
+    end
+
+    # Reaps exited members of the group that are this process's own children;
+    # members that are not are reaped by their own parent or by init.
+    def reap_exited_members(group)
+      loop { break if Process.wait(-group, Process::WNOHANG).nil? }
+    rescue Errno::ECHILD
+      nil
     end
 
     def monolith_ready?
@@ -290,17 +350,26 @@ RSpec.configure do |config|
   # Registered after the cleaner and owner-state hooks (see the require above):
   # the monolith is emptied and the owner state put back before the runtime
   # starts. The live-group check comes first, so a surviving worker from an
-  # earlier run is never running while rows are deleted.
+  # earlier run is never running while rows are deleted. Without
+  # TIMEKEEPING_LIVE=1 the example is skipped before anything is cleaned or
+  # started.
   config.before(:each, :integrated_runtime) do
+    skip "Set TIMEKEEPING_LIVE=1 to start the demo runtime" unless ENV["TIMEKEEPING_LIVE"] == "1"
+
     root = Rails.root.to_s
     IntegratedRuntime.refuse_if_running!(root:)
+    @integrated_runtime_owns_databases = true
     IntegratedRuntime.clean_monolith!
     @integrated_runtime = IntegratedRuntime.start(root:, env: ENV.to_h)
   end
 
   # A plain after hook runs before every append_after cleaner, so the runtime's
-  # workers and relay are stopped before any reset.
+  # workers and relay are stopped before any reset. An example that was
+  # skipped, or refused because another runtime is live, cleans nothing, since
+  # that runtime's workers may still be writing.
   config.after(:each, :integrated_runtime) do
+    next unless @integrated_runtime_owns_databases
+
     @integrated_runtime&.stop!
     IntegratedRuntime.clean_monolith!
   end
