@@ -53,10 +53,13 @@ RSpec.describe Timekeeping::SeedCapture do
     it "restores the seeded rows of every table, key-less ones included, and every sequence's state, well under a minute" do
       # The :without_transaction hook leaves the ownership row behind, and the
       # seed load refuses any occupied table, so empty everything first as the
-      # two-tenant seed context does.
+      # two-tenant seed context does. The process store is used, as that
+      # context does, so this runs db/seeds.rb only when no earlier group has.
       TestDatabaseCleanup.before_reset!
       DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
-      Timekeeping::SeedDispositionRecorder.load_fresh_seed!(as_of: TestDatabaseCleanup.seed_as_of)
+      Timekeeping::SeedDispositionRecorder.load_fresh_seed!(
+        as_of: TestDatabaseCleanup.seed_as_of, captures: TestDatabaseCleanup.seed_captures
+      )
       loaded_digests = seed_capture_spec_table_digests
       loaded_sequences = seed_capture_spec_sequence_states
       expect(loaded_digests.fetch("users_roles").first).to be_positive

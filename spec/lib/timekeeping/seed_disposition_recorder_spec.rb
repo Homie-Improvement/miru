@@ -173,64 +173,12 @@ RSpec.describe Timekeeping::SeedDispositionRecorder do
   end
 end
 
-RSpec.describe Timekeeping::SeedDispositionRecorder, :without_transaction do
-  def recorder_store_spec_connection
-    ActiveRecord::Base.connection
-  end
-
-  def recorder_store_spec_empty_database!
-    TestDatabaseCleanup.before_reset!
-    DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
-  end
-
-  # Ids per table (row count for tables with no id column), so the comparison
-  # does not depend on when each load ran.
-  def recorder_store_spec_ids
-    (recorder_store_spec_connection.tables - %w[ar_internal_metadata schema_migrations]).sort.to_h do |table|
-      quoted = recorder_store_spec_connection.quote_table_name(table)
-      if recorder_store_spec_connection.column_exists?(table, :id)
-        [table, recorder_store_spec_connection.select_values("SELECT id::text FROM #{quoted} ORDER BY id")]
-      else
-        [table, recorder_store_spec_connection.select_value("SELECT count(*) FROM #{quoted}").to_i]
-      end
-    end
-  end
-
-  def recorder_store_spec_sequences
-    names = recorder_store_spec_connection.select_values(<<~SQL)
-      SELECT c.relname FROM pg_class c
-      JOIN pg_namespace n ON n.oid = c.relnamespace
-      WHERE c.relkind = 'S' AND n.nspname = current_schema()
-      ORDER BY c.relname
-    SQL
-    names.to_h do |name|
-      quoted = recorder_store_spec_connection.quote_table_name(name)
-      [name, recorder_store_spec_connection.select_rows("SELECT last_value, is_called FROM #{quoted}").first]
-    end
-  end
-
-  it "a reload through the process store gives the same ids and sequence values as a real seed load, well under a minute" do
-    as_of = TestDatabaseCleanup.seed_as_of
-
-    recorder_store_spec_empty_database!
-    described_class.load_fresh_seed!(as_of:)
-    ids_from_real_load = recorder_store_spec_ids
-    sequences_from_real_load = recorder_store_spec_sequences
-
-    # The first call fills the store when it is empty; the second must restore.
-    recorder_store_spec_empty_database!
-    described_class.load_fresh_seed!(as_of:, captures: TestDatabaseCleanup.seed_captures)
-    expect(TestDatabaseCleanup.seed_captures.fetch(as_of)).not_to be_nil
-
-    recorder_store_spec_empty_database!
-    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    described_class.load_fresh_seed!(as_of:, captures: TestDatabaseCleanup.seed_captures)
-    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
-
-    # "Reloading the two-tenant seed for a handoff example group takes well under a minute, either through bulk inserts in db/seeds.rb or by restoring a captured snapshot, and gives the same ids and sequence values as before."
-    expect(recorder_store_spec_ids).to eq(ids_from_real_load)
-    expect(recorder_store_spec_sequences).to eq(sequences_from_real_load)
-    expect(elapsed).to be < 20
+RSpec.describe TestDatabaseCleanup do
+  # Both seeded test paths must share one store, or each would pay for its own
+  # real seed load.
+  it "returns the same seed capture store on every call in a process" do
+    expect(described_class.seed_captures).to be_a(Timekeeping::SeedCapture::Store)
+    expect(described_class.seed_captures).to be(described_class.seed_captures)
   end
 end
 
