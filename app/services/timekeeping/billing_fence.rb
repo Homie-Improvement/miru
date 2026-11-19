@@ -8,10 +8,10 @@ module Timekeeping
   # two would make that comparison meaningless.
   #
   # Each billing write transaction takes FOR SHARE on the single ownership
-  # row and reads handoff_step under that lock. The handoff's first step
-  # updates the row, so it waits for every billing transaction already
-  # holding the lock, and every billing transaction that starts after it
-  # reads the new handoff_step and is refused.
+  # row and checks TimekeepingOwnership#admission_closed? under that lock.
+  # The monolith's admission fence and the handoff's first step both update
+  # the row, so each waits for every billing transaction already holding the
+  # lock, and every billing transaction that starts after it is refused.
   class BillingFence
     # Raised when a billing write is refused. Retryable: the write succeeds
     # once the handoff ends. Rendered as 503 ownership_moving.
@@ -50,7 +50,7 @@ module Timekeeping
       end
 
       ownership = TimekeepingOwnership.lock("FOR SHARE").find_by(id: TimekeepingOwnership::SINGLETON_ID)
-      raise OwnershipMoving if ownership.nil? || ownership.handoff_step.present?
+      raise OwnershipMoving if ownership.nil? || ownership.admission_closed?
 
       nil
     end
