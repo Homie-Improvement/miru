@@ -41,6 +41,14 @@ module TestDatabaseCleanup
       example.metadata[:seeded_without_transaction] ||
       CommittedDataMode.example?(example)
   end
+
+  # An :integrated_runtime example may reset the databases only once it has
+  # confirmed no earlier runtime is live, and only after its own runtime
+  # stopped (spec/support/timekeeping/integrated_runtime.rb sets the flag).
+  # Otherwise a surviving runtime's workers could be writing during a reset.
+  def reset_withheld?(example)
+    example.metadata[:integrated_runtime] && !example.metadata[:integrated_runtime_resets_allowed]
+  end
 end
 
 RSpec.configure do |config|
@@ -87,13 +95,17 @@ RSpec.configure do |config|
     TimekeepingOwnership.ensure_initial!
   end
 
-  config.append_after(:each, :without_transaction) do
+  config.append_after(:each, :without_transaction) do |example|
+    next if TestDatabaseCleanup.reset_withheld?(example)
+
     DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata schema_migrations)
     TimekeepingOwnership.ensure_initial!
   end
 
   # Declared last so it runs after DatabaseCleaner.clean.
-  config.append_after do
+  config.append_after do |example|
+    next if TestDatabaseCleanup.reset_withheld?(example)
+
     TestDatabaseCleanup.delete_operation_ledger_rows!
   end
 end

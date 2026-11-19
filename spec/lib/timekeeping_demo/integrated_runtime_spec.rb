@@ -453,11 +453,14 @@ RSpec.describe IntegratedRuntime do
     steps = []
     allow(described_class).to receive(:refuse_if_running!).and_raise(IntegratedRuntime::BootError, "already running")
     allow(TestDatabaseCleanup).to receive(:delete_all_committed!) { steps << :clean_monolith }
+    allow(TestDatabaseCleanup).to receive(:delete_operation_ledger_rows!) { steps << :delete_ledger }
+    allow(DatabaseCleaner).to receive(:clean_with) { steps << :truncate }
     allow(described_class).to receive(:start) { steps << :start }
     allow(ENV).to receive(:[]).and_call_original
     allow(ENV).to receive(:[]).with("TIMEKEEPING_LIVE").and_return("1")
 
-    inner = RSpec::Core::ExampleGroup.describe("integrated runtime refused", :integrated_runtime) do
+    # :without_transaction adds the truncation hooks before and after, which must not run either.
+    inner = RSpec::Core::ExampleGroup.describe("integrated runtime refused", :integrated_runtime, :without_transaction) do
       it("must not run") { steps << :example }
     end
     passed = inner.run(RSpec::Core::NullReporter)
@@ -473,10 +476,13 @@ RSpec.describe IntegratedRuntime do
     allow(described_class).to receive(:refuse_if_running!) { steps << :refuse_if_running }
     allow(TestDatabaseCleanup).to receive(:delete_all_committed!) { steps << :clean_monolith }
     allow(described_class).to receive(:start) { steps << :start }
+    allow(TestDatabaseCleanup).to receive(:delete_operation_ledger_rows!) { steps << :delete_ledger }
+    allow(DatabaseCleaner).to receive(:clean_with) { steps << :truncate }
     allow(ENV).to receive(:[]).and_call_original
     allow(ENV).to receive(:[]).with("TIMEKEEPING_LIVE").and_return(nil)
 
-    inner = RSpec::Core::ExampleGroup.describe("integrated runtime without the live flag", :integrated_runtime) do
+    inner = RSpec::Core::ExampleGroup.describe("integrated runtime without the live flag", :integrated_runtime,
+                                               :without_transaction) do
       it("is skipped") { steps << :example }
     end
     inner.run(RSpec::Core::NullReporter)
@@ -486,6 +492,30 @@ RSpec.describe IntegratedRuntime do
     # "Live tests skip unless `TIMEKEEPING_LIVE=1`."
     expect(pending_example.execution_result.status).to eq(:pending)
     expect(steps).to eq([])
+  end
+
+  it "an integrated_runtime example whose runtime fails to stop runs no reset afterwards" do
+    steps = []
+    runtime = instance_double(described_class)
+    allow(described_class).to receive(:refuse_if_running!)
+    allow(described_class).to receive(:start).and_return(runtime)
+    allow(runtime).to receive(:stop!).and_raise(IntegratedRuntime::BootError, "groups still alive after KILL")
+    allow(TestDatabaseCleanup).to receive(:delete_all_committed!) { steps << :clean_monolith }
+    allow(TestDatabaseCleanup).to receive(:delete_operation_ledger_rows!) { steps << :delete_ledger }
+    allow(DatabaseCleaner).to receive(:clean_with) { steps << :truncate }
+    allow(ENV).to receive(:[]).and_call_original
+    allow(ENV).to receive(:[]).with("TIMEKEEPING_LIVE").and_return("1")
+
+    inner = RSpec::Core::ExampleGroup.describe("integrated runtime stop failure", :integrated_runtime,
+                                               :without_transaction) do
+      it("runs") { steps << :example }
+    end
+    passed = inner.run(RSpec::Core::NullReporter)
+    RSpec.world.example_groups.delete(inner)
+
+    # "No worker or scheduler then runs during a reset": nothing resets beside a group that outlived stop!.
+    expect(passed).to be(false)
+    expect(steps).to eq(%i[truncate clean_monolith example])
   end
 
   it "boot! stops its launcher when readiness is interrupted, so the caller never holds a running orphan" do

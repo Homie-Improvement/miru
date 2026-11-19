@@ -347,30 +347,39 @@ class IntegratedRuntime
 end
 
 RSpec.configure do |config|
-  # Registered after the cleaner and owner-state hooks (see the require above):
-  # the monolith is emptied and the owner state put back before the runtime
-  # starts. The live-group check comes first, so a surviving worker from an
-  # earlier run is never running while rows are deleted. Without
-  # TIMEKEEPING_LIVE=1 the example is skipped before anything is cleaned or
-  # started.
-  config.before(:each, :integrated_runtime) do
+  # Runs before every other before hook, including the committed_data and
+  # without_transaction resets, so a skipped example or one refused because an
+  # earlier runtime is live never reaches any reset. Only after the check
+  # passes may this example's resets run (TestDatabaseCleanup.reset_withheld?).
+  config.prepend_before(:each, :integrated_runtime) do |example|
     skip "Set TIMEKEEPING_LIVE=1 to start the demo runtime" unless ENV["TIMEKEEPING_LIVE"] == "1"
 
-    root = Rails.root.to_s
-    IntegratedRuntime.refuse_if_running!(root:)
-    @integrated_runtime_owns_databases = true
+    IntegratedRuntime.refuse_if_running!(root: Rails.root.to_s)
+    example.metadata[:integrated_runtime_resets_allowed] = true
+  end
+
+  # Registered after the cleaner and owner-state hooks (see the require above):
+  # the monolith is emptied and the owner state put back before the runtime
+  # starts. Resets are withheld while start runs: a start that fails because a
+  # group survived its own cleanup leaves nothing safe to reset beside.
+  config.before(:each, :integrated_runtime) do |example|
     IntegratedRuntime.clean_monolith!
-    @integrated_runtime = IntegratedRuntime.start(root:, env: ENV.to_h)
+    example.metadata[:integrated_runtime_resets_allowed] = false
+    @integrated_runtime = IntegratedRuntime.start(root: Rails.root.to_s, env: ENV.to_h)
+    example.metadata[:integrated_runtime_resets_allowed] = true
   end
 
   # A plain after hook runs before every append_after cleaner, so the runtime's
-  # workers and relay are stopped before any reset. An example that was
-  # skipped, or refused because another runtime is live, cleans nothing, since
-  # that runtime's workers may still be writing.
-  config.after(:each, :integrated_runtime) do
-    next unless @integrated_runtime_owns_databases
+  # workers and relay are stopped before any reset. Resets stay withheld until
+  # stop! confirms every group is gone: if it raises, no cleaner runs beside a
+  # surviving process. A start that failed after stopping cleanly also leaves
+  # them withheld; the next runtime example cleans before it starts.
+  config.after(:each, :integrated_runtime) do |example|
+    next unless example.metadata[:integrated_runtime_resets_allowed]
 
+    example.metadata[:integrated_runtime_resets_allowed] = false
     @integrated_runtime&.stop!
+    example.metadata[:integrated_runtime_resets_allowed] = true
     IntegratedRuntime.clean_monolith!
   end
 end
