@@ -89,6 +89,13 @@ class TimekeepingOwnership < ApplicationRecord
       monolith_store != INITIAL_MONOLITH_STORE
   end
 
+  # Whether the monolith's entry and billing writers must refuse. A handoff
+  # step closes admission, and so does the admission adapter's fence mark,
+  # which is set before close_admission records its step.
+  def admission_closed?
+    !handoff_step.nil? || !admission_fenced_at.nil?
+  end
+
   # Whether the handoff source is the legacy timesheet_entries table, which is
   # what makes a handoff run the pre-flight and derive reservations. Only the
   # flip of a handoff from the legacy source sets legacy_retired_at. The

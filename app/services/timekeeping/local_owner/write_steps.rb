@@ -58,11 +58,11 @@ module Timekeeping
 
       # The one generation the local owner admits, read with lock so a handoff
       # that updates the row waits for this write to commit. nil while the
-      # monolith is not the prepared owner, during a handoff, or when the row
-      # is missing.
+      # monolith is not the prepared owner, while admission is closed for a
+      # handoff, or when the row is missing.
       def admitted_generation(lock: SHARED_OWNERSHIP_LOCK)
         ownership = TimekeepingOwnership.lock(lock).find_by(id: TimekeepingOwnership::SINGLETON_ID)
-        return if ownership.nil? || !ownership.handoff_step.nil? || EntryOwner.for(ownership) != :prepared
+        return if ownership.nil? || ownership.admission_closed? || EntryOwner.for(ownership) != :prepared
 
         ownership.generation
       end
