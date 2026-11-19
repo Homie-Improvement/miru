@@ -19,6 +19,23 @@ module Timekeeping
     const_set(:Blob, Data.define(:service_name, :key))
     const_set(:RestoreError, Class.new(StandardError))
 
+    # Captures by the as_of they were loaded at. Seeded rows depend on as_of,
+    # so a capture is restored only for the as_of it was taken at. Keys are
+    # compared as strings, so a Date and its ISO string name the same load.
+    const_set(:Store, Class.new do
+      def initialize
+        @captures = {}
+      end
+
+      def fetch(as_of)
+        @captures[as_of.to_s]
+      end
+
+      def store(as_of, capture)
+        @captures[as_of.to_s] = capture
+      end
+    end)
+
     def self.take(connection:, tables:)
       new(
         tables: tables.sort.map { |table| copy_out(connection, table) }.freeze,
