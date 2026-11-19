@@ -4,7 +4,7 @@
 
 require "rails_helper"
 
-RSpec.describe "Timekeeping local relay" do
+RSpec.describe "Timekeeping local relay", committed_data: true do
   let(:local_relay_projection_url) { "https://www.example.com" }
 
   # Sends the relay's real HTTP POST into this app, so the internal controller

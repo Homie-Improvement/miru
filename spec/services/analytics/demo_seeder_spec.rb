@@ -156,3 +156,25 @@ RSpec.describe Analytics::DemoSeeder do
     end
   end
 end
+
+RSpec.describe Analytics::DemoSeeder do
+  # "A spec shows that the seed refusal and the users controller's `unless_handoff_begun` either refuse
+  # while `admission_fenced_at` is set or are documented as deliberately exempt, and states whether seed
+  # runs hold the ownership row FOR SHARE through their writes."
+  it "raises HandoffBegun on a fenced-only ownership row and persists no users, clients or projects" do
+    company = create(:company, base_currency: "USD", standard_price: 120)
+    TimekeepingOwnership.current.update_columns(
+      generation: 1, handoff_step: nil, owner: "monolith", monolith_store: "legacy", admission_fenced_at: Time.current
+    )
+    baseline = { users: User.count, clients: Client.count, projects: Project.count }
+
+    expect { described_class.new(company:).process }
+      .to raise_error(TimekeepingOwnership::HandoffBegun)
+
+    expect({ users: User.count, clients: Client.count, projects: Project.count }).to eq(baseline)
+    expect(company.clients.count).to eq(0)
+    expect(TimekeepingOwnership.pluck(:generation, :handoff_step, :owner, :monolith_store))
+      .to eq([[1, nil, "monolith", "legacy"]])
+    expect(TimekeepingOwnership.current.admission_fenced_at).not_to be_nil
+  end
+end
