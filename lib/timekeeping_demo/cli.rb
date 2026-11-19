@@ -7,7 +7,8 @@ module TimekeepingDemo
   # The `bin/timekeeping-demo` command. `up` takes the caller's complete
   # credential set or makes a fresh one, plans the processes from
   # Procfile.timekeeping, prepares both databases, records the running
-  # versions and hands the processes to the supervisor.
+  # versions and hands the processes to the supervisor. `regression` runs the
+  # regression specs in every ownership state through TimekeepingDemo::Regression.
   module CLI
     EX_OK = 0
     EX_FAILURE = 1
@@ -20,7 +21,7 @@ module TimekeepingDemo
     PROCESS_GROUPS_FILE = "process_groups"
     DEFAULT_PORTS = { monolith: 3000, timekeeping: 3100 }.freeze
     PORT_KEYS = { monolith: "MONOLITH_PORT", timekeeping: "TIMEKEEPING_PORT" }.freeze
-    USAGE = "usage: bin/timekeeping-demo up"
+    USAGE = "usage: bin/timekeeping-demo up|regression"
     # Ctrl-C in the terminal, or a TERM from whoever started the demo.
     STOP_SIGNALS = %w[INT TERM].freeze
 
@@ -30,9 +31,21 @@ module TimekeepingDemo
     # Without a supervisor, the default one records every process group it
     # starts in state_dir's PROCESS_GROUPS_FILE, so a caller can still find and
     # stop the applications after this launcher itself was killed.
-    def run(argv, root:, supervisor: nil, state_dir: DEFAULT_STATE_DIR, caller_env: ENV.to_h)
-      return usage_error unless argv == ["up"]
+    # `regression` is dispatched before any supervisor is built, so it never
+    # creates state_dir; without a regression_runner it spawns rspec from root.
+    def run(argv, root:, supervisor: nil, state_dir: DEFAULT_STATE_DIR, caller_env: ENV.to_h,
+            regression_runner: nil)
+      case argv
+      in ["regression"]
+        Regression.run(runner: regression_runner || default_regression_runner(root:, caller_env:))
+      in ["up"]
+        start(root:, supervisor:, state_dir:, caller_env:)
+      else
+        usage_error
+      end
+    end
 
+    def start(root:, supervisor:, state_dir:, caller_env:)
       state_dir = File.expand_path(state_dir, root)
       supervisor ||= default_supervisor(state_dir)
       up(root:, supervisor:, state_dir:, caller_env:)
@@ -52,6 +65,16 @@ module TimekeepingDemo
       write_versions(state_dir, VersionRecord.capture(root:))
       supervisor.run(specs, stop_signals: STOP_SIGNALS)
       EX_OK
+    end
+
+    # The child's values win over the caller's; a nil value makes system drop
+    # an inherited key. The argv array is passed as separate arguments, so no
+    # shell ever reads a spec path. The result is system's own: true, false,
+    # or nil when rspec could not start or was killed.
+    def default_regression_runner(root:, caller_env:)
+      lambda do |env:, argv:|
+        system(caller_env.merge(env), "bundle", "exec", "rspec", *argv, chdir: root)
+      end
     end
 
     def default_supervisor(state_dir)

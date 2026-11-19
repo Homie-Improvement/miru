@@ -380,3 +380,255 @@ RSpec.describe TimekeepingDemo::CLI do
     expect(started.none? { |spec| old_names.any? { |name| spec.env.key?(name) } }).to be(true)
   end
 end
+
+RSpec.describe TimekeepingDemo::CLI do
+  it "default regression runner hands argv to system as separate arguments and never as a shell string" do
+    root = Dir.mktmpdir("regression root with space")
+    calls = []
+    allow(described_class).to receive(:system) do |*args, **opts|
+      calls << [args, opts]
+      false
+    end
+
+    runner = described_class.default_regression_runner(root:, caller_env: { "KEEP_ME" => "1" })
+    hostile = "spec/x_spec.rb; touch #{root}/pwned"
+    result = runner.call(env: { "TIMEKEEPING_OWNER_STATE" => "legacy" }, argv: [hostile, "--tag", "~switches_owner"])
+
+    # "The default runner, built by `CLI.run` from `root:` and `caller_env:`, uses `system(env, "bundle", "exec", "rspec", *argv, chdir: root)` with an argv array, never a shell string."
+    expect(calls.size).to eq(1)
+    args, opts = calls.first
+    expect(args).to eq([{ "KEEP_ME" => "1", "TIMEKEEPING_OWNER_STATE" => "legacy" },
+                        "bundle", "exec", "rspec", hostile, "--tag", "~switches_owner"])
+    expect(opts).to eq(chdir: root)
+    expect(result).to be(false)
+    expect(File).not_to exist(File.join(root, "pwned"))
+  ensure
+    FileUtils.rm_rf(root) if root
+  end
+end
+
+RSpec.describe TimekeepingDemo::CLI do
+  it "regression children never inherit the caller's owner state or queue ledger path" do
+    envs = []
+    allow(described_class).to receive(:system) do |env, *_args, **_opts|
+      envs << env
+      true
+    end
+    supervisor = double("timekeeping demo supervisor")
+    parent_ledger = "/parent/queue_ledger.json"
+    caller_env = { "TIMEKEEPING_OWNER_STATE" => "rollback", "TIMEKEEPING_QUEUE_LEDGER_PATH" => parent_ledger }
+
+    Dir.mktmpdir do |dir|
+      state_dir = File.join(dir, "state")
+      expect do
+        described_class.run(["regression"], root: Rails.root.to_s, supervisor:, state_dir:, caller_env:)
+      end.to output.to_stdout
+
+      expect(Dir).not_to exist(state_dir)
+    end
+
+    # "Each child env sets `TIMEKEEPING_OWNER_STATE` to its state (overriding any caller value), `TIMEKEEPING_REGRESSION=1`, `TIMEKEEPING_LIVE=1`, and its own `TIMEKEEPING_QUEUE_LEDGER_PATH` in a fresh temp directory (a child rspec that inherits the parent's ledger path deletes the parent's ledger at suite start)."
+    state_envs = envs.select { |env| env["TIMEKEEPING_OWNER_STATE"] }
+    expect(state_envs.map { |env| env["TIMEKEEPING_OWNER_STATE"] }).to eq(%w[legacy timekeeping rollback])
+    ledgers = envs.map { |env| env["TIMEKEEPING_QUEUE_LEDGER_PATH"] }
+    expect(ledgers).to all(be_a(String))
+    expect(ledgers).not_to include(parent_ledger)
+    expect(ledgers.uniq.size).to eq(envs.size)
+
+    # The report pass runs with "no owner state": a nil value makes system remove the inherited key.
+    report_envs = envs - state_envs
+    expect(report_envs.size).to eq(1)
+    expect(report_envs.first).to have_key("TIMEKEEPING_OWNER_STATE")
+    expect(report_envs.first["TIMEKEEPING_OWNER_STATE"]).to be_nil
+  end
+end
+
+RSpec.describe TimekeepingDemo::CLI do
+  it "an unknown verb or a regression verb with extra arguments returns 64 and starts neither the supervisor nor the runner" do
+    supervisor = double("timekeeping demo supervisor")
+    regression_runner = double("regression runner")
+
+    [["nope"], ["regression", "; rm -rf /"]].each do |argv|
+      Dir.mktmpdir do |dir|
+        state_dir = File.join(dir, "state")
+        status = nil
+        # "`CLI.run(["nope"])` returns 64 and calls neither the supervisor nor the runner"
+        expect do
+          status = described_class.run(argv, root: Rails.root.to_s, supervisor:, state_dir:, regression_runner:)
+        end.to output(/regression/).to_stderr
+
+        expect(status).to eq(described_class::EX_USAGE)
+        expect(status).to eq(64)
+        expect(Dir).not_to exist(state_dir)
+      end
+    end
+  end
+end
+
+require "rails_helper"
+require "json"
+require "stringio"
+require "tmpdir"
+
+RSpec.describe TimekeepingDemo::CLI do
+  it "regression calls the runner once per state, in order, with the full 12.1 list and never builds the supervisor" do
+    expected_specs = %w[
+      spec/models/timesheet_entry_spec.rb
+      spec/policies/timesheet_entry_policy_spec.rb
+      spec/requests/api/v1/timesheet_entries/bulk_actions/update_spec.rb
+      spec/requests/api/v1/timesheet_entries/bulk_actions/destroy_spec.rb
+      spec/requests/api/v1/timesheet_entry/index_spec.rb
+      spec/requests/api/v1/cli/timesheet_entries/create_spec.rb
+      spec/requests/api/v1/cli/timesheet_entries/update_spec.rb
+      spec/requests/api/v1/cli/timesheet_entries/destroy_spec.rb
+      spec/mcp/tools/write_tools_spec.rb
+      spec/mcp/idempotency_store_spec.rb
+      spec/requests/api/v1/agent/timesheet_entries/create_spec.rb
+      spec/requests/api/v1/invoices/create_spec.rb
+      spec/models/invoice_spec.rb
+      spec/models/invoice_line_item_spec.rb
+      spec/requests/api/v1/invoices/send_invoice_spec.rb
+      spec/system/invoices/send_invoice_spec.rb
+      spec/services/imports/harvest_time_entries_importer_spec.rb
+      spec/services/reports/time_entries/
+      spec/services/analytics/team_productivity_analytics_spec.rb
+      spec/services/metrics/data_builder_spec.rb
+      spec/characterization/invoice_entry_locking_spec.rb
+      spec/characterization/timesheet_entry_rules_spec.rb
+      spec/characterization/entry_lookups_and_pdf_totals_spec.rb
+    ]
+    flags = ["--tag", "~switches_owner", "--fail-if-no-examples"]
+    calls = []
+    runner = lambda do |env:, argv:|
+      calls << { env:, argv: }
+      true
+    end
+    supervisor = double("timekeeping demo supervisor")
+
+    Dir.mktmpdir do |parent|
+      state_dir = File.join(parent, "state")
+      status = nil
+      expect do
+        status = described_class.run(["regression"], root: Rails.root.to_s, supervisor:, state_dir:,
+                                                     caller_env: {}, regression_runner: runner)
+      end.to output.to_stdout
+
+      expect(status).to eq(0)
+      # "`CLI.run([\"regression\"])` never calls the supervisor."
+      expect(File).not_to exist(state_dir)
+    end
+
+    state_calls = calls.select { |call| call[:argv].include?("~switches_owner") }
+    # "`CLI.run([\"regression\"])` calls the runner three times with each state (legacy, timekeeping, rollback) and the full list, including the three characterization specs"
+    expect(state_calls.map { |call| call[:env]["TIMEKEEPING_OWNER_STATE"] }).to eq(%w[legacy timekeeping rollback])
+    state_calls.each do |call|
+      expect(call[:argv] - flags).to contain_exactly(*expected_specs)
+      expect(call[:argv]).to include(*flags)
+      expect(call[:argv][call[:argv].index("--tag") + 1]).to eq("~switches_owner")
+    end
+  end
+end
+
+require "rails_helper"
+require "tmpdir"
+
+RSpec.describe TimekeepingDemo::CLI do
+  it "an unknown verb such as nope exits 64 and calls neither the supervisor nor the regression runner" do
+    supervisor = double("timekeeping demo supervisor")
+    regression_runner = double("timekeeping regression runner")
+
+    Dir.mktmpdir do |parent|
+      state_dir = File.join(parent, "state")
+      status = nil
+      expect do
+        status = described_class.run(["nope"], root: Rails.root.to_s, supervisor:, state_dir:,
+                                               caller_env: {}, regression_runner:)
+      end.to output(/regression/).to_stderr
+
+      # "`CLI.run([\"nope\"])` returns 64 and calls neither the supervisor nor the runner"
+      expect(status).to eq(64)
+      expect(File).not_to exist(state_dir)
+    end
+  end
+end
+
+require "rails_helper"
+
+RSpec.describe TimekeepingDemo::CLI do
+  it "USAGE names both the up and the regression commands" do
+    # "USAGE names up and regression, and `CLI.run([\"nope\"])` still returns `EX_USAGE` and starts nothing"
+    expect(described_class::USAGE).to match(/\bup\b/)
+    expect(described_class::USAGE).to match(/\bregression\b/)
+  end
+end
+
+require "rails_helper"
+
+RSpec.describe TimekeepingDemo::CLI do
+  it "the default regression runner calls system with an argv array, the child state over the caller's, chdir root, and passes nil through" do
+    caller_env = { "TIMEKEEPING_OWNER_STATE" => "rollback", "KEEP_ME" => "x" }
+    # "The default runner, built by `CLI.run` from `root:` and `caller_env:`, uses `system(env, \"bundle\", \"exec\", \"rspec\", *argv, chdir: root)` with an argv array, never a shell string."
+    expect(described_class).to receive(:system)
+      .with({ "TIMEKEEPING_OWNER_STATE" => "legacy", "KEEP_ME" => "x" },
+            "bundle", "exec", "rspec", "spec/a b_spec.rb", "--tag", "~switches_owner", chdir: "/srv/app")
+      .and_return(nil)
+
+    runner = described_class.default_regression_runner(root: "/srv/app", caller_env:)
+    result = runner.call(env: { "TIMEKEEPING_OWNER_STATE" => "legacy" },
+                         argv: ["spec/a b_spec.rb", "--tag", "~switches_owner"])
+
+    # "Only `true` counts as a pass; `false` and `nil` (spawn failure, killed by a signal) fail."
+    expect(result).to be_nil
+    expect(caller_env).to eq("TIMEKEEPING_OWNER_STATE" => "rollback", "KEEP_ME" => "x")
+  end
+end
+
+RSpec.describe TimekeepingDemo::CLI do
+  # "Each child env sets `TIMEKEEPING_OWNER_STATE` to its state (overriding any caller value), `TIMEKEEPING_REGRESSION=1`,
+  # `TIMEKEEPING_LIVE=1`, and its own `TIMEKEEPING_QUEUE_LEDGER_PATH` in a fresh temp directory (a child rspec that
+  # inherits the parent's ledger path deletes the parent's ledger at suite start)."
+  it "regression overrides a caller TIMEKEEPING_OWNER_STATE per state and sends no owner state to the report pass" do
+    calls = []
+    runner = ->(env:, argv:) { calls << [env, argv] and true }
+
+    Dir.mktmpdir do |state_dir|
+      caller_env = { "TIMEKEEPING_OWNER_STATE" => "rollback", "TIMEKEEPING_QUEUE_LEDGER_PATH" => "/caller/ledger.json" }
+      expect do
+        described_class.run(["regression"], root: Rails.root.to_s, supervisor: double("timekeeping demo supervisor"),
+                                            state_dir:, caller_env:, regression_runner: runner)
+      end.to output.to_stdout
+
+      state_calls = calls.reject { |_env, argv| argv.include?("switches_owner") }
+      report_calls = calls.select { |_env, argv| argv.include?("switches_owner") }
+      expect(state_calls.map { |env, _argv| env["TIMEKEEPING_OWNER_STATE"] }).to eq(%w[legacy timekeeping rollback])
+      expect(report_calls.size).to eq(1)
+      # The child env is merged over the caller's, so the report pass must clear the key, not omit it or blank it.
+      report_env = caller_env.merge(report_calls.first.first)
+      expect(report_env["TIMEKEEPING_OWNER_STATE"]).to be_nil
+      expect(calls.map { |env, _argv| env["TIMEKEEPING_QUEUE_LEDGER_PATH"] }).not_to include("/caller/ledger.json")
+      expect(Dir.children(state_dir)).to be_empty
+    end
+  end
+end
+
+RSpec.describe TimekeepingDemo::CLI do
+  # "`CLI.run([\"nope\"])` returns 64 and calls neither the supervisor nor the runner"
+  it "an unknown verb or regression with an extra argument exits 64 and calls neither the supervisor nor the runner" do
+    [["nope"], %w[regression extra]].each do |argv|
+      Dir.mktmpdir do |dir|
+        state_dir = File.join(dir, "state")
+        status = nil
+
+        expect do
+          status = described_class.run(argv, root: Rails.root.to_s,
+                                             supervisor: double("timekeeping demo supervisor"),
+                                             regression_runner: double("regression runner"),
+                                             state_dir:)
+        end.to output(/regression/).to_stderr
+
+        expect(status).to eq(described_class::EX_USAGE)
+        expect(File.exist?(state_dir)).to be(false)
+      end
+    end
+  end
+end
