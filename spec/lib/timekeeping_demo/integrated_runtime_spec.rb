@@ -67,10 +67,14 @@ RSpec.describe IntegratedRuntime do
       env_before = ENV.to_h
       # The reset is not under test here; stubbing it makes sure the error comes from the launcher.
       allow(TimekeepingDatabaseReset).to receive(:reset!)
+      # A ledger of its own, so this fake boot never activates the suite's shared queue ledger.
+      ledger = instance_spy(TimekeepingQueueLedger::Session)
+      expect(TimekeepingQueueLedger.session).not_to receive(:activate!)
+      expect(TimekeepingQueueLedger.session).not_to receive(:open_window!)
 
       error = nil
       output = capture_harness_output do
-        described_class.start(root:, env:)
+        described_class.start(root:, env:, ledger:)
       rescue StandardError => e
         error = e
       end
@@ -88,6 +92,9 @@ RSpec.describe IntegratedRuntime do
       expect(output.include?(sentinel)).to be(false)
       expect(output.include?("PRIVATE KEY")).to be(false)
       expect(ENV.to_h == env_before).to be(true)
+      # "A suite with no active ledger runs unchanged": the injected ledger, not the shared one, opened the window.
+      expect(ledger).to have_received(:activate!)
+      expect(ledger).to have_received(:open_window!)
     end
   end
 

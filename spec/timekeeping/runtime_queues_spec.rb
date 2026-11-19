@@ -14,6 +14,7 @@ RSpec.describe "Timekeeping demo runtime queues", :two_tenant_seed, committed_da
     # A skipped example started nothing, and may run without a Timekeeping database.
     next unless ENV["TIMEKEEPING_LIVE"] == "1"
 
+    TestDatabaseCleanup.before_reset!
     queue_tables = ActiveRecord::Base.connection.tables.grep(/\Asolid_queue_/)
     ActiveRecord::Base.connection.execute("TRUNCATE #{queue_tables.join(', ')}") if queue_tables.any?
     timekeeping = PG.connect(ENV.fetch("TIMEKEEPING_DATABASE_URL"))

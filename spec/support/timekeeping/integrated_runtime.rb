@@ -47,7 +47,12 @@ class IntegratedRuntime
   # databases whose names do not end in _test, prepares and resets the
   # Timekeeping database, then starts the launcher and waits until both apps
   # answer. Anything that fails after the launcher started stops it first.
-  def self.start(root:, env:, owner_state: TimekeepingOwnerState::SELECTED)
+  #
+  # Just before the launcher starts, the queue ledger is activated and its two
+  # control jobs are enqueued, so stop! and every reset from here on record
+  # any job a non-dedicated worker ran. Tests that boot a fake launcher pass a ledger of
+  # their own, so the suite's shared ledger stays inactive.
+  def self.start(root:, env:, owner_state: TimekeepingOwnerState::SELECTED, ledger: TimekeepingQueueLedger.session)
     refuse_if_running!(root:)
     TestDatabaseGuard.require_test_database!(monolith_database_name)
     # The launcher's monolith prefers a caller DATABASE_URL over the test
@@ -60,11 +65,15 @@ class IntegratedRuntime
     clear_leftovers!(root)
     prepare_timekeeping!(root:, env:, credentials:, ports:)
     reset_timekeeping!(owner_state, env)
-    new(root:, env:, credentials:, ports:).tap(&:boot!)
+    ledger.activate!(env:)
+    ledger.open_window!
+    runtime = new(root:, env:, credentials:, ports:, ledger:)
+    ledger.register_runtime(root, runtime:)
+    runtime.tap(&:boot!)
   end
 
-  def self.run(root:, env:, owner_state: TimekeepingOwnerState::SELECTED)
-    runtime = start(root:, env:, owner_state:)
+  def self.run(root:, env:, owner_state: TimekeepingOwnerState::SELECTED, ledger: TimekeepingQueueLedger.session)
+    runtime = start(root:, env:, owner_state:, ledger:)
     yield runtime
   ensure
     runtime&.stop!
@@ -214,8 +223,9 @@ class IntegratedRuntime
                        :active_record_database_name, :free_port, :clear_leftovers!, :prepare_timekeeping!,
                        :wait_for_prepare, :reset_timekeeping!
 
-  def initialize(root:, env:, credentials:, ports:)
+  def initialize(root:, env:, credentials:, ports:, ledger: TimekeepingQueueLedger.session)
     @root = root
+    @ledger = ledger
     @env = env
     @credentials = credentials
     @ports = ports
@@ -248,6 +258,10 @@ class IntegratedRuntime
   # still alive and waits for them to be gone. Raises when a group outlives
   # the KILL, so no database reset runs beside it. Safe to call again: a call
   # after a full stop does nothing.
+  #
+  # Once every group is gone no worker can run another job, so the ledger
+  # collects and records the controls' status then. The control window stays
+  # open until the next reset checks the controls again.
   def stop!
     return if @stopped
 
@@ -260,6 +274,7 @@ class IntegratedRuntime
     raise BootError, "process groups of the demo runtime were still alive after KILL" unless gone
 
     @stopped = true
+    @ledger.after_stop!
   end
 
   def inspect
