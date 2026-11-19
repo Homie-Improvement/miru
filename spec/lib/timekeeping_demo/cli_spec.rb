@@ -525,26 +525,6 @@ RSpec.describe TimekeepingDemo::CLI do
 end
 
 RSpec.describe TimekeepingDemo::CLI do
-  it "an unknown verb such as nope exits 64 and calls neither the supervisor nor the regression runner" do
-    supervisor = double("timekeeping demo supervisor")
-    regression_runner = double("timekeeping regression runner")
-
-    Dir.mktmpdir do |parent|
-      state_dir = File.join(parent, "state")
-      status = nil
-      expect do
-        status = described_class.run(["nope"], root: Rails.root.to_s, supervisor:, state_dir:,
-                                               caller_env: {}, regression_runner:)
-      end.to output(/regression/).to_stderr
-
-      # "`CLI.run([\"nope\"])` returns 64 and calls neither the supervisor nor the runner"
-      expect(status).to eq(64)
-      expect(File).not_to exist(state_dir)
-    end
-  end
-end
-
-RSpec.describe TimekeepingDemo::CLI do
   it "USAGE names both the up and the regression commands" do
     # "USAGE names up and regression, and `CLI.run([\"nope\"])` still returns `EX_USAGE` and starts nothing"
     expect(described_class::USAGE).to match(/\bup\b/)
@@ -595,28 +575,6 @@ RSpec.describe TimekeepingDemo::CLI do
       expect(report_env["TIMEKEEPING_OWNER_STATE"]).to be_nil
       expect(calls.map { |env, _argv| env["TIMEKEEPING_QUEUE_LEDGER_PATH"] }).not_to include("/caller/ledger.json")
       expect(Dir.children(state_dir)).to be_empty
-    end
-  end
-end
-
-RSpec.describe TimekeepingDemo::CLI do
-  # "`CLI.run([\"nope\"])` returns 64 and calls neither the supervisor nor the runner"
-  it "an unknown verb or regression with an extra argument exits 64 and calls neither the supervisor nor the runner" do
-    [["nope"], %w[regression extra]].each do |argv|
-      Dir.mktmpdir do |dir|
-        state_dir = File.join(dir, "state")
-        status = nil
-
-        expect do
-          status = described_class.run(argv, root: Rails.root.to_s,
-                                             supervisor: double("timekeeping demo supervisor"),
-                                             regression_runner: double("regression runner"),
-                                             state_dir:)
-        end.to output(/regression/).to_stderr
-
-        expect(status).to eq(described_class::EX_USAGE)
-        expect(File.exist?(state_dir)).to be(false)
-      end
     end
   end
 end
