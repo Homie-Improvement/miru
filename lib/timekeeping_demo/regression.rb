@@ -88,7 +88,9 @@ module TimekeepingDemo
     def run_switches_owner_report(runner, specs)
       Dir.mktmpdir("timekeeping-regression-switches-owner") do |dir|
         out = File.join(dir, REPORT_FILE)
-        argv = [*specs, "--tag", SWITCHES_OWNER_TAG, "--format", "json", "--out", out]
+        # The json formatter replaces the default one, so progress is named
+        # again to keep rspec's failure details on stdout.
+        argv = [*specs, "--tag", SWITCHES_OWNER_TAG, "--format", "json", "--out", out, "--format", "progress"]
         passed = runner.call(env: child_env(dir, nil), argv:).equal?(true)
         ids = report_example_ids(out)
         puts REPORT_HEADING

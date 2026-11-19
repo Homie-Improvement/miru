@@ -467,31 +467,8 @@ end
 
 RSpec.describe TimekeepingDemo::CLI do
   it "regression calls the runner once per state, in order, with the full 12.1 list and never builds the supervisor" do
-    expected_specs = %w[
-      spec/models/timesheet_entry_spec.rb
-      spec/policies/timesheet_entry_policy_spec.rb
-      spec/requests/api/v1/timesheet_entries/bulk_actions/update_spec.rb
-      spec/requests/api/v1/timesheet_entries/bulk_actions/destroy_spec.rb
-      spec/requests/api/v1/timesheet_entry/index_spec.rb
-      spec/requests/api/v1/cli/timesheet_entries/create_spec.rb
-      spec/requests/api/v1/cli/timesheet_entries/update_spec.rb
-      spec/requests/api/v1/cli/timesheet_entries/destroy_spec.rb
-      spec/mcp/tools/write_tools_spec.rb
-      spec/mcp/idempotency_store_spec.rb
-      spec/requests/api/v1/agent/timesheet_entries/create_spec.rb
-      spec/requests/api/v1/invoices/create_spec.rb
-      spec/models/invoice_spec.rb
-      spec/models/invoice_line_item_spec.rb
-      spec/requests/api/v1/invoices/send_invoice_spec.rb
-      spec/system/invoices/send_invoice_spec.rb
-      spec/services/imports/harvest_time_entries_importer_spec.rb
-      spec/services/reports/time_entries/
-      spec/services/analytics/team_productivity_analytics_spec.rb
-      spec/services/metrics/data_builder_spec.rb
-      spec/characterization/invoice_entry_locking_spec.rb
-      spec/characterization/timesheet_entry_rules_spec.rb
-      spec/characterization/entry_lookups_and_pdf_totals_spec.rb
-    ]
+    # The literal 12.1 list, characterization specs included, is pinned in regression_spec.rb.
+    expected_specs = TimekeepingDemo::Regression::SPECS
     flags = ["--tag", "~switches_owner"]
     calls = []
     runner = lambda do |env:, argv:|

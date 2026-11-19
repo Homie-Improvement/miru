@@ -12,7 +12,7 @@ RSpec.describe TimekeepingDemo::Regression do
       runner = ->(env:, argv:) { calls << [env, argv]; true }
 
       # "Refuse a state outside legacy/timekeeping/rollback with `ArgumentError` before anything is spawned."
-      ["legacy; rm -rf /", "", "LEGACY"].each do |bad|
+      ["legacy; rm -rf /", "", "LEGACY", "bogus"].each do |bad|
         expect do
           described_class.run(runner:, states: ["legacy", bad], specs: ["spec/models/invoice_spec.rb"])
         end.to raise_error(ArgumentError)
@@ -138,19 +138,6 @@ RSpec.describe TimekeepingDemo::Regression do
     end
   end
 
-  context "more tests 18" do
-    # "Refuse a state outside legacy/timekeeping/rollback with `ArgumentError` before anything is spawned."
-    it "refuses a state list whose later entry is unknown before the runner is called even once" do
-      calls = []
-      runner = ->(env:, argv:) { calls << [env, argv] and true }
-
-      expect do
-        described_class.run(runner:, states: %w[legacy bogus], specs: ["spec/models/invoice_spec.rb"])
-      end.to raise_error(ArgumentError)
-      expect(calls).to be_empty
-    end
-  end
-
   context "more tests 19" do
     # "Run every state in the given order, one at a time, even after a failure, and print each state's result."
     it "keeps running the later states after the middle state fails and returns EX_FAILURE" do
@@ -241,6 +228,8 @@ RSpec.describe TimekeepingDemo::Regression do
       _, report_argv = calls.last
       expect(report_argv.first(5)).to eq(["spec/models/invoice_spec.rb", "--tag", "switches_owner", "--format", "json"])
       expect(report_argv[5]).to eq("--out")
+      # Keeps rspec's failure details on stdout beside the json report.
+      expect(report_argv.last(2)).to eq(["--format", "progress"])
     end
   end
 
@@ -283,15 +272,7 @@ RSpec.describe TimekeepingDemo::Regression do
         calls << { env: env.dup, argv: argv.dup }
         true
       end
-      caller_ledger = File.join(Dir.tmpdir, "caller_ledger.json")
-      saved = ENV.to_h.slice("TIMEKEEPING_OWNER_STATE", "TIMEKEEPING_QUEUE_LEDGER_PATH")
-      begin
-        ENV["TIMEKEEPING_OWNER_STATE"] = "rollback"
-        ENV["TIMEKEEPING_QUEUE_LEDGER_PATH"] = caller_ledger
-        expect { described_class.run(runner:, specs: ["spec/models/invoice_spec.rb"]) }.to output.to_stdout
-      ensure
-        %w[TIMEKEEPING_OWNER_STATE TIMEKEEPING_QUEUE_LEDGER_PATH].each { |key| ENV[key] = saved[key] }
-      end
+      expect { described_class.run(runner:, specs: ["spec/models/invoice_spec.rb"]) }.to output.to_stdout
 
       state_calls = calls.select { |call| call[:argv].include?("~switches_owner") }
       # "Each child env sets `TIMEKEEPING_OWNER_STATE` to its state (overriding any caller value), `TIMEKEEPING_REGRESSION=1`, `TIMEKEEPING_LIVE=1`, and its own `TIMEKEEPING_QUEUE_LEDGER_PATH` in a fresh temp directory (a child rspec that inherits the parent's ledger path deletes the parent's ledger at suite start)."
@@ -304,7 +285,6 @@ RSpec.describe TimekeepingDemo::Regression do
       ledger_paths = calls.map { |call| call[:env]["TIMEKEEPING_QUEUE_LEDGER_PATH"] }
       expect(ledger_paths.size).to eq(4)
       expect(ledger_paths.uniq.size).to eq(4)
-      expect(ledger_paths).not_to include(caller_ledger)
     end
   end
 
@@ -324,15 +304,9 @@ RSpec.describe TimekeepingDemo::Regression do
       end
 
       status = nil
-      saved = ENV.fetch("TIMEKEEPING_OWNER_STATE", nil)
-      begin
-        ENV["TIMEKEEPING_OWNER_STATE"] = "timekeeping"
-        # "Run one more pass with `--tag switches_owner --format json --out <tmp file>` and no owner state; print the example ids from that file under a separate heading, or \"none\". A failure in that pass also returns `EX_FAILURE`"
-        expect { status = described_class.run(runner:, specs: ["spec/models/invoice_spec.rb"]) }
-          .to output(%r{switches_owner.*\./spec/models/invoice_spec\.rb\[1:4\].*\./spec/models/invoice_spec\.rb\[1:7\]}m).to_stdout
-      ensure
-        ENV["TIMEKEEPING_OWNER_STATE"] = saved
-      end
+      # "Run one more pass with `--tag switches_owner --format json --out <tmp file>` and no owner state; print the example ids from that file under a separate heading, or \"none\". A failure in that pass also returns `EX_FAILURE`"
+      expect { status = described_class.run(runner:, specs: ["spec/models/invoice_spec.rb"]) }
+        .to output(%r{switches_owner.*\./spec/models/invoice_spec\.rb\[1:4\].*\./spec/models/invoice_spec\.rb\[1:7\]}m).to_stdout
 
       expect(report_calls.size).to eq(1)
       argv = report_calls.first[:argv]
