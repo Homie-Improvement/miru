@@ -110,3 +110,69 @@ RSpec.describe "Seed refusal once a Timekeeping handoff has begun" do
     end
   end
 end
+
+RSpec.describe "Seed refusal while the monolith admission fence is set" do
+  before { allow($stdout).to receive(:write) }
+
+  # "A spec shows that the seed refusal and the users controller's `unless_handoff_begun` either refuse
+  # while `admission_fenced_at` is set or are documented as deliberately exempt, and states whether seed
+  # runs hold the ownership row FOR SHARE through their writes."
+  it "timesheet_data refuses on a fenced-only ownership row, writes no company and leaves the ownership row as fenced" do
+    fenced_at = Time.current.change(usec: 0)
+    TimekeepingOwnership.current.update_columns(
+      generation: 1, handoff_step: nil, owner: "monolith", monolith_store: "legacy", admission_fenced_at: fenced_at
+    )
+    company_baseline = Company.count
+
+    expect { load Rails.root.join("db/seeds/timesheet_data.rb") }
+      .to raise_error(TimekeepingOwnership::HandoffBegun)
+
+    expect(Company.count).to eq(company_baseline)
+    expect(Company.exists?(name: "Test Company")).to be(false)
+    expect(TimekeepingOwnership.pluck(:generation, :handoff_step, :owner, :monolith_store))
+      .to eq([[1, nil, "monolith", "legacy"]])
+    expect(TimekeepingOwnership.current.admission_fenced_at).to eq(fenced_at)
+  end
+end
+
+RSpec.describe "Seed refusal once a Timekeeping handoff has begun" do
+  before { allow($stdout).to receive(:write) }
+
+  # "A spec shows that the seed refusal ... either refuse while `admission_fenced_at` is set or are
+  # documented as deliberately exempt". The plan chooses refusal for db/seeds.rb and timesheet_data.rb.
+  it "both seed files refuse on a row fenced by the admission adapter before any company write and leave the fence mark in place" do
+    company = create(:company, name: "Fork & Leaf Salads", business_phone: "+1 2025550123")
+    TimekeepingOwnership.current.update_columns(generation: 1, handoff_step: nil, owner: "monolith",
+                                                monolith_store: "legacy", admission_fenced_at: Time.current)
+    baseline = company.reload.attributes
+    company_count = Company.count
+
+    expect { load Rails.root.join("db/seeds.rb") }.to raise_error(TimekeepingOwnership::HandoffBegun)
+    expect { load Rails.root.join("db/seeds/timesheet_data.rb") }.to raise_error(TimekeepingOwnership::HandoffBegun)
+
+    expect(company.reload.attributes).to eq(baseline)
+    expect(Company.count).to eq(company_count)
+    expect(Company.exists?(name: "Test Company")).to be(false)
+    expect(TimekeepingOwnership.pluck(:generation, :handoff_step, :owner, :monolith_store))
+      .to eq([[1, nil, "monolith", "legacy"]])
+    expect(TimekeepingOwnership.current.admission_fenced_at).not_to be_nil
+  end
+
+  # An aborted handoff admits the monolith again, which clears the fence mark and returns the row to its
+  # initial state, so seeding is allowed again without a demo reset.
+  it "timesheet_data refuses on a fenced-only row and gets past the ownership check once admit clears the mark" do
+    create(:company, name: "Test Company")
+    TimekeepingOwnership.current.update_columns(generation: 1, handoff_step: nil, owner: "monolith",
+                                                monolith_store: "legacy", admission_fenced_at: Time.current)
+
+    expect { load Rails.root.join("db/seeds/timesheet_data.rb") }.to raise_error(TimekeepingOwnership::HandoffBegun)
+
+    Timekeeping::Handoff::MonolithAdmission.new.admit(generation: 1)
+    expect(TimekeepingOwnership.current.admission_fenced_at).to be_nil
+
+    # As in the initial-state example: the script fails when it creates the company's address, which
+    # proves the ownership check let it through to its writes.
+    expect { load Rails.root.join("db/seeds/timesheet_data.rb") }
+      .to raise_error(ActiveRecord::RecordInvalid, /Address type has already been taken/)
+  end
+end

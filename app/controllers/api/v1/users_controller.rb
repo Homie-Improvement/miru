@@ -64,9 +64,10 @@ class Api::V1::UsersController < Api::V1::BaseController
       return
     end
 
-    # Once a timekeeping handoff has begun, the hard delete is refused. The
-    # audit row and the delete run under the ownership row's share lock, so a
-    # handoff cannot begin between the check and the delete.
+    # Once a timekeeping handoff has begun, including while the monolith's
+    # admission fence is set, the hard delete is refused. The audit row and
+    # the delete run under the ownership row's share lock, so neither the
+    # fence nor a handoff step can land between the check and the delete.
     deleted = TimekeepingOwnership.unless_handoff_begun do
       Audited::Audit.create!(
         auditable: target_user,
