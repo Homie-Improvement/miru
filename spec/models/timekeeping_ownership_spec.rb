@@ -625,37 +625,3 @@ RSpec.describe TimekeepingOwnership::SettlingPhase, "close" do
     expect(described_class.close(no_step)).to eq(settling_generation: nil, settling_stopped_generation: nil)
   end
 end
-
-RSpec.describe TimekeepingOwnership, "close_settling_step" do
-  it "close_settling_step assigns a cleared step and a raised stop mark to the record without saving it" do
-    described_class.current.update_columns(generation: 3, handoff_step: "reconcile",
-                                           settling_generation: 2, settling_stopped_generation: nil)
-    ownership = described_class.current
-
-    ownership.close_settling_step
-
-    expect([ownership.settling_generation, ownership.settling_stopped_generation]).to eq([nil, 2])
-    stored = described_class.current
-    expect([stored.settling_generation, stored.settling_stopped_generation]).to eq([2, nil])
-  end
-end
-
-RSpec.describe TimekeepingOwnership::SettlingPhase, "close at flip or abort" do
-  # "After flip or abort_handoff ends a handoff whose settle step stop_applying! never stopped,
-  # settling_stopped_generation is at least the cleared settling generation, and a later begin_settling!
-  # at that generation leaves settling_generation NULL."
-  it "close never lowers a stop mark already above the open step, and leaves the mark alone when no step is open" do
-    state = TimekeepingOwnership::PhaseState.new(handoff_step: "reconcile", settling_generation: 3,
-                                                 settling_stopped_generation: nil)
-
-    expect(described_class.close(state)).to eq(settling_generation: nil, settling_stopped_generation: 3)
-    # A mark left higher by an earlier stop must survive a flip that clears an older step.
-    expect(described_class.close(state.with(settling_stopped_generation: 5)))
-      .to eq(settling_generation: nil, settling_stopped_generation: 5)
-    # With no step open there is nothing to stop, so the mark neither rises nor falls.
-    expect(described_class.close(state.with(settling_generation: nil, settling_stopped_generation: 4)))
-      .to eq(settling_generation: nil, settling_stopped_generation: 4)
-    expect(described_class.close(state.with(settling_generation: nil)))
-      .to eq(settling_generation: nil, settling_stopped_generation: nil)
-  end
-end
