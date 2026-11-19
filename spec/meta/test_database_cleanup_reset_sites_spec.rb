@@ -57,9 +57,24 @@ module TestDatabaseCleanupResetSiteScan
     end
   end
 
+  # Returns the number of the first line of each statement that matches.
   def matching_lines(text, pattern)
-    text.each_line.with_index(1).filter_map do |line, number|
-      number if !line.lstrip.start_with?("#") && line.match?(pattern)
+    statements(text).filter_map do |number, statement|
+      number if !statement.lstrip.start_with?("#") && statement.match?(pattern)
+    end
+  end
+
+  # Joins a method chain split across lines (a line that starts with ".")
+  # onto the line its receiver is on, so SolidQueue::Job.where(...) followed
+  # by .delete_all on the next line is matched as one call. A comment line is
+  # never a receiver, so a chain is not hidden behind one.
+  def statements(text)
+    text.each_line.with_index(1).each_with_object([]) do |(line, number), joined|
+      if line.lstrip.start_with?(".") && joined.any? && !joined.last[1].lstrip.start_with?("#")
+        joined.last[1] = "#{joined.last[1].rstrip} #{line.strip}"
+      else
+        joined << [number, line.chomp]
+      end
     end
   end
 
@@ -155,6 +170,26 @@ RSpec.describe TestDatabaseCleanupResetSiteScan do
       .to eq(["Solid Queue model delete: spec/fixtures/timekeeping_harness/queue_ledger_rows_probe.rb:5"])
   end
 
+  it "reports a Solid Queue delete chain split across lines at its receiver's line" do
+    sources = { "spec/support/new_reset.rb" => "x = 1\nSolidQueue::Job.where.not(finished_at: nil)\n  .delete_all\n" }
+
+    expect(described_class.offenses(sources)).to eq(["Solid Queue model delete: spec/support/new_reset.rb:2"])
+  end
+
+  # An allowance that no longer matches anything would let a new site take
+  # its place unnoticed, so each allowed file must still hold exactly that many.
+  it "finds exactly the allowed number of matches in each allowed file" do
+    sources = described_class.spec_sources(skip: __FILE__)
+    counts = described_class::RULES.flat_map do |rule|
+      rule.allowed.map do |path, allowed|
+        [rule.name, path, described_class.matching_lines(sources.fetch(path), rule.pattern).size, allowed]
+      end
+    end
+
+    expect(counts.map { |name, path, found, _allowed| [name, path, found] })
+      .to eq(counts.map { |name, path, _found, allowed| [name, path, allowed] })
+  end
+
   it "ignores words and symbols that only look like truncate" do
     text = "truncate_tables(connection)\nsteps << :truncate }\nit \"truncates long names\" do\n" \
            "expect(steps).to eq(%i[truncate clean_monolith example])\n"
@@ -210,57 +245,6 @@ RSpec.describe TestDatabaseCleanup do
         [:deletion, { except: %w[ar_internal_metadata schema_migrations] }],
         [:deletion, { except: %w[ar_internal_metadata schema_migrations], pre_count: true, reset_ids: false }]
       ])
-    end
-  end
-
-  context "more tests 18" do
-    # "Every monolith truncate and delete site calls one TestDatabaseCleanup wrapper that runs before_reset! and then DatabaseCleaner.clean_with, and no site calls before_reset! on its own."
-    it "no spec file outside the Timekeeping database reset calls the collect hook or DatabaseCleaner.clean_with directly" do
-      hook_call = ["TestDatabaseCleanup", "before_reset!"].join(".")
-      clean_call = ["DatabaseCleaner", "clean_with"].join(".")
-      timekeeping_reset = "spec/support/timekeeping/timekeeping_database_reset.rb"
-      hook_callers = []
-      clean_callers = []
-
-      Dir.glob(Rails.root.join("spec/**/*.rb")).each do |path|
-        next if File.expand_path(path) == File.expand_path(__FILE__)
-
-        relative = Pathname(path).relative_path_from(Rails.root).to_s
-        File.foreach(path).with_index(1) do |line, number|
-          hook_callers << "#{relative}:#{number}" if line.include?(hook_call) && relative != timekeeping_reset
-          clean_callers << relative if line.include?(clean_call)
-        end
-      end
-
-      expect(hook_callers).to eq([])
-      expect(clean_callers).to eq(["spec/support/database_cleaner.rb"])
-    end
-  end
-
-  context "more tests 19" do
-    # "A new truncate site that leaves out the call erases executions with no record, and nothing catches it."
-    it "no spec file truncates monolith tables with raw SQL outside the two Timekeeping database truncates" do
-      # SQL statements only, so method names such as truncate_tables, symbols
-      # such as :truncate and words such as "truncated" are not counted.
-      raw_truncate = TestDatabaseCleanupResetSiteScan::RULES.find { |rule| rule.name == "raw SQL truncate" }.pattern
-      raw_queue_delete = TestDatabaseCleanupResetSiteScan::RULES.find { |rule| rule.name == "raw SQL queue delete" }.pattern
-      counts = Hash.new(0)
-
-      Dir.glob(Rails.root.join("spec/**/*.rb")).each do |path|
-        next if File.expand_path(path) == File.expand_path(__FILE__)
-
-        relative = Pathname(path).relative_path_from(Rails.root).to_s
-        File.foreach(path) do |line|
-          next if line.lstrip.start_with?("#")
-
-          counts[relative] += 1 if line.match?(raw_truncate) || line.match?(raw_queue_delete)
-        end
-      end
-
-      expect(counts).to eq(
-        "spec/support/timekeeping/timekeeping_database_reset.rb" => 1,
-        "spec/timekeeping/runtime_queues_spec.rb" => 1
-      )
     end
   end
 
