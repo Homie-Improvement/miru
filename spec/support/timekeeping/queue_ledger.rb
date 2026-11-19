@@ -412,14 +412,36 @@ module TimekeepingQueueLedger
       end
   end
 
-  DEFAULT_PATH = "tmp/timekeeping-integration/queue_ledger.json"
+  LEDGER_DIR = "tmp/timekeeping-integration"
+  LEDGER_NAME = "queue_ledger"
+  DEFAULT_PATH = "#{LEDGER_DIR}/#{LEDGER_NAME}.json".freeze
   PATH_KEY = "TIMEKEEPING_QUEUE_LEDGER_PATH"
+  # parallel_tests gives its first process an empty number and the others "2", "3" and so on.
+  PROCESS_NUMBER_KEY = "TEST_ENV_NUMBER"
+  PROCESS_NUMBER = /\A[1-9]\d*\z/
 
   module_function
 
+  # An explicit override is used exactly as written, so a spec that hands a
+  # child process its own file reads back that same file. Otherwise every
+  # parallel process gets its own default file, because each one deletes its
+  # ledger at suite start.
   def ledger_path(env = ENV)
     override = env[PATH_KEY].to_s
-    override.strip.empty? ? Rails.root.join(DEFAULT_PATH).to_s : override
+    return override unless override.strip.empty?
+
+    Rails.root.join(default_ledger_file(env[PROCESS_NUMBER_KEY].to_s)).to_s
+  end
+
+  # The number becomes part of a path the suite-start hook deletes, so anything
+  # but a positive integer is refused rather than allowed to name another file.
+  def default_ledger_file(process_number)
+    return DEFAULT_PATH if process_number.empty?
+    unless PROCESS_NUMBER.match?(process_number)
+      raise ArgumentError, "#{PROCESS_NUMBER_KEY} must be empty or a positive integer, got #{process_number.inspect}"
+    end
+
+    File.join(LEDGER_DIR, "#{LEDGER_NAME}.#{process_number}.json")
   end
 
   # The process-wide session the cleaner hooks and the integrated runtime use.
