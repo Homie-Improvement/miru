@@ -118,10 +118,15 @@ module TimekeepingQueueLedger
     [record.database, record.kind, record.active_job_id, record.execution_id]
   end
 
-  # A later check of the same control replaces the earlier one.
+  # A later check of the same control replaces the earlier one, except that a
+  # recorded failure (ran or missing) is never overwritten: a control put back
+  # after it went missing must still fail the run.
   def merge_controls(stored, added)
     by_id = stored.index_by(&:active_job_id)
-    added.each { |control| by_id[control.active_job_id] = control }
+    added.each do |control|
+      earlier = by_id[control.active_job_id]
+      by_id[control.active_job_id] = control unless earlier&.status && earlier.status != UNRUN
+    end
     by_id.values
   end
   private_class_method :control_failure, :execution_failure, :ledger_shape?, :json_fields, :record_key,
@@ -288,7 +293,6 @@ module TimekeepingQueueLedger
       @collectors = collectors
       @live = live
       @active = false
-      @collecting = false
       @env = {}.freeze
       @runtime_roots = []
       @runtimes = []
@@ -301,14 +305,11 @@ module TimekeepingQueueLedger
       @active
     end
 
-    # Active means the end of the suite judges the ledger. Collecting lasts
-    # only from activation to the first reset after it, because no worker runs
-    # once that reset has confirmed no runtime is live. Later specs then leave
-    # their own deliberately finished or failed jobs out of the ledger.
+    # Once active, the ledger stays active for the rest of the suite: every
+    # later reset collects, and the end of the suite judges what it recorded.
     def activate!(env:)
       @env = env.to_h.freeze
       @active = true
-      @collecting = true
       nil
     end
 
@@ -347,17 +348,15 @@ module TimekeepingQueueLedger
     # The live check comes first: collecting or deleting beside a running
     # worker would race it.
     def before_reset!
-      return nil unless @collecting
+      return nil unless active?
       raise LiveRuntimeDuringReset, "a demo runtime is still live; refusing to reset its databases" if @live.call
 
       collect!
       close_window!
-      @collecting = false
-      nil
     end
 
     def collect!
-      return nil unless @collecting
+      return nil unless active?
 
       write_ledger(records: @collectors.flat_map { |_database, collector| collector.call }, controls: [])
     end

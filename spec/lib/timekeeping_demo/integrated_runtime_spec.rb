@@ -69,6 +69,8 @@ RSpec.describe IntegratedRuntime do
       allow(TimekeepingDatabaseReset).to receive(:reset!)
       # A ledger of its own, so this fake boot never activates the suite's shared queue ledger.
       ledger = instance_spy(TimekeepingQueueLedger::Session)
+      expect(TimekeepingQueueLedger.session).not_to receive(:activate!)
+      expect(TimekeepingQueueLedger.session).not_to receive(:open_window!)
 
       error = nil
       output = capture_harness_output do
@@ -90,6 +92,9 @@ RSpec.describe IntegratedRuntime do
       expect(output.include?(sentinel)).to be(false)
       expect(output.include?("PRIVATE KEY")).to be(false)
       expect(ENV.to_h == env_before).to be(true)
+      # "A suite with no active ledger runs unchanged": the injected ledger, not the shared one, opened the window.
+      expect(ledger).to have_received(:activate!)
+      expect(ledger).to have_received(:open_window!)
     end
   end
 
@@ -596,34 +601,5 @@ RSpec.describe IntegratedRuntime do
       .to raise_error(TestDatabaseGuard::NotATestDatabase, /timekeeping_development/)
     expect(Process).not_to have_received(:spawn)
     expect(TimekeepingDatabaseReset).not_to have_received(:reset!)
-  end
-end
-
-RSpec.describe IntegratedRuntime do
-  before { allow(described_class).to receive(:monolith_database_name).and_return("miru_web_test") }
-
-  it "start with an isolated ledger raises the launcher boot error and never activates the shared ledger" do
-    Dir.mktmpdir("integrated-runtime-ledger-root") do |root|
-      FileUtils.cp(Rails.root.join("Procfile.timekeeping"), root)
-      FileUtils.mkdir_p(File.join(root, "bin"))
-      FileUtils.mkdir_p(File.join(root, "timekeeping", "bin"))
-      File.write(File.join(root, "timekeeping", "Gemfile"), "")
-      File.write(File.join(root, "timekeeping", "bin", "rails"), "#!/bin/sh\nexit 0\n")
-      File.write(File.join(root, "bin", "timekeeping-demo"), "#!/bin/sh\nexit 1\n")
-      FileUtils.chmod(0o755, [File.join(root, "bin", "timekeeping-demo"), File.join(root, "timekeeping", "bin", "rails")])
-      env = ENV.to_h.merge(
-        "DATABASE_URL" => "postgres://monolith_harness_user@127.0.0.1:5432/miru_harness_test",
-        "TIMEKEEPING_DATABASE_URL" => "postgres://timekeeping_harness_user@127.0.0.1:5432/timekeeping_harness_missing_test"
-      )
-      allow(TimekeepingDatabaseReset).to receive(:reset!)
-      ledger = instance_spy(TimekeepingQueueLedger::Session)
-      expect(TimekeepingQueueLedger.session).not_to receive(:activate!)
-      expect(TimekeepingQueueLedger.session).not_to receive(:open_window!)
-
-      # "A suite with no active ledger runs unchanged"
-      expect { described_class.start(root:, env:, ledger:) }.to raise_error(IntegratedRuntime::BootError)
-      expect(ledger).to have_received(:activate!)
-      expect(ledger).to have_received(:open_window!)
-    end
   end
 end

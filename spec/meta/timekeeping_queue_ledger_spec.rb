@@ -6,6 +6,18 @@ require "open3"
 require "securerandom"
 require "tmpdir"
 
+# These examples finish, claim and fail default-queue jobs on purpose. They
+# delete those rows themselves, before the cleaner's reset runs, so a suite
+# ledger left active by an earlier live runtime never records them as a stray
+# worker's executions.
+RSpec.shared_context "queue ledger spec Solid Queue rows" do
+  after do
+    connection = SolidQueue::Record.connection
+    tables = connection.tables.grep(/\Asolid_queue_/)
+    connection.execute("TRUNCATE #{tables.join(', ')}") if tables.any?
+  end
+end
+
 RSpec.describe "Timekeeping queue ledger file contents" do
   # "Record only the database, queue, job class, execution kind, ids and timestamps, never job arguments or credentials."
   it "a written ledger record holds only the database, queue, job class, kind, ids and timestamps and no job arguments or error text" do
@@ -720,29 +732,51 @@ end
 
 
 RSpec.describe TimekeepingQueueLedger::Session do
-  # A spec that runs after a stopped runtime may finish or fail default jobs on purpose; no worker ran them.
-  it "stops collecting after the first reset that follows activation, so later specs' own job rows are not recorded" do
-    stray = TimekeepingQueueLedger::Record.new(
-      database: "monolith", queue: "default", job_class: "QueueLedgerLaterSpecJob", kind: "completed", job_id: 9,
-      active_job_id: SecureRandom.uuid, execution_id: nil, created_at: Time.current, finished_at: Time.current
-    )
+  # "Before every database reset, and once after the workers stop, it collects ..."
+  it "keeps collecting at every later reset and at teardown, and keeps the live-runtime check" do
+    stray = lambda do |job_class|
+      TimekeepingQueueLedger::Record.new(
+        database: "monolith", queue: "default", job_class:, kind: "completed", job_id: 9,
+        active_job_id: SecureRandom.uuid, execution_id: nil, created_at: Time.current, finished_at: Time.current
+      )
+    end
     found = []
+    live = false
 
-    Dir.mktmpdir("queue-ledger-disarm") do |dir|
+    Dir.mktmpdir("queue-ledger-armed") do |dir|
       session = described_class.new(path: File.join(dir, "queue_ledger.json"),
-                                    collectors: { "monolith" => -> { found.dup } }, live: -> { false })
+                                    collectors: { "monolith" => -> { found.dup } }, live: -> { live })
       session.activate!(env: {})
       session.before_reset!
-      found << stray
+      found << stray.call("QueueLedgerSecondResetJob")
       session.before_reset!
+      found.replace([stray.call("QueueLedgerTeardownJob")])
 
-      expect { session.finish! }.not_to raise_error
-      expect(TimekeepingQueueLedger.parse(File.read(session.path))[:records]).to eq([])
+      live = true
+      expect { session.before_reset! }.to raise_error(TimekeepingQueueLedger::LiveRuntimeDuringReset)
+      live = false
 
-      session.activate!(env: {})
-      session.before_reset!
+      expect { session.finish! }.to raise_error(TimekeepingQueueLedger::RunFailed) { |error|
+        expect(error.message).to include("QueueLedgerSecondResetJob")
+        expect(error.message).to include("QueueLedgerTeardownJob")
+      }
+    end
+  end
 
-      expect { session.finish! }.to raise_error(TimekeepingQueueLedger::RunFailed, /QueueLedgerLaterSpecJob/)
+  # "An `after(:suite)` hook ... fails the run on any recorded execution or missing control."
+  it "a control recorded missing stays missing when a later check finds it unrun" do
+    Dir.mktmpdir("queue-ledger-sticky-missing") do |dir|
+      path = File.join(dir, "queue_ledger.json")
+      control = TimekeepingQueueLedger::Control.new(queue: "default", job_class: "UpdateInvoiceStatusToOverdueJob",
+                                                    job_id: 1, active_job_id: SecureRandom.uuid, status: "missing")
+      TimekeepingQueueLedger.write(path, records: [], controls: [control])
+      TimekeepingQueueLedger.write(path, records: [], controls: [control.with(status: "unrun")])
+
+      stored = TimekeepingQueueLedger.parse(File.read(path))
+      expect(stored[:controls].map(&:status)).to eq(["missing"])
+      verdict = TimekeepingQueueLedger.verdict(records: stored[:records], controls: stored[:controls],
+                                               dedicated_queues: TimekeepingQueueLedger::DEDICATED_QUEUES)
+      expect(verdict.passed?).to be(false)
     end
   end
 end
@@ -793,6 +827,8 @@ end
 
 
 RSpec.describe TimekeepingQueueLedger::Session, :without_transaction do
+  include_context "queue ledger spec Solid Queue rows"
+
   # "In each window between resets it enqueues one `default` and one `billing_sync` control job. Before the reset it checks that both still exist and have not run."
   it "a default control that finishes between resets fails finish! even when no collector reports it" do
     Dir.mktmpdir("queue-ledger-control-ran") do |dir|
@@ -812,6 +848,8 @@ end
 
 
 RSpec.describe TimekeepingQueueLedger::Session, :without_transaction do
+  include_context "queue ledger spec Solid Queue rows"
+
   # "Before the reset it checks that both still exist and have not run."
   # "A missing control or an unparsable tmp/timekeeping-integration/queue_ledger.json fails the suite"
   it "a control seen unrun at stop and deleted before the reset still fails finish! as missing" do
@@ -832,6 +870,8 @@ end
 
 
 RSpec.describe TimekeepingQueueLedger::Session, :without_transaction do
+  include_context "queue ledger spec Solid Queue rows"
+
   # "A job enqueued by other code never stands in for a control."
   it "another code's unrun default job does not stand in for a deleted default control at the reset check" do
     Dir.mktmpdir("queue-ledger-stand-in") do |dir|
@@ -902,7 +942,35 @@ end
 
 
 RSpec.describe TimekeepingQueueLedger::Session, :without_transaction do
+  include_context "queue ledger spec Solid Queue rows"
+
   # "Use `ActiveJob::QueueAdapters::SolidQueueAdapter.new.enqueue`, with `UpdateInvoiceStatusToOverdueJob` on `default` and `SyncStripeSubscriptionCompanyJob` on `billing_sync`."
+  it "open_window! inside a transaction that is rolled back leaves both controls committed and visible elsewhere" do
+    Dir.mktmpdir("queue-ledger-open-window-rollback") do |dir|
+      path = File.join(dir, "queue_ledger.json")
+      session = described_class.new(path:, collectors: {}, live: -> { false })
+      session.activate!(env: {})
+      ActiveRecord::Base.transaction do
+        session.open_window!
+        raise ActiveRecord::Rollback
+      end
+
+      other = SolidQueue::Record.connection_pool.db_config.new_connection
+      begin
+        classes = other.select_values(<<~SQL)
+          SELECT class_name FROM solid_queue_jobs
+          WHERE class_name IN ('UpdateInvoiceStatusToOverdueJob', 'SyncStripeSubscriptionCompanyJob')
+        SQL
+      ensure
+        other.disconnect!
+      end
+      expect(classes).to contain_exactly("UpdateInvoiceStatusToOverdueJob", "SyncStripeSubscriptionCompanyJob")
+
+      session.before_reset!
+      expect(TimekeepingQueueLedger.parse(File.read(path))[:controls].map(&:status)).to eq(%w[unrun unrun])
+    end
+  end
+
   it "open_window! commits one default and one billing_sync control that a clean reset records as unrun" do
     Dir.mktmpdir("queue-ledger-open-window") do |dir|
       path = File.join(dir, "queue_ledger.json")
@@ -926,6 +994,8 @@ end
 
 
 RSpec.describe TimekeepingQueueLedger::Session, :without_transaction do
+  include_context "queue ledger spec Solid Queue rows"
+
   # "Before the reset it checks that both still exist and have not run."
   it "a billing_sync control with a claimed execution and a default control with a failed execution both check as ran" do
     Dir.mktmpdir("queue-ledger-claimed-failed") do |dir|
@@ -952,6 +1022,8 @@ end
 
 
 RSpec.describe TimekeepingQueueLedger::MonolithCollector, :without_transaction do
+  include_context "queue ledger spec Solid Queue rows"
+
   # "it collects claimed, completed and failed Solid Queue executions on any queue other than the dedicated ones"
   it "returns a finished default job and ignores a ready one" do
     adapter = ActiveJob::QueueAdapters::SolidQueueAdapter.new
