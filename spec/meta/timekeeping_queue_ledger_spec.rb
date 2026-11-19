@@ -297,7 +297,7 @@ RSpec.describe TimekeepingQueueLedger::Session do
   describe "#before_reset!" do
     # "A suite with no active ledger runs unchanged"
     # "As a backstop, it raises if a runtime is still live during a reset."
-    it "does nothing while the session is inactive and raises LiveRuntimeDuringReset before collecting while a runtime is live" do
+    it "does nothing while inactive, raises LiveRuntimeDuringReset at any reset while a runtime is live, and still judges the run at teardown" do
       untouchable = Class.new(BasicObject) do
         def method_missing(name, *) = ::Kernel.raise("collector used: #{name}")
         def respond_to_missing?(*) = true
@@ -326,39 +326,29 @@ RSpec.describe TimekeepingQueueLedger::Session do
         expect(used).to eq([])
         expect(File.exist?(live_path)).to be(false)
 
-        # The live check must hold at every reset, not only the first.
+        # "Before every database reset, and once after the workers stop, it collects ..."
+        # The live check holds at every reset, and a refused reset leaves the session judging the run at teardown.
+        stray = lambda do |job_class|
+          TimekeepingQueueLedger::Record.new(
+            database: "monolith", queue: "default", job_class:, kind: "completed", job_id: 9,
+            active_job_id: SecureRandom.uuid, execution_id: nil, created_at: Time.current, finished_at: Time.current
+          )
+        end
+        found = []
         runtime_live = false
-        later = described_class.new(path: File.join(dir, "later_ledger.json"),
-                                    collectors: { "monolith" => -> { [] } }, live: -> { runtime_live })
-        later.activate!(env: {})
-        later.before_reset!
-        later.before_reset!
-        runtime_live = true
-
-        expect { later.before_reset! }.to raise_error(TimekeepingQueueLedger::LiveRuntimeDuringReset)
-      end
-    end
-
-    # "Before every database reset, and once after the workers stop, it collects ..."
-    it "keeps collecting at every later reset and at teardown" do
-      stray = lambda do |job_class|
-        TimekeepingQueueLedger::Record.new(
-          database: "monolith", queue: "default", job_class:, kind: "completed", job_id: 9,
-          active_job_id: SecureRandom.uuid, execution_id: nil, created_at: Time.current, finished_at: Time.current
-        )
-      end
-      found = []
-
-      Dir.mktmpdir("queue-ledger-armed") do |dir|
-        session = described_class.new(path: File.join(dir, "queue_ledger.json"),
-                                      collectors: { "monolith" => -> { found.dup } }, live: -> { false })
-        session.activate!(env: {})
-        session.before_reset!
+        armed = described_class.new(path: File.join(dir, "armed_ledger.json"),
+                                    collectors: { "monolith" => -> { found.dup } }, live: -> { runtime_live })
+        armed.activate!(env: {})
+        armed.before_reset!
         found << stray.call("QueueLedgerSecondResetJob")
-        session.before_reset!
+        armed.before_reset!
         found.replace([stray.call("QueueLedgerTeardownJob")])
 
-        expect { session.finish! }.to raise_error(TimekeepingQueueLedger::RunFailed) { |error|
+        runtime_live = true
+        expect { armed.before_reset! }.to raise_error(TimekeepingQueueLedger::LiveRuntimeDuringReset)
+        runtime_live = false
+
+        expect { armed.finish! }.to raise_error(TimekeepingQueueLedger::RunFailed) { |error|
           expect(error.message).to include("QueueLedgerSecondResetJob")
           expect(error.message).to include("QueueLedgerTeardownJob")
         }
