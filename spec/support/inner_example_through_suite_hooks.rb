@@ -5,14 +5,16 @@
 module InnerExampleThroughSuiteHooks
   # Runs one inner example with the suite's registered hooks, in a group the
   # surrounding run does not report, and returns its execution result.
-  def run_inner_example_through_suite_hooks(metadata, &body)
+  # metadata tags the group; example_metadata tags the example alone, so it
+  # can override what the example would inherit from the group.
+  def run_inner_example_through_suite_hooks(metadata, example_metadata = {}, &body)
     inner_results = []
     listener = Object.new
     listener.define_singleton_method(:example_finished) { |notification| inner_results << notification.example.execution_result }
     reporter = RSpec::Core::Reporter.new(RSpec::Core::Configuration.new)
     reporter.register_listener(listener, :example_finished)
     group = RSpec::Core::ExampleGroup.subclass(RSpec::Core::ExampleGroup, "inner example", [metadata], []) do
-      it("runs the inner body", &body)
+      it("runs the inner body", example_metadata, &body)
     end
 
     outer_example = RSpec.current_example

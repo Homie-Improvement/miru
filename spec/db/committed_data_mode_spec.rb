@@ -423,6 +423,22 @@ RSpec.describe "Committed-data test mode", committed_data: true do
   ensure
     TimekeepingOwnership.ensure_initial!
   end
+
+  # The group-level load is skipped only when every example takes the
+  # per-example seeded reset; an example that turns committed_data off does not.
+  it "a committed_data two_tenant_seed group still loads the seed for an example that turns committed_data off" do
+    seen = {}
+    result = run_inner_example_through_suite_hooks(
+      { committed_data: true, two_tenant_seed: true }, { committed_data: false }
+    ) do
+      seen[:companies] = Company.where(name: ["Fork & Leaf Salads", "Copper Kettle Bakery"]).count
+    end
+
+    expect(result.exception).to be_nil
+    expect(seen[:companies]).to eq(2)
+  ensure
+    TimekeepingOwnership.ensure_initial!
+  end
 end
 
 RSpec.describe "Committed-data test mode", committed_data: true do
