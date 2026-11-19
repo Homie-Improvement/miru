@@ -18,8 +18,9 @@ jobs:
   tests:
     name: Running tests
     runs-on: ubuntu-24.04  # Standard 2-core runner
-    # Each Timekeeping handoff spec group reloads the two-tenant seed, so the
-    # process that draws those files runs far longer than the other.
+    # The Timekeeping handoff specs reload the two-tenant seed in every example
+    # group, so they run in the timekeeping-handoff job instead of here; left
+    # in, they kept one parallel process running up to this limit.
     timeout-minutes: 60
     permissions:
       contents: read
@@ -113,10 +114,6 @@ jobs:
         run: |
           bundle exec rake "parallel:create[2]" "parallel:load_schema[2]"
 
-      - name: Run CLI request specs
-        run: |
-          bundle exec rspec spec/requests/api/v1/cli
-
       - name: Run parallel tests (excluding system specs)
         env:
           PARALLEL_TEST_PROCESSORS: 2  # Optimal for standard runners
@@ -124,7 +121,7 @@ jobs:
           PARALLEL_FAILURES_LOG: tmp/failing_specs.txt
         run: |
           mkdir -p tmp
-          bin/parallel_test -n 2 --exclude-system
+          bin/parallel_test -n 2 --exclude-system --exclude-dir spec/lib/timekeeping/handoff
 
           # Save failed specs list for debugging
           if [ -f tmp/failing_specs.txt ]; then
@@ -132,8 +129,10 @@ jobs:
             cat tmp/failing_specs.txt
           fi
 
+      # A cancelled or timed-out run can leave a partial runtime log; caching it
+      # would make the next run fall back to splitting spec files by size.
       - name: Save parallel runtime log cache
-        if: ${{ always() && hashFiles('tmp/parallel_runtime_rspec.log') != '' }}
+        if: ${{ !cancelled() && hashFiles('tmp/parallel_runtime_rspec.log') != '' }}
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: tmp/parallel_runtime_rspec.log
@@ -152,6 +151,55 @@ jobs:
             tmp/parallel_runtime_rspec.log
             log/test.log
           if-no-files-found: warn
+
+  # The handoff specs reload the two-tenant seed in every example group and take
+  # about 40 minutes run one after another, so they run here, beside Running
+  # tests, rather than on one of its two parallel processes.
+  timekeeping-handoff:
+    name: Timekeeping handoff specs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    if: github.event_name != 'push' || !contains(github.event.head_commit.message, 'skip ci')
+    env:
+      RAILS_ENV: test
+      DB_HOST: localhost
+      DB_USER: root
+      DB_PASS: password
+      CI: true
+      # The handoff specs render no pages, so they need no Vite build (and this job installs no Node).
+      SKIP_VITE_TEST_BUILD: "1"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: miru_web_test
+          POSTGRES_USER: root
+          POSTGRES_PASSWORD: password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U root -d miru_web_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1
+        with:
+          ruby-version: '4.0.1'
+          bundler-cache: true
+          bundler: latest
+
+      - name: Setup test database
+        run: bundle exec rails db:test:prepare
+
+      - name: Run handoff specs
+        run: bundle exec rspec spec/lib/timekeeping/handoff
 
   responsive-system-specs:
     name: Responsive system specs
