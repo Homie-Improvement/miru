@@ -219,5 +219,17 @@ RSpec.describe "Timekeeping seeded runtime hooks" do
       # reset the Timekeeping admission row in the example's state.
       expect(TimekeepingDatabaseReset).to have_received(:reset!).with("timekeeping", env: anything).once
     end
+
+    # An unseeded committed example's cleanup leaves the legacy row, so only the owner-state hook can put the
+    # row in the state the metadata names.
+    it "hold an unseeded committed example in the owner state its metadata names" do
+      stub_const("TimekeepingOwnerState::SELECTED", nil)
+
+      result = run_inner_example_through_suite_hooks({ committed_data: true }, { owner_state: "rollback" }) do
+        expect_owner_state!("rollback")
+      end
+
+      expect(result.exception).to be_nil
+    end
   end
 end
