@@ -997,3 +997,27 @@ RSpec.describe TimekeepingQueueLedger::TimekeepingCollector do
       }
   end
 end
+
+require "rails_helper"
+
+RSpec.describe "Timekeeping queue ledger reset hooks" do
+  # "Every reset path, including the seeded committed reset, collects executions before it deletes"
+  it "the without_transaction and two_tenant_seed hooks collect before each of their truncates" do
+    steps = []
+    allow(TestDatabaseCleanup).to receive(:before_reset!) { steps << :collect }
+    allow(DatabaseCleaner).to receive(:clean_with) { steps << :delete }
+    allow(TimekeepingOwnership).to receive(:ensure_initial!)
+    allow(Timekeeping::SeedDispositionRecorder).to receive(:load_fresh_seed!)
+    allow(TestDatabaseCleanup).to receive(:delete_operation_ledger_rows!)
+
+    inner = RSpec::Core::ExampleGroup.describe("queue ledger reset hooks", :without_transaction, :two_tenant_seed) do
+      it("runs between the resets") { steps << :example }
+    end
+    passed = inner.run(RSpec::Core::NullReporter)
+    RSpec.world.example_groups.delete(inner)
+
+    expect(passed).to be(true)
+    # before(:all) seed truncate, without_transaction before and after truncates, after(:all) truncate.
+    expect(steps).to eq(%i[collect delete collect delete example collect delete collect delete])
+  end
+end

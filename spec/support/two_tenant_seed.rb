@@ -9,11 +9,13 @@
 # data matches the checked-in record.
 RSpec.shared_context "two tenant seed" do
   before(:all) do
+    TestDatabaseCleanup.before_reset!
     DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
     Timekeeping::SeedDispositionRecorder.load_fresh_seed!(as_of: TestDatabaseCleanup.seed_as_of)
   end
 
   after(:all) do
+    TestDatabaseCleanup.before_reset!
     DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
     # Truncation empties the ownership table; restore its one row, as the
     # suite setup in spec/support/database_cleaner.rb does, so later specs find it.
