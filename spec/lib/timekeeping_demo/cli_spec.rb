@@ -158,9 +158,11 @@ end
 
 RSpec.describe TimekeepingDemo::CLI, "up with caller-supplied credentials" do
   # Starts nothing: collects the process specs the CLI hands the supervisor.
-  def caller_credentials_recording_supervisor(started)
+  # prepare spawns real children with each spec's env, so its specs are a
+  # credential boundary too and are recorded beside the run specs.
+  def caller_credentials_recording_supervisor(started, prepared)
     supervisor = instance_double(TimekeepingDemo::Supervisor)
-    allow(supervisor).to receive(:prepare)
+    allow(supervisor).to receive(:prepare) { |specs| prepared.concat(specs) }
     allow(supervisor).to receive(:run) { |specs, **| started.concat(specs) }
     supervisor
   end
@@ -176,7 +178,8 @@ RSpec.describe TimekeepingDemo::CLI, "up with caller-supplied credentials" do
       "DB_USER" => "monolith_demo_role"
     ).merge(supplied.to_env)
     started = []
-    supervisor = caller_credentials_recording_supervisor(started)
+    prepared = []
+    supervisor = caller_credentials_recording_supervisor(started, prepared)
     captured_out = StringIO.new
     captured_err = StringIO.new
     original_out = $stdout
@@ -192,6 +195,8 @@ RSpec.describe TimekeepingDemo::CLI, "up with caller-supplied credentials" do
         $stderr = original_err
       end
       expect(status).to eq(0)
+      # Preparation gets exactly the checked run specs; a boolean, so a failure prints no credential.
+      expect(prepared == started).to be(true)
 
       monolith = started.select { |spec| spec.app == :monolith }
       timekeeping = started.select { |spec| spec.app == :timekeeping }
@@ -243,13 +248,15 @@ RSpec.describe TimekeepingDemo::CLI, "up with caller-supplied credentials" do
 
     variants.each do |label, credential_env|
       started = []
-      supervisor = caller_credentials_recording_supervisor(started)
+      prepared = []
+      supervisor = caller_credentials_recording_supervisor(started, prepared)
       status = Dir.mktmpdir("timekeeping-demo-state") do |state_dir|
         described_class.run(["up"], root: Rails.root.to_s, supervisor:, state_dir:,
                                     caller_env: base_env.merge(credential_env))
       end
 
       expect(status).to eq(0), "expected status 0 with #{label}"
+      expect(prepared == started).to be(true), "expected preparation to get the run specs with #{label}"
       monolith = started.select { |spec| spec.app == :monolith }
       timekeeping = started.select { |spec| spec.app == :timekeeping }
       expect(monolith.empty? || timekeeping.empty?).to be(false), "expected both apps to start with #{label}"
