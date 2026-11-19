@@ -18,8 +18,8 @@ RSpec.describe "Timekeeping internal handoff routes refuse callers without the s
   def refused_handoff_state
     admission = Timekeeping::Admission.current
     handoff_stored_rows.merge("admission_generation" => admission.generation,
-                              "admission_settling_generation" => admission.settling_generation,
-                              "admission_settling_stopped_generation" => admission.settling_stopped_generation,
+                              "settling_generation" => admission.settling_generation,
+                              "settling_stopped_generation" => admission.settling_stopped_generation,
                               "next_entry_id" => handoff_next_id("entries"))
   end
 
@@ -36,9 +36,11 @@ RSpec.describe "Timekeeping internal handoff routes refuse callers without the s
   # Bodies that would change stored state if a refused call reached its
   # controller: an empty checkpoint deletes the seeded entry, the sequence
   # target moves the next id, and the snapshot at version 2 raises the
-  # version-1 entry to 2. A settle at generation 4 opens settling on a fenced
-  # row, a stop at generation 4 raises the stop mark, and a drain through a
-  # high position would run the relay over any unsent snapshot.
+  # version-1 entry to 2. An admission begin_settling or stop_applying at
+  # generation 3 opens a step while fenced with none open or raises the stop
+  # mark to 3. A settle at generation 4 opens settling on a fenced row, a stop
+  # at generation 4 raises the stop mark, and a drain through a high position
+  # would run the relay over any unsent snapshot.
   def refused_handoff_bodies(entry)
     empty_checkpoint = Timekeeping::Handoff::Checkpoint.build(
       tables: Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }
@@ -48,6 +50,8 @@ RSpec.describe "Timekeeping internal handoff routes refuse callers without the s
       entry_id_sequence: { above: 9_000_000_000 },
       correction_snapshots: { generation: 2, version: 2, snapshots: [handoff_correction_snapshot(entry, locked: true)] },
       admission_admit: { generation: 4 },
+      admission_begin_settling: { generation: 3 },
+      admission_stop_applying: { generation: 3 },
       settle: { generation: 4 },
       stop_applying: { generation: 4 },
       drain: { through: 9_000_000 }
@@ -69,6 +73,7 @@ RSpec.describe "Timekeeping internal handoff routes refuse callers without the s
 
         expect([route, caller_name, response.status, response.parsed_body])
           .to eq([route, caller_name, 401, { "reason" => "unauthorized" }])
+        expect(response.body).not_to include(handoff_service_token)
         expect([route, caller_name, refused_handoff_state]).to eq([route, caller_name, baseline])
       end
     end
@@ -96,6 +101,21 @@ RSpec.describe "Timekeeping internal handoff routes refuse callers without the s
 
     expect_every_refused_caller_to_change_nothing(entry, baseline)
     expect(entry.reload.version).to eq(1)
+  end
+
+  # "Every handoff endpoint refuses a caller without service credentials"
+  # With a settle step open, a stop that got through would end it, and the
+  # outgoing owner would stop applying commits it still owes.
+  it "refuses every route while fenced with a settle step open at 3 and leaves the step open" do
+    Timekeeping::Admission.admit!(generation: 3)
+    Timekeeping::Admission.fence!
+    Timekeeping::Admission.begin_settling!(generation: 3)
+    entry = create_private_entry
+    baseline = refused_handoff_state
+    expect(baseline.values_at("admission_generation", "settling_generation", "settling_stopped_generation"))
+      .to eq([nil, 3, nil])
+
+    expect_every_refused_caller_to_change_nothing(entry, baseline)
   end
 
   # "Every handoff endpoint refuses a caller without service credentials"
@@ -150,5 +170,46 @@ RSpec.describe "Timekeeping internal handoff routes refuse callers without the s
 
     expect([response.status, response.parsed_body]).to eq([200, { "drained" => true }])
     expect(OutboxSnapshot.where(outbox_position: 5).pick(:sent_at)).not_to be_nil
+  end
+
+  # The admission row is one row for every company, so a token that holds one
+  # company must not open or stop the settle step that governs all of them.
+  it "refuses one company's owner and admin tokens on begin_settling and stop_applying and leaves the shared settle step as it was" do
+    Timekeeping::Admission.admit!(generation: 3)
+    Timekeeping::Admission.fence!
+    Timekeeping::Admission.begin_settling!(generation: 3)
+
+    settling_state = lambda do
+      row = Timekeeping::Admission.current
+      [row.generation, row.settling_generation, row.settling_stopped_generation]
+    end
+    expect(settling_state.call).to eq([nil, 3, nil])
+
+    callers = {
+      "company 1 owner" => mint_token({ sub: 7, company_id: 1, role: "owner" }),
+      "company 2 admin" => mint_token({ sub: 8, company_id: 2, role: "admin" })
+    }
+    requests = {
+      "begin_settling" => ["/internal/v1/handoff/admission/begin_settling", 4],
+      "stop_applying" => ["/internal/v1/handoff/admission/stop_applying", 3]
+    }
+
+    requests.each do |route, (path, generation)|
+      callers.each do |caller_name, token|
+        post path, params: JSON.generate(generation:),
+                   headers: { "Content-Type" => "application/json", "Authorization" => "Bearer #{token}" }
+
+        expect([route, caller_name, response.status, response.parsed_body])
+          .to eq([route, caller_name, 401, { "reason" => "unauthorized" }])
+        expect([route, caller_name, settling_state.call]).to eq([route, caller_name, [nil, 3, nil]])
+      end
+    end
+
+    # The service bearer reaches the same route, so the refusals above come
+    # from the caller's credentials and not from a missing route.
+    post "/internal/v1/handoff/admission/stop_applying", params: JSON.generate(generation: 3),
+         headers: { "Content-Type" => "application/json", "Authorization" => "Bearer #{handoff_service_token}" }
+    expect(response.status).to eq(200)
+    expect(settling_state.call).to eq([nil, nil, 3])
   end
 end

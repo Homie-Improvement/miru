@@ -14,6 +14,8 @@ module HandoffRequests
     correction_snapshots: [:put, "/internal/v1/handoff/correction_snapshots", { generation: 2, version: 1, snapshots: [] }],
     admission_fence: [:post, "/internal/v1/handoff/admission/fence", nil],
     admission_admit: [:post, "/internal/v1/handoff/admission/admit", { generation: 7 }],
+    admission_begin_settling: [:post, "/internal/v1/handoff/admission/begin_settling", { generation: 7 }],
+    admission_stop_applying: [:post, "/internal/v1/handoff/admission/stop_applying", { generation: 7 }],
     settle: [:post, "/internal/v1/handoff/settle", { generation: 7 }],
     stop_applying: [:post, "/internal/v1/handoff/stop_applying", { generation: 7 }],
     drain: [:post, "/internal/v1/handoff/drain", { through: 0 }]

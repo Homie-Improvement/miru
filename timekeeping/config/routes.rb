@@ -27,6 +27,8 @@ Rails.application.routes.draw do
       put "correction_snapshots", to: "correction_snapshots#update"
       post "admission/fence", to: "admissions#fence"
       post "admission/admit", to: "admissions#admit"
+      post "admission/begin_settling", to: "admissions#begin_settling"
+      post "admission/stop_applying", to: "admissions#stop_applying"
       post "settle", to: "settling#settle"
       post "stop_applying", to: "settling#stop_applying"
       post "drain", to: "drains#create"
