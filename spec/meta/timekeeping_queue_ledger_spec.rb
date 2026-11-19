@@ -1021,3 +1021,12 @@ RSpec.describe "Timekeeping queue ledger reset hooks" do
     expect(steps).to eq(%i[collect delete collect delete example collect delete collect delete])
   end
 end
+
+RSpec.describe "Timekeeping queue ledger probe fixture" do
+  it "keeps the queue ledger probe out of a normal suite run" do
+    probe = Rails.root.join("spec/fixtures/timekeeping_harness/queue_ledger_probe.rb")
+
+    expect(probe).to exist
+    expect(probe.basename.to_s).not_to end_with("_spec.rb")
+  end
+end

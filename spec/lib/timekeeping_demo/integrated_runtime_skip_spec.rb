@@ -3,6 +3,7 @@
 require "rails_helper"
 require "json"
 require "open3"
+require "tmpdir"
 
 # Outside the example transaction: the child rspec truncates this same test
 # database in its before(:suite), and an open transaction holding the
@@ -13,9 +14,13 @@ RSpec.describe "IntegratedRuntime live examples without TIMEKEEPING_LIVE", :with
     live_spec = Rails.root.join("spec/lib/timekeeping_demo/integrated_runtime_live_spec.rb").to_s
     expect(File.exist?(live_spec)).to be(true)
 
-    output, = Bundler.with_unbundled_env do
-      Open3.capture2({ "TIMEKEEPING_LIVE" => nil, "RAILS_ENV" => "test" },
-                     "bundle", "exec", "rspec", live_spec, "--format", "json", chdir: Rails.root.to_s)
+    # The child gets a ledger file of its own, so its suite start never deletes this run's.
+    output, = Dir.mktmpdir("skip-check-ledger") do |dir|
+      Bundler.with_unbundled_env do
+        Open3.capture2({ "TIMEKEEPING_LIVE" => nil, "RAILS_ENV" => "test",
+                         TimekeepingQueueLedger::PATH_KEY => File.join(dir, "queue_ledger.json") },
+                       "bundle", "exec", "rspec", live_spec, "--format", "json", chdir: Rails.root.to_s)
+      end
     end
     summary = JSON.parse(output[output.index("{")..]).fetch("summary")
 
