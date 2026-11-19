@@ -1,0 +1,47 @@
+# Handoff commands Timekeeping serves as the outgoing owner during a rollback
+# (docs/architecture/timekeeping-soa.md section 10.5). Only the service token
+# may call these routes; no user token of any role is accepted.
+name: handoff
+source: docs/architecture/timekeeping-soa.md section 10.5
+
+routes:
+  settle:
+    method: POST
+    path: /internal/v1/handoff/settle
+    request_fields: [generation]
+    response_fields: [settling, prepared_operations]
+  stop_applying:
+    method: POST
+    path: /internal/v1/handoff/stop_applying
+    request_fields: [generation]
+    response_fields: []
+  drain:
+    method: POST
+    path: /internal/v1/handoff/drain
+    request_fields: [through]
+    response_fields: [drained]
+
+headers:
+  authorization: "Authorization: Bearer <service token>"
+
+rules:
+  generation_value: generation must be a positive integer; a missing, negative or non-integer value is refused with invalid_request and changes nothing.
+  through_value: through must be a non-negative integer; a missing, negative or non-integer value is refused with invalid_request and changes nothing.
+  settling_read_back: settling is true only when the stored settle step after the call is the requested generation's, so it is false when the admission was not fenced, that generation's step was already stopped, or a newer generation is settling.
+  prepared_operations: prepared_operations counts the invoice_operations still in state prepared.
+  older_stop: A stop for an older generation than the one settling changes nothing.
+  drained: drained is true only when no outbox_snapshots row with position at or below through has sent_at NULL.
+  relay_skipped: A relay that skipped on its advisory lock leaves drained false.
+  held_rows: Rows the relay holds back for the held generation still count as unsent.
+  repeatable: A repeated identical request leaves the same state.
+
+errors:
+  unauthorized:
+    status: 401
+    body: { reason: unauthorized }
+  invalid_request:
+    status: 400
+    body: { reason: invalid_request }
+  admission_missing:
+    status: 409
+    body: { reason: admission_missing }

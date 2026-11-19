@@ -96,3 +96,17 @@ RSpec.describe TimekeepingContract do
     end
   end
 end
+
+RSpec.describe TimekeepingContract do
+  it "loads the handoff contract with the settle, stop_applying and drain routes and a placeholder Authorization header" do
+    contract = described_class.load(:handoff)
+    signatures = contract.fetch("routes").values.map { |route| "#{route.fetch('method')} #{route.fetch('path')}" }
+
+    expect(contract).to be_frozen
+    expect(signatures).to include("POST /internal/v1/handoff/settle", "POST /internal/v1/handoff/stop_applying",
+                                  "POST /internal/v1/handoff/drain")
+    # "Write contracts/timekeeping/handoff.yml in the style of the other contract files, with the Authorization
+    # header only as a placeholder."
+    expect(contract.dig("headers", "authorization")).to match(/\AAuthorization: Bearer <[^>]+>\z/)
+  end
+end

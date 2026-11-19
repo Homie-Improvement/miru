@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "rails_helper"
+require "webmock/rspec"
 
 # The handoff routes read and replace every company's rows at once, so only the
 # service bearer may reach them: no user token of any role, and no near-miss of
@@ -34,9 +35,12 @@ RSpec.describe "Timekeeping internal handoff routes refuse callers without the s
 
   # Bodies that would change stored state if a refused call reached its
   # controller: an empty checkpoint deletes the seeded entry, the sequence
-  # target moves the next id, the snapshot at version 2 raises the version-1
-  # entry to 2, and settle generation 3 opens a step while fenced with none
-  # open or raises the stop mark to 3.
+  # target moves the next id, and the snapshot at version 2 raises the
+  # version-1 entry to 2. An admission begin_settling or stop_applying at
+  # generation 3 opens a step while fenced with none open or raises the stop
+  # mark to 3. A settle at generation 4 opens settling on a fenced row, a stop
+  # at generation 4 raises the stop mark, and a drain through a high position
+  # would run the relay over any unsent snapshot.
   def refused_handoff_bodies(entry)
     empty_checkpoint = Timekeeping::Handoff::Checkpoint.build(
       tables: Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }
@@ -47,7 +51,10 @@ RSpec.describe "Timekeeping internal handoff routes refuse callers without the s
       correction_snapshots: { generation: 2, version: 2, snapshots: [handoff_correction_snapshot(entry, locked: true)] },
       admission_admit: { generation: 4 },
       admission_begin_settling: { generation: 3 },
-      admission_stop_applying: { generation: 3 }
+      admission_stop_applying: { generation: 3 },
+      settle: { generation: 4 },
+      stop_applying: { generation: 4 },
+      drain: { through: 9_000_000 }
     }
   end
 
@@ -124,6 +131,45 @@ RSpec.describe "Timekeeping internal handoff routes refuse callers without the s
         entry, baseline, callers: { "empty bearer" => "Bearer ", "any bearer" => "Bearer anything" }
       )
     end
+  end
+
+  # A settle that got through would open the settle step on the fenced row.
+  it "a settle request without the service token gets 401" do
+    Timekeeping::Admission.fence!
+    baseline = refused_handoff_state
+
+    handoff_request(:settle, body: { generation: 4 }, authorization: nil)
+
+    expect([response.status, response.parsed_body]).to eq([401, { "reason" => "unauthorized" }])
+    expect(refused_handoff_state).to eq(baseline)
+    expect(Timekeeping::Admission.settling?).to be(false)
+  end
+
+  # Delivery is stubbed to succeed, so a drain that reached the relay would mark
+  # the seeded snapshot sent; the service bearer's drain shows it would.
+  it "refuses drain for every refused caller without running the relay over an unsent snapshot" do
+    insert_outbox_rows(outbox_row(outbox_position: 5, id: 901))
+    snapshot_url = "http://snapshots.handoff-refusals.test"
+    snapshot_stub = WebMock.stub_request(:post, "#{snapshot_url}/internal/v1/timekeeping/entry-snapshots")
+                           .to_return(status: 200, headers: { "Content-Type" => "application/json" },
+                                      body: JSON.generate(applied: 1, ignored: 0))
+    baseline = refused_handoff_state
+
+    with_timekeeping_env(Timekeeping::Environment::MONOLITH_SNAPSHOT_URL => snapshot_url) do
+      refused_handoff_callers.each do |caller_name, authorization|
+        handoff_request(:drain, body: { through: 5 }, authorization:)
+
+        expect([caller_name, response.status, response.parsed_body])
+          .to eq([caller_name, 401, { "reason" => "unauthorized" }])
+        expect([caller_name, refused_handoff_state]).to eq([caller_name, baseline])
+      end
+      expect(snapshot_stub).not_to have_been_requested
+
+      handoff_request(:drain, body: { through: 5 })
+    end
+
+    expect([response.status, response.parsed_body]).to eq([200, { "drained" => true }])
+    expect(OutboxSnapshot.where(outbox_position: 5).pick(:sent_at)).not_to be_nil
   end
 
   # The admission row is one row for every company, so a token that holds one
