@@ -29,6 +29,9 @@ Rails.application.routes.draw do
       post "admission/admit", to: "admissions#admit"
       post "admission/begin_settling", to: "admissions#begin_settling"
       post "admission/stop_applying", to: "admissions#stop_applying"
+      post "settle", to: "settling#settle"
+      post "stop_applying", to: "settling#stop_applying"
+      post "drain", to: "drains#create"
     end
 
     # Drawn only when the test hooks are loaded, so elsewhere these paths 404.
