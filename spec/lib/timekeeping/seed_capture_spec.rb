@@ -26,8 +26,7 @@ RSpec.describe Timekeeping::SeedCapture do
       # seed load refuses any occupied table, so empty everything first as the
       # two-tenant seed context does. The process store is used, as that
       # context does, so this runs db/seeds.rb only when no earlier group has.
-      TestDatabaseCleanup.before_reset!
-      DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
+      TestDatabaseCleanup.clean_with!(:truncation, except: %w(ar_internal_metadata))
       Timekeeping::SeedDispositionRecorder.load_fresh_seed!(
         as_of: TestDatabaseCleanup.seed_as_of, captures: TestDatabaseCleanup.seed_captures
       )
@@ -39,7 +38,7 @@ RSpec.describe Timekeeping::SeedCapture do
       capture = described_class.take(connection: seed_capture_spec_connection, tables: seed_capture_spec_tables)
       loaded_next_ids = seed_capture_spec_next_ids
 
-      DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
+      TestDatabaseCleanup.clean_with!(:truncation, except: %w(ar_internal_metadata))
       expect(User.count).to eq(0)
       started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       capture.restore!(connection: seed_capture_spec_connection)
@@ -62,7 +61,7 @@ RSpec.describe Timekeeping::SeedCapture do
     end
 
     def seed_capture_failure_spec_truncate
-      DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata schema_migrations)
+      TestDatabaseCleanup.clean_with!(:truncation, except: %w(ar_internal_metadata schema_migrations))
     end
 
     it "brings back an attachment whose file is still on disk" do

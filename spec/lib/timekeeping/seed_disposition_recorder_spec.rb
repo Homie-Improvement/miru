@@ -194,13 +194,12 @@ RSpec.describe Timekeeping::SeedDispositionRecorder, :without_transaction do
 
     # The :without_transaction hook leaves the ownership row in place, which
     # the empty-table guard refuses.
-    TestDatabaseCleanup.before_reset!
-    DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
+    TestDatabaseCleanup.clean_with!(:truncation, except: %w(ar_internal_metadata))
     described_class.load_fresh_seed!(as_of:, captures: store)
     expect(store.fetch(as_of)).to be_a(Timekeeping::SeedCapture)
     first_load = recorder_store_spec_state
 
-    DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
+    TestDatabaseCleanup.clean_with!(:truncation, except: %w(ar_internal_metadata))
     started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     described_class.load_fresh_seed!(as_of:, captures: store)
     elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
@@ -275,8 +274,7 @@ RSpec.describe Timekeeping::SeedDispositionRecorder, :two_tenant_seed, :seeded_w
     store = Timekeeping::SeedCapture::Store.new
     store.store(as_of, broken)
 
-    TestDatabaseCleanup.before_reset!
-    DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
+    TestDatabaseCleanup.clean_with!(:truncation, except: %w(ar_internal_metadata))
     described_class.load_fresh_seed!(as_of:, captures: store)
 
     expect(User.order(:id).pluck(:id, :email)).to eq(user_ids)
@@ -300,8 +298,7 @@ RSpec.describe Timekeeping::SeedDispositionRecorder, :two_tenant_seed, :seeded_w
     store = Timekeeping::SeedCapture::Store.new
     store.store("2000-01-01", stale)
 
-    TestDatabaseCleanup.before_reset!
-    DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
+    TestDatabaseCleanup.clean_with!(:truncation, except: %w(ar_internal_metadata))
     described_class.load_fresh_seed!(as_of:, captures: store)
 
     expect(restored).to be_empty
