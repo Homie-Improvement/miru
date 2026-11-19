@@ -117,7 +117,7 @@ RSpec.describe TimekeepingOwnership, committed_data: true do
     expect(described_class.find(described_class::SINGLETON_ID).admission_fenced_at).not_to be_nil
   ensure
     commit << true
-    [fence, guarded].compact.each { |thread| thread.join(5) }
+    stop_committed_data_threads(fence, guarded)
   end
 end
 
@@ -159,7 +159,7 @@ RSpec.describe TimekeepingOwnership, committed_data: true do
     expect { described_class.refuse_if_handoff_begun! }.to raise_error(TimekeepingOwnership::HandoffBegun)
   ensure
     release << true
-    [seed, fence].compact.each { |thread| thread.join(5) }
+    stop_committed_data_threads(seed, fence)
   end
 end
 
@@ -197,6 +197,6 @@ RSpec.describe TimekeepingOwnership, committed_data: true do
     expect(described_class.find(described_class::SINGLETON_ID).admission_fenced_at).not_to be_nil
   ensure
     release << true
-    [guarded, fence].compact.each { |thread| thread.join(5) }
+    stop_committed_data_threads(guarded, fence)
   end
 end
