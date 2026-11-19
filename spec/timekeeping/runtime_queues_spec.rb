@@ -14,9 +14,13 @@ RSpec.describe "Timekeeping demo runtime queues", :two_tenant_seed, committed_da
     # A skipped example started nothing, and may run without a Timekeeping database.
     next unless ENV["TIMEKEEPING_LIVE"] == "1"
 
-    TestDatabaseCleanup.before_reset!
     queue_tables = ActiveRecord::Base.connection.tables.grep(/\Asolid_queue_/)
-    ActiveRecord::Base.connection.execute("TRUNCATE #{queue_tables.join(', ')}") if queue_tables.any?
+    # DatabaseCleaner reads an empty only: list as every table, and skipping
+    # the call would leave the Timekeeping queue tables below cleared with no
+    # record taken first.
+    raise "the monolith test database has no solid_queue_ tables" if queue_tables.empty?
+
+    TestDatabaseCleanup.clean_with!(:truncation, only: queue_tables)
     timekeeping = PG.connect(ENV.fetch("TIMEKEEPING_DATABASE_URL"))
     tables = timekeeping.exec("SELECT tablename FROM pg_tables WHERE tablename LIKE 'solid_queue_%'").column_values(0)
     timekeeping.exec("TRUNCATE #{tables.join(', ')}") if tables.any?
