@@ -18,6 +18,9 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, committed_data: t
   before(:all) do
     skip "Set TIMEKEEPING_LIVE=1 to run the handoff against a real Timekeeping server" unless ENV["TIMEKEEPING_LIVE"] == "1"
 
+    # The live instance runs db:prepare on this URL and the after hook empties
+    # its tables, so refuse any database that is not a test database first.
+    IntegratedRuntime.require_test_database_url!(ENV.fetch("TIMEKEEPING_DATABASE_URL"))
     WebMock.disable_net_connect!(allow_localhost: true)
     @handoff_live_reference = TimekeepingLiveInstance::ReferenceStub.new
     @handoff_live_timekeeping = TimekeepingLiveInstance.start(
@@ -32,7 +35,10 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, committed_data: t
     # A skipped example started nothing, and may run without a Timekeeping database.
     next unless ENV["TIMEKEEPING_LIVE"] == "1"
 
-    timekeeping = PG.connect(ENV.fetch("TIMEKEEPING_DATABASE_URL"))
+    # This hook also runs when before(:all) refused the database, so it checks again.
+    timekeeping_url = ENV.fetch("TIMEKEEPING_DATABASE_URL")
+    IntegratedRuntime.require_test_database_url!(timekeeping_url)
+    timekeeping = PG.connect(timekeeping_url)
     timekeeping.exec("TRUNCATE #{handoff_live_tables.join(', ')} CASCADE")
   ensure
     timekeeping&.close

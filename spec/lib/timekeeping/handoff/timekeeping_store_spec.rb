@@ -517,29 +517,9 @@ RSpec.describe Timekeeping::Handoff::TimekeepingStore do
   end
 end
 
-RSpec.describe Timekeeping::Handoff::TimekeepingStore do
-  let(:base_url) { "http://timekeeping-correction-times.test" }
-
-  it "write_correction_snapshots sends created_at and updated_at that read back to the exact microsecond" do
-    created_at = Time.utc(2026, 1, 2, 3, 4, 5, 123_456)
-    updated_at = Time.utc(2026, 1, 3, 4, 5, 6, 654_321)
-    snapshot = { "company_id" => 1, "id" => 7, "created_at" => created_at, "updated_at" => updated_at }
-    url = "#{base_url}/internal/v1/handoff/correction_snapshots"
-    stub_request(:put, url).to_return(status: 200, body: JSON.generate("written" => 1))
-
-    written = described_class.new(base_url:, token: "svc-#{SecureRandom.hex(8)}")
-      .write_correction_snapshots(snapshots: [snapshot], version: 1, generation: 2)
-
-    expect(written).to eq(1)
-    expect(a_request(:put, url).with do |request|
-      sent = JSON.parse(request.body).fetch("snapshots").first
-      Time.iso8601(sent.fetch("created_at")) == created_at && Time.iso8601(sent.fetch("updated_at")) == updated_at
-    end).to have_been_made.once
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::TimekeepingStore do
+RSpec.describe Timekeeping::Handoff::TimekeepingStore, "#write_correction_snapshots timestamps" do
   let(:base_url) { "http://timekeeping-correction-resend.test" }
+  let(:correction_time_base_url) { "http://timekeeping-corrections.test" }
 
   it "write_correction_snapshots re-sent for the same corrections sends the same timestamps both times" do
     created_at = Time.utc(2026, 1, 2, 3, 4, 5, 999_999)
@@ -559,29 +539,6 @@ RSpec.describe Timekeeping::Handoff::TimekeepingStore do
     sent = JSON.parse(sent_bodies.first).fetch("snapshots").first
     expect(Time.iso8601(sent.fetch("created_at"))).to eq(created_at)
   end
-end
-
-RSpec.describe Timekeeping::Handoff::TimekeepingStore do
-  it "sends a correction snapshot's created_at and updated_at with every microsecond" do
-    base_url = "http://timekeeping-handoff-times.test"
-    url = "#{base_url}/internal/v1/handoff/correction_snapshots"
-    created_at = Time.utc(2025, 11, 3, 9, 15, 42, 654321)
-    updated_at = Time.utc(2025, 11, 4, 10, 0, 1, 7)
-    snapshot = { "id" => 61, "company_id" => 4, "locked" => false, "created_at" => created_at, "updated_at" => updated_at }
-    stub_request(:put, url).to_return(status: 200, body: JSON.generate("written" => 1))
-
-    described_class.new(base_url:, token: "svc-token")
-      .write_correction_snapshots(snapshots: [snapshot], version: 1, generation: 2)
-
-    expect(a_request(:put, url).with do |request|
-      sent = JSON.parse(request.body).fetch("snapshots").first
-      Time.iso8601(sent.fetch("created_at")) == created_at && Time.iso8601(sent.fetch("updated_at")) == updated_at
-    end).to have_been_made.once
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::TimekeepingStore do
-  let(:correction_time_base_url) { "http://timekeeping-corrections.test" }
 
   # Legacy rows carry Time values. Truncated to milliseconds on the wire, they reach the
   # monolith's projection changed, and the rollback's projection check refuses the handoff.
