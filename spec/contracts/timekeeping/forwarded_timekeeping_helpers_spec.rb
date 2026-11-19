@@ -85,6 +85,19 @@ RSpec.describe "forwarded Timekeeping setup helpers" do
     expect(ownership).to have_attributes(owner: "timekeeping", monolith_store: "legacy", generation: 2)
     expect(arrange_fake.generation).to eq(2)
   end
+
+  # Real callers leave owner_state out, so a regression run reaches the selected state only through the default.
+  it "arrange_forwarded_timekeeping without owner_state follows the selected rollback state" do
+    stub_const("TimekeepingOwnerState::SELECTED", "rollback")
+
+    arrange_forwarded_timekeeping(arrange_fake, company: arrange_company,
+                                                users: { arrange_paul => "employee" },
+                                                project: arrange_project)
+
+    ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+    expect(ownership).to have_attributes(owner: "monolith", monolith_store: "prepared", generation: 3)
+    expect(arrange_fake.generation).to eq(3)
+  end
 end
 
 RSpec.describe "forwarded Timekeeping environment helper" do
