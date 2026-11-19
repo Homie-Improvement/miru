@@ -142,7 +142,7 @@ RSpec.describe TimekeepingQueueLedger do
 end
 
 
-RSpec.describe "Timekeeping queue ledger file at suite start" do
+RSpec.describe "Timekeeping queue ledger file at suite start", :without_transaction do
   it "a clean probe run deletes a stale ledger file at suite start, so a record from an earlier run neither survives nor fails it" do
     skip "set TIMEKEEPING_LIVE=1 to run the queue ledger probes" unless ENV["TIMEKEEPING_LIVE"] == "1"
 
@@ -748,6 +748,37 @@ RSpec.describe TimekeepingQueueLedger::Session do
 end
 
 
+RSpec.describe TimekeepingQueueLedger::Session do
+  # stop! runs from ensure blocks, so a ledger error there must not replace the boot or example error.
+  it "after_stop! keeps a collector error for finish! instead of raising it" do
+    Dir.mktmpdir("queue-ledger-after-stop") do |dir|
+      session = described_class.new(path: File.join(dir, "queue_ledger.json"),
+                                    collectors: { "monolith" => -> { raise TimekeepingQueueLedger::CollectError, "monolith unreachable" } },
+                                    live: -> { false })
+      session.activate!(env: {})
+
+      expect(session.after_stop!).to be_nil
+      expect { session.finish! }.to raise_error(TimekeepingQueueLedger::RunFailed, /monolith unreachable/)
+    end
+  end
+
+  it "a boot error raised before stop! reaches the caller even when the ledger collector fails in stop!" do
+    Dir.mktmpdir("queue-ledger-boot-error") do |dir|
+      session = described_class.new(path: File.join(dir, "queue_ledger.json"),
+                                    collectors: { "monolith" => -> { raise TimekeepingQueueLedger::CollectError, "monolith unreachable" } },
+                                    live: -> { false })
+      session.activate!(env: {})
+
+      expect do
+        raise IntegratedRuntime::BootError, "launcher exited"
+      ensure
+        session.after_stop!
+      end.to raise_error(IntegratedRuntime::BootError, "launcher exited")
+    end
+  end
+end
+
+
 RSpec.describe TimekeepingDatabaseReset do
   it "reset! refuses a non-test database before it runs the collect hook" do
     calls = []
@@ -986,7 +1017,7 @@ RSpec.describe "Timekeeping queue ledger probe fixture" do
   end
 end
 
-RSpec.describe "Timekeeping queue ledger probe isolation" do
+RSpec.describe "Timekeeping queue ledger probe isolation", :without_transaction do
   # "Every probe subprocess sets it to its own temporary file, so a probe never touches the parent run's ledger."
   it "a clean probe run leaves the parent's inherited ledger file byte for byte unchanged" do
     skip "set TIMEKEEPING_LIVE=1 to run the queue ledger probes" unless ENV["TIMEKEEPING_LIVE"] == "1"

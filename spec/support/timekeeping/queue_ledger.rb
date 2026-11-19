@@ -294,6 +294,7 @@ module TimekeepingQueueLedger
       @runtimes = []
       @open_controls = []
       @written = false
+      @stop_errors = []
     end
 
     def active?
@@ -335,6 +336,14 @@ module TimekeepingQueueLedger
       write_ledger(records: [], controls: Controls.check(@open_controls))
     end
 
+    # Called from IntegratedRuntime#stop!, which often runs in an ensure while
+    # a boot or example error is in flight. A ledger error raised there would
+    # replace that error, so it is kept and reported by finish! instead.
+    def after_stop!
+      [step_error { collect! }, step_error { observe_controls! }].compact.each { |error| @stop_errors << error }
+      nil
+    end
+
     # The live check comes first: collecting or deleting beside a running
     # worker would race it.
     def before_reset!
@@ -359,7 +368,7 @@ module TimekeepingQueueLedger
     def finish!
       return nil unless active?
 
-      errors = @runtimes.map { |runtime| step_error { runtime.stop! } }
+      errors = @runtimes.map { |runtime| step_error { runtime.stop! } } + @stop_errors
       errors << step_error { collect! }
       errors << step_error { close_window! }
       failures = []

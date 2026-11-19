@@ -274,8 +274,7 @@ class IntegratedRuntime
     raise BootError, "process groups of the demo runtime were still alive after KILL" unless gone
 
     @stopped = true
-    @ledger.collect!
-    @ledger.observe_controls!
+    @ledger.after_stop!
   end
 
   def inspect
