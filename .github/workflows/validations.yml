@@ -445,7 +445,8 @@ jobs:
   #
   # The same job also runs the Timekeeping queue collector against real
   # completed, claimed and failed Solid Queue rows in the Timekeeping test
-  # database. Every other job lacks that database, so it skips the spec.
+  # database. Every other job leaves TIMEKEEPING_LIVE unset or does not name
+  # this spec, so the spec skips or does not run there.
   timekeeping-runtime-live:
     name: Timekeeping demo runtime starts only the dedicated workers
     runs-on: ubuntu-24.04

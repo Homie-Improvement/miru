@@ -604,48 +604,36 @@ RSpec.describe IntegratedRuntime do
   end
 end
 
-RSpec.describe IntegratedRuntime, "public test database URL guard" do
-  it "require_test_database_url! is callable publicly and refuses a URL whose path names a non-test database behind a _test dbname parameter" do
-    # The collector probe writes rows that break the queue rule on purpose, so it must never reach a
-    # database that is not a test database. Active Record reads the path, libpq reads the parameter.
+RSpec.describe IntegratedRuntime, ".require_test_database_url!" do
+  # The collector probe writes rows that break the queue rule on purpose, so it must never reach a
+  # database that is not a test database. Active Record reads the URL's path; libpq, which PG.connect
+  # uses to insert and delete the probe's rows, reads its dbname parameter.
+  it "is public" do
+    expect(described_class.public_methods).to include(:require_test_database_url!)
+  end
+
+  it "returns nil for a URL that names a _test database under both readings" do
+    url = "postgresql://collector_guard_user@127.0.0.1/timekeeping_collector_guard_test"
+
+    expect(described_class.require_test_database_url!(url)).to be_nil
+  end
+
+  it "refuses a URL whose path names a non-test database" do
+    expect { described_class.require_test_database_url!("postgres://localhost:5432/timekeeping_collector_rows_demo") }
+      .to raise_error(TestDatabaseGuard::NotATestDatabase)
+  end
+
+  it "refuses a URL whose path names a non-test database behind a _test dbname parameter" do
     url = "postgresql://collector_guard_user@127.0.0.1/timekeeping_development?dbname=timekeeping_collector_guard_test"
 
     expect { described_class.require_test_database_url!(url) }
       .to raise_error(TestDatabaseGuard::NotATestDatabase, /timekeeping_development/)
   end
-end
 
-RSpec.describe IntegratedRuntime, "public test database URL guard, libpq reading" do
-  it "require_test_database_url! refuses a URL whose dbname parameter names a non-test database behind a _test path" do
-    # libpq, which PG.connect uses to insert and delete the probe's rows, reads the dbname parameter.
+  it "refuses a URL whose dbname parameter names a non-test database behind a _test path" do
     url = "postgresql://collector_guard_user@127.0.0.1/timekeeping_collector_guard_test?dbname=timekeeping_production"
 
     expect { described_class.require_test_database_url!(url) }
       .to raise_error(TestDatabaseGuard::NotATestDatabase, /timekeeping_production/)
-  end
-end
-
-RSpec.describe IntegratedRuntime, "public test database URL guard, accepted URL" do
-  it "require_test_database_url! returns nil for a URL that names a _test database under both readings" do
-    url = "postgresql://collector_guard_user@127.0.0.1/timekeeping_collector_guard_test"
-
-    expect(described_class.require_test_database_url!(url)).to be_nil
-  end
-end
-
-RSpec.describe IntegratedRuntime do
-  it "require_test_database_url! is public, accepts a _test URL and refuses a URL either reading names as a non-test database" do
-    expect(described_class.public_methods).to include(:require_test_database_url!)
-
-    expect(described_class.require_test_database_url!("postgres://localhost:5432/timekeeping_collector_rows_test")).to be_nil
-
-    expect { described_class.require_test_database_url!("postgres://localhost:5432/timekeeping_collector_rows_demo") }
-      .to raise_error(TestDatabaseGuard::NotATestDatabase)
-    # The path and the dbname parameter disagree, so one of the two readings names a non-test database.
-    expect do
-      described_class.require_test_database_url!(
-        "postgres://localhost:5432/timekeeping_collector_rows_test?dbname=timekeeping_collector_rows_demo"
-      )
-    end.to raise_error(TestDatabaseGuard::NotATestDatabase)
   end
 end
