@@ -522,4 +522,11 @@ RSpec.describe IntegratedRuntime do
     expect(Process).not_to have_received(:spawn)
     expect(TimekeepingDatabaseReset).not_to have_received(:reset!)
   end
+
+  # "IntegratedRuntime no longer defines `require_test_database_url!` or `active_record_database_name`
+  # and calls the TestDatabaseGuard method instead"
+  it "no longer defines the URL guard or its Active Record helper" do
+    expect(described_class.respond_to?(:require_test_database_url!, true)).to be(false)
+    expect(described_class.respond_to?(:active_record_database_name, true)).to be(false)
+  end
 end

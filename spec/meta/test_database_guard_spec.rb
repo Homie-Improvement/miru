@@ -1,6 +1,10 @@
 # frozen_string_literal: true
 
-require "rails_helper"
+# The guard only parses URLs, so this spec loads the guard and its two parsers
+# without rails_helper, whose schema check and cleaners need a live database.
+require "active_record"
+require "active_record/database_configurations"
+require_relative "../support/timekeeping/timekeeping_database_reset"
 
 RSpec.describe "TestDatabaseGuard.require_test_database_url!" do
   # "`TestDatabaseGuard.require_test_database_url!(url)` refuses
@@ -53,11 +57,7 @@ RSpec.describe "TestDatabaseGuard.require_test_database_url!" do
     end
   end
 
-  # "IntegratedRuntime no longer defines `require_test_database_url!` or `active_record_database_name`
-  # and calls the TestDatabaseGuard method instead"
-  it "IntegratedRuntime no longer defines the URL guard or its Active Record helper" do
-    expect(IntegratedRuntime.respond_to?(:require_test_database_url!, true)).to be(false)
-    expect(IntegratedRuntime.respond_to?(:active_record_database_name, true)).to be(false)
+  it "exposes the URL guard but keeps its Active Record helper private" do
     expect(TestDatabaseGuard).to respond_to(:require_test_database_url!)
     expect(TestDatabaseGuard).not_to respond_to(:active_record_database_name)
   end
