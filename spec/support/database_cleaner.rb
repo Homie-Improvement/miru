@@ -28,7 +28,8 @@ module TestDatabaseCleanup
   end
 
   # Empties every table, loads the seed, then puts the ownership row in the
-  # selected state and clears the Timekeeping database.
+  # given state (the run's selected state by default) and clears the
+  # Timekeeping database.
   #
   # The order matters. load_fresh_seed! refuses any occupied table, the
   # ownership table included, so ensure_initial! must not run before it.
@@ -125,10 +126,15 @@ RSpec.configure do |config|
 
   # Before as well as after (the after step is in spec/support/committed_data.rb):
   # a tagged example starts from committed-empty tables whatever ran before it,
-  # or, when it is also tagged :two_tenant_seed, from a freshly loaded seed.
+  # or, when it is also tagged :two_tenant_seed, from a freshly loaded seed in
+  # the example's owner state. An :integrated_runtime example reloads the seed
+  # again in its own hook (spec/support/timekeeping/integrated_runtime.rb),
+  # which runs after this one.
   config.before(:each, committed_data: true) do |example|
     if TestDatabaseCleanup.seeded_committed?(example.metadata)
-      TestDatabaseCleanup.reset_seeded_committed!(as_of: TestDatabaseCleanup.seed_as_of)
+      TestDatabaseCleanup.reset_seeded_committed!(
+        as_of: TestDatabaseCleanup.seed_as_of, state: TimekeepingOwnerState.for_example(example.metadata)
+      )
     else
       TestDatabaseCleanup.delete_all_committed!
     end

@@ -101,12 +101,18 @@ class IntegratedRuntime
     [spawn_env, [File.join(root, "bin", "timekeeping-demo"), "up"], { chdir: root, pgroup: true }]
   end
 
-  # Empties the monolith test database for a runtime example, after checking
-  # its name, and puts back the selected owner state the emptying reset.
-  def self.clean_monolith!(owner_state: TimekeepingOwnerState::SELECTED)
+  # Resets the monolith test database for a runtime example, after checking
+  # its name. A seeded example gets a freshly loaded two-tenant seed, the owner
+  # state and a reset Timekeeping admission row; any other example gets empty
+  # tables with the owner state the emptying reset put back.
+  def self.clean_monolith!(seeded: false, owner_state: TimekeepingOwnerState::SELECTED, env: ENV)
     TestDatabaseGuard.require_test_database!(monolith_database_name)
-    TestDatabaseCleanup.delete_all_committed!
-    TimekeepingOwnerState.apply!(owner_state) if owner_state
+    if seeded
+      TestDatabaseCleanup.reset_seeded_committed!(as_of: TestDatabaseCleanup.seed_as_of, state: owner_state, env:)
+    else
+      TestDatabaseCleanup.delete_all_committed!
+      TimekeepingOwnerState.apply!(owner_state) if owner_state
+    end
     nil
   end
 
@@ -374,13 +380,19 @@ RSpec.configure do |config|
   end
 
   # Registered after the cleaner and owner-state hooks (see the require above):
-  # the monolith is emptied and the owner state put back before the runtime
-  # starts. Resets are withheld while start runs: a start that fails because a
-  # group survived its own cleanup leaves nothing safe to reset beside.
+  # the monolith is emptied, or reseeded for a seeded committed example, and
+  # the example's owner state put back before the runtime starts in that
+  # state. The reseed is needed because this clean would otherwise delete the
+  # seed the committed_data hook loaded. Resets are withheld while start runs:
+  # a start that fails because a group survived its own cleanup leaves nothing
+  # safe to reset beside.
   config.before(:each, :integrated_runtime) do |example|
-    IntegratedRuntime.clean_monolith!
+    owner_state = TimekeepingOwnerState.for_example(example.metadata)
+    IntegratedRuntime.clean_monolith!(
+      seeded: TestDatabaseCleanup.seeded_committed?(example.metadata), owner_state:, env: ENV.to_h
+    )
     example.metadata[:integrated_runtime_resets_allowed] = false
-    @integrated_runtime = IntegratedRuntime.start(root: Rails.root.to_s, env: ENV.to_h)
+    @integrated_runtime = IntegratedRuntime.start(root: Rails.root.to_s, env: ENV.to_h, owner_state:)
     example.metadata[:integrated_runtime_resets_allowed] = true
   end
 
@@ -395,6 +407,6 @@ RSpec.configure do |config|
     example.metadata[:integrated_runtime_resets_allowed] = false
     @integrated_runtime&.stop!
     example.metadata[:integrated_runtime_resets_allowed] = true
-    IntegratedRuntime.clean_monolith!
+    IntegratedRuntime.clean_monolith!(owner_state: TimekeepingOwnerState.for_example(example.metadata))
   end
 end
