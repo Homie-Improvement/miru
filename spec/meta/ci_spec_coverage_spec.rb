@@ -27,7 +27,7 @@ RSpec.describe "CI spec coverage in validations.yml" do
     expect(parallel_run).to include("--exclude-dir #{handoff_dir}")
 
     handoff_steps = handoff_job.fetch("steps").select do |step|
-      step["run"].to_s.include?("bundle exec rspec #{handoff_dir}")
+      step["run"].to_s.match?(/rspec\s+#{Regexp.escape(handoff_dir)}(\s|\z)/)
     end
     expect(handoff_steps.size).to eq(1)
     expect(handoff_job.fetch("continue-on-error", false)).to be(false)
@@ -109,6 +109,89 @@ RSpec.describe "CI spec coverage in validations.yml" do
       handoff_rspec_step["run"] = "bundle exec rspec spec/lib/timekeeping/other"
 
       expect(uncovered_excluded_dirs(workflow)).not_to be_empty
+    end
+  end
+
+  describe "guard for the handoff spec groups and their summary check" do
+    let(:summary_check_name) { "Timekeeping handoff specs" }
+
+    # Returns one message per way the handoff matrix could leave spec files unrun,
+    # or the summary check could pass or be skipped while a group failed. Branch
+    # protection reads only the summary check, so either gap would let a failing
+    # handoff spec merge. Taking the parsed workflow lets the failure cases run
+    # against altered copies.
+    def handoff_group_problems(workflow)
+      jobs = workflow.fetch("jobs")
+      group_job = jobs.fetch("timekeeping-handoff")
+      strategy = group_job.fetch("strategy", {})
+      rspec_run = /rspec\s+#{Regexp.escape(handoff_dir)}(\s|\z)/
+      run = group_job.fetch("steps").map { |step| step["run"].to_s }.find { |text| text.match?(rspec_run) }.to_s
+      group_count = run[/\s-n\s+(\d+)/, 1].to_i
+      groups = strategy.dig("matrix", "group")
+
+      problems = []
+      unless group_count.positive? && groups == (1..group_count).to_a
+        problems << "matrix groups #{groups.inspect} do not list 1 to #{group_count}"
+      end
+      problems << "fail-fast is not off for the handoff groups" unless strategy["fail-fast"] == false
+
+      summary_job = jobs.values.find { |job| job["name"] == summary_check_name }
+      return problems << "no job is named #{summary_check_name}" unless summary_job
+
+      unless Array(summary_job["needs"]).include?("timekeeping-handoff")
+        problems << "#{summary_check_name} does not need timekeeping-handoff"
+      end
+      problems << "#{summary_check_name} is skipped when a group fails" unless summary_job["if"].to_s.include?("always()")
+      problems
+    end
+
+    let(:summary_job) { jobs.values.find { |job| job["name"] == summary_check_name } }
+    let(:summary_step) { summary_job.fetch("steps").sole }
+
+    it "finds the real workflow's groups complete and its summary check wired to them" do
+      expect(handoff_group_problems(workflow)).to be_empty
+    end
+
+    it "fails when a group is missing from the matrix" do
+      handoff_job.fetch("strategy").fetch("matrix")["group"] = [1, 2]
+
+      expect(handoff_group_problems(workflow)).to eq(["matrix groups [1, 2] do not list 1 to 3"])
+    end
+
+    it "fails when one failing group cancels the others" do
+      handoff_job.fetch("strategy")["fail-fast"] = true
+
+      expect(handoff_group_problems(workflow)).to eq(["fail-fast is not off for the handoff groups"])
+    end
+
+    it "fails when the summary check no longer needs the handoff groups" do
+      summary_job.delete("needs")
+
+      expect(handoff_group_problems(workflow)).to eq(["Timekeeping handoff specs does not need timekeeping-handoff"])
+    end
+
+    it "fails when the summary check would be skipped after a group fails" do
+      summary_job["if"] = summary_job.fetch("if").sub("always() && ", "")
+
+      expect(handoff_group_problems(workflow)).to eq(["Timekeeping handoff specs is skipped when a group fails"])
+    end
+
+    it "fails when no job carries the summary check's name" do
+      summary_job["name"] = "Timekeeping handoff summary"
+
+      expect(handoff_group_problems(workflow)).to eq(["no job is named Timekeeping handoff specs"])
+    end
+
+    it "passes the summary step only when every handoff group succeeded" do
+      expect(summary_step.fetch("env").fetch("HANDOFF_RESULT")).to eq("${{ needs.timekeeping-handoff.result }}")
+
+      outcomes = %w[success failure cancelled skipped].to_h do |result|
+        passed = system({ "HANDOFF_RESULT" => result }, "bash", "-c", summary_step.fetch("run"),
+                        out: File::NULL, err: File::NULL)
+        [result, passed]
+      end
+
+      expect(outcomes).to eq("success" => true, "failure" => false, "cancelled" => false, "skipped" => false)
     end
   end
 end
