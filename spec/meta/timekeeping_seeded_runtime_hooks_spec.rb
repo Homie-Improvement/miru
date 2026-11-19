@@ -97,6 +97,21 @@ RSpec.describe "Timekeeping seeded runtime hooks" do
       expect(TimekeepingOwnership.count).to eq(1)
     end
 
+    describe "over an already loaded seed", :two_tenant_seed do
+      # The committed_data hook has already loaded the seed, so this is the second and third load in a row.
+      it "a seeded clean run twice leaves each seeded company once with its entries and the timekeeping state" do
+        2.times { IntegratedRuntime.clean_monolith!(seeded: true, owner_state: "timekeeping", env: {}) }
+
+        seeded_company_names.each { |name| expect(Company.where(name:).count).to eq(1) }
+        [fork_and_leaf, copper_kettle].each do |company|
+          entries = TimesheetEntry.joins(project: :client).where(clients: { company_id: company.id })
+          expect(entries.exists?).to be(true)
+        end
+        expect(TimekeepingOwnership.count).to eq(1)
+        expect_owner_state!("timekeeping")
+      end
+    end
+
     def occupied_committed_tables
       connection = ActiveRecord::Base.connection
       checked = connection.tables - TestDatabaseCleanup::KEPT_TABLES - [TimekeepingOwnership.table_name]
@@ -115,8 +130,9 @@ RSpec.describe "Timekeeping seeded runtime hooks" do
     #  fork_and_leaf and copper_kettle and their entries present in the monolith"
     # "An example's owner_state metadata (legacy, timekeeping or rollback) sets the ownership row and the
     #  runtime's owner state for that example, and is checked by expect_owner_state!"
+    # The run selects a different valid state, so a hook that still read it would boot the wrong owner.
     it "start a seeded integrated_runtime example on both seeded companies in the owner state its metadata names" do
-      stub_const("TimekeepingOwnerState::SELECTED", nil)
+      stub_const("TimekeepingOwnerState::SELECTED", "timekeeping")
       allow(ENV).to receive(:[]).and_call_original
       allow(ENV).to receive(:[]).with("TIMEKEEPING_LIVE").and_return("1")
       allow(IntegratedRuntime).to receive(:monolith_database_name).and_return("miru_web_test")
@@ -143,6 +159,39 @@ RSpec.describe "Timekeeping seeded runtime hooks" do
       expect(seen[:entries]).to all(be > 0)
       expect(IntegratedRuntime).to have_received(:start).with(hash_including(owner_state: "rollback")).once
       expect(runtime).to have_received(:stop!).once
+    end
+
+    # "The after hook still empties every table."
+    it "the integrated_runtime after hook empties every table after a seeded example instead of reseeding" do
+      steps = []
+      runtime = instance_double(IntegratedRuntime)
+      allow(ENV).to receive(:[]).and_call_original
+      allow(ENV).to receive(:[]).with("TIMEKEEPING_LIVE").and_return("1")
+      allow(IntegratedRuntime).to receive(:monolith_database_name).and_return("miru_web_test")
+      allow(IntegratedRuntime).to receive(:refuse_if_running!)
+      allow(IntegratedRuntime).to receive(:start).and_return(runtime)
+      allow(runtime).to receive(:stop!) { steps << :stop }
+      allow(TestDatabaseCleanup).to receive(:reset_seeded_committed!).and_wrap_original do |original, **kwargs|
+        steps << :reseed
+        original.call(**kwargs)
+      end
+      allow(TestDatabaseCleanup).to receive(:delete_all_committed!).and_wrap_original do |original|
+        steps << :empty
+        original.call
+      end
+
+      seen_companies = nil
+      result = run_inner_example_through_suite_hooks(
+        { integrated_runtime: true, two_tenant_seed: true, committed_data: true }, { owner_state: "timekeeping" }
+      ) { seen_companies = Company.count }
+
+      expect(result.status).to eq(:passed)
+      expect(seen_companies).to be >= 2
+      after_stop = steps.drop(steps.index(:stop) + 1)
+      expect(after_stop).to include(:empty)
+      expect(after_stop).not_to include(:reseed)
+      expect(Company.count).to eq(0)
+      expect(TimekeepingOwnership.count).to eq(1)
     end
 
     # "An example's owner_state metadata (legacy, timekeeping or rollback) sets the ownership row and the
