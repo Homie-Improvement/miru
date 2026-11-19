@@ -4,7 +4,7 @@ require "rails_helper"
 require "webmock/rspec"
 
 RSpec.describe Timekeeping::Handoff::Drain do
-  context "more tests 2" do
+  context "with an unsent snapshot the monolith refuses" do
     # "It answers `drained`, which is true only when no outbox_snapshots row with position at or below P has `sent_at` NULL."
     it "Drain.call answers true when every snapshot at or below through is sent and false when an unsent one sits at or below it" do
       insert_outbox_rows(
@@ -28,7 +28,7 @@ RSpec.describe Timekeeping::Handoff::Drain do
     end
   end
 
-  context "more tests 3" do
+  context "while another connection holds the relay lock" do
     it "answers false while another connection holds the relay lock even though every row at or below through is sent, and true once the lock is released" do
       insert_outbox_rows(outbox_row(outbox_position: 1, id: 811), outbox_row(outbox_position: 2, id: 812))
       OutboxSnapshot.update_all(sent_at: Time.current)

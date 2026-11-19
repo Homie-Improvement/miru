@@ -386,10 +386,12 @@ RSpec.describe Timekeeping::Handoff::TimekeepingStore do
       end
     end
 
-    it "names an answered refusal reason only when it is a plain reason word" do
-      token = "service-#{SecureRandom.hex(24)}"
+    # A token made only of lowercase letters looks like a reason word, so only
+    # a reason the handoff routes answer may be named.
+    it "names an answered refusal reason only when it is one the handoff routes answer" do
+      token = "service_token_only_lowercase_letters"
       stub_request(:post, "#{base_url}/internal/v1/handoff/settle")
-        .to_return(status: 409, body: JSON.generate("reason" => "Bearer #{token}"))
+        .to_return(status: 409, body: JSON.generate("reason" => token))
 
       expect { described_class.new(base_url:, token:).settle(generation: 3) }
         .to raise_error(Timekeeping::Handoff::Store::Error, "Timekeeping POST /internal/v1/handoff/settle answered 409")
@@ -433,18 +435,21 @@ RSpec.describe Timekeeping::Handoff::TimekeepingStore do
   # "Raise `Store::Error` on non-200, and never put the token in a message."
   it "settle, stop_applying and drain raise Store::Error without the bearer when a refusal echoes the token as its reason" do
     base_url = "http://timekeeping-handoff-echo.test"
-    token = "service-#{SecureRandom.hex(24)}"
-    store = described_class.new(base_url:, token:)
-    calls = {
-      "/internal/v1/handoff/settle" => -> { store.settle(generation: 2) },
-      "/internal/v1/handoff/stop_applying" => -> { store.stop_applying(generation: 2) },
-      "/internal/v1/handoff/drain" => -> { store.drain(through: 40) }
-    }
+    # A lowercase-only token echoed bare looks like a reason word.
+    tokens = ["service-#{SecureRandom.hex(24)}", "servicetokenonlylowercaseletters"]
 
-    calls.each do |path, call|
-      [401, 409, 503].each do |status|
+    tokens.product(%w[bearer bare], [401, 409, 503]).each do |token, echo, status|
+      store = described_class.new(base_url:, token:)
+      calls = {
+        "/internal/v1/handoff/settle" => -> { store.settle(generation: 2) },
+        "/internal/v1/handoff/stop_applying" => -> { store.stop_applying(generation: 2) },
+        "/internal/v1/handoff/drain" => -> { store.drain(through: 40) }
+      }
+      reason = echo == "bearer" ? "Bearer #{token}" : token
+
+      calls.each do |path, call|
         stub = stub_request(:post, "#{base_url}#{path}")
-          .to_return(status:, body: JSON.generate("reason" => "Bearer #{token}"))
+          .to_return(status:, body: JSON.generate("reason" => reason))
 
         expect { call.call }.to raise_error(Timekeeping::Handoff::Store::Error) { |error|
           expect(error.message).not_to include(token)
@@ -455,9 +460,7 @@ RSpec.describe Timekeeping::Handoff::TimekeepingStore do
       end
     end
   end
-end
 
-RSpec.describe Timekeeping::Handoff::TimekeepingStore do
   # "Read answers with `integer_field` or an equivalent boolean reader. Raise `Store::Error` on non-200,
   # and never put the token in a message."
   it "settle and drain send the service bearer and refuse a drained or settling answer that is not a JSON boolean" do
@@ -472,7 +475,8 @@ RSpec.describe Timekeeping::Handoff::TimekeepingStore do
     expect(store.drain(through: 40)).to be(false)
     expect(drain_stub).to have_been_requested.once
 
-    ['{"drained":"true"}', '{"drained":1}', '{"drained":null}', "{}", "[true]", "not json"].each do |answer|
+    ['{"drained":"true"}', '{"drained":1}', '{"drained":null}', "{}", "[true]", "not json",
+     '{"drained":"false"}'].each do |answer|
       WebMock.reset!
       stub_request(:post, "#{base_url}/internal/v1/handoff/drain").to_return(status: 200, body: answer)
       expect { store.drain(through: 40) }.to raise_error(Timekeeping::Handoff::Store::Error) { |error|
@@ -485,94 +489,6 @@ RSpec.describe Timekeeping::Handoff::TimekeepingStore do
       WebMock.reset!
       stub_request(:post, "#{base_url}/internal/v1/handoff/settle").to_return(status: 200, body: answer)
       expect { store.settle(generation: 2) }.to raise_error(Timekeeping::Handoff::Store::Error)
-    end
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::TimekeepingStore do
-  it "sends settle, stop_applying and drain to their handoff paths with the stated bodies and reads their answers" do
-    base_url = "http://timekeeping-handoff.test"
-    token = "service-#{SecureRandom.hex(24)}"
-    headers = { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
-    settle = stub_request(:post, "#{base_url}/internal/v1/handoff/settle")
-      .with(headers:, body: { "generation" => 4 })
-      .to_return(status: 200, body: JSON.generate("settling" => true, "prepared_operations" => 2))
-    stop = stub_request(:post, "#{base_url}/internal/v1/handoff/stop_applying")
-      .with(headers:, body: { "generation" => 4 })
-      .to_return(status: 200, body: "{}")
-    drain = stub_request(:post, "#{base_url}/internal/v1/handoff/drain")
-      .with(headers:, body: { "through" => 17 })
-      .to_return(status: 200, body: JSON.generate("drained" => false))
-    store = described_class.new(base_url:, token:)
-
-    answer = store.settle(generation: 4)
-
-    expect([answer.settling, answer.prepared_operations]).to eq([true, 2])
-    expect(store.stop_applying(generation: 4)).to be_nil
-    expect(store.drain(through: 17)).to be(false)
-    [settle, stop, drain].each { |stub| expect(stub).to have_been_requested.once }
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::TimekeepingStore do
-  it "raises Store::Error without the token when drain answers a non-boolean drained or a non-200 status" do
-    base_url = "http://timekeeping-handoff.test"
-    token = "service-#{SecureRandom.hex(24)}"
-    store = described_class.new(base_url:, token:)
-    answers = [
-      { status: 200, body: JSON.generate("drained" => "true") },
-      { status: 200, body: JSON.generate("drained" => 1) },
-      { status: 200, body: JSON.generate("drained" => nil) },
-      { status: 503, body: JSON.generate("reason" => "Bearer #{token}") }
-    ]
-
-    # "Raise `Store::Error` on non-200, and never put the token in a message."
-    answers.each do |answer|
-      WebMock.reset!
-      stub_request(:post, "#{base_url}/internal/v1/handoff/drain").to_return(**answer)
-
-      expect { store.drain(through: 5) }
-        .to raise_error(Timekeeping::Handoff::Store::Error) { |error| expect(error.message).not_to include(token) }
-    end
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::TimekeepingStore do
-  # "Raise `Store::Error` on non-200, and never put the token in a message."
-  it "drain, settle and stop_applying keep a bearer echoed in a refusal reason out of Store::Error" do
-    base_url = "http://timekeeping-echo.test"
-    token = "service-#{SecureRandom.hex(24)}"
-    store = described_class.new(base_url:, token:)
-    calls = {
-      "/internal/v1/handoff/drain" => -> { store.drain(through: 4) },
-      "/internal/v1/handoff/settle" => -> { store.settle(generation: 2) },
-      "/internal/v1/handoff/stop_applying" => -> { store.stop_applying(generation: 2) }
-    }
-
-    calls.each do |path, call|
-      stub = stub_request(:post, "#{base_url}#{path}")
-        .to_return(status: 503, body: JSON.generate("reason" => "Bearer #{token}"))
-
-      expect { call.call }.to raise_error(Timekeeping::Handoff::Store::Error) { |error|
-        expect(error.message).not_to include(token)
-      }
-      expect(stub).to have_been_requested.once
-    end
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::TimekeepingStore do
-  # "Read answers with `integer_field` or an equivalent boolean reader."
-  # A truthy reader would let a garbled answer report drained and start a cutover with unsent snapshots.
-  it "drain raises Store::Error rather than reading a quoted or numeric drained as true" do
-    base_url = "http://timekeeping-drained.test"
-    store = described_class.new(base_url:, token: "svc-token")
-    ['{"drained":"true"}', '{"drained":"false"}', '{"drained":1}', '{"drained":null}', "{}"].each do |answer|
-      stub = stub_request(:post, "#{base_url}/internal/v1/handoff/drain").to_return(status: 200, body: answer)
-
-      expect { store.drain(through: 9) }.to raise_error(Timekeeping::Handoff::Store::Error)
-      expect(stub).to have_been_requested.once
-      WebMock.reset!
     end
   end
 end

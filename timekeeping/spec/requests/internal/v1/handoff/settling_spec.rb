@@ -36,49 +36,6 @@ RSpec.describe "Timekeeping internal handoff settle refuses callers without the 
   end
 end
 
-RSpec.describe "Timekeeping internal handoff stop_applying and drain refuse callers without the service token" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around { |example| with_handoff_env(public_key: true) { example.run } }
-
-  # "Each of the three routes answers 401 with no bearer and refuses a near-miss token and a user token.
-  # The admission row, invoice_operations and outbox_snapshots stay unchanged."
-  it "a stop_applying or drain request without the service token gets 401 and changes no stored row" do
-    Timekeeping::Admission.fence!
-    Timekeeping::Admission.begin_settling!(generation: 4)
-    state = lambda do
-      handoff_stored_rows.merge(
-        "admission" => ApplicationRecord.connection.select_rows("SELECT * FROM admission ORDER BY 1")
-      )
-    end
-    baseline = state.call
-    callers = {
-      "no bearer" => nil,
-      "near-miss service token" => "Bearer #{handoff_service_token}x",
-      "admin token" => "Bearer #{mint_token({ sub: 7, company_id: 1, role: 'admin' })}",
-      "employee token" => "Bearer #{mint_token}"
-    }
-    # A stop for generation 4 would close the open settle step if it got through.
-    requests = {
-      "/internal/v1/handoff/stop_applying" => { generation: 4 },
-      "/internal/v1/handoff/drain" => { through: 0 }
-    }
-
-    requests.each do |path, body|
-      callers.each do |caller_name, authorization|
-        headers = { "Content-Type" => "application/json" }
-        headers["Authorization"] = authorization if authorization
-        post path, params: JSON.generate(body), headers: headers
-
-        expect([path, caller_name, response.status, response.parsed_body])
-          .to eq([path, caller_name, 401, { "reason" => "unauthorized" }])
-        expect([path, caller_name, state.call]).to eq([path, caller_name, baseline])
-      end
-    end
-    expect(Timekeeping::Admission.settling?).to be(true)
-  end
-end
-
 RSpec.describe "Timekeeping internal handoff settle and stop_applying refuse a malformed generation" do
   include_context "timekeeping entry writes without transactional fixtures"
 
@@ -242,53 +199,6 @@ RSpec.describe "Timekeeping internal handoff settle on an admitted row" do
   end
 end
 
-RSpec.describe "Timekeeping internal handoff settle repeated" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around { |example| with_handoff_env(public_key: true) { example.run } }
-
-  it "a repeated identical settle request gives the same answer and leaves the same admission state" do
-    Timekeeping::Admission.fence!
-    headers = { "Content-Type" => "application/json", "Authorization" => "Bearer #{handoff_service_token}" }
-
-    # "A repeated identical request leaves the same state."
-    post "/internal/v1/handoff/settle", params: JSON.generate("generation" => 6), headers: headers
-    first = [response.status, response.parsed_body, Timekeeping::Admission.current.attributes, handoff_stored_rows]
-
-    post "/internal/v1/handoff/settle", params: JSON.generate("generation" => 6), headers: headers
-    second = [response.status, response.parsed_body, Timekeeping::Admission.current.attributes, handoff_stored_rows]
-
-    expect(first[0..1]).to eq([200, { "settling" => true, "prepared_operations" => 0 }])
-    expect(second).to eq(first)
-  end
-end
-
-RSpec.describe "Timekeeping internal handoff stop_applying" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around { |example| with_handoff_env(public_key: true) { example.run } }
-
-  it "stop_applying for an older generation than the one settling leaves settling open and the row unchanged" do
-    Timekeeping::Admission.fence!
-    Timekeeping::Admission.begin_settling!(generation: 5)
-    before_row = Timekeeping::Admission.current.attributes
-    headers = { "Content-Type" => "application/json", "Authorization" => "Bearer #{handoff_service_token}" }
-
-    # "A stop for an older generation than the one settling changes nothing."
-    post "/internal/v1/handoff/stop_applying", params: JSON.generate("generation" => 4), headers: headers
-
-    expect(response.status).to eq(200)
-    expect(Timekeeping::Admission.current.attributes).to eq(before_row)
-    expect(Timekeeping::Admission.settling?).to be(true)
-
-    post "/internal/v1/handoff/stop_applying", params: JSON.generate("generation" => 5), headers: headers
-
-    expect(response.status).to eq(200)
-    expect(Timekeeping::Admission.settling?).to be(false)
-    expect(Timekeeping::Admission.current.settling_stopped_generation).to eq(5)
-  end
-end
-
 RSpec.describe "POST /internal/v1/handoff/settle after the step was stopped", type: :request do
   include_context "timekeeping entry writes without transactional fixtures"
 
@@ -319,36 +229,6 @@ RSpec.describe "POST /internal/v1/handoff/settle after the step was stopped", ty
     expect(response.parsed_body).to include("settling" => false)
     expect(settling_late_settle_state).to eq(stopped_state)
     expect(stopped_state).to eq("generation" => nil, "settling_generation" => nil, "settling_stopped_generation" => 5)
-  end
-end
-
-RSpec.describe "POST /internal/v1/handoff/stop_applying for an older generation", type: :request do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around { |example| with_handoff_env(public_key: false) { example.run } }
-
-  def settling_older_stop_state
-    Timekeeping::Admission.current.attributes.slice("generation", "settling_generation", "settling_stopped_generation")
-  end
-
-  def settling_older_stop_post(path, generation)
-    post path, params: JSON.generate(generation:),
-               headers: { "Content-Type" => "application/json", "Authorization" => "Bearer #{handoff_service_token}" }
-  end
-
-  # "A stop for an older generation than the one settling changes nothing."
-  it "a late stop_applying for an older generation leaves the newer settling step open and the stop mark unchanged" do
-    Timekeeping::Admission.fence!
-    settling_older_stop_post("/internal/v1/handoff/settle", 7)
-    open_state = settling_older_stop_state
-    expect(open_state).to include("settling_generation" => 7)
-
-    2.times do
-      settling_older_stop_post("/internal/v1/handoff/stop_applying", 6)
-      expect(response).to have_http_status(:ok)
-      expect(settling_older_stop_state).to eq(open_state)
-    end
-    expect(Timekeeping::Admission.settling?).to be(true)
   end
 end
 

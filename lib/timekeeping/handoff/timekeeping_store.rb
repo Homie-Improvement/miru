@@ -26,10 +26,11 @@ module Timekeeping
       STOP_APPLYING_PATH = "/internal/v1/handoff/stop_applying"
       DRAIN_PATH = "/internal/v1/handoff/drain"
 
-      # A refusal reason is copied into Store::Error only in the shape every
-      # Timekeeping reason has, so an answer that echoes the bearer or any
-      # other text never puts it into a message or a log.
-      REASON_FORMAT = /\A[a-z_]{1,64}\z/
+      # The reasons Timekeeping's internal handoff routes answer with. Only one
+      # of these is copied into Store::Error, never other answered text, so an
+      # answer that echoes the token, whatever characters it holds, never puts
+      # it into a message or a log.
+      REFUSAL_REASONS = %w[unauthorized forbidden invalid_request handoff_refused fence_timeout admission_missing].freeze
 
       # What Timekeeping answered to a settle request: whether its settle step
       # is open after the call, and how many invoice operations are still
@@ -149,7 +150,7 @@ module Timekeeping
         end
 
         # Names the reason Timekeeping answered with, when the body holds one
-        # in REASON_FORMAT.
+        # listed in REFUSAL_REASONS.
         def refuse_answer!(method, path, response)
           reason = begin
             JSON.parse(response.body.to_s)["reason"] if response.body.present?
@@ -157,7 +158,7 @@ module Timekeeping
             nil
           end
           message = "Timekeeping #{method.upcase} #{path} answered #{response.code}"
-          message += " #{reason}" if reason.is_a?(String) && reason.match?(REASON_FORMAT)
+          message += " #{reason}" if REFUSAL_REASONS.include?(reason)
           raise Store::Error, message
         end
 

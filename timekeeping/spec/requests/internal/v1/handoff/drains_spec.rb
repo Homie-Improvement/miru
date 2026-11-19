@@ -3,40 +3,6 @@
 require "rails_helper"
 require "webmock/rspec"
 
-RSpec.describe "Timekeeping internal handoff drain refuses a malformed through" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around { |example| with_handoff_env(public_key: true) { example.run } }
-
-  # "`generation` must be a positive integer and `through` a non-negative one. A missing, negative or
-  # non-integer value gets a refusal reason from timekeeping/app/services/timekeeping/reasons.rb and changes nothing."
-  it "a drain request with a malformed through is refused with invalid_request and changes nothing" do
-    Timekeeping::Admission.admit!(generation: 3)
-    baseline = handoff_stored_rows
-    headers = { "Content-Type" => "application/json", "Authorization" => "Bearer #{handoff_service_token}" }
-    bodies = {
-      "missing" => "{}",
-      "string" => JSON.generate(through: "3"),
-      "float" => '{"through": 3.5}',
-      "negative" => JSON.generate(through: -1),
-      "boolean" => JSON.generate(through: false),
-      "null" => JSON.generate(through: nil),
-      "not an object" => "[3]"
-    }
-
-    bodies.each do |row, body|
-      post "/internal/v1/handoff/drain", params: body, headers: headers
-
-      expect([row, response.status, response.parsed_body]).to eq([row, 400, { "reason" => "invalid_request" }])
-      expect([row, handoff_stored_rows]).to eq([row, baseline])
-    end
-
-    post "/internal/v1/handoff/drain", params: JSON.generate(through: 0), headers: headers
-    expect(response.status).to eq(200)
-    expect(response.parsed_body.keys).to eq(["drained"])
-  end
-end
-
 RSpec.describe "Timekeeping internal handoff drain persistence" do
   include_context "timekeeping entry writes without transactional fixtures"
 
@@ -66,7 +32,8 @@ RSpec.describe "Timekeeping internal handoff drain persistence" do
 
     bodies = {
       "missing" => {}, "negative" => { through: -1 }, "string" => { through: "17" },
-      "float" => '{"through": 17.5}', "null" => { through: nil }, "boolean" => { through: true }
+      "float" => '{"through": 17.5}', "null" => { through: nil }, "boolean" => { through: true },
+      "false" => { through: false }, "not an object" => "[17]"
     }
     bodies.each do |label, body|
       answer = drain_persistence_post(body)
@@ -113,27 +80,6 @@ RSpec.describe "Timekeeping internal handoff drain repeat" do
     expect(second).to eq(first)
     expect(after_first).to eq(baseline)
     expect(handoff_stored_rows).to eq(baseline)
-  end
-end
-
-RSpec.describe "Timekeeping internal handoff drain with a malformed through" do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around { |example| with_handoff_env(public_key: true) { example.run } }
-
-  it "drain refuses a missing, negative, string, decimal or null through with invalid_request and changes no row" do
-    Timekeeping::Admission.admit!(generation: 3)
-    baseline = [Timekeeping::Admission.current.attributes, handoff_stored_rows]
-    headers = { "Content-Type" => "application/json", "Authorization" => "Bearer #{handoff_service_token}" }
-
-    # "`generation` must be a positive integer and `through` a non-negative one. A missing, negative or
-    # non-integer value gets a refusal reason from timekeeping/app/services/timekeeping/reasons.rb and changes nothing."
-    ["{}", '{"through":-1}', '{"through":"3"}', '{"through":3.5}', '{"through":null}'].each do |body|
-      post "/internal/v1/handoff/drain", params: body, headers: headers
-
-      expect([body, response.status, response.parsed_body]).to eq([body, 400, { "reason" => "invalid_request" }])
-      expect([body, Timekeeping::Admission.current.attributes, handoff_stored_rows]).to eq([body, *baseline])
-    end
   end
 end
 
@@ -218,32 +164,6 @@ RSpec.describe "POST /internal/v1/handoff/drain when delivery fails part way", t
     expect(response).to have_http_status(:ok)
     expect(response.parsed_body).to eq("drained" => false)
     expect(OutboxSnapshot.where(outbox_position: 30).pick(:sent_at)).to be_nil
-  end
-end
-
-RSpec.describe "POST /internal/v1/handoff/drain with a malformed through", type: :request do
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  around { |example| with_handoff_env(public_key: false) { example.run } }
-
-  # "`generation` must be a positive integer and `through` a non-negative one. A missing, negative or non-integer value gets a refusal reason from timekeeping/app/services/timekeeping/reasons.rb and changes nothing."
-  it "refuses a string through with invalid_request and never starts a relay run" do
-    insert_outbox_rows(outbox_row(outbox_position: 3, id: 821))
-    snapshot_url = "http://snapshots.drain-malformed.test"
-    WebMock.stub_request(:post, "#{snapshot_url}/internal/v1/timekeeping/entry-snapshots")
-           .to_return(status: 200, body: "{}")
-    headers = { "Content-Type" => "application/json", "Authorization" => "Bearer #{handoff_service_token}" }
-
-    with_timekeeping_env(Timekeeping::Environment::MONOLITH_SNAPSHOT_URL => snapshot_url) do
-      ['{"through":"3"}', '{"through":-1}', '{"through":3.5}', "{}"].each do |body|
-        post "/internal/v1/handoff/drain", params: body, headers: headers
-
-        expect([body, response.status, response.parsed_body]).to eq([body, 400, { "reason" => "invalid_request" }])
-      end
-    end
-
-    expect(a_request(:post, "#{snapshot_url}/internal/v1/timekeeping/entry-snapshots")).not_to have_been_made
-    expect(OutboxSnapshot.where(outbox_position: 3).pick(:sent_at)).to be_nil
   end
 end
 
