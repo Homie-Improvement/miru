@@ -319,4 +319,31 @@ RSpec.describe TimekeepingDemo::RuntimePlan do
                             ports: { monolith: 3000, timekeeping: 3100 })
     end.to raise_error(TimekeepingDemo::ConfigurationError, /TIMEKEEPING_DATABASE_URL/)
   end
+
+  it "passes credential keys only through own_keys: no copied list names them and each app gets only its share" do
+    credential_keys = TimekeepingDemo::Credentials::ENV_KEYS.values
+    copied_lists = described_class::APPLICATIONS.values.flat_map { |settings| settings.values_at(:copied, :always_set) }
+
+    # "Never add these keys to `TOOLCHAIN_KEYS` or to any `copied` or `always_set` list."
+    expect((described_class::TOOLCHAIN_KEYS & credential_keys).empty?).to be(true)
+    copied_lists.each { |list| expect((list & credential_keys).empty?).to be(true) }
+
+    credentials = TimekeepingDemo::Credentials.generate
+    caller_env = credentials.to_env.merge(
+      "DB_USER" => "monolith_user",
+      "TIMEKEEPING_DATABASE_URL" => "postgres://timekeeping_user@127.0.0.1:5432/timekeeping_demo"
+    )
+    specs = described_class.build(root: Rails.root.to_s, procfile: Rails.root.join("Procfile.timekeeping").read,
+                                  caller_env:, credentials: TimekeepingDemo::Credentials.generate,
+                                  ports: { monolith: 3000, timekeeping: 3100 })
+    private_key, public_key = TimekeepingDemo::Credentials::ENV_KEYS.values_at(:private_key_pem, :public_key_pem)
+
+    # "Timekeeping gets the public key and the token, and never the private key."
+    specs.each do |spec|
+      forbidden = spec.app == :timekeeping ? private_key : public_key
+      expect(spec.env.key?(forbidden)).to be(false)
+      # Caller values never reach the apps; only the credentials handed to build do.
+      credentials.to_env.each_value { |value| expect(spec.env.value?(value)).to be(false) }
+    end
+  end
 end

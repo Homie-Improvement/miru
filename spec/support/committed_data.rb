@@ -37,6 +37,21 @@ module CommittedDataMode
       end
     end
 
+    # Waits for each worker thread, then kills any still running, so none keeps its database connection
+    # while the committed-data reset empties the tables. A worker's own error is left to the example body,
+    # which joins it first, so one failed worker never stops the others from being stopped.
+    def stop_committed_data_threads(*threads, wait: 5)
+      threads.compact.each do |thread|
+        begin
+          next if thread.join(wait)
+        rescue StandardError
+          # join re-raises the error the thread ended with; the thread has stopped, which is all this needs.
+          next
+        end
+        thread.kill.join
+      end
+    end
+
     # True once the server reports waiting_pid blocked by holding_pid's locks;
     # false when that has not happened within the given seconds. A thread that
     # is alive but has not yet sent its statement is not blocked, which a
@@ -64,7 +79,9 @@ end
 RSpec.configure do |config|
   config.include CommittedDataMode::Helpers, committed_data: true
 
-  config.append_after(:each, committed_data: true) do
+  config.append_after(:each, committed_data: true) do |example|
+    next if TestDatabaseCleanup.reset_withheld?(example)
+
     CommittedDataMode.reset_database
   end
 end

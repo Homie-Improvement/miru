@@ -59,6 +59,14 @@ module TimekeepingDemo
       }
     }.freeze
 
+    # The Credentials values each application receives (section 11.2). The
+    # monolith signs user tokens; Timekeeping only verifies them, so it never
+    # holds the private key.
+    CREDENTIALS_OF = {
+      monolith: %i[private_key_pem service_token],
+      timekeeping: %i[public_key_pem service_token]
+    }.freeze
+
     module_function
 
     # Answers one ProcessSpec per Procfile line, or raises ConfigurationError.
@@ -124,22 +132,19 @@ module TimekeepingDemo
     # application holds: the private key never reaches Timekeeping.
     def own_keys(app, caller_env, credentials, ports)
       monolith_url = "http://#{LOOPBACK}:#{ports.fetch(:monolith)}"
+      credential_env = credentials.to_env.slice(*Credentials::ENV_KEYS.values_at(*CREDENTIALS_OF.fetch(app)))
       case app
       when :monolith
-        {
-          "TIMEKEEPING_TOKEN_PRIVATE_KEY" => credentials.private_key_pem,
-          "TIMEKEEPING_SERVICE_TOKEN" => credentials.service_token,
+        credential_env.merge(
           "TIMEKEEPING_BASE_URL" => "http://#{LOOPBACK}:#{ports.fetch(:timekeeping)}",
           "TIMEKEEPING_PROJECTION_URL" => monolith_url
-        }
+        )
       when :timekeeping
-        {
+        credential_env.merge(
           TIMEKEEPING_DATABASE_URL => caller_env.fetch(TIMEKEEPING_DATABASE_URL),
-          "TIMEKEEPING_TOKEN_PUBLIC_KEY" => credentials.public_key_pem,
-          "TIMEKEEPING_SERVICE_TOKEN" => credentials.service_token,
           "MONOLITH_REFERENCE_URL" => monolith_url,
           "MONOLITH_SNAPSHOT_URL" => monolith_url
-        }
+        )
       end
     end
 

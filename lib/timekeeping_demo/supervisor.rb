@@ -12,8 +12,13 @@ module TimekeepingDemo
     POLL_SECONDS = 0.25
     PREPARE_COMMAND = %w[bin/rails db:prepare].freeze
 
-    def initialize(output: $stderr)
+    # groups_path: a file that receives every process group id, one per line,
+    # as soon as the group exists. Each app leads its own group, so a launcher
+    # killed before it can stop them leaves them running; the file lets
+    # whoever started the launcher find and stop them. nil records nothing.
+    def initialize(output: $stderr, groups_path: nil)
       @output = output
+      @groups_path = groups_path
     end
 
     # Creates or migrates each application's database once, with that
@@ -23,6 +28,7 @@ module TimekeepingDemo
         pid = spawn(spec, PREPARE_COMMAND, pgroup: true)
         status = nil
         begin
+          record_group(pid)
           _, status = Process.wait2(pid)
         ensure
           # Reached without a status when the wait was interrupted, such as by
@@ -48,6 +54,7 @@ module TimekeepingDemo
         pid = spawn(spec, spec.argv, pgroup: true)
         running[pid] = spec.name
         groups << pid
+        record_group(pid)
         @output.puts "timekeeping-demo: started #{spec.name}"
       end
       exited = wait_for_stop_or_exit(running, stop_pipe.first)
@@ -103,6 +110,17 @@ module TimekeepingDemo
         groups.each { |group| signal_group("KILL", group) }
         running.each_key { |pid| reap(pid) }
         running.clear
+      end
+
+      # Appends and flushes at once, so the id is on disk even if the launcher
+      # is killed before its next step.
+      def record_group(group)
+        return unless @groups_path
+
+        File.open(@groups_path, "a") do |file|
+          file.puts(group)
+          file.flush
+        end
       end
 
       def signal_group(signal, group)
