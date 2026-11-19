@@ -110,13 +110,7 @@ module Invoices
         conflicts = conflicts_in(decisions)
         next outcome("refused", conflicts:) if conflicts.any?
 
-        operation = Operation.create!(
-          company_id: request.company_id, invoice_id: request.invoice_id, operation_id: request.operation_id,
-          actor_name: ACTOR_NAME, state: PREPARED, desired_entry_ids: request.entries,
-          disposition: request.disposition, generation: request.generation, created_at: Time.current
-        )
-        reserve_provisionally(operation, claimed_ids(decisions))
-        record_locked_flips(request.company_id, entries, operation.generation)
+        store_prepared(request, entries, decisions)
         outcome(PREPARED, counts: { entries: request.entries.size })
       end
     rescue ActiveRecord::RecordNotUnique
@@ -198,6 +192,18 @@ module Invoices
     end
 
     private
+
+      # Stores the operation row, its provisional reservations and the
+      # snapshots of every entry whose locked flag flips.
+      def store_prepared(request, entries, decisions)
+        operation = Operation.create!(
+          company_id: request.company_id, invoice_id: request.invoice_id, operation_id: request.operation_id,
+          actor_name: ACTOR_NAME, state: PREPARED, desired_entry_ids: request.entries,
+          disposition: request.disposition, generation: request.generation, created_at: Time.current
+        )
+        reserve_provisionally(operation, claimed_ids(decisions))
+        record_locked_flips(request.company_id, entries, operation.generation)
+      end
 
       def find_operation(request)
         Operation.where(company_id: request.company_id, actor_name: ACTOR_NAME,
