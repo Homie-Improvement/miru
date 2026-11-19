@@ -107,5 +107,5 @@ module TimekeepingDatabaseReset
       connection.exec_params("INSERT INTO admission (id, generation) VALUES ($1, $2)", [ADMISSION_ID, generation])
     end
   end
-  private_class_method :admission_generation, :database_name, :connect, :truncate_tables, :insert_admission
+  private_class_method :admission_generation, :connect, :truncate_tables, :insert_admission
 end

@@ -79,7 +79,9 @@ end
 RSpec.configure do |config|
   config.include CommittedDataMode::Helpers, committed_data: true
 
-  config.append_after(:each, committed_data: true) do
+  config.append_after(:each, committed_data: true) do |example|
+    next if TestDatabaseCleanup.reset_withheld?(example)
+
     CommittedDataMode.reset_database
   end
 end
