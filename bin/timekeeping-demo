@@ -9,12 +9,18 @@
 # It runs in the foreground; Ctrl-C stops every process it started. The
 # running versions are written to tmp/timekeeping-demo/versions.json.
 #
+#   bin/timekeeping-demo regression
+#
+# runs the section 12.1 regression specs once in each ownership state (legacy,
+# timekeeping, rollback), then once more for the examples tagged
+# :switches_owner, and exits non-zero when any of those runs fails.
+#
 # Rails is not loaded here, so the launcher's files are required directly, in
 # the order they depend on each other.
 
 root = File.expand_path("..", __dir__)
 
-%w[configuration_error process_spec credentials runtime_plan version_record supervisor cli].each do |file|
+%w[configuration_error process_spec credentials runtime_plan version_record supervisor regression cli].each do |file|
   require File.join(root, "lib", "timekeeping_demo", file)
 end
 
