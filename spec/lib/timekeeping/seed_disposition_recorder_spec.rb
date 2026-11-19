@@ -183,26 +183,8 @@ RSpec.describe TestDatabaseCleanup do
 end
 
 RSpec.describe Timekeeping::SeedDispositionRecorder, :without_transaction do
-  def recorder_store_spec_connection
-    ActiveRecord::Base.connection
-  end
-
   def recorder_store_spec_state
-    connection = recorder_store_spec_connection
-    tables = (connection.tables - described_class::METADATA_TABLES).sort
-    digests = tables.index_with do |table|
-      connection.select_value(
-        "SELECT md5(coalesce(string_agg(t::text, E'\\n' ORDER BY t::text), '')) FROM #{connection.quote_table_name(table)} t"
-      )
-    end
-    sequences = connection.select_values(<<~SQL).sort.to_h do |name|
-      SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-      WHERE c.relkind = 'S' AND n.nspname = current_schema()
-    SQL
-      row = connection.select_one("SELECT last_value, is_called FROM #{connection.quote_table_name(name)}")
-      [name, [row["last_value"].to_i, row["is_called"]]]
-    end
-    { digests:, sequences: }
+    { digests: SeedStateComparison.table_digests, sequences: SeedStateComparison.sequence_states }
   end
 
   it "with a store, a second load restores the first load's capture with the same ids and sequences, well under a minute" do

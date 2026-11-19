@@ -12,35 +12,6 @@ RSpec.describe Timekeeping::SeedCapture do
       seed_capture_spec_connection.tables - %w[ar_internal_metadata schema_migrations]
     end
 
-    # Rows are compared as text sorted by that text, so tables with no primary
-    # key (reservations, users_roles) and duplicate rows are compared too.
-    def seed_capture_spec_table_digests
-      seed_capture_spec_tables.sort.to_h do |table|
-        quoted = seed_capture_spec_connection.quote_table_name(table)
-        row = seed_capture_spec_connection.select_one(<<~SQL)
-          SELECT count(*) AS row_count,
-                 md5(coalesce(string_agg(t::text, E'\\n' ORDER BY t::text), '')) AS digest
-          FROM #{quoted} t
-        SQL
-        [table, [row["row_count"].to_i, row["digest"]]]
-      end
-    end
-
-    # Read from each sequence itself: pg_sequences has no is_called column and
-    # shows NULL for a sequence that never supplied a value.
-    def seed_capture_spec_sequence_states
-      names = seed_capture_spec_connection.select_values(<<~SQL)
-        SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE c.relkind = 'S' AND n.nspname = current_schema()
-      SQL
-      names.sort.to_h do |name|
-        row = seed_capture_spec_connection.select_one(
-          "SELECT last_value, is_called FROM #{seed_capture_spec_connection.quote_table_name(name)}"
-        )
-        [name, [row["last_value"].to_i, row["is_called"]]]
-      end
-    end
-
     def seed_capture_spec_next_ids
       %w[users timekeeping_ownership].to_h do |table|
         sequence = seed_capture_spec_connection.select_value(
@@ -60,8 +31,8 @@ RSpec.describe Timekeeping::SeedCapture do
       Timekeeping::SeedDispositionRecorder.load_fresh_seed!(
         as_of: TestDatabaseCleanup.seed_as_of, captures: TestDatabaseCleanup.seed_captures
       )
-      loaded_digests = seed_capture_spec_table_digests
-      loaded_sequences = seed_capture_spec_sequence_states
+      loaded_digests = SeedStateComparison.table_digests
+      loaded_sequences = SeedStateComparison.sequence_states
       expect(loaded_digests.fetch("users_roles").first).to be_positive
       expect(loaded_digests.fetch("rails_event_viewer_entries").first).to be_positive
 
@@ -75,8 +46,8 @@ RSpec.describe Timekeeping::SeedCapture do
       elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
 
       # "Reloading the two-tenant seed for a handoff example group takes well under a minute, either through bulk inserts in db/seeds.rb or by restoring a captured snapshot, and gives the same ids and sequence values as before."
-      expect(seed_capture_spec_table_digests).to eq(loaded_digests)
-      expect(seed_capture_spec_sequence_states).to eq(loaded_sequences)
+      expect(SeedStateComparison.table_digests).to eq(loaded_digests)
+      expect(SeedStateComparison.sequence_states).to eq(loaded_sequences)
       expect(seed_capture_spec_next_ids).to eq(loaded_next_ids)
       expect(elapsed).to be < 20
     end
