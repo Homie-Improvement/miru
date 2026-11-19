@@ -58,11 +58,13 @@ class TimekeepingLiveInstance
   BOOT_TIMEOUT_SECONDS = 120
   HOST = "127.0.0.1"
   RAILS = %w[bundle exec rails].freeze
+  DEFAULT_ADMISSION_GENERATION = 1
   # Runs once before the server starts: entry writes need the admission row at
-  # generation 1.
-  ADMIT_SCRIPT = <<~RUBY
+  # the instance's generation. The generation is filled in with %d from a
+  # checked Integer, because this text runs as Ruby source.
+  ADMIT_SCRIPT_FORMAT = <<~RUBY
     Timekeeping::Admission.ensure_initial!
-    Timekeeping::Admission.admit!(generation: 1)
+    Timekeeping::Admission.admit!(generation: %d)
   RUBY
   # The service counts writes by company id, and the monolith specs restart
   # their id sequences, so counts left by an earlier example or run would be
@@ -74,22 +76,33 @@ class TimekeepingLiveInstance
 
   attr_reader :base_url, :service_token, :private_key
 
-  def self.start(reference_stub:)
-    new(reference_stub:).tap(&:start)
+  # admission_generation is the generation admitted at boot and sent by
+  # write_entry. port defaults to a free one. database_url, when given, is the
+  # only URL every child opens; when nil, TIMEKEEPING_DATABASE_URL is read.
+  # The instance does not check the URL: its caller does.
+  def self.start(reference_stub:, admission_generation: DEFAULT_ADMISSION_GENERATION, port: nil, database_url: nil)
+    new(reference_stub:, admission_generation:, port:, database_url:).tap(&:start)
   end
 
-  def initialize(reference_stub:)
+  def initialize(reference_stub:, admission_generation: DEFAULT_ADMISSION_GENERATION, port: nil, database_url: nil)
+    unless admission_generation.is_a?(Integer) && admission_generation.positive?
+      raise ArgumentError, "admission_generation must be a positive Integer"
+    end
+
     @reference_stub = reference_stub
+    @admission_generation = admission_generation
+    @port = port
+    @database_url = database_url
     @service_token = "live-service-#{SecureRandom.hex(24)}"
     @private_key = OpenSSL::PKey::RSA.generate(2048)
   end
 
   def start
     start_reference_server
-    port = free_port
+    port = @port || free_port
     @base_url = "http://#{HOST}:#{port}"
     run_in_service!(*RAILS, "db:prepare")
-    run_in_service!(*RAILS, "runner", ADMIT_SCRIPT)
+    run_in_service!(*RAILS, "runner", format(ADMIT_SCRIPT_FORMAT, @admission_generation))
     @log = Tempfile.new(["timekeeping-live", ".log"])
     # A pid file of its own, so a server left by an interrupted run never
     # stops this one from booting.
@@ -133,7 +146,7 @@ class TimekeepingLiveInstance
   # the admitted generation and a fresh idempotency key.
   def write_entry(company_id:, token:, body:)
     post = Net::HTTP::Post.new(URI.join(base_url, "/v1/companies/#{Integer(company_id)}/entries"))
-    post["Ownership-Generation"] = "1"
+    post["Ownership-Generation"] = @admission_generation.to_s
     post["Idempotency-Key"] = SecureRandom.uuid
     request(post, body, "Bearer #{token}")
   end
@@ -151,15 +164,23 @@ class TimekeepingLiveInstance
       {
         "RAILS_ENV" => "test",
         "BUNDLE_GEMFILE" => File.join(SERVICE_DIRECTORY, "Gemfile"),
-        "TIMEKEEPING_DATABASE_URL" => ENV.fetch("TIMEKEEPING_DATABASE_URL") do
-          raise BootError, "TIMEKEEPING_DATABASE_URL must name the live Timekeeping test database"
-        end,
+        "TIMEKEEPING_DATABASE_URL" => database_url,
         "TIMEKEEPING_TOKEN_PUBLIC_KEY" => private_key.public_key.to_pem,
         "TIMEKEEPING_SERVICE_TOKEN" => service_token,
         "MONOLITH_REFERENCE_URL" => reference_url,
         # The service's own process needs no monolith database setting.
         "DATABASE_URL" => nil
       }
+    end
+
+    # A given URL is used exactly as passed, a blank one included, so the
+    # global variable can never stand in for the URL the caller checked.
+    def database_url
+      return @database_url unless @database_url.nil?
+
+      ENV.fetch("TIMEKEEPING_DATABASE_URL") do
+        raise BootError, "TIMEKEEPING_DATABASE_URL must name the live Timekeeping test database"
+      end
     end
 
     # The monolith runs under its own bundle; boot.rb keeps an inherited
