@@ -10,6 +10,7 @@ module TestDatabaseCleanupResetSiteScan
   WRAPPER_FILE = "spec/support/database_cleaner.rb"
   TIMEKEEPING_RESET_FILE = "spec/support/timekeeping/timekeeping_database_reset.rb"
   RUNTIME_QUEUES_FILE = "spec/timekeeping/runtime_queues_spec.rb"
+  QUEUE_LEDGER_ROWS_PROBE_FILE = "spec/fixtures/timekeeping_harness/queue_ledger_rows_probe.rb"
 
   Rule = Data.define(:name, :pattern, :allowed, :only_in)
 
@@ -30,7 +31,15 @@ module TestDatabaseCleanupResetSiteScan
     Rule.new(name: "raw SQL truncate", pattern: /(?:["'`]|^\s*)truncate\s+(?:table\s+)?["#\w]/i,
              allowed: { TIMEKEEPING_RESET_FILE => 1, RUNTIME_QUEUES_FILE => 1 }, only_in: nil),
     Rule.new(name: "raw SQL queue delete", pattern: /\bdelete\s+from\s+"?solid_queue_/i,
-             allowed: {}, only_in: nil)
+             allowed: {}, only_in: nil),
+    # Rails' own truncate on a connection, such as connection.truncate_tables(...).
+    # A bare truncate_tables(connection) is the Timekeeping reset's private helper.
+    Rule.new(name: "connection truncate", pattern: /\.truncate_tables?\b/,
+             allowed: {}, only_in: nil),
+    # The rows probe deletes chosen queue rows on purpose to check what the
+    # ledger records; it is not a reset site.
+    Rule.new(name: "Solid Queue model delete", pattern: /\bSolidQueue::\w+\b.*\.(?:delete_all|destroy_all)\b/,
+             allowed: { QUEUE_LEDGER_ROWS_PROBE_FILE => 4 }, only_in: nil)
   ].freeze
 
   module_function
@@ -121,6 +130,29 @@ RSpec.describe TestDatabaseCleanupResetSiteScan do
 
     expect(described_class.offenses("spec/timekeeping/runtime_queues_spec.rb" => text))
       .to eq(["raw SQL truncate: spec/timekeeping/runtime_queues_spec.rb:2"])
+  end
+
+  it "reports a Rails connection truncate and a Solid Queue model delete" do
+    sources = {
+      "spec/support/new_reset.rb" => "ActiveRecord::Base.connection.truncate_tables(\"solid_queue_jobs\")\n" \
+                                     "SolidQueue::Job.where(queue_name: \"default\").delete_all\n" \
+                                     "SolidQueue::FailedExecution.destroy_all\n"
+    }
+
+    expect(described_class.offenses(sources)).to eq(
+      [
+        "connection truncate: spec/support/new_reset.rb:1",
+        "Solid Queue model delete: spec/support/new_reset.rb:2",
+        "Solid Queue model delete: spec/support/new_reset.rb:3"
+      ]
+    )
+  end
+
+  it "reports a Solid Queue model delete past the four the rows probe may hold" do
+    text = "SolidQueue::Job.delete_all\n" * 5
+
+    expect(described_class.offenses("spec/fixtures/timekeeping_harness/queue_ledger_rows_probe.rb" => text))
+      .to eq(["Solid Queue model delete: spec/fixtures/timekeeping_harness/queue_ledger_rows_probe.rb:5"])
   end
 
   it "ignores words and symbols that only look like truncate" do
