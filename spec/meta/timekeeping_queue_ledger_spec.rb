@@ -682,3 +682,107 @@ RSpec.describe "Timekeeping queue ledger probes", :without_transaction do
     end
   end
 end
+
+RSpec.describe "Timekeeping queue ledger per-process path" do
+  # Acceptance: "Under bin/parallel_test each process resolves its own ledger path, so one process's suite-start delete cannot remove another process's ledger file."
+  it "the first parallel process and process 2 resolve different default ledger files" do
+    first = TimekeepingQueueLedger.ledger_path({ "TEST_ENV_NUMBER" => "" })
+    second = TimekeepingQueueLedger.ledger_path({ "TEST_ENV_NUMBER" => "2" })
+    third = TimekeepingQueueLedger.ledger_path({ "TEST_ENV_NUMBER" => "3" })
+
+    # A non-parallel run, with no TEST_ENV_NUMBER at all, keeps the unsuffixed file the first process uses.
+    expect(TimekeepingQueueLedger.ledger_path({})).to eq(first)
+    expect(first).to eq(Rails.root.join("tmp/timekeeping-integration/queue_ledger.json").to_s)
+    expect(second).to eq(Rails.root.join("tmp/timekeeping-integration/queue_ledger.2.json").to_s)
+    expect(third).to eq(Rails.root.join("tmp/timekeeping-integration/queue_ledger.3.json").to_s)
+    expect([first, second, third].uniq.size).to eq(3)
+  end
+
+  # A suffix added to a subprocess's private path would make the parent's
+  # byte-for-byte check read a file the child never wrote.
+  it "an explicit ledger path inherited by a numbered parallel child stays the exact file the parent reads back" do
+    path = "/tmp/owner-state-probe-ledger/queue_ledger.json"
+    env = { TimekeepingQueueLedger::PATH_KEY => path, "TEST_ENV_NUMBER" => "2" }
+
+    expect(TimekeepingQueueLedger.ledger_path(env)).to eq(path)
+    expect(TimekeepingQueueLedger.build_session(env).path).to eq(path)
+  end
+
+  # The suite-start hook deletes whatever path this returns, so a malformed
+  # process number must never become part of that path.
+  it "ledger_path refuses a TEST_ENV_NUMBER that is not a positive integer instead of building a ledger path from it" do
+    ["../evil", "0", "2a", "2/../../x"].each do |value|
+      expect { TimekeepingQueueLedger.ledger_path({ "TEST_ENV_NUMBER" => value }) }
+        .to raise_error(ArgumentError, /#{Regexp.escape(value)}/)
+    end
+
+    ledger_dir = Rails.root.join("tmp/timekeeping-integration").to_s
+    resolved = TimekeepingQueueLedger.ledger_path({ "TEST_ENV_NUMBER" => "2" })
+    expect(File.dirname(File.expand_path(resolved))).to eq(ledger_dir)
+  end
+
+  # Process numbers 96 and 97 are ones bin/parallel_test's default process count never reaches,
+  # so this delete cannot hit the ledger of a sibling process running beside this one.
+  it "the suite-start delete of the second process leaves the first process's default ledger file byte for byte unchanged" do
+    first = TimekeepingQueueLedger.build_session({ "TEST_ENV_NUMBER" => "97" })
+    second = TimekeepingQueueLedger.build_session({ "TEST_ENV_NUMBER" => "96" })
+    contents = JSON.generate("records" => [], "controls" => [], "marker" => "process-97")
+
+    begin
+      FileUtils.mkdir_p(File.dirname(first.path))
+      File.write(first.path, contents)
+
+      # The same delete the before(:suite) hook performs, aimed at the other process's session.
+      FileUtils.rm_f(second.path)
+
+      expect(second.path).not_to eq(first.path)
+      expect(File.binread(first.path)).to eq(contents.b)
+    ensure
+      FileUtils.rm_f(first.path)
+      FileUtils.rm_f(second.path)
+    end
+  end
+end
+
+RSpec.describe "Timekeeping queue ledger per-process probe isolation", :without_transaction do
+  # Acceptance: "Under bin/parallel_test each process resolves its own ledger path, so one process's suite-start delete cannot remove another process's ledger file."
+  it "a probe running as another parallel process leaves this process's default ledger file byte for byte unchanged" do
+    skip "set TIMEKEEPING_LIVE=1 to run the queue ledger probes" unless ENV["TIMEKEEPING_LIVE"] == "1"
+
+    # Numbers bin/parallel_test's default process count never reaches, so no running sibling owns these files.
+    parent_path = TimekeepingQueueLedger.ledger_path({ "TEST_ENV_NUMBER" => "98" })
+    child_path = TimekeepingQueueLedger.ledger_path({ "TEST_ENV_NUMBER" => "99" })
+    violation = JSON.generate(
+      "records" => [{ "database" => "monolith", "queue" => "default", "job_class" => "StrayJob",
+                      "kind" => "completed", "job_id" => 1, "active_job_id" => "process-98-violation",
+                      "execution_id" => nil, "created_at" => "2026-01-01T00:00:00Z",
+                      "finished_at" => "2026-01-01T00:00:01Z" }],
+      "controls" => []
+    )
+    # config/database.yml names the database from TEST_ENV_NUMBER unless DATABASE_URL is present,
+    # so the child keeps this run's prepared database while its process number changes. A
+    # DATABASE_URL this run already uses is passed on whole, so its host and user survive.
+    database_url = ENV["DATABASE_URL"].presence ||
+                   "postgresql:///#{ActiveRecord::Base.connection_db_config.database}"
+    probe = Rails.root.join("spec/fixtures/timekeeping_harness/queue_ledger_probe.rb").to_s
+
+    begin
+      FileUtils.mkdir_p(File.dirname(parent_path))
+      File.write(parent_path, violation)
+      stdout, stderr, status = Open3.capture3(
+        { "QUEUE_LEDGER_PROBE" => "clean", "TEST_ENV_NUMBER" => "99",
+          # Empty rather than unset: dotenv fills in an unset key from .env or .env.test, but leaves "" alone.
+          TimekeepingQueueLedger::PATH_KEY => "", "DATABASE_URL" => database_url },
+        "bundle", "exec", "rspec", probe, chdir: Rails.root.to_s
+      )
+
+      expect(status).to be_success, "#{stdout}\n#{stderr}"
+      expect(File.binread(parent_path)).to eq(violation.b)
+      # The child really used its own per-process default file, not some other path.
+      expect(File.exist?(child_path)).to be(true)
+    ensure
+      FileUtils.rm_f(parent_path)
+      FileUtils.rm_f(child_path)
+    end
+  end
+end

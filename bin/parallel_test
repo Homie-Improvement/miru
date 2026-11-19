@@ -107,6 +107,15 @@ if ARGV.any? && options[:exclude_dirs].any?
   abort "bin/parallel_test: --exclude-dir only applies when no spec paths are given"
 end
 
+# Each parallel process derives its own queue ledger file from TEST_ENV_NUMBER.
+# An explicit path would be inherited by every process, so one process's
+# suite-start delete would remove the ledger another process is writing.
+QUEUE_LEDGER_PATH_KEY = "TIMEKEEPING_QUEUE_LEDGER_PATH"
+unless ENV.fetch(QUEUE_LEDGER_PATH_KEY, "").strip.empty?
+  abort "bin/parallel_test: unset #{QUEUE_LEDGER_PATH_KEY}; every parallel process would share that one " \
+        "queue ledger file, so each process uses its own default file instead"
+end
+
 # Set up database for parallel tests if requested
 if options[:setup]
   puts "Setting up parallel test databases..."
@@ -123,7 +132,10 @@ command = [
 ]
 parallel_env = {
   "PARALLEL_RUNTIME_LOG" => options[:runtime_log],
-  "PARALLEL_FAILURES_LOG" => options[:failures_log]
+  "PARALLEL_FAILURES_LOG" => options[:failures_log],
+  # dotenv never replaces a key that is already set, even to "", so this stops a
+  # .env or .env.test file from giving every worker the same ledger file again.
+  QUEUE_LEDGER_PATH_KEY => ""
 }
 
 excluded = excluded_prefixes(exclude_system: options[:exclude_system], exclude_dirs: options[:exclude_dirs])
