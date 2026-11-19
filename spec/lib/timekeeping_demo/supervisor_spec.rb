@@ -171,7 +171,8 @@ RSpec.describe TimekeepingDemo::Supervisor do
       recorded_at_wait = []
       allow(Process).to receive(:wait2).and_wrap_original do |original, pid, *rest|
         waited << pid
-        recorded_at_wait << (File.exist?(groups_path) ? File.read(groups_path).lines.map { |line| Integer(line, 10) } : [])
+        # Kept as text, so a line such as "+4242" never passes as the pid it would convert to.
+        recorded_at_wait << (File.exist?(groups_path) ? File.read(groups_path).lines.map(&:strip) : [])
         original.call(pid, *rest)
       end
 
@@ -179,11 +180,11 @@ RSpec.describe TimekeepingDemo::Supervisor do
       described_class.new(output: StringIO.new, groups_path:).prepare(specs)
 
       expect(waited.size).to eq(2)
-      expect(waited.zip(recorded_at_wait).map { |pid, recorded| recorded.include?(pid) }).to eq([true, true])
+      expect(waited.zip(recorded_at_wait).map { |pid, recorded| recorded.include?(pid.to_s) }).to eq([true, true])
       # The id being waited on is the newest line, so each id is written before its own wait.
-      expect(waited.zip(recorded_at_wait).map { |pid, recorded| recorded.last == pid }).to eq([true, true])
+      expect(waited.zip(recorded_at_wait).map { |pid, recorded| recorded.last == pid.to_s }).to eq([true, true])
       expect(File.read(groups_path).lines.size).to eq(2)
-      expect(File.read(groups_path).lines.map { |line| Integer(line, 10) }).to eq(waited)
+      expect(File.read(groups_path)).to eq(waited.map { |pid| "#{pid}\n" }.join)
     end
   end
 
