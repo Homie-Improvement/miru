@@ -264,5 +264,23 @@ RSpec.describe Timekeeping::Handoff::OperationsSettle do
       expect(store).to have_received(:stop_applying).with(generation: 4)
       expect(store).not_to have_received(:stop_applying).with(generation: 5)
     end
+
+    it "the Timekeeping port asks for a fresh prepared count at the outgoing generation on every settled? call" do
+      TimekeepingOwnership.current.update_columns(generation: 5, handoff_step: "settle")
+      store = instance_double(Timekeeping::Handoff::TimekeepingStore)
+      answers = [1, 0].map do |prepared_operations|
+        Timekeeping::Handoff::TimekeepingStore::SettleAnswer.new(settling: true, prepared_operations:)
+      end
+      allow(store).to receive(:settle) { answers.shift }
+      settle = Timekeeping::Handoff::OperationsSettle.new(owner: described_class.new(store:),
+                                                          reservations: Object.new,
+                                                          connection: ActiveRecord::Base.connection)
+
+      # "`settled?` is true only when no `invoice_operation_intents` row is 'pending' and the owner reports no 'prepared' operation."
+      expect(settle.settled?).to be(false)
+      expect(settle.settled?).to be(true)
+      expect(store).to have_received(:settle).with(generation: 4).twice
+      expect(store).not_to have_received(:settle).with(generation: 5)
+    end
   end
 end
