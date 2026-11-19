@@ -302,8 +302,7 @@ module Timekeeping
 
         # Step 7. Requires reconcile recorded at this run's generation, moves
         # the owner and clears the step and any open settle step in one
-        # transaction, and only then lets
-        # the incoming owner admit writes. A flip from the legacy source also
+        # transaction, and only then lets the incoming owner admit writes. A flip from the legacy source also
         # retires it: legacy_retired_at is set and the monolith's own store
         # becomes the prepared tables, so a later rollback lands there.
         #
