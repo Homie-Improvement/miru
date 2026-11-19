@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_11_18_120000) do
+ActiveRecord::Schema[8.1].define(version: 2026_11_19_120000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pg_stat_statements"
@@ -1275,6 +1275,8 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_18_120000) do
     t.datetime "legacy_retired_at"
     t.string "monolith_store", default: "legacy", null: false
     t.string "owner", default: "monolith", null: false
+    t.bigint "settling_generation"
+    t.bigint "settling_stopped_generation"
     t.check_constraint "handoff_step IS NULL OR (handoff_step::text = ANY (ARRAY['close_admission'::character varying, 'settle'::character varying, 'freeze'::character varying, 'checkpoint'::character varying, 'sequence'::character varying, 'reconcile'::character varying]::text[]))", name: "timekeeping_ownership_handoff_step_check"
     t.check_constraint "id = 1", name: "timekeeping_ownership_single_row_check"
     t.check_constraint "monolith_store::text = ANY (ARRAY['legacy'::character varying, 'prepared'::character varying]::text[])", name: "timekeeping_ownership_monolith_store_check"
