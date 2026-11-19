@@ -143,6 +143,7 @@ RSpec.describe "Timekeeping seeded runtime hooks" do
         companies_at_start << seeded_company_names.map { |name| Company.where(name:).count }
         runtime
       end
+      allow(TimekeepingDatabaseReset).to receive(:reset!).and_call_original
       seen = {}
 
       result = run_inner_example_through_suite_hooks(
@@ -158,6 +159,10 @@ RSpec.describe "Timekeeping seeded runtime hooks" do
       expect(companies_at_start).to eq([[1, 1]])
       expect(seen[:entries]).to all(be > 0)
       expect(IntegratedRuntime).to have_received(:start).with(hash_including(owner_state: "rollback")).once
+      # The Timekeeping admission row is reset in the example's state by the runtime hook's seeded clean, which
+      # alone passes ENV.to_h; the owner-state hook re-applies only the monolith row, so it cannot hide this.
+      expect(TimekeepingDatabaseReset).to have_received(:reset!).with("rollback", env: ENV.to_h).once
+      expect(TimekeepingDatabaseReset).not_to have_received(:reset!).with("timekeeping", env: anything)
       expect(runtime).to have_received(:stop!).once
     end
 
@@ -198,6 +203,7 @@ RSpec.describe "Timekeeping seeded runtime hooks" do
     #  runtime's owner state for that example, and is checked by expect_owner_state!"
     it "hold a seeded committed example without the runtime tag in the owner state its metadata names" do
       stub_const("TimekeepingOwnerState::SELECTED", nil)
+      allow(TimekeepingDatabaseReset).to receive(:reset!).and_call_original
       seen = {}
 
       result = run_inner_example_through_suite_hooks(
@@ -209,6 +215,9 @@ RSpec.describe "Timekeeping seeded runtime hooks" do
 
       expect(result.exception).to be_nil
       expect(seen[:companies]).to eq(2)
+      # The owner-state hook re-applies the monolith row afterwards, so only this shows the committed_data hook
+      # reset the Timekeeping admission row in the example's state.
+      expect(TimekeepingDatabaseReset).to have_received(:reset!).with("timekeeping", env: anything).once
     end
   end
 end
