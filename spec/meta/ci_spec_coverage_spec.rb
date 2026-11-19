@@ -134,6 +134,11 @@ RSpec.describe "CI spec coverage in validations.yml" do
         problems << "matrix groups #{groups.inspect} do not list 1 to #{group_count}"
       end
       problems << "fail-fast is not off for the handoff groups" unless strategy["fail-fast"] == false
+      # A hard-coded or missing group selector makes the legs repeat one group or
+      # every file, so some files run more than once and others never.
+      unless run.scan(/--only-group\b/).size == 1 && run.match?(/--only-group\s+\$\{\{\s*matrix\.group\s*\}\}(\s|\z)/)
+        problems << "the handoff run does not select its group with --only-group ${{ matrix.group }}"
+      end
 
       summary_job = jobs.values.find { |job| job["name"] == summary_check_name }
       return problems << "no job is named #{summary_check_name}" unless summary_job
@@ -142,11 +147,19 @@ RSpec.describe "CI spec coverage in validations.yml" do
         problems << "#{summary_check_name} does not need timekeeping-handoff"
       end
       problems << "#{summary_check_name} is skipped when a group fails" unless summary_job["if"].to_s.include?("always()")
+      # Either key would let the check conclude as passed after its step failed or was skipped.
+      summary_parts = [summary_job, *Array(summary_job["steps"])]
+      if summary_parts.any? { |part| part["continue-on-error"] } || Array(summary_job["steps"]).any? { |step| step.key?("if") }
+        problems << "#{summary_check_name} can pass without its step failing on a failed group"
+      end
       problems
     end
 
     let(:summary_job) { jobs.values.find { |job| job["name"] == summary_check_name } }
     let(:summary_step) { summary_job.fetch("steps").sole }
+    let(:handoff_job_run_step) do
+      handoff_job.fetch("steps").find { |step| step["run"].to_s.include?("rspec #{handoff_dir}") }
+    end
 
     it "finds the real workflow's groups complete and its summary check wired to them" do
       expect(handoff_group_problems(workflow)).to be_empty
@@ -180,6 +193,46 @@ RSpec.describe "CI spec coverage in validations.yml" do
       summary_job["name"] = "Timekeeping handoff summary"
 
       expect(handoff_group_problems(workflow)).to eq(["no job is named Timekeeping handoff specs"])
+    end
+
+    it "fails when every leg runs the same hard-coded group" do
+      handoff_job_run_step["run"] = handoff_job_run_step.fetch("run").sub("${{ matrix.group }}", "1")
+
+      expect(handoff_group_problems(workflow)).to eq(
+        ["the handoff run does not select its group with --only-group ${{ matrix.group }}"]
+      )
+    end
+
+    it "fails when the handoff run selects no group" do
+      handoff_job_run_step["run"] = handoff_job_run_step.fetch("run").sub(" --only-group ${{ matrix.group }}", "")
+
+      expect(handoff_group_problems(workflow)).to eq(
+        ["the handoff run does not select its group with --only-group ${{ matrix.group }}"]
+      )
+    end
+
+    it "fails when the summary step ignores its own failure" do
+      summary_step["continue-on-error"] = true
+
+      expect(handoff_group_problems(workflow)).to eq(
+        ["Timekeeping handoff specs can pass without its step failing on a failed group"]
+      )
+    end
+
+    it "fails when the summary job ignores its own failure" do
+      summary_job["continue-on-error"] = true
+
+      expect(handoff_group_problems(workflow)).to eq(
+        ["Timekeeping handoff specs can pass without its step failing on a failed group"]
+      )
+    end
+
+    it "fails when the summary step can be skipped" do
+      summary_step["if"] = false
+
+      expect(handoff_group_problems(workflow)).to eq(
+        ["Timekeeping handoff specs can pass without its step failing on a failed group"]
+      )
     end
 
     it "passes the summary step only when every handoff group succeeded" do
