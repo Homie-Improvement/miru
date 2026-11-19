@@ -42,6 +42,15 @@ class TimekeepingOwnership < ApplicationRecord
       { settling_generation: nil,
         settling_stopped_generation: [state.settling_stopped_generation, generation].compact.max }
     end
+
+    # Ends whatever step is open and raises the mark to that step's
+    # generation, for transitions such as a flip or an abort that end the
+    # handoff without stop_applying!. Without the raised mark, a late begin
+    # during a later handoff could reopen the old generation. With no step
+    # open the mark stays as it is.
+    def self.close(state)
+      stop(state, state.settling_generation)
+    end
   end
 
   # Raised by writers that may run only before any handoff has begun, such as
@@ -161,6 +170,13 @@ class TimekeepingOwnership < ApplicationRecord
       owner != INITIAL_OWNER ||
       monolith_store != INITIAL_MONOLITH_STORE ||
       !admission_fenced_at.nil?
+  end
+
+  # Assigns SettlingPhase.close's changes to this record without saving, for
+  # a caller that already holds the row lock and saves it in its own write.
+  def close_settling_step
+    assign_attributes(SettlingPhase.close(PhaseState.new(handoff_step:, settling_generation:,
+                                                         settling_stopped_generation:)))
   end
 
   # Whether the monolith's entry and billing writers must refuse. A handoff

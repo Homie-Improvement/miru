@@ -419,9 +419,20 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     expect(ownership.owner).to eq("timekeeping")
     # "In lib/timekeeping/handoff/runner.rb, `flip` and `abort_handoff` also set `settling_generation` to NULL, so no handoff ends with a stored settling generation."
     expect(ownership.settling_generation).to be_nil
+    # The legacy source's stop_applying! does nothing, so the flip alone closed this step and must raise the mark.
+    expect(ownership.settling_stopped_generation).to be >= 1
+
+    # A later handoff is in progress, so only the stop mark can refuse the late begin.
+    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(handoff_step: "settle")
+    TimekeepingOwnership.begin_settling!(generation: 1)
+    expect(TimekeepingOwnership.current.settling_generation).to be_nil
+
+    # The mark is the cleared generation, not higher, so the later handoff's own step still opens.
+    TimekeepingOwnership.begin_settling!(generation: 2)
+    expect(TimekeepingOwnership.current.settling_generation).to eq(2)
   ensure
     TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)
-      .update_all(settling_generation: nil, settling_stopped_generation: nil)
+      .update_all(settling_generation: nil, settling_stopped_generation: nil, handoff_step: nil)
   end
 end
 
@@ -447,8 +458,16 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     expect(ownership.handoff_step).to be_nil
     # "In lib/timekeeping/handoff/runner.rb, `flip` and `abort_handoff` also set `settling_generation` to NULL, so no handoff ends with a stored settling generation."
     expect(ownership.settling_generation).to be_nil
+    # The legacy source's stop_applying! does nothing, so the abort alone closed this step and must raise the mark.
+    expect(ownership.settling_stopped_generation).to be >= 1
+
+    # A later handoff is in progress, so only the stop mark can refuse the late begin.
+    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(handoff_step: "settle")
+    TimekeepingOwnership.begin_settling!(generation: 1)
+    expect(TimekeepingOwnership.current.settling_generation).to be_nil
   ensure
+    FileUtils.rm_rf(report_root) if report_root
     TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)
-      .update_all(settling_generation: nil, settling_stopped_generation: nil)
+      .update_all(settling_generation: nil, settling_stopped_generation: nil, handoff_step: nil)
   end
 end

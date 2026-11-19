@@ -584,3 +584,44 @@ RSpec.describe TimekeepingOwnership, type: :model do
     expect(Company.count).to eq(company_count + 1)
   end
 end
+
+RSpec.describe TimekeepingOwnership, "closing the settle step on the record" do
+  it "close_settling_step changes nothing stored until the record is saved, then persists the raised stop mark" do
+    ownership = described_class.current
+    ownership.update_columns(generation: 3, handoff_step: "reconcile", settling_generation: 2,
+                             settling_stopped_generation: nil)
+
+    ownership.close_settling_step
+    expect([ownership.settling_generation, ownership.settling_stopped_generation]).to eq([nil, 2])
+    stored = described_class.current
+    expect([stored.settling_generation, stored.settling_stopped_generation]).to eq([2, nil])
+
+    ownership.save!
+    stored = described_class.current
+    expect([stored.settling_generation, stored.settling_stopped_generation]).to eq([nil, 2])
+
+    # Closing again with no open step keeps the mark where it is.
+    stored.close_settling_step
+    stored.save!
+    expect(described_class.current.settling_stopped_generation).to eq(2)
+  end
+end
+
+RSpec.describe TimekeepingOwnership::SettlingPhase, "close" do
+  it "close ends the open step, raises a NULL or lower mark to its generation, and never lowers the mark" do
+    open_step = TimekeepingOwnership::PhaseState.new(handoff_step: "reconcile", settling_generation: 3,
+                                                     settling_stopped_generation: nil)
+
+    # "settling_stopped_generation is at least the cleared settling generation"
+    expect(described_class.close(open_step)).to eq(settling_generation: nil, settling_stopped_generation: 3)
+    expect(described_class.close(open_step.with(settling_stopped_generation: 2)))
+      .to eq(settling_generation: nil, settling_stopped_generation: 3)
+    expect(described_class.close(open_step.with(settling_stopped_generation: 5)))
+      .to eq(settling_generation: nil, settling_stopped_generation: 5)
+
+    no_step = open_step.with(settling_generation: nil)
+    expect(described_class.close(no_step.with(settling_stopped_generation: 4)))
+      .to eq(settling_generation: nil, settling_stopped_generation: 4)
+    expect(described_class.close(no_step)).to eq(settling_generation: nil, settling_stopped_generation: nil)
+  end
+end
