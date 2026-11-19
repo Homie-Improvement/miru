@@ -27,7 +27,7 @@ applies_when:
 
 The entry gateway sends each time-entry write to one of two stores. While the legacy store owns entries, a write leaves a local `TimesheetEntry` row. While Timekeeping owns them, the write goes to the Timekeeping service, which specs replace with `TimekeepingContract::FakeTimekeeping`, and no local row appears.
 
-The spec helpers `with_forwarded_timekeeping_env` and `arrange_forwarded_timekeeping` set up the second case. They do more than register users and projects on the fake: they also make Timekeeping the owner. That makes them look like the natural shared setup for every gateway spec, but they change which store a write lands in.
+The spec helpers `with_forwarded_timekeeping_env` and `arrange_forwarded_timekeeping` set up the second case. They do more than register users and projects on the fake: in an ordinary run they also make Timekeeping the owner. In a regression run that selects an ownership state through `TIMEKEEPING_OWNER_STATE`, `arrange_forwarded_timekeeping` applies that state instead, unless the caller passes `owner_state:`. That makes them look like the natural shared setup for every gateway spec, but they change which store a write lands in.
 
 The MCP write-tools spec checks local rows, for example that a retry after a handoff takes `TimesheetEntry.where(user:).count` from 1 to 2. Under the forwarding setup that count would never move. The test would then fail, or someone would "fix" it by checking the fake, which drops the only coverage that the MCP path writes a local row.
 

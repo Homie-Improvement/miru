@@ -56,5 +56,5 @@ A parsing slip here does not fail a test. It kills the test runner or the develo
 
 - PR #378 adds `record_group` to `lib/timekeeping_demo/supervisor.rb` and calls it after each spawn in `prepare` and `run`.
 - `spec/support/timekeeping/integrated_runtime.rb` adds `parse_groups` with `GROUP_LINE` and `SMALLEST_GROUP`, and `clear_leftovers!`, whose comment explains why old ids are cleared only after `refuse_if_running!`.
-- `spec/lib/timekeeping_demo/integrated_runtime_spec.rb` expects `parse_groups("4242\n\n0\n1\n-7\nabc\n12x\n 99\n31337\n5")` to equal `[4242, 31_337]`, skipping the final `5` that has no newline.
+- PR #378's `spec/lib/timekeeping_demo/integrated_runtime_spec.rb` expected `parse_groups("4242\n\n0\n1\n-7\nabc\n12x\n 99\n31337\n5")` to equal `[4242, 31_337]`, skipping the final `5` that has no newline. Its copies are now one example, which expects `parse_groups("4242\n\n0\n1\n-7\n-5\nabc\n12x\n 99\n4243\n4343\n9001\n31337\n5")` to equal `[4242, 4243, 4343, 9001, 31_337]` and `parse_groups("")` to equal `[]`.
 - `spec/lib/timekeeping_demo/supervisor_spec.rb` checks that each id is on disk before the next `Process.spawn` call.
