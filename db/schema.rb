@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_11_17_120000) do
+ActiveRecord::Schema[8.1].define(version: 2026_11_18_120000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
   enable_extension "pg_stat_statements"
@@ -1266,6 +1266,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_17_120000) do
   end
 
   create_table "timekeeping_ownership", force: :cascade do |t|
+    t.datetime "admission_fenced_at"
     t.datetime "changed_at", default: -> { "CURRENT_TIMESTAMP" }, null: false
     t.string "changed_by", default: "system", null: false
     t.bigint "final_outbox_position"
