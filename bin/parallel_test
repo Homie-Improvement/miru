@@ -101,6 +101,12 @@ OptionParser.new do |opts|
   end
 end.parse!
 
+# Explicit paths are passed to parallel_rspec as given, with no exclude pattern,
+# so an --exclude-dir beside them would be silently ignored.
+if ARGV.any? && options[:exclude_dirs].any?
+  abort "bin/parallel_test: --exclude-dir only applies when no spec paths are given"
+end
+
 # Set up database for parallel tests if requested
 if options[:setup]
   puts "Setting up parallel test databases..."

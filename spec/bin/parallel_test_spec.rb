@@ -55,6 +55,17 @@ RSpec.describe "bin/parallel_test" do
     expect(tokens[tokens.index("--exclude-pattern") + 1]).to eq(pattern.source)
   end
 
+  # Explicit paths run as given, so an --exclude-dir beside them would be ignored without a word.
+  it "refuses --exclude-dir together with explicit spec paths, and runs nothing" do
+    output, status, recorded_args = run_parallel_test_with_fake_bundle(
+      "-n", "2", "--exclude-dir", "spec/lib/timekeeping/handoff", "spec/lib"
+    )
+
+    expect(status).not_to be_success
+    expect(output).to include("--exclude-dir only applies when no spec paths are given")
+    expect(recorded_args).to be_empty
+  end
+
   # An unescaped "." would match any character and exclude directories nobody named.
   it "treats a regex metacharacter in an excluded directory as a literal character" do
     output, status, recorded_args = run_parallel_test_with_fake_bundle(
