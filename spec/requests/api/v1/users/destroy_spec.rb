@@ -457,7 +457,7 @@ RSpec.describe "Api::V1::Users#destroy while the monolith admission fence is set
     expect(response).to have_http_status(:unprocessable_content)
     expect(json_response.keys).to eq(["errors"])
     expect(json_response["errors"]).to eq(I18n.t("user.super_admin_delete.handoff_begun"))
-    ["2031-07-19", "13:47:52", fenced_at.iso8601, "admission_fenced_at", "fence-operator-5519@example.com",
+    ["2031", "13:47", fenced_at.iso8601, "admission_fenced_at", "fence-operator-5519@example.com",
      "monolith", "legacy", fenced_company.name].each do |hidden|
       expect(response.body).not_to include(hidden)
     end
@@ -555,39 +555,6 @@ RSpec.describe "Api::V1::Users#destroy while the admission fence is set", type: 
   end
 end
 
-RSpec.describe "Api::V1::Users#destroy while the admission fence is set", type: :request do
-  # "A spec shows that the seed refusal and the users controller's `unless_handoff_begun` either refuse while `admission_fenced_at` is set or are documented as deliberately exempt"
-  # The ownership row is global operator state shared by every company, so the
-  # refusal must carry only the fixed locale message and no ownership values.
-  it "refuses the delete on a fenced-only ownership row with only the fixed handoff message and no fence timestamp or company name" do
-    company = create(:company, name: "Fenced Body Co")
-    super_admin = create(:user, email: "hello@saeloun.com", current_workspace_id: company.id)
-    create(:employment, company:, user: super_admin)
-    super_admin.add_role :admin, company
-    target_user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user: target_user)
-    target_user.add_role :employee, company
-    sign_in super_admin
-
-    fenced_at = Time.utc(2031, 7, 14, 9, 26, 53)
-    TimekeepingOwnership.current.update_columns(
-      generation: 1, handoff_step: nil, owner: "monolith", monolith_store: "legacy", admission_fenced_at: fenced_at
-    )
-    audit_baseline = Audited::Audit.where(action: "super_admin_delete").count
-
-    send_request :delete, api_v1_user_path(target_user), headers: auth_headers(super_admin)
-
-    expect(response).to have_http_status(:unprocessable_content)
-    expect(json_response.keys).to eq(["errors"])
-    expect(json_response["errors"]).to eq(I18n.t("user.super_admin_delete.handoff_begun"))
-    ["2031", fenced_at.iso8601, "admission_fenced_at", company.name].each do |value|
-      expect(response.body).not_to include(value)
-    end
-    expect(User.exists?(target_user.id)).to be(true)
-    expect(Audited::Audit.where(action: "super_admin_delete").count).to eq(audit_baseline)
-  end
-end
-
 RSpec.describe "Api::V1::Users#destroy fenced refusal across companies", type: :request do
   # "A spec shows that the seed refusal and the users controller's `unless_handoff_begun` either refuse while `admission_fenced_at` is set or are documented as deliberately exempt"
   # The fence mark sits on the one global ownership row, so it refuses deletes
@@ -617,68 +584,6 @@ RSpec.describe "Api::V1::Users#destroy fenced refusal across companies", type: :
     expect(Employment.where(user_id: target_user.id).count).to eq(1)
     expect(Audited::Audit.where(action: "super_admin_delete").count).to eq(audit_baseline)
     expect(TimekeepingOwnership.current.admission_fenced_at).not_to be_nil
-  end
-end
-
-RSpec.describe "Api::V1::Users#destroy while the monolith admission fence is set", type: :request do
-  # "A spec shows that ... the users controller's `unless_handoff_begun` either refuse while
-  # `admission_fenced_at` is set or are documented as deliberately exempt". The plan chooses refusal.
-  it "refuses the super-admin delete of a user with no agents on a fenced-only row with the fixed message and no audit row, then deletes after admit" do
-    company = create(:company, name: "Fence Co")
-    super_admin = create(:user, email: "hello@saeloun.com", current_workspace_id: company.id)
-    create(:employment, company:, user: super_admin)
-    super_admin.add_role :admin, company
-    target_user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user: target_user)
-    target_user.add_role :employee, company
-    sign_in super_admin
-    fenced_at = Time.zone.parse("2026-03-14 09:26:53")
-    TimekeepingOwnership.current.update_columns(generation: 1, handoff_step: nil, owner: "monolith",
-                                                monolith_store: "legacy", admission_fenced_at: fenced_at)
-    audits = Audited::Audit.where(action: "super_admin_delete")
-    audit_baseline = audits.count
-
-    send_request :delete, api_v1_user_path(target_user), headers: auth_headers(super_admin)
-
-    expect(response).to have_http_status(:unprocessable_content)
-    expect(json_response.keys).to eq(["errors"])
-    expect(json_response["errors"]).to eq(I18n.t("user.super_admin_delete.handoff_begun"))
-    ["2026", "09:26", fenced_at.iso8601, "admission_fenced_at", company.name].each do |value|
-      expect(response.body).not_to include(value)
-    end
-    expect(User.exists?(target_user.id)).to be(true)
-    expect(target_user.employments.count).to eq(1)
-    expect(audits.count).to eq(audit_baseline)
-
-    Timekeeping::Handoff::MonolithAdmission.new.admit(generation: 1)
-    send_request :delete, api_v1_user_path(target_user), headers: auth_headers(super_admin)
-
-    expect(response).to have_http_status(:ok)
-    expect(User.exists?(target_user.id)).to be(false)
-    expect(audits.count).to eq(audit_baseline + 1)
-  end
-end
-
-RSpec.describe "Api::V1::Users#destroy authorization while the admission fence is set", type: :request do
-  # The handoff refusal must come after authorization, so the fence state never reaches a caller
-  # who may not delete the user.
-  it "answers a non-super-admin with forbidden on a fenced-only row, never the handoff refusal" do
-    company = create(:company)
-    admin_user = create(:user, current_workspace_id: company.id)
-    target_user = create(:user, current_workspace_id: company.id)
-    create(:employment, company:, user: admin_user)
-    create(:employment, company:, user: target_user)
-    admin_user.add_role :admin, company
-    target_user.add_role :employee, company
-    sign_in admin_user
-    TimekeepingOwnership.current.update_columns(generation: 1, handoff_step: nil, owner: "monolith",
-                                                monolith_store: "legacy", admission_fenced_at: Time.current)
-
-    send_request :delete, api_v1_user_path(target_user), headers: auth_headers(admin_user)
-
-    expect(response).to have_http_status(:forbidden)
-    expect(response.body).not_to include(I18n.t("user.super_admin_delete.handoff_begun"))
-    expect(User.exists?(target_user.id)).to be(true)
   end
 end
 

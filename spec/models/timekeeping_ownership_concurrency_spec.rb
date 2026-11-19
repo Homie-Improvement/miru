@@ -81,44 +81,6 @@ RSpec.describe TimekeepingOwnership, committed_data: true do
 end
 
 RSpec.describe TimekeepingOwnership, committed_data: true do
-  # "...and states whether seed runs hold the ownership row FOR SHARE through their writes."
-  # The plan's answer is no: seeds check once, unlocked, before their first write.
-  it "seed runs do not hold the ownership row FOR SHARE: a fence commits while a seed transaction that passed the check is still open, and the next check refuses" do
-    checked = Queue.new
-    release = Queue.new
-    seed_pids = Queue.new
-    fence_pids = Queue.new
-    seed = committed_data_thread(seed_pids) do
-      ActiveRecord::Base.transaction do
-        described_class.refuse_if_handoff_begun!
-        checked << true
-        release.pop
-      end
-    end
-    expect(checked.pop(timeout: 5)).to be(true), "the seed check never passed on the initial row"
-
-    fence = committed_data_thread(fence_pids) do
-      Timekeeping::Handoff::MonolithAdmission.new(lock_timeout: 5.seconds).fence_admission
-    end
-
-    begin
-      blocked = blocked_by?(fence_pids.pop(timeout: 5), seed_pids.pop(timeout: 5), within: 1)
-      fence_finished = fence.join(5)
-    ensure
-      release << true
-    end
-
-    expect(blocked).to be(false)
-    expect(fence_finished).not_to be_nil
-    expect(described_class.find(described_class::SINGLETON_ID).admission_fenced_at).not_to be_nil
-    expect { described_class.refuse_if_handoff_begun! }.to raise_error(TimekeepingOwnership::HandoffBegun)
-  ensure
-    release << true
-    [seed, fence].compact.each { |thread| thread.join(5) }
-  end
-end
-
-RSpec.describe TimekeepingOwnership, committed_data: true do
   # "A spec shows that the seed refusal and the users controller's `unless_handoff_begun` either refuse while
   # `admission_fenced_at` is set or are documented as deliberately exempt"
   # A user delete that reads the row while a fence update is uncommitted must wait and then refuse; otherwise it
@@ -177,8 +139,9 @@ RSpec.describe TimekeepingOwnership, committed_data: true do
     end
     expect(checked.pop(timeout: 5)).to be(true), "the seed check never passed on the initial row"
 
+    # A short lock timeout makes the fence fail fast instead of hanging if the seed check ever takes a lock.
     fence = committed_data_thread(fence_pids) do
-      Timekeeping::Handoff::MonolithAdmission.new.fence_admission
+      Timekeeping::Handoff::MonolithAdmission.new(lock_timeout: 5.seconds).fence_admission
       :fenced
     end
 
