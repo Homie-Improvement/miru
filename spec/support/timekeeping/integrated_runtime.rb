@@ -143,6 +143,8 @@ class IntegratedRuntime
   # libpq (used by the reset) and Active Record (used by db:prepare and the
   # apps) can read different databases from one URL, for example a path name
   # and a dbname query parameter. Both readings must name a test database.
+  # Public so specs that write rows into the Timekeeping database apply the
+  # same check before they touch it.
   def self.require_test_database_url!(url)
     TestDatabaseGuard.require_test_database!(TimekeepingDatabaseReset.database_name(url))
     TestDatabaseGuard.require_test_database!(active_record_database_name(url))
@@ -225,9 +227,8 @@ class IntegratedRuntime
   rescue Errno::ESRCH, Errno::EPERM
     nil
   end
-  private_class_method :monolith_database_name, :timekeeping_database_url, :require_test_database_url!,
-                       :active_record_database_name, :free_port, :clear_leftovers!, :prepare_timekeeping!,
-                       :wait_for_prepare, :reset_timekeeping!
+  private_class_method :monolith_database_name, :timekeeping_database_url, :active_record_database_name,
+                       :free_port, :clear_leftovers!, :prepare_timekeeping!, :wait_for_prepare, :reset_timekeeping!
 
   def initialize(root:, env:, credentials:, ports:, ledger: TimekeepingQueueLedger.session)
     @root = root
