@@ -7,8 +7,14 @@
 #
 # The seed is loaded with the as_of recorded in the seed disposition, so the
 # data matches the checked-in record.
+#
+# A group also tagged committed_data: true skips the load here: the
+# committed_data hook in spec/support/database_cleaner.rb deletes every table
+# and loads the seed again before each example, so a load here is wasted.
 RSpec.shared_context "two tenant seed" do
   before(:all) do
+    next if TestDatabaseCleanup.seeded_committed?(self.class.metadata)
+
     DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
     Timekeeping::SeedDispositionRecorder.load_fresh_seed!(as_of: TestDatabaseCleanup.seed_as_of)
   end

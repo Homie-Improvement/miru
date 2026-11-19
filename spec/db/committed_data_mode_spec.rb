@@ -406,6 +406,28 @@ end
 RSpec.describe "Committed-data test mode", committed_data: true do
   include InnerExampleThroughSuiteHooks
 
+  # "The two_tenant_seed shared context's before(:all) no longer truncates and loads the seed for a group tagged committed_data: true, so only the per-example reset_seeded_committed! loads it."
+  it "a committed_data group tagged two_tenant_seed loads the seed once, from the per-example reset only" do
+    allow(Timekeeping::SeedDispositionRecorder).to receive(:load_fresh_seed!).and_call_original
+    allow(TestDatabaseCleanup).to receive(:reset_seeded_committed!).and_call_original
+    seen = {}
+
+    result = run_inner_example_through_suite_hooks(committed_data: true, two_tenant_seed: true) do
+      seen[:companies] = Company.where(name: ["Fork & Leaf Salads", "Copper Kettle Bakery"]).count
+    end
+
+    expect(result.exception).to be_nil
+    expect(seen[:companies]).to eq(2)
+    expect(TestDatabaseCleanup).to have_received(:reset_seeded_committed!).once
+    expect(Timekeeping::SeedDispositionRecorder).to have_received(:load_fresh_seed!).once
+  ensure
+    TimekeepingOwnership.ensure_initial!
+  end
+end
+
+RSpec.describe "Committed-data test mode", committed_data: true do
+  include InnerExampleThroughSuiteHooks
+
   # "A committed_data example without the seed tag still starts empty, with a legacy row."
   it "a committed_data inner example without the seed tag starts with no companies and one legacy ownership row" do
     create(:company)
