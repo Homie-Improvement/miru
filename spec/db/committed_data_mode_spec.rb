@@ -356,6 +356,10 @@ RSpec.describe "Committed-data test mode", committed_data: true do
   it "seeded committed reset refuses a non-test Timekeeping database without connecting or echoing its password" do
     password = "seeded-reset-secret-#{SecureRandom.hex(4)}"
     demo_url = "postgres://demo_user:#{password}@db.invalid:5432/timekeeping_demo"
+    # The seed loads before the guard runs, and it writes through
+    # InvoiceOperationsRecord's lazily opened pool. Opening both application
+    # pools first keeps that connection from counting as a Timekeeping one.
+    [ActiveRecord::Base, InvoiceOperationsRecord].each { |model| model.connection_pool.with_connection(&:verify!) }
     allow(PG).to receive(:connect).and_call_original
 
     # The seeded path must keep the Timekeeping reset's own guard: a database

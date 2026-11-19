@@ -90,6 +90,31 @@ RSpec.describe TimekeepingIntegrationTags do
       expect(described_class.violations("c_spec.rb", symbol_tagged)).to eq([])
       expect(described_class.violations("d_spec.rb", aliased).map(&:kind)).to eq([:missing_committed_data])
     end
+
+    it "flags untagged focus, pending and skip examples, and reads example_group as a group" do
+      source = <<~RUBY
+        RSpec.describe "relay" do
+          focus "focused" do
+          end
+
+          pending "not yet" do
+          end
+
+          skip "skipped" do
+          end
+
+          example_group "tagged group", committed_data: true do
+            it "inherits the tag" do
+            end
+          end
+        end
+      RUBY
+
+      violations = described_class.violations("e_spec.rb", source)
+
+      expect(violations.map { |v| [v.kind, v.line] })
+        .to eq([[:missing_committed_data, 2], [:missing_committed_data, 5], [:missing_committed_data, 8]])
+    end
   end
 
   describe ".violations handoff fakes rule" do

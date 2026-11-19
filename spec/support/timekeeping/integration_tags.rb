@@ -20,8 +20,8 @@ module TimekeepingIntegrationTags
 
   # RSpec core's group and example methods, aliases included, so an example
   # written with fit or xit is checked like one written with it.
-  GROUP_METHODS = %i[describe context fdescribe xdescribe fcontext xcontext].freeze
-  EXAMPLE_METHODS = %i[it specify example fit fspecify fexample xit xspecify xexample].freeze
+  GROUP_METHODS = %i[describe context example_group fdescribe xdescribe fcontext xcontext].freeze
+  EXAMPLE_METHODS = %i[it specify example focus pending skip fit fspecify fexample xit xspecify xexample].freeze
   LOAD_METHODS = %i[require require_relative load].freeze
   HANDOFF_FAKES_BASENAME = "handoff_fakes"
   # Object::Name and ::Name both name the top-level constant Name.
