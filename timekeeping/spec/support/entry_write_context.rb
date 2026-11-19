@@ -41,8 +41,9 @@ end
 
 # For specs that need commits other connections can see: races, and failures
 # that must roll a real transaction back. Each example empties the tables it
-# may have written, and puts the admission row back to generation 1, so a
-# fence or a deleted row never leaks into a later example. Each example also
+# may have written, and puts the admission row back to generation 1 with no
+# settle step and no stop mark, so a fence, a settle step, a stop mark or a
+# deleted row never leaks into a later example. Each example also
 # starts with those tables' id sequences restarted, because examples that
 # roll back still draw ids, and a handoff example asserts exact sequence values.
 RSpec.shared_context "timekeeping entry writes without transactional fixtures" do
@@ -61,6 +62,9 @@ RSpec.shared_context "timekeeping entry writes without transactional fixtures" d
     truncate_entry_write_tables.call
     Timekeeping::Admission.ensure_initial!
     Timekeeping::Admission.admit!(generation: 1)
+    # admit! keeps the stop mark on purpose, so only a test resets it.
+    Timekeeping::Admission.where(id: Timekeeping::Admission::SINGLETON_ID)
+      .update_all(settling_generation: nil, settling_stopped_generation: nil)
   end
 end
 

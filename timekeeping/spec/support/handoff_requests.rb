@@ -13,7 +13,9 @@ module HandoffRequests
     outbox_position: [:get, "/internal/v1/handoff/outbox_position", nil],
     correction_snapshots: [:put, "/internal/v1/handoff/correction_snapshots", { generation: 2, version: 1, snapshots: [] }],
     admission_fence: [:post, "/internal/v1/handoff/admission/fence", nil],
-    admission_admit: [:post, "/internal/v1/handoff/admission/admit", { generation: 7 }]
+    admission_admit: [:post, "/internal/v1/handoff/admission/admit", { generation: 7 }],
+    admission_begin_settling: [:post, "/internal/v1/handoff/admission/begin_settling", { generation: 7 }],
+    admission_stop_applying: [:post, "/internal/v1/handoff/admission/stop_applying", { generation: 7 }]
   }.transform_values(&:freeze).freeze
 
   # A fresh service token per example, so no spec depends on another's value.

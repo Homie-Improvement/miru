@@ -12,12 +12,17 @@ module Timekeeping
   # 1. Lock the operation key (company, service, operation_id), then the
   #    company's invoice, so commit and abort of one operation, and prepares
   #    for one invoice, wait in turn.
-  # 2. Re-read the stored answer: the operation row for prepare, the receipt
-  #    for commit and abort. It comes before the generation check, so a retry
-  #    of finished work replays even after the generation has moved.
-  # 3. Read the admitted generation (Timekeeping::Admission) FOR SHARE; a
-  #    body generation that is not that generation, or any generation while
-  #    fenced, is stale_generation.
+  # 2. Read the admission row (Timekeeping::Admission.locked_state) FOR SHARE,
+  #    so stop_applying!, fence! and admit! wait for this transaction. While
+  #    fenced, refuse as stale_generation anything but a commit or abort that
+  #    carries the settling generation and names an operation this service
+  #    stored at that generation. This comes before the stored answer, so a
+  #    commit re-sent after stop_applying! is not replayed its old receipt.
+  # 3. Re-read the stored answer: the operation row for prepare, the receipt
+  #    for commit and abort. While admitted it comes before the generation
+  #    check, so a retry of finished work replays even after the generation
+  #    has moved. Then a body generation that is not the admitted generation
+  #    (or, while settling, the settling generation) is stale_generation.
   # 4. Lock the entries involved FOR UPDATE in id order, then read their
   #    reservations and decide with TimekeepingRules::ReservationDecision.
   # 5. Change the reservations. Each entry whose locked flag flips gets
@@ -52,6 +57,9 @@ module Timekeeping
                           :entry_ids)
 
     ROUTES = { prepare: :prepare, commit: :commit, abort: :abort_operation }.freeze
+    # The only routes applied during a handoff's settle step: they finish
+    # operations already registered, and never start new ones.
+    SETTLING_ROUTES = %i[commit abort].freeze
 
     # What commit and abort answer for an operation that is already terminal:
     # the first of them won, so this one changes nothing.
@@ -69,8 +77,11 @@ module Timekeeping
     rescue ActiveRecord::RecordNotUnique
       # A backstop: the operation and invoice locks normally stop two writers
       # from both reaching an insert. The failed transaction has rolled back
-      # every row it wrote, so what is stored now decides the answer.
-      stored = stored_answer(request) || (request.route == :prepare && unresolved_refusal(request))
+      # every row it wrote, so what is stored now decides the answer. While
+      # fenced, the settle step decides first, as in run, so this path never
+      # replays a receipt that run would refuse.
+      stored = settling_refusal(request, Admission.locked_state) || stored_answer(request) ||
+               (request.route == :prepare && unresolved_refusal(request))
       raise unless stored
 
       stored
@@ -89,15 +100,38 @@ module Timekeeping
       def run(request)
         WriteSteps.lock_key(request.company_id, ACTOR_TYPE, request.actor_name, request.operation_id)
         WriteSteps.lock_key(request.company_id, INVOICE_LOCK, request.invoice_id)
+        admission = Admission.locked_state
+        refusal = settling_refusal(request, admission)
+        return refusal if refusal
+
         stored = stored_answer(request)
         checkpoint.call(:operation_checked)
         return stored if stored
 
-        generation = Admission.locked_generation
+        # A fenced request that got here passed settling_refusal, so it runs
+        # at the settling generation and its snapshots carry that generation.
+        generation = admission.generation || admission.settling_generation
         checkpoint.call(:generation_checked)
         return WriteOutcome.refusal(:stale_generation) unless WriteSteps.generation_matches?(request.generation, generation)
 
         send(ROUTES.fetch(request.route), request, generation)
+      end
+
+      # nil while admitted, or for a fenced request the settle step still
+      # applies; stale_generation for every other fenced request.
+      def settling_refusal(request, admission)
+        return unless admission.generation.nil?
+        return if settling_applies?(request, admission.settling_generation)
+
+        WriteOutcome.refusal(:stale_generation)
+      end
+
+      # A missing settling generation never matches, so outside a settle step
+      # nothing applies while fenced.
+      def settling_applies?(request, settling_generation)
+        SETTLING_ROUTES.include?(request.route) &&
+          WriteSteps.generation_matches?(request.generation, settling_generation) &&
+          find_operation(request)&.generation == settling_generation
       end
 
       # Prepare answers from its operation row with the operation's current

@@ -131,4 +131,151 @@ RSpec.describe "Timekeeping internal handoff admission and entry id sequence" do
     # "Outbox position: report the highest `outbox_snapshots.outbox_position`."
     expect(handoff_answer_for_spec(:outbox_position)).to eq([200, { "outbox_position" => 42 }])
   end
+
+  # "The internal handoff admission endpoints have routes that call
+  # `Admission.begin_settling!(generation:)` and `Admission.stop_applying!(generation:)`"
+  # The body is caller input: coercing "4" or 4.5 into 4 would open or stop a
+  # step the caller never named, so every value but a positive Integer is
+  # refused before the row is touched.
+  it "refuses a malformed settle generation with invalid_request on both routes without coercing it or touching the settling columns" do
+    Timekeeping::Admission.admit!(generation: 4)
+    Timekeeping::Admission.fence!
+    settling_columns = lambda do
+      row = Timekeeping::Admission.current
+      [row.generation, row.settling_generation, row.settling_stopped_generation]
+    end
+    expect(settling_columns.call).to eq([nil, nil, nil])
+
+    bodies = {
+      "string" => { generation: "4" },
+      "zero" => { generation: 0 },
+      "negative" => { generation: -1 },
+      "float" => { generation: 4.5 },
+      "boolean" => { generation: true },
+      "null" => { generation: nil },
+      "missing" => {}
+    }
+    paths = %w[/internal/v1/handoff/admission/begin_settling /internal/v1/handoff/admission/stop_applying]
+    headers = { "Content-Type" => "application/json", "Authorization" => "Bearer #{handoff_service_token}" }
+
+    paths.each do |path|
+      bodies.each do |row_name, body|
+        post path, params: JSON.generate(body), headers: headers
+
+        expect([path, row_name, response.status, response.parsed_body])
+          .to eq([path, row_name, 400, { "reason" => "invalid_request" }])
+        expect([path, row_name, settling_columns.call]).to eq([path, row_name, [nil, nil, nil]])
+      end
+    end
+  end
+
+  # "The internal handoff admission endpoints have routes that call `Admission.begin_settling!(generation:)` and
+  # `Admission.stop_applying!(generation:)`, and a request spec shows the monolith's handoff runner can open and
+  # stop the settle step over HTTP."
+  it "opens the settle step for the outgoing generation 4 after a fence and stops it over HTTP, as the handoff runner does" do
+    Timekeeping::Admission.admit!(generation: 4)
+
+    handoff_request(:admission_fence)
+    expect(response.status).to eq(200)
+
+    handoff_request(:admission_begin_settling, body: { generation: 4 })
+    expect([response.status, response.parsed_body]).to eq(
+      [200, { "generation" => nil, "settling_generation" => 4, "settling_stopped_generation" => nil }]
+    )
+    row = Timekeeping::Admission.current
+    expect([row.generation, row.settling_generation, row.settling_stopped_generation]).to eq([nil, 4, nil])
+    expect(Timekeeping::Admission.settling?).to be(true)
+
+    handoff_request(:admission_stop_applying, body: { generation: 4 })
+    expect([response.status, response.parsed_body]).to eq(
+      [200, { "generation" => nil, "settling_generation" => nil, "settling_stopped_generation" => 4 }]
+    )
+    row = Timekeeping::Admission.current
+    expect([row.generation, row.settling_generation, row.settling_stopped_generation]).to eq([nil, nil, 4])
+    expect(Timekeeping::Admission.settling?).to be(false)
+  end
+
+  # A runner may repeat a step after a crash; a repeat must answer success and leave the row as the first call
+  # left it, and a begin after a stop must not let the outgoing owner apply commits again.
+  it "repeated and late settle calls over HTTP never reopen a stopped step or lower the stop mark below 4" do
+    Timekeeping::Admission.admit!(generation: 4)
+    Timekeeping::Admission.fence!
+
+    steps = [
+      [:admission_begin_settling, 4, [nil, 4, nil]],
+      [:admission_begin_settling, 4, [nil, 4, nil]],
+      [:admission_stop_applying, 4, [nil, nil, 4]],
+      [:admission_stop_applying, 4, [nil, nil, 4]],
+      [:admission_begin_settling, 4, [nil, nil, 4]],
+      [:admission_begin_settling, 3, [nil, nil, 4]],
+      [:admission_stop_applying, 3, [nil, nil, 4]]
+    ]
+    steps.each_with_index do |(route, generation, expected), index|
+      handoff_request(route, body: { generation: })
+      answer = response.parsed_body
+      row = Timekeeping::Admission.current
+
+      expect([index, route, response.status]).to eq([index, route, 200])
+      expect([index, route, answer.values_at("generation", "settling_generation", "settling_stopped_generation")])
+        .to eq([index, route, expected])
+      expect([index, route, [row.generation, row.settling_generation, row.settling_stopped_generation]])
+        .to eq([index, route, expected])
+    end
+    expect(Timekeeping::Admission.settling?).to be(false)
+  end
+
+  # The generation is passed through without coercion, so "4" or 4.5 can never open or stop a step a caller did
+  # not name exactly.
+  it "both settle routes refuse a string, zero, negative, float, boolean, null or missing generation and keep the open step at 3" do
+    Timekeeping::Admission.admit!(generation: 3)
+    Timekeeping::Admission.fence!
+    Timekeeping::Admission.begin_settling!(generation: 3)
+
+    bodies = {
+      "string" => { generation: "4" }, "zero" => { generation: 0 }, "negative" => { generation: -1 },
+      "float" => { generation: 4.5 }, "boolean" => { generation: true }, "null" => { generation: nil },
+      "missing" => {}
+    }
+    %i[admission_begin_settling admission_stop_applying].each do |route|
+      bodies.each do |label, body|
+        handoff_request(route, body:)
+        row = Timekeeping::Admission.current
+
+        expect([route, label, response.status, response.parsed_body])
+          .to eq([route, label, 400, { "reason" => "invalid_request" }])
+        expect([route, label, [row.generation, row.settling_generation, row.settling_stopped_generation]])
+          .to eq([route, label, [nil, 3, nil]])
+      end
+    end
+  end
+
+  # A runner whose settle or freeze hit a missing row must never be told the step happened.
+  it "both settle routes answer admission_missing and never recreate the row after the admission row is deleted" do
+    Timekeeping::Admission.delete_all
+
+    %i[admission_begin_settling admission_stop_applying].each do |route|
+      handoff_request(route, body: { generation: 4 })
+
+      expect([route, response.status, response.parsed_body]).to eq([route, 409, { "reason" => "admission_missing" }])
+      expect([route, Timekeeping::Admission.count]).to eq([route, 0])
+    end
+  end
+
+  # Acceptance: "a request spec shows the monolith's handoff runner can open and stop the settle step over HTTP".
+  # A begin sent before the fence must not read as an open step, and the raised
+  # generation must show on the wire as a different step from the outgoing one.
+  it "begin_settling before the fence or with the raised generation answers the real settling state, not a bare success" do
+    Timekeeping::Admission.admit!(generation: 4)
+
+    expect(handoff_answer_for_spec(:admission_begin_settling, body: { generation: 4 })).to eq(
+      [200, { "generation" => 4, "settling_generation" => nil, "settling_stopped_generation" => nil }]
+    )
+    expect(Timekeeping::Admission.settling?).to be(false)
+
+    Timekeeping::Admission.fence!
+    expect(handoff_answer_for_spec(:admission_begin_settling, body: { generation: 5 })).to eq(
+      [200, { "generation" => nil, "settling_generation" => 5, "settling_stopped_generation" => nil }]
+    )
+    expect(Timekeeping::Admission.current.settling_generation).not_to eq(4)
+  end
 end
