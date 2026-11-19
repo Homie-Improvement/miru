@@ -75,11 +75,17 @@ module TimekeepingOwnerState
 
   SELECTED = selected(ENV)
 
+  # The state this run expects the row to be in: the selected one, or the
+  # cleaners' default when none is selected.
+  def current
+    SELECTED || DEFAULT_STATE
+  end
+
   module Expectations
     # Asserts the stored row is in the state. EntryOwner.for cannot tell
     # generations apart, so the owner columns, generation and whether the
     # legacy table is retired are compared too.
-    def expect_owner_state!(state_name = TimekeepingOwnerState::SELECTED || TimekeepingOwnerState::DEFAULT_STATE)
+    def expect_owner_state!(state_name = TimekeepingOwnerState.current)
       columns = TimekeepingOwnerState.fetch(state_name)
       expected = TimekeepingOwnership.new(columns.slice(*TimekeepingOwnerState::OWNERSHIP_COLUMNS))
 
