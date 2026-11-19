@@ -403,60 +403,6 @@ RSpec.describe TimekeepingOwnership, "settling generation argument" do
   end
 end
 
-RSpec.describe TimekeepingOwnership, "settling phase storage" do
-  it "begin_settling! after stop_applying! at the same generation leaves the stored phase closed and the stop mark in place" do
-    TimekeepingOwnership.current.update_columns(generation: 3, handoff_step: "settle")
-    TimekeepingOwnership.begin_settling!(generation: 2)
-    expect(TimekeepingOwnership.settling?).to be(true)
-    expect(TimekeepingOwnership.current.settling_generation).to eq(2)
-
-    TimekeepingOwnership.stop_applying!(generation: 2)
-    # "A stopped phase cannot be reopened by begin_settling! at the same generation"
-    TimekeepingOwnership.begin_settling!(generation: 2)
-
-    stored = TimekeepingOwnership.current
-    expect(TimekeepingOwnership.settling?).to be(false)
-    expect([stored.settling_generation, stored.settling_stopped_generation]).to eq([nil, 2])
-  end
-end
-
-RSpec.describe TimekeepingOwnership, "settling stop mark storage" do
-  it "stop_applying! with a lower generation never lowers the stored stop mark" do
-    TimekeepingOwnership.current.update_columns(generation: 6, handoff_step: "settle")
-
-    # "`stop_applying!(generation: n)` clears `settling_generation` and raises the stop mark to n, never lowering it."
-    TimekeepingOwnership.stop_applying!(generation: 5)
-    TimekeepingOwnership.stop_applying!(generation: 3)
-
-    stored = TimekeepingOwnership.current
-    expect([stored.settling_generation, stored.settling_stopped_generation]).to eq([nil, 5])
-
-    TimekeepingOwnership.begin_settling!(generation: 4)
-    expect(TimekeepingOwnership.settling?).to be(false)
-    expect(TimekeepingOwnership.current.settling_generation).to be_nil
-  end
-end
-
-RSpec.describe TimekeepingOwnership, "settle step reopening" do
-  it "begin_settling! after stop_applying! at the same generation does not reopen the settle step" do
-    described_class.current.update_columns(generation: 3, handoff_step: "settle")
-
-    described_class.begin_settling!(generation: 2)
-    expect(described_class.settling?).to be(true)
-    expect(described_class.current.settling_generation).to eq(2)
-
-    # "`stop_applying!(generation: n)` clears `settling_generation` and raises the stop mark to n, never lowering it."
-    described_class.stop_applying!(generation: 2)
-    # "A stopped phase cannot be reopened by begin_settling! at the same generation"
-    described_class.begin_settling!(generation: 2)
-
-    ownership = described_class.current.reload
-    expect(described_class.settling?).to be(false)
-    expect(ownership.settling_generation).to be_nil
-    expect(ownership.settling_stopped_generation).to eq(2)
-  end
-end
-
 RSpec.describe TimekeepingOwnership, "settle step stop mark" do
   it "stop_applying! with a lower generation never lowers the stop mark" do
     described_class.current.update_columns(generation: 6, handoff_step: "settle")
@@ -471,6 +417,7 @@ RSpec.describe TimekeepingOwnership, "settle step stop mark" do
 
     # A mark at 5 also keeps a lower generation's step from opening.
     described_class.begin_settling!(generation: 4)
+    expect(described_class.settling?).to be(false)
     expect(described_class.current.reload.settling_generation).to be_nil
   end
 end
@@ -494,6 +441,7 @@ RSpec.describe TimekeepingOwnership, "settle step reopening" do
     described_class.current.update_columns(generation: 6, handoff_step: "settle")
     described_class.begin_settling!(generation: 5)
     expect(described_class.settling?).to be(true)
+    expect(described_class.current.reload.settling_generation).to eq(5)
 
     described_class.stop_applying!(generation: 5)
     # "A stopped phase cannot be reopened by begin_settling! at the same generation"
