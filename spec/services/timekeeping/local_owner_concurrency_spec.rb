@@ -265,3 +265,102 @@ RSpec.describe Timekeeping::LocalOwner, "with competing writers", committed_data
     [first, second].compact.each { |thread| thread.join(5) }
   end
 end
+
+RSpec.describe Timekeeping::LocalOwner, "settling commit with a queued stop", committed_data: true do
+  it "answers a service-route settling commit stale_generation while stop_applying! is queued on the ownership row" do
+    outgoing = prepare_local_ownership!.generation
+    seeded_invoice_entry => { company:, invoice:, entry: }
+    actor = described_class::Actor.service(name: "invoices", company_id: company.id,
+                                           operations: %w[reservations.prepare reservations.commit])
+    operation_id = SecureRandom.uuid
+    prepared = reservation_call(:prepare, company:, generation: outgoing.to_s, actor:, invoice:, operation_id:,
+                                          entry_ids: [entry.id])
+    expect(prepared.status).to eq(200)
+    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)
+      .update_all(generation: outgoing + 1, handoff_step: "settle")
+    TimekeepingOwnership.begin_settling!(generation: outgoing)
+
+    reached = Queue.new
+    release = Queue.new
+    holder_pids = Queue.new
+    stopper_pids = Queue.new
+    holder = committed_data_thread(holder_pids) do
+      ApplicationRecord.transaction do
+        TimekeepingOwnership.lock("FOR SHARE").find(TimekeepingOwnership::SINGLETON_ID)
+        reached << true
+        release.pop
+      end
+    end
+    expect(reached.pop(timeout: 5)).to be(true), "the share holder never took its lock"
+    stopper = committed_data_thread(stopper_pids) { TimekeepingOwnership.stop_applying!(generation: outgoing) }
+    begin
+      expect(blocked_by?(stopper_pids.pop(timeout: 5), holder_pids.pop(timeout: 5))).to be(true)
+      # "The service route keeps its NOWAIT read and pg_locks tuple check."
+      # PostgreSQL would grant this read FOR SHARE beside the holder, so only the tuple check
+      # keeps a commit from being admitted ahead of the queued stop.
+      outcome = reservation_call(:commit, company:, generation: outgoing.to_s, actor:, invoice:, operation_id:)
+    ensure
+      release << true
+    end
+
+    expect(outcome.status).to eq(409)
+    expect(outcome.body).to eq("reason" => "stale_generation")
+    state = ActiveRecord::Base.connection.select_value(ActiveRecord::Base.sanitize_sql_array(
+      ["SELECT state FROM invoice_operations WHERE company_id = ? AND operation_id = ?", company.id, operation_id]
+    ))
+    expect(state).to eq("prepared")
+  ensure
+    release&.push(true)
+    [holder, stopper].compact.each { |thread| thread.kill unless thread.join(5) }
+  end
+end
+
+RSpec.describe Timekeeping::LocalOwner, "stop_applying! behind an admitted settling commit", committed_data: true do
+  # "Because `stop_applying!` is a row update, it waits for an admitted commit, and none applies after it."
+  it "makes stop_applying! wait for a settling commit admitted before it, then refuses the same commit as stale" do
+    outgoing = prepare_local_ownership!.generation
+    seeded_invoice_entry => { company:, invoice:, entry: }
+    actor = described_class::Actor.service(name: "invoices", company_id: company.id,
+                                           operations: %w[reservations.prepare reservations.commit])
+    operation_id = SecureRandom.uuid
+    reservation_call(:prepare, company:, generation: outgoing.to_s, actor:, invoice:, operation_id:, entry_ids: [entry.id])
+    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)
+      .update_all(generation: outgoing + 1, handoff_step: "settle")
+    TimekeepingOwnership.begin_settling!(generation: outgoing)
+    commit = lambda do |checkpoint|
+      reservation_call(:commit, company:, generation: outgoing.to_s, actor:, invoice:, operation_id:, checkpoint:)
+    end
+
+    admitted = Queue.new
+    release = Queue.new
+    committer_pids = Queue.new
+    stopper_pids = Queue.new
+    pause = lambda do |step|
+      next unless step == :generation_checked
+
+      admitted << true
+      release.pop
+    end
+    committer = committed_data_thread(committer_pids) { commit.call(pause) }
+    expect(admitted.pop(timeout: 5)).to be(true), "the settling commit was never admitted"
+    stopper = committed_data_thread(stopper_pids) { TimekeepingOwnership.stop_applying!(generation: outgoing) }
+    begin
+      blocked = blocked_by?(stopper_pids.pop(timeout: 5), committer_pids.pop(timeout: 5))
+    ensure
+      release << true
+    end
+
+    expect(blocked).to be(true), "stop_applying! did not wait for the admitted commit"
+    expect(committer.join(5)&.value&.status).to eq(200)
+    stopper.join(5)
+    expect(TimekeepingOwnership.settling?).to be(false)
+
+    baseline = timekeeping_row_counts
+    refused = commit.call(->(_step) { })
+    expect(refused.body).to eq("reason" => "stale_generation")
+    expect(timekeeping_row_counts).to eq(baseline)
+  ensure
+    release&.push(true)
+    [committer, stopper].compact.each { |thread| thread.kill unless thread.join(5) }
+  end
+end
