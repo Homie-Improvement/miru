@@ -9,8 +9,11 @@ require "socket"
 RSpec.describe "TimekeepingLiveInstance generation and port", :without_transaction, committed_data: true do
   before(:all) do
     skip "Set TIMEKEEPING_LIVE=1 to boot a real Timekeeping server" unless ENV["TIMEKEEPING_LIVE"] == "1"
+    # The checked value is the only URL the instance opens.
+    database_url = ENV.fetch("TIMEKEEPING_DATABASE_URL", "")
+    skip "Set TIMEKEEPING_DATABASE_URL to the live Timekeeping test database" if database_url.strip.empty?
     begin
-      TestDatabaseGuard.require_test_database_url!(ENV.fetch("TIMEKEEPING_DATABASE_URL", nil))
+      TestDatabaseGuard.require_test_database_url!(database_url)
     rescue TestDatabaseGuard::NotATestDatabase
       skip "Set TIMEKEEPING_DATABASE_URL to a URL whose libpq and Active Record names both end in _test"
     end
@@ -20,7 +23,8 @@ RSpec.describe "TimekeepingLiveInstance generation and port", :without_transacti
     @chosen_port = probe.addr[1]
     probe.close
     @reference = TimekeepingLiveInstance::ReferenceStub.new
-    @timekeeping = TimekeepingLiveInstance.start(reference_stub: @reference, admission_generation: 2, port: @chosen_port)
+    @timekeeping = TimekeepingLiveInstance.start(reference_stub: @reference, admission_generation: 2, port: @chosen_port,
+                                                  database_url:)
     @reference.service_token = @timekeeping.service_token
   end
 
