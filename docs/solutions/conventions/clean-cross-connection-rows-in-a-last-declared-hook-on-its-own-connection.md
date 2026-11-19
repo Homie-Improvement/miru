@@ -33,7 +33,7 @@ In `spec/support/database_cleaner.rb`:
 
 - Declare the cleanup hook last, as `config.append_after`. RSpec runs `append_after` hooks in the order they are declared, so a hook declared last runs after `DatabaseCleaner.clean`.
 - Run the deletes on the pooled connection, `ActiveRecord::Base.connection`. After hooks run while the example's stubs are still active, so an example that stubs the connection must scope that stub to the call it tests. See [Scope connection stubs so after hooks can use the pooled connection](scope-connection-stubs-so-after-hooks-can-use-the-pooled-connection.md).
-- For examples tagged `committed_data: true`, which run with no transaction, delete all data both before and after the example. The before step means a tagged example starts from empty tables whatever ran before it. Deletion also empties the ownership table, so `delete_all_committed!` calls `TimekeepingOwnership.ensure_initial!` after it.
+- For examples tagged `committed_data: true`, which run with no transaction, delete all data both before and after the example. The before step means a tagged example starts from empty tables whatever ran before it. Deletion also empties the ownership table, so `delete_all_committed!` calls `TimekeepingOwnership.ensure_initial!` after it. An example tagged both `committed_data: true` and `:two_tenant_seed` takes a different before step instead: `TestDatabaseCleanup.reset_seeded_committed!` empties every table, reloads the seed, and only then restores the ownership row and the selected owner state. So that example starts with the seed rather than with empty tables.
 
 These deletes cover every company, so they belong in the test database only.
 
