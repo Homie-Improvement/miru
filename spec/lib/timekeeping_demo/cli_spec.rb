@@ -429,8 +429,8 @@ RSpec.describe TimekeepingDemo::CLI do
 
     # "Each child env sets `TIMEKEEPING_OWNER_STATE` to its state (overriding any caller value), `TIMEKEEPING_REGRESSION=1`, `TIMEKEEPING_LIVE=1`, and its own `TIMEKEEPING_QUEUE_LEDGER_PATH` in a fresh temp directory (a child rspec that inherits the parent's ledger path deletes the parent's ledger at suite start)."
     state_envs = envs.select { |env| env["TIMEKEEPING_OWNER_STATE"] }
-    expect(state_envs.map { |env| env["TIMEKEEPING_OWNER_STATE"] }).to eq(%w[legacy timekeeping rollback])
-    ledgers = envs.map { |env| env["TIMEKEEPING_QUEUE_LEDGER_PATH"] }
+    expect(state_envs.pluck("TIMEKEEPING_OWNER_STATE")).to eq(%w[legacy timekeeping rollback])
+    ledgers = envs.pluck("TIMEKEEPING_QUEUE_LEDGER_PATH")
     expect(ledgers).to all(be_a(String))
     expect(ledgers).not_to include(parent_ledger)
     expect(ledgers.uniq.size).to eq(envs.size)
@@ -465,11 +465,6 @@ RSpec.describe TimekeepingDemo::CLI do
   end
 end
 
-require "rails_helper"
-require "json"
-require "stringio"
-require "tmpdir"
-
 RSpec.describe TimekeepingDemo::CLI do
   it "regression calls the runner once per state, in order, with the full 12.1 list and never builds the supervisor" do
     expected_specs = %w[
@@ -497,7 +492,7 @@ RSpec.describe TimekeepingDemo::CLI do
       spec/characterization/timesheet_entry_rules_spec.rb
       spec/characterization/entry_lookups_and_pdf_totals_spec.rb
     ]
-    flags = ["--tag", "~switches_owner", "--fail-if-no-examples"]
+    flags = ["--tag", "~switches_owner"]
     calls = []
     runner = lambda do |env:, argv:|
       calls << { env:, argv: }
@@ -529,9 +524,6 @@ RSpec.describe TimekeepingDemo::CLI do
   end
 end
 
-require "rails_helper"
-require "tmpdir"
-
 RSpec.describe TimekeepingDemo::CLI do
   it "an unknown verb such as nope exits 64 and calls neither the supervisor nor the regression runner" do
     supervisor = double("timekeeping demo supervisor")
@@ -552,8 +544,6 @@ RSpec.describe TimekeepingDemo::CLI do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe TimekeepingDemo::CLI do
   it "USAGE names both the up and the regression commands" do
     # "USAGE names up and regression, and `CLI.run([\"nope\"])` still returns `EX_USAGE` and starts nothing"
@@ -561,8 +551,6 @@ RSpec.describe TimekeepingDemo::CLI do
     expect(described_class::USAGE).to match(/\bregression\b/)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe TimekeepingDemo::CLI do
   it "the default regression runner calls system with an argv array, the child state over the caller's, chdir root, and passes nil through" do

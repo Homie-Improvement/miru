@@ -50,9 +50,11 @@ module TimekeepingDemo
     REPORT_FILE = "switches_owner.json"
     CHILD_ENV = { "TIMEKEEPING_REGRESSION" => "1", "TIMEKEEPING_LIVE" => "1" }.freeze
     SWITCHES_OWNER_TAG = "switches_owner"
-    # Without --fail-if-no-examples a state run whose filters leave nothing to
-    # run would pass while proving nothing.
-    STATE_FLAGS = ["--tag", "~#{SWITCHES_OWNER_TAG}", "--fail-if-no-examples"].freeze
+    # A state run whose filters leave nothing to run must fail rather than pass
+    # while proving nothing. rspec-core 3.13 has no --fail-if-no-examples
+    # command-line option, so spec/support/timekeeping/owner_state.rb sets
+    # config.fail_if_no_examples for a regression child that has a state.
+    STATE_FLAGS = ["--tag", "~#{SWITCHES_OWNER_TAG}"].freeze
     REPORT_HEADING = "#{SWITCHES_OWNER_TAG} examples (run once, outside the ownership states):".freeze
 
     module_function
@@ -78,8 +80,9 @@ module TimekeepingDemo
       passed
     end
 
-    # No --fail-if-no-examples here: finding no tagged example is a normal
-    # outcome, reported as "none". The report is read before the temporary
+    # This pass sets no owner state, so it does not fail when it finds no
+    # examples: finding no tagged example is a normal outcome, reported as
+    # "none". The report is read before the temporary
     # directory holding it is removed, and lists whatever the file holds even
     # when the pass failed, so failing examples are still named.
     def run_switches_owner_report(runner, specs)

@@ -401,7 +401,7 @@ RSpec.describe "Timekeeping owner state harness" do
     end
 
     it "keeps the probe fixtures out of a normal suite run" do
-      %w[owner_state_probe.rb unset_owner_state_probe.rb].each do |fixture|
+      %w[owner_state_probe.rb unset_owner_state_probe.rb switches_owner_probe.rb].each do |fixture|
         probe = Rails.root.join("spec/fixtures/timekeeping_harness", fixture)
         expect(probe).to exist
         expect(probe.basename.to_s).not_to end_with("_spec.rb")
