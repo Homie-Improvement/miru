@@ -22,6 +22,11 @@ module TimekeepingIntegrationTags
   # written with fit or xit is checked like one written with it.
   GROUP_METHODS = %i[describe context example_group fdescribe xdescribe fcontext xcontext].freeze
   EXAMPLE_METHODS = %i[it specify example focus pending skip fit fspecify fexample xit xspecify xexample].freeze
+  # Blocks that run while an example runs, not while groups are declared, so
+  # a `skip` or `pending` call inside one is a runtime call, not an example.
+  RUNTIME_BLOCK_METHODS = %i[
+    before after around prepend_before append_before prepend_after append_after let let! subject subject!
+  ].freeze
   LOAD_METHODS = %i[require require_relative load].freeze
   HANDOFF_FAKES_BASENAME = "handoff_fakes"
   # Object::Name and ::Name both name the top-level constant Name.
@@ -32,7 +37,7 @@ module TimekeepingIntegrationTags
   # Every violation in one spec file's source, in source order.
   def violations(path, source, fake_constants: handoff_fake_constants)
     found = []
-    walk(Prism.parse(source).value, false, fake_constants) do |node, kind, detail|
+    walk(Prism.parse(source).value, false, false, fake_constants) do |node, kind, detail|
       found << Violation.new(path:, line: node.location.start_line, kind:, detail:)
     end
     found.sort_by(&:line).freeze
@@ -49,27 +54,30 @@ module TimekeepingIntegrationTags
   end
 
   # tagged is whether the nearest committed_data setting above node is true.
-  def walk(node, tagged, fake_constants, &report)
+  # runtime is whether node sits inside an example body or a hook, where
+  # group and example methods are calls rather than declarations.
+  def walk(node, tagged, runtime, fake_constants, &report)
     case node
     when Prism::CallNode
-      walk_call(node, tagged, fake_constants, &report)
+      walk_call(node, tagged, runtime, fake_constants, &report)
     when Prism::ConstantReadNode, Prism::ConstantPathNode
       # A path is checked whole; its parent segments are not separate references.
       if fake_reference?(node, fake_constants)
         report.call(node, :loads_handoff_fakes, "references #{node.slice}")
       end
     else
-      node.compact_child_nodes.each { |child| walk(child, tagged, fake_constants, &report) }
+      node.compact_child_nodes.each { |child| walk(child, tagged, runtime, fake_constants, &report) }
     end
   end
 
-  def walk_call(node, tagged, fake_constants, &report)
+  def walk_call(node, tagged, runtime, fake_constants, &report)
     report.call(node, :loads_handoff_fakes, node.slice) if loads_handoff_fakes?(node)
 
-    example = example_call?(node)
-    tagged = tag_setting(node).fetch(:value, tagged) if example || group_call?(node)
+    example = !runtime && example_call?(node)
+    tagged = tag_setting(node).fetch(:value, tagged) if example || (!runtime && group_call?(node))
     report.call(node, :missing_committed_data, "example lacks committed_data: true") if example && !tagged
-    node.compact_child_nodes.each { |child| walk(child, tagged, fake_constants, &report) }
+    runtime ||= example || RUNTIME_BLOCK_METHODS.include?(node.name)
+    node.compact_child_nodes.each { |child| walk(child, tagged, runtime, fake_constants, &report) }
   end
 
   def group_call?(node)
@@ -108,8 +116,10 @@ module TimekeepingIntegrationTags
     key.is_a?(Prism::SymbolNode) && key.unescaped.to_sym == TAG
   end
 
+  # A bare call, or one through Kernel (Kernel.require is the same call).
   def loads_handoff_fakes?(node)
-    return false unless LOAD_METHODS.include?(node.name) && node.receiver.nil?
+    return false unless LOAD_METHODS.include?(node.name)
+    return false unless node.receiver.nil? || top_level_segments(node.receiver) == [:Kernel]
 
     target = node.arguments&.arguments&.first
     target.is_a?(Prism::StringNode) && File.basename(target.unescaped, ".rb") == HANDOFF_FAKES_BASENAME
@@ -120,15 +130,24 @@ module TimekeepingIntegrationTags
   # qualified names, not only top-level ones, also catches a fake declared
   # compactly as `class Outer::Fake`, without flagging Outer's other constants.
   def fake_reference?(node, fake_constants)
-    segments = constant_segments(node)
+    segments = top_level_segments(node)
     return false if segments.nil?
 
-    segments = segments.drop(1) if segments.first == TOP_LEVEL_NAMESPACE && segments.size > 1
     (1..segments.size).any? { |length| fake_constants.include?(segments.first(length).join("::")) }
   end
 
-  # The names along a constant path, or nil when it starts from an expression
-  # such as `record.class::Name`, which cannot be resolved from source.
+  # The constant path's names from the top-level namespace, with a leading
+  # Object segment dropped, or nil when the path cannot be resolved.
+  def top_level_segments(node)
+    segments = constant_segments(node)
+    return segments unless segments && segments.first == TOP_LEVEL_NAMESPACE && segments.size > 1
+
+    segments.drop(1)
+  end
+
+  # The names along a constant path, or nil when it is not a constant or
+  # starts from an expression such as `record.class::Name`, which cannot be
+  # resolved from source.
   def constant_segments(node)
     case node
     when Prism::ConstantReadNode
@@ -153,5 +172,6 @@ module TimekeepingIntegrationTags
     end
   end
   private_class_method :walk, :walk_call, :group_call?, :example_call?, :rspec_receiver?, :tag_setting,
-                       :tag_key?, :loads_handoff_fakes?, :fake_reference?, :constant_segments, :declared_constants
+                       :tag_key?, :loads_handoff_fakes?, :fake_reference?, :top_level_segments,
+                       :constant_segments, :declared_constants
 end

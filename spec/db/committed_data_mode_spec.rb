@@ -472,20 +472,27 @@ RSpec.describe "Committed-data test mode", committed_data: true do
     # that connection from counting as a Timekeeping one.
     [ActiveRecord::Base, InvoiceOperationsRecord].each { |model| model.connection_pool.with_connection(&:verify!) }
     expect(PG).not_to receive(:connect)
+    allow(TimekeepingDatabaseReset).to receive(:reset!).and_call_original
+    # Holds no TIMEKEEPING_DATABASE_URL, so the reset connects nowhere; the
+    # marker shows the caller's environment is the one passed through.
+    seeded_reset_env = { "SEEDED_RESET_ENV_MARKER" => "1" }
 
-    TestDatabaseCleanup.reset_seeded_committed!(as_of: TestDatabaseCleanup.seed_as_of, state: "timekeeping", env: {})
+    TestDatabaseCleanup.reset_seeded_committed!(as_of: TestDatabaseCleanup.seed_as_of, state: "timekeeping", env: seeded_reset_env)
 
     expect(Company.where(name: "Fork & Leaf Salads").count).to eq(1)
     expect(Company.where(name: "Copper Kettle Bakery").count).to eq(1)
     expect(TimekeepingOwnership.count).to eq(1)
     expect_owner_state!("timekeeping")
+    expect(TimekeepingDatabaseReset).to have_received(:reset!).with("timekeeping", env: seeded_reset_env).once
 
     # Run again over the rows the first call left: the delete step must empty
     # every table, the ownership row included, before the seed loads.
-    expect { TestDatabaseCleanup.reset_seeded_committed!(as_of: TestDatabaseCleanup.seed_as_of, state: "rollback", env: {}) }
-      .not_to raise_error
+    expect do
+      TestDatabaseCleanup.reset_seeded_committed!(as_of: TestDatabaseCleanup.seed_as_of, state: "rollback", env: seeded_reset_env)
+    end.not_to raise_error
     expect(Company.where(name: ["Fork & Leaf Salads", "Copper Kettle Bakery"]).count).to eq(2)
     expect_owner_state!("rollback")
+    expect(TimekeepingDatabaseReset).to have_received(:reset!).with("rollback", env: seeded_reset_env).once
   end
 end
 

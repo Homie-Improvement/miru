@@ -115,6 +115,25 @@ RSpec.describe TimekeepingIntegrationTags do
       expect(violations.map { |v| [v.kind, v.line] })
         .to eq([[:missing_committed_data, 2], [:missing_committed_data, 5], [:missing_committed_data, 8]])
     end
+
+    it "reads skip and pending inside hooks and example bodies as runtime calls, not examples" do
+      source = <<~RUBY
+        RSpec.describe "relay" do
+          before { skip "requires live" }
+          let(:value) { pending "not yet" }
+
+          it "works", committed_data: true do
+            skip "later"
+            TimekeepingHandoffFakeRelay.new(store: nil)
+          end
+        end
+      RUBY
+
+      violations = described_class.violations("f_spec.rb", source)
+
+      # The fake reference inside the example body is still checked.
+      expect(violations.map { |v| [v.kind, v.line] }).to eq([[:loads_handoff_fakes, 7]])
+    end
   end
 
   describe ".violations handoff fakes rule" do
@@ -130,7 +149,10 @@ RSpec.describe TimekeepingIntegrationTags do
         'require "support/timekeeping/handoff_fakes"',
         'require_relative "../../support/timekeeping/handoff_fakes.rb"',
         'load "spec/support/timekeeping/handoff_fakes.rb"',
-        'require_relative "../../support/timekeeping/handoff_fakes"'
+        'require_relative "../../support/timekeeping/handoff_fakes"',
+        'Kernel.require "support/timekeeping/handoff_fakes"',
+        'Kernel.require_relative "../../support/timekeeping/handoff_fakes.rb"',
+        '::Kernel.load "spec/support/timekeeping/handoff_fakes.rb"'
       ]
 
       loading_calls.each do |call|
