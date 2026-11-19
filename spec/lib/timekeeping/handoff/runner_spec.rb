@@ -419,9 +419,20 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     expect(ownership.owner).to eq("timekeeping")
     # "In lib/timekeeping/handoff/runner.rb, `flip` and `abort_handoff` also set `settling_generation` to NULL, so no handoff ends with a stored settling generation."
     expect(ownership.settling_generation).to be_nil
+    # The legacy source's stop_applying! does nothing, so the flip alone closed this step and must raise the mark.
+    expect(ownership.settling_stopped_generation).to be >= 1
+
+    # A later handoff is in progress, so only the stop mark can refuse the late begin.
+    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(handoff_step: "settle")
+    TimekeepingOwnership.begin_settling!(generation: 1)
+    expect(TimekeepingOwnership.current.settling_generation).to be_nil
+
+    # The mark is the cleared generation, not higher, so the later handoff's own step still opens.
+    TimekeepingOwnership.begin_settling!(generation: 2)
+    expect(TimekeepingOwnership.current.settling_generation).to eq(2)
   ensure
     TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)
-      .update_all(settling_generation: nil, settling_stopped_generation: nil)
+      .update_all(settling_generation: nil, settling_stopped_generation: nil, handoff_step: nil)
   end
 end
 
@@ -447,76 +458,11 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     expect(ownership.handoff_step).to be_nil
     # "In lib/timekeeping/handoff/runner.rb, `flip` and `abort_handoff` also set `settling_generation` to NULL, so no handoff ends with a stored settling generation."
     expect(ownership.settling_generation).to be_nil
-  ensure
-    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)
-      .update_all(settling_generation: nil, settling_stopped_generation: nil)
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Runner, "flip closes the settle step", :two_tenant_seed, :seeded_without_transaction do
-  it "a flip that clears a settle step stop_applying! never stopped persists a stop mark that refuses a late begin_settling! at that generation in a later handoff" do
-    TimekeepingOwnership.ensure_initial!
-    owners = TimekeepingHandoffFakes.owners(timekeeping: TimekeepingHandoffFakes::InMemoryTimekeepingStore.new,
-                                            settle: nil, relay: false)
-    # The legacy source's stop_applying! does nothing, so the step stored here, after freeze, is one only the flip ends.
-    observer = lambda do |event, step:|
-      if event == :before_step && step.to_s == "flip"
-        TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)
-          .update_all(settling_generation: 1, settling_stopped_generation: nil)
-      end
-    end
-
-    Dir.mktmpdir do |report_root|
-      described_class.run(direction: :cutover, owners:, observer:, report_root: Pathname(report_root), clock: Time)
-    end
-
-    # "After flip or abort_handoff ends a handoff whose settle step stop_applying! never stopped, settling_stopped_generation is at least the cleared settling generation, and a later begin_settling! at that generation leaves settling_generation NULL."
-    ownership = TimekeepingOwnership.current
-    expect(ownership.owner).to eq("timekeeping")
-    expect(ownership.handoff_step).to be_nil
-    expect(ownership.settling_generation).to be_nil
+    # The legacy source's stop_applying! does nothing, so the abort alone closed this step and must raise the mark.
     expect(ownership.settling_stopped_generation).to be >= 1
 
     # A later handoff is in progress, so only the stop mark can refuse the late begin.
     TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(handoff_step: "settle")
-    TimekeepingOwnership.begin_settling!(generation: 1)
-    TimekeepingOwnership.begin_settling!(generation: 1)
-    expect(TimekeepingOwnership.current.settling_generation).to be_nil
-
-    # The mark is the cleared generation, not higher, so the later handoff's own step still opens.
-    TimekeepingOwnership.begin_settling!(generation: 2)
-    expect(TimekeepingOwnership.current.settling_generation).to eq(2)
-  ensure
-    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)
-      .update_all(settling_generation: nil, settling_stopped_generation: nil, handoff_step: nil)
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Runner, "abort closes the settle step", :two_tenant_seed, :seeded_without_transaction do
-  it "an abort that clears a settle step stop_applying! never stopped persists a stop mark that refuses a late begin_settling! at that generation in a later handoff" do
-    TimekeepingOwnership.ensure_initial!
-    clock = Struct.new(:now).new(Time.utc(2026, 10, 27, 12))
-    report_root = Pathname(Dir.mktmpdir("handoff-abort-stop-mark"))
-    owners = TimekeepingHandoffFakes.owners(timekeeping: TimekeepingHandoffFakes::InMemoryTimekeepingStore.new,
-                                            settle: nil, relay: false)
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:, clock:,
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_close_admission))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)
-      .update_all(settling_generation: 1, settling_stopped_generation: nil)
-
-    described_class.run(direction: :cutover, abort: true, owners:, report_root:, clock:)
-
-    # "After flip or abort_handoff ends a handoff whose settle step stop_applying! never stopped, settling_stopped_generation is at least the cleared settling generation, and a later begin_settling! at that generation leaves settling_generation NULL."
-    ownership = TimekeepingOwnership.current
-    expect(ownership.handoff_step).to be_nil
-    expect(ownership.settling_generation).to be_nil
-    expect(ownership.settling_stopped_generation).to be >= 1
-
-    # A later handoff is in progress, so only the stop mark can refuse the late begin.
-    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(handoff_step: "settle")
-    TimekeepingOwnership.begin_settling!(generation: 1)
     TimekeepingOwnership.begin_settling!(generation: 1)
     expect(TimekeepingOwnership.current.settling_generation).to be_nil
   ensure
