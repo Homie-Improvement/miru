@@ -4,6 +4,13 @@ require "rails_helper"
 require "fileutils"
 require "tmpdir"
 
+# Parallel CI workers connect to miru_web_test_N, a name the monolith guard
+# refuses by design. Examples that are not about that guard pin a name it
+# accepts, so they test the same path on every worker.
+RSpec.shared_context "integrated runtime on an accepted monolith test database" do
+  before { allow(IntegratedRuntime).to receive(:monolith_database_name).and_return("miru_web_test") }
+end
+
 RSpec.describe IntegratedRuntime do
   it "launch passes harness credentials only in the spawn env, overriding stale ones, and never in argv or ENV" do
     harness = TimekeepingDemo::Credentials.generate
@@ -39,6 +46,8 @@ RSpec.describe IntegratedRuntime do
 end
 
 RSpec.describe IntegratedRuntime do
+  include_context "integrated runtime on an accepted monolith test database"
+
   it "start raises a boot error that names no environment value, child output or credential when the launcher dies during boot" do
     sentinel = "harness-sentinel-#{SecureRandom.hex(8)}"
     Dir.mktmpdir("integrated-runtime-root") do |root|
@@ -156,6 +165,8 @@ RSpec.describe "IntegratedRuntime" do
 end
 
 RSpec.describe "IntegratedRuntime" do
+  include_context "integrated runtime on an accepted monolith test database"
+
   it "start refuses a Timekeeping database whose name does not end in _test before db:prepare runs" do
     allow(TimekeepingDatabaseReset).to receive(:reset!)
     allow(Process).to receive(:spawn).and_call_original
@@ -190,6 +201,8 @@ RSpec.describe "IntegratedRuntime" do
 end
 
 RSpec.describe "IntegratedRuntime" do
+  include_context "integrated runtime on an accepted monolith test database"
+
   it "start prepares the Timekeeping database before resetting it for the owner state and before launching" do
     steps = []
     stop_after_reset = Class.new(StandardError)
@@ -367,6 +380,8 @@ RSpec.describe "IntegratedRuntime.start refusal" do
 end
 
 RSpec.describe IntegratedRuntime do
+  include_context "integrated runtime on an accepted monolith test database"
+
   def integrated_runtime_teardown_fixture(root)
     credentials = TimekeepingDemo::Credentials.generate
     described_class.new(root:, env: {}, credentials:, ports: { monolith: 40_011, timekeeping: 40_012 })
