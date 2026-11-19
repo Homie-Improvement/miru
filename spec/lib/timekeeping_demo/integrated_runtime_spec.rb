@@ -634,24 +634,6 @@ RSpec.describe IntegratedRuntime, "public test database URL guard, accepted URL"
 end
 
 RSpec.describe IntegratedRuntime do
-  # The collector row probe writes rows into the database this URL names, so
-  # both the libpq and the Active Record reading must name a _test database.
-  it "require_test_database_url! is callable from a spec and refuses a Timekeeping URL whose path or dbname parameter is not a _test database" do
-    expect(described_class.require_test_database_url!("postgres://rows_user@localhost:5432/timekeeping_rows_test"))
-      .to be_nil
-
-    [
-      "postgres://rows_user@localhost:5432/timekeeping_rows_production",
-      "postgres://rows_user@localhost:5432/timekeeping_rows_test?dbname=timekeeping_rows_production"
-    ].each do |url|
-      expect { described_class.require_test_database_url!(url) }.to raise_error(StandardError) { |error|
-        expect(error).not_to be_a(NoMethodError)
-      }
-    end
-  end
-end
-
-RSpec.describe IntegratedRuntime do
   it "require_test_database_url! is public, accepts a _test URL and refuses a URL either reading names as a non-test database" do
     expect(described_class.public_methods).to include(:require_test_database_url!)
 
@@ -665,22 +647,5 @@ RSpec.describe IntegratedRuntime do
         "postgres://localhost:5432/timekeeping_collector_rows_test?dbname=timekeeping_collector_rows_demo"
       )
     end.to raise_error(TestDatabaseGuard::NotATestDatabase)
-  end
-end
-
-RSpec.describe IntegratedRuntime do
-  it "require_test_database_url! is callable publicly and refuses a Timekeeping URL whose path and dbname parameter disagree about being a _test database before collector rows are written" do
-    # The real-row collector probe inserts and resets rows in the database this URL names, so a URL whose
-    # libpq reading (the dbname parameter) and Active Record reading (the path) name different databases
-    # must be refused whenever either reading is not a _test database.
-    path_only_test = "postgresql://collector_rows_user@127.0.0.1/timekeeping_collector_rows_test?dbname=timekeeping_development"
-    parameter_only_test = "postgresql://collector_rows_user@127.0.0.1/timekeeping_development?dbname=timekeeping_collector_rows_test"
-    both_test = "postgresql://collector_rows_user@127.0.0.1/timekeeping_collector_rows_test"
-
-    expect { described_class.require_test_database_url!(path_only_test) }
-      .to raise_error(TestDatabaseGuard::NotATestDatabase)
-    expect { described_class.require_test_database_url!(parameter_only_test) }
-      .to raise_error(TestDatabaseGuard::NotATestDatabase)
-    expect(described_class.require_test_database_url!(both_test)).to be_nil
   end
 end
