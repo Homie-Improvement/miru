@@ -15,7 +15,10 @@ module HandoffRequests
     admission_fence: [:post, "/internal/v1/handoff/admission/fence", nil],
     admission_admit: [:post, "/internal/v1/handoff/admission/admit", { generation: 7 }],
     admission_begin_settling: [:post, "/internal/v1/handoff/admission/begin_settling", { generation: 7 }],
-    admission_stop_applying: [:post, "/internal/v1/handoff/admission/stop_applying", { generation: 7 }]
+    admission_stop_applying: [:post, "/internal/v1/handoff/admission/stop_applying", { generation: 7 }],
+    settle: [:post, "/internal/v1/handoff/settle", { generation: 7 }],
+    stop_applying: [:post, "/internal/v1/handoff/stop_applying", { generation: 7 }],
+    drain: [:post, "/internal/v1/handoff/drain", { through: 0 }]
   }.transform_values(&:freeze).freeze
 
   # A fresh service token per example, so no spec depends on another's value.

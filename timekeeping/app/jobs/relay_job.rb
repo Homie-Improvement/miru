@@ -15,6 +15,9 @@ class RelayJob < ActiveJob::Base
   # thread does not cover a duplicate enqueue or a perform_now from elsewhere.
   RELAY_LOCK_KEY = 2_026_034_002
 
+  # Returns true when this run held the lock and delivered, false when it
+  # skipped because another run held the lock. The handoff drain reads this;
+  # the recurring task ignores it.
   def perform
     with_relay_lock do
       TimekeepingRelay::Relay.new(source: Timekeeping::RelayOutboxSource.new,
@@ -38,10 +41,11 @@ class RelayJob < ActiveJob::Base
     # open across the POST and each mark_sent commits on its own.
     def with_relay_lock
       connection = ApplicationRecord.connection
-      return unless connection.select_value(lock_sql("pg_try_advisory_lock"))
+      return false unless connection.select_value(lock_sql("pg_try_advisory_lock"))
 
       begin
         yield
+        true
       ensure
         connection.select_value(lock_sql("pg_advisory_unlock"))
       end

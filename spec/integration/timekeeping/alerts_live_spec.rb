@@ -7,7 +7,7 @@ require "rails_helper"
 # metrics read with the service token. It needs the service's bundle and its
 # test database (TIMEKEEPING_DATABASE_URL), so it runs only when
 # TIMEKEEPING_LIVE=1; then a server that cannot boot fails the run.
-RSpec.describe "timekeeping:alerts against a live Timekeeping server", :without_transaction do
+RSpec.describe "timekeeping:alerts against a live Timekeeping server", :without_transaction, committed_data: true do
   # Puts every write in the 500 ms bucket, past the 300 ms alert.
   let(:live_write_delay_ms) { 400 }
   # A window must have this long left before a spec writes into it, so all of

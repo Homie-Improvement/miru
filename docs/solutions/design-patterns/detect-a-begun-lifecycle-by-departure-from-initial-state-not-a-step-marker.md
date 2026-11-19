@@ -51,6 +51,8 @@ def handoff_begun?
 end
 ```
 
+The snippet is the method as PR #149 wrote it. It now also returns true while `admission_fenced_at` is set, because the monolith admission fence is the handoff's first write and leaves the other four columns initial; see `count-a-handoffs-first-mark-column-as-begun-in-the-shared-predicate.md`.
+
 Write the owner and store clauses as `!=` against the initial value, not `==` against known later values. Then an owner or store value added later counts as begun with no change to this method.
 
 Keep this rule in one instance method. The class reader `TimekeepingOwnership.handoff_begun?`, `refuse_if_handoff_begun!` and `unless_handoff_begun` all call it, and they treat a missing row as begun.
@@ -61,7 +63,7 @@ Test each column on its own. Start from the initial row, change exactly one colu
 
 The writers this rule guards bypass the Timekeeping service. A seed run or a hard delete after the flip writes data that Timekeeping never sees, and the hard delete cannot be undone. The state where the guard most needs to hold, after the flip, is exactly the state where the step marker is empty.
 
-The trade-off is that an aborted handoff also blocks seeding and user deletion for every company, because the ownership row is global. This change accepts that cost: a fresh demo reset is the way back, which the `HandoffBegun` error message says.
+The trade-off is that an aborted handoff also blocks seeding and user deletion for every company, because the ownership row is global. This change accepts that cost: a fresh demo reset is the way back, which the `HandoffBegun` error message says. The exception is a handoff aborted after the fence but before `close_admission` raised the generation: the abort's `admit` clears the fence mark, the row is initial again, and seeding and deletion work without a reset.
 
 Before you reuse the billing fence's `handoff_step` check, ask which question the guard answers. "Is a handoff running right now?" and "has a handoff ever begun?" need different rules.
 
