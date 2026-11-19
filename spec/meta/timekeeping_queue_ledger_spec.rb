@@ -1,5 +1,9 @@
+# frozen_string_literal: true
+
 require "rails_helper"
 require "json"
+require "open3"
+require "securerandom"
 require "tmpdir"
 
 RSpec.describe "Timekeeping queue ledger file contents" do
@@ -25,7 +29,6 @@ RSpec.describe "Timekeeping queue ledger file contents" do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe "Timekeeping queue ledger parsing" do
   # "Any failure, or a ledger file that cannot be parsed, raises, and the run exits non-zero."
@@ -35,7 +38,6 @@ RSpec.describe "Timekeeping queue ledger parsing" do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe "Timekeeping queue ledger reset guard" do
   # The collect step runs only after the database name guard, so a non-test database is refused before anything else.
@@ -50,8 +52,6 @@ RSpec.describe "Timekeeping queue ledger reset guard" do
   end
 end
 
-require "rails_helper"
-require "tmpdir"
 
 RSpec.describe TimekeepingQueueLedger do
   it "write keeps the records an earlier write stored and leaves no temp file beside the ledger" do
@@ -80,9 +80,6 @@ RSpec.describe TimekeepingQueueLedger do
   end
 end
 
-require "rails_helper"
-require "json"
-require "tmpdir"
 
 RSpec.describe TimekeepingQueueLedger do
   it "a stored ledger record holds only database, queue, job class, kind, ids and timestamps" do
@@ -107,7 +104,6 @@ RSpec.describe TimekeepingQueueLedger do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe TimekeepingQueueLedger do
   it "parse raises UnreadableLedger for a ledger file that is not valid JSON" do
@@ -116,8 +112,6 @@ RSpec.describe TimekeepingQueueLedger do
   end
 end
 
-require "rails_helper"
-require "tmpdir"
 
 RSpec.describe TimekeepingQueueLedger do
   it "a control that ran stays recorded across a later write and still fails the verdict" do
@@ -147,11 +141,6 @@ RSpec.describe TimekeepingQueueLedger do
   end
 end
 
-require "rails_helper"
-require "json"
-require "open3"
-require "securerandom"
-require "tmpdir"
 
 RSpec.describe "Timekeeping queue ledger file at suite start" do
   it "a clean probe run deletes a stale ledger file at suite start, so a record from an earlier run neither survives nor fails it" do
@@ -180,7 +169,6 @@ RSpec.describe "Timekeeping queue ledger file at suite start" do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe TimekeepingQueueLedger do
   # "The verdict passes when the ledger is clean."
@@ -207,7 +195,6 @@ RSpec.describe TimekeepingQueueLedger do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe TimekeepingQueueLedger do
   # "A control job that runs, or any execution on a non-dedicated queue, fails the suite at teardown"
@@ -227,7 +214,6 @@ RSpec.describe TimekeepingQueueLedger do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe TimekeepingQueueLedger do
   # "A missing control or an unparsable tmp/timekeeping-integration/queue_ledger.json fails the suite"
@@ -247,7 +233,6 @@ RSpec.describe TimekeepingQueueLedger do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe TimekeepingQueueLedger do
   # "Before the reset it checks that both still exist and have not run."
@@ -265,7 +250,6 @@ RSpec.describe TimekeepingQueueLedger do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe TimekeepingQueueLedger do
   # "A job enqueued by other code never stands in for a control. An execution of other code's job on a non-dedicated queue still counts."
@@ -289,7 +273,6 @@ RSpec.describe TimekeepingQueueLedger do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe TimekeepingQueueLedger do
   # "Dedicated queues are kept per database, as runtime_queues_spec.rb has them. The monolith allows `invoice_operations` and `timekeeping_relay`. Timekeeping allows only `timekeeping_relay`."
@@ -317,7 +300,6 @@ RSpec.describe TimekeepingQueueLedger do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe TimekeepingQueueLedger do
   # "Before every database reset, and once after the workers stop, it collects claimed, completed and failed Solid Queue executions on any queue other than the dedicated ones, in both databases."
@@ -343,7 +325,6 @@ RSpec.describe TimekeepingQueueLedger do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe TimekeepingQueueLedger do
   # "Any failure, or a ledger file that cannot be parsed, raises, and the run exits non-zero."
@@ -354,8 +335,6 @@ RSpec.describe TimekeepingQueueLedger do
   end
 end
 
-require "rails_helper"
-require "tmpdir"
 
 RSpec.describe TimekeepingQueueLedger do
   # "Rewrite it atomically, with a temp file and a rename."
@@ -378,9 +357,6 @@ RSpec.describe TimekeepingQueueLedger do
   end
 end
 
-require "rails_helper"
-require "json"
-require "tmpdir"
 
 RSpec.describe TimekeepingQueueLedger do
   # "Record only the database, queue, job class, execution kind, ids and timestamps, never job arguments or credentials."
@@ -400,8 +376,6 @@ RSpec.describe TimekeepingQueueLedger do
   end
 end
 
-require "rails_helper"
-require "tmpdir"
 
 RSpec.describe TimekeepingQueueLedger::Session do
   # "A suite with no active ledger runs unchanged"
@@ -423,8 +397,6 @@ RSpec.describe TimekeepingQueueLedger::Session do
   end
 end
 
-require "rails_helper"
-require "tmpdir"
 
 RSpec.describe TimekeepingQueueLedger::Session do
   # "As a backstop, it raises if a runtime is still live during a reset."
@@ -445,7 +417,6 @@ RSpec.describe TimekeepingQueueLedger::Session do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe TestDatabaseCleanup do
   # "Every reset path, including the seeded committed reset, collects executions before it deletes"
@@ -465,7 +436,6 @@ RSpec.describe TestDatabaseCleanup do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe TimekeepingDatabaseReset do
   # "Every reset path, including the seeded committed reset, collects executions before it deletes"
@@ -482,9 +452,6 @@ RSpec.describe TimekeepingDatabaseReset do
   end
 end
 
-require "rails_helper"
-require "open3"
-require "tmpdir"
 
 RSpec.describe "Timekeeping queue ledger probe run: control ran", :without_transaction do
   it "a probe that marks its default control finished between resets exits non-zero naming the control" do
@@ -504,10 +471,6 @@ RSpec.describe "Timekeeping queue ledger probe run: control ran", :without_trans
   end
 end
 
-require "rails_helper"
-require "open3"
-require "tmpdir"
-require "json"
 
 RSpec.describe "Timekeeping queue ledger probe run: non-dedicated job", :without_transaction do
   it "a probe with a completed non-dedicated job exits non-zero and records it in its own ledger file" do
@@ -529,9 +492,6 @@ RSpec.describe "Timekeeping queue ledger probe run: non-dedicated job", :without
   end
 end
 
-require "rails_helper"
-require "open3"
-require "tmpdir"
 
 RSpec.describe "Timekeeping queue ledger probe run: clean", :without_transaction do
   it "a clean queue ledger probe exits zero" do
@@ -550,8 +510,6 @@ RSpec.describe "Timekeeping queue ledger probe run: clean", :without_transaction
   end
 end
 
-require "rails_helper"
-require "tmpdir"
 
 RSpec.describe "Timekeeping queue ledger session finish" do
   it "an active session's finish! raises on an unparsable ledger file and passes on an empty valid one" do
@@ -574,7 +532,6 @@ RSpec.describe "Timekeeping queue ledger session finish" do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe "Timekeeping queue ledger reset paths" do
   it "delete_all_committed! and the committed_data reset collect before they delete" do
@@ -593,7 +550,6 @@ RSpec.describe "Timekeeping queue ledger reset paths" do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe "Timekeeping queue ledger Timekeeping reset path" do
   it "the Timekeeping database reset calls before_truncate once before it connects to a test database" do
@@ -615,7 +571,6 @@ RSpec.describe "Timekeeping queue ledger Timekeeping reset path" do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe TimekeepingQueueLedger do
   it "verdict fails when a control observed unrun later shows up as a collected execution" do
@@ -642,7 +597,6 @@ RSpec.describe TimekeepingQueueLedger do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe TimekeepingQueueLedger do
   it "verdict does not let another job on default stand in for a missing control" do
@@ -660,7 +614,6 @@ RSpec.describe TimekeepingQueueLedger do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe TimekeepingQueueLedger do
   it "verdict keeps dedicated queues per database so invoice_operations fails only in Timekeeping" do
@@ -688,7 +641,6 @@ RSpec.describe TimekeepingQueueLedger do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe TimekeepingQueueLedger do
   it "parse raises UnreadableLedger for a half-written ledger and for valid JSON of the wrong shape" do
@@ -699,8 +651,6 @@ RSpec.describe TimekeepingQueueLedger do
   end
 end
 
-require "rails_helper"
-require "tmpdir"
 
 RSpec.describe TimekeepingQueueLedger do
   it "write twice keeps the first record and leaves no temp file beside the ledger" do
@@ -725,8 +675,6 @@ RSpec.describe TimekeepingQueueLedger do
   end
 end
 
-require "rails_helper"
-require "tmpdir"
 
 RSpec.describe TimekeepingQueueLedger::Session do
   it "an inactive session before_reset! touches no collector and writes no ledger file" do
@@ -746,8 +694,6 @@ RSpec.describe TimekeepingQueueLedger::Session do
   end
 end
 
-require "rails_helper"
-require "tmpdir"
 
 RSpec.describe TimekeepingQueueLedger::Session do
   it "an active session before_reset! raises while a runtime is live and collects nothing first" do
@@ -772,7 +718,6 @@ RSpec.describe TimekeepingQueueLedger::Session do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe TimekeepingDatabaseReset do
   it "reset! refuses a non-test database before it runs the collect hook" do
@@ -786,8 +731,6 @@ RSpec.describe TimekeepingDatabaseReset do
   end
 end
 
-require "rails_helper"
-require "tmpdir"
 
 RSpec.describe TimekeepingQueueLedger::Session, :without_transaction do
   # "In each window between resets it enqueues one `default` and one `billing_sync` control job. Before the reset it checks that both still exist and have not run."
@@ -807,8 +750,6 @@ RSpec.describe TimekeepingQueueLedger::Session, :without_transaction do
   end
 end
 
-require "rails_helper"
-require "tmpdir"
 
 RSpec.describe TimekeepingQueueLedger::Session, :without_transaction do
   # "Before the reset it checks that both still exist and have not run."
@@ -829,8 +770,6 @@ RSpec.describe TimekeepingQueueLedger::Session, :without_transaction do
   end
 end
 
-require "rails_helper"
-require "tmpdir"
 
 RSpec.describe TimekeepingQueueLedger::Session, :without_transaction do
   # "A job enqueued by other code never stands in for a control."
@@ -850,9 +789,6 @@ RSpec.describe TimekeepingQueueLedger::Session, :without_transaction do
   end
 end
 
-require "rails_helper"
-require "securerandom"
-require "tmpdir"
 
 RSpec.describe TimekeepingQueueLedger::Session do
   # "A control job that runs, or any execution on a non-dedicated queue, fails the suite at teardown"
@@ -875,9 +811,6 @@ RSpec.describe TimekeepingQueueLedger::Session do
   end
 end
 
-require "rails_helper"
-require "securerandom"
-require "tmpdir"
 
 RSpec.describe TimekeepingQueueLedger::Session do
   # "One after(:suite) hook stops any live runtime, collects once more and calls the pure `TimekeepingQueueLedger.verdict(records:, controls:, dedicated_queues:)`."
@@ -907,8 +840,6 @@ RSpec.describe TimekeepingQueueLedger::Session do
   end
 end
 
-require "rails_helper"
-require "tmpdir"
 
 RSpec.describe TimekeepingQueueLedger::Session, :without_transaction do
   # "Use `ActiveJob::QueueAdapters::SolidQueueAdapter.new.enqueue`, with `UpdateInvoiceStatusToOverdueJob` on `default` and `SyncStripeSubscriptionCompanyJob` on `billing_sync`."
@@ -933,8 +864,6 @@ RSpec.describe TimekeepingQueueLedger::Session, :without_transaction do
   end
 end
 
-require "rails_helper"
-require "tmpdir"
 
 RSpec.describe TimekeepingQueueLedger::Session, :without_transaction do
   # "Before the reset it checks that both still exist and have not run."
@@ -961,7 +890,6 @@ RSpec.describe TimekeepingQueueLedger::Session, :without_transaction do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe TimekeepingQueueLedger::MonolithCollector, :without_transaction do
   # "it collects claimed, completed and failed Solid Queue executions on any queue other than the dedicated ones"
@@ -980,7 +908,6 @@ RSpec.describe TimekeepingQueueLedger::MonolithCollector, :without_transaction d
   end
 end
 
-require "rails_helper"
 
 RSpec.describe TimekeepingQueueLedger::TimekeepingCollector do
   # "Any failure, or a ledger file that cannot be parsed, raises, and the run exits non-zero."
@@ -998,7 +925,6 @@ RSpec.describe TimekeepingQueueLedger::TimekeepingCollector do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe "Timekeeping queue ledger reset hooks" do
   # "Every reset path, including the seeded committed reset, collects executions before it deletes"
