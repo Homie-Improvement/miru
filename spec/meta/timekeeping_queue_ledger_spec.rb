@@ -31,15 +31,16 @@ RSpec.describe TimekeepingQueueLedger do
       end
     end
 
-    it "write appends to the ledger file in order across both databases and leaves no temp file after each write" do
+    it "write appends to the ledger file in order within one database and across both, leaving no temp file after each write" do
       first = described_class::Record.new(
         database: "monolith", queue: "default", job_class: "UpdateInvoiceStatusToOverdueJob", kind: "completed",
         job_id: 1, active_job_id: "job-1", execution_id: nil,
         created_at: "2026-01-01T00:00:00.000000Z", finished_at: "2026-01-01T00:00:01.000000Z"
       )
-      second = described_class::Record.new(
+      second = first.with(job_id: 2, active_job_id: "job-2")
+      third = described_class::Record.new(
         database: "timekeeping", queue: "invoice_operations", job_class: "RelayJob", kind: "completed",
-        job_id: 2, active_job_id: "job-2", execution_id: nil,
+        job_id: 3, active_job_id: "job-3", execution_id: nil,
         created_at: "2026-01-01T00:00:02.000000Z", finished_at: "2026-01-01T00:00:03.000000Z"
       )
 
@@ -48,15 +49,16 @@ RSpec.describe TimekeepingQueueLedger do
 
         # "It adds what it finds to tmp/timekeeping-integration/queue_ledger.json, outside the cleaned tables."
         # "Rewrite it atomically, with a temp file and a rename."
-        described_class.write(path, records: [first], controls: [])
-        expect(Dir.children(dir)).to eq(["queue_ledger.json"])
-        described_class.write(path, records: [second], controls: [])
-        expect(Dir.children(dir)).to eq(["queue_ledger.json"])
+        # The second write appends to the same database as the first; the third adds the other database.
+        [first, second, third].each do |record|
+          described_class.write(path, records: [record], controls: [])
+          expect(Dir.children(dir)).to eq(["queue_ledger.json"])
+        end
 
         stored = described_class.parse(File.read(path))[:records]
-        expect(stored.map(&:active_job_id)).to eq(%w[job-1 job-2])
-        expect(stored.map(&:job_id)).to eq([1, 2])
-        expect(stored.map(&:database)).to eq(%w[monolith timekeeping])
+        expect(stored.map(&:active_job_id)).to eq(%w[job-1 job-2 job-3])
+        expect(stored.map(&:job_id)).to eq([1, 2, 3])
+        expect(stored.map(&:database)).to eq(%w[monolith monolith timekeeping])
       end
     end
 
