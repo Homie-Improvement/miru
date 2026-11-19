@@ -1056,12 +1056,15 @@ RSpec.describe "Timekeeping queue ledger per-process probe isolation", :without_
       File.write(parent_path, violation)
       stdout, stderr, status = Open3.capture3(
         { "QUEUE_LEDGER_PROBE" => "clean", "TEST_ENV_NUMBER" => "99",
-          TimekeepingQueueLedger::PATH_KEY => nil, "DATABASE_URL" => database_url },
+          # Empty rather than unset: dotenv fills in an unset key from .env or .env.test, but leaves "" alone.
+          TimekeepingQueueLedger::PATH_KEY => "", "DATABASE_URL" => database_url },
         "bundle", "exec", "rspec", probe, chdir: Rails.root.to_s
       )
 
       expect(status).to be_success, "#{stdout}\n#{stderr}"
       expect(File.binread(parent_path)).to eq(violation.b)
+      # The child really used its own per-process default file, not some other path.
+      expect(File.exist?(child_path)).to be(true)
     ensure
       FileUtils.rm_f(parent_path)
       FileUtils.rm_f(child_path)
