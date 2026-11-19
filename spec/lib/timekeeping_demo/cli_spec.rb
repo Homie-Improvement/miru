@@ -397,7 +397,8 @@ RSpec.describe TimekeepingDemo::CLI do
     # "The default runner, built by `CLI.run` from `root:` and `caller_env:`, uses `system(env, "bundle", "exec", "rspec", *argv, chdir: root)` with an argv array, never a shell string."
     expect(calls.size).to eq(1)
     args, opts = calls.first
-    expect(args).to eq([{ "KEEP_ME" => "1", "DATABASE_URL" => "", "TIMEKEEPING_OWNER_STATE" => "legacy" },
+    expect(args).to eq([{ "KEEP_ME" => "1", "DATABASE_URL" => "", "RAILS_ENV" => "test",
+                          "TIMEKEEPING_OWNER_STATE" => "legacy" },
                         "bundle", "exec", "rspec", hostile, "--tag", "~switches_owner"])
     expect(opts).to eq(chdir: root)
     expect(result).to be(false)
@@ -514,7 +515,7 @@ RSpec.describe TimekeepingDemo::CLI do
     caller_env = { "TIMEKEEPING_OWNER_STATE" => "rollback", "KEEP_ME" => "x" }
     # "The default runner, built by `CLI.run` from `root:` and `caller_env:`, uses `system(env, \"bundle\", \"exec\", \"rspec\", *argv, chdir: root)` with an argv array, never a shell string."
     expect(described_class).to receive(:system)
-      .with({ "TIMEKEEPING_OWNER_STATE" => "legacy", "KEEP_ME" => "x", "DATABASE_URL" => "" },
+      .with({ "TIMEKEEPING_OWNER_STATE" => "legacy", "KEEP_ME" => "x", "DATABASE_URL" => "", "RAILS_ENV" => "test" },
             "bundle", "exec", "rspec", "spec/a b_spec.rb", "--tag", "~switches_owner", chdir: "/srv/app")
       .and_return(nil)
 
@@ -595,5 +596,23 @@ RSpec.describe TimekeepingDemo::CLI, "regression database guard" do
     envs.clear
     expect { described_class.run(["regression"], root: Rails.root.to_s, caller_env: {}) }.to output.to_stdout
     expect(envs.pluck("DATABASE_URL").uniq).to eq([""])
+  end
+
+  # With no URL, config/database.yml picks the database by Rails environment;
+  # development would select miru_web_development.
+  it "runs every child in the test Rails environment when the caller has no URL and selects development" do
+    envs = []
+    allow(described_class).to receive(:system) do |env, *_args, **_opts|
+      envs << env
+      true
+    end
+
+    [{ "RAILS_ENV" => "development" }, { "RAILS_ENV" => "development", "DATABASE_URL" => "" }].each do |caller_env|
+      envs.clear
+      expect { described_class.run(["regression"], root: Rails.root.to_s, caller_env:) }.to output.to_stdout
+      expect(envs.size).to eq(4)
+      expect(envs.pluck("RAILS_ENV").uniq).to eq(["test"])
+      expect(envs.pluck("DATABASE_URL").uniq).to eq([""])
+    end
   end
 end

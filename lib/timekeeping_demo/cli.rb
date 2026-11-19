@@ -24,6 +24,8 @@ module TimekeepingDemo
     PORT_KEYS = { monolith: "MONOLITH_PORT", timekeeping: "TIMEKEEPING_PORT" }.freeze
     USAGE = "usage: bin/timekeeping-demo up|regression"
     TEST_DATABASE_SUFFIX = "_test"
+    RAILS_ENV_KEY = "RAILS_ENV"
+    TEST_RAILS_ENV = "test"
     # Ctrl-C in the terminal, or a TERM from whoever started the demo.
     STOP_SIGNALS = %w[INT TERM].freeze
 
@@ -101,12 +103,15 @@ module TimekeepingDemo
     #
     # Every child empties its database at suite start, so a caller
     # DATABASE_URL must name a _test database, checked here before any child
-    # can start. Without one, the key is set to "" (which config/application.rb
-    # reads as unset) so that dotenv cannot fill it from a local .env.
+    # can start. Without one, config/database.yml picks the database from the
+    # Rails environment, so the child always runs in test, whatever the caller
+    # set. The URL key is then set to "" (which config/application.rb reads as
+    # unset) so that dotenv cannot fill it from a local .env.
     def default_regression_runner(root:, caller_env:)
       database_url = caller_env.fetch(RuntimePlan::MONOLITH_DATABASE_URL, "")
       require_test_database_url!(database_url)
-      child_caller_env = caller_env.merge(RuntimePlan::MONOLITH_DATABASE_URL => database_url)
+      child_caller_env = caller_env.merge(RuntimePlan::MONOLITH_DATABASE_URL => database_url,
+                                          RAILS_ENV_KEY => TEST_RAILS_ENV)
       lambda do |env:, argv:|
         system(child_caller_env.merge(env), "bundle", "exec", "rspec", *argv, chdir: root)
       end
