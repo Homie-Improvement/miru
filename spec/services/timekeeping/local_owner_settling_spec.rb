@@ -53,6 +53,34 @@ RSpec.describe Timekeeping::LocalOwner, "settle step reservations" do
     end
   end
 
+  it "service route publishes the snapshot of an entry a settling commit releases at the outgoing generation, not the raised one" do
+    outgoing = prepare_local_ownership!.generation
+    generation = outgoing.to_s
+    seeded_invoice_entry => { company:, invoice:, entry: }
+    actor = settling_spec_actor(company)
+    held_id = SecureRandom.uuid
+    reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id: held_id, entry_ids: [entry.id])
+    expect(reservation_call(:commit, company:, generation:, actor:, invoice:, operation_id: held_id).status).to eq(200)
+    release_id = SecureRandom.uuid
+    expect(reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id: release_id, entry_ids: []).status)
+      .to eq(200)
+    settling_spec_open(outgoing)
+    snapshot_generations = lambda do
+      ActiveRecord::Base.connection.select_values(ActiveRecord::Base.sanitize_sql_array(
+        ["SELECT generation FROM entry_outbox_items WHERE company_id = ? AND entry_id = ? ORDER BY outbox_position",
+         company.id, entry.id]
+      ))
+    end
+    before = snapshot_generations.call
+
+    # Releasing the entry flips its locked flag, so the commit publishes one snapshot.
+    released = reservation_call(:commit, company:, generation:, actor:, invoice:, operation_id: release_id)
+
+    expect(released.status).to eq(200)
+    expect(released.body).to eq("reserved" => 0, "released" => 1)
+    expect(snapshot_generations.call).to eq(before + [outgoing])
+  end
+
   it "service route applies an abort of a prepared operation at the outgoing generation while settling" do
     outgoing = prepare_local_ownership!.generation
     seeded_invoice_entry => { company:, invoice:, entry: }

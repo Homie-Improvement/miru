@@ -311,7 +311,14 @@ RSpec.describe Timekeeping::LocalOwner, "settling commit with a queued stop", co
     expect(state).to eq("prepared")
   ensure
     release&.push(true)
-    [holder, stopper].compact.each { |thread| thread.kill unless thread.join(5) }
+    # A killed worker is joined before the committed-data cleanup, and one
+    # worker's error never skips the others.
+    [holder, stopper].compact.each do |thread|
+      thread.kill unless thread.join(5)
+      thread.join
+    rescue StandardError
+      nil
+    end
   end
 end
 
@@ -361,6 +368,11 @@ RSpec.describe Timekeeping::LocalOwner, "stop_applying! behind an admitted settl
     expect(timekeeping_row_counts).to eq(baseline)
   ensure
     release&.push(true)
-    [committer, stopper].compact.each { |thread| thread.kill unless thread.join(5) }
+    [committer, stopper].compact.each do |thread|
+      thread.kill unless thread.join(5)
+      thread.join
+    rescue StandardError
+      nil
+    end
   end
 end

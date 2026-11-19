@@ -495,3 +495,20 @@ RSpec.describe TimekeepingOwnership, "settle step while a newer step is open" do
     expect([ownership.settling_generation, ownership.settling_stopped_generation]).to eq([nil, 4])
   end
 end
+
+RSpec.describe TimekeepingOwnership, "settle step in a later handoff" do
+  # "`begin_settling!` sets the outgoing generation under the row lock, only during a handoff, and only when the stop mark is NULL or lower."
+  it "begin_settling! opens a later generation above a stop mark left by an earlier handoff and keeps the mark" do
+    described_class.current.update_columns(generation: 6, handoff_step: "settle")
+    described_class.begin_settling!(generation: 5)
+    described_class.stop_applying!(generation: 5)
+    # The first handoff flips; the next one raises the generation again.
+    described_class.current.update_columns(handoff_step: nil)
+    described_class.current.update_columns(generation: 7, handoff_step: "settle")
+    described_class.begin_settling!(generation: 6)
+
+    ownership = described_class.current.reload
+    expect(described_class.settling?).to be(true)
+    expect([ownership.settling_generation, ownership.settling_stopped_generation]).to eq([6, 5])
+  end
+end

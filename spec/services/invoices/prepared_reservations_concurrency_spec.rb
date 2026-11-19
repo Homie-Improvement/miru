@@ -309,7 +309,14 @@ RSpec.describe Invoices::PreparedReservations, "settle step racing stop_applying
     expect(prepared_spec_operations(company, second_invoice).map(&:first)).to eq(["prepared"])
   ensure
     release&.push(true)
-    [holder, stopper].compact.each { |thread| thread.kill unless thread.join(5) }
+    # As the after hook above: a killed worker is joined before the
+    # committed-data cleanup, and one worker's error never skips the others.
+    [holder, stopper].compact.each do |thread|
+      thread.kill unless thread.join(5)
+      thread.join
+    rescue StandardError
+      nil
+    end
   end
 end
 
@@ -364,6 +371,11 @@ RSpec.describe Invoices::PreparedReservations, "settle step lock order", committ
     expect(prepared_spec_operations(company, invoice).map(&:first)).to eq(["committed"])
   ensure
     release&.push(true)
-    [holder, committer, stopper].compact.each { |thread| thread.kill unless thread.join(5) }
+    [holder, committer, stopper].compact.each do |thread|
+      thread.kill unless thread.join(5)
+      thread.join
+    rescue StandardError
+      nil
+    end
   end
 end

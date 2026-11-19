@@ -46,6 +46,30 @@ RSpec.describe Invoices::PreparedReservations, "settle step" do
     end
   end
 
+  it "prepared adapter publishes the snapshot of an entry a settling commit releases at the outgoing generation, not the raised one" do
+    prepare_local_ownership!
+    company = create(:company)
+    entry = prepared_spec_entry(company)
+    invoice = prepared_spec_invoice(company)
+    adapter = described_class.new
+    outgoing = TimekeepingOwnership.current.generation
+    prepared_spec_commit_flow(adapter, prepared_spec_request(company, invoice, [entry.id]))
+    release = prepared_spec_request(company, invoice, [])
+    expect(adapter.prepare(release).state).to eq("prepared")
+    prepared_settling_spec_open(outgoing)
+    snapshot_generations = lambda do
+      Timekeeping::LocalOutboxEntry.where(company_id: company.id, entry_id: entry.id).order(:outbox_position).pluck(:generation)
+    end
+    before = snapshot_generations.call
+
+    # Releasing the entry flips its locked flag, so the commit publishes one snapshot.
+    outcome = adapter.commit(release)
+
+    expect(outcome.state).to eq("committed")
+    expect(prepared_spec_reservations(company)).to eq([])
+    expect(snapshot_generations.call).to eq(before + [outgoing])
+  end
+
   it "prepared adapter applies an abort of a prepared operation at the outgoing generation while settling" do
     prepare_local_ownership!
     company = create(:company)
@@ -69,13 +93,17 @@ RSpec.describe Invoices::PreparedReservations, "settle step" do
     adapter = described_class.new
     company_a = create(:company)
     company_b = create(:company)
-    entry_a = prepared_spec_entry(company_a)
     entry_b = prepared_spec_entry(company_b)
     invoice_a = prepared_spec_invoice(company_a)
     invoice_b = prepared_spec_invoice(company_b)
     operation_id = SecureRandom.uuid
     request_b = prepared_spec_request(company_b, invoice_b, [entry_b.id], operation_id:)
-    request_a = prepared_spec_request(company_a, invoice_a, [entry_a.id], operation_id:)
+    # Only the company differs from the stored operation's key, so the refusal
+    # can come from nothing but the company filter.
+    request_a = Invoices::ReservationRequest.new(
+      company_id: company_a.id, invoice_id: invoice_b.id, operation_id:, generation: request_b.generation,
+      disposition: request_b.disposition, entries: request_b.entries
+    )
     expect(request_a.generation).to eq(outgoing)
     expect(adapter.prepare(request_b).state).to eq("prepared")
 
