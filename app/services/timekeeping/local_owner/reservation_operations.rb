@@ -19,8 +19,12 @@ module Timekeeping
     #    the company's invoice with Invoices::OperationLock, the lock
     #    Invoices::PreparedReservations runs under, so the two writers on one
     #    invoice wait in turn.
-    # 2. Read the ownership generation FOR SHARE NOWAIT. A body generation
-    #    that is not the admitted one is stale_generation. The service
+    # 2. Read the ownership row FOR SHARE NOWAIT. A body generation that is
+    #    not the admitted one is stale_generation. While a handoff step is
+    #    recorded nothing is admitted, except that during the settle step a
+    #    commit or abort carrying exactly the settling generation, for an
+    #    operation stored at it, is applied at that generation
+    #    (WriteSteps.settling_generation). The service
     #    replays before this check; this order is deliberately the reverse,
     #    so a retry at an old generation is refused even when its earlier
     #    answer is stored. A billing write holds the ownership row FOR SHARE
@@ -126,15 +130,28 @@ module Timekeeping
           lock_operation_key
           checkpoint.call(:operation_key_locked)
           Invoices::OperationLock.acquire!(ApplicationRecord.connection, company_id:, invoice_id: request.invoice_id)
-          stored_generation = WriteSteps.locked_generation_nowait
-          return Outcome.refusal(:stale_generation) unless WriteSteps.generation_matches?(generation, stored_generation)
+          write_generation = generation_to_write(WriteSteps.locked_ownership_nowait)
+          return Outcome.refusal(:stale_generation) unless write_generation
 
           checkpoint.call(:generation_checked)
           stored = stored_answer
           checkpoint.call(:operation_checked)
           return stored if stored
 
-          send(ROUTES.fetch(route), stored_generation)
+          send(ROUTES.fetch(route), write_generation)
+        end
+
+        # The generation this request writes at, or nil when it is stale.
+        # During a handoff only the settle step's rule can admit it, and the
+        # generation is the outgoing one the operation was stored at, never
+        # the raised one on the row.
+        def generation_to_write(ownership)
+          if ownership&.handoff_step
+            WriteSteps.settling_generation(ownership, route:, generation:, operation_generation: find_operation&.generation)
+          else
+            admitted = WriteSteps.generation_admitted_by(ownership)
+            admitted if WriteSteps.generation_matches?(generation, admitted)
+          end
         end
 
         # Only the params keys below are read, so a company_id or actor field

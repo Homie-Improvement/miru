@@ -149,10 +149,14 @@ module Timekeeping
 
         # Finishes settle and freeze if they are owed, then reopens the
         # outgoing owner at the raised generation. The incoming owner stays
-        # fenced, and the generation stays raised.
+        # fenced, and the generation stays raised. The settle step is cleared
+        # in the same save, so no aborted handoff leaves one open.
         def abort_handoff(owed)
           carry_out(owed)
-          update_row { |row| row.handoff_step = nil }
+          update_row do |row|
+            row.handoff_step = nil
+            row.settling_generation = nil
+          end
           outgoing.admission.admit(generation: @generation)
         end
 
@@ -297,8 +301,8 @@ module Timekeeping
         end
 
         # Step 7. Requires reconcile recorded at this run's generation, moves
-        # the owner and clears the step in one transaction, and only then lets
-        # the incoming owner admit writes. A flip from the legacy source also
+        # the owner and clears the step and any open settle step in one
+        # transaction, and only then lets the incoming owner admit writes. A flip from the legacy source also
         # retires it: legacy_retired_at is set and the monolith's own store
         # becomes the prepared tables, so a later rollback lands there.
         #
@@ -310,6 +314,7 @@ module Timekeeping
           update_row(expected_step: "reconcile") do |row|
             row.owner = @route.fetch(:to)
             row.handoff_step = nil
+            row.settling_generation = nil
             if source_legacy
               row.legacy_retired_at = Time.current
               row.monolith_store = PREPARED_MONOLITH_STORE
