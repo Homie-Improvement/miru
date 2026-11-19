@@ -351,3 +351,185 @@ RSpec.describe "TestDatabaseCleanup ledger deletes" do
     expect(InvoiceOperationOutboxItem.count).to eq(0)
   end
 end
+
+RSpec.describe "Committed-data test mode", committed_data: true do
+  it "seeded committed reset refuses a non-test Timekeeping database without connecting or echoing its password" do
+    password = "seeded-reset-secret-#{SecureRandom.hex(4)}"
+    demo_url = "postgres://demo_user:#{password}@db.invalid:5432/timekeeping_demo"
+    # The seed loads before the guard runs, and it writes through
+    # InvoiceOperationsRecord's lazily opened pool. Opening both application
+    # pools first keeps that connection from counting as a Timekeeping one.
+    [ActiveRecord::Base, InvoiceOperationsRecord].each { |model| model.connection_pool.with_connection(&:verify!) }
+    allow(PG).to receive(:connect).and_call_original
+
+    # The seeded path must keep the Timekeeping reset's own guard: a database
+    # whose name does not end in "_test" is refused before any connection opens.
+    expect do
+      TestDatabaseCleanup.reset_seeded_committed!(
+        as_of: TestDatabaseCleanup.seed_as_of,
+        state: nil,
+        env: { "TIMEKEEPING_DATABASE_URL" => demo_url }
+      )
+    end.to raise_error(TestDatabaseGuard::NotATestDatabase) { |error|
+      expect(error.message).to include("timekeeping_demo")
+      expect(error.message).not_to include(password)
+      expect(error.message).not_to include("db.invalid")
+    }
+    expect(PG).not_to have_received(:connect)
+  end
+end
+
+RSpec.describe "Committed-data test mode", committed_data: true do
+  include InnerExampleThroughSuiteHooks
+
+  # "A committed_data example tagged two_tenant_seed loads the seed without the occupied-table refusal and sees `fork_and_leaf`, `copper_kettle` and the ownership row"
+  it "a seeded committed_data inner example sees both seeded companies and one ownership row committed for other connections" do
+    seen = {}
+    result = run_inner_example_through_suite_hooks(committed_data: true, two_tenant_seed: true) do
+      seen[:company_names] = Thread.new do
+        ActiveRecord::Base.connection_pool.with_connection { Company.pluck(:name) }
+      end.value
+      seen[:fork_and_leaf] = Company.where(name: "Fork & Leaf Salads").count
+      seen[:copper_kettle] = Company.where(name: "Copper Kettle Bakery").count
+      seen[:ownership_rows] = TimekeepingOwnership.count
+    end
+
+    # A refusal raised by a before hook shows only in the inner result.
+    expect(result.exception).to be_nil
+    expect(seen[:company_names]).to include("Fork & Leaf Salads", "Copper Kettle Bakery")
+    expect(seen.except(:company_names)).to eq(fork_and_leaf: 1, copper_kettle: 1, ownership_rows: 1)
+  ensure
+    TimekeepingOwnership.ensure_initial!
+  end
+end
+
+RSpec.describe "Committed-data test mode", committed_data: true do
+  include InnerExampleThroughSuiteHooks
+
+  # "A committed_data example without the seed tag still starts empty, with a legacy row."
+  it "a committed_data inner example without the seed tag starts with no companies and one legacy ownership row" do
+    create(:company)
+    seen = {}
+    result = run_inner_example_through_suite_hooks(committed_data: true) do
+      seen[:companies] = Company.count
+      seen[:ownership_rows] = TimekeepingOwnership.count
+      seen[:ownership] = TimekeepingOwnership.current.slice(:owner, :generation, :handoff_step)
+    end
+
+    expect(result.exception).to be_nil
+    expect(seen[:companies]).to eq(0)
+    expect(seen[:ownership_rows]).to eq(1)
+    expect(seen[:ownership]).to eq("owner" => "monolith", "generation" => 1, "handoff_step" => nil)
+  ensure
+    TimekeepingOwnership.ensure_initial!
+  end
+end
+
+RSpec.describe "Committed-data test mode", committed_data: true do
+  # "delete every application table without `ensure_initial!`, load the seed with the `as_of` from spec/fixtures/timekeeping/seed_disposition.yml, then call `ensure_initial!` and re-apply the owner state."
+  # A second run starts from the rows the first one committed, so it must delete them first rather than refuse or duplicate them.
+  it "reset_seeded_committed! run twice leaves exactly one of each seeded company and one ownership row" do
+    as_of = TestDatabaseCleanup.seed_as_of
+
+    TestDatabaseCleanup.reset_seeded_committed!(as_of:, state: nil, env: {})
+    first_company_count = Company.count
+    expect { TestDatabaseCleanup.reset_seeded_committed!(as_of:, state: nil, env: {}) }.not_to raise_error
+
+    expect(Company.where(name: "Fork & Leaf Salads").count).to eq(1)
+    expect(Company.where(name: "Copper Kettle Bakery").count).to eq(1)
+    expect(Company.count).to eq(first_company_count)
+    expect(TimekeepingOwnership.count).to eq(1)
+  end
+end
+
+RSpec.describe "Committed-data test mode", committed_data: true do
+  include InnerExampleThroughSuiteHooks
+
+  # The :without_transaction before hook is registered after the committed_data
+  # hook, so without the seeded path taking precedence its truncation would
+  # delete the seed just loaded.
+  it "a seeded committed_data example also tagged without_transaction keeps both seeded companies" do
+    seen = {}
+    result = run_inner_example_through_suite_hooks(committed_data: true, two_tenant_seed: true, without_transaction: true) do
+      seen[:companies] = Company.where(name: ["Fork & Leaf Salads", "Copper Kettle Bakery"]).pluck(:name).sort
+      seen[:ownership_rows] = TimekeepingOwnership.count
+    end
+
+    expect(result.exception).to be_nil
+    expect(seen).to eq(companies: ["Copper Kettle Bakery", "Fork & Leaf Salads"], ownership_rows: 1)
+  ensure
+    TimekeepingOwnership.ensure_initial!
+  end
+end
+
+RSpec.describe "Committed-data test mode", committed_data: true do
+  # "Any non-legacy state must be applied only after the seed loads, or the seed raises `HandoffBegun`."
+  # "With `TIMEKEEPING_DATABASE_URL` unset, the Timekeeping clear is skipped."
+  it "reset_seeded_committed! loads the seed then applies the timekeeping state without touching an unconfigured Timekeeping database" do
+    create(:company)
+    # The seed writes through InvoiceOperationsRecord's own pool, which opens
+    # its first connection lazily. Opening both application pools first keeps
+    # that connection from counting as a Timekeeping one.
+    [ActiveRecord::Base, InvoiceOperationsRecord].each { |model| model.connection_pool.with_connection(&:verify!) }
+    expect(PG).not_to receive(:connect)
+    allow(TimekeepingDatabaseReset).to receive(:reset!).and_call_original
+    # Holds no TIMEKEEPING_DATABASE_URL, so the reset connects nowhere; the
+    # marker shows the caller's environment is the one passed through.
+    seeded_reset_env = { "SEEDED_RESET_ENV_MARKER" => "1" }
+
+    TestDatabaseCleanup.reset_seeded_committed!(as_of: TestDatabaseCleanup.seed_as_of, state: "timekeeping", env: seeded_reset_env)
+
+    expect(Company.where(name: "Fork & Leaf Salads").count).to eq(1)
+    expect(Company.where(name: "Copper Kettle Bakery").count).to eq(1)
+    expect(TimekeepingOwnership.count).to eq(1)
+    expect_owner_state!("timekeeping")
+    expect(TimekeepingDatabaseReset).to have_received(:reset!).with("timekeeping", env: seeded_reset_env).once
+
+    # Run again over the rows the first call left: the delete step must empty
+    # every table, the ownership row included, before the seed loads.
+    expect do
+      TestDatabaseCleanup.reset_seeded_committed!(as_of: TestDatabaseCleanup.seed_as_of, state: "rollback", env: seeded_reset_env)
+    end.not_to raise_error
+    expect(Company.where(name: ["Fork & Leaf Salads", "Copper Kettle Bakery"]).count).to eq(2)
+    expect_owner_state!("rollback")
+    expect(TimekeepingDatabaseReset).to have_received(:reset!).with("rollback", env: seeded_reset_env).once
+  end
+end
+
+RSpec.describe "Committed-data test mode", committed_data: true do
+  it "reset_seeded_committed! with no selected state leaves the seed and the legacy ownership row" do
+    # Opens InvoiceOperationsRecord's lazy pool before PG.connect is watched, as above.
+    [ActiveRecord::Base, InvoiceOperationsRecord].each { |model| model.connection_pool.with_connection(&:verify!) }
+    expect(PG).not_to receive(:connect)
+
+    result = TestDatabaseCleanup.reset_seeded_committed!(as_of: TestDatabaseCleanup.seed_as_of, state: nil, env: {})
+
+    expect(result).to be_nil
+    expect(Company.where(name: ["Fork & Leaf Salads", "Copper Kettle Bakery"]).count).to eq(2)
+    expect(TimekeepingOwnership.count).to eq(1)
+    expect_owner_state!("legacy")
+  end
+end
+
+RSpec.describe "Committed-data test mode" do
+  # "A committed_data example tagged `:two_tenant_seed` runs the seeded path and skips `delete_all_committed!`. Every other committed example keeps today's path."
+  it "seeded_committed? chooses the seeded path only for committed_data true with two_tenant_seed" do
+    expect(TestDatabaseCleanup.seeded_committed?({ committed_data: true, two_tenant_seed: true })).to be(true)
+    expect(TestDatabaseCleanup.seeded_committed?({ committed_data: true })).to be(false)
+    expect(TestDatabaseCleanup.seeded_committed?({ two_tenant_seed: true })).to be(false)
+    expect(TestDatabaseCleanup.seeded_committed?({ two_tenant_seed: true, seeded_without_transaction: true })).to be(false)
+    expect(TestDatabaseCleanup.seeded_committed?({ committed_data: false, two_tenant_seed: true })).to be(false)
+    expect(TestDatabaseCleanup.seeded_committed?({ committed_data: :yes, two_tenant_seed: true })).to be(false)
+    expect(TestDatabaseCleanup.seeded_committed?({ committed_data: true, two_tenant_seed: nil })).to be(false)
+    expect(TestDatabaseCleanup.seeded_committed?({})).to be(false)
+  end
+end
+
+RSpec.describe "Committed-data test mode" do
+  # "reading `as_of` as two_tenant_seed.rb does: `YAML.load_file(Timekeeping::SeedDispositionRecorder::DEFAULT_PATH).fetch("as_of")`."
+  it "seed_as_of reads as_of from the seed disposition file" do
+    expected = YAML.load_file(Rails.root.join("spec/fixtures/timekeeping/seed_disposition.yml")).fetch("as_of")
+
+    expect(TestDatabaseCleanup.seed_as_of).to eq(expected)
+  end
+end

@@ -10,8 +10,7 @@
 RSpec.shared_context "two tenant seed" do
   before(:all) do
     DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
-    as_of = YAML.load_file(Timekeeping::SeedDispositionRecorder::DEFAULT_PATH).fetch("as_of")
-    Timekeeping::SeedDispositionRecorder.load_fresh_seed!(as_of:)
+    Timekeeping::SeedDispositionRecorder.load_fresh_seed!(as_of: TestDatabaseCleanup.seed_as_of)
   end
 
   after(:all) do

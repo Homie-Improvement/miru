@@ -7,7 +7,7 @@ require "socket"
 require "tempfile"
 require "json"
 
-RSpec.describe "Timekeeping demo runtime queues", :two_tenant_seed, :seeded_without_transaction do
+RSpec.describe "Timekeeping demo runtime queues", :two_tenant_seed, committed_data: true do
   dedicated_queues = %w[invoice_operations timekeeping_relay].freeze
 
   after do
