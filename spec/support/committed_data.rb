@@ -17,6 +17,7 @@ module CommittedDataMode
   end
 
   def self.reset_database
+    TestDatabaseCleanup.before_reset!
     DatabaseCleaner.clean_with(:deletion, except: KEPT_TABLES)
     TimekeepingOwnership.ensure_initial!
   end

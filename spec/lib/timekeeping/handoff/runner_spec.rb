@@ -397,3 +397,58 @@ RSpec.describe Timekeeping::Handoff::Runner, "failed rollback admit", :two_tenan
   end
 end
 # rubocop:enable Lint/DuplicateMethods
+
+RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
+  it "a flip that finds a settling generation stored ends the handoff with settling_generation NULL" do
+    TimekeepingOwnership.ensure_initial!
+    owners = TimekeepingHandoffFakes.owners(timekeeping: TimekeepingHandoffFakes::InMemoryTimekeepingStore.new,
+                                            settle: nil, relay: false)
+    # Stores a settling generation just before the flip step runs, so only the flip can clear it.
+    observer = lambda do |event, step:|
+      if event == :before_step && step.to_s == "flip"
+        TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(settling_generation: 1)
+      end
+    end
+
+    Dir.mktmpdir do |report_root|
+      described_class.run(direction: :cutover, owners:, observer:, report_root: Pathname(report_root), clock: Time)
+    end
+
+    ownership = TimekeepingOwnership.current
+    expect(ownership.handoff_step).to be_nil
+    expect(ownership.owner).to eq("timekeeping")
+    # "In lib/timekeeping/handoff/runner.rb, `flip` and `abort_handoff` also set `settling_generation` to NULL, so no handoff ends with a stored settling generation."
+    expect(ownership.settling_generation).to be_nil
+  ensure
+    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)
+      .update_all(settling_generation: nil, settling_stopped_generation: nil)
+  end
+end
+
+RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
+  it "aborting a handoff with a settling generation stored ends it with settling_generation NULL" do
+    calls = []
+    clock = Struct.new(:now).new(Time.utc(2026, 10, 27, 12))
+    report_root = Pathname(Dir.mktmpdir("handoff-abort-settling"))
+    owners = TimekeepingHandoffFakes.owners(
+      timekeeping: TimekeepingHandoffFakes::InMemoryTimekeepingStore.new(log: calls, tag: :timekeeping),
+      monolith_admission: TimekeepingHandoffFakes::RecordingAdmission.new(log: calls, tag: :monolith),
+      settle: nil, relay: false
+    )
+    expect do
+      described_class.run(direction: :cutover, owners:, report_root:, clock:,
+                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_close_admission))
+    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(settling_generation: 1)
+
+    described_class.run(direction: :cutover, abort: true, owners:, report_root:, clock:)
+
+    ownership = TimekeepingOwnership.current
+    expect(ownership.handoff_step).to be_nil
+    # "In lib/timekeeping/handoff/runner.rb, `flip` and `abort_handoff` also set `settling_generation` to NULL, so no handoff ends with a stored settling generation."
+    expect(ownership.settling_generation).to be_nil
+  ensure
+    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)
+      .update_all(settling_generation: nil, settling_stopped_generation: nil)
+  end
+end

@@ -45,7 +45,16 @@ module TestDatabaseCleanup
     TimekeepingDatabaseReset.reset!(state, env:)
   end
 
+  # Every reset path calls this before it deletes anything. It does nothing
+  # unless an integrated runtime has activated the queue ledger
+  # (spec/support/timekeeping/queue_ledger.rb); then it records the Solid
+  # Queue executions the reset would otherwise erase unobserved.
+  def before_reset!
+    TimekeepingQueueLedger.session.before_reset!
+  end
+
   def delete_all_tables!
+    before_reset!
     DatabaseCleaner.clean_with :deletion, except: KEPT_TABLES, pre_count: true, reset_ids: false
   end
   private_class_method :delete_all_tables!
@@ -92,6 +101,7 @@ RSpec.configure do |config|
   config.before(:suite) do
     DatabaseCleaner.allow_remote_database_url = true
     DatabaseCleaner.url_allowlist = [ENV["DATABASE_URL"]]
+    TestDatabaseCleanup.before_reset!
     DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata)
     # Truncation empties the ownership table; restore its one row.
     TimekeepingOwnership.ensure_initial!
@@ -138,6 +148,7 @@ RSpec.configure do |config|
   config.before(:each, :without_transaction) do |example|
     next if TestDatabaseCleanup.seeded_committed?(example.metadata)
 
+    TestDatabaseCleanup.before_reset!
     DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata schema_migrations)
     TimekeepingOwnership.ensure_initial!
   end
@@ -145,6 +156,7 @@ RSpec.configure do |config|
   config.append_after(:each, :without_transaction) do |example|
     next if TestDatabaseCleanup.reset_withheld?(example)
 
+    TestDatabaseCleanup.before_reset!
     DatabaseCleaner.clean_with :truncation, except: %w(ar_internal_metadata schema_migrations)
     TimekeepingOwnership.ensure_initial!
   end

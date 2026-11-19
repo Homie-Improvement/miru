@@ -3184,3 +3184,36 @@ RSpec.describe Timekeeping::Gateway, "legacy create receipts across the first cu
     end
   end
 end
+
+RSpec.describe Timekeeping::Gateway do
+  # "While settling, the monolith also refuses new entry writes and service commands (through LocalOwner, BillingFence and Gateway), with nothing changed, and still applies a commit or abort of an operation registered at the outgoing generation"
+  it "a prepared-state gateway create while the settle step is open raises OwnershipMoving and writes nothing" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "owner")
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+      .update_columns(owner: "monolith", monolith_store: "prepared", generation: 3, handoff_step: "settle")
+    TimekeepingOwnership.begin_settling!(generation: 2)
+    expect(TimekeepingOwnership.settling?).to be(true)
+    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: "req-settling-create")
+    # Doubles with no allowed methods: any forwarded write or remote lookup fails the example.
+    gateway = described_class.new(
+      context:, write_client: instance_double(Timekeeping::EntryWriteClient),
+      read_client: instance_double(Timekeeping::EntryApiClient)
+    )
+    ownership_before = TimekeepingOwnership.current.attributes
+    baseline = timekeeping_row_counts
+
+    expect do
+      expect do
+        gateway.create(user:, project:, attributes: {
+          duration: 30, work_date: Date.current, note: "during settle", bill_status: "unbilled"
+        })
+      end.to raise_error(Timekeeping::Gateway::OwnershipMoving)
+    end.not_to change(TimesheetEntry, :count)
+
+    expect(timekeeping_row_counts).to eq(baseline)
+    expect(Timekeeping::LocalEntry.where(company_id: company.id).count).to eq(0)
+    expect(TimekeepingOwnership.current.attributes).to eq(ownership_before)
+  end
+end

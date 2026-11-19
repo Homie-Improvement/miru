@@ -18,6 +18,32 @@ class TimekeepingOwnership < ApplicationRecord
   INITIAL_OWNER = "monolith"
   INITIAL_MONOLITH_STORE = "legacy"
 
+  # What a settle step transition reads under the row lock.
+  PhaseState = Data.define(:handoff_step, :settling_generation, :settling_stopped_generation)
+
+  # The settle step's transitions, as pure functions of the locked row. Each
+  # returns the column changes to write, or nil when the call changes
+  # nothing. A stop mark at or above a generation means that generation's
+  # step was stopped and must stay stopped.
+  module SettlingPhase
+    # Opens only during a handoff, never at or below the stop mark, and never
+    # over a step that is already open at the same or a newer generation.
+    def self.begin(state, generation)
+      return if state.handoff_step.nil?
+      return unless state.settling_stopped_generation.nil? || state.settling_stopped_generation < generation
+      return unless state.settling_generation.nil? || state.settling_generation < generation
+
+      { settling_generation: generation }
+    end
+
+    # Always ends the open step and raises the mark to generation; the mark
+    # never falls.
+    def self.stop(state, generation)
+      { settling_generation: nil,
+        settling_stopped_generation: [state.settling_stopped_generation, generation].compact.max }
+    end
+  end
+
   # Raised by writers that may run only before any handoff has begun, such as
   # the seed and demo-data builders.
   class HandoffBegun < StandardError
@@ -76,6 +102,47 @@ class TimekeepingOwnership < ApplicationRecord
     ownership.nil? || ownership.handoff_begun?
   end
   private_class_method :begun?
+
+  # Opens the settle step of a handoff for the outgoing generation: while it
+  # is open, the monolith still applies a commit or abort it registered at
+  # that generation (docs/architecture/timekeeping-soa.md section 10.5 step
+  # 2). A late or repeated call never reopens a stopped step or replaces a
+  # newer one (SettlingPhase.begin).
+  def self.begin_settling!(generation:)
+    change_settling_phase!(generation) { |state| SettlingPhase.begin(state, generation) }
+  end
+
+  # Ends the settle step and raises the stop mark to generation. The update
+  # waits for every commit or abort holding the row FOR SHARE, so none of
+  # them applies after this returns.
+  def self.stop_applying!(generation:)
+    change_settling_phase!(generation) { |state| SettlingPhase.stop(state, generation) }
+  end
+
+  # Whether a settle step is open. false when the row is missing.
+  def self.settling?
+    !where(id: SINGLETON_ID).pick(:settling_generation).nil?
+  end
+
+  def self.change_settling_phase!(generation)
+    check_generation!(generation)
+
+    transaction do
+      row = lock.where(id: SINGLETON_ID).pick(:handoff_step, :settling_generation, :settling_stopped_generation)
+      raise ActiveRecord::RecordNotFound.new("timekeeping_ownership row is missing", name, primary_key, SINGLETON_ID) if row.nil?
+
+      changes = yield PhaseState.new(*row)
+      where(id: SINGLETON_ID).update_all(changes) if changes
+    end
+  end
+  private_class_method :change_settling_phase!
+
+  # A nil or non-Integer generation could never match a stored generation, so
+  # it is refused before the row is touched.
+  def self.check_generation!(generation)
+    raise ArgumentError, "generation must be a positive Integer" unless generation.is_a?(Integer) && generation.positive?
+  end
+  private_class_method :check_generation!
 
   # True once the generation has been raised or any other column leaves its
   # initial value. The flip clears handoff_step, and an aborted handoff leaves

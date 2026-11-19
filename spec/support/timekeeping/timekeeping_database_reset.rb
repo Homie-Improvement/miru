@@ -42,7 +42,11 @@ module TimekeepingDatabaseReset
 
   # state_name nil means no owner state is selected; the admission row then
   # takes its column default, as it does for legacy.
-  def reset!(state_name, env:)
+  #
+  # before_truncate runs once the name guard has passed and before any
+  # connection, so the queue ledger collects the Solid Queue executions this
+  # truncate would erase, whichever caller resets the database.
+  def reset!(state_name, env:, before_truncate: -> { TestDatabaseCleanup.before_reset! })
     # Checked first, so an unknown state name fails whether or not a database is configured.
     generation = admission_generation(state_name)
     return nil unless env.key?(DATABASE_URL_KEY)
@@ -50,6 +54,7 @@ module TimekeepingDatabaseReset
     url = env.fetch(DATABASE_URL_KEY)
     name = database_name(url)
     TestDatabaseGuard.require_test_database!(name)
+    before_truncate.call
     connection = connect(url, name)
     return nil unless connection
 

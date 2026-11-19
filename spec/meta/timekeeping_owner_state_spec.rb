@@ -1,8 +1,10 @@
 # frozen_string_literal: true
 
 require "rails_helper"
+require "json"
 require "open3"
 require "pg"
+require "tmpdir"
 
 RSpec.describe "Timekeeping owner state harness" do
   # Written out by hand rather than read from TimekeepingOwnerState::STATES, so
@@ -361,11 +363,41 @@ RSpec.describe "Timekeeping owner state harness" do
   end
 
   describe "probe runs", :without_transaction do
+    # The probe gets a ledger file of its own: its suite start deletes that
+    # file, and the inherited path would be this run's ledger.
     def run_probe(fixture, owner_state)
       probe = Rails.root.join("spec/fixtures/timekeeping_harness", fixture).to_s
-      stdout, stderr, status = Open3.capture3({ "TIMEKEEPING_OWNER_STATE" => owner_state },
-                                              "bundle", "exec", "rspec", probe, chdir: Rails.root.to_s)
-      ["#{stdout}\n#{stderr}", status]
+      Dir.mktmpdir("owner-state-probe-ledger") do |dir|
+        env = { "TIMEKEEPING_OWNER_STATE" => owner_state,
+                TimekeepingQueueLedger::PATH_KEY => File.join(dir, "queue_ledger.json") }
+        stdout, stderr, status = Open3.capture3(env, "bundle", "exec", "rspec", probe, chdir: Rails.root.to_s)
+        ["#{stdout}\n#{stderr}", status]
+      end
+    end
+
+    # "Every probe subprocess sets it to its own temporary file, so a probe never touches the parent run's ledger."
+    it "an owner state probe leaves the parent's inherited ledger file byte for byte unchanged" do
+      Dir.mktmpdir("owner-state-parent-ledger") do |dir|
+        parent_path = File.join(dir, "parent_ledger.json")
+        violation = JSON.generate(
+          "records" => [{ "database" => "monolith", "queue" => "default", "job_class" => "StrayJob",
+                          "kind" => "completed", "job_id" => 1, "active_job_id" => "owner-state-parent-violation",
+                          "execution_id" => nil, "created_at" => "2026-01-01T00:00:00Z",
+                          "finished_at" => "2026-01-01T00:00:01Z" }],
+          "controls" => []
+        )
+        File.write(parent_path, violation)
+        previous = ENV.fetch(TimekeepingQueueLedger::PATH_KEY, nil)
+        begin
+          ENV[TimekeepingQueueLedger::PATH_KEY] = parent_path
+          output, status = run_probe("unset_owner_state_probe.rb", nil)
+        ensure
+          ENV[TimekeepingQueueLedger::PATH_KEY] = previous
+        end
+
+        expect(status).to be_success, output
+        expect(File.binread(parent_path)).to eq(violation.b)
+      end
     end
 
     it "keeps the probe fixtures out of a normal suite run" do
@@ -418,8 +450,12 @@ RSpec.describe "Seeded committed_data owner state probe run (rollback)", :withou
     expect(probe_source).to include("expect_owner_state!")
 
     # "The seeded path ends in the selected state under `TIMEKEEPING_OWNER_STATE=rollback` and `=timekeeping`"
-    stdout, stderr, status = Open3.capture3({ "TIMEKEEPING_OWNER_STATE" => "rollback" },
-                                            "bundle", "exec", "rspec", probe, chdir: Rails.root.to_s)
+    # The probe's own ledger file, so its suite start never deletes this run's.
+    stdout, stderr, status = Dir.mktmpdir("seeded-owner-state-probe-ledger") do |dir|
+      Open3.capture3({ "TIMEKEEPING_OWNER_STATE" => "rollback",
+                       TimekeepingQueueLedger::PATH_KEY => File.join(dir, "queue_ledger.json") },
+                     "bundle", "exec", "rspec", probe, chdir: Rails.root.to_s)
+    end
 
     expect(status).to be_success, "#{stdout}\n#{stderr}"
     expect(stdout).to include("1 example, 0 failures")
@@ -434,8 +470,12 @@ RSpec.describe "Seeded committed_data owner state probe run (timekeeping)", :wit
     # "The seeded path ends in the selected state under `TIMEKEEPING_OWNER_STATE=rollback` and `=timekeeping`"
     # Under timekeeping a seed loaded after the state was applied raises HandoffBegun, so this run also
     # fails if the state is applied before the seed loads.
-    stdout, stderr, status = Open3.capture3({ "TIMEKEEPING_OWNER_STATE" => "timekeeping" },
-                                            "bundle", "exec", "rspec", probe, chdir: Rails.root.to_s)
+    # The probe's own ledger file, so its suite start never deletes this run's.
+    stdout, stderr, status = Dir.mktmpdir("seeded-owner-state-probe-ledger") do |dir|
+      Open3.capture3({ "TIMEKEEPING_OWNER_STATE" => "timekeeping",
+                       TimekeepingQueueLedger::PATH_KEY => File.join(dir, "queue_ledger.json") },
+                     "bundle", "exec", "rspec", probe, chdir: Rails.root.to_s)
+    end
 
     expect(status).to be_success, "#{stdout}\n#{stderr}"
     expect(stdout).to include("1 example, 0 failures")
