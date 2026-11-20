@@ -41,39 +41,38 @@ module TimekeepingForwardingHelpers
     request.fetch(:headers).find { |key, _value| key.to_s.casecmp?("Idempotency-Key") }&.last
   end
 
-  # Every entry request the monolith sent to Timekeeping, in send order, as
+  # Every request the monolith sent to Timekeeping, in send order, as
   # { method:, idempotency_key:, body: }. Read from the fake's own request
   # list, or, while TimekeepingRegressionAdapter runs, from the requests the
   # monolith sent to the live app, because the live app keeps no request log.
-  def forwarded_entry_requests(fake)
-    return ForwardedEntryRequestLog.requests if TimekeepingRegressionAdapter.current
+  # No path is filtered out, so an exact check on this list also fails when an
+  # extra request of any kind is sent.
+  def forwarded_timekeeping_requests(fake)
+    return ForwardedTimekeepingRequestLog.requests if TimekeepingRegressionAdapter.current
 
-    fake.requests.filter_map do |request|
-      next unless ForwardedEntryRequestLog.entry_path?(request.fetch(:path))
-
+    fake.requests.map do |request|
       { method: request.fetch(:method), idempotency_key: forwarded_idempotency_key(request), body: request.fetch(:body) }
     end
   end
 
-  # The creates among forwarded_entry_requests, in send order.
+  # The POST requests among forwarded_timekeeping_requests, in send order.
   def forwarded_create_requests(fake)
-    forwarded_entry_requests(fake).select { |request| request.fetch(:method) == "POST" }
+    forwarded_timekeeping_requests(fake).select { |request| request.fetch(:method) == "POST" }
   end
 
-  # How many entries Timekeeping holds that are not discarded: the fake's
-  # outbox, or, while TimekeepingRegressionAdapter runs, the live entries table
-  # for company. A duplicate write therefore shows up as an extra entry.
+  # How many entries Timekeeping has ever stored, discarded ones included: the
+  # distinct entry ids in the fake's outbox, or, while
+  # TimekeepingRegressionAdapter runs, the live entries rows for company. A
+  # duplicate write therefore shows up as an extra entry even if it was later
+  # discarded.
   def forwarded_stored_entry_count(fake, company:)
     if TimekeepingRegressionAdapter.current
       return with_live_timekeeping_database do |connection|
-        connection.exec_params("SELECT count(*) FROM entries WHERE company_id = $1 AND discarded_at IS NULL",
-                               [company.id]).getvalue(0, 0).to_i
+        connection.exec_params("SELECT count(*) FROM entries WHERE company_id = $1", [company.id]).getvalue(0, 0).to_i
       end
     end
 
-    latest_snapshots = fake.outbox.map { |row| row.fetch("entry") }.group_by { |entry| entry.fetch("id") }
-                           .transform_values(&:last)
-    latest_snapshots.values.count { |entry| entry["discarded_at"].nil? }
+    fake.outbox.map { |row| row.fetch("entry").fetch("id") }.uniq.size
   end
 
   # Moves the generation Timekeeping admits writes at, on the fake and, while
@@ -86,7 +85,11 @@ module TimekeepingForwardingHelpers
     return unless TimekeepingRegressionAdapter.current
 
     with_live_timekeeping_database do |connection|
-      connection.exec_params("UPDATE admission SET generation = $1 WHERE id = 1", [generation])
+      result = connection.exec_params("UPDATE admission SET generation = $1 WHERE id = $2",
+                                      [generation, TimekeepingDatabaseReset::ADMISSION_ID])
+      # A missing admission row would leave the generation unchanged, and the
+      # example would then fail later on a stale-generation refusal instead.
+      raise "the live admission row #{TimekeepingDatabaseReset::ADMISSION_ID} is missing" unless result.cmd_tuples == 1
     end
   end
 
@@ -117,17 +120,12 @@ module TimekeepingForwardingHelpers
     end
 end
 
-# The entry requests the monolith sent to the live Timekeeping app during the
+# The requests the monolith sent to the live Timekeeping app during the
 # current example. A WebMock callback records them, because the live app keeps
 # no request log and its idempotency receipts hold one row per key, so neither
 # can show that a key was sent twice or in what order. WebMock.reset! between
 # examples leaves callbacks in place; the before hook below empties the log.
-module ForwardedEntryRequestLog
-  # Timekeeping::EntryWriteClient::ENTRIES_PATH with any company id, followed
-  # by nothing, a query, or a further path segment (one entry, bulk move).
-  ENTRY_PATH = Regexp.new(
-    "\\A#{Regexp.escape(Timekeeping::EntryWriteClient::ENTRIES_PATH).sub('%<company_id>d') { '\d+' }}(?:[/?]|\\z)"
-  )
+module ForwardedTimekeepingRequestLog
   IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
 
   @requests = []
@@ -141,19 +139,15 @@ module ForwardedEntryRequestLog
       @requests = []
     end
 
-    def entry_path?(path)
-      ENTRY_PATH.match?(path)
-    end
-
-    # Records request_signature when it went to the running live app's entry
-    # paths; requests to any other address are left out.
+    # Records request_signature when it went to the running live app's host
+    # and port, whatever its path; requests to any other address are left out.
     def record(request_signature)
       live = TimekeepingRegressionAdapter.current
       return unless live
 
       uri = request_signature.uri
       live_uri = URI(live.base_url)
-      return unless uri.host == live_uri.host && uri.inferred_port == live_uri.port && entry_path?(uri.request_uri)
+      return unless uri.host == live_uri.host && uri.inferred_port == live_uri.port
 
       @requests += [{
         method: request_signature.method.to_s.upcase,
@@ -170,9 +164,9 @@ module ForwardedEntryRequestLog
   end
 end
 
-WebMock.after_request { |request_signature, _response| ForwardedEntryRequestLog.record(request_signature) }
+WebMock.after_request { |request_signature, _response| ForwardedTimekeepingRequestLog.record(request_signature) }
 
 RSpec.configure do |config|
   config.include TimekeepingForwardingHelpers
-  config.before { ForwardedEntryRequestLog.clear }
+  config.before { ForwardedTimekeepingRequestLog.clear }
 end

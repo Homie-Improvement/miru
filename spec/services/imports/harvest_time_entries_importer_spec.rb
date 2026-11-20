@@ -529,7 +529,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true do
     fwd_company.update!(base_currency: "USD")
     described_class.new(DataImport.find(fwd_import.id)).process
 
-    first_row_keys = forwarded_entry_requests(fwd_fake)
+    first_row_keys = forwarded_timekeeping_requests(fwd_fake)
       .filter_map { |request| request[:idempotency_key] if request[:body]&.dig("note") == "first row" }
     expect(first_row_keys.size).to eq(2)
     expect(first_row_keys.uniq.size).to eq(1)
@@ -661,7 +661,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true do
   it "forwards a billed Harvest row as exactly one create carrying billed" do
     with_forwarded_timekeeping_env { described_class.new(billed_fwd_import).process }
 
-    sent = forwarded_entry_requests(billed_fwd_fake)
+    sent = forwarded_timekeeping_requests(billed_fwd_fake)
     expect(sent.pluck(:method)).to eq(["POST"])
     expect(sent.first[:body]["bill_status"]).to eq("billed")
     expect(billed_fwd_import.reload).to have_attributes(status: "completed", imported_rows: 1, failed_rows: 0)

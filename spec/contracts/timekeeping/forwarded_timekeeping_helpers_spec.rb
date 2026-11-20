@@ -270,7 +270,7 @@ RSpec.describe "forwarded Timekeeping readers with the live adapter running" do
     send_reader_request(Net::HTTP::Post, reader_entries_url, key: "k1", body: { "note" => "a" })
     send_reader_request(Net::HTTP::Patch, "#{reader_entries_url}/12", key: "k2", body: { "note" => "b" })
 
-    expect(forwarded_entry_requests(reader_fake)).to eq(
+    expect(forwarded_timekeeping_requests(reader_fake)).to eq(
       [
         { method: "POST", idempotency_key: "k1", body: { "note" => "a" } },
         { method: "PATCH", idempotency_key: "k2", body: { "note" => "b" } }
@@ -282,14 +282,14 @@ RSpec.describe "forwarded Timekeeping readers with the live adapter running" do
   end
 
   # This example runs after the one above, which left two requests in the log.
-  it "starts each example with an empty log, records identical creates twice and leaves out other addresses and paths" do
-    expect(forwarded_entry_requests(reader_fake)).to eq([])
+  it "starts each example with an empty log, records identical creates twice and every path on the live app, and leaves out other addresses" do
+    expect(forwarded_timekeeping_requests(reader_fake)).to eq([])
 
     2.times { send_reader_request(Net::HTTP::Post, reader_entries_url, key: "k1", body: { "note" => "a" }) }
     send_reader_request(Net::HTTP::Post, "http://127.0.0.1:4998/v1/companies/7/entries", key: "other-port")
     send_reader_request(Net::HTTP::Post, "http://127.0.0.1:4999/v1/companies/7/reservations", key: "other-path")
 
-    expect(forwarded_create_requests(reader_fake).pluck(:idempotency_key)).to eq(%w[k1 k1])
+    expect(forwarded_timekeeping_requests(reader_fake).pluck(:idempotency_key)).to eq(%w[k1 k1 other-path])
   end
 end
 
@@ -299,21 +299,23 @@ RSpec.describe "forwarded Timekeeping readers against the fake" do
 
   before { allow(TimekeepingRegressionAdapter).to receive(:current).and_return(nil) }
 
-  it "reads the fake's entry requests, with only the POST as a create" do
+  it "reads every request the fake received, on any path, with only the POST as a create" do
     entries_path = "/v1/companies/#{reader_company.id}/entries"
     reader_fake.call("POST", entries_path, headers: { "idempotency-key" => "k1" }, body: { "note" => "a" })
     reader_fake.call("PATCH", "#{entries_path}/12", headers: { "Idempotency-Key" => "k2" }, body: { "note" => "b" })
+    reader_fake.call("GET", "/v1/companies/#{reader_company.id}/reservations")
 
-    expect(forwarded_entry_requests(reader_fake)).to eq(
+    expect(forwarded_timekeeping_requests(reader_fake)).to eq(
       [
         { method: "POST", idempotency_key: "k1", body: { "note" => "a" } },
-        { method: "PATCH", idempotency_key: "k2", body: { "note" => "b" } }
+        { method: "PATCH", idempotency_key: "k2", body: { "note" => "b" } },
+        { method: "GET", idempotency_key: nil, body: {} }
       ]
     )
     expect(forwarded_create_requests(reader_fake)).to eq([{ method: "POST", idempotency_key: "k1", body: { "note" => "a" } }])
   end
 
-  it "counts each entry in the fake's outbox once and leaves out an entry whose latest snapshot is discarded" do
+  it "counts each entry in the fake's outbox once, including an entry whose latest snapshot is discarded" do
     outbox = [
       { "entry" => { "id" => 1, "discarded_at" => nil } },
       { "entry" => { "id" => 1, "discarded_at" => nil } },
@@ -323,7 +325,7 @@ RSpec.describe "forwarded Timekeeping readers against the fake" do
     ]
     allow(reader_fake).to receive(:outbox).and_return(outbox)
 
-    expect(forwarded_stored_entry_count(reader_fake, company: reader_company)).to eq(2)
+    expect(forwarded_stored_entry_count(reader_fake, company: reader_company)).to eq(3)
   end
 
   it "admit_forwarded_generation moves the fake's generation and opens no live database connection" do
