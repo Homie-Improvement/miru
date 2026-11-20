@@ -248,9 +248,9 @@ module Timekeeping
           observer.call(:during_checkpoint, step: "checkpoint")
           incoming.store.load_checkpoint(source_copy.fetch(:load))
           if source_legacy
-            incoming.store.write_correction_snapshots(
-              snapshots: correction_snapshots, version: ReservationDerivation::CORRECTION_VERSION, generation: @generation
-            )
+            snapshots_by_version.each do |version, snapshots|
+              incoming.store.write_correction_snapshots(snapshots:, version:, generation: @generation)
+            end
           end
           observer.call(:after_corrections, step: "checkpoint")
         end
@@ -440,11 +440,27 @@ module Timekeeping
           planned.merge(legacy_receipts) { |_company_id, differences, receipts| differences + receipts }
         end
 
-        # The first cutover's corrections as the outbox rows Timekeeping's
-        # correction writer takes: the corrected entry without its version,
-        # which travels as its own argument.
-        def correction_snapshots
-          source_copy.fetch(:corrections).map { |correction| correction.fetch("snapshot").except("version") }
+        # The first cutover's snapshots as the outbox rows Timekeeping's
+        # correction writer takes, grouped by the version each is written at:
+        # each corrected entry at the correction version, and each entry the
+        # load raised without correcting it at the version it was loaded at.
+        # A raised entry usually loads at the correction version, so this is
+        # one group; one Timekeeping already stores higher loads at that
+        # version, and a snapshot written lower would leave the projection
+        # behind. The relay delivers only outbox rows, so a raised entry
+        # without a snapshot would stay at its legacy version in the
+        # monolith's projection and a later rollback would refuse it.
+        #
+        # Returns { version => [snapshot without its version] }.
+        def snapshots_by_version
+          corrections = source_copy.fetch(:corrections)
+          loaded = source_copy.fetch(:load)
+          loaded_versions = loaded.rows.fetch("entries").to_h { |row| [row["id"], row["version"]] }
+          corrected = corrections.map { |correction| correction.fetch("snapshot").except("version") }
+          raised = LegacyLoadVersions.raised_snapshots(source: source_copy.fetch(:source), loaded:, corrections:)
+          raised_by_version = raised.group_by { |snapshot| loaded_versions.fetch(snapshot["id"]) }
+          { ReservationDerivation::CORRECTION_VERSION => corrected }
+            .merge(raised_by_version) { |_version, corrected_rows, raised_rows| corrected_rows + raised_rows }
         end
 
         def recorded_disposition
