@@ -894,13 +894,16 @@ RSpec.describe Invoices::LegacyReservations do
     request = writer_mark_request([valid_entry.id, invalid_entry.id])
     raised = nil
 
-    _marks, seen_after = writer_marks_in_caller_transaction do
+    marks, seen_after = writer_marks_in_caller_transaction do
       described_class.new.mark_billed(request)
     rescue ActiveRecord::RecordInvalid => error
       raised = error
     end
 
     expect(raised).to be_a(ActiveRecord::RecordInvalid)
+    expect(raised.record.id).to eq(invalid_entry.id)
+    # The first entry's billed update ran under the mark before the second entry failed validation.
+    expect(marks).to eq(["legacy_gateway"])
     expect(seen_after).to eq("caller_mark")
   end
 end
