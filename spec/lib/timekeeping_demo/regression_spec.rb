@@ -320,26 +320,6 @@ RSpec.describe TimekeepingDemo::Regression do
 end
 
 RSpec.describe TimekeepingDemo::Regression do
-  it "the switches_owner report pass sets TIMEKEEPING_OWNER_STATE to an empty string so dotenv cannot refill it, while state passes keep their states" do
-    calls = []
-    runner = lambda do |env:, argv:|
-      calls << { env: env.dup, argv: argv.dup }
-      true
-    end
-
-    expect { described_class.run(runner:, specs: ["spec/models/invoice_spec.rb"]) }.to output.to_stdout
-
-    report_calls, state_calls = calls.partition { |call| call[:argv].include?("switches_owner") && !call[:argv].include?("~switches_owner") }
-    # "Prevent file-based configuration from restoring owner selection"
-    # dotenv fills only absent keys, so the report pass must send the key, set to "", rather than drop it.
-    expect(report_calls.size).to eq(1)
-    expect(report_calls.first[:env]).to have_key("TIMEKEEPING_OWNER_STATE")
-    expect(report_calls.first[:env]["TIMEKEEPING_OWNER_STATE"]).to eq("")
-    expect(state_calls.map { |call| call[:env]["TIMEKEEPING_OWNER_STATE"] }).to eq(%w[legacy timekeeping rollback])
-  end
-end
-
-RSpec.describe TimekeepingDemo::Regression do
   it "the switches_owner report pass sets TIMEKEEPING_OWNER_STATE to an empty string instead of dropping it, while each state pass keeps its own state" do
     calls = []
     runner = lambda do |env:, argv:|
@@ -364,26 +344,5 @@ RSpec.describe TimekeepingDemo::Regression do
       env = described_class.child_env(dir, "")
       expect(env).to include("TIMEKEEPING_OWNER_STATE" => "", "TIMEKEEPING_REGRESSION" => "1")
     end
-  end
-end
-
-RSpec.describe TimekeepingDemo::Regression do
-  it "the switches_owner pass keeps TIMEKEEPING_OWNER_STATE present as an empty string so dotenv cannot refill it" do
-    report_envs = []
-    state_envs = []
-    runner = lambda do |env:, argv:|
-      (argv.include?("switches_owner") && !argv.include?("~switches_owner") ? report_envs : state_envs) << env.dup
-      true
-    end
-
-    expect { described_class.run(runner:, specs: ["spec/models/invoice_spec.rb"]) }.to output.to_stdout
-
-    # "Prevent file-based configuration from restoring owner selection, and test boot with a temporary dotenv file."
-    # A dropped key (nil) lets dotenv fill it from a local .env inside the child; a present "" does not.
-    expect(report_envs.size).to eq(1)
-    expect(report_envs.first).to have_key("TIMEKEEPING_OWNER_STATE")
-    expect(report_envs.first["TIMEKEEPING_OWNER_STATE"]).to eq("")
-    # The state passes must still carry their own non-empty state, never the report marker.
-    expect(state_envs.pluck("TIMEKEEPING_OWNER_STATE")).to eq(%w[legacy timekeeping rollback])
   end
 end
