@@ -155,98 +155,73 @@ RSpec.describe "forwarded Timekeeping environment helper" do
   end
 end
 
-RSpec.describe "forwarded Timekeeping environment helper with the live adapter active" do
-  # "While the live adapter runs (`TimekeepingRegressionAdapter.current` non-nil), `with_forwarded_timekeeping_env`
-  # uses the adapter's base URL and private key instead of `FORWARDED_TIMEKEEPING_BASE_URL` and the fake's key"
-  it "with the adapter active with_forwarded_timekeeping_env uses the adapter key only inside the block and restores both keys when it raises" do
-    adapter_key = OpenSSL::PKey::RSA.generate(2048)
-    adapter = double("live adapter instance", base_url: "http://127.0.0.1:4999", private_key: adapter_key)
-    allow(TimekeepingRegressionAdapter).to receive(:current).and_return(adapter)
-
-    with_timekeeping_env(
-      Timekeeping::UserToken::PRIVATE_KEY_ENV => "outer-key",
-      Timekeeping::EntryApiClient::BASE_URL_ENV => "http://outer.test"
-    ) do
-      seen = {}
-      expect do
-        with_forwarded_timekeeping_env("http://other-timekeeping.test") do
-          seen[:base_url] = ENV.fetch(Timekeeping::EntryApiClient::BASE_URL_ENV, nil)
-          seen[:private_key] = ENV.fetch(Timekeeping::UserToken::PRIVATE_KEY_ENV, nil)
-          raise Timekeeping::Gateway::StaleGeneration
-        end
-      end.to raise_error(Timekeeping::Gateway::StaleGeneration)
-
-      expect(seen).to eq(base_url: "http://127.0.0.1:4999", private_key: adapter_key.to_pem)
-      expect(seen[:private_key]).not_to eq(timekeeping_key_pair.to_pem)
-      expect(ENV.fetch(Timekeeping::EntryApiClient::BASE_URL_ENV, nil)).to eq("http://outer.test")
-      expect(ENV.fetch(Timekeeping::UserToken::PRIVATE_KEY_ENV, nil)).to eq("outer-key")
-    end
-  end
-end
-
-RSpec.describe "forwarded Timekeeping setup helpers with the live adapter running" do
+RSpec.describe "forwarded Timekeeping helpers with the live adapter running" do
   let(:adapter_company) { create(:company) }
-  let(:adapter_paul) { create(:user, current_workspace_id: adapter_company.id) }
+  let(:adapter_user) { create(:user, current_workspace_id: adapter_company.id) }
   let(:adapter_project) { create(:project, client: create(:client, company: adapter_company)) }
   let(:adapter_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+  let(:adapter_key) { OpenSSL::PKey::RSA.generate(2048) }
+  let(:adapter_live) { double("live adapter instance", base_url: "http://127.0.0.1:4999", private_key: adapter_key) }
 
-  it "with the live adapter running, arrange_forwarded_timekeeping applies the owner state but registers nothing on the fake and adds no WebMock stub" do
-    live = double("live adapter instance", base_url: "http://127.0.0.1:4999", private_key: OpenSSL::PKey::RSA.new(2048))
-    allow(TimekeepingRegressionAdapter).to receive(:current).and_return(live)
+  before { allow(TimekeepingRegressionAdapter).to receive(:current).and_return(adapter_live) }
+
+  # "With the adapter present, `arrange_forwarded_timekeeping` still applies its `owner_state:` but skips every
+  # `fake.register_*` call and `route_timekeeping_to_fake`."
+  it "arrange_forwarded_timekeeping applies the owner state but registers and routes nothing to the fake, even with an explicit base_url" do
     %i[register_company register_user register_project].each do |method|
       allow(adapter_fake).to receive(method).and_call_original
     end
     allow(self).to receive(:route_timekeeping_to_fake).and_call_original
     stubs_before = WebMock::StubRegistry.instance.request_stubs.size
 
-    arrange_forwarded_timekeeping(adapter_fake, company: adapter_company,
-                                                users: { adapter_paul => "employee" },
-                                                project: adapter_project,
-                                                owner_state: "timekeeping")
+    [{}, { base_url: "http://other-timekeeping.test" }].each do |base_url_option|
+      arrange_forwarded_timekeeping(adapter_fake, company: adapter_company, users: { adapter_user => "admin" },
+                                                  project: adapter_project, owner_state: "timekeeping", **base_url_option)
 
-    # "With the adapter present, `arrange_forwarded_timekeeping` still applies its `owner_state:` but skips every
-    # `fake.register_*` call and `route_timekeeping_to_fake`."
-    ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
-    expect(ownership).to have_attributes(owner: "timekeeping", monolith_store: "legacy", generation: 2)
+      expect(TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID))
+        .to have_attributes(owner: "timekeeping", monolith_store: "legacy", generation: 2)
+    end
+
     expect(self).not_to have_received(:route_timekeeping_to_fake)
-    expect(adapter_fake).not_to have_received(:register_company)
-    expect(adapter_fake).not_to have_received(:register_user)
-    expect(adapter_fake).not_to have_received(:register_project)
     expect(WebMock::StubRegistry.instance.request_stubs.size).to eq(stubs_before)
+    %i[register_company register_user register_project].each do |method|
+      expect(adapter_fake).not_to have_received(method)
+    end
     # "FakeTimekeeping records zero requests"
     expect(adapter_fake.requests).to be_empty
   end
-end
 
-RSpec.describe "forwarded Timekeeping environment helper with the live adapter running" do
-  it "with the live adapter running, with_forwarded_timekeeping_env yields the adapter URL and PEM and puts both env keys back even when the block raises" do
-    private_key = OpenSSL::PKey::RSA.new(2048)
-    live = double("live adapter instance", base_url: "http://127.0.0.1:4999", private_key:)
-    allow(TimekeepingRegressionAdapter).to receive(:current).and_return(live)
+  # "While the live adapter runs (`TimekeepingRegressionAdapter.current` non-nil), `with_forwarded_timekeeping_env`
+  # uses the adapter's base URL and private key instead of `FORWARDED_TIMEKEEPING_BASE_URL` and the fake's key"
+  it "with_forwarded_timekeeping_env yields the adapter URL and PEM, even for an explicit URL, and restores both keys, also when the block raises" do
     base_url_env = Timekeeping::EntryApiClient::BASE_URL_ENV
     key_env = Timekeeping::UserToken::PRIVATE_KEY_ENV
+    adapter_values = { base_url: "http://127.0.0.1:4999", private_key: adapter_key.to_pem }
 
     with_timekeeping_env(base_url_env => "http://outer.test", key_env => "outer-key") do
-      seen = {}
-      expect do
-        with_forwarded_timekeeping_env do
-          seen[:base_url] = ENV.fetch(base_url_env, nil)
-          seen[:private_key] = ENV.fetch(key_env, nil)
-          raise Timekeeping::Gateway::StaleGeneration
-        end
-      end.to raise_error(Timekeeping::Gateway::StaleGeneration)
-
-      # "`with_forwarded_timekeeping_env` uses the adapter's base URL and private key instead of
-      # `FORWARDED_TIMEKEEPING_BASE_URL` and the fake's key"
-      expect(seen).to eq(base_url: "http://127.0.0.1:4999", private_key: private_key.to_pem)
+      seen = nil
+      with_forwarded_timekeeping_env do
+        seen = { base_url: ENV.fetch(base_url_env, nil), private_key: ENV.fetch(key_env, nil) }
+      end
+      expect(seen).to eq(adapter_values)
+      expect(seen[:private_key]).not_to eq(timekeeping_key_pair.to_pem)
       expect(ENV.fetch(base_url_env, nil)).to eq("http://outer.test")
       expect(ENV.fetch(key_env, nil)).to eq("outer-key")
 
-      # The plan's choice: an explicit URL does not take the connection away from the adapter.
-      with_forwarded_timekeeping_env("http://other-timekeeping.test") do
-        expect(ENV.fetch(base_url_env, nil)).to eq("http://127.0.0.1:4999")
+      # An explicit URL does not take the connection away from the adapter.
+      [[], ["http://other-timekeeping.test"]].each do |url_argument|
+        seen_while_raising = nil
+        expect do
+          with_forwarded_timekeeping_env(*url_argument) do
+            seen_while_raising = { base_url: ENV.fetch(base_url_env, nil), private_key: ENV.fetch(key_env, nil) }
+            raise Timekeeping::Gateway::StaleGeneration
+          end
+        end.to raise_error(Timekeeping::Gateway::StaleGeneration)
+
+        expect(seen_while_raising).to eq(adapter_values)
+        expect(ENV.fetch(base_url_env, nil)).to eq("http://outer.test")
+        expect(ENV.fetch(key_env, nil)).to eq("outer-key")
       end
-      expect(ENV.fetch(base_url_env, nil)).to eq("http://outer.test")
     end
   end
 end
@@ -270,158 +245,5 @@ RSpec.describe "forwarded Timekeeping setup helpers in the legacy state" do
     ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
     expect(ownership).to have_attributes(owner: "monolith", monolith_store: "legacy", generation: 1)
     expect(legacy_fake.generation).to eq(1)
-  end
-end
-
-RSpec.describe "forwarded Timekeeping setup helpers with the live adapter active" do
-  let(:adapter_company) { create(:company) }
-  let(:adapter_user) { create(:user, current_workspace_id: adapter_company.id) }
-  let(:adapter_project) do
-    create(:project, name: "Adapter Website", billable: true, client: create(:client, company: adapter_company, name: "Adapter LLC"))
-  end
-  let(:adapter_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-
-  # "With the adapter present, `arrange_forwarded_timekeeping` still applies its `owner_state:` but skips every
-  # `fake.register_*` call and `route_timekeeping_to_fake`."
-  it "with the adapter active arrange_forwarded_timekeeping applies the owner state but registers and routes nothing to the fake" do
-    live = double("live adapter", base_url: "http://127.0.0.1:4999", private_key: OpenSSL::PKey::RSA.generate(2048))
-    allow(TimekeepingRegressionAdapter).to receive(:current).and_return(live)
-    %i[register_company register_user register_project].each { |method| allow(adapter_fake).to receive(method) }
-    allow(self).to receive(:route_timekeeping_to_fake)
-    stubs_before = WebMock::StubRegistry.instance.request_stubs.size
-
-    arrange_forwarded_timekeeping(adapter_fake, company: adapter_company, users: { adapter_user => "admin" },
-                                                project: adapter_project, owner_state: "timekeeping")
-
-    expect(TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID))
-      .to have_attributes(owner: "timekeeping", monolith_store: "legacy", generation: 2)
-    expect(self).not_to have_received(:route_timekeeping_to_fake)
-    expect(WebMock::StubRegistry.instance.request_stubs.size).to eq(stubs_before)
-    expect(adapter_fake).not_to have_received(:register_company)
-    expect(adapter_fake).not_to have_received(:register_user)
-    expect(adapter_fake).not_to have_received(:register_project)
-    expect(adapter_fake.requests).to be_empty
-  end
-end
-
-RSpec.describe "forwarded Timekeeping environment helper with the live adapter active" do
-  # "While the live adapter runs (`TimekeepingRegressionAdapter.current` non-nil), `with_forwarded_timekeeping_env`
-  # uses the adapter's base URL and private key instead of `FORWARDED_TIMEKEEPING_BASE_URL` and the fake's key"
-  it "with the adapter active with_forwarded_timekeeping_env yields the adapter URL and key PEM and restores both" do
-    key = OpenSSL::PKey::RSA.generate(2048)
-    live = double("live adapter", base_url: "http://127.0.0.1:4999", private_key: key)
-    allow(TimekeepingRegressionAdapter).to receive(:current).and_return(live)
-    base_url_env = Timekeeping::EntryApiClient::BASE_URL_ENV
-    key_env = Timekeeping::UserToken::PRIVATE_KEY_ENV
-
-    with_timekeeping_env(base_url_env => "http://outer.test", key_env => "outer-key") do
-      seen = nil
-      with_forwarded_timekeeping_env do
-        seen = { base_url: ENV.fetch(base_url_env, nil), private_key: ENV.fetch(key_env, nil) }
-      end
-      expect(seen).to eq(base_url: "http://127.0.0.1:4999", private_key: key.to_pem)
-      expect(ENV.fetch(base_url_env, nil)).to eq("http://outer.test")
-      expect(ENV.fetch(key_env, nil)).to eq("outer-key")
-
-      explicit_seen = nil
-      expect do
-        with_forwarded_timekeeping_env("http://other-timekeeping.test") do
-          explicit_seen = ENV.fetch(base_url_env, nil)
-          raise Timekeeping::Gateway::StaleGeneration
-        end
-      end.to raise_error(Timekeeping::Gateway::StaleGeneration)
-      expect(explicit_seen).to eq("http://127.0.0.1:4999")
-      expect(ENV.fetch(base_url_env, nil)).to eq("http://outer.test")
-      expect(ENV.fetch(key_env, nil)).to eq("outer-key")
-    end
-  end
-end
-
-RSpec.describe "forwarded Timekeeping setup helpers in the legacy state" do
-  let(:legacy_company) { create(:company) }
-  let(:legacy_user) { create(:user, current_workspace_id: legacy_company.id) }
-  let(:legacy_project) do
-    create(:project, name: "Legacy Website", billable: true, client: create(:client, company: legacy_company, name: "Legacy LLC"))
-  end
-  let(:legacy_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-
-  # "`arrange_forwarded_timekeeping(owner_state: "legacy")` leaves owner monolith, store legacy, generation 1 and
-  # `fake.generation` 1"
-  it "arrange_forwarded_timekeeping with owner_state legacy leaves owner monolith, store legacy, generation 1" do
-    arrange_forwarded_timekeeping(legacy_fake, company: legacy_company, users: { legacy_user => "employee" },
-                                               project: legacy_project, owner_state: "legacy")
-
-    expect(TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID))
-      .to have_attributes(owner: "monolith", monolith_store: "legacy", generation: 1)
-    expect(legacy_fake.generation).to eq(1)
-  end
-end
-
-RSpec.describe "forwarded Timekeeping setup helpers" do
-  let(:adapter_arrange_company) { create(:company) }
-  let(:adapter_arrange_user) { create(:user, current_workspace_id: adapter_arrange_company.id) }
-  let(:adapter_arrange_project) do
-    create(:project, name: "Adapter Site", client: create(:client, company: adapter_arrange_company, name: "Adapter LLC"))
-  end
-  let(:adapter_arrange_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
-  let(:adapter_arrange_live) do
-    double("live Timekeeping", base_url: "http://127.0.0.1:4999", private_key: OpenSSL::PKey::RSA.generate(2048))
-  end
-
-  before { allow(TimekeepingRegressionAdapter).to receive(:current).and_return(adapter_arrange_live) }
-
-  # "While the live adapter runs (`TimekeepingRegressionAdapter.current` non-nil), ... `arrange_forwarded_timekeeping`
-  # neither registers on nor routes HTTP to the fake."
-  it "with the adapter active an explicit base_url still neither registers on nor routes HTTP to the fake" do
-    %i[register_company register_user register_project].each do |method|
-      allow(adapter_arrange_fake).to receive(method).and_call_original
-    end
-    allow(self).to receive(:route_timekeeping_to_fake).and_call_original
-    stubs_before = WebMock::StubRegistry.instance.request_stubs.size
-
-    arrange_forwarded_timekeeping(adapter_arrange_fake, company: adapter_arrange_company,
-                                                        users: { adapter_arrange_user => "admin" },
-                                                        project: adapter_arrange_project,
-                                                        base_url: "http://other-timekeeping.test",
-                                                        owner_state: "timekeeping")
-
-    expect(self).not_to have_received(:route_timekeeping_to_fake)
-    expect(WebMock::StubRegistry.instance.request_stubs.size).to eq(stubs_before)
-    %i[register_company register_user register_project].each do |method|
-      expect(adapter_arrange_fake).not_to have_received(method)
-    end
-    expect(adapter_arrange_fake.requests).to be_empty
-    expect(TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID))
-      .to have_attributes(owner: "timekeeping", generation: 2)
-  end
-end
-
-RSpec.describe "forwarded Timekeeping environment helper" do
-  let(:adapter_env_key) { OpenSSL::PKey::RSA.generate(2048) }
-  let(:adapter_env_live) { double("live Timekeeping", base_url: "http://127.0.0.1:4999", private_key: adapter_env_key) }
-
-  before { allow(TimekeepingRegressionAdapter).to receive(:current).and_return(adapter_env_live) }
-
-  # "While the live adapter runs (`TimekeepingRegressionAdapter.current` non-nil), `with_forwarded_timekeeping_env`
-  # uses the adapter's base URL and private key instead of `FORWARDED_TIMEKEEPING_BASE_URL` and the fake's key"
-  it "with the adapter active an explicit URL and a raising block still use the adapter URL and PEM and restore both keys" do
-    with_timekeeping_env(
-      Timekeeping::EntryApiClient::BASE_URL_ENV => "http://outer-adapter.test",
-      Timekeeping::UserToken::PRIVATE_KEY_ENV => "outer-adapter-key"
-    ) do
-      seen = {}
-      expect do
-        with_forwarded_timekeeping_env("http://other-timekeeping.test") do
-          seen[:base_url] = ENV.fetch(Timekeeping::EntryApiClient::BASE_URL_ENV, nil)
-          seen[:private_key] = ENV.fetch(Timekeeping::UserToken::PRIVATE_KEY_ENV, nil)
-          raise Timekeeping::Gateway::StaleGeneration
-        end
-      end.to raise_error(Timekeeping::Gateway::StaleGeneration)
-
-      expect(seen).to eq(base_url: "http://127.0.0.1:4999", private_key: adapter_env_key.to_pem)
-      expect(seen[:private_key]).not_to eq(timekeeping_key_pair.to_pem)
-      expect(ENV.fetch(Timekeeping::EntryApiClient::BASE_URL_ENV, nil)).to eq("http://outer-adapter.test")
-      expect(ENV.fetch(Timekeeping::UserToken::PRIVATE_KEY_ENV, nil)).to eq("outer-adapter-key")
-    end
   end
 end
