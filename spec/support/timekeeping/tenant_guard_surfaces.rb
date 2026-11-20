@@ -65,6 +65,12 @@ module TenantGuardSurfaces
 
   WRITE_METHODS = %w[POST PATCH DELETE].freeze
 
+  # Contracts whose write routes take no idempotency key. idempotency.yml
+  # key_sources names none for handoff, whose commands are repeatable by rule
+  # (handoff.yml rules.repeatable). Any other contract with a write route and
+  # no key source raises, so a missing key source cannot drop key pairs.
+  KEYLESS_CONTRACTS = %i[handoff].freeze
+
   # The pairs a replay counts toward. Every other pair needs a probe.
   REPLAY_PAIRS = [
     %i[entry_api create idempotency_key],
@@ -122,11 +128,16 @@ module TenantGuardSurfaces
         end
 
         key_source = key_sources[contract_name]
+        write = WRITE_METHODS.include?(route.fetch("method"))
+        if write && key_source.nil? && !KEYLESS_CONTRACTS.include?(contract_name)
+          raise UnknownFieldError, "#{contract_name}.#{route_name} is a write route with no idempotency key source"
+        end
+
         names = route_field_names(contract_name, contract, route_name, route)
         kinds = names.flat_map do |name|
           field_kinds(contract_name, route_name, name, key_source, non_identifiers)
         end
-        kinds << :idempotency_key if key_source == :header && WRITE_METHODS.include?(route.fetch("method"))
+        kinds << :idempotency_key if key_source == :header && write
         kinds.uniq
       end
 
@@ -180,7 +191,7 @@ module TenantGuardSurfaces
       end
 
       def key_sources(contracts)
-        contracts.fetch(:idempotency, {}).fetch("key_sources", {}).to_h do |contract_name, source|
+        contracts.fetch(:idempotency).fetch("key_sources").to_h do |contract_name, source|
           key = source.fetch("key")
           [contract_name.to_sym, KEY_SOURCES.fetch(key) { raise UnknownFieldError, "unknown key source #{key.inspect}" }]
         end

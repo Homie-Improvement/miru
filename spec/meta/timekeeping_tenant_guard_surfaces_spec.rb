@@ -95,6 +95,16 @@ RSpec.describe "Timekeeping tenant guard surfaces and cases" do
     end
   end
 
+  describe "TenantGuardSurfaces.pairs without a key source" do
+    it "raises when a contract with write routes has no idempotency key source, instead of dropping its key pairs" do
+      changed = guard_surfaces_contracts_copy
+      changed[:idempotency]["key_sources"].delete("entry_api")
+
+      expect { TenantGuardSurfaces.pairs(changed) }
+        .to raise_error(TenantGuardSurfaces::UnknownFieldError, /entry_api\.\w+ is a write route/)
+    end
+  end
+
   describe "TenantGuardSurfaces.uncovered" do
     # "The real contracts against `TenantGuardCases` give an empty uncovered set."
     it "R1 the real contracts against TenantGuardCases::ALL leave no route and no pair uncovered" do
