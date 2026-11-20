@@ -10,7 +10,12 @@ module TimekeepingContract
   # monolith's real Timekeeping clients run unchanged and the fake sees the
   # token, headers and body they actually build.
   module FakeHttpBridge
+    # While TimekeepingRegressionAdapter runs, the live app owns the connection,
+    # so nothing is routed to the fake: a spec that still expects the fake then
+    # fails instead of passing against it while the live app goes unused.
     def route_timekeeping_to_fake(fake, base_url:)
+      return if TimekeepingRegressionAdapter.current
+
       target = URI.parse(base_url)
       stub_request(:any, ->(uri) { uri.host == target.host && uri.port == target.port }).to_return do |request|
         body = request.body.to_s.empty? ? nil : JSON.parse(request.body)
