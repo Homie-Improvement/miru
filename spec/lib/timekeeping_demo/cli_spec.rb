@@ -429,18 +429,19 @@ RSpec.describe TimekeepingDemo::CLI do
     end
 
     # "Each child env sets `TIMEKEEPING_OWNER_STATE` to its state (overriding any caller value), `TIMEKEEPING_REGRESSION=1`, `TIMEKEEPING_LIVE=1`, and its own `TIMEKEEPING_QUEUE_LEDGER_PATH` in a fresh temp directory (a child rspec that inherits the parent's ledger path deletes the parent's ledger at suite start)."
-    state_envs = envs.select { |env| env["TIMEKEEPING_OWNER_STATE"] }
+    state_envs = envs.reject { |env| env["TIMEKEEPING_OWNER_STATE"] == "" }
     expect(state_envs.pluck("TIMEKEEPING_OWNER_STATE")).to eq(%w[legacy timekeeping rollback])
     ledgers = envs.pluck("TIMEKEEPING_QUEUE_LEDGER_PATH")
     expect(ledgers).to all(be_a(String))
     expect(ledgers).not_to include(parent_ledger)
     expect(ledgers.uniq.size).to eq(envs.size)
 
-    # The report pass runs with "no owner state": a nil value makes system remove the inherited key.
+    # The report pass runs with "no owner state": an empty value overrides the
+    # inherited key and, unlike a removed key, cannot be filled by dotenv.
     report_envs = envs - state_envs
     expect(report_envs.size).to eq(1)
     expect(report_envs.first).to have_key("TIMEKEEPING_OWNER_STATE")
-    expect(report_envs.first["TIMEKEEPING_OWNER_STATE"]).to be_nil
+    expect(report_envs.first["TIMEKEEPING_OWNER_STATE"]).to eq("")
   end
 end
 
@@ -548,9 +549,10 @@ RSpec.describe TimekeepingDemo::CLI do
       report_calls = calls.select { |_env, argv| argv.include?("switches_owner") }
       expect(state_calls.map { |env, _argv| env["TIMEKEEPING_OWNER_STATE"] }).to eq(%w[legacy timekeeping rollback])
       expect(report_calls.size).to eq(1)
-      # The child env is merged over the caller's, so the report pass must clear the key, not omit it or blank it.
+      # The child env is merged over the caller's, so the report pass must set the key to "", not omit it: an
+      # omitted key would inherit the caller's state, and a removed one could be filled by dotenv.
       report_env = caller_env.merge(report_calls.first.first)
-      expect(report_env["TIMEKEEPING_OWNER_STATE"]).to be_nil
+      expect(report_env["TIMEKEEPING_OWNER_STATE"]).to eq("")
       expect(calls.map { |env, _argv| env["TIMEKEEPING_QUEUE_LEDGER_PATH"] }).not_to include("/caller/ledger.json")
       expect(Dir.children(state_dir)).to be_empty
     end
