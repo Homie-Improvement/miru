@@ -309,6 +309,34 @@ RSpec.describe "Timekeeping tenant guard surfaces and cases" do
       flatten.call(request.merge(path: request.fetch(:path).split("/")), []).to_h
     end
 
+    # Where each identifier kind sits in a route's request, as a guard_cases_request_leaves location. Index 5 of a
+    # split path is the parameter after /v1/companies/{company_id}/<collection>/.
+    def guard_cases_swap_locations
+      body_operation = [:body, "operation_id"]
+      {
+        %i[entry_api update entry_id] => [:path, 5],
+        %i[entry_api destroy entry_id] => [:path, 5],
+        %i[entry_api show entry_id] => [:path, 5],
+        %i[entry_api destroy idempotency_key] => [:headers, "Idempotency-Key"],
+        %i[entry_api bulk_move entry_id] => [:body, "entry_ids", 0],
+        %i[entry_api bulk_delete entry_id] => [:body, "entry_ids", 0],
+        %i[entry_api bulk_delete idempotency_key] => [:headers, "Idempotency-Key"],
+        %i[reservations prepare invoice_id] => [:body, "invoice_id"],
+        %i[reservations prepare entry_id] => [:body, "entries", 0],
+        %i[reservations prepare operation_id] => body_operation,
+        %i[reservations commit invoice_id] => [:body, "invoice_id"],
+        %i[reservations commit operation_id] => body_operation,
+        %i[reservations commit idempotency_key] => body_operation,
+        %i[reservations abort invoice_id] => [:body, "invoice_id"],
+        %i[reservations abort operation_id] => body_operation,
+        %i[reservations abort idempotency_key] => body_operation,
+        %i[reservations mark_billed invoice_id] => [:path, 5],
+        %i[reservations mark_billed operation_id] => body_operation,
+        %i[reservations detach_entries operation_id] => body_operation,
+        %i[entry_snapshots deliver entry_id] => [:body, "snapshots", 0, "entry", "id"]
+      }
+    end
+
     # "Each case swaps in exactly one foreign identifier and keeps the others valid for the requesting company."
     it "R5 every identifier probe differs from the requester's valid request in exactly the owner's swapped identifier" do
       # The reservations key is the body operation_id, so its swapped value is the owner's operation id.
@@ -331,6 +359,10 @@ RSpec.describe "Timekeeping tenant guard surfaces and cases" do
         expect(changed.size).to eq(1), "#{label} changed #{changed.inspect}"
         expect(changed.values.first).to eq(owner_value.call(kase)), label
         expect(probe.values).not_to include("1101"), "#{label} must keep the requester's company"
+        # Every kind the probe claims to cover must live at the one location it changed, so a probe cannot claim
+        # a kind whose field it leaves as the requester's.
+        expected_locations = kase.covers.map { |kind| guard_cases_swap_locations.fetch([kase.contract, kase.route, kind]) }
+        expect(expected_locations.uniq).to eq([changed.keys.first]), label
       end
     end
 
@@ -362,6 +394,26 @@ RSpec.describe "Timekeeping tenant guard surfaces and cases" do
         expect(TenantGuardCases.probe_request(kase, requester: requester_ids, owner: owner_ids))
           .to eq(TenantGuardCases.valid_request(kase, ids: requester_ids)), "#{kase.contract} #{kase.route}"
       end
+    end
+
+    # "For a replay, it takes the other company's recorded request and replaces only the company and the credential."
+    it "R10 replays a recorded snapshot batch with only each entry's company_id and the Authorization header replaced" do
+      kase = guard_cases_find(:entry_snapshots, :deliver, :replay, [:idempotency_key])
+      built = TenantGuardCases.valid_request(kase, ids: owner_ids)
+      recorded = built.merge(headers: built.fetch(:headers).merge("Authorization" => "Bearer owner-service"))
+      original = Marshal.load(Marshal.dump(recorded))
+
+      replay = TenantGuardCases.replay_request(recorded, company_id: 101, authorization: "Bearer requester-service")
+
+      expected_body = Marshal.load(Marshal.dump(recorded.fetch(:body)))
+      expected_body.fetch("snapshots").each { |snapshot| snapshot.fetch("entry")["company_id"] = 101 }
+      expect(recorded.dig(:body, "snapshots", 0, "entry", "company_id")).to eq(1101)
+      expect(replay).to eq(
+        method: "POST", path: "/internal/v1/timekeeping/entry-snapshots",
+        headers: { "Idempotency-Key" => "key-owner-0001", "Authorization" => "Bearer requester-service" },
+        body: expected_body
+      )
+      expect(recorded).to eq(original)
     end
 
     it "builds delivery baseline, probe and replay batches that the snapshot parser accepts" do
