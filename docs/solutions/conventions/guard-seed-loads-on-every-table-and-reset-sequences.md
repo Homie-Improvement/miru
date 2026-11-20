@@ -56,6 +56,8 @@ def load_fresh_seed!(as_of:)
 end
 ```
 
+This is the function as PR #43 wrote it. It now also takes an optional `captures:` store (a `Timekeeping::SeedCapture::Store`). With a store, a load restores the copy saved for that `as_of` instead of running `db/seeds.rb`. The empty-table refusal and the sequence reset still run first on both paths. If a restore fails, the sequences are reset again before the real load (see [Reset sequences again after a failed restore](../design-patterns/reset-sequences-again-after-a-failed-restore-because-setval-is-not-rolled-back.md)).
+
 Three related rules come from the same change:
 
 1. **Keep loading and writing as separate steps.** `generate!` is `load_fresh_seed!` followed by `write!`, and `write!` never loads the seed. A spec that has already loaded the seed calls `write!` directly. That way the spec never needs to weaken the guard to pass.

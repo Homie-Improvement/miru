@@ -27,15 +27,41 @@ module Timekeeping
     #
     # Which seeded entries exist depends on user ids, so the id sequences are
     # reset before the load: two loads at the same as_of give the same ids.
-    def load_fresh_seed!(as_of:)
+    #
+    # Running db/seeds.rb takes about a minute. Given a store (a
+    # Timekeeping::SeedCapture::Store), a load restores the capture stored for
+    # this as_of instead, and a real load stores a capture of what it wrote.
+    # The refusal and the sequence reset run first on both paths.
+    def load_fresh_seed!(as_of:, captures: nil)
       tables = application_tables
       occupied = tables.select { |table| table_has_rows?(table) }
       if occupied.any?
         raise Error, "Refusing to load the seed over existing data in: #{occupied.sort.join(', ')}"
       end
 
-      tables.each { |table| connection.reset_pk_sequence!(table) }
+      reset_sequences(tables)
+      return if captures && restore_capture(captures.fetch(as_of), tables)
+
       with_seed_as_of(as_of) { load SEED_PATH.to_s }
+      captures&.store(as_of, SeedCapture.take(connection:, tables:))
+    end
+
+    # Whether the capture was restored. A failed restore leaves the tables
+    # empty, but PostgreSQL does not roll back setval, so the sequences are
+    # reset again before the caller runs the real seed.
+    def restore_capture(capture, tables)
+      return false unless capture
+
+      capture.restore!(connection:)
+      true
+    rescue SeedCapture::RestoreError => e
+      Rails.logger.warn("Seed capture restore failed, loading db/seeds.rb instead: #{e.message}")
+      reset_sequences(tables)
+      false
+    end
+
+    def reset_sequences(tables)
+      tables.each { |table| connection.reset_pk_sequence!(table) }
     end
 
     # Writes the disposition of the data already in the database, without

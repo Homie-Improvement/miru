@@ -172,3 +172,138 @@ RSpec.describe Timekeeping::SeedDispositionRecorder do
     end
   end
 end
+
+RSpec.describe TestDatabaseCleanup do
+  # Both seeded test paths must share one store, or each would pay for its own
+  # real seed load.
+  it "returns the same seed capture store on every call in a process" do
+    expect(described_class.seed_captures).to be_a(Timekeeping::SeedCapture::Store)
+    expect(described_class.seed_captures).to be(described_class.seed_captures)
+  end
+end
+
+RSpec.describe Timekeeping::SeedDispositionRecorder, :without_transaction do
+  def recorder_store_spec_state
+    { digests: SeedStateComparison.table_digests, sequences: SeedStateComparison.sequence_states }
+  end
+
+  it "with a store, a second load restores the first load's capture with the same ids and sequences, well under a minute" do
+    as_of = TestDatabaseCleanup.seed_as_of
+    store = Timekeeping::SeedCapture::Store.new
+    expect(store.fetch(as_of)).to be_nil
+
+    # The :without_transaction hook leaves the ownership row in place, which
+    # the empty-table guard refuses.
+    TestDatabaseCleanup.clean_with!(:truncation, except: %w(ar_internal_metadata))
+    described_class.load_fresh_seed!(as_of:, captures: store)
+    expect(store.fetch(as_of)).to be_a(Timekeeping::SeedCapture)
+    first_load = recorder_store_spec_state
+
+    TestDatabaseCleanup.clean_with!(:truncation, except: %w(ar_internal_metadata))
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    described_class.load_fresh_seed!(as_of:, captures: store)
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+    # "Reloading the two-tenant seed for a handoff example group takes well under a minute, either through bulk inserts in db/seeds.rb or by restoring a captured snapshot, and gives the same ids and sequence values as before."
+    expect(recorder_store_spec_state).to eq(first_load)
+    expect(elapsed).to be < 20
+    expect(Company.pluck(:name)).to contain_exactly("Fork & Leaf Salads", "Copper Kettle Bakery")
+  end
+end
+
+RSpec.describe Timekeeping::SeedDispositionRecorder do
+  # A restore over existing rows would stack the seed on data that was never
+  # the seed, and the ids would no longer be "the same ids and sequence
+  # values as before".
+  it "refuses a lone-user database before restoring a stored capture, and leaves that user unchanged" do
+    # A stand-in that only records whether it was restored, so the guard's
+    # order is observable.
+    restored = []
+    capture = Object.new
+    capture.define_singleton_method(:restore!) { |**| restored << :restore }
+    store = Timekeeping::SeedCapture::Store.new
+    store.store("2026-10-23", capture)
+    user = create(:user, email: "dana@forkandleaf.example", current_workspace: nil, first_name: "Existing")
+    Company.delete_all
+    before = user.reload.attributes.slice("first_name", "last_name", "encrypted_password", "current_workspace_id")
+
+    expect { described_class.load_fresh_seed!(as_of: "2026-10-23", captures: store) }
+      .to raise_error(described_class::Error, /users/)
+
+    expect(restored).to be_empty
+    expect(user.reload.attributes.slice("first_name", "last_name", "encrypted_password", "current_workspace_id"))
+      .to eq(before)
+    expect(User.count).to eq(1)
+    expect(Company.count).to eq(0)
+  end
+end
+
+RSpec.describe Timekeeping::SeedDispositionRecorder, :two_tenant_seed, :seeded_without_transaction do
+  def failed_restore_spec_ids
+    %w[companies invoices invoice_line_items].index_with do |table|
+      connection = ActiveRecord::Base.connection
+      connection.select_values("SELECT id FROM #{connection.quote_table_name(table)} ORDER BY id").map(&:to_i)
+    end
+  end
+
+  def failed_restore_spec_sequence(table)
+    connection = ActiveRecord::Base.connection
+    name = connection.select_value("SELECT pg_get_serial_sequence(#{connection.quote(table)}, 'id')")
+    connection.select_one("SELECT last_value, is_called FROM #{name}").to_h
+  end
+
+  # Acceptance: the reload "gives the same ids and sequence values as before".
+  # PostgreSQL does not roll back setval, so a restore that moved a sequence
+  # and then failed must not leave the fallback seed load on shifted ids.
+  it "after a restore that moved sequences and then failed, falls back to a real load with the same ids and sequence values and replaces the capture" do
+    as_of = TestDatabaseCleanup.seed_as_of
+    user_ids = User.order(:id).pluck(:id, :email)
+    entry_ids = TimesheetEntry.order(:id).pluck(:id)
+    other_ids = failed_restore_spec_ids
+    users_sequence = failed_restore_spec_sequence("users")
+    entries_sequence = failed_restore_spec_sequence("timesheet_entries")
+
+    broken = Object.new
+    broken.define_singleton_method(:restore!) do |connection:|
+      %w[users timesheet_entries].each do |table|
+        name = connection.select_value("SELECT pg_get_serial_sequence(#{connection.quote(table)}, 'id')")
+        connection.select_value("SELECT setval(#{connection.quote(name)}, 900000)")
+      end
+      raise Timekeeping::SeedCapture::RestoreError, "blob file missing"
+    end
+    store = Timekeeping::SeedCapture::Store.new
+    store.store(as_of, broken)
+
+    TestDatabaseCleanup.clean_with!(:truncation, except: %w(ar_internal_metadata))
+    described_class.load_fresh_seed!(as_of:, captures: store)
+
+    expect(User.order(:id).pluck(:id, :email)).to eq(user_ids)
+    expect(TimesheetEntry.order(:id).pluck(:id)).to eq(entry_ids)
+    expect(failed_restore_spec_ids).to eq(other_ids)
+    expect(failed_restore_spec_sequence("users")).to eq(users_sequence)
+    expect(failed_restore_spec_sequence("timesheet_entries")).to eq(entries_sequence)
+    expect(store.fetch(as_of)).to be_a(Timekeeping::SeedCapture)
+  end
+end
+
+RSpec.describe Timekeeping::SeedDispositionRecorder, :two_tenant_seed, :seeded_without_transaction do
+  # Seeded entries depend on as_of, so a copy taken at another as_of would
+  # not give "the same ids and sequence values as before".
+  it "does not restore a capture stored for a different as_of, and stores a real capture for the requested one" do
+    as_of = TestDatabaseCleanup.seed_as_of
+    entry_ids = TimesheetEntry.order(:id).pluck(:id)
+    restored = []
+    stale = Object.new
+    stale.define_singleton_method(:restore!) { |**| restored << :restore }
+    store = Timekeeping::SeedCapture::Store.new
+    store.store("2000-01-01", stale)
+
+    TestDatabaseCleanup.clean_with!(:truncation, except: %w(ar_internal_metadata))
+    described_class.load_fresh_seed!(as_of:, captures: store)
+
+    expect(restored).to be_empty
+    expect(TimesheetEntry.order(:id).pluck(:id)).to eq(entry_ids)
+    expect(store.fetch(as_of)).to be_a(Timekeeping::SeedCapture)
+    expect(store.fetch("2000-01-01")).to be(stale)
+  end
+end

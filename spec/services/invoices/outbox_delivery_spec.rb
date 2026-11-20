@@ -663,3 +663,107 @@ RSpec.describe Invoices::OutboxDelivery, "a row already marked undeliverable" do
     expect(row.reload.attributes).to eq(before)
   end
 end
+
+RSpec.describe Invoices::OutboxDelivery, "prepared-store stale_generation answer during a handoff", committed_data: true do
+  include PreparedReservationsSpecSupport
+
+  # The prepared store refuses a commit or abort as stale only while a handoff step is recorded, and applies
+  # it again once the handoff is aborted. A row marked undeliverable is never resent, so an abort row would
+  # leave its provisional reservations locking the entries and a commit row would keep blocking billing.
+  # These rows are therefore retried rather than marked.
+
+  # Prepares one operation in the prepared store and returns its outbox row of the given kind, with the
+  # payload the row was stored with.
+  def prepared_stale_spec_row(company, entry, invoice, kind:, intent_state:)
+    request = prepared_spec_request(company, invoice, [entry.id])
+    expect(Invoices::PreparedReservations.new.prepare(request).state).to eq("prepared")
+    payload = {
+      "company_id" => company.id, "invoice_id" => invoice.id, "operation_id" => request.operation_id,
+      "generation" => request.generation, "disposition" => "active", "desired_entry_ids" => [entry.id]
+    }
+    InvoiceOperationIntent.create!(
+      company_id: company.id, invoice_id: invoice.id, operation_id: request.operation_id, state: intent_state,
+      generation: request.generation, disposition: "active", desired_entry_ids: [entry.id]
+    )
+    row = InvoiceOperationOutboxItem.create!(
+      company_id: company.id, invoice_id: invoice.id, operation_id: request.operation_id, kind:, payload:
+    )
+    [row, payload]
+  end
+
+  def prepared_stale_spec_sweep_selects?(row)
+    InvoiceOperationOutboxItem.where(delivered_at: nil, undeliverable_at: nil).pluck(:id).include?(row.id)
+  end
+
+  it "prepared store: an abort row refused as stale_generation during close_admission is retried, not marked, and releases its reservations once the handoff ends" do
+    prepare_local_ownership!
+    company = create(:company)
+    entry = prepared_spec_entry(company)
+    invoice = prepared_spec_invoice(company)
+    row, payload = prepared_stale_spec_row(company, entry, invoice, kind: "abort", intent_state: "failed")
+    expect(prepared_spec_reservations(company).pluck(2)).to eq([Invoices::PreparedReservations::PROVISIONAL])
+    reserved = prepared_spec_reservations(company)
+    delivery = described_class.new(adapter_source: -> { Invoices::PreparedReservations.new })
+
+    TimekeepingOwnership.current.update_columns(handoff_step: "close_admission")
+    stale_outcome = nil
+    payloads = undeliverable_operation_event_payloads { stale_outcome = delivery.deliver(row.id) }
+
+    expect([stale_outcome.state, stale_outcome.reason]).to eq(%w[retryable stale_generation])
+    row.reload
+    expect(row.undeliverable_at).to be_nil
+    expect(row.delivered_at).to be_nil
+    expect(row.attempts).to eq(1)
+    expect(row.payload).to eq(payload)
+    expect(payloads).to be_empty
+    expect(prepared_spec_reservations(company)).to eq(reserved)
+    expect(prepared_stale_spec_sweep_selects?(row)).to be(true)
+
+    # A handoff abort leaves no handoff step recorded; the next delivery must apply the abort.
+    TimekeepingOwnership.current.update_columns(handoff_step: nil)
+    settled = delivery.deliver(row.id)
+
+    expect(settled.state).to eq("aborted")
+    row.reload
+    expect(row.delivered_at).to be_present
+    expect(row.undeliverable_at).to be_nil
+    expect(row.attempts).to eq(1)
+    expect(prepared_spec_reservations(company)).to eq([])
+  end
+
+  it "prepared store: a commit row refused as stale_generation twice during close_admission counts one attempt per delivery, emits no event, stays selected for the next sweep and commits once the handoff ends" do
+    prepare_local_ownership!
+    company = create(:company)
+    entry = prepared_spec_entry(company)
+    invoice = prepared_spec_invoice(company)
+    row, payload = prepared_stale_spec_row(company, entry, invoice, kind: "commit", intent_state: "committed")
+    adapter_calls = 0
+    delivery = described_class.new(adapter_source: lambda {
+      adapter_calls += 1
+      Invoices::PreparedReservations.new
+    })
+
+    # A sweep and a job can both reach the same row while the handoff is still closing admission.
+    TimekeepingOwnership.current.update_columns(handoff_step: "close_admission")
+    outcomes = []
+    payloads = undeliverable_operation_event_payloads do
+      2.times { outcomes << delivery.deliver(row.id) }
+    end
+
+    expect(outcomes.map { |outcome| [outcome.state, outcome.reason] })
+      .to eq([%w[retryable stale_generation], %w[retryable stale_generation]])
+    expect(adapter_calls).to eq(2)
+    row.reload
+    expect(row.attempts).to eq(2)
+    expect(row.undeliverable_at).to be_nil
+    expect(row.delivered_at).to be_nil
+    expect(row.payload).to eq(payload)
+    expect(payloads).to be_empty
+    expect(prepared_stale_spec_sweep_selects?(row)).to be(true)
+
+    TimekeepingOwnership.current.update_columns(handoff_step: nil)
+    expect(delivery.deliver(row.id).state).to eq("committed")
+    expect(row.reload.delivered_at).to be_present
+    expect(prepared_spec_reservations(company)).to eq([[entry.id, invoice.id, "committed", "active"]])
+  end
+end
