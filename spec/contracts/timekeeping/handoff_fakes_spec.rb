@@ -118,329 +118,329 @@ RSpec.describe TimekeepingHandoffFakes::InMemoryTimekeepingStore do
   end
 
   context "more tests 10" do
-  # "Fake-path runner specs can use a test relay that delivers only Timekeeping's outbox snapshots through `Timekeeping::ProjectionConsumer`, so a snapshot left out of the outbox leaves the projection behind and fails the spec."
-  # A batch the consumer refuses must fail the drain loudly, so a malformed
-  # snapshot is never mistaken for a projection left behind.
-  it "the outbox relay raises Undelivered naming 422 for a snapshot the projection consumer refuses and stays undrained" do
-    store = described_class.new
-    store.admit(generation: 2)
-    store.write_correction_snapshots(snapshots: [{ "id" => 5, "note" => "missing every other contract field" }],
-                                     version: 2, generation: 2)
-    through = store.highest_outbox_position
-    expect(through).to be_positive
+    # "Fake-path runner specs can use a test relay that delivers only Timekeeping's outbox snapshots through `Timekeeping::ProjectionConsumer`, so a snapshot left out of the outbox leaves the projection behind and fails the spec."
+    # A batch the consumer refuses must fail the drain loudly, so a malformed
+    # snapshot is never mistaken for a projection left behind.
+    it "the outbox relay raises Undelivered naming 422 for a snapshot the projection consumer refuses and stays undrained" do
+      store = described_class.new
+      store.admit(generation: 2)
+      store.write_correction_snapshots(snapshots: [{ "id" => 5, "note" => "missing every other contract field" }],
+                                       version: 2, generation: 2)
+      through = store.highest_outbox_position
+      expect(through).to be_positive
 
-    relay = TimekeepingHandoffOutboxRelay.new(store:)
+      relay = TimekeepingHandoffOutboxRelay.new(store:)
 
-    expect { relay.drain!(through:) }.to raise_error(TimekeepingHandoffOutboxRelay::Undelivered, /422/)
-    expect(relay.drained?(through:)).to be(false)
-  end
+      expect { relay.drain!(through:) }.to raise_error(TimekeepingHandoffOutboxRelay::Undelivered, /422/)
+      expect(relay.drained?(through:)).to be(false)
+    end
   end
 
   context "more tests 11" do
-  # Correction rows wait for the flip to admit their generation; the snapshot
-  # here is malformed, so any delivery attempt would come back 422 and raise.
-  it "the outbox relay holds back rows of a generation the store never admitted and sends nothing to the consumer" do
-    store = described_class.new
-    store.write_correction_snapshots(snapshots: [{ "id" => 9, "note" => "not yet admitted" }],
-                                     version: 2, generation: 2)
-    through = store.highest_outbox_position
-    relay = TimekeepingHandoffOutboxRelay.new(store:)
-    allow(Timekeeping::ProjectionConsumer).to receive(:call).and_call_original
+    # Correction rows wait for the flip to admit their generation; the snapshot
+    # here is malformed, so any delivery attempt would come back 422 and raise.
+    it "the outbox relay holds back rows of a generation the store never admitted and sends nothing to the consumer" do
+      store = described_class.new
+      store.write_correction_snapshots(snapshots: [{ "id" => 9, "note" => "not yet admitted" }],
+                                       version: 2, generation: 2)
+      through = store.highest_outbox_position
+      relay = TimekeepingHandoffOutboxRelay.new(store:)
+      allow(Timekeeping::ProjectionConsumer).to receive(:call).and_call_original
 
-    expect { relay.drain!(through:) }.not_to raise_error
-    expect(Timekeeping::ProjectionConsumer).not_to have_received(:call)
-    expect(relay.drained?(through:)).to be(true)
-    expect(store.outbox.pluck("generation")).to eq([2])
-  end
+      expect { relay.drain!(through:) }.not_to raise_error
+      expect(Timekeeping::ProjectionConsumer).not_to have_received(:call)
+      expect(relay.drained?(through:)).to be(true)
+      expect(store.outbox.pluck("generation")).to eq([2])
+    end
   end
 
   context "more tests 12" do
-  it "rewriting a correction at the same generation replaces that entry's outbox row at a higher position and keeps the other entry's row" do
-    store = described_class.new
-    first_row = handoff_fakes_entry_row(id: 5, version: 1)
-    second_row = handoff_fakes_entry_row(id: 6, version: 1)
-    store.load_checkpoint(handoff_fakes_checkpoint(first_row, second_row))
+    it "rewriting a correction at the same generation replaces that entry's outbox row at a higher position and keeps the other entry's row" do
+      store = described_class.new
+      first_row = handoff_fakes_entry_row(id: 5, version: 1)
+      second_row = handoff_fakes_entry_row(id: 6, version: 1)
+      store.load_checkpoint(handoff_fakes_checkpoint(first_row, second_row))
 
-    store.write_correction_snapshots(snapshots: [first_row.except("version"), second_row.except("version")],
-                                     version: 2, generation: 2)
-    first_position = store.outbox.find { |row| row.dig("entry", "id") == 5 }.fetch("outbox_position")
+      store.write_correction_snapshots(snapshots: [first_row.except("version"), second_row.except("version")],
+                                       version: 2, generation: 2)
+      first_position = store.outbox.find { |row| row.dig("entry", "id") == 5 }.fetch("outbox_position")
 
-    store.write_correction_snapshots(snapshots: [first_row.except("version").merge("note" => "rewritten")],
-                                     version: 2, generation: 2)
+      store.write_correction_snapshots(snapshots: [first_row.except("version").merge("note" => "rewritten")],
+                                       version: 2, generation: 2)
 
-    rows_for_five = store.outbox.select { |row| row.dig("entry", "id") == 5 && row["generation"] == 2 }
-    expect(rows_for_five.size).to eq(1)
-    expect(rows_for_five.first.dig("entry", "note")).to eq("rewritten")
-    expect(rows_for_five.first.dig("entry", "version")).to eq(2)
-    expect(rows_for_five.first.fetch("outbox_position")).to be > first_position
-    expect(store.outbox.count { |row| row.dig("entry", "id") == 6 }).to eq(1)
+      rows_for_five = store.outbox.select { |row| row.dig("entry", "id") == 5 && row["generation"] == 2 }
+      expect(rows_for_five.size).to eq(1)
+      expect(rows_for_five.first.dig("entry", "note")).to eq("rewritten")
+      expect(rows_for_five.first.dig("entry", "version")).to eq(2)
+      expect(rows_for_five.first.fetch("outbox_position")).to be > first_position
+      expect(store.outbox.count { |row| row.dig("entry", "id") == 6 }).to eq(1)
 
-    positions = store.outbox.map { |row| row.fetch("outbox_position") }
-    expect(positions).to eq(positions.sort)
-    expect(positions.uniq.size).to eq(positions.size)
-    expect(store.highest_outbox_position).to eq(positions.max)
-  end
+      positions = store.outbox.map { |row| row.fetch("outbox_position") }
+      expect(positions).to eq(positions.sort)
+      expect(positions.uniq.size).to eq(positions.size)
+      expect(store.highest_outbox_position).to eq(positions.max)
+    end
   end
 
   context "more tests 13" do
-  it "edit_entry! refuses before any admission and after admitting generation 2 appends an outbox row at the edited version" do
-    store = described_class.new
-    store.load_checkpoint(handoff_fakes_checkpoint(handoff_fakes_entry_row(id: 9, version: 1)))
+    it "edit_entry! refuses before any admission and after admitting generation 2 appends an outbox row at the edited version" do
+      store = described_class.new
+      store.load_checkpoint(handoff_fakes_checkpoint(handoff_fakes_entry_row(id: 9, version: 1)))
 
-    expect { store.edit_entry!(9) }.to raise_error(ArgumentError)
-    expect(store.outbox).to eq([])
+      expect { store.edit_entry!(9) }.to raise_error(ArgumentError)
+      expect(store.outbox).to eq([])
 
-    store.admit(generation: 2)
-    store.edit_entry!(9)
+      store.admit(generation: 2)
+      store.edit_entry!(9)
 
-    expect(store.outbox.size).to eq(1)
-    row = store.outbox.first
-    expect(row.fetch("generation")).to eq(2)
-    expect(row.dig("entry", "id")).to eq(9)
-    expect(row.dig("entry", "version")).to eq(store.rows.fetch("entries").first.fetch("version"))
-    expect(row.dig("entry", "version")).to eq(2)
-    expect(store.highest_outbox_position).to eq(row.fetch("outbox_position"))
-  end
+      expect(store.outbox.size).to eq(1)
+      row = store.outbox.first
+      expect(row.fetch("generation")).to eq(2)
+      expect(row.dig("entry", "id")).to eq(9)
+      expect(row.dig("entry", "version")).to eq(store.rows.fetch("entries").first.fetch("version"))
+      expect(row.dig("entry", "version")).to eq(2)
+      expect(store.highest_outbox_position).to eq(row.fetch("outbox_position"))
+    end
   end
 
   context "more tests 14" do
-  it "a batch the projection consumer refuses with 422 stays unsent, so a second drain raises again and drained? stays false" do
-    store = described_class.new
-    store.admit(generation: 2)
-    # A snapshot missing most contract fields, so the consumer answers 422 invalid_snapshot.
-    store.write_correction_snapshots(snapshots: [{ "id" => 5, "note" => "incomplete" }], version: 1, generation: 2)
-    through = store.highest_outbox_position
-    expect(through).to be_positive
-    relay = TimekeepingHandoffOutboxRelay.new(store:)
+    it "a batch the projection consumer refuses with 422 stays unsent, so a second drain raises again and drained? stays false" do
+      store = described_class.new
+      store.admit(generation: 2)
+      # A snapshot missing most contract fields, so the consumer answers 422 invalid_snapshot.
+      store.write_correction_snapshots(snapshots: [{ "id" => 5, "note" => "incomplete" }], version: 1, generation: 2)
+      through = store.highest_outbox_position
+      expect(through).to be_positive
+      relay = TimekeepingHandoffOutboxRelay.new(store:)
 
-    expect { relay.drain!(through:) }.to raise_error(TimekeepingHandoffOutboxRelay::Undelivered, /422/)
-    expect(relay.drained?(through:)).to be(false)
+      expect { relay.drain!(through:) }.to raise_error(TimekeepingHandoffOutboxRelay::Undelivered, /422/)
+      expect(relay.drained?(through:)).to be(false)
 
-    # The refused row was never marked sent, so retrying sends it again and is refused again.
-    expect { relay.drain!(through:) }.to raise_error(TimekeepingHandoffOutboxRelay::Undelivered, /422/)
-    expect(relay.drained?(through:)).to be(false)
-  end
+      # The refused row was never marked sent, so retrying sends it again and is refused again.
+      expect { relay.drain!(through:) }.to raise_error(TimekeepingHandoffOutboxRelay::Undelivered, /422/)
+      expect(relay.drained?(through:)).to be(false)
+    end
   end
 
   context "more tests 15" do
-  it "outbox relay store: a rewritten correction replaces its entry's row at that generation, keeps other entries and generations, and raises the highest position" do
-    at = Time.utc(2026, 1, 5, 9)
-    entry_row = lambda do |id|
+    it "outbox relay store: a rewritten correction replaces its entry's row at that generation, keeps other entries and generations, and raises the highest position" do
+      at = Time.utc(2026, 1, 5, 9)
+      entry_row = lambda do |id|
+        values = {
+          "id" => id, "company_id" => 1, "version" => 1, "project_id" => 10, "user_id" => 20,
+          "work_date" => Date.new(2026, 1, 5), "duration" => 60.0, "note" => "", "bill_status" => "unbilled",
+          "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
+          "proof_metadata" => {}, "created_at" => at, "updated_at" => at
+        }
+        Timekeeping::Handoff::Checkpoint::TABLES.fetch("entries").index_with { |column| values[column] }
+      end
+      tables = Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }
+      store = described_class.new
+      store.load_checkpoint(Timekeeping::Handoff::Checkpoint.build(tables: tables.merge("entries" => [entry_row.call(5), entry_row.call(6)])))
+
+      expect(store.outbox).to eq([])
+      expect(store.highest_outbox_position).to eq(0)
+
+      store.write_correction_snapshots(snapshots: [entry_row.call(5).except("version")], version: 2, generation: 2)
+      store.write_correction_snapshots(snapshots: [entry_row.call(6).except("version")], version: 2, generation: 2)
+      first_position_of_five = store.outbox.find { |row| row.dig("entry", "id") == 5 }.fetch("outbox_position")
+      store.write_correction_snapshots(snapshots: [entry_row.call(5).except("version").merge("note" => "again")], version: 2, generation: 2)
+      store.write_correction_snapshots(snapshots: [entry_row.call(5).except("version")], version: 3, generation: 3)
+
+      outbox = store.outbox
+      positions = outbox.map { |row| row.fetch("outbox_position") }
+      expect(positions).to eq(positions.sort)
+      expect(positions.uniq.size).to eq(positions.size)
+      expect(positions).to all(be_a(Integer).and(be_positive))
+      expect(outbox.map { |row| [row.dig("entry", "id"), row.fetch("generation")] })
+        .to contain_exactly([6, 2], [5, 2], [5, 3])
+
+      rewritten = outbox.find { |row| row.dig("entry", "id") == 5 && row.fetch("generation") == 2 }
+      expect(rewritten.dig("entry", "note")).to eq("again")
+      expect(rewritten.fetch("outbox_position")).to be > first_position_of_five
+      expect(rewritten.fetch("entry").keys).to match_array(Timekeeping::Handoff::Checkpoint::TABLES.fetch("entries"))
+      expect(rewritten.dig("entry", "version")).to eq(2)
+      expect(store.highest_outbox_position).to eq(positions.max)
+    end
+  end
+
+  context "more tests 16" do
+    it "outbox relay store: an entry edit is written to the outbox at the last admitted generation, and refused before any admission" do
+      at = Time.utc(2026, 1, 5, 9)
       values = {
-        "id" => id, "company_id" => 1, "version" => 1, "project_id" => 10, "user_id" => 20,
+        "id" => 7, "company_id" => 1, "version" => 1, "project_id" => 10, "user_id" => 20,
         "work_date" => Date.new(2026, 1, 5), "duration" => 60.0, "note" => "", "bill_status" => "unbilled",
         "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
         "proof_metadata" => {}, "created_at" => at, "updated_at" => at
       }
-      Timekeeping::Handoff::Checkpoint::TABLES.fetch("entries").index_with { |column| values[column] }
+      row = Timekeeping::Handoff::Checkpoint::TABLES.fetch("entries").index_with { |column| values[column] }
+      tables = Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }
+      store = described_class.new
+      store.load_checkpoint(Timekeeping::Handoff::Checkpoint.build(tables: tables.merge("entries" => [row])))
+
+      expect { store.edit_entry!(7) }.to raise_error(ArgumentError)
+      expect(store.outbox).to eq([])
+
+      store.admit(generation: 2)
+      store.admit(generation: 3)
+      store.edit_entry!(7)
+
+      expect(store.outbox.size).to eq(1)
+      edited = store.outbox.first
+      expect(edited.fetch("generation")).to eq(3)
+      expect(edited.dig("entry", "id")).to eq(7)
+      expect(edited.dig("entry", "version")).to eq(store.rows.fetch("entries").first.fetch("version"))
+      expect(edited.dig("entry", "note")).to eq("edited in Timekeeping")
+      expect(store.highest_outbox_position).to eq(edited.fetch("outbox_position"))
     end
-    tables = Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }
-    store = described_class.new
-    store.load_checkpoint(Timekeeping::Handoff::Checkpoint.build(tables: tables.merge("entries" => [entry_row.call(5), entry_row.call(6)])))
-
-    expect(store.outbox).to eq([])
-    expect(store.highest_outbox_position).to eq(0)
-
-    store.write_correction_snapshots(snapshots: [entry_row.call(5).except("version")], version: 2, generation: 2)
-    store.write_correction_snapshots(snapshots: [entry_row.call(6).except("version")], version: 2, generation: 2)
-    first_position_of_five = store.outbox.find { |row| row.dig("entry", "id") == 5 }.fetch("outbox_position")
-    store.write_correction_snapshots(snapshots: [entry_row.call(5).except("version").merge("note" => "again")], version: 2, generation: 2)
-    store.write_correction_snapshots(snapshots: [entry_row.call(5).except("version")], version: 3, generation: 3)
-
-    outbox = store.outbox
-    positions = outbox.map { |row| row.fetch("outbox_position") }
-    expect(positions).to eq(positions.sort)
-    expect(positions.uniq.size).to eq(positions.size)
-    expect(positions).to all(be_a(Integer).and(be_positive))
-    expect(outbox.map { |row| [row.dig("entry", "id"), row.fetch("generation")] })
-      .to contain_exactly([6, 2], [5, 2], [5, 3])
-
-    rewritten = outbox.find { |row| row.dig("entry", "id") == 5 && row.fetch("generation") == 2 }
-    expect(rewritten.dig("entry", "note")).to eq("again")
-    expect(rewritten.fetch("outbox_position")).to be > first_position_of_five
-    expect(rewritten.fetch("entry").keys).to match_array(Timekeeping::Handoff::Checkpoint::TABLES.fetch("entries"))
-    expect(rewritten.dig("entry", "version")).to eq(2)
-    expect(store.highest_outbox_position).to eq(positions.max)
-  end
-  end
-
-  context "more tests 16" do
-  it "outbox relay store: an entry edit is written to the outbox at the last admitted generation, and refused before any admission" do
-    at = Time.utc(2026, 1, 5, 9)
-    values = {
-      "id" => 7, "company_id" => 1, "version" => 1, "project_id" => 10, "user_id" => 20,
-      "work_date" => Date.new(2026, 1, 5), "duration" => 60.0, "note" => "", "bill_status" => "unbilled",
-      "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
-      "proof_metadata" => {}, "created_at" => at, "updated_at" => at
-    }
-    row = Timekeeping::Handoff::Checkpoint::TABLES.fetch("entries").index_with { |column| values[column] }
-    tables = Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }
-    store = described_class.new
-    store.load_checkpoint(Timekeeping::Handoff::Checkpoint.build(tables: tables.merge("entries" => [row])))
-
-    expect { store.edit_entry!(7) }.to raise_error(ArgumentError)
-    expect(store.outbox).to eq([])
-
-    store.admit(generation: 2)
-    store.admit(generation: 3)
-    store.edit_entry!(7)
-
-    expect(store.outbox.size).to eq(1)
-    edited = store.outbox.first
-    expect(edited.fetch("generation")).to eq(3)
-    expect(edited.dig("entry", "id")).to eq(7)
-    expect(edited.dig("entry", "version")).to eq(store.rows.fetch("entries").first.fetch("version"))
-    expect(edited.dig("entry", "note")).to eq("edited in Timekeeping")
-    expect(store.highest_outbox_position).to eq(edited.fetch("outbox_position"))
-  end
   end
 
   context "more tests 17" do
-  it "owners with relay :timekeeping_outbox gives Timekeeping the outbox relay and keeps the monolith's copy relay" do
-    timekeeping = described_class.new
-    owners = TimekeepingHandoffFakes.owners(timekeeping:, relay: :timekeeping_outbox)
+    it "owners with relay :timekeeping_outbox gives Timekeeping the outbox relay and keeps the monolith's copy relay" do
+      timekeeping = described_class.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:, relay: :timekeeping_outbox)
 
-    expect(owners.fetch(:timekeeping).drain).to be_a(TimekeepingHandoffOutboxRelay)
-    expect(owners.fetch(:timekeeping).drain).not_to be_a(TimekeepingHandoffFakeRelay)
-    expect(owners.fetch(:monolith).drain).to be_a(TimekeepingHandoffFakeRelay)
-    expect(owners.fetch(:monolith).drain).not_to be_a(TimekeepingHandoffOutboxRelay)
-    expect(owners.fetch(:timekeeping).store).to equal(timekeeping)
-    expect(owners.fetch(:timekeeping).admission).to equal(timekeeping)
+      expect(owners.fetch(:timekeeping).drain).to be_a(TimekeepingHandoffOutboxRelay)
+      expect(owners.fetch(:timekeeping).drain).not_to be_a(TimekeepingHandoffFakeRelay)
+      expect(owners.fetch(:monolith).drain).to be_a(TimekeepingHandoffFakeRelay)
+      expect(owners.fetch(:monolith).drain).not_to be_a(TimekeepingHandoffOutboxRelay)
+      expect(owners.fetch(:timekeeping).store).to equal(timekeeping)
+      expect(owners.fetch(:timekeeping).admission).to equal(timekeeping)
 
-    # The default stays the copy relay for both owners.
-    TimekeepingHandoffFakes.owners(timekeeping:).each_value do |owner|
-      expect(owner.drain).to be_a(TimekeepingHandoffFakeRelay)
+      # The default stays the copy relay for both owners.
+      TimekeepingHandoffFakes.owners(timekeeping:).each_value do |owner|
+        expect(owner.drain).to be_a(TimekeepingHandoffFakeRelay)
+      end
     end
-  end
   end
 
   context "more tests 18" do
-  it "outbox relay: a batch the projection consumer refuses as invalid raises Undelivered naming 422 and leaves the outbox undrained" do
-    at = Time.utc(2026, 1, 5, 9)
-    values = {
-      "id" => 9, "company_id" => 1, "version" => 1, "project_id" => 10, "user_id" => 20,
-      "work_date" => Date.new(2026, 1, 5), "duration" => 60.0, "note" => "", "bill_status" => "not_a_bill_status",
-      "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
-      "proof_metadata" => {}, "created_at" => at, "updated_at" => at
-    }
-    row = Timekeeping::Handoff::Checkpoint::TABLES.fetch("entries").index_with { |column| values[column] }
-    store = described_class.new
-    store.write_correction_snapshots(snapshots: [row.except("version")], version: 2, generation: 2)
-    store.admit(generation: 2)
-    log = []
-    relay = TimekeepingHandoffOutboxRelay.new(store:, log:)
-    through = store.highest_outbox_position
-    expect(through).to be_positive
+    it "outbox relay: a batch the projection consumer refuses as invalid raises Undelivered naming 422 and leaves the outbox undrained" do
+      at = Time.utc(2026, 1, 5, 9)
+      values = {
+        "id" => 9, "company_id" => 1, "version" => 1, "project_id" => 10, "user_id" => 20,
+        "work_date" => Date.new(2026, 1, 5), "duration" => 60.0, "note" => "", "bill_status" => "not_a_bill_status",
+        "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
+        "proof_metadata" => {}, "created_at" => at, "updated_at" => at
+      }
+      row = Timekeeping::Handoff::Checkpoint::TABLES.fetch("entries").index_with { |column| values[column] }
+      store = described_class.new
+      store.write_correction_snapshots(snapshots: [row.except("version")], version: 2, generation: 2)
+      store.admit(generation: 2)
+      log = []
+      relay = TimekeepingHandoffOutboxRelay.new(store:, log:)
+      through = store.highest_outbox_position
+      expect(through).to be_positive
 
-    expect { relay.drain!(through:) }
-      .to raise_error(TimekeepingHandoffOutboxRelay::Undelivered, /422/)
-    expect(log).to eq([[:drain, through]])
-    expect(relay.drained?(through:)).to be(false)
-    expect(TimesheetEntry.unscoped.where(id: 9)).not_to exist
-  end
+      expect { relay.drain!(through:) }
+        .to raise_error(TimekeepingHandoffOutboxRelay::Undelivered, /422/)
+      expect(log).to eq([[:drain, through]])
+      expect(relay.drained?(through:)).to be(false)
+      expect(TimesheetEntry.unscoped.where(id: 9)).not_to exist
+    end
   end
 
   context "more tests 19" do
-  # A resumed first cutover writes its corrections again. Appending would give
-  # one drain two snapshots of one entry, so the rewrite must replace the row.
-  it "a correction written twice for one entry at one generation leaves one outbox row, the later one at a higher position" do
-    store = described_class.new
-    store.load_checkpoint(handoff_fakes_checkpoint(handoff_fakes_entry_row(id: 5, version: 1)))
-    snapshot = handoff_fakes_entry_row(id: 5, version: 1).except("version")
-    other = handoff_fakes_entry_row(id: 6, version: 1).except("version")
+    # A resumed first cutover writes its corrections again. Appending would give
+    # one drain two snapshots of one entry, so the rewrite must replace the row.
+    it "a correction written twice for one entry at one generation leaves one outbox row, the later one at a higher position" do
+      store = described_class.new
+      store.load_checkpoint(handoff_fakes_checkpoint(handoff_fakes_entry_row(id: 5, version: 1)))
+      snapshot = handoff_fakes_entry_row(id: 5, version: 1).except("version")
+      other = handoff_fakes_entry_row(id: 6, version: 1).except("version")
 
-    store.write_correction_snapshots(snapshots: [snapshot.merge("note" => "first"), other], version: 2, generation: 2)
-    first_position = store.outbox.find { |row| row.fetch("entry").fetch("id") == 5 }.fetch("outbox_position")
-    store.write_correction_snapshots(snapshots: [snapshot.merge("note" => "second")], version: 2, generation: 2)
+      store.write_correction_snapshots(snapshots: [snapshot.merge("note" => "first"), other], version: 2, generation: 2)
+      first_position = store.outbox.find { |row| row.fetch("entry").fetch("id") == 5 }.fetch("outbox_position")
+      store.write_correction_snapshots(snapshots: [snapshot.merge("note" => "second")], version: 2, generation: 2)
 
-    rows_for_five = store.outbox.select { |row| row.fetch("entry").fetch("id") == 5 && row.fetch("generation") == 2 }
-    expect(rows_for_five.size).to eq(1)
-    expect(rows_for_five.first.fetch("entry").fetch("note")).to eq("second")
-    expect(rows_for_five.first.fetch("entry").fetch("version")).to eq(2)
-    expect(rows_for_five.first.fetch("outbox_position")).to be > first_position
-    # The other entry's row in the same generation is not dropped by the rewrite.
-    expect(store.outbox.count { |row| row.fetch("entry").fetch("id") == 6 }).to eq(1)
-    expect(store.outbox.pluck("outbox_position")).to eq(store.outbox.pluck("outbox_position").sort)
-    expect(store.highest_outbox_position).to eq(store.outbox.pluck("outbox_position").max)
-  end
+      rows_for_five = store.outbox.select { |row| row.fetch("entry").fetch("id") == 5 && row.fetch("generation") == 2 }
+      expect(rows_for_five.size).to eq(1)
+      expect(rows_for_five.first.fetch("entry").fetch("note")).to eq("second")
+      expect(rows_for_five.first.fetch("entry").fetch("version")).to eq(2)
+      expect(rows_for_five.first.fetch("outbox_position")).to be > first_position
+      # The other entry's row in the same generation is not dropped by the rewrite.
+      expect(store.outbox.count { |row| row.fetch("entry").fetch("id") == 6 }).to eq(1)
+      expect(store.outbox.pluck("outbox_position")).to eq(store.outbox.pluck("outbox_position").sort)
+      expect(store.highest_outbox_position).to eq(store.outbox.pluck("outbox_position").max)
+    end
   end
 
   context "more tests 20" do
-  it "an entry edit before any generation was admitted is refused and writes no outbox row" do
-    store = described_class.new
-    store.load_checkpoint(handoff_fakes_checkpoint(handoff_fakes_entry_row(id: 5, version: 1)))
+    it "an entry edit before any generation was admitted is refused and writes no outbox row" do
+      store = described_class.new
+      store.load_checkpoint(handoff_fakes_checkpoint(handoff_fakes_entry_row(id: 5, version: 1)))
 
-    expect { store.edit_entry!(5) }.to raise_error(ArgumentError)
-    expect(store.outbox).to eq([])
-    expect(store.highest_outbox_position).to eq(0)
+      expect { store.edit_entry!(5) }.to raise_error(ArgumentError)
+      expect(store.outbox).to eq([])
+      expect(store.highest_outbox_position).to eq(0)
 
-    store.admit(generation: 2)
-    store.admit(generation: 4)
-    store.edit_entry!(5)
+      store.admit(generation: 2)
+      store.admit(generation: 4)
+      store.edit_entry!(5)
 
-    expect(store.outbox.size).to eq(1)
-    expect(store.outbox.first.fetch("generation")).to eq(4)
-    expect(store.outbox.first.fetch("entry").fetch("version")).to eq(store.rows.fetch("entries").first.fetch("version"))
-  end
+      expect(store.outbox.size).to eq(1)
+      expect(store.outbox.first.fetch("generation")).to eq(4)
+      expect(store.outbox.first.fetch("entry").fetch("version")).to eq(store.rows.fetch("entries").first.fetch("version"))
+    end
   end
 
   context "more tests 21" do
-  # "a snapshot left out of the outbox leaves the projection behind and fails the spec"
-  # A refused batch must not pass for a drained outbox, or a shape bug in the
-  # fake would read as a projection left behind (or as no failure at all).
-  it "the outbox relay holds back an unadmitted generation and fails loudly on a refused batch once it is admitted" do
-    store = described_class.new
-    invalid = handoff_fakes_entry_row(id: 5, version: 1).except("version").merge("bill_status" => "no_such_status")
-    store.write_correction_snapshots(snapshots: [invalid], version: 1, generation: 2)
-    relay = TimekeepingHandoffOutboxRelay.new(store:)
-    through = store.highest_outbox_position
+    # "a snapshot left out of the outbox leaves the projection behind and fails the spec"
+    # A refused batch must not pass for a drained outbox, or a shape bug in the
+    # fake would read as a projection left behind (or as no failure at all).
+    it "the outbox relay holds back an unadmitted generation and fails loudly on a refused batch once it is admitted" do
+      store = described_class.new
+      invalid = handoff_fakes_entry_row(id: 5, version: 1).except("version").merge("bill_status" => "no_such_status")
+      store.write_correction_snapshots(snapshots: [invalid], version: 1, generation: 2)
+      relay = TimekeepingHandoffOutboxRelay.new(store:)
+      through = store.highest_outbox_position
 
-    # Generation 2 was never admitted, so nothing is sent before the flip.
-    expect { relay.drain!(through:) }.not_to raise_error
-    expect(relay.drained?(through:)).to be(true)
+      # Generation 2 was never admitted, so nothing is sent before the flip.
+      expect { relay.drain!(through:) }.not_to raise_error
+      expect(relay.drained?(through:)).to be(true)
 
-    # A position above the drain's bound is not this drain's to deliver.
-    store.admit(generation: 2)
-    expect { relay.drain!(through: 0) }.not_to raise_error
-    expect(relay.drained?(through: 0)).to be(true)
+      # A position above the drain's bound is not this drain's to deliver.
+      store.admit(generation: 2)
+      expect { relay.drain!(through: 0) }.not_to raise_error
+      expect(relay.drained?(through: 0)).to be(true)
 
-    expect { relay.drain!(through:) }.to raise_error(TimekeepingHandoffOutboxRelay::Undelivered, /422/)
-    expect(relay.drained?(through:)).to be(false)
-    # The refused row stays unsent, so a second drain refuses again rather than passing.
-    expect { relay.drain!(through:) }.to raise_error(TimekeepingHandoffOutboxRelay::Undelivered, /422/)
-  end
+      expect { relay.drain!(through:) }.to raise_error(TimekeepingHandoffOutboxRelay::Undelivered, /422/)
+      expect(relay.drained?(through:)).to be(false)
+      # The refused row stays unsent, so a second drain refuses again rather than passing.
+      expect { relay.drain!(through:) }.to raise_error(TimekeepingHandoffOutboxRelay::Undelivered, /422/)
+    end
   end
 
   context "more tests 22" do
-  # "Fake-path runner specs can use a test relay that delivers only Timekeeping's outbox snapshots through `Timekeeping::ProjectionConsumer`, so a snapshot left out of the outbox leaves the projection behind and fails the spec."
-  # The scenario: the store holds a newer version of an entry with no outbox row.
-  # A relay that copied stored rows, as the old fake drain does, would move the projection.
-  it "the outbox relay leaves the projection untouched for an entry the store holds at a newer version but never wrote to its outbox" do
-    entry = create(:timesheet_entry)
-    projected = TimesheetEntry.unscoped.find(entry.id)
-    at = Time.utc(2026, 1, 5, 9)
-    values = {
-      "id" => projected.id, "company_id" => projected.company_id, "version" => projected.version.to_i + 5,
-      "project_id" => projected.project_id, "user_id" => projected.user_id, "work_date" => Date.new(2026, 1, 5),
-      "duration" => 60.0, "note" => "held only in the store", "bill_status" => "unbilled",
-      "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
-      "proof_metadata" => {}, "created_at" => at, "updated_at" => at
-    }
-    row = Timekeeping::Handoff::Checkpoint::TABLES.fetch("entries").index_with { |column| values[column] }
-    tables = Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }.merge("entries" => [row])
-    store = described_class.new
-    store.load_checkpoint(Timekeeping::Handoff::Checkpoint.build(tables:))
-    store.admit(generation: TimekeepingOwnership.current.generation)
-    expect(store.outbox).to eq([])
+    # "Fake-path runner specs can use a test relay that delivers only Timekeeping's outbox snapshots through `Timekeeping::ProjectionConsumer`, so a snapshot left out of the outbox leaves the projection behind and fails the spec."
+    # The scenario: the store holds a newer version of an entry with no outbox row.
+    # A relay that copied stored rows, as the old fake drain does, would move the projection.
+    it "the outbox relay leaves the projection untouched for an entry the store holds at a newer version but never wrote to its outbox" do
+      entry = create(:timesheet_entry)
+      projected = TimesheetEntry.unscoped.find(entry.id)
+      at = Time.utc(2026, 1, 5, 9)
+      values = {
+        "id" => projected.id, "company_id" => projected.company_id, "version" => projected.version.to_i + 5,
+        "project_id" => projected.project_id, "user_id" => projected.user_id, "work_date" => Date.new(2026, 1, 5),
+        "duration" => 60.0, "note" => "held only in the store", "bill_status" => "unbilled",
+        "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
+        "proof_metadata" => {}, "created_at" => at, "updated_at" => at
+      }
+      row = Timekeeping::Handoff::Checkpoint::TABLES.fetch("entries").index_with { |column| values[column] }
+      tables = Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }.merge("entries" => [row])
+      store = described_class.new
+      store.load_checkpoint(Timekeeping::Handoff::Checkpoint.build(tables:))
+      store.admit(generation: TimekeepingOwnership.current.generation)
+      expect(store.outbox).to eq([])
 
-    relay = TimekeepingHandoffOutboxRelay.new(store:)
-    relay.drain!(through: store.highest_outbox_position)
+      relay = TimekeepingHandoffOutboxRelay.new(store:)
+      relay.drain!(through: store.highest_outbox_position)
 
-    expect(relay.drained?(through: store.highest_outbox_position)).to be(true)
-    after = TimesheetEntry.unscoped.find(entry.id)
-    expect(after.version).to eq(projected.version)
-    expect(after.note).to eq(projected.note)
-  end
+      expect(relay.drained?(through: store.highest_outbox_position)).to be(true)
+      after = TimesheetEntry.unscoped.find(entry.id)
+      expect(after.version).to eq(projected.version)
+      expect(after.note).to eq(projected.note)
+    end
   end
 
   # A well-formed snapshot at a generation the ownership row does not accept
