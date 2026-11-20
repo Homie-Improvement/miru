@@ -433,7 +433,8 @@ RSpec.describe "Timekeeping owner state harness" do
     end
 
     it "keeps the probe fixtures out of a normal suite run" do
-      %w[owner_state_probe.rb unset_owner_state_probe.rb switches_owner_probe.rb].each do |fixture|
+      %w[owner_state_probe.rb unset_owner_state_probe.rb switches_owner_probe.rb
+         dotenv_owner_state_probe.rb].each do |fixture|
         probe = Rails.root.join("spec/fixtures/timekeeping_harness", fixture)
         expect(probe).to exist
         expect(probe.basename.to_s).not_to end_with("_spec.rb")
@@ -513,5 +514,32 @@ RSpec.describe "Seeded committed_data owner state probe run (timekeeping)", :wit
     expect(stdout).to include("1 example, 0 failures")
     expect("#{stdout}\n#{stderr}").not_to include("HandoffBegun")
     expect("#{stdout}\n#{stderr}").not_to include("SeedDispositionRecorder::Error")
+  end
+end
+
+require "rails_helper"
+require "open3"
+require "tmpdir"
+
+RSpec.describe "Timekeeping owner state harness", :without_transaction do
+  it "the dotenv owner state probe's switches_owner example fails when an owner state is selected for its run, so it can catch a restored owner selection" do
+    probe = Rails.root.join("spec/fixtures/timekeeping_harness/dotenv_owner_state_probe.rb").to_s
+    expect(File).to exist(probe)
+    # A name ending in _spec.rb would put the probe into every normal suite run.
+    expect(File.basename(probe)).not_to end_with("_spec.rb")
+
+    # "Prevent file-based configuration from restoring owner selection, and test boot with a temporary dotenv file."
+    # The probe is the check that runs inside the booted child. Here a state is selected for its
+    # switches_owner example, as a restored dotenv value would select one, and the probe must fail.
+    # The probe's own ledger file, so its suite start never deletes this run's.
+    stdout, stderr, status = Dir.mktmpdir("dotenv-owner-state-probe-ledger") do |dir|
+      Open3.capture3({ "TIMEKEEPING_OWNER_STATE" => "timekeeping",
+                       TimekeepingQueueLedger::PATH_KEY => File.join(dir, "queue_ledger.json") },
+                     "bundle", "exec", "rspec", probe, "--tag", "switches_owner", chdir: Rails.root.to_s)
+    end
+    output = "#{stdout}\n#{stderr}"
+
+    expect(status).not_to be_success, output
+    expect(output).to include("1 example, 1 failure")
   end
 end
