@@ -16,6 +16,9 @@ RSpec.describe "forwarded Timekeeping setup helpers" do
   end
   let(:arrange_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
 
+  # These examples pin the helpers without the live adapter, so they stay meaningful in a live regression run too.
+  before { allow(TimekeepingRegressionAdapter).to receive(:current).and_return(nil) }
+
   # The copied setups every forwarded group used set the ownership singleton to owner
   # "timekeeping" at generation 2, gave the fake the same generation, registered the company,
   # the admin actor, paul and the project, and routed HTTP to the fake. The shared helper must
@@ -101,6 +104,9 @@ RSpec.describe "forwarded Timekeeping setup helpers" do
 end
 
 RSpec.describe "forwarded Timekeeping environment helper" do
+  # These examples pin the helper without the live adapter, so they stay meaningful in a live regression run too.
+  before { allow(TimekeepingRegressionAdapter).to receive(:current).and_return(nil) }
+
   # Both variables must be set for a forwarded import: the base URL picks the service and the key
   # signs the user token. A helper that set only one, or leaked them past the block, would break
   # other examples that expect the legacy store.
@@ -146,5 +152,98 @@ RSpec.describe "forwarded Timekeeping environment helper" do
       expect(ENV.fetch(Timekeeping::EntryApiClient::BASE_URL_ENV, nil)).to eq("http://outer.test")
       expect(ENV.fetch(Timekeeping::UserToken::PRIVATE_KEY_ENV, nil)).to eq("outer-key")
     end
+  end
+end
+
+RSpec.describe "forwarded Timekeeping helpers with the live adapter running" do
+  let(:adapter_company) { create(:company) }
+  let(:adapter_user) { create(:user, current_workspace_id: adapter_company.id) }
+  let(:adapter_project) { create(:project, client: create(:client, company: adapter_company)) }
+  let(:adapter_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+  let(:adapter_key) { OpenSSL::PKey::RSA.generate(2048) }
+  let(:adapter_live) { double("live adapter instance", base_url: "http://127.0.0.1:4999", private_key: adapter_key) }
+
+  before { allow(TimekeepingRegressionAdapter).to receive(:current).and_return(adapter_live) }
+
+  # "With the adapter present, `arrange_forwarded_timekeeping` still applies its `owner_state:` but skips every
+  # `fake.register_*` call and `route_timekeeping_to_fake`."
+  it "arrange_forwarded_timekeeping applies the owner state but registers and routes nothing to the fake, even with an explicit base_url" do
+    %i[register_company register_user register_project].each do |method|
+      allow(adapter_fake).to receive(method).and_call_original
+    end
+    allow(self).to receive(:route_timekeeping_to_fake).and_call_original
+    stubs_before = WebMock::StubRegistry.instance.request_stubs.size
+
+    [{}, { base_url: "http://other-timekeeping.test" }].each do |base_url_option|
+      arrange_forwarded_timekeeping(adapter_fake, company: adapter_company, users: { adapter_user => "admin" },
+                                                  project: adapter_project, owner_state: "timekeeping", **base_url_option)
+
+      expect(TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID))
+        .to have_attributes(owner: "timekeeping", monolith_store: "legacy", generation: 2)
+    end
+
+    expect(self).not_to have_received(:route_timekeeping_to_fake)
+    expect(WebMock::StubRegistry.instance.request_stubs.size).to eq(stubs_before)
+    %i[register_company register_user register_project].each do |method|
+      expect(adapter_fake).not_to have_received(method)
+    end
+    # "FakeTimekeeping records zero requests"
+    expect(adapter_fake.requests).to be_empty
+  end
+
+  # "While the live adapter runs (`TimekeepingRegressionAdapter.current` non-nil), `with_forwarded_timekeeping_env`
+  # uses the adapter's base URL and private key instead of `FORWARDED_TIMEKEEPING_BASE_URL` and the fake's key"
+  it "with_forwarded_timekeeping_env yields the adapter URL and PEM, even for an explicit URL, and restores both keys, also when the block raises" do
+    base_url_env = Timekeeping::EntryApiClient::BASE_URL_ENV
+    key_env = Timekeeping::UserToken::PRIVATE_KEY_ENV
+    adapter_values = { base_url: "http://127.0.0.1:4999", private_key: adapter_key.to_pem }
+
+    with_timekeeping_env(base_url_env => "http://outer.test", key_env => "outer-key") do
+      seen = nil
+      with_forwarded_timekeeping_env do
+        seen = { base_url: ENV.fetch(base_url_env, nil), private_key: ENV.fetch(key_env, nil) }
+      end
+      expect(seen).to eq(adapter_values)
+      expect(seen[:private_key]).not_to eq(timekeeping_key_pair.to_pem)
+      expect(ENV.fetch(base_url_env, nil)).to eq("http://outer.test")
+      expect(ENV.fetch(key_env, nil)).to eq("outer-key")
+
+      # An explicit URL does not take the connection away from the adapter.
+      [[], ["http://other-timekeeping.test"]].each do |url_argument|
+        seen_while_raising = nil
+        expect do
+          with_forwarded_timekeeping_env(*url_argument) do
+            seen_while_raising = { base_url: ENV.fetch(base_url_env, nil), private_key: ENV.fetch(key_env, nil) }
+            raise Timekeeping::Gateway::StaleGeneration
+          end
+        end.to raise_error(Timekeeping::Gateway::StaleGeneration)
+
+        expect(seen_while_raising).to eq(adapter_values)
+        expect(ENV.fetch(base_url_env, nil)).to eq("http://outer.test")
+        expect(ENV.fetch(key_env, nil)).to eq("outer-key")
+      end
+    end
+  end
+end
+
+RSpec.describe "forwarded Timekeeping setup helpers in the legacy state" do
+  let(:legacy_company) { create(:company) }
+  let(:legacy_paul) { create(:user, current_workspace_id: legacy_company.id) }
+  let(:legacy_project) { create(:project, client: create(:client, company: legacy_company)) }
+  let(:legacy_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  it "arrange_forwarded_timekeeping with owner_state legacy leaves owner monolith, store legacy, generation 1 and fake generation 1" do
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 5)
+    legacy_fake.generation = 5
+
+    arrange_forwarded_timekeeping(legacy_fake, company: legacy_company,
+                                               users: { legacy_paul => "employee" },
+                                               project: legacy_project,
+                                               owner_state: "legacy")
+
+    # "`arrange_forwarded_timekeeping(owner_state: "legacy")` leaves owner monolith, store legacy, generation 1 and `fake.generation` 1"
+    ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+    expect(ownership).to have_attributes(owner: "monolith", monolith_store: "legacy", generation: 1)
+    expect(legacy_fake.generation).to eq(1)
   end
 end
