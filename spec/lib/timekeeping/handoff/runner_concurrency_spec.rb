@@ -6,18 +6,20 @@ require "rails_helper"
 require "tmpdir"
 
 RSpec.describe Timekeeping::Handoff::Runner, committed_data: true do
-  it "close admission stops at the lock timeout with the generation unchanged and a later run raises it only once" do
+  # Owners whose stores the runner never reaches in these examples, because
+  # each run stops at or before close admission.
+  def unreached_store_owners(monolith_admission: TimekeepingHandoffFakes::RecordingAdmission.new,
+                             timekeeping_admission: TimekeepingHandoffFakes::RecordingAdmission.new)
     store = Object.new
-    owners = TimekeepingHandoffFakes.owners(
-      timekeeping: store, timekeeping_admission: TimekeepingHandoffFakes::RecordingAdmission.new,
-      monolith_admission: TimekeepingHandoffFakes::RecordingAdmission.new, monolith_store: store,
-      settle: nil, relay: false
-    )
-    observer = TimekeepingHandoffHooks::Interrupt.new(at: :after_close_admission)
+    TimekeepingHandoffFakes.owners(timekeeping: store, timekeeping_admission:, monolith_admission:,
+                                   monolith_store: store, settle: nil, relay: false)
+  end
 
-    # "Close admission waits at most 60 s for billing write transactions holding FOR SHARE on the ownership row, then stops resumable"
-    expect(Timekeeping::Handoff::Runner::CLOSE_ADMISSION_LOCK_TIMEOUT).to eq(60.seconds)
-
+  # Runs the block while another connection holds FOR SHARE on the ownership
+  # row, as an open billing write transaction does. A join that times out
+  # leaves the thread alive with its transaction open, so it is stopped before
+  # the example goes on.
+  def while_a_billing_write_holds_the_ownership_row
     held = Queue.new
     release = Queue.new
     billing_write = committed_data_thread do
@@ -28,17 +30,29 @@ RSpec.describe Timekeeping::Handoff::Runner, committed_data: true do
       end
     end
 
+    begin
+      expect(held.pop(timeout: 5)).to be(true)
+      yield
+    ensure
+      release << true
+      billing_write.join(5) || billing_write.kill.join
+    end
+  end
+
+  it "close admission stops at the lock timeout with the generation unchanged and a later run raises it only once" do
+    owners = unreached_store_owners
+    observer = TimekeepingHandoffHooks::Interrupt.new(at: :after_close_admission)
+
+    # "Close admission waits at most 60 s for billing write transactions holding FOR SHARE on the ownership row, then stops resumable"
+    expect(Timekeeping::Handoff::Runner::CLOSE_ADMISSION_LOCK_TIMEOUT).to eq(60.seconds)
+
     Dir.mktmpdir do |report_root|
-      begin
-        expect(held.pop(timeout: 5)).to be(true)
+      while_a_billing_write_holds_the_ownership_row do
         started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         expect do
           described_class.run(direction: :cutover, owners:, report_root:, close_admission_lock_timeout: 0.3.seconds)
         end.to raise_error(Timekeeping::Handoff::Runner::Refused)
         expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be < 5
-      ensure
-        release << true
-        billing_write.join(5)
       end
 
       # A raised generation with a null handoff_step would make the next start raise it a second time.
@@ -55,20 +69,37 @@ RSpec.describe Timekeeping::Handoff::Runner, committed_data: true do
     expect(resumed.generation).to eq(2)
     expect(resumed.handoff_step).to eq("close_admission")
   end
-end
 
-RSpec.describe "Timekeeping::Handoff::Runner second concurrent run", committed_data: true do
-  it "a second run on another connection fails fast while the first run holds the handoff lock" do
-    store = Object.new
-    build_owners = lambda do |monolith_admission, timekeeping_admission|
-      TimekeepingHandoffFakes.owners(timekeeping: store, timekeeping_admission:, monolith_admission:,
-                                     monolith_store: store, settle: nil, relay: false)
+  it "an abort after the close admission lock timeout reopens only the monolith at the unchanged generation 1" do
+    monolith_admission = TimekeepingHandoffFakes::RecordingAdmission.new
+    timekeeping_admission = TimekeepingHandoffFakes::RecordingAdmission.new
+    owners = unreached_store_owners(monolith_admission:, timekeeping_admission:)
+
+    Dir.mktmpdir do |report_root|
+      while_a_billing_write_holds_the_ownership_row do
+        expect do
+          described_class.run(direction: :cutover, owners:, report_root:, close_admission_lock_timeout: 0.3.seconds)
+        end.to raise_error(Timekeeping::Handoff::Runner::Refused)
+      end
+
+      # The lock holder has finished, so the abort below does not depend on thread timing.
+      timed_out = TimekeepingOwnership.current.attributes.slice("generation", "owner", "handoff_step")
+      expect(timed_out).to eq("generation" => 1, "owner" => "monolith", "handoff_step" => nil)
+
+      # "Extend the timeout example to execute abort and verify that it reopens only the unchanged current owner."
+      described_class.run(direction: :cutover, abort: true, owners:, report_root:)
+
+      expect(TimekeepingOwnership.current.attributes.slice("generation", "owner", "handoff_step")).to eq(timed_out)
+      expect(monolith_admission.calls.select { |call| call[0] == :admit }).to eq([[:admit, 1]])
+      expect(timekeeping_admission.calls.select { |call| call[0] == :admit }).to be_empty
     end
-    first_owners = build_owners.call(TimekeepingHandoffFakes::RecordingAdmission.new,
-                                     TimekeepingHandoffFakes::RecordingAdmission.new)
+  end
+
+  it "a second run on another connection fails fast while the first run holds the handoff lock" do
+    first_owners = unreached_store_owners
     second_monolith = TimekeepingHandoffFakes::RecordingAdmission.new
     second_timekeeping = TimekeepingHandoffFakes::RecordingAdmission.new
-    second_owners = build_owners.call(second_monolith, second_timekeeping)
+    second_owners = unreached_store_owners(monolith_admission: second_monolith, timekeeping_admission: second_timekeeping)
 
     stop_first_run = Class.new(StandardError)
     paused = Queue.new
@@ -85,7 +116,7 @@ RSpec.describe "Timekeeping::Handoff::Runner second concurrent run", committed_d
     Dir.mktmpdir do |report_root|
       first_error = nil
       first_run = committed_data_thread do
-        Timekeeping::Handoff::Runner.run(direction: :cutover, owners: first_owners, observer: holding_observer, report_root:)
+        described_class.run(direction: :cutover, owners: first_owners, observer: holding_observer, report_root:)
       rescue StandardError => error
         first_error = error
       end
@@ -98,7 +129,7 @@ RSpec.describe "Timekeeping::Handoff::Runner second concurrent run", committed_d
         # "A session advisory lock held for the whole run makes a second concurrent run fail fast."
         started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         expect do
-          Timekeeping::Handoff::Runner.run(direction: :cutover, owners: second_owners, report_root:)
+          described_class.run(direction: :cutover, owners: second_owners, report_root:)
         end.to raise_error(Timekeeping::Handoff::Runner::Refused)
         expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be < 2
 
@@ -112,74 +143,6 @@ RSpec.describe "Timekeeping::Handoff::Runner second concurrent run", committed_d
       end
 
       expect(first_error).to be_a(stop_first_run)
-    end
-  end
-end
-
-# Generated by Descant: acceptance tests below.
-RSpec.describe Timekeeping::Handoff::Runner, "abort after close admission timeout", committed_data: true do
-  it "an abort after the close admission lock timeout reopens only the monolith at the unchanged generation 1" do
-    admission_class = Class.new do
-      attr_reader :calls
-
-      def initialize
-        @calls = []
-      end
-
-      def enforces_fence? = true
-
-      def fence_admission
-        @calls << [:fence]
-        nil
-      end
-
-      def admit(generation:)
-        @calls << [:admit, generation]
-        nil
-      end
-    end
-    store = Object.new
-    monolith_admission = admission_class.new
-    timekeeping_admission = admission_class.new
-    owners = {
-      monolith: Timekeeping::Handoff::Owner.new(name: "monolith", store:, admission: monolith_admission,
-                                                settle: nil, drain: nil),
-      timekeeping: Timekeeping::Handoff::Owner.new(name: "timekeeping", store:, admission: timekeeping_admission,
-                                                   settle: nil, drain: nil)
-    }
-
-    held = Queue.new
-    release = Queue.new
-    billing_write = committed_data_thread do
-      TimekeepingOwnership.transaction do
-        TimekeepingOwnership.lock("FOR SHARE").find(TimekeepingOwnership::SINGLETON_ID)
-        held << true
-        release.pop
-      end
-    end
-
-    Dir.mktmpdir do |report_root|
-      begin
-        expect(held.pop(timeout: 5)).to be(true)
-        expect do
-          described_class.run(direction: :cutover, owners:, report_root:, close_admission_lock_timeout: 0.3.seconds)
-        end.to raise_error(Timekeeping::Handoff::Runner::Refused)
-      ensure
-        release << true
-        # A join that times out leaves the thread alive with its transaction open, so stop it before going on.
-        billing_write.join(5) || billing_write.kill.join
-      end
-
-      # The lock holder has finished, so the abort below does not depend on thread timing.
-      timed_out = TimekeepingOwnership.current.attributes.slice("generation", "owner", "handoff_step")
-      expect(timed_out).to eq("generation" => 1, "owner" => "monolith", "handoff_step" => nil)
-
-      # "Extend the timeout example to execute abort and verify that it reopens only the unchanged current owner."
-      described_class.run(direction: :cutover, abort: true, owners:, report_root:)
-
-      expect(TimekeepingOwnership.current.attributes.slice("generation", "owner", "handoff_step")).to eq(timed_out)
-      expect(monolith_admission.calls.select { |call| call[0] == :admit }).to eq([[:admit, 1]])
-      expect(timekeeping_admission.calls.select { |call| call[0] == :admit }).to be_empty
     end
   end
 end

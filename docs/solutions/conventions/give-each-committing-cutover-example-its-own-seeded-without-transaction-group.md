@@ -25,7 +25,7 @@ A group tagged `:seeded_without_transaction` loads the two-tenant seed once. It 
 
 ## Solution
 
-Put each example that commits a cutover in its own `RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction` group, so each one starts from a fresh seed. Add a comment saying why the groups are split, so no one merges them back. Before you trust a new pair of examples, run them together in one file.
+Put each example that commits a cutover in its own group tagged `:two_tenant_seed, :seeded_without_transaction`, so each one starts from a fresh seed. In the runner specs that group is a `context` under one untagged `RSpec.describe Timekeeping::Handoff::Runner`. Never tag the parent describe, because the seed loads once per ancestry and every child would share it. Add a comment saying why the groups are split, so no one merges them back. Before you trust a new pair of examples, run them together in one file.
 
 ## Why it matters
 
