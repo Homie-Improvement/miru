@@ -1004,6 +1004,14 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     timekeeping.rows.fetch(table).filter_map { |row| row["operation_id"].to_s if row["company_id"] == company_id }
   end
 
+  # The company's full invoice_operations and reservations rows Timekeeping
+  # holds, so a rewritten field is caught as well as an added or lost row.
+  def recutover_loaded_company_rows(timekeeping, company_id)
+    %w[invoice_operations reservations].index_with do |table|
+      timekeeping.rows.fetch(table).filter_map { |row| row.dup if row["company_id"] == company_id }
+    end
+  end
+
   # "the monolith commits a new invoice intent through the prepared adapter
   # between rollback and re-cutover, and the re-cutover then reaches its checkpoint"
   # The save locks the entry only through its reservation and outbox snapshot:
@@ -1026,9 +1034,10 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     expect(local_entry).not_to be_nil
     company_id = local_entry.company_id
     other_company_id = Company.where.not(id: company_id).pick(:id)
-    other_before = %w[invoice_operations reservations].index_with do |table|
-      recutover_loaded_operation_ids(timekeeping, table, other_company_id)
-    end
+    other_before = recutover_loaded_company_rows(timekeeping, other_company_id)
+    # The other company's seeded reservations predate any invoice operation,
+    # so only its reservations give the unchanged-rows check something to hold.
+    expect(other_before.fetch("reservations")).to be_present
     raised_version = local_entry.version + 1
     timesheet_entry = TimesheetEntry.unscoped.find(local_entry.id)
     invoice = create(:invoice, company_id:, client: Client.where(company_id:).first)
@@ -1056,10 +1065,8 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     loaded_operation = timekeeping.rows.fetch("invoice_operations").find { |row| row["operation_id"].to_s == operation_id }
     expect(loaded_operation).to include("company_id" => company_id, "state" => "committed")
     expect(TimesheetEntry.unscoped.find(local_entry.id)).to have_attributes(locked: true, version: raised_version)
-    other_after = %w[invoice_operations reservations].index_with do |table|
-      recutover_loaded_operation_ids(timekeeping, table, other_company_id)
-    end
-    expect(other_after).to eq(other_before)
+    other_after = recutover_loaded_company_rows(timekeeping, other_company_id)
+    other_before.each { |table, rows| expect(other_after.fetch(table)).to match_array(rows) }
   ensure
     FileUtils.rm_rf(report_root) if report_root
   end
