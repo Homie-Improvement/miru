@@ -710,6 +710,20 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
     expect(second.companies.fetch(202)).not_to be_abort
   end
 
+  # The only run in this file whose every difference is listed, so the whole result must not abort.
+  it "signals a listed difference with listed true" do
+    tables = recon_checks_tables(entries: [recon_checks_entry(101, note: "changed")])
+    correction = described_class::Correction.new(check: :entries, row_key: [1], field: "note")
+    result = recon_checks_run(checkpoint_tables: tables, listed_corrections: { 101 => [correction] })
+    expect(result).not_to be_abort
+
+    stored = RailsEventViewer::Entry.where(name: "Timekeeping::ReconciliationDifferenceFound")
+    expect { described_class.report(result) }.to change { stored.count }.by(1)
+
+    data = stored.order(:id).last.payload["data"]
+    expect(data).to include("company_id" => 101, "check" => "entries", "field" => "note", "listed" => true)
+  end
+
   # Reconciliation never repairs to "intended" behaviour: a listed difference stays in the report as stored.
   it "reports listed and unlisted differences without writing outside the event store and returns the result unrepaired" do
     changed = recon_checks_tables.merge(
@@ -749,7 +763,11 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
   end
 
   # Event history is readable across every workspace, so the payloads hold identifiers, not row or money values.
+  # Both sides carry a note, so a note leaking from either the source or the checkpoint is caught.
   it "stores one difference event per difference under its own company and a financial event only for the changed discount" do
+    source = recon_checks_tables.merge(
+      "entries" => [recon_checks_entry(101, note: "secret-note-source-a"), recon_checks_entry(202, note: "secret-note-source-b")]
+    )
     changed = recon_checks_tables.merge(
       "entries" => [recon_checks_entry(101, note: "secret-note-a"), recon_checks_entry(202, note: "secret-note-b")]
     )
@@ -757,7 +775,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
                      202 => recon_checks_snapshot(202, { [:invoice, 9, :discount] => BigDecimal("5") }) }
     money_after = { 101 => recon_checks_snapshot(101, { [:invoice, 9, :discount] => BigDecimal("987654.32") }),
                     202 => recon_checks_snapshot(202, { [:invoice, 9, :discount] => BigDecimal("5") }) }
-    result = recon_checks_run(checkpoint_tables: changed, money_before:, money_after:)
+    result = recon_checks_run(source_tables: source, checkpoint_tables: changed, money_before:, money_after:)
     differences = result.companies.values.flat_map { |report| report.checks.values.flatten }
     expect(differences.map(&:company_id).uniq).to contain_exactly(101, 202)
     expect(result.to_h.inspect).not_to include("secret-note")
@@ -768,11 +786,12 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
     expect { described_class.report(result) }
       .to change { reconciliation.count }.by(differences.size).and change { financial.count }.by(1)
 
-    stored = reconciliation.order(:id).last(differences.size).map { |row| row.payload["data"] }
+    payloads = reconciliation.order(:id).last(differences.size).map(&:payload)
+    stored = payloads.pluck("data")
     expect(stored.pluck("company_id")).to match_array(differences.map(&:company_id))
     expect(stored.map(&:keys)).to all(contain_exactly(*%w[company_id check table row_key field reason listed]))
-    expect(JSON.generate(stored)).not_to include("secret-note")
-    expect(JSON.generate(stored)).not_to include("987654")
+    expect(JSON.generate(payloads)).not_to include("secret-note")
+    expect(JSON.generate(payloads)).not_to include("987654")
 
     money_data = financial.order(:id).last.payload["data"]
     expect(money_data.keys).to match_array(%w[company_id kind record_id field])
