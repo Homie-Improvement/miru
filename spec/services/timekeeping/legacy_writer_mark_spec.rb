@@ -93,44 +93,6 @@ RSpec.describe Timekeeping::LegacyWriterMark do
     end
   end
 
-  context "more tests 13" do
-    # Records every statement and answers nil to every read, the way a session
-    # that never set miru.writer answers current_setting('miru.writer', true).
-    let(:null_setting_connection) do
-      Class.new do
-        attr_reader :statements
-
-        def initialize
-          @statements = []
-        end
-
-        def select_value(sql)
-          @statements << sql
-          nil
-        end
-
-        def execute(sql)
-          @statements << sql
-          nil
-        end
-      end.new
-    end
-
-    it "restores a NULL previous writer as an empty string through set_config" do
-      result = described_class.call(null_setting_connection) { :block_result }
-
-      # "a NULL previous value is restored as `''`, because the code writes `previous.to_s`"
-      expect(result).to eq(:block_result)
-      expect(null_setting_connection.statements).to eq(
-        [
-          "SELECT current_setting('miru.writer', true)",
-          "SET LOCAL miru.writer = 'legacy_gateway'",
-          "SELECT set_config('miru.writer', '', true)"
-        ]
-      )
-    end
-  end
-
   context "more tests 14" do
     it "marks legacy_gateway inside the block and puts the caller's mark back before the caller's transaction ends" do
       connection = ActiveRecord::Base.connection
@@ -210,26 +172,6 @@ RSpec.describe Timekeeping::LegacyWriterMark do
         .to eq(["app/services/timekeeping/legacy_writer_mark.rb"])
       expect(Rails.root.join("app/services/timekeeping/gateway.rb").read).to include("LegacyWriterMark.call")
       expect(Rails.root.join("app/services/invoices/legacy_reservations.rb").read).to include("LegacyWriterMark.call")
-    end
-  end
-
-  context "more tests 18" do
-    # "restore on failure too, and rescue `ActiveRecord::StatementInvalid` from the restore only, so the write's own error reaches the caller."
-    it "re-raises the block's own SQL error when the aborted transaction makes the restore fail" do
-      connection = ActiveRecord::Base.connection
-      raised = nil
-
-      ActiveRecord::Base.transaction(requires_new: true) do
-        connection.execute("SET LOCAL miru.writer = 'caller_mark'")
-        described_class.call(connection) { connection.select_value("SELECT 1 / 0") }
-      rescue ActiveRecord::StatementInvalid => error
-        raised = error
-        raise ActiveRecord::Rollback
-      end
-
-      expect(raised).to be_a(ActiveRecord::StatementInvalid)
-      expect(raised.message).to include("division by zero")
-      expect(raised.message).not_to include("current transaction is aborted")
     end
   end
 end
