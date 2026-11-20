@@ -473,8 +473,10 @@ jobs:
   #
   # The same job also runs the Timekeeping queue collector against real
   # completed, claimed and failed Solid Queue rows in the Timekeeping test
-  # database. Every other job leaves TIMEKEEPING_LIVE unset or does not name
-  # this spec, so the spec skips or does not run there.
+  # database, and the per-company tenant state digest against the same
+  # Timekeeping test database. Every other job leaves TIMEKEEPING_LIVE unset
+  # or does not name these specs, so their live examples skip or do not run
+  # there.
   timekeeping-runtime-live:
     name: Timekeeping demo runtime starts only the dedicated workers
     runs-on: ubuntu-24.04
@@ -533,8 +535,8 @@ jobs:
       - name: Setup monolith test database
         run: bundle exec rails db:test:prepare
 
-      - name: Run the demo runtime queue spec and the Timekeeping collector row spec
-        run: bundle exec rspec spec/timekeeping/runtime_queues_spec.rb spec/timekeeping/timekeeping_collector_rows_spec.rb
+      - name: Run the demo runtime queue, Timekeeping collector row and tenant state digest specs
+        run: bundle exec rspec spec/timekeeping/runtime_queues_spec.rb spec/timekeeping/timekeeping_collector_rows_spec.rb spec/meta/timekeeping_tenant_state_digest_spec.rb
 
   security-audit:
     name: Security audit
