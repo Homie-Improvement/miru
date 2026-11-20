@@ -284,3 +284,44 @@ RSpec.describe Timekeeping::Handoff::OperationsSettle do
     end
   end
 end
+
+RSpec.describe Timekeeping::Handoff::OperationsSettle do
+  it "builds the monolith settle integration without leasing an invoice operations connection" do
+    # Built at boot by the initializer, a connection leased here would belong to
+    # the boot thread and be reused from request and job threads.
+    expect(InvoiceOperationsRecord).not_to receive(:connection)
+
+    port = described_class::MonolithPort.new
+    settle = described_class.new(owner: port, reservations: Invoices::PreparedReservations.new)
+
+    expect(settle).to respond_to(:settle!, :settled?, :stop_applying!)
+  end
+end
+
+RSpec.describe Timekeeping::Handoff::OperationsSettle do
+  it "counts prepared operations on an explicit connection and on the invoice operations connection when none is given" do
+    explicit = instance_double(ActiveRecord::ConnectionAdapters::PostgreSQLAdapter)
+    allow(explicit).to receive(:select_value).with(described_class::MonolithPort::PREPARED_SQL).and_return("7")
+
+    expect(described_class::MonolithPort.new(connection: explicit).prepared_operations).to eq(7)
+
+    shared = instance_double(ActiveRecord::ConnectionAdapters::PostgreSQLAdapter)
+    allow(shared).to receive(:select_value).with(described_class::MonolithPort::PREPARED_SQL).and_return("2")
+    port = described_class::MonolithPort.new
+    # Resolved when the port queries, not when it was built.
+    allow(InvoiceOperationsRecord).to receive(:connection).and_return(shared)
+
+    expect(port.prepared_operations).to eq(2)
+  end
+
+  it "reads pending intents on the invoice operations connection at query time when none is given" do
+    owner = instance_double(described_class::MonolithPort, prepared_operations: 0)
+    settle = described_class.new(owner:, reservations: Invoices::PreparedReservations.new)
+    shared = instance_double(ActiveRecord::ConnectionAdapters::PostgreSQLAdapter)
+    allow(shared).to receive(:select_value).with(described_class::PENDING_SQL).and_return(true, false)
+    allow(InvoiceOperationsRecord).to receive(:connection).and_return(shared)
+
+    expect(settle.settled?).to be(false)
+    expect(settle.settled?).to be(true)
+  end
+end

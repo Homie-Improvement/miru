@@ -18,6 +18,17 @@ module MiruWeb
     # boot, so an empty value means unset: config/database.yml applies instead.
     ENV.delete("DATABASE_URL") if ENV["DATABASE_URL"] == ""
 
+    # The `bin/timekeeping-demo regression` switches_owner pass sets
+    # TIMEKEEPING_OWNER_STATE to "" for the same reason, so that a local .env
+    # cannot select an owner state for it. The spec harness in
+    # spec/support/timekeeping/owner_state.rb reads only an absent key as no
+    # state, so an empty value is removed here, before the harness reads it.
+    # Only a regression child (TIMEKEEPING_REGRESSION=1) gets this, so a blank
+    # value set anywhere else still reaches the harness and is reported there.
+    if ENV["TIMEKEEPING_REGRESSION"] == "1" && ENV["TIMEKEEPING_OWNER_STATE"] == ""
+      ENV.delete("TIMEKEEPING_OWNER_STATE")
+    end
+
     config.active_storage ||= ActiveSupport::OrderedOptions.new
     config.active_storage.queues ||= ActiveSupport::OrderedOptions.new
 
