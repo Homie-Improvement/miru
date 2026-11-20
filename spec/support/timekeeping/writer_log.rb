@@ -89,9 +89,10 @@ module TimekeepingWriterLog
   module_function
 
   # Creates the log table, the record function and the trigger. Safe to run
-  # again, and over objects a crashed run left behind.
+  # again, and over objects a crashed run left behind. A leftover table keeps
+  # the dead run's rows, so the log is emptied before the trigger goes back on.
   def install!(connection)
-    [CREATE_LOG_TABLE_SQL, CREATE_RECORD_FUNCTION_SQL, DROP_TRIGGER_SQL, CREATE_TRIGGER_SQL].each do |sql|
+    [CREATE_LOG_TABLE_SQL, CLEAR_LOG_SQL, CREATE_RECORD_FUNCTION_SQL, DROP_TRIGGER_SQL, CREATE_TRIGGER_SQL].each do |sql|
       connection.execute(sql)
     end
     nil

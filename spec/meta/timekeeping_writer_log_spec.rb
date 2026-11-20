@@ -447,6 +447,10 @@ RSpec.describe "TimekeepingWriterLog crashed-run install", committed_data: true 
   it "install! over an installed trigger leaves exactly one trigger in the catalog" do
     connection = ActiveRecord::Base.connection
     TimekeepingWriterLog.install!(connection)
+    # A row the dead run logged must not reach the next guard's reads.
+    connection.execute(
+      "INSERT INTO public.miru_writer_log (writer, op, backend_pid) VALUES ('stale_run', 'UPDATE', 0)"
+    )
     TimekeepingWriterLog.install!(connection)
 
     entry = create(:timesheet_entry)
