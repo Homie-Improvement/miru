@@ -44,7 +44,9 @@ module Timekeeping
       class MonolithPort
         PREPARED_SQL = "SELECT COUNT(*) FROM invoice_operations WHERE state = 'prepared'"
 
-        def initialize(connection: InvoiceOperationsRecord.connection)
+        # connection: nil reads InvoiceOperationsRecord's connection at query
+        # time, so a port built at boot leases none on the boot thread.
+        def initialize(connection: nil)
           @connection = connection
         end
 
@@ -56,13 +58,19 @@ module Timekeeping
         end
 
         def prepared_operations
-          Integer(@connection.select_value(PREPARED_SQL))
+          Integer(connection.select_value(PREPARED_SQL))
         end
 
         def stop_applying(generation:)
           TimekeepingOwnership.stop_applying!(generation:)
           nil
         end
+
+        private
+
+          def connection
+            @connection || InvoiceOperationsRecord.connection
+          end
       end
 
       # Timekeeping as outgoing owner, reached through its handoff routes.
@@ -90,8 +98,9 @@ module Timekeeping
       # reservations: the adapter commits and aborts are delivered to; the
       # outgoing owner's.
       # connection: where invoice_operation_intents are read; intents are
-      # written through InvoiceOperationsRecord's own connection.
-      def initialize(owner:, reservations:, connection: InvoiceOperationsRecord.connection)
+      # written through InvoiceOperationsRecord's own connection, which nil
+      # reads at query time.
+      def initialize(owner:, reservations:, connection: nil)
         @owner = owner
         @reservations = reservations
         @connection = connection
@@ -132,7 +141,11 @@ module Timekeeping
         end
 
         def pending_intent?
-          ActiveRecord::Type::Boolean.new.cast(@connection.select_value(PENDING_SQL))
+          ActiveRecord::Type::Boolean.new.cast(connection.select_value(PENDING_SQL))
+        end
+
+        def connection
+          @connection || InvoiceOperationsRecord.connection
         end
     end
   end

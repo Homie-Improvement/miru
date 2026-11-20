@@ -80,12 +80,19 @@ class TimekeepingLiveInstance
   # port nil picks a free port. database_url nil reads TIMEKEEPING_DATABASE_URL
   # from ENV; a given URL is the only one the service's processes see. Either
   # way start refuses the URL unless TestDatabaseGuard accepts it.
-  def self.start(reference_stub:, admission_generation: DEFAULT_ADMISSION_GENERATION, port: nil, database_url: nil)
-    new(reference_stub:, admission_generation:, port:, database_url:).tap(&:start)
+  #
+  # snapshot_app: a Rack app that answers the monolith's entry-snapshot
+  # endpoint, such as Rails.application. When given, it is served on its own
+  # loopback listener and the service's relay delivers to it; without it the
+  # service has no snapshot endpoint.
+  def self.start(reference_stub:, admission_generation: DEFAULT_ADMISSION_GENERATION, port: nil, database_url: nil,
+                 snapshot_app: nil)
+    new(reference_stub:, admission_generation:, port:, database_url:, snapshot_app:).tap(&:start)
   end
 
   # Every argument is checked here, before any process starts.
-  def initialize(reference_stub:, admission_generation: DEFAULT_ADMISSION_GENERATION, port: nil, database_url: nil)
+  def initialize(reference_stub:, admission_generation: DEFAULT_ADMISSION_GENERATION, port: nil, database_url: nil,
+                 snapshot_app: nil)
     unless admission_generation.is_a?(Integer) && admission_generation.positive?
       raise ArgumentError, "admission_generation must be a positive Integer"
     end
@@ -99,6 +106,7 @@ class TimekeepingLiveInstance
     @admission_generation = admission_generation
     @port = port
     @database_url = database_url
+    @snapshot_app = snapshot_app
     @service_token = "live-service-#{SecureRandom.hex(24)}"
     @private_key = OpenSSL::PKey::RSA.generate(2048)
   end
@@ -106,6 +114,7 @@ class TimekeepingLiveInstance
   def start
     @database_url = checked_database_url
     start_reference_server
+    start_snapshot_server if @snapshot_app
     port = @port || free_port
     @base_url = "http://#{HOST}:#{port}"
     run_in_service!(*RAILS, "db:prepare")
@@ -133,6 +142,8 @@ class TimekeepingLiveInstance
     @pid = nil
     @reference_server&.stop(true)
     @reference_server = nil
+    @snapshot_server&.stop(true)
+    @snapshot_server = nil
   end
 
   # Empties the service's write metrics; call it before each example.
@@ -142,6 +153,11 @@ class TimekeepingLiveInstance
 
   def reference_url
     "http://#{HOST}:#{@reference_port}"
+  end
+
+  # nil when the instance was started without a snapshot_app.
+  def snapshot_url
+    "http://#{HOST}:#{@snapshot_port}" if @snapshot_port
   end
 
   # Sends one request with the service token and answers the Net::HTTPResponse.
@@ -177,7 +193,7 @@ class TimekeepingLiveInstance
         "MONOLITH_REFERENCE_URL" => reference_url,
         # The service's own process needs no monolith database setting.
         "DATABASE_URL" => nil
-      }
+      }.merge(snapshot_url ? { "MONOLITH_SNAPSHOT_URL" => snapshot_url } : {})
     end
 
     # db:prepare, the admit runner and clear_metrics! all write to this
@@ -239,6 +255,13 @@ class TimekeepingLiveInstance
       @reference_server.add_tcp_listener(HOST, 0)
       @reference_port = @reference_server.connected_ports.first
       @reference_server.run
+    end
+
+    def start_snapshot_server
+      @snapshot_server = Puma::Server.new(@snapshot_app, nil, min_threads: 1, max_threads: 4)
+      @snapshot_server.add_tcp_listener(HOST, 0)
+      @snapshot_port = @snapshot_server.connected_ports.first
+      @snapshot_server.run
     end
 
     def free_port
