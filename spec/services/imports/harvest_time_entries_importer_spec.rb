@@ -444,7 +444,9 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   end
 end
 
-RSpec.describe Imports::HarvestTimeEntriesImporter do
+# committed_data: the live Timekeeping app reads the company, users and project
+# over its own database connection, so they must be committed to be seen.
+RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true do
   let(:fwd_company) { create(:company, base_currency: "INR", date_format: "MM-DD-YYYY") }
   let(:fwd_actor) { create(:user, current_workspace_id: fwd_company.id) }
   let(:fwd_paul) { create(:user, first_name: "Paul", last_name: "Connors", email: "paul.fwd@example.com", current_workspace_id: fwd_company.id) }
@@ -479,21 +481,20 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
       calls += 1
       if calls == 1
         TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(generation: 3)
-        fwd_fake.generation = 3
+        admit_forwarded_generation(fwd_fake, 3)
       end
       result
     end
 
     expect { described_class.new(fwd_import).process }.to raise_error(Timekeeping::Gateway::StaleGeneration)
-    first_run_keys = fwd_fake.requests
-      .filter_map { |request| request[:headers]["Idempotency-Key"] if request[:method] == "POST" }
+    first_run_keys = forwarded_create_requests(fwd_fake).pluck(:idempotency_key)
     expect(first_run_keys.size).to eq(1)
 
     described_class.new(fwd_import.reload).process
 
-    posts = fwd_fake.requests.select { |request| request[:method] == "POST" }
+    posts = forwarded_create_requests(fwd_fake)
     keys_by_note = posts.group_by { |request| request[:body]["note"] }
-      .transform_values { |requests| requests.map { |request| request[:headers]["Idempotency-Key"] }.uniq }
+      .transform_values { |requests| requests.pluck(:idempotency_key).uniq }
     expect(keys_by_note.keys).to contain_exactly("first row", "second row")
     expect(keys_by_note["first row"]).to eq(first_run_keys)
     expect(keys_by_note["second row"].size).to eq(1)
@@ -501,14 +502,13 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
 
     # Grouping by note hides how many creates the rerun sent and in what order, so check its own creates too.
     rerun_posts = posts.drop(first_run_keys.size)
-    rerun_keys = rerun_posts.map { |request| request[:headers]["Idempotency-Key"] }
+    rerun_keys = rerun_posts.pluck(:idempotency_key)
     expect(rerun_keys.size).to eq(2)
     expect(rerun_keys.uniq.size).to eq(2)
     expect(rerun_keys.first).to eq(first_run_keys.first)
     expect(rerun_posts.map { |request| request[:body]["note"] }).to eq(["first row", "second row"])
 
-    stored_entry_ids = fwd_fake.outbox.map { |row| row["entry"]["id"] }.uniq
-    expect(stored_entry_ids.size).to eq(2)
+    expect(forwarded_stored_entry_count(fwd_fake, company: fwd_company)).to eq(2)
     expect(fwd_import.reload).to have_attributes(status: "completed", failed_rows: 0)
   end
 
@@ -520,7 +520,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
       calls += 1
       if calls == 1
         TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(generation: 3)
-        fwd_fake.generation = 3
+        admit_forwarded_generation(fwd_fake, 3)
       end
       result
     end
@@ -529,11 +529,11 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     fwd_company.update!(base_currency: "USD")
     described_class.new(DataImport.find(fwd_import.id)).process
 
-    first_row_keys = fwd_fake.requests
-      .filter_map { |request| request[:headers]["Idempotency-Key"] if request[:body]&.dig("note") == "first row" }
+    first_row_keys = forwarded_timekeeping_requests(fwd_fake)
+      .filter_map { |request| request[:idempotency_key] if request[:body]&.dig("note") == "first row" }
     expect(first_row_keys.size).to eq(2)
     expect(first_row_keys.uniq.size).to eq(1)
-    expect(fwd_fake.outbox.map { |row| row["entry"]["id"] }.uniq.size).to eq(2)
+    expect(forwarded_stored_entry_count(fwd_fake, company: fwd_company)).to eq(2)
   end
 
   it "sends only the unwritten row on a rerun once the written row has reached the local projection" do
@@ -543,7 +543,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
       calls += 1
       if calls == 1
         TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(generation: 3)
-        fwd_fake.generation = 3
+        admit_forwarded_generation(fwd_fake, 3)
       end
       result
     end
@@ -554,9 +554,9 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
                              note: "first row", bill_status: "unbilled", source: "import")
     described_class.new(fwd_import.reload).process
 
-    posted_notes = fwd_fake.requests.filter_map { |request| request[:body]&.dig("note") if request[:method] == "POST" }
+    posted_notes = forwarded_create_requests(fwd_fake).map { |request| request[:body]["note"] }
     expect(posted_notes).to eq(["first row", "second row"])
-    expect(fwd_fake.outbox.map { |row| row["entry"]["id"] }.uniq.size).to eq(2)
+    expect(forwarded_stored_entry_count(fwd_fake, company: fwd_company)).to eq(2)
     expect(fwd_import.reload).to have_attributes(status: "completed", imported_rows: 1, skipped_rows: 1)
   end
 
@@ -577,9 +577,9 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_call_original
     described_class.new(fwd_import.reload).process
 
-    posted_notes = fwd_fake.requests.filter_map { |request| request[:body]&.dig("note") if request[:method] == "POST" }
+    posted_notes = forwarded_create_requests(fwd_fake).map { |request| request[:body]["note"] }
     expect(posted_notes).to eq(["first row", "second row"])
-    expect(fwd_fake.outbox.map { |row| row["entry"]["id"] }.uniq.size).to eq(2)
+    expect(forwarded_stored_entry_count(fwd_fake, company: fwd_company)).to eq(2)
     expect(fwd_import.reload).to have_attributes(status: "completed", imported_rows: 1, skipped_rows: 1)
   end
 end
@@ -631,7 +631,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   end
 end
 
-RSpec.describe Imports::HarvestTimeEntriesImporter do
+RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true do
   let(:billed_fwd_company) { create(:company) }
   let(:billed_fwd_actor) { create(:user, current_workspace_id: billed_fwd_company.id) }
   let(:billed_fwd_paul) do
@@ -661,8 +661,9 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   it "forwards a billed Harvest row as exactly one create carrying billed" do
     with_forwarded_timekeeping_env { described_class.new(billed_fwd_import).process }
 
-    expect(billed_fwd_fake.requests.pluck(:method)).to eq(["POST"])
-    expect(billed_fwd_fake.requests.first[:body]["bill_status"]).to eq("billed")
+    sent = forwarded_timekeeping_requests(billed_fwd_fake)
+    expect(sent.pluck(:method)).to eq(["POST"])
+    expect(sent.first[:body]["bill_status"]).to eq("billed")
     expect(billed_fwd_import.reload).to have_attributes(status: "completed", imported_rows: 1, failed_rows: 0)
     expect(billed_fwd_import.row_errors).to eq([])
   end
@@ -819,7 +820,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   end
 end
 
-RSpec.describe Imports::HarvestTimeEntriesImporter do
+RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true do
   let(:rerun_company) { create(:company, base_currency: "INR", date_format: "MM-DD-YYYY") }
   let(:rerun_actor) { create(:user, current_workspace_id: rerun_company.id) }
   let(:rerun_paul) do
@@ -847,7 +848,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   end
 
   def rerun_create_keys
-    rerun_fake.requests.filter_map { |request| request[:headers]["Idempotency-Key"] if request[:method] == "POST" }
+    forwarded_create_requests(rerun_fake).pluck(:idempotency_key)
   end
 
   # "Forwarded writes use an `Idempotency-Key` built from the data import id and a digest of the row, so rerunning a failed import does not duplicate rows it already forwarded."
@@ -885,7 +886,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
       calls += 1
       if calls == 1
         TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(generation: 3)
-        rerun_fake.generation = 3
+        admit_forwarded_generation(rerun_fake, 3)
       end
       result
     end
@@ -908,7 +909,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
                              note: "", bill_status: "unbilled", source: "import")
     with_forwarded_timekeeping_env { described_class.new(rerun_import.reload).process }
 
-    expect(rerun_fake.outbox.map { |event| event["entry"]["id"] }.uniq.size).to eq(2)
+    expect(forwarded_stored_entry_count(rerun_fake, company: rerun_company)).to eq(2)
     expect(rerun_import.reload).to have_attributes(status: "completed", imported_rows: 1, skipped_rows: 1)
   end
 end
@@ -945,7 +946,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   end
 end
 
-RSpec.describe Imports::HarvestTimeEntriesImporter do
+RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true do
   let(:drift_company) { create(:company) }
   let(:drift_actor) { create(:user, current_workspace_id: drift_company.id) }
   let(:drift_paul) do
@@ -984,16 +985,15 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     with_forwarded_timekeeping_env do
       expect { described_class.new(drift_import).process }.to raise_error(Timekeeping::EntryWriteClient::Error)
     end
-    first_key = drift_fake.requests.find { |request| request[:method] == "POST" }[:headers]["Idempotency-Key"]
+    first_key = forwarded_create_requests(drift_fake).first[:idempotency_key]
 
     drift_project.update!(billable: false)
     with_forwarded_timekeeping_env do
       expect { described_class.new(drift_import.reload).process }.to raise_error(Timekeeping::EntryWriteClient::Rejected)
     end
 
-    posts = drift_fake.requests.select { |request| request[:method] == "POST" }
-    expect(posts.map { |request| request[:headers]["Idempotency-Key"] }).to eq([first_key, first_key])
-    expect(drift_fake.outbox.map { |row| row["entry"]["id"] }.uniq.size).to eq(1)
+    expect(forwarded_create_requests(drift_fake).pluck(:idempotency_key)).to eq([first_key, first_key])
+    expect(forwarded_stored_entry_count(drift_fake, company: drift_company)).to eq(1)
     expect(drift_import.reload).to have_attributes(status: "failed", failed_rows: 0)
   end
 end
