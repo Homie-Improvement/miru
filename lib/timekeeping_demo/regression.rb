@@ -54,6 +54,8 @@ module TimekeepingDemo
     # while proving nothing. rspec-core 3.13 has no --fail-if-no-examples
     # command-line option, so spec/spec_helper.rb sets
     # config.fail_if_no_examples for a regression child that has a state.
+    # spec/lib/timekeeping_demo/regression_spec.rb pins that rspec rejects the
+    # option, so an upgrade that adds it fails that spec.
     STATE_FLAGS = ["--tag", "~#{SWITCHES_OWNER_TAG}"].freeze
     REPORT_HEADING = "#{SWITCHES_OWNER_TAG} examples (run once, outside the ownership states):".freeze
 

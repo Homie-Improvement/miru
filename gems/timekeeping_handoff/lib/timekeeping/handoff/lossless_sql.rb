@@ -15,12 +15,19 @@ module Timekeeping
 
       # JSON text with each BigDecimal written as a bare number. The default
       # encoders write a BigDecimal as a quoted string.
+      #
+      # Times are written in UTC in Checkpoint::TIME_FORMAT. The default
+      # encoder keeps only milliseconds and the value's own offset; a
+      # timestamp column ignores that offset, so either would store a time
+      # other than the one sent.
       def json_text(value)
         case value
         when Hash then "{#{value.map { |key, item| "#{JSON.generate(key.to_s)}:#{json_text(item)}" }.join(',')}}"
         when Array then "[#{value.map { |item| json_text(item) }.join(',')}]"
         when BigDecimal then value.to_s("F")
         when Checkpoint::JSON_NULL then "null"
+        when Time, DateTime, ActiveSupport::TimeWithZone
+          JSON.generate(value.to_time.getutc.strftime(Checkpoint::TIME_FORMAT))
         else JSON.generate(value.as_json)
         end
       end
