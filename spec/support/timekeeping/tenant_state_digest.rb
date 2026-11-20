@@ -57,10 +57,9 @@ module TenantStateDigest
 
   TABLE_FRAME = "T"
   ROW_FRAME = "R"
+  URL_FORM = %r{\Apostgres(?:ql)?://}i
 
   module_function
-
-  URL_FORM = %r{\Apostgres(?:ql)?://}i
 
   def take(company_id:, timekeeping_url:)
     require_test_database!(timekeeping_url)
