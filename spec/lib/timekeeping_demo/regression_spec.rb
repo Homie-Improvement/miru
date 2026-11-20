@@ -319,8 +319,6 @@ RSpec.describe TimekeepingDemo::Regression do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe TimekeepingDemo::Regression do
   it "the switches_owner report pass sets TIMEKEEPING_OWNER_STATE to an empty string so dotenv cannot refill it, while state passes keep their states" do
     calls = []
@@ -340,8 +338,6 @@ RSpec.describe TimekeepingDemo::Regression do
     expect(state_calls.map { |call| call[:env]["TIMEKEEPING_OWNER_STATE"] }).to eq(%w[legacy timekeeping rollback])
   end
 end
-
-require "rails_helper"
 
 RSpec.describe TimekeepingDemo::Regression do
   it "the switches_owner report pass sets TIMEKEEPING_OWNER_STATE to an empty string instead of dropping it, while each state pass keeps its own state" do
@@ -371,9 +367,6 @@ RSpec.describe TimekeepingDemo::Regression do
   end
 end
 
-require "rails_helper"
-require "tmpdir"
-
 RSpec.describe TimekeepingDemo::Regression do
   it "the switches_owner pass keeps TIMEKEEPING_OWNER_STATE present as an empty string so dotenv cannot refill it" do
     report_envs = []
@@ -391,6 +384,6 @@ RSpec.describe TimekeepingDemo::Regression do
     expect(report_envs.first).to have_key("TIMEKEEPING_OWNER_STATE")
     expect(report_envs.first["TIMEKEEPING_OWNER_STATE"]).to eq("")
     # The state passes must still carry their own non-empty state, never the report marker.
-    expect(state_envs.map { |env| env["TIMEKEEPING_OWNER_STATE"] }).to eq(%w[legacy timekeeping rollback])
+    expect(state_envs.pluck("TIMEKEEPING_OWNER_STATE")).to eq(%w[legacy timekeeping rollback])
   end
 end

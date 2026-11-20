@@ -100,10 +100,6 @@ RSpec.describe "timekeeping regression command", :without_transaction do
   end
 end
 
-require "rails_helper"
-require "json"
-require "tmpdir"
-
 RSpec.describe "timekeeping regression command", :without_transaction do
   it "a dotenv file naming an owner state is loaded at boot but neither restores a state in the switches_owner report pass nor overrides the legacy state pass" do
     checkout_env_files_before = Rails.root.glob(".env*").map(&:to_s).sort
@@ -140,9 +136,6 @@ RSpec.describe "timekeeping regression command", :without_transaction do
   end
 end
 
-require "rails_helper"
-require "tmpdir"
-
 RSpec.describe "timekeeping regression command", :without_transaction do
   it "a regression child with an empty TIMEKEEPING_OWNER_STATE boots with no state and does not fail when its filters leave no example" do
     probe = Rails.root.join("spec/fixtures/timekeeping_harness/switches_owner_probe.rb").to_s
@@ -159,9 +152,6 @@ RSpec.describe "timekeeping regression command", :without_transaction do
     end
   end
 end
-
-require "rails_helper"
-require "tmpdir"
 
 RSpec.describe "timekeeping regression command", :without_transaction do
   it "a dotenv file in the app root naming an owner state is loaded but does not restore owner selection in the switches_owner report pass, and the legacy state pass keeps legacy" do
@@ -225,9 +215,6 @@ RSpec.describe "timekeeping regression command", :without_transaction do
   end
 end
 
-require "rails_helper"
-require "tmpdir"
-
 RSpec.describe "timekeeping regression command", :without_transaction do
   it "a regression child given an empty TIMEKEEPING_OWNER_STATE boots with no state and passes when its filters match no example" do
     probe = Rails.root.join("spec/fixtures/timekeeping_harness/switches_owner_probe.rb").to_s
@@ -244,10 +231,6 @@ RSpec.describe "timekeeping regression command", :without_transaction do
     end
   end
 end
-
-require "rails_helper"
-require "json"
-require "tmpdir"
 
 RSpec.describe "timekeeping regression command", :without_transaction do
   it "a dotenv file naming the timekeeping state neither restores a state in the switches_owner pass nor overrides the legacy pass" do
@@ -280,10 +263,6 @@ RSpec.describe "timekeeping regression command", :without_transaction do
     expect(Dir.glob(Rails.root.join(".env*").to_s, File::FNM_DOTMATCH).sort).to eq(checkout_env_files_before)
   end
 end
-
-require "rails_helper"
-require "json"
-require "tmpdir"
 
 RSpec.describe "timekeeping regression command", :without_transaction do
   it "a dotenv file holding an unknown owner state does not crash the switches_owner pass at load" do

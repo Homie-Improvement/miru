@@ -517,10 +517,6 @@ RSpec.describe "Seeded committed_data owner state probe run (timekeeping)", :wit
   end
 end
 
-require "rails_helper"
-require "open3"
-require "tmpdir"
-
 RSpec.describe "Timekeeping owner state harness", :without_transaction do
   it "the dotenv owner state probe's switches_owner example fails when an owner state is selected for its run, so it can catch a restored owner selection" do
     probe = Rails.root.join("spec/fixtures/timekeeping_harness/dotenv_owner_state_probe.rb").to_s
