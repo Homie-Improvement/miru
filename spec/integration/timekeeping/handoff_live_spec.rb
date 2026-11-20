@@ -3,7 +3,6 @@
 require "rails_helper"
 require "fileutils"
 require "json"
-require "pg"
 require "tmpdir"
 
 # Runs the real handoff with the owners config/initializers/timekeeping_handoff.rb
@@ -13,8 +12,6 @@ require "tmpdir"
 # committed example reloads the seed before it runs, so separate examples
 # would hide what cutover leaves for rollback.
 RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, committed_data: true do
-  handoff_live_tables = %w[idempotency_receipts audit_events reservations invoice_operations outbox_snapshots entries].freeze
-
   before(:all) do
     skip "Set TIMEKEEPING_LIVE=1 to run the handoff against a real Timekeeping server" unless ENV["TIMEKEEPING_LIVE"] == "1"
 
@@ -35,13 +32,10 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, committed_data: t
     # A skipped example started nothing, and may run without a Timekeeping database.
     next unless ENV["TIMEKEEPING_LIVE"] == "1"
 
-    # This hook also runs when before(:all) refused the database, so it checks again.
-    timekeeping_url = ENV.fetch("TIMEKEEPING_DATABASE_URL")
-    IntegratedRuntime.require_test_database_url!(timekeeping_url)
-    timekeeping = PG.connect(timekeeping_url)
-    timekeeping.exec("TRUNCATE #{handoff_live_tables.join(', ')} CASCADE")
-  ensure
-    timekeeping&.close
+    # This hook also runs when before(:all) refused the database, so it checks
+    # again; the shared reset then refuses the same names before it connects.
+    IntegratedRuntime.require_test_database_url!(ENV.fetch("TIMEKEEPING_DATABASE_URL"))
+    TimekeepingDatabaseReset.reset!(nil, env: ENV)
   end
 
   # Reruns the initializer's own code, so the integrations it builds read the
