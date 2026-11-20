@@ -248,6 +248,22 @@ RSpec.describe TimekeepingDemo::Regression do
     end
   end
 
+  # The empty-run guard lives in spec/spec_helper.rb as config.fail_if_no_examples
+  # because the locked rspec-core has no --fail-if-no-examples command-line
+  # option. If an upgrade adds the option, the first example fails, and the
+  # guard can move into STATE_FLAGS.
+  context "with the empty-run guard kept out of the state argv" do
+    it "has rspec's own option parser reject --fail-if-no-examples" do
+      expect { RSpec::Core::Parser.parse(["--fail-if-no-examples"]) }
+        .to raise_error(SystemExit)
+        .and output(/invalid option: --fail-if-no-examples/).to_stderr
+    end
+
+    it "has rspec's own option parser accept the state flags" do
+      expect { RSpec::Core::Parser.parse(described_class::STATE_FLAGS.dup) }.not_to raise_error
+    end
+  end
+
   it "leaves the parent's queue ledger in place when every child deletes its own ledger at suite start" do
     ledger_key = "TIMEKEEPING_QUEUE_LEDGER_PATH"
     Dir.mktmpdir("regression-parent-ledger") do |dir|
