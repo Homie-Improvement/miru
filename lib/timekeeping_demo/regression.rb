@@ -45,6 +45,11 @@ module TimekeepingDemo
     ].freeze
 
     OWNER_STATE_KEY = "TIMEKEEPING_OWNER_STATE"
+    # The switches_owner pass sends the key set to "" rather than removing it:
+    # dotenv fills only absent keys, so a removed key would come back from a
+    # local .env file. config/application.rb deletes an empty value right
+    # after dotenv loads, so the child's harness sees no state.
+    NO_OWNER_STATE = ""
     LEDGER_PATH_KEY = "TIMEKEEPING_QUEUE_LEDGER_PATH"
     LEDGER_FILE = "queue_ledger.json"
     REPORT_FILE = "switches_owner.json"
@@ -82,9 +87,18 @@ module TimekeepingDemo
       passed
     end
 
+    # A json report the switches_owner pass wrote, holding the ids of the
+    # examples it ran.
+    Report = Data.define(:ids)
+    # A report that is missing, not JSON, not shaped as rspec's json
+    # formatter writes it, or not readable from disk; reason says which.
+    UnreadableReport = Data.define(:reason)
+
     # This pass sets no owner state, so it does not fail when it finds no
-    # examples: finding no tagged example is a normal outcome, reported as
-    # "none". The report is read before the temporary
+    # examples: a readable report with no tagged example is a normal outcome,
+    # reported as "none". The pass passes only when its runner returned true
+    # and its report could be read, because without the report nothing shows
+    # which tagged examples ran. The report is read before the temporary
     # directory holding it is removed, and lists whatever the file holds even
     # when the pass failed, so failing examples are still named.
     def run_switches_owner_report(runner, specs)
@@ -93,36 +107,44 @@ module TimekeepingDemo
         # The json formatter replaces the default one, so progress is named
         # again to keep rspec's failure details on stdout.
         argv = [*specs, "--tag", SWITCHES_OWNER_TAG, "--format", "json", "--out", out, "--format", "progress"]
-        passed = runner.call(env: child_env(dir, nil), argv:).equal?(true)
-        ids = report_example_ids(out)
+        runner_passed = runner.call(env: child_env(dir, NO_OWNER_STATE), argv:).equal?(true)
+        report = read_report(out)
         puts REPORT_HEADING
-        puts(ids.empty? ? "none" : ids)
-        passed
+        case report
+        in Report(ids: [])
+          puts "none"
+        in Report(ids:)
+          puts ids
+        in UnreadableReport(reason:)
+          puts "unreadable report: #{reason}"
+        end
+        runner_passed && report.is_a?(Report)
       end
     end
 
-    # A nil owner state removes the key from the child's environment, so a
-    # value the caller holds is not inherited; an empty string would make the
-    # child's harness reject it at load. Each child gets a ledger of its own
-    # because a child rspec deletes the ledger it is given at suite start.
+    # The owner state always overrides the caller's value. Each child gets a
+    # ledger of its own because a child rspec deletes the ledger it is given at
+    # suite start.
     def child_env(dir, owner_state)
       { OWNER_STATE_KEY => owner_state, LEDGER_PATH_KEY => File.join(dir, LEDGER_FILE) }.merge(CHILD_ENV)
     end
 
-    # A pass that could not start, or was killed, leaves no readable report;
-    # its runner result already fails it, so this answers no ids rather than
-    # raising.
-    def report_example_ids(path)
-      return [] unless File.exist?(path)
+    # Answers a Report or an UnreadableReport and never raises for a bad
+    # file, so a pass that wrote no report, or a broken one, fails the
+    # command with a reason instead of crashing it or passing as "none".
+    def read_report(path)
+      return UnreadableReport.new(reason: "no report at #{path}") unless File.exist?(path)
 
       case JSON.parse(File.read(path), symbolize_names: true)
       in { examples: Array => examples }
-        examples.filter_map { |example| example[:id] if example.is_a?(Hash) }
+        Report.new(ids: examples.filter_map { |example| example[:id] if example.is_a?(Hash) })
       else
-        []
+        UnreadableReport.new(reason: "#{path} has no examples list")
       end
-    rescue JSON::ParserError
-      []
+    rescue JSON::ParserError => e
+      UnreadableReport.new(reason: "#{path} is not valid JSON: #{e.message}")
+    rescue SystemCallError => e
+      UnreadableReport.new(reason: e.message)
     end
   end
 end
