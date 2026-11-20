@@ -59,13 +59,6 @@ module Timekeeping
       end
     end
 
-    # Marks the transaction's legacy writes so a database guard can tell them
-    # from writes that bypass the gateway. A fixed literal, as
-    # ProjectionConsumer::MARK_PROJECTION_WRITER_SQL is.
-    MARK_LEGACY_WRITER_SQL = "SET LOCAL miru.writer = 'legacy_gateway'"
-    READ_WRITER_SQL = "SELECT current_setting('miru.writer', true)"
-    RESTORE_WRITER_SQL = "SELECT set_config('miru.writer', ?, true)"
-
     REFUSAL_REASONS = { OwnershipMoving => "ownership_moving", StaleGeneration => "stale_generation" }.freeze
 
     # Names the legacy create receipt lock, so it never shares a lock with
@@ -765,7 +758,7 @@ module Timekeeping
           owner = EntryOwner.for(ownership)
           next yield(ownership, owner) unless owner == :legacy
 
-          as_legacy_writer { yield(ownership, owner) }
+          LegacyWriterMark.call(ActiveRecord::Base.connection) { yield(ownership, owner) }
         end
       rescue OwnershipMoving, StaleGeneration => refusal
         Rails.event.notify(EntryWriteRefused.new(context, reason: REFUSAL_REASONS.fetch(refusal.class)))
@@ -863,38 +856,6 @@ module Timekeeping
         end
         authorize.call(EntryLookup.replayed(context:, row:, entry_id:, scope:))
         true
-      end
-
-      # SET LOCAL lasts until the outermost transaction ends. When the gateway
-      # joins a caller's transaction, the previous value is put back after the
-      # write, so the caller's later statements are not marked as the gateway's.
-      # That holds when the write raises too, since the caller may rescue and
-      # go on in the same transaction.
-      def as_legacy_writer
-        connection = ActiveRecord::Base.connection
-        previous = connection.select_value(READ_WRITER_SQL)
-        connection.execute(MARK_LEGACY_WRITER_SQL)
-        begin
-          result = yield
-        rescue StandardError
-          restore_writer_after_failure(connection, previous)
-          raise
-        end
-        restore_writer(connection, previous)
-        result
-      end
-
-      def restore_writer(connection, previous)
-        connection.select_value(ActiveRecord::Base.sanitize_sql_array([RESTORE_WRITER_SQL, previous.to_s]))
-      end
-
-      # A failed SQL statement aborts the whole transaction, which can then only
-      # roll back, and the rollback clears the setting. The restore cannot run
-      # then, and its own error must not hide the write's.
-      def restore_writer_after_failure(connection, previous)
-        restore_writer(connection, previous)
-      rescue ActiveRecord::StatementInvalid
-        nil
       end
 
       # A forwarded answer outside the company or for another user is never
