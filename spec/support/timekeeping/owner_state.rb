@@ -55,10 +55,11 @@ module TimekeepingOwnerState
 
   # The selected state name, or nil only when the key is absent. The value
   # must match a state name exactly: a blank, padded or mixed-case value is a
-  # mistake to report, not a request for the default. An empty
-  # TIMEKEEPING_OWNER_STATE never reaches SELECTED: config/application.rb
-  # removes it at boot, because the regression command's switches_owner pass
-  # sets it to "" so that dotenv cannot fill it from a local .env.
+  # mistake to report, not a request for the default. In a regression child
+  # (TIMEKEEPING_REGRESSION=1) an empty TIMEKEEPING_OWNER_STATE never reaches
+  # SELECTED: config/application.rb removes it at boot, because the regression
+  # command's switches_owner pass sets it to "" so that dotenv cannot fill it
+  # from a local .env.
   def selected(env)
     return nil unless env.key?(ENV_KEY)
 

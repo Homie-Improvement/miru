@@ -528,8 +528,12 @@ RSpec.describe "Timekeeping owner state harness", :without_transaction do
     # The probe is the check that runs inside the booted child. Here a state is selected for its
     # switches_owner example, as a restored dotenv value would select one, and the probe must fail.
     # The probe's own ledger file, so its suite start never deletes this run's.
+    # The dotenv marker and tree keys are set as the boot test sets them, so the
+    # probe's first checks pass and only its owner state check can fail.
     stdout, stderr, status = Dir.mktmpdir("dotenv-owner-state-probe-ledger") do |dir|
       Open3.capture3({ "TIMEKEEPING_OWNER_STATE" => "timekeeping",
+                       "TIMEKEEPING_DOTENV_PROBE" => "loaded",
+                       "TIMEKEEPING_DOTENV_TREE" => Rails.root.to_s,
                        TimekeepingQueueLedger::PATH_KEY => File.join(dir, "queue_ledger.json") },
                      "bundle", "exec", "rspec", probe, "--tag", "switches_owner", chdir: Rails.root.to_s)
     end
@@ -537,5 +541,6 @@ RSpec.describe "Timekeeping owner state harness", :without_transaction do
 
     expect(status).not_to be_success, output
     expect(output).to include("1 example, 1 failure")
+    expect(output).to include("expect(TimekeepingOwnerState::SELECTED).to be_nil")
   end
 end
