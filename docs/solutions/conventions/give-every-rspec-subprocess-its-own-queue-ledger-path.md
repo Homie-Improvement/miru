@@ -46,6 +46,8 @@ A runner without its own path still passes its own test. The damage happens else
 
 Under `bin/parallel_test` the processes share `tmp/`. That case is now handled by the default path, not by this convention. With no override, `ledger_path` adds the process's `TEST_ENV_NUMBER` to the default file name, so process N writes `queue_ledger.N.json`. The first process, whose number is empty, keeps `queue_ledger.json`. An explicit `PATH_KEY` is still used exactly as written, so a subprocess's private file is never renamed. `bin/parallel_test` refuses to start when `TIMEKEEPING_QUEUE_LEDGER_PATH` is set, because every process would inherit and share that one file. It also hands its workers the key set to an empty string, so a value in `.env` cannot fill it in.
 
+A spec that must exercise the numbered default name, rather than an explicit file, sets `TIMEKEEPING_QUEUE_LEDGER_ROOT` (`TimekeepingQueueLedger::ROOT_KEY`) to its own `Dir.mktmpdir` directory instead. `ledger_path` then builds `<root>/tmp/timekeeping-integration/queue_ledger.N.json`, so the spec keeps the per-process naming without touching the files real workers own under `Rails.root`, whatever `-n` the run uses. The root must be an absolute path; a relative one raises `ArgumentError`. An explicit `PATH_KEY` still wins over a root. Pass the root to a child process explicitly, beside `PATH_KEY => ""`, because the child reads it from its own environment.
+
 ## Evidence
 
 - PR #393, `spec/support/timekeeping/queue_ledger.rb`: the before(:suite) hook calls `FileUtils.rm_f(TimekeepingQueueLedger.session.path)`, and `ledger_path` reads `PATH_KEY`.

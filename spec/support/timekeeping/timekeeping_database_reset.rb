@@ -22,6 +22,23 @@ module TestDatabaseGuard
 
     nil
   end
+
+  # libpq (used by the reset) and Active Record (used by db:prepare and the
+  # apps) can read different databases from one URL, for example a path name
+  # and a dbname query parameter. Both readings must name a test database.
+  def require_test_database_url!(url)
+    require_test_database!(TimekeepingDatabaseReset.database_name(url))
+    require_test_database!(active_record_database_name(url))
+  end
+
+  # Builds the configuration Rails would build from the URL without connecting.
+  # A value Active Record cannot parse yields no name, so the guard refuses it
+  # without echoing the value back.
+  def active_record_database_name(url)
+    ActiveRecord::DatabaseConfigurations::UrlConfig.new("test", "harness_guard", url, { adapter: "postgresql" }).database
+  rescue ActiveRecord::DatabaseConfigurations::InvalidConfigurationError, URI::Error
+    nil
+  end
 end
 
 # Empties the Timekeeping database named by TIMEKEEPING_DATABASE_URL and puts
