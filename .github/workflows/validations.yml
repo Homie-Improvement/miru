@@ -1,15 +1,18 @@
 name: CI Test Suite
 on:
   push:
-    branches: [develop, main, stable-3-0, production]
+    # "**" matches every branch name, including ones with slashes, and no tags.
+    branches: ["**"]
   pull_request:
     branches: [develop, main, production]
     types: [labeled, opened, synchronize, reopened]
   workflow_dispatch:
 
-# Cancel in-progress runs on same branch
+# A newer run cancels an older one of the same event on the same branch. The
+# event name keeps a push run and a pull request run of one branch apart, so
+# neither cancels the other.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 # Every job pins ubuntu-24.04: ruby/setup-ruby has no prebuilt Ruby 4.0.1
@@ -414,8 +417,8 @@ jobs:
   # server, and the handoff spec empties the Timekeeping tables after its
   # example; the alerts spec writes its own entries, so it relies on none.
   #
-  # This job has no skip-ci condition, so every push the workflow runs on
-  # runs the live handoff proof. The job id and name stay as they are because
+  # The workflow runs on a push to any branch, and this job has no skip-ci
+  # condition, so every branch push runs the live handoff proof. The job id and name stay as they are because
   # branch protection may require this check by name.
   timekeeping-alerts-live:
     name: Timekeeping alerts against a live service
