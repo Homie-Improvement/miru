@@ -354,7 +354,6 @@ RSpec.describe TimekeepingWriterLog do
       expect(other_company_id).not_to eq(main_company_id)
       main_pid = connection.select_value("SELECT pg_backend_pid()")
       worker_pids = Queue.new
-      worker = nil
 
       described_class.guarding(connection) do
         worker = committed_data_thread(worker_pids) do
@@ -370,7 +369,12 @@ RSpec.describe TimekeepingWriterLog do
             "DELETE FROM timesheet_entries WHERE id = #{worker_connection.quote(other_entry.id)}"
           )
         end
-        expect(worker.join(5)).to eq(worker), "the worker thread did not finish within 5 seconds"
+        begin
+          expect(worker.join(5)).to eq(worker), "the worker thread did not finish within 5 seconds"
+        ensure
+          # Stop the worker before guarding's remove! drops the trigger it may still be writing through.
+          stop_committed_data_threads(worker)
+        end
         worker_pid = worker_pids.pop
 
         expect(described_class.rows(connection, include_backend_pid: true)).to eq(
@@ -382,8 +386,6 @@ RSpec.describe TimekeepingWriterLog do
         )
         expect(worker_pid).not_to eq(main_pid)
       end
-    ensure
-      stop_committed_data_threads(worker)
     end
   end
 
