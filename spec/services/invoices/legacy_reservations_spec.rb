@@ -795,7 +795,7 @@ RSpec.describe Invoices::LegacyReservations do
     connection = ApplicationRecord.connection
     marks_during_entry_writes = []
     subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
-      next unless payload[:sql].match?(/\AUPDATE "timesheet_entries"/)
+      next unless payload[:sql].start_with?('UPDATE "timesheet_entries"')
 
       marks_during_entry_writes << connection.select_value("SELECT current_setting('miru.writer', true)")
     end
@@ -840,7 +840,7 @@ RSpec.describe Invoices::LegacyReservations do
     connection = ApplicationRecord.connection
     marks_during_entry_writes = []
     subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
-      next unless payload[:sql].match?(/\AUPDATE "timesheet_entries"/)
+      next unless payload[:sql].start_with?('UPDATE "timesheet_entries"')
 
       marks_during_entry_writes << connection.select_value("SELECT current_setting('miru.writer', true)")
     end
@@ -884,7 +884,7 @@ RSpec.describe Invoices::LegacyReservations do
     connection = ApplicationRecord.connection
     marks_during_entry_writes = []
     subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
-      next unless payload[:sql].match?(/\AUPDATE "timesheet_entries"/)
+      next unless payload[:sql].start_with?('UPDATE "timesheet_entries"')
 
       marks_during_entry_writes << connection.select_value("SELECT current_setting('miru.writer', true)")
     end
@@ -949,7 +949,7 @@ RSpec.describe Invoices::LegacyReservations do
 
   # Reads miru.writer right after each UPDATE of timesheet_entries completes,
   # on the same connection and still inside the write's transaction.
-  def prepare_mark_writers_seen_during_entry_updates
+  def prepare_mark_writers_seen_during_entry_updates(&)
     connection = ActiveRecord::Base.connection
     seen = []
     on_sql = lambda do |*, payload|
@@ -957,7 +957,7 @@ RSpec.describe Invoices::LegacyReservations do
 
       seen << connection.select_value("SELECT current_setting('miru.writer', true)")
     end
-    ActiveSupport::Notifications.subscribed(on_sql, "sql.active_record") { yield }
+    ActiveSupport::Notifications.subscribed(on_sql, "sql.active_record", &)
     seen
   end
 
@@ -995,7 +995,7 @@ RSpec.describe Invoices::LegacyReservations do
 
   # Reads miru.writer right after each UPDATE of timesheet_entries completes,
   # on the same connection and still inside the write's transaction.
-  def commit_mark_writers_seen_during_entry_updates
+  def commit_mark_writers_seen_during_entry_updates(&)
     connection = ActiveRecord::Base.connection
     seen = []
     on_sql = lambda do |*, payload|
@@ -1003,7 +1003,7 @@ RSpec.describe Invoices::LegacyReservations do
 
       seen << connection.select_value("SELECT current_setting('miru.writer', true)")
     end
-    ActiveSupport::Notifications.subscribed(on_sql, "sql.active_record") { yield }
+    ActiveSupport::Notifications.subscribed(on_sql, "sql.active_record", &)
     seen
   end
 
@@ -1045,7 +1045,7 @@ RSpec.describe Invoices::LegacyReservations do
 
   # Reads miru.writer right after each UPDATE of timesheet_entries completes,
   # on the same connection and still inside the write's transaction.
-  def billed_mark_writers_seen_during_entry_updates
+  def billed_mark_writers_seen_during_entry_updates(&)
     connection = ActiveRecord::Base.connection
     seen = []
     on_sql = lambda do |*, payload|
@@ -1053,7 +1053,7 @@ RSpec.describe Invoices::LegacyReservations do
 
       seen << connection.select_value("SELECT current_setting('miru.writer', true)")
     end
-    ActiveSupport::Notifications.subscribed(on_sql, "sql.active_record") { yield }
+    ActiveSupport::Notifications.subscribed(on_sql, "sql.active_record", &)
     seen
   end
 
@@ -1140,7 +1140,7 @@ RSpec.describe Invoices::LegacyReservations do
     connection = ApplicationRecord.connection
     marks_during_entry_updates = []
     subscriber = lambda do |*, payload|
-      next unless payload[:sql].to_s.match?(/\AUPDATE "timesheet_entries"/)
+      next unless payload[:sql].to_s.start_with?('UPDATE "timesheet_entries"')
 
       marks_during_entry_updates << connection.select_value("SELECT current_setting('miru.writer', true)")
     end
