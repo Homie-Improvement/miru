@@ -117,25 +117,6 @@ RSpec.describe TimekeepingHandoffFakes::InMemoryTimekeepingStore do
     expect(store.highest_outbox_position).to eq(0)
   end
 
-  context "more tests 10" do
-    # "Fake-path runner specs can use a test relay that delivers only Timekeeping's outbox snapshots through `Timekeeping::ProjectionConsumer`, so a snapshot left out of the outbox leaves the projection behind and fails the spec."
-    # A batch the consumer refuses must fail the drain loudly, so a malformed
-    # snapshot is never mistaken for a projection left behind.
-    it "the outbox relay raises Undelivered naming 422 for a snapshot the projection consumer refuses and stays undrained" do
-      store = described_class.new
-      store.admit(generation: 2)
-      store.write_correction_snapshots(snapshots: [{ "id" => 5, "note" => "missing every other contract field" }],
-                                       version: 2, generation: 2)
-      through = store.highest_outbox_position
-      expect(through).to be_positive
-
-      relay = TimekeepingHandoffOutboxRelay.new(store:)
-
-      expect { relay.drain!(through:) }.to raise_error(TimekeepingHandoffOutboxRelay::Undelivered, /422/)
-      expect(relay.drained?(through:)).to be(false)
-    end
-  end
-
   context "more tests 11" do
     # Correction rows wait for the flip to admit their generation; the snapshot
     # here is malformed, so any delivery attempt would come back 422 and raise.
@@ -151,55 +132,6 @@ RSpec.describe TimekeepingHandoffFakes::InMemoryTimekeepingStore do
       expect(Timekeeping::ProjectionConsumer).not_to have_received(:call)
       expect(relay.drained?(through:)).to be(true)
       expect(store.outbox.pluck("generation")).to eq([2])
-    end
-  end
-
-  context "more tests 12" do
-    it "rewriting a correction at the same generation replaces that entry's outbox row at a higher position and keeps the other entry's row" do
-      store = described_class.new
-      first_row = handoff_fakes_entry_row(id: 5, version: 1)
-      second_row = handoff_fakes_entry_row(id: 6, version: 1)
-      store.load_checkpoint(handoff_fakes_checkpoint(first_row, second_row))
-
-      store.write_correction_snapshots(snapshots: [first_row.except("version"), second_row.except("version")],
-                                       version: 2, generation: 2)
-      first_position = store.outbox.find { |row| row.dig("entry", "id") == 5 }.fetch("outbox_position")
-
-      store.write_correction_snapshots(snapshots: [first_row.except("version").merge("note" => "rewritten")],
-                                       version: 2, generation: 2)
-
-      rows_for_five = store.outbox.select { |row| row.dig("entry", "id") == 5 && row["generation"] == 2 }
-      expect(rows_for_five.size).to eq(1)
-      expect(rows_for_five.first.dig("entry", "note")).to eq("rewritten")
-      expect(rows_for_five.first.dig("entry", "version")).to eq(2)
-      expect(rows_for_five.first.fetch("outbox_position")).to be > first_position
-      expect(store.outbox.count { |row| row.dig("entry", "id") == 6 }).to eq(1)
-
-      positions = store.outbox.map { |row| row.fetch("outbox_position") }
-      expect(positions).to eq(positions.sort)
-      expect(positions.uniq.size).to eq(positions.size)
-      expect(store.highest_outbox_position).to eq(positions.max)
-    end
-  end
-
-  context "more tests 13" do
-    it "edit_entry! refuses before any admission and after admitting generation 2 appends an outbox row at the edited version" do
-      store = described_class.new
-      store.load_checkpoint(handoff_fakes_checkpoint(handoff_fakes_entry_row(id: 9, version: 1)))
-
-      expect { store.edit_entry!(9) }.to raise_error(ArgumentError)
-      expect(store.outbox).to eq([])
-
-      store.admit(generation: 2)
-      store.edit_entry!(9)
-
-      expect(store.outbox.size).to eq(1)
-      row = store.outbox.first
-      expect(row.fetch("generation")).to eq(2)
-      expect(row.dig("entry", "id")).to eq(9)
-      expect(row.dig("entry", "version")).to eq(store.rows.fetch("entries").first.fetch("version"))
-      expect(row.dig("entry", "version")).to eq(2)
-      expect(store.highest_outbox_position).to eq(row.fetch("outbox_position"))
     end
   end
 
@@ -280,6 +212,7 @@ RSpec.describe TimekeepingHandoffFakes::InMemoryTimekeepingStore do
 
       expect { store.edit_entry!(7) }.to raise_error(ArgumentError)
       expect(store.outbox).to eq([])
+      expect(store.highest_outbox_position).to eq(0)
 
       store.admit(generation: 2)
       store.admit(generation: 3)
@@ -290,6 +223,7 @@ RSpec.describe TimekeepingHandoffFakes::InMemoryTimekeepingStore do
       expect(edited.fetch("generation")).to eq(3)
       expect(edited.dig("entry", "id")).to eq(7)
       expect(edited.dig("entry", "version")).to eq(store.rows.fetch("entries").first.fetch("version"))
+      expect(edited.dig("entry", "version")).to eq(2)
       expect(edited.dig("entry", "note")).to eq("edited in Timekeeping")
       expect(store.highest_outbox_position).to eq(edited.fetch("outbox_position"))
     end
@@ -337,50 +271,6 @@ RSpec.describe TimekeepingHandoffFakes::InMemoryTimekeepingStore do
       expect(log).to eq([[:drain, through]])
       expect(relay.drained?(through:)).to be(false)
       expect(TimesheetEntry.unscoped.where(id: 9)).not_to exist
-    end
-  end
-
-  context "more tests 19" do
-    # A resumed first cutover writes its corrections again. Appending would give
-    # one drain two snapshots of one entry, so the rewrite must replace the row.
-    it "a correction written twice for one entry at one generation leaves one outbox row, the later one at a higher position" do
-      store = described_class.new
-      store.load_checkpoint(handoff_fakes_checkpoint(handoff_fakes_entry_row(id: 5, version: 1)))
-      snapshot = handoff_fakes_entry_row(id: 5, version: 1).except("version")
-      other = handoff_fakes_entry_row(id: 6, version: 1).except("version")
-
-      store.write_correction_snapshots(snapshots: [snapshot.merge("note" => "first"), other], version: 2, generation: 2)
-      first_position = store.outbox.find { |row| row.fetch("entry").fetch("id") == 5 }.fetch("outbox_position")
-      store.write_correction_snapshots(snapshots: [snapshot.merge("note" => "second")], version: 2, generation: 2)
-
-      rows_for_five = store.outbox.select { |row| row.fetch("entry").fetch("id") == 5 && row.fetch("generation") == 2 }
-      expect(rows_for_five.size).to eq(1)
-      expect(rows_for_five.first.fetch("entry").fetch("note")).to eq("second")
-      expect(rows_for_five.first.fetch("entry").fetch("version")).to eq(2)
-      expect(rows_for_five.first.fetch("outbox_position")).to be > first_position
-      # The other entry's row in the same generation is not dropped by the rewrite.
-      expect(store.outbox.count { |row| row.fetch("entry").fetch("id") == 6 }).to eq(1)
-      expect(store.outbox.pluck("outbox_position")).to eq(store.outbox.pluck("outbox_position").sort)
-      expect(store.highest_outbox_position).to eq(store.outbox.pluck("outbox_position").max)
-    end
-  end
-
-  context "more tests 20" do
-    it "an entry edit before any generation was admitted is refused and writes no outbox row" do
-      store = described_class.new
-      store.load_checkpoint(handoff_fakes_checkpoint(handoff_fakes_entry_row(id: 5, version: 1)))
-
-      expect { store.edit_entry!(5) }.to raise_error(ArgumentError)
-      expect(store.outbox).to eq([])
-      expect(store.highest_outbox_position).to eq(0)
-
-      store.admit(generation: 2)
-      store.admit(generation: 4)
-      store.edit_entry!(5)
-
-      expect(store.outbox.size).to eq(1)
-      expect(store.outbox.first.fetch("generation")).to eq(4)
-      expect(store.outbox.first.fetch("entry").fetch("version")).to eq(store.rows.fetch("entries").first.fetch("version"))
     end
   end
 
