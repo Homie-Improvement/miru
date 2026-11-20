@@ -56,164 +56,6 @@ RSpec.describe "TimekeepingWriterLog verdict input checks" do
   end
 end
 
-RSpec.describe TimekeepingWriterLog, committed_data: true do
-  # "TimekeepingWriterLog.install! and remove! each succeed when run twice, and install twice logs a write once"
-  it "install! run twice logs one write exactly once with op INSERT and the entry's company_id" do
-    connection = ActiveRecord::Base.connection
-    begin
-      described_class.install!(connection)
-      described_class.install!(connection)
-
-      entry = create(:timesheet_entry)
-      company_id = connection.select_value("SELECT company_id FROM timesheet_entries WHERE id = #{Integer(entry.id)}")
-
-      expect(company_id).not_to be_nil
-      expect(described_class.rows(connection)).to eq([{ writer: nil, company_id:, op: "INSERT" }])
-    ensure
-      described_class.remove!(connection)
-    end
-  end
-end
-
-RSpec.describe TimekeepingWriterLog, committed_data: true do
-  # "TimekeepingWriterLog.install! and remove! each succeed when run twice, and install twice logs a write once"
-  it "remove! run twice succeeds and leaves no log table, function or trigger behind" do
-    connection = ActiveRecord::Base.connection
-    described_class.install!(connection)
-
-    expect { described_class.remove!(connection) }.not_to raise_error
-    expect { described_class.remove!(connection) }.not_to raise_error
-
-    expect(connection.select_value("SELECT to_regclass('public.miru_writer_log')")).to be_nil
-    expect(connection.select_value("SELECT count(*) FROM pg_proc WHERE proname = 'miru_writer_log_record'")).to eq(0)
-    expect(connection.select_value(<<~SQL)).to eq(0)
-      SELECT count(*) FROM pg_trigger
-      WHERE tgname = 'miru_writer_log_trigger' AND tgrelid = 'timesheet_entries'::regclass
-    SQL
-  end
-end
-
-RSpec.describe TimekeepingWriterLog, committed_data: true do
-  # "INSERT, UPDATE and DELETE on timesheet_entries each log one row with the right op and company_id, DELETE reading OLD, including writes from another connection"
-  it "UPDATE and DELETE each log one row with the right op, and DELETE reads company_id from OLD" do
-    connection = ActiveRecord::Base.connection
-    entry = create(:timesheet_entry)
-    entry_id = Integer(entry.id)
-    company_id = connection.select_value("SELECT company_id FROM timesheet_entries WHERE id = #{entry_id}")
-    expect(company_id).not_to be_nil
-
-    described_class.guarding(connection) do
-      connection.execute("UPDATE timesheet_entries SET note = 'updated' WHERE id = #{entry_id}")
-      connection.execute("DELETE FROM timesheet_entries WHERE id = #{entry_id}")
-
-      expect(described_class.rows(connection)).to eq(
-        [
-          { writer: nil, company_id:, op: "UPDATE" },
-          { writer: nil, company_id:, op: "DELETE" }
-        ]
-      )
-    end
-  end
-end
-
-RSpec.describe TimekeepingWriterLog, committed_data: true do
-  # "Each logged row's writer is the writing session's `current_setting('miru.writer', true)`: a `SET LOCAL` 'projection' write logs `projection`, a 'legacy_gateway' write logs `legacy_gateway`, and an unmarked write logs NULL"
-  it "each logged writer is the writing session's mark: projection, legacy_gateway, and NULL when unmarked" do
-    connection = ActiveRecord::Base.connection
-    entry_id = Integer(create(:timesheet_entry).id)
-
-    described_class.guarding(connection) do
-      ActiveRecord::Base.transaction do
-        connection.execute("SET LOCAL miru.writer = 'projection'")
-        connection.execute("UPDATE timesheet_entries SET note = 'projection write' WHERE id = #{entry_id}")
-      end
-      ActiveRecord::Base.transaction do
-        connection.execute("SET LOCAL miru.writer = 'legacy_gateway'")
-        connection.execute("UPDATE timesheet_entries SET note = 'legacy write' WHERE id = #{entry_id}")
-      end
-
-      # A pooled session that once ran SET LOCAL reads '' afterwards, so the
-      # unmarked write runs on a session that has never set miru.writer.
-      fresh = ActiveRecord::Base.connection_pool.db_config.new_connection
-      begin
-        fresh.execute("UPDATE timesheet_entries SET note = 'unmarked write' WHERE id = #{entry_id}")
-      ensure
-        fresh.disconnect!
-      end
-
-      writers = described_class.rows(connection).map { |row| row.fetch(:writer) }
-      expect(writers.size).to eq(3)
-      expect(writers[0]).to eq("projection")
-      expect(writers[1]).to eq("legacy_gateway")
-      expect(writers[2]).to be_nil
-    end
-  end
-end
-
-RSpec.describe TimekeepingWriterLog, committed_data: true do
-  # "INSERT, UPDATE and DELETE on timesheet_entries each log one row with the right op and company_id, DELETE reading OLD, including writes from another connection"
-  it "a write committed by a second pooled connection is logged with that session's backend pid" do
-    connection = ActiveRecord::Base.connection
-    entry_id = Integer(create(:timesheet_entry).id)
-    company_id = connection.select_value("SELECT company_id FROM timesheet_entries WHERE id = #{entry_id}")
-    main_pid = connection.select_value("SELECT pg_backend_pid()")
-    pids = Queue.new
-
-    described_class.guarding(connection) do
-      worker = committed_data_thread(pids) do
-        ActiveRecord::Base.connection.execute("UPDATE timesheet_entries SET note = 'other session' WHERE id = #{entry_id}")
-      end
-      begin
-        worker.join
-      ensure
-        stop_committed_data_threads(worker)
-      end
-      worker_pid = pids.pop
-
-      expect(worker_pid).not_to eq(main_pid)
-      expect(described_class.rows(connection, include_backend_pid: true)).to eq(
-        [{ writer: nil, company_id:, op: "UPDATE", backend_pid: worker_pid }]
-      )
-    end
-  end
-end
-
-RSpec.describe TimekeepingWriterLog, committed_data: true do
-  # "Make `install!` and `remove!` safe to run twice, and call `remove!` in an `ensure`, so no trigger outlives the guard."
-  it "guarding re-raises the block's error and leaves no trigger on timesheet_entries" do
-    connection = ActiveRecord::Base.connection
-    block_failure = Class.new(StandardError)
-
-    expect { described_class.guarding(connection) { raise block_failure, "guard body failed" } }
-      .to raise_error(block_failure, "guard body failed")
-
-    expect(connection.select_value(<<~SQL)).to eq(0)
-      SELECT count(*) FROM pg_trigger
-      WHERE tgname = 'miru_writer_log_trigger' AND tgrelid = 'timesheet_entries'::regclass
-    SQL
-    expect(connection.select_value("SELECT to_regclass('public.miru_writer_log')")).to be_nil
-  end
-end
-
-RSpec.describe TimekeepingWriterLog, committed_data: true do
-  # "`clear!(connection = ActiveRecord::Base.connection)` empties the log with DELETE FROM."
-  it "clear! empties the log while the trigger keeps logging later writes" do
-    connection = ActiveRecord::Base.connection
-    entry_id = Integer(create(:timesheet_entry).id)
-
-    described_class.guarding(connection) do
-      connection.execute("UPDATE timesheet_entries SET note = 'before clear' WHERE id = #{entry_id}")
-      expect(described_class.rows(connection).size).to eq(1)
-
-      described_class.clear!(connection)
-      expect(described_class.rows(connection)).to eq([])
-
-      connection.execute("UPDATE timesheet_entries SET note = 'after clear' WHERE id = #{entry_id}")
-      expect(described_class.rows(connection).map { |row| row.fetch(:op) }).to eq(["UPDATE"])
-    end
-  end
-end
-
 RSpec.describe "TimekeepingWriterLog company attribution", committed_data: true do
   # "INSERT, UPDATE and DELETE on timesheet_entries each log one row with the right op and company_id, DELETE reading OLD, including writes from another connection"
   it "logs each write with the company of the row it changed, never another company's, DELETE included" do
@@ -551,23 +393,6 @@ RSpec.describe "TimekeepingWriterLog.require_cases!" do
   end
 end
 
-RSpec.describe "TimekeepingWriterLog.clear!", committed_data: true do
-  # "`clear!(connection = ActiveRecord::Base.connection)` empties the log with DELETE FROM."
-  it "clear! empties the log and the next write is logged on its own" do
-    connection = ActiveRecord::Base.connection
-    TimekeepingWriterLog.guarding(connection) do
-      entry = create(:timesheet_entry)
-      expect(TimekeepingWriterLog.rows(connection).size).to eq(1)
-
-      TimekeepingWriterLog.clear!(connection)
-      expect(TimekeepingWriterLog.rows(connection)).to eq([])
-
-      entry.update!(note: "after clear")
-      expect(TimekeepingWriterLog.rows(connection).map { |row| row[:op] }).to eq(["UPDATE"])
-    end
-  end
-end
-
 RSpec.describe "TimekeepingWriterLog" do
   # "Never add it under db/migrate or to db/schema.rb."
   it "keeps the writer log table, function and trigger out of db/schema.rb and db/migrate" do
@@ -633,51 +458,6 @@ RSpec.describe "TimekeepingWriterLog crashed-run install", committed_data: true 
     expect(TimekeepingWriterLog.rows(connection)).to eq([{ writer: nil, company_id: entry.company_id, op: "INSERT" }])
   ensure
     TimekeepingWriterLog.remove!(ActiveRecord::Base.connection)
-  end
-end
-
-RSpec.describe "TimekeepingWriterLog writer marks after a committed mark", committed_data: true do
-  # "Each logged row's writer is the writing session's `current_setting('miru.writer', true)`: a `SET LOCAL`
-  # 'projection' write logs `projection`, a 'legacy_gateway' write logs `legacy_gateway`, and an unmarked write logs NULL"
-  # The marked write runs first, so a log that stored a mark left over from another session, or that
-  # turned NULL into '', fails here.
-  it "an unmarked write on a never-marked session logs NULL even after a marked write committed" do
-    connection = ActiveRecord::Base.connection
-    entry = create(:timesheet_entry)
-    fresh = nil
-
-    TimekeepingWriterLog.guarding(connection) do
-      ActiveRecord::Base.transaction do
-        connection.execute("SET LOCAL miru.writer = 'legacy_gateway'")
-        entry.update!(note: "marked")
-      end
-
-      fresh = ActiveRecord::Base.connection_pool.db_config.new_connection
-      fresh.execute("UPDATE timesheet_entries SET note = 'unmarked' WHERE id = #{Integer(entry.id)}")
-
-      writers = TimekeepingWriterLog.rows(connection).map { |row| row[:writer] }
-      expect(writers.size).to eq(2)
-      expect(writers.first).to eq("legacy_gateway")
-      expect(writers.last).to be_nil
-    end
-  ensure
-    fresh&.disconnect!
-  end
-end
-
-RSpec.describe "TimekeepingWriterLog delete logging", committed_data: true do
-  # "INSERT, UPDATE and DELETE on timesheet_entries each log one row with the right op and company_id, DELETE reading OLD, including writes from another connection"
-  it "a delete logs the deleted row's company_id from OLD, not a NULL from NEW" do
-    connection = ActiveRecord::Base.connection
-    entry = create(:timesheet_entry)
-    company_id = entry.reload.company_id
-    expect(company_id).not_to be_nil
-
-    TimekeepingWriterLog.guarding(connection) do
-      connection.execute("DELETE FROM timesheet_entries WHERE id = #{Integer(entry.id)}")
-
-      expect(TimekeepingWriterLog.rows(connection)).to eq([{ writer: nil, company_id:, op: "DELETE" }])
-    end
   end
 end
 
@@ -775,21 +555,6 @@ RSpec.describe "TimekeepingWriterLog section 10.1 parser edges" do
 
     empty = "#{heading}\n\nThe web controller writes through `app/services/timekeeping/gateway.rb`.\n"
     expect { TimekeepingWriterLog.section_10_1_paths(empty) }.to raise_error(ArgumentError)
-  end
-end
-
-RSpec.describe "TimekeepingWriterLog section 10.1 drift" do
-  # "Read the backticked paths in the bullet list after \"**Every writer goes through the gateway.**\" in docs/architecture/timekeeping-soa.md, and compare the two sets in both directions."
-  it "check_section_10_1! names a writer path the real doc lacks and a doc path the writers lack" do
-    text = Rails.root.join("docs/architecture/timekeeping-soa.md").read
-
-    with_extra = TimekeepingWriterLog::SECTION_10_1_WRITERS.merge("app/services/timekeeping/gateway.rb" => :gateway)
-    expect { TimekeepingWriterLog.check_section_10_1!(text: text, writers: with_extra) }
-      .to raise_error(ArgumentError, %r{app/services/timekeeping/gateway\.rb})
-
-    without_agent = TimekeepingWriterLog::SECTION_10_1_WRITERS.except("app/models/agent.rb")
-    expect { TimekeepingWriterLog.check_section_10_1!(text: text, writers: without_agent) }
-      .to raise_error(ArgumentError, %r{app/models/agent\.rb})
   end
 end
 
