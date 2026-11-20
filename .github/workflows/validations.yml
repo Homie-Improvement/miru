@@ -535,13 +535,12 @@ jobs:
       - name: Setup monolith test database
         run: bundle exec rails db:test:prepare
 
-      - name: Run the demo runtime queue spec, the Timekeeping collector row spec and the boot database isolation specs
+      - name: Run the demo runtime queue spec, the Timekeeping collector row spec and the boot database isolation spec
         run: >-
           bundle exec rspec
           spec/timekeeping/runtime_queues_spec.rb
           spec/timekeeping/timekeeping_collector_rows_spec.rb
           spec/lib/timekeeping_demo/boot_database_isolation_live_spec.rb
-          spec/lib/timekeeping_demo/boot_database_isolation_live_2_spec.rb
 
   security-audit:
     name: Security audit

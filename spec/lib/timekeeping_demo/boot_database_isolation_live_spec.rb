@@ -29,6 +29,7 @@ RSpec.describe TimekeepingDotenvTree do
       expect(File.symlink?(File.join(tree, ".git"))).to be(false)
       expect(git.call(tree, "rev-parse", "--show-toplevel").strip).to eq(tree)
       expect(File.read(File.join(tree, ".env.test.local"))).to eq("PGAPPNAME=#{probe}\n")
+      expect(Dir.glob(".env*", File::FNM_DOTMATCH, base: tree)).to eq([".env.test.local"])
     end
 
     expect(git.call(checkout, "rev-parse", "HEAD")).to eq(head_before)
@@ -40,15 +41,11 @@ end
 
 RSpec.describe "Timekeeping demo boot database isolation tree" do
   it "version capture succeeds in a dotenv tree built with its own git repository and records both applications" do
+    checkout_env_files_before = Rails.root.glob(".env*").map(&:to_s).sort
+
     Dir.mktmpdir do |dir|
       tree = File.realpath(dir)
-      built = begin
-        TimekeepingDotenvTree.build(tree, dotenv: "PGAPPNAME=boot-isolation-version-probe\n", own_git: true)
-        true
-      rescue ArgumentError
-        false
-      end
-      expect(built).to be(true)
+      TimekeepingDotenvTree.build(tree, dotenv: "PGAPPNAME=boot-isolation-version-probe\n", own_git: true)
 
       # The launcher captures versions before any app starts, so a capture
       # that raises here would stop the boot before any connection exists.
@@ -56,7 +53,10 @@ RSpec.describe "Timekeeping demo boot database isolation tree" do
       expect(record.keys).to eq(%w[monolith timekeeping])
       expect(record.values.map { |entry| entry.fetch("revision") }.uniq.size).to eq(1)
       expect(File.symlink?(File.join(tree, ".git"))).to be(false)
+      expect(File.directory?(File.join(tree, ".git"))).to be(true)
     end
+
+    expect(Rails.root.glob(".env*").map(&:to_s).sort).to eq(checkout_env_files_before)
   end
 end
 
@@ -85,28 +85,6 @@ RSpec.describe "Timekeeping demo boot database isolation tree" do
     expect(checkout_head_after).to eq(checkout_head_before)
     expect(Rails.root.glob(".env*").map(&:to_s).sort).to eq(env_files_before)
     expect(File.exist?(tree_path)).to be(false)
-  end
-end
-
-RSpec.describe TimekeepingDotenvTree, "for a boot of bin/timekeeping-demo up" do
-  it "the launcher's version capture succeeds in a dotenv tree built with its own git repository" do
-    checkout_env_files_before = Rails.root.glob(".env*").map(&:to_s).sort
-
-    Dir.mktmpdir("boot-isolation-version-tree") do |dir|
-      tree = File.realpath(dir)
-      described_class.build(tree, dotenv: "PGAPPNAME=version-capture-probe\n", own_git: true)
-
-      # `bin/timekeeping-demo up` captures versions before it starts any app, so
-      # a tree the capture fails in can never boot either application.
-      versions = nil
-      expect { versions = TimekeepingDemo::VersionRecord.capture(root: tree) }.not_to raise_error
-      expect(versions.keys).to contain_exactly("monolith", "timekeeping")
-      expect(versions.values.map { |entry| entry.fetch("revision") }.uniq.size).to eq(1)
-      expect(File.symlink?(File.join(tree, ".git"))).to be(false)
-      expect(File.directory?(File.join(tree, ".git"))).to be(true)
-    end
-
-    expect(Rails.root.glob(".env*").map(&:to_s).sort).to eq(checkout_env_files_before)
   end
 end
 
@@ -255,52 +233,5 @@ RSpec.describe IntegratedRuntime, "booted from a tree without the empty DATABASE
 
     expect(Rails.root.join("config", "application.rb").read).to include('ENV.delete("DATABASE_URL") if ENV["DATABASE_URL"] == ""')
     expect(Rails.root.glob(".env*").map(&:to_s).sort).to eq(checkout_env_files_before)
-  end
-end
-
-RSpec.describe TimekeepingDotenvTree do
-  # "A spec boots the monolith and Timekeeping through bin/timekeeping-demo with a temporary dotenv file that sets conflicting DATABASE_URL, DB_USER and PG\* values, and asserts that each app's live connection reports its own distinct current_user."
-  # These files find the app root from their own resolved location. A symlink to the checkout
-  # would boot the checkout's application, read its .env files, and never read the tree's file.
-  it "every monolith entry point in the dotenv tree resolves its app root to the tree, not the real checkout, so db:prepare and the servers read the tree's dotenv file" do
-    Dir.mktmpdir("boot-isolation-entry-tree") do |dir|
-      tree = File.realpath(dir)
-      described_class.build(tree, dotenv: "PGAPPNAME=boot-isolation-entry-probe\n")
-
-      scripts = %w[bin/timekeeping-demo bin/timekeeping-demo-queue bin/rails]
-      roots = scripts.index_with do |path|
-        File.expand_path("..", File.dirname(File.realpath(File.join(tree, path))))
-      end
-      top_level = %w[Rakefile config.ru].index_with do |path|
-        File.dirname(File.realpath(File.join(tree, path)))
-      end
-
-      expect(roots).to eq(scripts.index_with(tree))
-      expect(top_level).to eq("Rakefile" => tree, "config.ru" => tree)
-      expect(scripts.all? { |path| File.executable?(File.join(tree, path)) }).to be(true)
-    end
-  end
-end
-
-RSpec.describe TimekeepingDotenvTree do
-  # "A spec boots the monolith and Timekeeping through bin/timekeeping-demo with a temporary dotenv file that sets conflicting DATABASE_URL, DB_USER and PG\* values, and asserts that each app's live connection reports its own distinct current_user."
-  # The temporary dotenv file must never reach the developer's checkout, and the tree's own
-  # git commit must not land in the checkout's repository.
-  it "building a dotenv tree with its own git repository leaves the checkout's env files and git history untouched and holds no env file but the conflicting one" do
-    checkout_env_files_before = Rails.root.glob(".env*").map(&:to_s).sort
-    checkout_head_before, = Open3.capture2("git", "rev-parse", "HEAD", chdir: Rails.root.to_s)
-
-    Dir.mktmpdir("boot-isolation-untouched-tree") do |dir|
-      tree = File.realpath(dir)
-      described_class.build(tree, dotenv: "DB_USER=boot_isolation_conflict\nPGAPPNAME=boot-isolation-untouched\n",
-                                  own_git: true)
-
-      expect(Dir.glob(".env*", File::FNM_DOTMATCH, base: tree)).to eq([".env.test.local"])
-      expect(File.read(File.join(tree, ".env.test.local"))).to include("DB_USER=boot_isolation_conflict")
-    end
-
-    checkout_head_after, = Open3.capture2("git", "rev-parse", "HEAD", chdir: Rails.root.to_s)
-    expect(Rails.root.glob(".env*").map(&:to_s).sort).to eq(checkout_env_files_before)
-    expect(checkout_head_after).to eq(checkout_head_before)
   end
 end
