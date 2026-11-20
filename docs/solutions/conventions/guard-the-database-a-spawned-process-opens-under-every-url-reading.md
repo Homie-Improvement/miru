@@ -48,7 +48,7 @@ module TestDatabaseGuard
 end
 ```
 
-The guard lives in `TestDatabaseGuard`, so every helper that hands a URL to a spawned process (`IntegratedRuntime.start` and the collector probe today) applies the same two readings. `active_record_database_name` builds an `ActiveRecord::DatabaseConfigurations::UrlConfig` without connecting. Run all of these checks before the first spawn, because a pending migration cannot be undone once `db:prepare` starts.
+The guard lives in `TestDatabaseGuard`, so every helper that hands a URL to a spawned process (`IntegratedRuntime.start`, `TimekeepingLiveInstance#start` and the collector probe today) applies the same two readings. `active_record_database_name` builds an `ActiveRecord::DatabaseConfigurations::UrlConfig` without connecting. Run all of these checks before the first spawn, because a pending migration cannot be undone once `db:prepare` starts.
 
 ## Why it matters
 
