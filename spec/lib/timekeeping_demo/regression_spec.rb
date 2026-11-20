@@ -335,8 +335,9 @@ RSpec.describe TimekeepingDemo::Regression do
 end
 
 RSpec.describe TimekeepingDemo::Regression, "with a switches_owner report the command cannot read" do
-  # "The plan says missing or unparseable reports fail the command. The author's declined answer and
-  # run_switches_owner_report instead allow success without a readable report when the runner returns true."
+  # The switches_owner pass passes only when its runner returns true and its
+  # json report can be read; these examples pin each way the report can be
+  # unreadable.
 
   # Runs the command with every state passing. The switches_owner pass hands
   # its --out path to the block, if one is given, then answers report_result.
