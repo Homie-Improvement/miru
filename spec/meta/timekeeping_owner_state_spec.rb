@@ -538,308 +538,308 @@ RSpec.describe "Timekeeping owner state harness" do
   end
 
   context "more tests 10" do
-  it "forwards_writes? refuses a misspelt, padded or nil owner state instead of answering" do
-    # A typo in a regression child's state must fail loudly; answering false
-    # would skip the forwarded importer examples and leave the run green.
-    ["Legacy", "rollback ", "bogus", "", nil].each do |state_name|
-      expect { TimekeepingOwnerState.forwards_writes?(state_name) }
-        .to raise_error(ArgumentError, /legacy, timekeeping, rollback/)
+    it "forwards_writes? refuses a misspelt, padded or nil owner state instead of answering" do
+      # A typo in a regression child's state must fail loudly; answering false
+      # would skip the forwarded importer examples and leave the run green.
+      ["Legacy", "rollback ", "bogus", "", nil].each do |state_name|
+        expect { TimekeepingOwnerState.forwards_writes?(state_name) }
+          .to raise_error(ArgumentError, /legacy, timekeeping, rollback/)
+      end
     end
-  end
   end
 
   context "more tests 11" do
-  it "forwarding_skip_reason raises for a tagged example whose owner_state is misspelt rather than giving a skip reason" do
-    metadata = { TimekeepingOwnerState::FORWARDS_TAG => true, owner_state: "Rollback" }
+    it "forwarding_skip_reason raises for a tagged example whose owner_state is misspelt rather than giving a skip reason" do
+      metadata = { TimekeepingOwnerState::FORWARDS_TAG => true, owner_state: "Rollback" }
 
-    expect { TimekeepingOwnerState.forwarding_skip_reason(metadata) }.to raise_error(ArgumentError)
-  end
+      expect { TimekeepingOwnerState.forwarding_skip_reason(metadata) }.to raise_error(ArgumentError)
+    end
   end
 
   context "more tests 12" do
-  include InnerExampleThroughSuiteHooks
+    include InnerExampleThroughSuiteHooks
 
-  it "a forwards_to_timekeeping example with a misspelt owner_state fails instead of being skipped" do
-    body_ran = false
-    result = run_inner_example_through_suite_hooks(
-      { forwards_to_timekeeping: true }, { owner_state: "legcy" }
-    ) { body_ran = true }
+    it "a forwards_to_timekeeping example with a misspelt owner_state fails instead of being skipped" do
+      body_ran = false
+      result = run_inner_example_through_suite_hooks(
+        { forwards_to_timekeeping: true }, { owner_state: "legcy" }
+      ) { body_ran = true }
 
-    expect(result.status).to eq(:failed)
-    expect(result.exception).to be_a(ArgumentError)
-    expect(result.pending_message).to be_nil
-    expect(body_ran).to be(false)
-  end
+      expect(result.status).to eq(:failed)
+      expect(result.exception).to be_a(ArgumentError)
+      expect(result.pending_message).to be_nil
+      expect(body_ran).to be(false)
+    end
   end
 
   context "more tests 13" do
-  it "forwards_writes? answers true only for the timekeeping owner state and refuses unknown names" do
-    # Written out by hand so a wrong STATES row fails here instead of being compared with itself.
-    expected = { "legacy" => false, "timekeeping" => true, "rollback" => false }
+    it "forwards_writes? answers true only for the timekeeping owner state and refuses unknown names" do
+      # Written out by hand so a wrong STATES row fails here instead of being compared with itself.
+      expected = { "legacy" => false, "timekeeping" => true, "rollback" => false }
 
-    expected.each do |state_name, forwards|
-      expect(TimekeepingOwnerState.forwards_writes?(state_name)).to be(forwards)
+      expected.each do |state_name, forwards|
+        expect(TimekeepingOwnerState.forwards_writes?(state_name)).to be(forwards)
+      end
+      expect { TimekeepingOwnerState.forwards_writes?("bogus") }.to raise_error(ArgumentError)
+      expect { TimekeepingOwnerState.forwards_writes?(nil) }.to raise_error(ArgumentError)
     end
-    expect { TimekeepingOwnerState.forwards_writes?("bogus") }.to raise_error(ArgumentError)
-    expect { TimekeepingOwnerState.forwards_writes?(nil) }.to raise_error(ArgumentError)
-  end
   end
 
   context "more tests 14" do
-  include InnerExampleThroughSuiteHooks
+    include InnerExampleThroughSuiteHooks
 
-  it "a forwarded example in the legacy and rollback owner states is skipped with a stated reason before its body runs" do
-    # "Running `bin/timekeeping-demo regression` in the `legacy` and `rollback` states shows every forwarded
-    # Harvest importer example either passing or skipped with a stated reason, with none failing."
-    %w[legacy rollback].each do |state_name|
+    it "a forwarded example in the legacy and rollback owner states is skipped with a stated reason before its body runs" do
+      # "Running `bin/timekeeping-demo regression` in the `legacy` and `rollback` states shows every forwarded
+      # Harvest importer example either passing or skipped with a stated reason, with none failing."
+      %w[legacy rollback].each do |state_name|
+        body_ran = false
+        result = run_inner_example_through_suite_hooks({ forwards_to_timekeeping: true }, { owner_state: state_name }) do
+          body_ran = true
+        end
+
+        expect(result.status).to eq(:pending)
+        expect(result.pending_message).to include(state_name)
+        expect(result.pending_message).to match(/Timekeeping/)
+        expect(body_ran).to be(false)
+      end
+    end
+  end
+
+  context "more tests 15" do
+    include InnerExampleThroughSuiteHooks
+
+    it "a forwarded example in the timekeeping owner state still runs its body and passes" do
       body_ran = false
-      result = run_inner_example_through_suite_hooks({ forwards_to_timekeeping: true }, { owner_state: state_name }) do
+      result = run_inner_example_through_suite_hooks({ forwards_to_timekeeping: true }, { owner_state: "timekeeping" }) do
+        body_ran = true
+      end
+
+      expect(result.status).to eq(:passed)
+      expect(body_ran).to be(true)
+    end
+  end
+
+  context "more tests 16" do
+    include InnerExampleThroughSuiteHooks
+
+    it "an untagged example and a tag overridden to false still run in the legacy owner state" do
+      untagged = run_inner_example_through_suite_hooks({}, { owner_state: "legacy" }) { nil }
+      overridden = run_inner_example_through_suite_hooks(
+        { forwards_to_timekeeping: true }, { owner_state: "legacy", forwards_to_timekeeping: false }
+      ) { nil }
+
+      expect(untagged.status).to eq(:passed)
+      expect(overridden.status).to eq(:passed)
+    end
+  end
+
+  context "more tests 17" do
+    include InnerExampleThroughSuiteHooks
+
+    # "Running `bin/timekeeping-demo regression` in the `legacy` and `rollback` states shows every forwarded Harvest
+    # importer example either passing or skipped with a stated reason, with none failing."
+    it "skips a forwarded example in the legacy owner state with a reason naming the state, before its body runs" do
+      body_ran = false
+      result = run_inner_example_through_suite_hooks({ forwards_to_timekeeping: true }, { owner_state: "legacy" }) do
         body_ran = true
       end
 
       expect(result.status).to eq(:pending)
-      expect(result.pending_message).to include(state_name)
-      expect(result.pending_message).to match(/Timekeeping/)
+      expect(result.exception).to be_nil
+      expect(result.pending_message).to include("legacy")
+      expect(result.pending_message).to include("Timekeeping")
       expect(body_ran).to be(false)
     end
   end
-  end
-
-  context "more tests 15" do
-  include InnerExampleThroughSuiteHooks
-
-  it "a forwarded example in the timekeeping owner state still runs its body and passes" do
-    body_ran = false
-    result = run_inner_example_through_suite_hooks({ forwards_to_timekeeping: true }, { owner_state: "timekeeping" }) do
-      body_ran = true
-    end
-
-    expect(result.status).to eq(:passed)
-    expect(body_ran).to be(true)
-  end
-  end
-
-  context "more tests 16" do
-  include InnerExampleThroughSuiteHooks
-
-  it "an untagged example and a tag overridden to false still run in the legacy owner state" do
-    untagged = run_inner_example_through_suite_hooks({}, { owner_state: "legacy" }) { nil }
-    overridden = run_inner_example_through_suite_hooks(
-      { forwards_to_timekeeping: true }, { owner_state: "legacy", forwards_to_timekeeping: false }
-    ) { nil }
-
-    expect(untagged.status).to eq(:passed)
-    expect(overridden.status).to eq(:passed)
-  end
-  end
-
-  context "more tests 17" do
-  include InnerExampleThroughSuiteHooks
-
-  # "Running `bin/timekeeping-demo regression` in the `legacy` and `rollback` states shows every forwarded Harvest
-  # importer example either passing or skipped with a stated reason, with none failing."
-  it "skips a forwarded example in the legacy owner state with a reason naming the state, before its body runs" do
-    body_ran = false
-    result = run_inner_example_through_suite_hooks({ forwards_to_timekeeping: true }, { owner_state: "legacy" }) do
-      body_ran = true
-    end
-
-    expect(result.status).to eq(:pending)
-    expect(result.exception).to be_nil
-    expect(result.pending_message).to include("legacy")
-    expect(result.pending_message).to include("Timekeeping")
-    expect(body_ran).to be(false)
-  end
-  end
 
   context "more tests 18" do
-  include InnerExampleThroughSuiteHooks
+    include InnerExampleThroughSuiteHooks
 
-  # "Running `bin/timekeeping-demo regression` in the `legacy` and `rollback` states shows every forwarded Harvest
-  # importer example either passing or skipped with a stated reason, with none failing."
-  it "skips a forwarded example in the rollback owner state with a reason naming the state, before its body runs" do
-    body_ran = false
-    result = run_inner_example_through_suite_hooks({ forwards_to_timekeeping: true }, { owner_state: "rollback" }) do
-      body_ran = true
+    # "Running `bin/timekeeping-demo regression` in the `legacy` and `rollback` states shows every forwarded Harvest
+    # importer example either passing or skipped with a stated reason, with none failing."
+    it "skips a forwarded example in the rollback owner state with a reason naming the state, before its body runs" do
+      body_ran = false
+      result = run_inner_example_through_suite_hooks({ forwards_to_timekeeping: true }, { owner_state: "rollback" }) do
+        body_ran = true
+      end
+
+      expect(result.status).to eq(:pending)
+      expect(result.exception).to be_nil
+      expect(result.pending_message).to include("rollback")
+      expect(result.pending_message).to include("Timekeeping")
+      expect(body_ran).to be(false)
     end
-
-    expect(result.status).to eq(:pending)
-    expect(result.exception).to be_nil
-    expect(result.pending_message).to include("rollback")
-    expect(result.pending_message).to include("Timekeeping")
-    expect(body_ran).to be(false)
-  end
   end
 
   context "more tests 19" do
-  include InnerExampleThroughSuiteHooks
+    include InnerExampleThroughSuiteHooks
 
-  # The forwarded examples keep their coverage where Timekeeping owns the entries: a failing body must still fail.
-  it "runs a forwarded example in the timekeeping owner state, so a failure in its body still fails it" do
-    passing = run_inner_example_through_suite_hooks({ forwards_to_timekeeping: true }, { owner_state: "timekeeping" }) do
-      expect(TimekeepingOwnership.current.owner).to eq("timekeeping")
-    end
-    failing = run_inner_example_through_suite_hooks({ forwards_to_timekeeping: true }, { owner_state: "timekeeping" }) do
-      raise "the forwarded body ran and failed"
-    end
+    # The forwarded examples keep their coverage where Timekeeping owns the entries: a failing body must still fail.
+    it "runs a forwarded example in the timekeeping owner state, so a failure in its body still fails it" do
+      passing = run_inner_example_through_suite_hooks({ forwards_to_timekeeping: true }, { owner_state: "timekeeping" }) do
+        expect(TimekeepingOwnership.current.owner).to eq("timekeeping")
+      end
+      failing = run_inner_example_through_suite_hooks({ forwards_to_timekeeping: true }, { owner_state: "timekeeping" }) do
+        raise "the forwarded body ran and failed"
+      end
 
-    expect(passing.status).to eq(:passed)
-    expect(failing.status).to eq(:failed)
-    expect(failing.exception.message).to eq("the forwarded body ran and failed")
-  end
+      expect(passing.status).to eq(:passed)
+      expect(failing.status).to eq(:failed)
+      expect(failing.exception.message).to eq("the forwarded body ran and failed")
+    end
   end
 
   context "more tests 20" do
-  include InnerExampleThroughSuiteHooks
+    include InnerExampleThroughSuiteHooks
 
-  # Local-write examples prove imports in the monolith-owned states, so only tagged examples may be skipped.
-  it "does not skip an untagged or tag-overridden example in the legacy owner state" do
-    runs = []
-    untagged = run_inner_example_through_suite_hooks({}, { owner_state: "legacy" }) { runs << :untagged }
-    overridden = run_inner_example_through_suite_hooks(
-      { forwards_to_timekeeping: true }, { owner_state: "legacy", forwards_to_timekeeping: false }
-    ) { runs << :overridden }
+    # Local-write examples prove imports in the monolith-owned states, so only tagged examples may be skipped.
+    it "does not skip an untagged or tag-overridden example in the legacy owner state" do
+      runs = []
+      untagged = run_inner_example_through_suite_hooks({}, { owner_state: "legacy" }) { runs << :untagged }
+      overridden = run_inner_example_through_suite_hooks(
+        { forwards_to_timekeeping: true }, { owner_state: "legacy", forwards_to_timekeeping: false }
+      ) { runs << :overridden }
 
-    expect(untagged.status).to eq(:passed)
-    expect(overridden.status).to eq(:passed)
-    expect(runs).to eq(%i[untagged overridden])
-  end
+      expect(untagged.status).to eq(:passed)
+      expect(overridden.status).to eq(:passed)
+      expect(runs).to eq(%i[untagged overridden])
+    end
   end
 
   context "more tests 21" do
-  # Written out by hand so a wrong owner in STATES fails here instead of being compared with itself.
-  it "forwards_writes? answers true only for the timekeeping state and refuses unknown or nil names" do
-    answers = %w[legacy timekeeping rollback].to_h { |name| [name, TimekeepingOwnerState.forwards_writes?(name)] }
+    # Written out by hand so a wrong owner in STATES fails here instead of being compared with itself.
+    it "forwards_writes? answers true only for the timekeeping state and refuses unknown or nil names" do
+      answers = %w[legacy timekeeping rollback].index_with { |name| TimekeepingOwnerState.forwards_writes?(name) }
 
-    expect(answers).to eq("legacy" => false, "timekeeping" => true, "rollback" => false)
-    expect { TimekeepingOwnerState.forwards_writes?("Timekeeping") }.to raise_error(ArgumentError, /legacy, timekeeping, rollback/)
-    expect { TimekeepingOwnerState.forwards_writes?(nil) }.to raise_error(ArgumentError)
-  end
+      expect(answers).to eq("legacy" => false, "timekeeping" => true, "rollback" => false)
+      expect { TimekeepingOwnerState.forwards_writes?("Timekeeping") }.to raise_error(ArgumentError, /legacy, timekeeping, rollback/)
+      expect { TimekeepingOwnerState.forwards_writes?(nil) }.to raise_error(ArgumentError)
+    end
   end
 
   context "more tests 22" do
-  it "forwarding_skip_reason gives a reason only for a tagged example whose state does not forward" do
-    rollback_reason = TimekeepingOwnerState.forwarding_skip_reason(forwards_to_timekeeping: true, owner_state: "rollback")
+    it "forwarding_skip_reason gives a reason only for a tagged example whose state does not forward" do
+      rollback_reason = TimekeepingOwnerState.forwarding_skip_reason(forwards_to_timekeeping: true, owner_state: "rollback")
 
-    expect(rollback_reason).to be_a(String)
-    expect(rollback_reason).to include("rollback")
-    expect(TimekeepingOwnerState.forwarding_skip_reason(forwards_to_timekeeping: true, owner_state: "timekeeping")).to be_nil
-    expect(TimekeepingOwnerState.forwarding_skip_reason(owner_state: "legacy")).to be_nil
-    expect(TimekeepingOwnerState.forwarding_skip_reason(forwards_to_timekeeping: false, owner_state: "legacy")).to be_nil
-    expect { TimekeepingOwnerState.forwarding_skip_reason(forwards_to_timekeeping: true, owner_state: "bogus") }
-      .to raise_error(ArgumentError)
-  end
+      expect(rollback_reason).to be_a(String)
+      expect(rollback_reason).to include("rollback")
+      expect(TimekeepingOwnerState.forwarding_skip_reason(forwards_to_timekeeping: true, owner_state: "timekeeping")).to be_nil
+      expect(TimekeepingOwnerState.forwarding_skip_reason(owner_state: "legacy")).to be_nil
+      expect(TimekeepingOwnerState.forwarding_skip_reason(forwards_to_timekeeping: false, owner_state: "legacy")).to be_nil
+      expect { TimekeepingOwnerState.forwarding_skip_reason(forwards_to_timekeeping: true, owner_state: "bogus") }
+        .to raise_error(ArgumentError)
+    end
   end
 
   context "more tests 23" do
-  # An ordinary run selects no state and the forwarding helper hands ownership to Timekeeping, so the
-  # forwarded examples must run there.
-  it "forwarding_skip_reason gives no reason for a tagged example when no owner state is selected" do
-    skip "this run selects TIMEKEEPING_OWNER_STATE" unless TimekeepingOwnerState::SELECTED.nil?
+    # An ordinary run selects no state and the forwarding helper hands ownership to Timekeeping, so the
+    # forwarded examples must run there.
+    it "forwarding_skip_reason gives no reason for a tagged example when no owner state is selected" do
+      skip "this run selects TIMEKEEPING_OWNER_STATE" unless TimekeepingOwnerState::SELECTED.nil?
 
-    expect(TimekeepingOwnerState.forwarding_skip_reason(forwards_to_timekeeping: true)).to be_nil
-  end
+      expect(TimekeepingOwnerState.forwarding_skip_reason(forwards_to_timekeeping: true)).to be_nil
+    end
   end
 
   context "more tests 24" do
-  # "Running `bin/timekeeping-demo regression` in the `legacy` and `rollback` states shows every forwarded
-  # Harvest importer example either passing or skipped with a stated reason, with none failing."
-  it "forwarding_skip_reason states why a forwarded example is skipped in the legacy owner state" do
-    reason = TimekeepingOwnerState.forwarding_skip_reason({ forwards_to_timekeeping: true, owner_state: "legacy" })
+    # "Running `bin/timekeeping-demo regression` in the `legacy` and `rollback` states shows every forwarded
+    # Harvest importer example either passing or skipped with a stated reason, with none failing."
+    it "forwarding_skip_reason states why a forwarded example is skipped in the legacy owner state" do
+      reason = TimekeepingOwnerState.forwarding_skip_reason({ forwards_to_timekeeping: true, owner_state: "legacy" })
 
-    expect(reason).to be_a(String)
-    expect(reason.strip).not_to be_empty
-    expect(reason).to include("legacy")
-    expect(reason).to match(/Timekeeping/)
-    expect(reason).to match(/own/i)
-  end
+      expect(reason).to be_a(String)
+      expect(reason.strip).not_to be_empty
+      expect(reason).to include("legacy")
+      expect(reason).to match(/Timekeeping/)
+      expect(reason).to match(/own/i)
+    end
   end
 
   context "more tests 25" do
-  # "Running `bin/timekeeping-demo regression` in the `legacy` and `rollback` states shows every forwarded
-  # Harvest importer example either passing or skipped with a stated reason, with none failing."
-  # A typo in the state must not pass as a monolith-owned state and quietly skip the forwarded examples.
-  it "a misspelt owner state on a forwarded example raises instead of turning into a skip" do
-    stub_const("TimekeepingOwnerState::SELECTED", nil)
+    # "Running `bin/timekeeping-demo regression` in the `legacy` and `rollback` states shows every forwarded
+    # Harvest importer example either passing or skipped with a stated reason, with none failing."
+    # A typo in the state must not pass as a monolith-owned state and quietly skip the forwarded examples.
+    it "a misspelt owner state on a forwarded example raises instead of turning into a skip" do
+      stub_const("TimekeepingOwnerState::SELECTED", nil)
 
-    ["Rollback", "legacy ", "bogus", ""].each do |misspelt|
-      expect { TimekeepingOwnerState.forwarding_skip_reason({ forwards_to_timekeeping: true, owner_state: misspelt }) }
-        .to raise_error(ArgumentError, /legacy, timekeeping, rollback/)
+      ["Rollback", "legacy ", "bogus", ""].each do |misspelt|
+        expect { TimekeepingOwnerState.forwarding_skip_reason({ forwards_to_timekeeping: true, owner_state: misspelt }) }
+          .to raise_error(ArgumentError, /legacy, timekeeping, rollback/)
+      end
+      expect { TimekeepingOwnerState.forwards_writes?(nil) }.to raise_error(ArgumentError)
+      expect { TimekeepingOwnerState.forwards_writes?("Timekeeping") }.to raise_error(ArgumentError)
     end
-    expect { TimekeepingOwnerState.forwards_writes?(nil) }.to raise_error(ArgumentError)
-    expect { TimekeepingOwnerState.forwards_writes?("Timekeeping") }.to raise_error(ArgumentError)
-  end
   end
 
   context "more tests 26" do
-  include InnerExampleThroughSuiteHooks
+    include InnerExampleThroughSuiteHooks
 
-  # "Running `bin/timekeeping-demo regression` in the `legacy` and `rollback` states shows every forwarded
-  # Harvest importer example either passing or skipped with a stated reason, with none failing."
-  # A skip that also fired in the timekeeping state would keep every run green while dropping the only
-  # forwarded-import coverage, so both sides are checked in one example.
-  it "a forwarded example in the rollback state is skipped with its reason before its body runs, while the timekeeping state still runs it" do
-    stub_const("TimekeepingOwnerState::SELECTED", "rollback")
-    bodies_run = []
+    # "Running `bin/timekeeping-demo regression` in the `legacy` and `rollback` states shows every forwarded
+    # Harvest importer example either passing or skipped with a stated reason, with none failing."
+    # A skip that also fired in the timekeeping state would keep every run green while dropping the only
+    # forwarded-import coverage, so both sides are checked in one example.
+    it "a forwarded example in the rollback state is skipped with its reason before its body runs, while the timekeeping state still runs it" do
+      stub_const("TimekeepingOwnerState::SELECTED", "rollback")
+      bodies_run = []
 
-    skipped = run_inner_example_through_suite_hooks({ forwards_to_timekeeping: true }) { bodies_run << :rollback }
-    expect(skipped.status).to eq(:pending)
-    expect(skipped.pending_message).to include("rollback")
-    expect(skipped.pending_message).to match(/Timekeeping owns/i)
+      skipped = run_inner_example_through_suite_hooks({ forwards_to_timekeeping: true }) { bodies_run << :rollback }
+      expect(skipped.status).to eq(:pending)
+      expect(skipped.pending_message).to include("rollback")
+      expect(skipped.pending_message).to match(/Timekeeping owns/i)
 
-    ran = run_inner_example_through_suite_hooks({ forwards_to_timekeeping: true }, { owner_state: "timekeeping" }) do
-      bodies_run << :timekeeping
+      ran = run_inner_example_through_suite_hooks({ forwards_to_timekeeping: true }, { owner_state: "timekeeping" }) do
+        bodies_run << :timekeeping
+      end
+      expect(ran.status).to eq(:passed)
+      expect(bodies_run).to eq([:timekeeping])
     end
-    expect(ran.status).to eq(:passed)
-    expect(bodies_run).to eq([:timekeeping])
-  end
   end
 
   context "more tests 27" do
-  include InnerExampleThroughSuiteHooks
+    include InnerExampleThroughSuiteHooks
 
-  # "Running `bin/timekeeping-demo regression` in the `legacy` and `rollback` states shows every forwarded
-  # Harvest importer example either passing or skipped with a stated reason, with none failing."
-  # Only those states skip. TimekeepingOwnerState.current answers "legacy" when nothing is selected, so a
-  # skip keyed on it would hide the forwarded examples in every ordinary run.
-  it "a forwarded example with no owner state selected is not skipped even though the cleaners leave the row at legacy" do
-    stub_const("TimekeepingOwnerState::SELECTED", nil)
-    expect(TimekeepingOwnerState.current).to eq("legacy")
+    # "Running `bin/timekeeping-demo regression` in the `legacy` and `rollback` states shows every forwarded
+    # Harvest importer example either passing or skipped with a stated reason, with none failing."
+    # Only those states skip. TimekeepingOwnerState.current answers "legacy" when nothing is selected, so a
+    # skip keyed on it would hide the forwarded examples in every ordinary run.
+    it "a forwarded example with no owner state selected is not skipped even though the cleaners leave the row at legacy" do
+      stub_const("TimekeepingOwnerState::SELECTED", nil)
+      expect(TimekeepingOwnerState.current).to eq("legacy")
 
-    expect(TimekeepingOwnerState.forwarding_skip_reason({ forwards_to_timekeeping: true })).to be_nil
+      expect(TimekeepingOwnerState.forwarding_skip_reason({ forwards_to_timekeeping: true })).to be_nil
 
-    body_ran = false
-    result = run_inner_example_through_suite_hooks({ forwards_to_timekeeping: true }) { body_ran = true }
-    expect(result.status).to eq(:passed)
-    expect(body_ran).to be(true)
-  end
+      body_ran = false
+      result = run_inner_example_through_suite_hooks({ forwards_to_timekeeping: true }) { body_ran = true }
+      expect(result.status).to eq(:passed)
+      expect(body_ran).to be(true)
+    end
   end
 
   context "more tests 28" do
-  include InnerExampleThroughSuiteHooks
+    include InnerExampleThroughSuiteHooks
 
-  # "Make the forwarded importer examples pass or skip with a stated reason in the `legacy` and `rollback`
-  # states of `bin/timekeeping-demo regression`, where `arrange_forwarded_timekeeping` applies a monolith
-  # owner and the importer writes locally."
-  # The local-write examples prove imports in the legacy state, so a skip that reached untagged examples,
-  # or ignored an example's own override, would remove that proof too.
-  it "in the legacy state only examples that carry the forwarding tag are skipped, and an example can turn the tag off" do
-    stub_const("TimekeepingOwnerState::SELECTED", "legacy")
-    expect(TimekeepingOwnerState::FORWARDS_TAG).to eq(:forwards_to_timekeeping)
-    bodies_run = []
+    # "Make the forwarded importer examples pass or skip with a stated reason in the `legacy` and `rollback`
+    # states of `bin/timekeeping-demo regression`, where `arrange_forwarded_timekeeping` applies a monolith
+    # owner and the importer writes locally."
+    # The local-write examples prove imports in the legacy state, so a skip that reached untagged examples,
+    # or ignored an example's own override, would remove that proof too.
+    it "in the legacy state only examples that carry the forwarding tag are skipped, and an example can turn the tag off" do
+      stub_const("TimekeepingOwnerState::SELECTED", "legacy")
+      expect(TimekeepingOwnerState::FORWARDS_TAG).to eq(:forwards_to_timekeeping)
+      bodies_run = []
 
-    tagged = run_inner_example_through_suite_hooks({ forwards_to_timekeeping: true }) { bodies_run << :tagged }
-    untagged = run_inner_example_through_suite_hooks({}) { bodies_run << :untagged }
-    overridden = run_inner_example_through_suite_hooks({ forwards_to_timekeeping: true },
-                                                       { forwards_to_timekeeping: false }) do
-      bodies_run << :overridden
+      tagged = run_inner_example_through_suite_hooks({ forwards_to_timekeeping: true }) { bodies_run << :tagged }
+      untagged = run_inner_example_through_suite_hooks({}) { bodies_run << :untagged }
+      overridden = run_inner_example_through_suite_hooks({ forwards_to_timekeeping: true },
+                                                         { forwards_to_timekeeping: false }) do
+        bodies_run << :overridden
+      end
+
+      expect(tagged.status).to eq(:pending)
+      expect(tagged.pending_message).to include("legacy")
+      expect([untagged.status, overridden.status]).to eq(%i[passed passed])
+      expect(bodies_run).to eq(%i[untagged overridden])
     end
-
-    expect(tagged.status).to eq(:pending)
-    expect(tagged.pending_message).to include("legacy")
-    expect([untagged.status, overridden.status]).to eq(%i[passed passed])
-    expect(bodies_run).to eq(%i[untagged overridden])
-  end
   end
 end
 
