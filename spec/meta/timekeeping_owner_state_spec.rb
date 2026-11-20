@@ -397,15 +397,24 @@ RSpec.describe "Timekeeping owner state harness" do
   describe "probe runs", :without_transaction do
     # The probe gets a ledger file of its own: its suite start deletes that
     # file, and the inherited path would be this run's ledger.
-    def run_probe(fixture, owner_state)
-      probe = Rails.root.join("spec/fixtures/timekeeping_harness", fixture).to_s
+    def run_probe(fixture, owner_state, root: Rails.root, env: {})
+      probe = root.join("spec/fixtures/timekeeping_harness", fixture).to_s
       Dir.mktmpdir("owner-state-probe-ledger") do |dir|
-        # A probe is never a regression child, even when this run is one.
-        env = { "TIMEKEEPING_OWNER_STATE" => owner_state, "TIMEKEEPING_REGRESSION" => nil,
-                TimekeepingQueueLedger::PATH_KEY => File.join(dir, "queue_ledger.json") }
-        stdout, stderr, status = Open3.capture3(env, "bundle", "exec", "rspec", probe, chdir: Rails.root.to_s)
+        # A probe is not a regression child unless its caller says so, even when this run is one.
+        probe_env = { "TIMEKEEPING_OWNER_STATE" => owner_state, "TIMEKEEPING_REGRESSION" => nil,
+                      TimekeepingQueueLedger::PATH_KEY => File.join(dir, "queue_ledger.json") }.merge(env)
+        stdout, stderr, status = Open3.capture3(probe_env, "bundle", "exec", "rspec", probe, chdir: root.to_s)
         ["#{stdout}\n#{stderr}", status]
       end
+    end
+
+    # Runs the unset probe with the owner state key set to empty rather than
+    # removed: dotenv fills only absent keys, so a removed key would come back
+    # from a local .env file. config/application.rb deletes the empty value
+    # after dotenv loads, but only in a regression child, so this launch is one.
+    def run_unset_probe(root: Rails.root, env: {})
+      run_probe("unset_owner_state_probe.rb", TimekeepingDemo::Regression::NO_OWNER_STATE,
+                root:, env: { "TIMEKEEPING_REGRESSION" => "1" }.merge(env))
     end
 
     # "Every probe subprocess sets it to its own temporary file, so a probe never touches the parent run's ledger."
@@ -423,7 +432,7 @@ RSpec.describe "Timekeeping owner state harness" do
         previous = ENV.fetch(TimekeepingQueueLedger::PATH_KEY, nil)
         begin
           ENV[TimekeepingQueueLedger::PATH_KEY] = parent_path
-          output, status = run_probe("unset_owner_state_probe.rb", nil)
+          output, status = run_unset_probe
         ensure
           ENV[TimekeepingQueueLedger::PATH_KEY] = previous
         end
@@ -476,10 +485,55 @@ RSpec.describe "Timekeeping owner state harness" do
 
     # "An unset value leaves the suite unchanged."
     it "with TIMEKEEPING_OWNER_STATE unset no hook rewrites the ownership row" do
-      output, status = run_probe("unset_owner_state_probe.rb", nil)
+      output, status = run_unset_probe
 
       expect(status).to be_success, output
       expect(output).to include("1 example, 0 failures")
+    end
+
+    context "in a temporary app tree whose dotenv file names an owner state" do
+      # The default file also sets the marker the probe checks to prove the file was read.
+      def run_in_dotenv_tree(dotenv = "TIMEKEEPING_OWNER_STATE=timekeeping\nTIMEKEEPING_DOTENV_PROBE=loaded\n")
+        Dir.mktmpdir("dotenv-unset-owner-state-tree") do |tree|
+          TimekeepingDotenvTree.build(tree, dotenv:)
+          yield Pathname.new(tree), { "TIMEKEEPING_DOTENV_TREE" => File.realpath(tree) }
+        end
+      end
+
+      # "The unset-owner-state probe in spec/meta/timekeeping_owner_state_spec.rb is launched so that a local dotenv
+      # TIMEKEEPING_OWNER_STATE cannot be loaded into it, and the probe still passes with no state selected."
+      it "the unset owner state probe passes with no state selected beside a dotenv file that names an owner state" do
+        checkout_env_files_before = Rails.root.glob(".env*").map(&:to_s).sort
+
+        output, status = run_in_dotenv_tree { |root, env| run_unset_probe(root:, env:) }
+
+        # A launch that removes the key lets dotenv select "timekeeping", and the probe's
+        # SELECTED-is-nil and rollback-row checks fail.
+        expect(status).to be_success, output
+        expect(output).to include("1 example, 0 failures")
+        # The dotenv file lives only in the temporary tree, never in the shared checkout.
+        expect(Rails.root.glob(".env*").map(&:to_s).sort).to eq(checkout_env_files_before)
+      end
+
+      # A launch that removes the key lets dotenv fill it from the tree's file, so the probe sees a state.
+      # This shows the dotenv file really reaches the probe, so the empty-value launch is what keeps it out.
+      it "the unset owner state probe launched with the owner state key removed picks up the dotenv state and fails" do
+        output, status = run_in_dotenv_tree { |root, env| run_probe("unset_owner_state_probe.rb", nil, root:, env:) }
+
+        expect(status).not_to be_success
+        expect(output).to include("1 example, 1 failure")
+      end
+
+      # When the probe is told it runs in a dotenv tree, a pass must not rest on dotenv never loading:
+      # with no TIMEKEEPING_DOTENV_PROBE=loaded marker in the file, the probe fails.
+      it "the unset owner state probe in a dotenv tree fails when its dotenv file was not read" do
+        output, status = run_in_dotenv_tree("TIMEKEEPING_OWNER_STATE=timekeeping\n") do |root, env|
+          run_unset_probe(root:, env: env.merge("TIMEKEEPING_DOTENV_PROBE" => nil))
+        end
+
+        expect(status).not_to be_success
+        expect(output).to include("1 example, 1 failure")
+      end
     end
   end
 end
