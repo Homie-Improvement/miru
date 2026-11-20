@@ -1,8 +1,10 @@
+# frozen_string_literal: true
+
 require "rails_helper"
 
 RSpec.describe "Timekeeping tenant guard surfaces: unlisted request field" do
   it "R11 raises on an unlisted reservations request field instead of reading it as no identifier" do
-    contracts = TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }
+    contracts = TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }
     changed = Marshal.load(Marshal.dump(contracts))
     changed[:reservations]["routes"]["prepare"]["request_fields"] << "tenant_ref"
 
@@ -16,11 +18,9 @@ RSpec.describe "Timekeeping tenant guard surfaces: unlisted request field" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping tenant guard surfaces: unrecognised route key" do
   it "R3 raises on an unrecognised route key instead of reading the route as carrying no identifier" do
-    contracts = TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }
+    contracts = TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }
     changed = Marshal.load(Marshal.dump(contracts))
     # A handoff route carries no identifier today, so a silently ignored key would leave it looking safe.
     changed[:handoff]["routes"]["settle"]["extra_field"] = ["entry_id"]
@@ -31,11 +31,9 @@ RSpec.describe "Timekeeping tenant guard surfaces: unrecognised route key" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping tenant guard cases: handoff routes" do
   it "R4 gives each handoff route a no-identifier case that expects 401 unauthorized" do
-    contracts = TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }
+    contracts = TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }
 
     # "The handoff routes in `contracts/timekeeping/handoff.yml` (settle, stop_applying, drain) carry none of the
     # four kinds, and each still gets a case. The case asserts from the contract that the route carries no such
@@ -54,8 +52,6 @@ RSpec.describe "Timekeeping tenant guard cases: handoff routes" do
     end
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "Timekeeping tenant guard cases: replay request" do
   it "R10 replay keeps the other company's key and body and replaces only the path company and the credential" do
@@ -78,8 +74,6 @@ RSpec.describe "Timekeeping tenant guard cases: replay request" do
     expect(recorded[:headers]["Authorization"]).to eq("Bearer owner-token")
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "Timekeeping tenant guard cases: probe requests" do
   it "R5 every identifier probe differs from the requester's valid request in exactly one owner identifier" do
@@ -105,13 +99,16 @@ RSpec.describe "Timekeeping tenant guard cases: probe requests" do
       end
     end
 
+    # Splits the path into segments, so a swapped path parameter shows as its own leaf.
+    split_path = ->(request) { request.merge(path: request.fetch(:path).split("/")) }
+
     probes = TenantGuardCases::ALL.select { |kase| kase.mode == :probe && kase.covers != [:none] }
     expect(probes).not_to be_empty
 
     probes.each do |kase|
       label = "#{kase.contract} #{kase.route} #{kase.covers.inspect}"
-      valid = leaves.call(TenantGuardCases.valid_request(kase, ids: requester)).to_h
-      probe = leaves.call(TenantGuardCases.probe_request(kase, requester:, owner:)).to_h
+      valid = leaves.call(split_path.call(TenantGuardCases.valid_request(kase, ids: requester))).to_h
+      probe = leaves.call(split_path.call(TenantGuardCases.probe_request(kase, requester:, owner:))).to_h
 
       # "Each case swaps in exactly one foreign identifier and keeps the others valid for the requesting company."
       expect(probe.keys).to match_array(valid.keys), label
@@ -122,8 +119,6 @@ RSpec.describe "Timekeeping tenant guard cases: probe requests" do
     end
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "Timekeeping tenant guard replay list" do
   it "REPLAY_PAIRS holds exactly the issue's listed idempotency key replays" do
@@ -145,10 +140,8 @@ RSpec.describe "Timekeeping tenant guard replay list" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping tenant guard replay coverage" do
-  let(:contracts) { TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] } }
+  let(:contracts) { TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) } }
 
   def replay_in_place_of(pair)
     contract, route, kind = pair
@@ -174,8 +167,6 @@ RSpec.describe "Timekeeping tenant guard replay coverage" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping tenant guard replay request" do
   it "replay_request keeps the recorded key and body and replaces only the company and the credential" do
     recorded = {
@@ -199,19 +190,15 @@ RSpec.describe "Timekeeping tenant guard replay request" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping tenant guard coverage of the real contracts" do
   it "the real contracts against TenantGuardCases give an empty uncovered set" do
-    contracts = TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }
+    contracts = TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }
 
     # "A route, or a route and identifier pair, with no case fails the guard."
     expect(TenantGuardSurfaces.uncovered(contracts:, cases: TenantGuardCases::ALL)).to eq(routes: [], pairs: [])
     expect(TenantGuardCases::ALL.map(&:mode).uniq - %i[probe replay]).to be_empty
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "Timekeeping tenant guard surfaces" do
   # "Each case swaps in exactly one foreign identifier and keeps the others valid for the requesting company."
@@ -260,8 +247,6 @@ RSpec.describe "Timekeeping tenant guard surfaces" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping tenant guard surfaces" do
   # "For a replay, it takes the other company's recorded request and replaces only the company and the credential."
   it "R10 a replay of the owner's recorded update changes only the path company and the Authorization header" do
@@ -288,8 +273,6 @@ RSpec.describe "Timekeeping tenant guard surfaces" do
     expect(replay.fetch(:headers).values.map(&:to_s)).to include("key-owner-0001")
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "Timekeeping tenant guard surfaces" do
   it "expected answers name the owner's entry as not_found in bulk probes and the prepare entry conflict" do
@@ -322,12 +305,10 @@ RSpec.describe "Timekeeping tenant guard surfaces" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping tenant guard surfaces" do
   # "A route, or a route and identifier pair, with no case fails the guard."
   it "R1 the real contracts against TenantGuardCases leave no route or foreign identifier pair uncovered" do
-    contracts = TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }
+    contracts = TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }
 
     expect(TenantGuardSurfaces.uncovered(contracts:, cases: TenantGuardCases::ALL)).to eq(routes: [], pairs: [])
 
@@ -342,65 +323,55 @@ RSpec.describe "Timekeeping tenant guard surfaces" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "TenantGuardSurfaces.pairs on reservations prepare" do
   it "R7 pairs: reservations prepare yields invoice_id, operation_id, idempotency_key and entry_id" do
-    contracts = TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }
+    contracts = TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }
 
     kinds = TenantGuardSurfaces.pairs(contracts)
-                               .select { |contract, route, _kind| contract == :reservations && route == :prepare }
-                               .map(&:last)
+                               .filter_map { |contract, route, kind| kind if contract == :reservations && route == :prepare }
 
     # "reservations prepare yields invoice_id, operation_id, idempotency_key and entry_id."
     expect(kinds).to contain_exactly(:invoice_id, :operation_id, :idempotency_key, :entry_id)
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "TenantGuardSurfaces.pairs on entry and snapshot write routes" do
   it "R7 pairs: entry_api update and bulk_delete, and entry_snapshots deliver, yield entry_id and idempotency_key" do
-    contracts = TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }
+    contracts = TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }
     pairs = TenantGuardSurfaces.pairs(contracts)
 
     # "entry_api update and bulk_delete yield entry_id and idempotency_key."
     # "entry_snapshots deliver yields entry_id and idempotency_key."
     [[:entry_api, :update], [:entry_api, :bulk_delete], [:entry_snapshots, :deliver]].each do |contract_name, route_name|
-      kinds = pairs.select { |contract, route, _kind| contract == contract_name && route == route_name }.map(&:last)
+      kinds = pairs.filter_map { |contract, route, kind| kind if contract == contract_name && route == route_name }
 
       expect(kinds).to contain_exactly(:entry_id, :idempotency_key), "#{contract_name} #{route_name}"
     end
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "TenantGuardSurfaces.pairs on routes that carry no identifier" do
   it "R4 R7 pairs: handoff settle, stop_applying, drain, reference show and entry_api index each yield exactly one no-identifier entry" do
-    contracts = TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }
+    contracts = TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }
     pairs = TenantGuardSurfaces.pairs(contracts)
 
     # "handoff settle, stop_applying and drain, reference show, and entry_api index yield none."
     # "A route carrying none of these gets a no-identifier entry."
     [[:handoff, :settle], [:handoff, :stop_applying], [:handoff, :drain], [:reference, :show], [:entry_api, :index]]
       .each do |contract_name, route_name|
-        kinds = pairs.select { |contract, route, _kind| contract == contract_name && route == route_name }.map(&:last)
+        kinds = pairs.filter_map { |contract, route, kind| kind if contract == contract_name && route == route_name }
 
         expect(kinds).to eq([:none]), "#{contract_name} #{route_name}"
       end
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "TenantGuardSurfaces.pairs on reservations detach_entries" do
   it "R7 pairs: detach_entries yields operation_id and idempotency_key and nothing for its agent_id path param" do
-    contracts = TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }
+    contracts = TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }
 
     kinds = TenantGuardSurfaces.pairs(contracts)
-                               .select { |contract, route, _kind| contract == :reservations && route == :detach_entries }
-                               .map(&:last)
+                               .filter_map { |contract, route, kind| kind if contract == :reservations && route == :detach_entries }
 
     # "`operation_id` maps to both operation id and idempotency key, because idempotency.yml
     # `key_sources.reservations.key` is "operation_id in the body"."
@@ -408,11 +379,9 @@ RSpec.describe "TenantGuardSurfaces.pairs on reservations detach_entries" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "TenantGuardSurfaces.uncovered with no routes" do
   it "R2 uncovered: contracts whose routes maps are all empty raise NoRoutesError" do
-    contracts = TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }.deep_dup
+    contracts = TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }.deep_dup
     contracts.each_value { |contract| contract["routes"] = {} if contract.key?("routes") }
 
     # "Read the `routes:` map of every contract in `TimekeepingContract::CONTRACT_NAMES`, and fail when there are zero routes."
@@ -421,11 +390,9 @@ RSpec.describe "TenantGuardSurfaces.uncovered with no routes" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "TenantGuardSurfaces.uncovered with an unrecognised route key" do
   it "R3 uncovered: an unrecognised key on a handoff route raises UnknownFieldError instead of reading the route as carrying no identifier" do
-    contracts = TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }.deep_dup
+    contracts = TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }.deep_dup
     contracts[:handoff]["routes"]["settle"]["extra_field"] = ["invoice_ref"]
 
     # "An unrecognised route field raises instead of being read as carrying no identifier"
@@ -434,11 +401,9 @@ RSpec.describe "TenantGuardSurfaces.uncovered with an unrecognised route key" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "TenantGuardSurfaces.uncovered with an unlisted request field" do
   it "R11 uncovered: an unlisted request field on a reservations route raises UnknownFieldError" do
-    contracts = TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }.deep_dup
+    contracts = TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }.deep_dup
     contracts[:reservations]["routes"]["commit"]["request_fields"] << "tenant_ref"
 
     # "Every other name must be on an explicit non-identifier list: ... An unlisted name raises."
@@ -447,22 +412,18 @@ RSpec.describe "TenantGuardSurfaces.uncovered with an unlisted request field" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "TenantGuardSurfaces.uncovered on the real contracts" do
   it "R1 uncovered: the real contracts against TenantGuardCases::ALL leave no route and no pair uncovered" do
-    contracts = TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }
+    contracts = TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }
 
     # "The real contracts against `TenantGuardCases` give an empty uncovered set."
     expect(TenantGuardSurfaces.uncovered(contracts:, cases: TenantGuardCases::ALL)).to eq(routes: [], pairs: [])
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "TenantGuardSurfaces.uncovered with an extra route" do
   it "R1 uncovered: an extra route with no case is reported under routes" do
-    contracts = TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }.deep_dup
+    contracts = TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }.deep_dup
     contracts[:entry_api]["routes"]["archive"] = { "method" => "GET", "path" => "/v1/companies/{company_id}/archive" }
 
     # "A route, or a route and identifier pair, with no case fails the guard."
@@ -471,11 +432,9 @@ RSpec.describe "TenantGuardSurfaces.uncovered with an extra route" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "TenantGuardSurfaces.uncovered with an extra identifier" do
   it "R1 uncovered: an extra invoice_id path param on entry_api show is reported as its one uncovered pair" do
-    contracts = TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }.deep_dup
+    contracts = TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }.deep_dup
     contracts[:entry_api]["routes"]["show"]["path"] = "/v1/companies/{company_id}/invoices/{invoice_id}/entries/{entry_id}"
 
     # "An extra identifier on an existing route is reported."
@@ -484,11 +443,9 @@ RSpec.describe "TenantGuardSurfaces.uncovered with an extra identifier" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "TenantGuardSurfaces.uncovered with replays outside the replay list" do
   it "R8 uncovered: a replay for the destroy key or the prepare operation_id does not cover that pair" do
-    contracts = TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }
+    contracts = TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }
     outside = [[:entry_api, :destroy, :idempotency_key], [:reservations, :prepare, :operation_id]]
 
     cases = TenantGuardCases::ALL.map do |kase|
@@ -500,8 +457,6 @@ RSpec.describe "TenantGuardSurfaces.uncovered with replays outside the replay li
     expect(TenantGuardSurfaces.uncovered(contracts:, cases:)[:pairs]).to include(*outside)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "TenantGuardSurfaces::REPLAY_PAIRS" do
   it "R8 REPLAY_PAIRS holds exactly the key pairs of create, update, bulk_move, prepare, mark_billed, detach_entries and deliver" do
@@ -521,8 +476,6 @@ RSpec.describe "TenantGuardSurfaces::REPLAY_PAIRS" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "TenantGuardCases::ALL handoff cases" do
   it "R4 cases: each handoff route has one probe covering only none that expects 401 unauthorized" do
     %i[settle stop_applying drain].each do |route|
@@ -538,8 +491,6 @@ RSpec.describe "TenantGuardCases::ALL handoff cases" do
     end
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "TenantGuardCases.probe_request against valid_request" do
   it "R5 probe_request: every identifier probe differs from the requester's valid request in exactly the swapped identifier" do
@@ -585,8 +536,6 @@ RSpec.describe "TenantGuardCases.probe_request against valid_request" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "TenantGuardCases.expected_answer for entry probes" do
   it "R9 expected_answer: bulk entry probes expect 200 with the owner's entry not_found and the prepare entry probe expects a not_found conflict for it" do
     owner = {
@@ -613,8 +562,6 @@ RSpec.describe "TenantGuardCases.expected_answer for entry probes" do
       .to include(status: 409, reason: "conflict", conflicts: [{ entry_id: 551, reason: "not_found" }])
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "TenantGuardCases.probe_request for replay-only key probes" do
   it "R5 probe_request: destroy and bulk_delete key probes send the requester's own entries with the three replay-only headers and the owner's key" do
@@ -650,8 +597,6 @@ RSpec.describe "TenantGuardCases.probe_request for replay-only key probes" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "TenantGuardCases.replay_request" do
   it "R10 replay_request: replaces only the path company and the Authorization header of the owner's recorded update" do
     owner = {
@@ -676,8 +621,6 @@ RSpec.describe "TenantGuardCases.replay_request" do
     expect(recorded).to eq(snapshot)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "Timekeeping tenant guard case records" do
   it "R9 cases: every record holds a route, a known mode, its covered kinds, its contract's credential kind and which company runs first" do
@@ -710,11 +653,9 @@ RSpec.describe "Timekeeping tenant guard case records" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping tenant guard surfaces: an extra route" do
   def guard_surfaces_contracts_copy
-    real = TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }
+    real = TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }
     Marshal.load(Marshal.dump(real))
   end
 
@@ -730,11 +671,9 @@ RSpec.describe "Timekeeping tenant guard surfaces: an extra route" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping tenant guard surfaces: an extra identifier" do
   def guard_surfaces_contracts_copy
-    real = TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }
+    real = TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }
     Marshal.load(Marshal.dump(real))
   end
 
@@ -750,11 +689,9 @@ RSpec.describe "Timekeeping tenant guard surfaces: an extra identifier" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping tenant guard surfaces: a replay outside the list for destroy" do
   def guard_surfaces_real_contracts
-    TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }
+    TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }
   end
 
   # "`uncovered` counts a replay toward its pairs only for that listed set."
@@ -773,11 +710,9 @@ RSpec.describe "Timekeeping tenant guard surfaces: a replay outside the list for
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping tenant guard surfaces: a replay outside the list for prepare" do
   def guard_surfaces_real_contracts
-    TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }
+    TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }
   end
 
   # "`uncovered` counts a replay toward its pairs only for that listed set."
@@ -798,11 +733,9 @@ RSpec.describe "Timekeeping tenant guard surfaces: a replay outside the list for
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping tenant guard surfaces: zero routes" do
   def guard_surfaces_contracts_copy
-    real = TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }
+    real = TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }
     Marshal.load(Marshal.dump(real))
   end
 
@@ -816,11 +749,9 @@ RSpec.describe "Timekeeping tenant guard surfaces: zero routes" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping tenant guard surfaces: an unrecognised route key" do
   def guard_surfaces_contracts_copy
-    real = TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }
+    real = TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }
     Marshal.load(Marshal.dump(real))
   end
 
@@ -834,11 +765,9 @@ RSpec.describe "Timekeeping tenant guard surfaces: an unrecognised route key" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping tenant guard surfaces: an unlisted field name" do
   def guard_surfaces_contracts_copy
-    real = TimekeepingContract::CONTRACT_NAMES.to_h { |name| [name, TimekeepingContract.load(name)] }
+    real = TimekeepingContract::CONTRACT_NAMES.index_with { |name| TimekeepingContract.load(name) }
     Marshal.load(Marshal.dump(real))
   end
 
@@ -859,8 +788,6 @@ RSpec.describe "Timekeeping tenant guard surfaces: an unlisted field name" do
       .to raise_error(TenantGuardSurfaces::UnknownFieldError, /tenant_ref/)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "Timekeeping tenant guard cases: one foreign identifier per probe" do
   let(:requester_ids) do
@@ -906,8 +833,6 @@ RSpec.describe "Timekeeping tenant guard cases: one foreign identifier per probe
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping tenant guard cases: bulk probe expected answer" do
   let(:owner_ids) do
     { company_id: 201, user_id: 211, project_id: 221, agent_id: 231, entry_ids: [241, 242],
@@ -925,5 +850,55 @@ RSpec.describe "Timekeeping tenant guard cases: bulk probe expected answer" do
     answer = TenantGuardCases.expected_answer(kase, owner: owner_ids)
 
     expect(answer).to include(status: 200, results: [{ entry_id: 241, result: "not_found" }])
+  end
+end
+
+RSpec.describe "Timekeeping tenant guard cases: baseline requests and remaining answers" do
+  let(:guard_cases_requester_ids) do
+    { company_id: 301, user_id: 311, project_id: 321, agent_id: 331, entry_ids: [341, 342],
+      entry_versions: { 341 => 9, 342 => 10 }, invoice_id: 351, operation_id: "op-requester-3",
+      idempotency_key: "key-requester-3", generation: 2 }
+  end
+
+  def guard_cases_find(contract, route, mode, covers)
+    TenantGuardCases::ALL.find do |kase|
+      kase.contract == contract && kase.route == route && kase.mode == mode && kase.covers == covers
+    end
+  end
+
+  it "update and destroy entry requests send If-Match with the entry's version, and a delivered snapshot names its user" do
+    %i[update destroy].each do |route|
+      request = TenantGuardCases.valid_request(guard_cases_find(:entry_api, route, :probe, [:entry_id]),
+                                               ids: guard_cases_requester_ids)
+
+      expect(request.fetch(:path)).to eq("/v1/companies/301/entries/341"), route.to_s
+      expect(request.fetch(:headers)).to include("If-Match" => "9"), route.to_s
+    end
+
+    deliver = TenantGuardCases.valid_request(guard_cases_find(:entry_snapshots, :deliver, :probe, [:entry_id]),
+                                             ids: guard_cases_requester_ids)
+    entry = deliver.fetch(:body).fetch("snapshots").first.fetch("entry")
+    expect(entry).to include("id" => 341, "company_id" => 301, "user_id" => 311, "version" => 9)
+  end
+
+  it "the bulk_move replay and the prepare, mark_billed and detach_entries operation probes expect 404 not_found" do
+    cases = [
+      guard_cases_find(:entry_api, :bulk_move, :replay, [:idempotency_key]),
+      guard_cases_find(:reservations, :prepare, :probe, [:operation_id]),
+      guard_cases_find(:reservations, :mark_billed, :probe, [:operation_id]),
+      guard_cases_find(:reservations, :detach_entries, :probe, [:operation_id])
+    ]
+
+    cases.each do |kase|
+      expect(kase.expected).to eq(status: 404, reason: "not_found")
+    end
+  end
+
+  it "keeps the case table, every record and its nested values frozen" do
+    expect(TenantGuardCases::ALL).to be_frozen
+    TenantGuardCases::ALL.each do |kase|
+      expect([kase, kase.covers, kase.expected, kase.headers]).to all(be_frozen)
+      expect(kase.expected.fetch(:results, []) + kase.expected.fetch(:conflicts, [])).to all(be_frozen)
+    end
   end
 end
