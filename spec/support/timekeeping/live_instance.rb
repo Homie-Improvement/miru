@@ -74,18 +74,24 @@ class TimekeepingLiveInstance
 
   attr_reader :base_url, :service_token, :private_key
 
-  def self.start(reference_stub:)
-    new(reference_stub:).tap(&:start)
+  # snapshot_app: a Rack app that answers the monolith's entry-snapshot
+  # endpoint, such as Rails.application. When given, it is served on its own
+  # loopback listener and the service's relay delivers to it; without it the
+  # service has no snapshot endpoint, as before.
+  def self.start(reference_stub:, snapshot_app: nil)
+    new(reference_stub:, snapshot_app:).tap(&:start)
   end
 
-  def initialize(reference_stub:)
+  def initialize(reference_stub:, snapshot_app: nil)
     @reference_stub = reference_stub
+    @snapshot_app = snapshot_app
     @service_token = "live-service-#{SecureRandom.hex(24)}"
     @private_key = OpenSSL::PKey::RSA.generate(2048)
   end
 
   def start
     start_reference_server
+    start_snapshot_server if @snapshot_app
     port = free_port
     @base_url = "http://#{HOST}:#{port}"
     run_in_service!(*RAILS, "db:prepare")
@@ -113,6 +119,8 @@ class TimekeepingLiveInstance
     @pid = nil
     @reference_server&.stop(true)
     @reference_server = nil
+    @snapshot_server&.stop(true)
+    @snapshot_server = nil
   end
 
   # Empties the service's write metrics; call it before each example.
@@ -122,6 +130,11 @@ class TimekeepingLiveInstance
 
   def reference_url
     "http://#{HOST}:#{@reference_port}"
+  end
+
+  # nil when the instance was started without a snapshot_app.
+  def snapshot_url
+    "http://#{HOST}:#{@snapshot_port}" if @snapshot_port
   end
 
   # Sends one request with the service token and answers the Net::HTTPResponse.
@@ -159,7 +172,7 @@ class TimekeepingLiveInstance
         "MONOLITH_REFERENCE_URL" => reference_url,
         # The service's own process needs no monolith database setting.
         "DATABASE_URL" => nil
-      }
+      }.merge(snapshot_url ? { "MONOLITH_SNAPSHOT_URL" => snapshot_url } : {})
     end
 
     # The monolith runs under its own bundle; boot.rb keeps an inherited
@@ -210,6 +223,13 @@ class TimekeepingLiveInstance
       @reference_server.add_tcp_listener(HOST, 0)
       @reference_port = @reference_server.connected_ports.first
       @reference_server.run
+    end
+
+    def start_snapshot_server
+      @snapshot_server = Puma::Server.new(@snapshot_app, nil, min_threads: 1, max_threads: 4)
+      @snapshot_server.add_tcp_listener(HOST, 0)
+      @snapshot_port = @snapshot_server.connected_ports.first
+      @snapshot_server.run
     end
 
     def free_port
