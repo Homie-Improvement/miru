@@ -42,6 +42,11 @@ module TimekeepingOwnerState
   # The state assumed when none is selected: the row the cleaners leave.
   DEFAULT_STATE = "legacy"
 
+  # Example metadata for specs that assert on writes forwarded to Timekeeping.
+  # In a state where the monolith owns the entries nothing is forwarded, so
+  # the hook below skips those examples with a stated reason.
+  FORWARDS_TAG = :forwards_to_timekeeping
+
   module_function
 
   # The state's columns; raises ArgumentError naming the valid states for any
@@ -97,6 +102,28 @@ module TimekeepingOwnerState
     state_name
   end
 
+  # Whether the gateway forwards entry writes to Timekeeping in the state. It
+  # asks Timekeeping::EntryOwner, the rule the gateway dispatches on, so no
+  # list of forwarding states is kept here. Raises like fetch for an unknown
+  # name, so a misspelt state fails instead of skipping forwarded examples.
+  def forwards_writes?(state_name)
+    columns = fetch(state_name).slice(*OWNERSHIP_COLUMNS)
+    Timekeeping::EntryOwner.for(TimekeepingOwnership.new(columns)) == :timekeeping
+  end
+
+  # Why an example tagged FORWARDS_TAG cannot run in its state, or nil when it
+  # can: when it is untagged, when no state is selected (the forwarding helper
+  # then hands ownership to Timekeeping), or when its state forwards writes.
+  def forwarding_skip_reason(metadata)
+    return nil unless metadata[FORWARDS_TAG] == true
+
+    state_name = for_example(metadata)
+    return nil if state_name.nil? || forwards_writes?(state_name)
+
+    "Writes are forwarded only when Timekeeping owns the entries; in the #{state_name} owner state " \
+      "the monolith owns them and writes locally, which the local-write examples cover."
+  end
+
   module Expectations
     # Asserts the stored row is in the state. EntryOwner.for cannot tell
     # generations apart, so the owner columns, generation and whether the
@@ -128,5 +155,12 @@ RSpec.configure do |config|
   config.before do |example|
     state_name = TimekeepingOwnerState.for_example(example.metadata)
     TimekeepingOwnerState.apply!(state_name) if state_name
+  end
+
+  # Suite hooks run before group hooks, so a skipped example builds none of
+  # its group's committed rows, fake registrations or HTTP routes.
+  config.before do |example|
+    reason = TimekeepingOwnerState.forwarding_skip_reason(example.metadata)
+    skip reason if reason
   end
 end
