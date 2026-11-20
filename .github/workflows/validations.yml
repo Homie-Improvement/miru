@@ -473,10 +473,12 @@ jobs:
   #
   # The same job also runs the Timekeeping queue collector against real
   # completed, claimed and failed Solid Queue rows in the Timekeeping test
-  # database, and boots the runtime from a temporary tree whose dotenv file
-  # sets conflicting database settings, to check that each app still connects
-  # as its own database user. Every other job leaves TIMEKEEPING_LIVE unset or
-  # does not name these specs, so they skip or do not run there.
+  # database, and the per-company tenant state digest against the same
+  # Timekeeping test database. It also boots the runtime from a temporary tree
+  # whose dotenv file sets conflicting database settings, to check that each
+  # app still connects as its own database user. Every other job leaves
+  # TIMEKEEPING_LIVE unset or does not name these specs, so their live
+  # examples skip or do not run there.
   timekeeping-runtime-live:
     name: Timekeeping demo runtime starts only the dedicated workers
     runs-on: ubuntu-24.04
@@ -535,11 +537,12 @@ jobs:
       - name: Setup monolith test database
         run: bundle exec rails db:test:prepare
 
-      - name: Run the demo runtime queue spec, the Timekeeping collector row spec and the boot database isolation spec
+      - name: Run the demo runtime queue, Timekeeping collector row, tenant state digest and boot database isolation specs
         run: >-
           bundle exec rspec
           spec/timekeeping/runtime_queues_spec.rb
           spec/timekeeping/timekeeping_collector_rows_spec.rb
+          spec/meta/timekeeping_tenant_state_digest_spec.rb
           spec/lib/timekeeping_demo/boot_database_isolation_live_spec.rb
 
   security-audit:
