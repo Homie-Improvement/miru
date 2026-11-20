@@ -890,6 +890,8 @@ end
 require "json"
 
 RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
+  include RunnerLegacyHandoffSpecSupport
+
   # Stands in for a relay that has delivered nothing: the projection keeps the
   # legacy version 0 rows the first cutover raised to version 1 in Timekeeping.
   let(:undelivered_drain) do
@@ -929,8 +931,52 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     expect(ownership.handoff_step).not_to be_nil
     reconciliation = JSON.parse(File.read(report_root.join("generation-3", "reconciliation.json")))
     expect(reconciliation.fetch("abort")).to be(true)
+
+    # Corrected entries also miss their lock in this setup, so the abort alone
+    # does not show the raised version is what was refused: an uncorrected
+    # raised entry must be reported unlisted under its own company.
+    raised_entry = TimesheetEntry.unscoped.where(version: 0).where.not(id: recorded_unlocked_entry_ids).first
+    unlisted = reconciliation.fetch("companies").fetch(raised_entry.company_id.to_s).fetch("unlisted")
+    expect(unlisted).to include(
+      a_hash_including(
+        "check" => "projection", "table" => "timesheet_entries", "row_key" => [raised_entry.id],
+        "field" => "version", "reason" => "changed"
+      )
+    )
   ensure
     FileUtils.rm_rf(report_root) if report_root
+  end
+end
+
+# A raised entry Timekeeping already stores above the correction version is
+# loaded at that stored version, so its snapshot must be written at it too: a
+# snapshot written lower would leave the projection behind Timekeeping.
+RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
+  include RunnerLegacyHandoffSpecSupport
+
+  it "a first cutover writes a raised entry's snapshot at the higher version Timekeeping already stores, once" do
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+    exported = Timekeeping::Handoff::LegacySource.new(
+      connection: ActiveRecord::Base.connection,
+      recorded_disposition: YAML.load_file(Timekeeping::SeedDispositionRecorder::DEFAULT_PATH)
+    ).export(generation: 2, captured_at: Time.current.utc.floor(6))
+    source = exported.fetch(:checkpoint)
+    corrected_ids = exported.fetch(:corrections).map { |correction| correction.fetch("entry_id") }
+    higher_id = source.rows.fetch("entries").find { |row| row["version"].zero? && corrected_ids.exclude?(row["id"]) }.fetch("id")
+    stored_entries = source.rows.fetch("entries").map do |row|
+      row.merge("version" => row["id"] == higher_id ? 3 : [row["version"], 1].max)
+    end
+    timekeeping.load_checkpoint(Timekeeping::Handoff::Checkpoint.build(tables: source.rows.merge("entries" => stored_entries)))
+
+    described_class.run(direction: :cutover, owners: TimekeepingHandoffFakes.owners(timekeeping:),
+                        report_root: Dir.mktmpdir("handoff-raised-higher"))
+
+    expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
+    expect(timekeeping.correction_writes.pluck("id").count(higher_id)).to eq(1)
+    written = timekeeping.corrections.find { |snapshot| snapshot["id"] == higher_id }
+    expect(written.fetch("version")).to eq(3)
+    other_versions = timekeeping.corrections.reject { |snapshot| snapshot["id"] == higher_id }.pluck("version").uniq
+    expect(other_versions).to eq([Timekeeping::ReservationDerivation::CORRECTION_VERSION])
   end
 end
 

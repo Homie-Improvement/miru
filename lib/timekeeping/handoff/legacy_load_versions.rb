@@ -66,10 +66,9 @@ module Timekeeping
       end
 
       # The snapshots of the entries the load raised and did not correct: each
-      # loaded row without its version, which travels with the correction
-      # snapshots at the correction version. LOWEST_LOADABLE_VERSION equals
-      # ReservationDerivation::CORRECTION_VERSION, so one write carries both.
-      # Corrected entries are left out: their correction snapshot already
+      # loaded row without its version, which the caller writes as the
+      # snapshot's version, so the projection reaches the version Timekeeping
+      # holds. Corrected entries are left out: their correction snapshot already
       # covers them, and Timekeeping refuses an entry named twice.
       #
       # Returns [Hash], in loaded order.
