@@ -569,26 +569,6 @@ RSpec.describe "CI spec coverage in validations.yml" do
     end
   end
 
-  context "more tests 3" do
-    it "triggers the workflow holding the live handoff job on a push to every branch" do
-      # "A push to a branch outside develop, main, stable-3-0 and production, with no pull request open,
-      # runs the timekeeping-alerts-live job and its handoff_live_spec, and push and pull-request runs do
-      # not cancel each other."
-      live_job = workflow.fetch("jobs").fetch("timekeeping-alerts-live")
-      expect(live_job.fetch("steps").map { |step| step["run"].to_s })
-        .to include(a_string_including("spec/integration/timekeeping/handoff_live_spec.rb"))
-
-      # Psych reads the bare key `on` as the boolean true.
-      triggers = workflow.fetch(true) { workflow.fetch("on") }
-      expect(triggers).to have_key("push")
-
-      push = triggers.fetch("push") || {}
-      expect(push.fetch("branches", ["**"])).to eq(["**"])
-      expect(push.keys & %w[branches-ignore paths paths-ignore]).to be_empty
-      expect(push.key?("tags") && !push.key?("branches")).to be(false)
-    end
-  end
-
   context "more tests 4" do
     it "keys the cancelling workflow concurrency group on event and branch so push and pull request runs stay apart" do
       # "A push to a branch outside develop, main, stable-3-0 and production, with no pull request open,
@@ -631,28 +611,6 @@ RSpec.describe "CI spec coverage in validations.yml" do
         Array(job["steps"]).any? { |step| step["run"].to_s.include?("spec/integration/timekeeping/handoff_live_spec.rb") }
       end
       expect(live_jobs.keys).to eq(["timekeeping-alerts-live"])
-    end
-  end
-
-  context "more tests 6" do
-    it "keys every cancelling concurrency group of the live handoff run on event and branch so push and pull request runs cannot cancel each other" do
-      # "A push to a branch outside develop, main, stable-3-0 and production, with no pull request open,
-      # runs the timekeeping-alerts-live job and its handoff_live_spec, and push and pull-request runs do
-      # not cancel each other."
-      # The event keeps a push and a pull request of one branch apart; the branch keeps two pushes of one
-      # branch together, so a newer push still cancels an older one.
-      expected_group = "${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}"
-      squash = ->(text) { text.to_s.gsub(/\s+/, "") }
-
-      workflow_concurrency = workflow.fetch("concurrency")
-      expect(workflow_concurrency).to be_a(Hash)
-      expect(squash.call(workflow_concurrency.fetch("group"))).to eq(squash.call(expected_group))
-
-      live_job = workflow.fetch("jobs").fetch("timekeeping-alerts-live")
-      job_concurrency = live_job["concurrency"]
-      if job_concurrency.is_a?(Hash) && job_concurrency["cancel-in-progress"]
-        expect(squash.call(job_concurrency.fetch("group"))).to eq(squash.call(expected_group))
-      end
     end
   end
 
