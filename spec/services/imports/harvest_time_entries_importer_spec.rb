@@ -83,17 +83,18 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     expect(entry_event[:context]).to include(source: "harvest_import", data_import_id: data_import.id.to_s)
   end
 
-  # Counts the importer's own queries. The gateway's per-row write is left
-  # out: in the prepared store it reads the company and project memberships
+  # Where the prepared store owns the entries, the gateway's per-row write is
+  # left out of the count: there it reads the company and project memberships
   # for every row to check the write, which is the owner's check, not the
-  # importer's batching.
+  # importer's batching. In every other state the whole import is counted.
   it "avoids per-row project membership and company queries" do
     select_queries = 0
     project_member_queries = 0
     company_queries = 0
     inside_gateway_import = false
+    prepared_store_owns_entries = Timekeeping::EntryOwner.for(TimekeepingOwnership.current) == :prepared
     allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_wrap_original do |original, *args, **kwargs|
-      inside_gateway_import = true
+      inside_gateway_import = prepared_store_owns_entries
       original.call(*args, **kwargs)
     ensure
       inside_gateway_import = false
