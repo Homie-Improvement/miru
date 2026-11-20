@@ -516,3 +516,52 @@ RSpec.describe Timekeeping::Handoff::TimekeepingStore do
     end
   end
 end
+
+RSpec.describe Timekeeping::Handoff::TimekeepingStore, "#write_correction_snapshots timestamps" do
+  let(:base_url) { "http://timekeeping-correction-resend.test" }
+  let(:correction_time_base_url) { "http://timekeeping-corrections.test" }
+
+  it "write_correction_snapshots re-sent for the same corrections sends the same timestamps both times" do
+    created_at = Time.utc(2026, 1, 2, 3, 4, 5, 999_999)
+    snapshot = { "company_id" => 1, "id" => 7, "created_at" => created_at, "updated_at" => created_at }
+    url = "#{base_url}/internal/v1/handoff/correction_snapshots"
+    sent_bodies = []
+    stub_request(:put, url).to_return do |request|
+      sent_bodies << request.body
+      { status: 200, body: JSON.generate("written" => 1) }
+    end
+    store = described_class.new(base_url:, token: "svc-#{SecureRandom.hex(8)}")
+
+    2.times { store.write_correction_snapshots(snapshots: [snapshot], version: 1, generation: 2) }
+
+    expect(sent_bodies.size).to eq(2)
+    expect(sent_bodies.uniq.size).to eq(1)
+    sent = JSON.parse(sent_bodies.first).fetch("snapshots").first
+    expect(Time.iso8601(sent.fetch("created_at"))).to eq(created_at)
+  end
+
+  # Legacy rows carry Time values. Truncated to milliseconds on the wire, they reach the
+  # monolith's projection changed, and the rollback's projection check refuses the handoff.
+  it "sends a legacy row's Time created_at and updated_at in a correction snapshot without dropping microseconds" do
+    checkpoint = Timekeeping::Handoff::Checkpoint.from_json(
+      Rails.root.join("spec/fixtures/files/timekeeping_handoff/monolith_checkpoint.json").read
+    )
+    stamped = Time.utc(2026, 1, 2, 3, 4, 5, 123_456)
+    # A Rational, not the Float 0.000_001, so the later time is exactly one
+    # microsecond on, as a value read from a timestamp column is.
+    one_microsecond = Rational(1, 1_000_000)
+    snapshot = checkpoint.rows.fetch("entries").first.except("version")
+                         .merge("created_at" => stamped, "updated_at" => stamped + one_microsecond)
+    url = "#{correction_time_base_url}/internal/v1/handoff/correction_snapshots"
+    stub_request(:put, url).to_return(status: 200, body: JSON.generate("written" => 1))
+
+    described_class.new(base_url: correction_time_base_url, token: "svc-token")
+      .write_correction_snapshots(snapshots: [snapshot], version: 1, generation: 2)
+
+    expect(a_request(:put, url).with do |request|
+      sent = JSON.parse(request.body).fetch("snapshots").first
+      Time.iso8601(sent.fetch("created_at")) == stamped &&
+        Time.iso8601(sent.fetch("updated_at")) == stamped + one_microsecond
+    end).to have_been_made.once
+  end
+end

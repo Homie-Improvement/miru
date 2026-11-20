@@ -845,3 +845,39 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
     expect(described_class::INTENT_RULES).to be_frozen
   end
 end
+
+RSpec.describe Timekeeping::Handoff::Reconciliation, "projection timestamps" do
+  let(:projection_time_stored) { Time.utc(2026, 1, 5, 9, 0, 0, 123_456) }
+
+  def projection_time_entry
+    {
+      "id" => 1, "company_id" => 101, "version" => 1, "project_id" => 1, "user_id" => 1,
+      "work_date" => Date.new(2026, 1, 5), "duration" => 60.0, "note" => "", "bill_status" => "unbilled",
+      "review_status" => "not_required", "locked" => false, "source" => "manual", "source_metadata" => {},
+      "proof_metadata" => {}, "created_at" => projection_time_stored, "updated_at" => projection_time_stored
+    }.reverse_merge(Timekeeping::Handoff::Checkpoint::TABLES.fetch("entries").index_with { nil })
+  end
+
+  def projection_time_checkpoint
+    tables = Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }
+    Timekeeping::Handoff::Checkpoint.build(tables: tables.merge("entries" => [projection_time_entry]))
+  end
+
+  it "still reports a projection updated_at one microsecond off the checkpoint as a changed projection row and aborts" do
+    drifted = projection_time_entry.merge(
+      "bill_status" => TimesheetEntry.bill_statuses.fetch("unbilled"),
+      "review_status" => TimesheetEntry.review_statuses.fetch("not_required"),
+      "updated_at" => projection_time_stored + Rational(1, 1_000_000)
+    )
+    money = { 101 => { company_id: 101, values: {} } }
+
+    result = described_class.run(
+      source: projection_time_checkpoint, checkpoint: projection_time_checkpoint, projection: [drifted],
+      source_intents: [], intents: [], next_entry_id: 2, money_before: money, money_after: money
+    )
+
+    differences = result.companies.fetch(101).checks.fetch(:projection)
+    expect(differences.map { |difference| [difference.field, difference.reason] }).to include(["updated_at", :changed])
+    expect(result).to be_abort
+  end
+end
