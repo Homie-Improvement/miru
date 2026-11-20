@@ -442,6 +442,21 @@ RSpec.describe TimekeepingHandoffFakes::InMemoryTimekeepingStore do
     expect(after.note).to eq(projected.note)
   end
   end
+
+  # A well-formed snapshot at a generation the ownership row does not accept
+  # must fail the drain with the consumer's 409, not pass as drained.
+  it "the outbox relay raises Undelivered naming 409 for a generation the ownership row refuses and stays undrained" do
+    refused_generation = TimekeepingOwnership.current.generation + 5
+    store = described_class.new
+    store.write_correction_snapshots(snapshots: [handoff_fakes_entry_row(id: 5, version: 1).except("version")],
+                                     version: 1, generation: refused_generation)
+    store.admit(generation: refused_generation)
+    relay = TimekeepingHandoffOutboxRelay.new(store:)
+    through = store.highest_outbox_position
+
+    expect { relay.drain!(through:) }.to raise_error(TimekeepingHandoffOutboxRelay::Undelivered, /409/)
+    expect(relay.drained?(through:)).to be(false)
+  end
 end
 
 RSpec.describe TimekeepingHandoffFakes::RecordingAdmission do

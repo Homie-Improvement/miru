@@ -50,6 +50,114 @@ class TimekeepingHandoffFakeRelay
     end
 end
 
+# A drain integration for Timekeeping as the outgoing owner that delivers only
+# the rows in TimekeepingHandoffFakes::InMemoryTimekeepingStore#outbox, through
+# the real Timekeeping::ProjectionConsumer, by way of the gem's own
+# TimekeepingRelay::Relay. It never copies stored entries into the projection,
+# so an entry whose snapshot was left out of the outbox stays behind there and
+# the runner's reconcile reports it, as it would on a live rollback.
+#
+# Like the real relay, it holds back rows of a generation Timekeeping has not
+# admitted yet (the store records each admit call), and drain! delivers only
+# rows at or below through.
+class TimekeepingHandoffOutboxRelay
+  # Raised when a row this drain owes stays unsent, so a batch the consumer
+  # refused (409, 422 or any other answer) fails the spec with its status and
+  # body instead of reading as a projection left behind.
+  class Undelivered < StandardError; end
+
+  BATCH_LIMIT = 100
+
+  # The outbox rows this drain may deliver, as TimekeepingRelay::OutboxSource
+  # rows with each entry in the contract's wire shape.
+  class Source
+    include TimekeepingRelay::OutboxSource
+
+    def initialize(store:, through:, sent_positions:)
+      @store = store
+      @through = through
+      @sent_positions = sent_positions
+    end
+
+    def unsent_after(position, limit)
+      owed.select { |row| row.fetch("outbox_position") > position }.first(limit)
+          .map { |row| row.merge("entry" => TimekeepingHandoffOutboxRelay.wire_entry(row.fetch("entry"))) }
+    end
+
+    def mark_sent(positions)
+      @sent_positions.merge(positions)
+      nil
+    end
+
+    # Admitted, at or below through, and not yet sent, in position order.
+    def owed
+      admitted = @store.calls.filter_map { |call| call.last if call.first == :admit }
+      @store.outbox
+            .select { |row| admitted.include?(row.fetch("generation")) && row.fetch("outbox_position") <= @through }
+            .reject { |row| @sent_positions.include?(row.fetch("outbox_position")) }
+            .sort_by { |row| row.fetch("outbox_position") }
+    end
+  end
+
+  # Calls the projection consumer in process, as the monolith's snapshot
+  # endpoint does, and keeps the last answer for the Undelivered message.
+  class ConsumerEndpoint
+    attr_reader :last_response
+
+    def deliver(batch, idempotency_key:)
+      result = Timekeeping::ProjectionConsumer.call(batch:, idempotency_key:)
+      @last_response = TimekeepingRelay::Response.new(status: result.status, body: result.body)
+    end
+  end
+
+  # A stored entry as the contract's entry fields: times and dates as ISO 8601
+  # text and locked as a boolean, as the service's outbox serializes them.
+  # Fields the entry lacks stay missing, so the consumer refuses the batch.
+  def self.wire_entry(entry)
+    entry.slice(*Timekeeping::SnapshotBatch::ENTRY_FIELDS).to_h do |field, value|
+      [field, wire_value(field, value)]
+    end
+  end
+
+  def self.wire_value(field, value)
+    case value
+    when ActiveSupport::TimeWithZone, Time, DateTime then value.to_time.utc.iso8601(6)
+    when Date then value.iso8601
+    else field == "locked" ? value == true : value
+    end
+  end
+
+  # store: Timekeeping's InMemoryTimekeepingStore. log, when given, receives
+  # [:drain, through] for each drain, so specs can check the call order.
+  def initialize(store:, log: nil)
+    @store = store
+    @log = log
+    @sent_positions = Set.new
+  end
+
+  def drain!(through:)
+    @log&.push([:drain, through])
+    source = source_through(through)
+    endpoint = ConsumerEndpoint.new
+    TimekeepingRelay::Relay.new(source:, endpoint:).deliver(limit: BATCH_LIMIT)
+    return if source.owed.empty?
+
+    answer = endpoint.last_response
+    raise Undelivered, "outbox rows at or below position #{through} were not delivered: " \
+                       "status #{answer&.status.inspect}, body #{answer&.body.inspect}"
+  end
+
+  def drained?(through:)
+    source_through(through).owed.empty?
+  end
+
+  private
+
+    def source_through(through)
+      Source.new(store: @store, through:, sent_positions: @sent_positions)
+    end
+end
+
 # The owner-side fakes every Timekeeping::Handoff::Runner spec shares. One copy
 # of each keeps the specs from drifting apart: a looser private copy of the
 # store would let a runner bug pass where the real store refuses it.
@@ -194,20 +302,32 @@ module TimekeepingHandoffFakes
   # runner. By default the Timekeeping store is also Timekeeping's admission
   # adapter, and each owner's drain relays that owner's entries into the
   # projection, as the real outbox relay would, so reconcile sees the
-  # projection the drain left. relay: false leaves both drains nil; log is
+  # projection the drain left. relay: false leaves both drains nil;
+  # relay: :timekeeping_outbox keeps the monolith's copy relay and gives
+  # Timekeeping a TimekeepingHandoffOutboxRelay, which needs the store to be
+  # Timekeeping's admission so it sees which generations were admitted. log is
   # passed to the relays so drains appear in a spec's shared call log.
   def self.owners(timekeeping:, timekeeping_admission: timekeeping, monolith_admission: RecordingAdmission.new,
                   monolith_store: Timekeeping::Handoff::MonolithStore.new(connection: ActiveRecord::Base.connection),
                   settle: NoOpSettle.new, relay: true, log: nil)
-    drain_for = ->(store) { relay ? TimekeepingHandoffFakeRelay.new(store:, log:) : nil }
+    drains = RELAY_DRAINS.fetch(relay)
+    drain_for = ->(name, store) { drains.fetch(name)&.new(store:, log:) }
     {
       monolith: Timekeeping::Handoff::Owner.new(
-        name: :monolith, store: monolith_store, admission: monolith_admission, settle:, drain: drain_for.call(monolith_store)
+        name: :monolith, store: monolith_store, admission: monolith_admission, settle:,
+        drain: drain_for.call(:monolith, monolith_store)
       ),
       timekeeping: Timekeeping::Handoff::Owner.new(
         name: :timekeeping, store: timekeeping, admission: timekeeping_admission, settle:,
-        drain: drain_for.call(timekeeping)
+        drain: drain_for.call(:timekeeping, timekeeping)
       )
     }
   end
+
+  # The drain class each owner gets for each value of owners' relay: keyword.
+  RELAY_DRAINS = {
+    true => { monolith: TimekeepingHandoffFakeRelay, timekeeping: TimekeepingHandoffFakeRelay },
+    false => { monolith: nil, timekeeping: nil },
+    timekeeping_outbox: { monolith: TimekeepingHandoffFakeRelay, timekeeping: TimekeepingHandoffOutboxRelay }
+  }.freeze
 end
