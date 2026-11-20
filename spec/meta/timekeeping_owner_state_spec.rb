@@ -400,7 +400,8 @@ RSpec.describe "Timekeeping owner state harness" do
     def run_probe(fixture, owner_state)
       probe = Rails.root.join("spec/fixtures/timekeeping_harness", fixture).to_s
       Dir.mktmpdir("owner-state-probe-ledger") do |dir|
-        env = { "TIMEKEEPING_OWNER_STATE" => owner_state,
+        # A probe is never a regression child, even when this run is one.
+        env = { "TIMEKEEPING_OWNER_STATE" => owner_state, "TIMEKEEPING_REGRESSION" => nil,
                 TimekeepingQueueLedger::PATH_KEY => File.join(dir, "queue_ledger.json") }
         stdout, stderr, status = Open3.capture3(env, "bundle", "exec", "rspec", probe, chdir: Rails.root.to_s)
         ["#{stdout}\n#{stderr}", status]
@@ -433,7 +434,8 @@ RSpec.describe "Timekeeping owner state harness" do
     end
 
     it "keeps the probe fixtures out of a normal suite run" do
-      %w[owner_state_probe.rb unset_owner_state_probe.rb switches_owner_probe.rb].each do |fixture|
+      %w[owner_state_probe.rb unset_owner_state_probe.rb switches_owner_probe.rb
+         dotenv_owner_state_probe.rb].each do |fixture|
         probe = Rails.root.join("spec/fixtures/timekeeping_harness", fixture)
         expect(probe).to exist
         expect(probe.basename.to_s).not_to end_with("_spec.rb")
@@ -454,6 +456,17 @@ RSpec.describe "Timekeeping owner state harness" do
     # "An unknown `TIMEKEEPING_OWNER_STATE` raises at load and names the three values."
     it "with TIMEKEEPING_OWNER_STATE=bogus the run fails at load naming the three values" do
       output, status = run_probe("owner_state_probe.rb", "bogus")
+
+      expect(status).not_to be_success
+      expect(output.lines.find { |line| line.include?("ArgumentError") }).not_to be_nil
+      expect(output).to match(/legacy.*timekeeping.*rollback/m)
+      expect(output).to include("error occurred while loading").or include("errors occurred outside of examples")
+    end
+
+    # Only a regression child reads an empty value as no state, so a blank value
+    # set anywhere else still reaches the harness and is reported at load.
+    it "with TIMEKEEPING_OWNER_STATE empty outside a regression child the run fails at load naming the three values" do
+      output, status = run_probe("owner_state_probe.rb", "")
 
       expect(status).not_to be_success
       expect(output.lines.find { |line| line.include?("ArgumentError") }).not_to be_nil
@@ -513,5 +526,33 @@ RSpec.describe "Seeded committed_data owner state probe run (timekeeping)", :wit
     expect(stdout).to include("1 example, 0 failures")
     expect("#{stdout}\n#{stderr}").not_to include("HandoffBegun")
     expect("#{stdout}\n#{stderr}").not_to include("SeedDispositionRecorder::Error")
+  end
+end
+
+RSpec.describe "Timekeeping owner state harness", :without_transaction do
+  it "the dotenv owner state probe's switches_owner example fails when an owner state is selected for its run, so it can catch a restored owner selection" do
+    probe = Rails.root.join("spec/fixtures/timekeeping_harness/dotenv_owner_state_probe.rb").to_s
+    expect(File).to exist(probe)
+    # A name ending in _spec.rb would put the probe into every normal suite run.
+    expect(File.basename(probe)).not_to end_with("_spec.rb")
+
+    # "Prevent file-based configuration from restoring owner selection, and test boot with a temporary dotenv file."
+    # The probe is the check that runs inside the booted child. Here a state is selected for its
+    # switches_owner example, as a restored dotenv value would select one, and the probe must fail.
+    # The probe's own ledger file, so its suite start never deletes this run's.
+    # The dotenv marker and tree keys are set as the boot test sets them, so the
+    # probe's first checks pass and only its owner state check can fail.
+    stdout, stderr, status = Dir.mktmpdir("dotenv-owner-state-probe-ledger") do |dir|
+      Open3.capture3({ "TIMEKEEPING_OWNER_STATE" => "timekeeping",
+                       "TIMEKEEPING_DOTENV_PROBE" => "loaded",
+                       "TIMEKEEPING_DOTENV_TREE" => Rails.root.to_s,
+                       TimekeepingQueueLedger::PATH_KEY => File.join(dir, "queue_ledger.json") },
+                     "bundle", "exec", "rspec", probe, "--tag", "switches_owner", chdir: Rails.root.to_s)
+    end
+    output = "#{stdout}\n#{stderr}"
+
+    expect(status).not_to be_success, output
+    expect(output).to include("1 example, 1 failure")
+    expect(output).to include("expect(TimekeepingOwnerState::SELECTED).to be_nil")
   end
 end
