@@ -5,238 +5,285 @@
 require "rails_helper"
 require "tmpdir"
 
-RSpec.describe Timekeeping::Handoff::Runner, "money control run", :two_tenant_seed, :seeded_without_transaction do
-  it "flips a first cutover when neither company's invoice money changed during the handoff" do
-    TimekeepingOwnership.ensure_initial!
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    owners = TimekeepingHandoffFakes.owners(timekeeping:, settle: nil, relay: false)
-
-    Dir.mktmpdir do |report_root|
-      # "The financial snapshot is identical before and after each handoff, and a mutated value fails the handoff"
-      described_class.run(direction: :cutover, owners:, report_root: Pathname(report_root), clock: Time)
-
-      ownership = TimekeepingOwnership.current
-      expect(ownership.owner).to eq("timekeeping")
-      expect(ownership.generation).to eq(2)
-      expect(ownership.handoff_step).to be_nil
-      expect(Dir.glob(File.join(report_root, "**", "reconciliation.json"))).not_to be_empty
-    end
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Runner, "money mutated during the handoff", :two_tenant_seed, :seeded_without_transaction do
-  it "fails the cutover at reconcile and names only the company whose invoice discount changed after settle" do
-    TimekeepingOwnership.ensure_initial!
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    owners = TimekeepingHandoffFakes.owners(timekeeping:, settle: nil, relay: false)
-    invoice = Invoice.where(company_id: fork_and_leaf.id).order(:id).first!
-    # Changes one Fork & Leaf invoice after the step 2 snapshot was taken.
-    observer = lambda do |event, step:|
-      if event == :after_step && step.to_s == "settle"
-        invoice.update_columns(discount: invoice.discount.to_d + 1)
-      end
-    end
-
-    Dir.mktmpdir do |report_root|
-      # "The financial snapshot is identical before and after each handoff, and a mutated value fails the handoff"
-      event = assert_event_reported("Timekeeping::FinancialSnapshotChanged") do
-        expect do
-          described_class.run(direction: :cutover, owners:, observer:, report_root: Pathname(report_root), clock: Time)
-        end.to raise_error(Timekeeping::Handoff::Runner::Refused)
-      end
-
-      expect(event[:payload].to_h[:data][:company_id]).to eq(fork_and_leaf.id)
-      expect(event[:payload].to_h[:data][:company_id]).not_to eq(copper_kettle.id)
-
-      ownership = TimekeepingOwnership.current
-      expect(ownership.owner).to eq("monolith")
-      expect(ownership.handoff_step).not_to eq("reconcile")
-      expect(timekeeping.calls).not_to include([:admit, 2])
-      expect(Dir.glob(File.join(report_root, "**", "reconciliation.json"))).not_to be_empty
-    end
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  let(:calls) { [] }
-  let(:clock) { Struct.new(:now).new(Time.utc(2026, 10, 27, 12)) }
-  let(:report_root) { Pathname(Dir.mktmpdir("handoff-generations")) }
-  let(:timekeeping_store) { TimekeepingHandoffFakes::InMemoryTimekeepingStore.new(log: calls, tag: :timekeeping) }
-  let(:monolith_admission) { TimekeepingHandoffFakes::RecordingAdmission.new(log: calls, tag: :monolith) }
-
-  # A settle integration that records each call in the shared log, so the
-  # order of settle, drain and admission calls can be read from one array.
-  let(:settle) do
-    log = calls
-    Class.new do
-      define_method(:settle!) { |generation:| log << [:settle, generation] }
-      define_method(:stop_applying!) { log << [:stop_applying] }
-      def settled? = true
-    end.new
-  end
-
-  let(:owners) do
-    TimekeepingHandoffFakes.owners(timekeeping: timekeeping_store, monolith_admission:, settle:, log: calls)
-  end
-
-  def run_handoff(direction)
-    described_class.run(direction:, owners:, report_root:, clock:)
-  end
-
-  it "cutover, rollback and re-cutover raise the generation to 2, 3 and 4 and rollback leaves Timekeeping fenced" do
-    # "A resumable runner carries out the seven handoff steps in both directions under one rising generation
-    # (cutover 2, rollback 3, re-cutover 4)"
-    run_handoff(:cutover)
-    ownership = TimekeepingOwnership.current
-    expect([ownership.generation, ownership.owner, ownership.handoff_step]).to eq([2, "timekeeping", nil])
-    expect(calls).to include([:timekeeping, :admit, 2])
-
-    calls.clear
-    run_handoff(:rollback)
-    ownership.reload
-    expect([ownership.generation, ownership.owner, ownership.handoff_step]).to eq([3, "monolith", nil])
-    # "After rollback Timekeeping stays fenced" and "A flip away from Timekeeping leaves it fenced."
-    expect(calls).to include([:timekeeping, :fence])
-    expect(calls.select { |call| call[0..1] == [:timekeeping, :admit] }).to be_empty
-    expect(calls).to include([:monolith, :admit, 3])
-
-    run_handoff(:re_cutover)
-    ownership.reload
-    expect([ownership.generation, ownership.owner, ownership.handoff_step]).to eq([4, "timekeeping", nil])
-    expect(calls.last).to eq([:timekeeping, :admit, 4])
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  let(:calls) { [] }
-  let(:clock) { Struct.new(:now).new(Time.utc(2026, 10, 27, 12)) }
-  let(:report_root) { Pathname(Dir.mktmpdir("handoff-resume-freeze")) }
-  let(:timekeeping_store) { TimekeepingHandoffFakes::InMemoryTimekeepingStore.new(log: calls, tag: :timekeeping) }
-  let(:owners) do
-    TimekeepingHandoffFakes.owners(
-      timekeeping: timekeeping_store, monolith_admission: TimekeepingHandoffFakes::RecordingAdmission.new(log: calls, tag: :monolith),
-      settle: nil, relay: false
-    )
-  end
-
-  it "resuming a cutover interrupted after freeze finishes with the legacy entries and corrections of an uninterrupted run and one generation raise" do
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:, clock:,
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_freeze))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    expect(TimekeepingOwnership.current.attributes.slice("generation", "handoff_step"))
-      .to eq("generation" => 2, "handoff_step" => "freeze")
-
-    # A fresh call carries no in-memory state from the interrupted one.
-    described_class.run(direction: :cutover, owners:, report_root:, clock:)
-
-    ownership = TimekeepingOwnership.current
-    # "Resuming after an interrupt after step 3, during step 4, or after a restart once step 4 is recorded
-    # continues from the failed step and ends with the same counts and checksums as an uninterrupted run"
-    expect([ownership.generation, ownership.owner, ownership.handoff_step]).to eq([2, "timekeeping", nil])
-    expect(ownership.legacy_retired_at).to be_present
-
-    uninterrupted = Timekeeping::Handoff::LegacySource.new(
-      connection: ActiveRecord::Base.connection,
-      recorded_disposition: YAML.load_file(Timekeeping::SeedDispositionRecorder::DEFAULT_PATH)
-    ).export(generation: 2, captured_at: clock.now)
-
-    loaded_ids = timekeeping_store.rows.fetch("entries").pluck("id")
-    expect(loaded_ids.sort).to eq(uninterrupted[:checkpoint].rows.fetch("entries").pluck("id").sort)
-    expect(loaded_ids.size).to eq(TimesheetEntry.unscoped.count)
-    # Timekeeping's correction writer takes each corrected entry row without its version, and stores it with
-    # the correction version and the handoff's generation.
-    # correction_writes holds the snapshots exactly as the runner sent them.
-    expect(timekeeping_store.correction_writes.sort_by { |c| c["id"] })
-      .to eq(uninterrupted[:corrections].map { |c| c.fetch("snapshot").except("version") }.sort_by { |c| c["id"] })
-    corrections = timekeeping_store.corrections
-    expect(corrections.map { |c| c.except("version", "generation") }.sort_by { |c| c["id"] })
-      .to eq(uninterrupted[:corrections].map { |c| c.fetch("snapshot").except("version") }.sort_by { |c| c["id"] })
-    expect(corrections.pluck("version").uniq).to eq([Timekeeping::ReservationDerivation::CORRECTION_VERSION])
-    expect(corrections.pluck("generation").uniq).to eq([2])
-    expect(calls.count([:timekeeping, :admit, 2])).to eq(1)
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  let(:calls) { [] }
-  let(:clock) { Struct.new(:now).new(Time.utc(2026, 10, 27, 12)) }
-  let(:report_root) { Pathname(Dir.mktmpdir("handoff-resume-checkpoint")) }
-  let(:timekeeping_store) { TimekeepingHandoffFakes::InMemoryTimekeepingStore.new(log: calls, tag: :timekeeping) }
-  let(:owners) do
-    TimekeepingHandoffFakes.owners(
-      timekeeping: timekeeping_store, monolith_admission: TimekeepingHandoffFakes::RecordingAdmission.new(log: calls, tag: :monolith),
-      settle: nil, relay: false
-    )
-  end
-
-  it "resuming a cutover interrupted during the checkpoint load writes each correction once and keeps generation 2" do
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:, clock:,
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :during_checkpoint))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    expect(TimekeepingOwnership.current.handoff_step).to eq("freeze")
-
-    described_class.run(direction: :cutover, owners:, report_root:, clock:)
-
-    ownership = TimekeepingOwnership.current
-    # "Step 1 runs only when `handoff_step` is null; otherwise the runner resumes at the step after the recorded
-    # one, so a resume never raises the generation again."
-    expect([ownership.generation, ownership.owner, ownership.handoff_step]).to eq([2, "timekeeping", nil])
-
-    reserved_ids = YAML.load_file(Timekeeping::SeedDispositionRecorder::DEFAULT_PATH).fetch("companies").values
-      .flat_map { |invoices| invoices.values.flat_map { |invoice| invoice["entry_ids"] } }
-    # "The first cutover turns each recorded unlocked link into a committed reservation with one correction snapshot"
-    # correction_writes keeps every snapshot sent, so a duplicate the store's
-    # replace-by-entry would absorb still shows up here.
-    corrected = timekeeping_store.correction_writes.pluck("id")
-    expect(corrected.tally.values.uniq).to eq([1])
-    expect(corrected.sort).to eq(reserved_ids.sort)
-    expect(timekeeping_store.rows.fetch("entries").size).to eq(TimesheetEntry.unscoped.count)
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  let(:calls) { [] }
-  let(:clock) { Struct.new(:now).new(Time.utc(2026, 10, 27, 12)) }
-  let(:report_root) { Pathname(Dir.mktmpdir("handoff-abort")) }
-  let(:owners) do
-    TimekeepingHandoffFakes.owners(
-      timekeeping: TimekeepingHandoffFakes::InMemoryTimekeepingStore.new(log: calls, tag: :timekeeping),
-      monolith_admission: TimekeepingHandoffFakes::RecordingAdmission.new(log: calls, tag: :monolith),
-      settle: nil, relay: false
-    )
-  end
-
-  it "aborting a cutover stopped after close admission completes settle and freeze before the monolith admits at the raised generation" do
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:, clock:,
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_close_admission))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    expect(TimekeepingOwnership.current.handoff_step).to eq("close_admission")
-
-    # Records into the shared log so step completions can be ordered against admission calls.
-    log = calls
-    recorder = ->(event, step:) { log << [event, step.to_s] if event == :after_step }
-    described_class.run(direction: :cutover, abort: true, owners:, report_root:, clock:, observer: recorder)
-
-    # "Abort completes steps 2 and 3 before the outgoing owner admits writes again at the raised generation,
-    # and handoff_step returns to null"
-    admitted_at = calls.index([:monolith, :admit, 2])
-    expect(admitted_at).not_to be_nil
-    expect(calls.index([:after_step, "settle"])).to be < admitted_at
-    expect(calls.index([:after_step, "freeze"])).to be < admitted_at
-    expect(calls).not_to include([:after_step, "checkpoint"])
-
-    ownership = TimekeepingOwnership.current
-    # "The generation only rises, once per handoff; an aborted handoff does not lower it."
-    expect([ownership.generation, ownership.owner, ownership.handoff_step]).to eq([2, "monolith", nil])
-    expect(ownership.legacy_retired_at).to be_nil
-    expect(calls.select { |call| call[0..1] == [:timekeeping, :admit] }).to be_empty
-  end
-end
-
+# The seed loads in a before(:all) of a shared context that RSpec includes only
+# once per ancestry, and :seeded_without_transaction rolls nothing back. Every
+# example below that commits a handoff therefore sits in its own context that
+# carries the seed tags itself; tagging this describe would give them one seed.
 RSpec.describe Timekeeping::Handoff::Runner do
+  context "with a money control run", :two_tenant_seed, :seeded_without_transaction do
+    it "flips a first cutover when neither company's invoice money changed during the handoff" do
+      TimekeepingOwnership.ensure_initial!
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:, settle: nil, relay: false)
+
+      Dir.mktmpdir do |report_root|
+        # "The financial snapshot is identical before and after each handoff, and a mutated value fails the handoff"
+        described_class.run(direction: :cutover, owners:, report_root: Pathname(report_root), clock: Time)
+
+        ownership = TimekeepingOwnership.current
+        expect(ownership.owner).to eq("timekeeping")
+        expect(ownership.generation).to eq(2)
+        expect(ownership.handoff_step).to be_nil
+        expect(Dir.glob(File.join(report_root, "**", "reconciliation.json"))).not_to be_empty
+      end
+    end
+  end
+
+  context "with money mutated during the handoff", :two_tenant_seed, :seeded_without_transaction do
+    it "fails the cutover at reconcile and names only the company whose invoice discount changed after settle" do
+      TimekeepingOwnership.ensure_initial!
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:, settle: nil, relay: false)
+      invoice = Invoice.where(company_id: fork_and_leaf.id).order(:id).first!
+      # Changes one Fork & Leaf invoice after the step 2 snapshot was taken.
+      observer = lambda do |event, step:|
+        if event == :after_step && step.to_s == "settle"
+          invoice.update_columns(discount: invoice.discount.to_d + 1)
+        end
+      end
+
+      Dir.mktmpdir do |report_root|
+        # "The financial snapshot is identical before and after each handoff, and a mutated value fails the handoff"
+        event = assert_event_reported("Timekeeping::FinancialSnapshotChanged") do
+          expect do
+            described_class.run(direction: :cutover, owners:, observer:, report_root: Pathname(report_root), clock: Time)
+          end.to raise_error(Timekeeping::Handoff::Runner::Refused)
+        end
+
+        expect(event[:payload].to_h[:data][:company_id]).to eq(fork_and_leaf.id)
+        expect(event[:payload].to_h[:data][:company_id]).not_to eq(copper_kettle.id)
+
+        ownership = TimekeepingOwnership.current
+        expect(ownership.owner).to eq("monolith")
+        expect(ownership.handoff_step).not_to eq("reconcile")
+        expect(timekeeping.calls).not_to include([:admit, 2])
+        expect(Dir.glob(File.join(report_root, "**", "reconciliation.json"))).not_to be_empty
+      end
+    end
+  end
+
+  context "with recording fakes and a fixed clock" do
+    let(:calls) { [] }
+    let(:clock) { Struct.new(:now).new(Time.utc(2026, 10, 27, 12)) }
+    let(:report_root) { Pathname(Dir.mktmpdir("handoff-runner")) }
+    let(:timekeeping_store) { TimekeepingHandoffFakes::InMemoryTimekeepingStore.new(log: calls, tag: :timekeeping) }
+    let(:monolith_admission) { TimekeepingHandoffFakes::RecordingAdmission.new(log: calls, tag: :monolith) }
+    let(:owners) do
+      TimekeepingHandoffFakes.owners(timekeeping: timekeeping_store, monolith_admission:, settle: nil, relay: false)
+    end
+
+    context "when cutover, rollback and re-cutover run in turn", :two_tenant_seed, :seeded_without_transaction do
+      # A settle integration that records each call in the shared log, so the
+      # order of settle, drain and admission calls can be read from one array.
+      let(:settle) do
+        log = calls
+        Class.new do
+          define_method(:settle!) { |generation:| log << [:settle, generation] }
+          define_method(:stop_applying!) { log << [:stop_applying] }
+          def settled? = true
+        end.new
+      end
+
+      let(:owners) do
+        TimekeepingHandoffFakes.owners(timekeeping: timekeeping_store, monolith_admission:, settle:, log: calls)
+      end
+
+      def run_handoff(direction)
+        described_class.run(direction:, owners:, report_root:, clock:)
+      end
+
+      it "cutover, rollback and re-cutover raise the generation to 2, 3 and 4 and rollback leaves Timekeeping fenced" do
+        # "A resumable runner carries out the seven handoff steps in both directions under one rising generation
+        # (cutover 2, rollback 3, re-cutover 4)"
+        run_handoff(:cutover)
+        ownership = TimekeepingOwnership.current
+        expect([ownership.generation, ownership.owner, ownership.handoff_step]).to eq([2, "timekeeping", nil])
+        expect(calls).to include([:timekeeping, :admit, 2])
+
+        calls.clear
+        run_handoff(:rollback)
+        ownership.reload
+        expect([ownership.generation, ownership.owner, ownership.handoff_step]).to eq([3, "monolith", nil])
+        # "After rollback Timekeeping stays fenced" and "A flip away from Timekeeping leaves it fenced."
+        expect(calls).to include([:timekeeping, :fence])
+        expect(calls.select { |call| call[0..1] == [:timekeeping, :admit] }).to be_empty
+        expect(calls).to include([:monolith, :admit, 3])
+
+        run_handoff(:re_cutover)
+        ownership.reload
+        expect([ownership.generation, ownership.owner, ownership.handoff_step]).to eq([4, "timekeeping", nil])
+        expect(calls.last).to eq([:timekeeping, :admit, 4])
+      end
+    end
+
+    context "when a cutover is resumed after freeze", :two_tenant_seed, :seeded_without_transaction do
+      it "resuming a cutover interrupted after freeze finishes with the legacy entries and corrections of an uninterrupted run and one generation raise" do
+        expect do
+          described_class.run(direction: :cutover, owners:, report_root:, clock:,
+                              observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_freeze))
+        end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+        expect(TimekeepingOwnership.current.attributes.slice("generation", "handoff_step"))
+          .to eq("generation" => 2, "handoff_step" => "freeze")
+
+        # A fresh call carries no in-memory state from the interrupted one.
+        described_class.run(direction: :cutover, owners:, report_root:, clock:)
+
+        ownership = TimekeepingOwnership.current
+        # "Resuming after an interrupt after step 3, during step 4, or after a restart once step 4 is recorded
+        # continues from the failed step and ends with the same counts and checksums as an uninterrupted run"
+        expect([ownership.generation, ownership.owner, ownership.handoff_step]).to eq([2, "timekeeping", nil])
+        expect(ownership.legacy_retired_at).to be_present
+
+        uninterrupted = Timekeeping::Handoff::LegacySource.new(
+          connection: ActiveRecord::Base.connection,
+          recorded_disposition: YAML.load_file(Timekeeping::SeedDispositionRecorder::DEFAULT_PATH)
+        ).export(generation: 2, captured_at: clock.now)
+
+        loaded_ids = timekeeping_store.rows.fetch("entries").pluck("id")
+        expect(loaded_ids.sort).to eq(uninterrupted[:checkpoint].rows.fetch("entries").pluck("id").sort)
+        expect(loaded_ids.size).to eq(TimesheetEntry.unscoped.count)
+        # Timekeeping's correction writer takes each corrected entry row without its version, and stores it with
+        # the correction version and the handoff's generation.
+        # correction_writes holds the snapshots exactly as the runner sent them.
+        expect(timekeeping_store.correction_writes.sort_by { |c| c["id"] })
+          .to eq(uninterrupted[:corrections].map { |c| c.fetch("snapshot").except("version") }.sort_by { |c| c["id"] })
+        corrections = timekeeping_store.corrections
+        expect(corrections.map { |c| c.except("version", "generation") }.sort_by { |c| c["id"] })
+          .to eq(uninterrupted[:corrections].map { |c| c.fetch("snapshot").except("version") }.sort_by { |c| c["id"] })
+        expect(corrections.pluck("version").uniq).to eq([Timekeeping::ReservationDerivation::CORRECTION_VERSION])
+        expect(corrections.pluck("generation").uniq).to eq([2])
+        expect(calls.count([:timekeeping, :admit, 2])).to eq(1)
+      end
+    end
+
+    context "when a cutover is resumed after an interrupted checkpoint load", :two_tenant_seed, :seeded_without_transaction do
+      it "resuming a cutover interrupted during the checkpoint load writes each correction once and keeps generation 2" do
+        expect do
+          described_class.run(direction: :cutover, owners:, report_root:, clock:,
+                              observer: TimekeepingHandoffHooks::Interrupt.new(at: :during_checkpoint))
+        end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+        expect(TimekeepingOwnership.current.handoff_step).to eq("freeze")
+
+        described_class.run(direction: :cutover, owners:, report_root:, clock:)
+
+        ownership = TimekeepingOwnership.current
+        # "Step 1 runs only when `handoff_step` is null; otherwise the runner resumes at the step after the recorded
+        # one, so a resume never raises the generation again."
+        expect([ownership.generation, ownership.owner, ownership.handoff_step]).to eq([2, "timekeeping", nil])
+
+        reserved_ids = YAML.load_file(Timekeeping::SeedDispositionRecorder::DEFAULT_PATH).fetch("companies").values
+          .flat_map { |invoices| invoices.values.flat_map { |invoice| invoice["entry_ids"] } }
+        # "The first cutover turns each recorded unlocked link into a committed reservation with one correction snapshot"
+        # correction_writes keeps every snapshot sent, so a duplicate the store's
+        # replace-by-entry would absorb still shows up here.
+        corrected = timekeeping_store.correction_writes.pluck("id")
+        expect(corrected.tally.values.uniq).to eq([1])
+        expect(corrected.sort).to eq(reserved_ids.sort)
+        expect(timekeeping_store.rows.fetch("entries").size).to eq(TimesheetEntry.unscoped.count)
+      end
+    end
+
+    context "when a cutover stopped after close admission is aborted", :two_tenant_seed, :seeded_without_transaction do
+      it "aborting a cutover stopped after close admission completes settle and freeze before the monolith admits at the raised generation" do
+        # "The handoff specs use one shared RecordingAdmission, version-guarded in-memory Timekeeping store and owners
+        # builder from spec/support, and TimekeepingHandoffHooks::Interrupt in place of the ad-hoc stop lambdas."
+        expect do
+          described_class.run(direction: :cutover, owners:, report_root:, clock:,
+                              observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_close_admission))
+        end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+
+        # The interrupt must have fired exactly at the named point, not earlier or later.
+        stopped = TimekeepingOwnership.current
+        expect([stopped.generation, stopped.owner, stopped.handoff_step]).to eq([2, "monolith", "close_admission"])
+        expect(monolith_admission.calls).to eq([[:fence]])
+        expect(calls).to include([:monolith, :fence])
+        expect(calls.select { |call| call[0..1] == [:timekeeping, :admit] }).to be_empty
+        expect(timekeeping_store.rows.fetch("entries")).to be_empty
+
+        # Records into the shared log so step completions can be ordered against admission calls.
+        log = calls
+        recorder = ->(event, step:) { log << [event, step.to_s] if event == :after_step }
+        described_class.run(direction: :cutover, abort: true, owners:, report_root:, clock:, observer: recorder)
+
+        # "Abort completes steps 2 and 3 before the outgoing owner admits writes again at the raised generation,
+        # and handoff_step returns to null"
+        admitted_at = calls.index([:monolith, :admit, 2])
+        expect(admitted_at).not_to be_nil
+        expect(calls.index([:after_step, "settle"])).to be < admitted_at
+        expect(calls.index([:after_step, "freeze"])).to be < admitted_at
+        expect(calls).not_to include([:after_step, "checkpoint"])
+
+        ownership = TimekeepingOwnership.current
+        # "The generation only rises, once per handoff; an aborted handoff does not lower it."
+        expect([ownership.generation, ownership.owner, ownership.handoff_step]).to eq([2, "monolith", nil])
+        expect(ownership.legacy_retired_at).to be_nil
+        expect(calls.select { |call| call[0..1] == [:timekeeping, :admit] }).to be_empty
+      end
+    end
+
+    context "when a flip finds a settling generation stored", :two_tenant_seed, :seeded_without_transaction do
+      it "a flip that finds a settling generation stored ends the handoff with settling_generation NULL" do
+        TimekeepingOwnership.ensure_initial!
+        # Stores a settling generation just before the flip step runs, so only the flip can clear it.
+        observer = lambda do |event, step:|
+          if event == :before_step && step.to_s == "flip"
+            TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(settling_generation: 1)
+          end
+        end
+
+        described_class.run(direction: :cutover, owners:, observer:, report_root:, clock:)
+
+        ownership = TimekeepingOwnership.current
+        expect(ownership.handoff_step).to be_nil
+        expect(ownership.owner).to eq("timekeeping")
+        # "In lib/timekeeping/handoff/runner.rb, `flip` and `abort_handoff` also set `settling_generation` to NULL, so no handoff ends with a stored settling generation."
+        expect(ownership.settling_generation).to be_nil
+        # The legacy source's stop_applying! does nothing, so the flip alone closed this step and must raise the mark.
+        expect(ownership.settling_stopped_generation).to be >= 1
+
+        # A later handoff is in progress, so only the stop mark can refuse the late begin.
+        TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(handoff_step: "settle")
+        TimekeepingOwnership.begin_settling!(generation: 1)
+        expect(TimekeepingOwnership.current.settling_generation).to be_nil
+
+        # The mark is the cleared generation, not higher, so the later handoff's own step still opens.
+        TimekeepingOwnership.begin_settling!(generation: 2)
+        expect(TimekeepingOwnership.current.settling_generation).to eq(2)
+      ensure
+        TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)
+          .update_all(settling_generation: nil, settling_stopped_generation: nil, handoff_step: nil)
+      end
+    end
+
+    context "when an abort finds a settling generation stored", :two_tenant_seed, :seeded_without_transaction do
+      it "aborting a handoff with a settling generation stored ends it with settling_generation NULL" do
+        expect do
+          described_class.run(direction: :cutover, owners:, report_root:, clock:,
+                              observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_close_admission))
+        end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+        TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(settling_generation: 1)
+
+        described_class.run(direction: :cutover, abort: true, owners:, report_root:, clock:)
+
+        ownership = TimekeepingOwnership.current
+        expect(ownership.handoff_step).to be_nil
+        # "In lib/timekeeping/handoff/runner.rb, `flip` and `abort_handoff` also set `settling_generation` to NULL, so no handoff ends with a stored settling generation."
+        expect(ownership.settling_generation).to be_nil
+        # The legacy source's stop_applying! does nothing, so the abort alone closed this step and must raise the mark.
+        expect(ownership.settling_stopped_generation).to be >= 1
+
+        # A later handoff is in progress, so only the stop mark can refuse the late begin.
+        TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(handoff_step: "settle")
+        TimekeepingOwnership.begin_settling!(generation: 1)
+        expect(TimekeepingOwnership.current.settling_generation).to be_nil
+      ensure
+        FileUtils.rm_rf(report_root)
+        TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)
+          .update_all(settling_generation: nil, settling_stopped_generation: nil, handoff_step: nil)
+      end
+    end
+  end
+
   it "refuses a cutover with no monolith admission adapter before fencing Timekeeping or writing any report" do
     timekeeping_admission = TimekeepingHandoffFakes::RecordingAdmission.new
     store = Object.new
@@ -261,213 +308,99 @@ RSpec.describe Timekeeping::Handoff::Runner do
     after = TimekeepingOwnership.current.attributes.slice(*before.keys)
     expect(after).to eq(before)
   end
-end
 
-# Generated by Descant: acceptance tests below.
-RSpec.describe Timekeeping::Handoff::Runner, "stopped by the shared interrupt hook", :two_tenant_seed, :seeded_without_transaction do
-  # "The handoff specs use one shared RecordingAdmission, version-guarded in-memory Timekeeping store and owners
-  # builder from spec/support, and TimekeepingHandoffHooks::Interrupt in place of the ad-hoc stop lambdas."
-  it "a cutover built from the shared handoff fakes stops at Interrupt after close admission with the monolith fenced and Timekeeping not admitted" do
-    TimekeepingOwnership.ensure_initial!
-    log = []
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new(log:, tag: :timekeeping)
-    monolith_admission = TimekeepingHandoffFakes::RecordingAdmission.new(log:, tag: :monolith)
-    owners = TimekeepingHandoffFakes.owners(timekeeping:, monolith_admission:)
+  # rubocop:disable Lint/DuplicateMethods
+  context "with a failed rollback admit", :two_tenant_seed, :seeded_without_transaction do
+    let(:calls) { [] }
+    let(:clock) { Struct.new(:now).new(Time.utc(2026, 10, 27, 12)) }
+    let(:report_root) { Pathname(Dir.mktmpdir("handoff-failed-admit")) }
+    let(:admit_delivery_failed) { Class.new(StandardError) }
 
-    Dir.mktmpdir do |report_root|
-      expect do
-        described_class.run(direction: :cutover, owners:, report_root: Pathname(report_root),
-                            observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_close_admission))
-      end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+    let(:timekeeping_store) do
+      log = calls
+      Class.new do
+        attr_reader :loaded, :corrections
+
+        define_method(:initialize) { @log = log; @corrections = []; @next_id = 1 }
+        define_method(:fence_admission) { @log << [:timekeeping, :fence]; nil }
+        define_method(:admit) { |generation:| @log << [:timekeeping, :admit, generation]; nil }
+        def enforces_fence? = true
+        def load_checkpoint(checkpoint) = (@loaded = checkpoint)
+        def export_checkpoint = @loaded
+        def highest_outbox_position = 0
+        def advance_entry_id_sequence(above:) = (@next_id = [@next_id, above + 1].max)
+        def write_correction_snapshots(snapshots:, version:, generation:) = (@corrections = snapshots).size
+      end.new
     end
 
-    # The interrupt must have fired exactly at the named point, not earlier or later.
-    ownership = TimekeepingOwnership.current
-    expect([ownership.generation, ownership.owner, ownership.handoff_step]).to eq([2, "monolith", "close_admission"])
-    expect(monolith_admission.calls).to eq([[:fence]])
-    expect(log).to include([:monolith, :fence])
-    expect(log.select { |call| call[0..1] == [:timekeeping, :admit] }).to be_empty
-    expect(timekeeping.rows.fetch("entries")).to be_empty
-  end
-end
+    # The monolith admission logs every admit call once and is armed to raise on
+    # one call only, so the failure lands exactly where the test arms it.
+    let(:monolith_admission) do
+      log = calls
+      failure = admit_delivery_failed
+      Class.new do
+        attr_accessor :fail_next_admit
 
-# Generated by Descant: acceptance tests below.
-# rubocop:disable Lint/DuplicateMethods
-RSpec.describe Timekeeping::Handoff::Runner, "failed rollback admit", :two_tenant_seed, :seeded_without_transaction do
-  let(:calls) { [] }
-  let(:clock) { Struct.new(:now).new(Time.utc(2026, 10, 27, 12)) }
-  let(:report_root) { Pathname(Dir.mktmpdir("handoff-failed-admit")) }
-  let(:admit_delivery_failed) { Class.new(StandardError) }
-
-  let(:timekeeping_store) do
-    log = calls
-    Class.new do
-      attr_reader :loaded, :corrections
-
-      define_method(:initialize) { @log = log; @corrections = []; @next_id = 1 }
-      define_method(:fence_admission) { @log << [:timekeeping, :fence]; nil }
-      define_method(:admit) { |generation:| @log << [:timekeeping, :admit, generation]; nil }
-      def enforces_fence? = true
-      def load_checkpoint(checkpoint) = (@loaded = checkpoint)
-      def export_checkpoint = @loaded
-      def highest_outbox_position = 0
-      def advance_entry_id_sequence(above:) = (@next_id = [@next_id, above + 1].max)
-      def write_correction_snapshots(snapshots:, version:, generation:) = (@corrections = snapshots).size
-    end.new
-  end
-
-  # The monolith admission logs every admit call once and is armed to raise on
-  # one call only, so the failure lands exactly where the test arms it.
-  let(:monolith_admission) do
-    log = calls
-    failure = admit_delivery_failed
-    Class.new do
-      attr_accessor :fail_next_admit
-
-      define_method(:fence_admission) { log << [:monolith, :fence]; nil }
-      define_method(:admit) do |generation:|
-        log << [:monolith, :admit, generation]
-        if fail_next_admit
-          self.fail_next_admit = false
-          raise failure
+        define_method(:fence_admission) { log << [:monolith, :fence]; nil }
+        define_method(:admit) do |generation:|
+          log << [:monolith, :admit, generation]
+          if fail_next_admit
+            self.fail_next_admit = false
+            raise failure
+          end
+          nil
         end
-        nil
-      end
-      def enforces_fence? = true
-    end.new
-  end
+        def enforces_fence? = true
+      end.new
+    end
 
-  let(:settle) do
-    log = calls
-    Class.new do
-      define_method(:settle!) { |generation:| log << [:settle, generation] }
-      define_method(:stop_applying!) { log << [:stop_applying] }
-      def settled? = true
-    end.new
-  end
+    let(:settle) do
+      log = calls
+      Class.new do
+        define_method(:settle!) { |generation:| log << [:settle, generation] }
+        define_method(:stop_applying!) { log << [:stop_applying] }
+        def settled? = true
+      end.new
+    end
 
-  let(:monolith_store) { Timekeeping::Handoff::MonolithStore.new(connection: ActiveRecord::Base.connection) }
+    let(:owners) do
+      TimekeepingHandoffFakes.owners(timekeeping: timekeeping_store, monolith_admission:, settle:, log: calls)
+    end
 
-  let(:owners) do
-    {
-      "monolith" => Timekeeping::Handoff::Owner.new(
-        name: "monolith", store: monolith_store, admission: monolith_admission, settle:,
-        drain: TimekeepingHandoffFakeRelay.new(store: monolith_store, log: calls)
-      ),
-      "timekeeping" => Timekeeping::Handoff::Owner.new(
-        name: "timekeeping", store: timekeeping_store, admission: timekeeping_store, settle:,
-        drain: TimekeepingHandoffFakeRelay.new(store: timekeeping_store, log: calls)
-      )
-    }
-  end
+    def admit_calls
+      calls.select { |call| call[1] == :admit }
+    end
 
-  def admit_calls
-    calls.select { |call| call[1] == :admit }
-  end
+    it "a rollback whose monolith admit fails once is re-admitted by a fresh run at the unchanged generation with Timekeeping still fenced" do
+      described_class.run(direction: :cutover, owners:, report_root:, clock:)
+      expect(TimekeepingOwnership.current.attributes.slice("generation", "owner", "handoff_step"))
+        .to eq("generation" => 2, "owner" => "timekeeping", "handoff_step" => nil)
 
-  it "a rollback whose monolith admit fails once is re-admitted by a fresh run at the unchanged generation with Timekeeping still fenced" do
-    described_class.run(direction: :cutover, owners:, report_root:, clock:)
-    expect(TimekeepingOwnership.current.attributes.slice("generation", "owner", "handoff_step"))
-      .to eq("generation" => 2, "owner" => "timekeeping", "handoff_step" => nil)
+      calls.clear
+      monolith_admission.fail_next_admit = true
 
-    calls.clear
-    monolith_admission.fail_next_admit = true
+      # "Add a runner example that fails the incoming admission call once, then retries through a fresh runner."
+      expect do
+        described_class.run(direction: :rollback, owners:, report_root:, clock:)
+      end.to raise_error(admit_delivery_failed)
 
-    # "Add a runner example that fails the incoming admission call once, then retries through a fresh runner."
-    expect do
+      # The flip committed before the admit call failed: this is the state the retry must recover.
+      flipped = TimekeepingOwnership.current.attributes.slice("generation", "owner", "handoff_step")
+      expect(flipped).to eq("generation" => 3, "owner" => "monolith", "handoff_step" => nil)
+
+      # A new Runner.run call builds a new runner that reads the row, not the one that raised.
       described_class.run(direction: :rollback, owners:, report_root:, clock:)
-    end.to raise_error(admit_delivery_failed)
 
-    # The flip committed before the admit call failed: this is the state the retry must recover.
-    flipped = TimekeepingOwnership.current.attributes.slice("generation", "owner", "handoff_step")
-    expect(flipped).to eq("generation" => 3, "owner" => "monolith", "handoff_step" => nil)
-
-    # A new Runner.run call builds a new runner that reads the row, not the one that raised.
-    described_class.run(direction: :rollback, owners:, report_root:, clock:)
-
-    # "Assert unchanged generation, admission of only the current owner, and continued fencing of outgoing
-    # Timekeeping after rollback."
-    expect(TimekeepingOwnership.current.attributes.slice("generation", "owner", "handoff_step"))
-      .to eq("generation" => 3, "owner" => "monolith", "handoff_step" => nil)
-    expect(admit_calls).to eq([[:monolith, :admit, 3], [:monolith, :admit, 3]])
-    # The rollback fenced Timekeeping, and no admit at any generation reopened it afterwards.
-    expect(calls).to include([:timekeeping, :fence])
-    expect(calls.select { |call| call[0..1] == [:timekeeping, :admit] }).to be_empty
-    expect(Dir.glob(File.join(report_root, "generation-4"))).to be_empty
-  end
-end
-# rubocop:enable Lint/DuplicateMethods
-
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  it "a flip that finds a settling generation stored ends the handoff with settling_generation NULL" do
-    TimekeepingOwnership.ensure_initial!
-    owners = TimekeepingHandoffFakes.owners(timekeeping: TimekeepingHandoffFakes::InMemoryTimekeepingStore.new,
-                                            settle: nil, relay: false)
-    # Stores a settling generation just before the flip step runs, so only the flip can clear it.
-    observer = lambda do |event, step:|
-      if event == :before_step && step.to_s == "flip"
-        TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(settling_generation: 1)
-      end
+      # "Assert unchanged generation, admission of only the current owner, and continued fencing of outgoing
+      # Timekeeping after rollback."
+      expect(TimekeepingOwnership.current.attributes.slice("generation", "owner", "handoff_step"))
+        .to eq("generation" => 3, "owner" => "monolith", "handoff_step" => nil)
+      expect(admit_calls).to eq([[:monolith, :admit, 3], [:monolith, :admit, 3]])
+      # The rollback fenced Timekeeping, and no admit at any generation reopened it afterwards.
+      expect(calls).to include([:timekeeping, :fence])
+      expect(calls.select { |call| call[0..1] == [:timekeeping, :admit] }).to be_empty
+      expect(Dir.glob(File.join(report_root, "generation-4"))).to be_empty
     end
-
-    Dir.mktmpdir do |report_root|
-      described_class.run(direction: :cutover, owners:, observer:, report_root: Pathname(report_root), clock: Time)
-    end
-
-    ownership = TimekeepingOwnership.current
-    expect(ownership.handoff_step).to be_nil
-    expect(ownership.owner).to eq("timekeeping")
-    # "In lib/timekeeping/handoff/runner.rb, `flip` and `abort_handoff` also set `settling_generation` to NULL, so no handoff ends with a stored settling generation."
-    expect(ownership.settling_generation).to be_nil
-    # The legacy source's stop_applying! does nothing, so the flip alone closed this step and must raise the mark.
-    expect(ownership.settling_stopped_generation).to be >= 1
-
-    # A later handoff is in progress, so only the stop mark can refuse the late begin.
-    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(handoff_step: "settle")
-    TimekeepingOwnership.begin_settling!(generation: 1)
-    expect(TimekeepingOwnership.current.settling_generation).to be_nil
-
-    # The mark is the cleared generation, not higher, so the later handoff's own step still opens.
-    TimekeepingOwnership.begin_settling!(generation: 2)
-    expect(TimekeepingOwnership.current.settling_generation).to eq(2)
-  ensure
-    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)
-      .update_all(settling_generation: nil, settling_stopped_generation: nil, handoff_step: nil)
   end
-end
-
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  it "aborting a handoff with a settling generation stored ends it with settling_generation NULL" do
-    calls = []
-    clock = Struct.new(:now).new(Time.utc(2026, 10, 27, 12))
-    report_root = Pathname(Dir.mktmpdir("handoff-abort-settling"))
-    owners = TimekeepingHandoffFakes.owners(
-      timekeeping: TimekeepingHandoffFakes::InMemoryTimekeepingStore.new(log: calls, tag: :timekeeping),
-      monolith_admission: TimekeepingHandoffFakes::RecordingAdmission.new(log: calls, tag: :monolith),
-      settle: nil, relay: false
-    )
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:, clock:,
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_close_admission))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(settling_generation: 1)
-
-    described_class.run(direction: :cutover, abort: true, owners:, report_root:, clock:)
-
-    ownership = TimekeepingOwnership.current
-    expect(ownership.handoff_step).to be_nil
-    # "In lib/timekeeping/handoff/runner.rb, `flip` and `abort_handoff` also set `settling_generation` to NULL, so no handoff ends with a stored settling generation."
-    expect(ownership.settling_generation).to be_nil
-    # The legacy source's stop_applying! does nothing, so the abort alone closed this step and must raise the mark.
-    expect(ownership.settling_stopped_generation).to be >= 1
-
-    # A later handoff is in progress, so only the stop mark can refuse the late begin.
-    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).update_all(handoff_step: "settle")
-    TimekeepingOwnership.begin_settling!(generation: 1)
-    expect(TimekeepingOwnership.current.settling_generation).to be_nil
-  ensure
-    FileUtils.rm_rf(report_root) if report_root
-    TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID)
-      .update_all(settling_generation: nil, settling_stopped_generation: nil, handoff_step: nil)
-  end
+  # rubocop:enable Lint/DuplicateMethods
 end
