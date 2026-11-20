@@ -607,6 +607,7 @@ RSpec.describe Timekeeping::Handoff::Reconciliation, "check by check" do
     result = recon_checks_run(source_tables: tables, checkpoint_tables: tables)
 
     uncovered = result.companies.fetch(303)
+    expect(uncovered.checks.fetch(:money).map(&:reason)).to include(:snapshot_missing)
     expect(uncovered.unlisted.map(&:reason)).to eq(%i[snapshot_missing snapshot_missing])
     expect(uncovered.checks.values.flatten.map(&:company_id).uniq).to eq([303])
     expect(uncovered).to be_abort
