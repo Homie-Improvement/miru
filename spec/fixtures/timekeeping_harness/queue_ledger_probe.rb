@@ -1,9 +1,11 @@
 # frozen_string_literal: true
 
 # Run by spec/meta/timekeeping_queue_ledger_spec.rb in its own rspec process,
-# with QUEUE_LEDGER_PROBE naming a scenario and TIMEKEEPING_QUEUE_LEDGER_PATH
-# naming a temporary ledger file. Its name does not end in _spec.rb, so a
-# normal suite run never loads it.
+# with QUEUE_LEDGER_PROBE naming a scenario and either
+# TIMEKEEPING_QUEUE_LEDGER_PATH naming a temporary ledger file or
+# TIMEKEEPING_QUEUE_LEDGER_ROOT naming a temporary directory for its numbered
+# default ledger file. Its name does not end in _spec.rb, so a normal suite run
+# never loads it.
 #
 # The example activates the queue ledger the way the integrated runtime does,
 # without starting one, then changes Solid Queue rows. The :without_transaction

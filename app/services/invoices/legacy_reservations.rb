@@ -74,7 +74,7 @@ module Invoices
         entry_ids = lock_entries(request.company_id, request.entries)
         # Selected again after the wait for the row locks, so an entry
         # discarded meanwhile is not billed.
-        billed = TimesheetEntry.kept.where(id: entry_ids).update!(bill_status: :billed)
+        billed = as_legacy_writer { TimesheetEntry.kept.where(id: entry_ids).update!(bill_status: :billed) }
         outcome("committed", counts: { billed: billed.size })
       end
     end
@@ -103,7 +103,16 @@ module Invoices
       end
 
       def set_locked(entry_ids, locked)
-        TimesheetEntry.where(id: entry_ids).update_all(locked:, updated_at: Time.current) if entry_ids.any?
+        return if entry_ids.empty?
+
+        as_legacy_writer { TimesheetEntry.where(id: entry_ids).update_all(locked:, updated_at: Time.current) }
+      end
+
+      # Marks a timesheet_entries write as a legacy write, the same mark the
+      # entry gateway sets, so a database guard admits it while the monolith
+      # owns the entries. A caller's own mark is put back afterwards.
+      def as_legacy_writer(&)
+        Timekeeping::LegacyWriterMark.call(ApplicationRecord.connection, &)
       end
 
       # A successor that takes an entry drops the other invoices' claims that

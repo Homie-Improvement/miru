@@ -777,3 +777,133 @@ RSpec.describe Invoices::LegacyReservations, committed_data: true do
     expect(entry.reload.locked).to be(false)
   end
 end
+
+# "Inside a spec-opened transaction with a caller mark set, prepare, commit (apply_release) and mark_billed each
+# read legacy_gateway during the timesheet_entries write and the caller's mark afterwards"
+RSpec.describe Invoices::LegacyReservations do
+  let(:writer_mark_company) { create(:company) }
+  let(:writer_mark_client) { create(:client, company: writer_mark_company) }
+  let(:writer_mark_project) { create(:project, client: writer_mark_client, billable: true) }
+  let(:writer_mark_user) { create(:user, current_workspace_id: writer_mark_company.id) }
+  let(:writer_mark_invoice) { create(:invoice, company: writer_mark_company, client: writer_mark_client) }
+
+  def writer_mark_entry(**columns)
+    entry = create(:timesheet_entry, user: writer_mark_user, project: writer_mark_project, bill_status: "unbilled")
+    entry.update_columns(columns) if columns.any?
+    entry
+  end
+
+  def writer_mark_request(entries)
+    Invoices::ReservationRequest.new(
+      company_id: writer_mark_company.id, invoice_id: writer_mark_invoice.id, operation_id: SecureRandom.uuid,
+      generation: TimekeepingOwnership.current.generation, disposition: "active", entries:
+    )
+  end
+
+  def writer_mark_current
+    ApplicationRecord.connection.select_value("SELECT current_setting('miru.writer', true)")
+  end
+
+  # Runs the block in a transaction that first sets a caller mark. Returns the
+  # miru.writer values read right after each UPDATE of timesheet_entries, and
+  # the value read after the block, before that transaction ends: a read after
+  # the transaction ends would prove nothing, since SET LOCAL is gone by then.
+  def writer_marks_in_caller_transaction(&)
+    marks = []
+    on_sql = lambda do |*, payload|
+      marks << writer_mark_current if payload[:sql].to_s.start_with?('UPDATE "timesheet_entries"')
+    end
+    seen_after = ApplicationRecord.transaction do
+      ApplicationRecord.connection.execute("SET LOCAL miru.writer = 'caller_mark'")
+      ActiveSupport::Notifications.subscribed(on_sql, "sql.active_record", &)
+      writer_mark_current
+    end
+    [marks, seen_after]
+  end
+
+  it "prepare locks the entry under the legacy_gateway writer mark and puts back the caller's mark" do
+    entry = writer_mark_entry(locked: false)
+    request = writer_mark_request([entry.id])
+    outcome = nil
+
+    marks, seen_after = writer_marks_in_caller_transaction { outcome = described_class.new.prepare(request) }
+
+    expect(outcome.state).to eq("prepared")
+    expect(entry.reload.locked).to be(true)
+    expect(marks).not_to be_empty
+    expect(marks).to all(eq("legacy_gateway"))
+    expect(seen_after).to eq("caller_mark")
+  end
+
+  it "a commit delivered twice in one caller transaction marks only the unlock write and leaves the caller's writer mark after both" do
+    entry = writer_mark_entry(locked: true)
+    request = writer_mark_request([])
+    LegacyEntryRelease.insert(
+      { company_id: writer_mark_company.id, invoice_id: writer_mark_invoice.id, operation_id: request.operation_id,
+        entry_ids: [entry.id], created_at: Time.current }
+    )
+    outcomes = []
+
+    marks, seen_after = writer_marks_in_caller_transaction do
+      2.times { outcomes << described_class.new.commit(request) }
+    end
+
+    expect(outcomes.map(&:state)).to eq(%w[committed committed])
+    expect(entry.reload.locked).to be(false)
+    expect(marks).to eq(["legacy_gateway"])
+    expect(seen_after).to eq("caller_mark")
+  end
+
+  it "mark_billed bills the entry under the legacy_gateway writer mark and puts back the caller's mark" do
+    entry = writer_mark_entry
+    request = writer_mark_request([entry.id])
+    outcome = nil
+
+    marks, seen_after = writer_marks_in_caller_transaction { outcome = described_class.new.mark_billed(request) }
+
+    expect(outcome.state).to eq("committed")
+    expect(outcome.counts).to eq({ billed: 1 })
+    expect(entry.reload.bill_status).to eq("billed")
+    expect(marks).not_to be_empty
+    expect(marks).to all(eq("legacy_gateway"))
+    expect(seen_after).to eq("caller_mark")
+  end
+
+  # "A failing mark_billed raises its own original error and the caller's mark is restored afterwards"
+  # Validation stops update! before any UPDATE runs, so no mark is read during a write here.
+  it "a failing mark_billed raises its own validation error and the caller's writer mark is back afterwards" do
+    entry = writer_mark_entry(duration: -5)
+    request = writer_mark_request([entry.id])
+    raised = nil
+
+    _marks, seen_after = writer_marks_in_caller_transaction do
+      described_class.new.mark_billed(request)
+    rescue ActiveRecord::RecordInvalid => error
+      raised = error
+    end
+
+    expect(raised).to be_a(ActiveRecord::RecordInvalid)
+    expect(seen_after).to eq("caller_mark")
+    expect(entry.reload.bill_status).to eq("unbilled")
+  end
+
+  # "A failing mark_billed raises its own original error and the caller's mark is restored afterwards"
+  it "mark_billed that fails on its second entry after billing the first raises RecordInvalid and puts back the caller's writer mark" do
+    valid_entry = writer_mark_entry
+    invalid_entry = writer_mark_entry(duration: -5)
+    request = writer_mark_request([valid_entry.id, invalid_entry.id])
+    raised = nil
+
+    marks, seen_after = writer_marks_in_caller_transaction do
+      described_class.new.mark_billed(request)
+    rescue ActiveRecord::RecordInvalid => error
+      raised = error
+    end
+
+    expect(raised).to be_a(ActiveRecord::RecordInvalid)
+    expect(raised.record.id).to eq(invalid_entry.id)
+    # The first entry's billed update ran under the mark before the second entry failed validation.
+    expect(marks).to eq(["legacy_gateway"])
+    expect(seen_after).to eq("caller_mark")
+  end
+end
