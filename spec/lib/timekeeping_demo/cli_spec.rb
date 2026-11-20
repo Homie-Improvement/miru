@@ -474,6 +474,8 @@ RSpec.describe TimekeepingDemo::CLI do
     calls = []
     runner = lambda do |env:, argv:|
       calls << { env:, argv: }
+      # The report pass must leave a readable json report for the run to pass.
+      File.write(argv[argv.index("--out") + 1], JSON.generate("examples" => [])) if argv.include?("switches_owner")
       true
     end
     supervisor = double("timekeeping demo supervisor")
