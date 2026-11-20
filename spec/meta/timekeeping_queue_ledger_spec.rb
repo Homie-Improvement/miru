@@ -722,58 +722,18 @@ RSpec.describe "Timekeeping queue ledger per-process path" do
   end
 end
 
-RSpec.describe "Timekeeping queue ledger root refusal" do
+RSpec.describe "Timekeeping queue ledger private root" do
   # The suite-start hook deletes the resolved path, so a root that depends on the
   # working directory must be refused rather than turned into a path.
   it "ledger_path refuses a relative TIMEKEEPING_QUEUE_LEDGER_ROOT instead of building a deletable path from it" do
-    ["relative/dir", "tmp", "../outside"].each do |value|
+    ["relative/dir", "tmp", ".", "../outside"].each do |value|
       env = { "TIMEKEEPING_QUEUE_LEDGER_ROOT" => value, "TEST_ENV_NUMBER" => "97" }
 
       expect { TimekeepingQueueLedger.ledger_path(env) }
         .to raise_error(ArgumentError, /#{Regexp.escape(value)}/)
     end
   end
-end
 
-RSpec.describe "Timekeeping queue ledger private root path" do
-  # "The per-process file-operation example and the live per-process probe write and delete ledger files only under a private temporary root, never at tmp/timekeeping-integration/queue_ledger.N.json, so a bin/parallel_test run with -n 99 shares no ledger file with either test."
-  it "ledger_path places process 99's default ledger file under a private root and never at the worker path" do
-    Dir.mktmpdir("queue-ledger-root") do |dir|
-      env = { "TIMEKEEPING_QUEUE_LEDGER_ROOT" => dir, "TEST_ENV_NUMBER" => "99" }
-      worker_path = Rails.root.join("tmp/timekeeping-integration/queue_ledger.99.json").to_s
-
-      resolved = TimekeepingQueueLedger.ledger_path(env)
-
-      expect(resolved).to eq(File.join(dir, "tmp/timekeeping-integration/queue_ledger.99.json"))
-      expect(File.expand_path(resolved)).to start_with("#{File.expand_path(dir)}/")
-      expect(resolved).not_to eq(worker_path)
-      expect(TimekeepingQueueLedger.build_session(env).path).to eq(resolved)
-    end
-  end
-end
-
-RSpec.describe "Timekeeping queue ledger root precedence" do
-  it "an explicit TIMEKEEPING_QUEUE_LEDGER_PATH still wins over a TIMEKEEPING_QUEUE_LEDGER_ROOT and a blank root keeps Rails.root" do
-    Dir.mktmpdir("queue-ledger-root") do |dir|
-      explicit = File.join(dir, "explicit_ledger.json")
-      env = { "TIMEKEEPING_QUEUE_LEDGER_PATH" => explicit, "TIMEKEEPING_QUEUE_LEDGER_ROOT" => dir,
-              "TEST_ENV_NUMBER" => "2" }
-
-      expect(TimekeepingQueueLedger.ledger_path(env)).to eq(explicit)
-    end
-
-    default_two = Rails.root.join("tmp/timekeeping-integration/queue_ledger.2.json").to_s
-    ["", "  "].each do |blank|
-      env = { "TIMEKEEPING_QUEUE_LEDGER_ROOT" => blank, "TEST_ENV_NUMBER" => "2" }
-      expect(TimekeepingQueueLedger.ledger_path(env)).to eq(default_two)
-    end
-  end
-end
-
-require "rails_helper"
-require "tmpdir"
-
-RSpec.describe "Timekeeping queue ledger private root" do
   # "The per-process file-operation example and the live per-process probe write and delete ledger files only under a private temporary root, never at tmp/timekeeping-integration/queue_ledger.N.json, so a bin/parallel_test run with -n 99 shares no ledger file with either test."
   it "ledger_path puts a numbered default ledger file under TIMEKEEPING_QUEUE_LEDGER_ROOT instead of Rails.root" do
     Dir.mktmpdir("queue-ledger-root") do |dir|
@@ -791,12 +751,7 @@ RSpec.describe "Timekeeping queue ledger private root" do
       expect(resolved).not_to start_with(Rails.root.to_s)
     end
   end
-end
 
-require "rails_helper"
-require "tmpdir"
-
-RSpec.describe "Timekeeping queue ledger private root" do
   it "ledger_path keeps Rails.root for an empty or blank TIMEKEEPING_QUEUE_LEDGER_ROOT and lets an explicit ledger path win over a root" do
     default = Rails.root.join("tmp/timekeeping-integration/queue_ledger.2.json").to_s
 
@@ -812,24 +767,7 @@ RSpec.describe "Timekeeping queue ledger private root" do
       expect(TimekeepingQueueLedger.ledger_path(env)).to eq(explicit)
     end
   end
-end
 
-require "rails_helper"
-
-RSpec.describe "Timekeeping queue ledger private root" do
-  # The suite-start hook deletes the resolved path, so a root that depends on the working directory is refused.
-  it "ledger_path refuses a relative TIMEKEEPING_QUEUE_LEDGER_ROOT instead of resolving it against the working directory" do
-    expect do
-      TimekeepingQueueLedger.ledger_path({ "TIMEKEEPING_QUEUE_LEDGER_ROOT" => "relative/dir", "TEST_ENV_NUMBER" => "2" })
-    end.to raise_error(ArgumentError, %r{relative/dir})
-  end
-end
-
-require "rails_helper"
-require "json"
-require "tmpdir"
-
-RSpec.describe "Timekeeping queue ledger private root" do
   # "The per-process file-operation example and the live per-process probe write and delete ledger files only under a private temporary root, never at tmp/timekeeping-integration/queue_ledger.N.json, so a bin/parallel_test run with -n 99 shares no ledger file with either test."
   it "under a private root the second process's suite-start delete leaves the first process's numbered ledger file byte for byte unchanged" do
     Dir.mktmpdir("queue-ledger-root") do |dir|
@@ -851,14 +789,41 @@ RSpec.describe "Timekeeping queue ledger private root" do
       expect(File.binread(first.path)).to eq(contents.b)
     end
   end
+
+  # "The per-process file-operation example and the live per-process probe write and delete ledger files only under a private temporary root, never at tmp/timekeeping-integration/queue_ledger.N.json, so a bin/parallel_test run with -n 99 shares no ledger file with either test."
+  it "a private ledger root keeps the per-process number and never resolves to a worker path under Rails.root" do
+    Dir.mktmpdir("queue-ledger-root") do |dir|
+      worker_dir = Rails.root.join("tmp/timekeeping-integration").to_s
+      paths = %w[96 97 98 99].index_with do |number|
+        TimekeepingQueueLedger.ledger_path({ "TIMEKEEPING_QUEUE_LEDGER_ROOT" => dir, "TEST_ENV_NUMBER" => number })
+      end
+
+      paths.each do |number, path|
+        expect(path).to eq(File.join(dir, "tmp/timekeeping-integration", "queue_ledger.#{number}.json"))
+        expect(path).not_to start_with(worker_dir)
+      end
+      expect(paths.values.uniq.size).to eq(4)
+
+      session = TimekeepingQueueLedger.build_session({ "TIMEKEEPING_QUEUE_LEDGER_ROOT" => dir, "TEST_ENV_NUMBER" => "99" })
+      expect(session.path).to eq(paths.fetch("99"))
+    end
+  end
+
+  # A root must not become a way around the process-number check: "../x" would
+  # otherwise climb out of the private root toward another process's file.
+  it "a malformed process number is still refused when a private ledger root is set" do
+    Dir.mktmpdir("queue-ledger-root") do |dir|
+      ["../evil", "0", "2/../../x"].each do |value|
+        env = { "TIMEKEEPING_QUEUE_LEDGER_ROOT" => dir, "TEST_ENV_NUMBER" => value }
+
+        expect { TimekeepingQueueLedger.ledger_path(env) }
+          .to raise_error(ArgumentError, /#{Regexp.escape(value)}/)
+      end
+    end
+  end
 end
 
-require "rails_helper"
-require "json"
-require "open3"
-require "tmpdir"
-
-RSpec.describe "Timekeeping queue ledger private root", :without_transaction do
+RSpec.describe "Timekeeping queue ledger private root probe", :without_transaction do
   # "The per-process file-operation example and the live per-process probe write and delete ledger files only under a private temporary root, never at tmp/timekeeping-integration/queue_ledger.N.json, so a bin/parallel_test run with -n 99 shares no ledger file with either test."
   it "a probe child given a private root writes its numbered default ledger there and leaves the parent's private file byte for byte unchanged" do
     skip "set TIMEKEEPING_LIVE=1 to run the queue ledger probes" unless ENV["TIMEKEEPING_LIVE"] == "1"
@@ -875,6 +840,8 @@ RSpec.describe "Timekeeping queue ledger private root", :without_transaction do
                         "finished_at" => "2026-01-01T00:00:01Z" }],
         "controls" => []
       )
+      # config/database.yml names the database from TEST_ENV_NUMBER unless DATABASE_URL is present,
+      # so the child keeps this run's prepared database while its process number changes.
       database_url = ENV["DATABASE_URL"].presence ||
                      "postgresql:///#{ActiveRecord::Base.connection_db_config.database}"
       probe = Rails.root.join("spec/fixtures/timekeeping_harness/queue_ledger_probe.rb").to_s
@@ -893,80 +860,6 @@ RSpec.describe "Timekeeping queue ledger private root", :without_transaction do
       expect(File.binread(parent_path)).to eq(violation.b)
       # A child that ignored the root would have written under Rails.root and left this file absent.
       expect(File.exist?(child_path)).to be(true)
-    end
-  end
-end
-
-RSpec.describe "Timekeeping queue ledger root redirection" do
-  # The suite-start hook deletes the resolved path, so a root that depends on the
-  # current directory could name a real worker file under Rails.root.
-  it "a relative ledger root is refused instead of resolving against the working directory" do
-    ["relative/dir", ".", "tmp"].each do |root|
-      env = { "TIMEKEEPING_QUEUE_LEDGER_ROOT" => root, "TEST_ENV_NUMBER" => "99" }
-
-      expect { TimekeepingQueueLedger.ledger_path(env) }
-        .to raise_error(ArgumentError, /#{Regexp.escape(root)}/)
-    end
-  end
-end
-
-RSpec.describe "Timekeeping queue ledger root redirection" do
-  # "The per-process file-operation example and the live per-process probe write and delete ledger files only under a private temporary root, never at tmp/timekeeping-integration/queue_ledger.N.json, so a bin/parallel_test run with -n 99 shares no ledger file with either test."
-  it "a private ledger root keeps the per-process number and never resolves to a worker path under Rails.root" do
-    Dir.mktmpdir("queue-ledger-root") do |dir|
-      worker_dir = Rails.root.join("tmp/timekeeping-integration").to_s
-      paths = %w[96 97 98 99].to_h do |number|
-        [number, TimekeepingQueueLedger.ledger_path({ "TIMEKEEPING_QUEUE_LEDGER_ROOT" => dir, "TEST_ENV_NUMBER" => number })]
-      end
-
-      paths.each do |number, path|
-        expect(path).to eq(File.join(dir, "tmp/timekeeping-integration", "queue_ledger.#{number}.json"))
-        expect(path).not_to start_with(worker_dir)
-        expect(path).not_to eq(Rails.root.join("tmp/timekeeping-integration/queue_ledger.#{number}.json").to_s)
-      end
-      expect(paths.values.uniq.size).to eq(4)
-      expect(TimekeepingQueueLedger.ROOT_KEY).to eq("TIMEKEEPING_QUEUE_LEDGER_ROOT") if TimekeepingQueueLedger.respond_to?(:ROOT_KEY)
-      expect(TimekeepingQueueLedger::ROOT_KEY).to eq("TIMEKEEPING_QUEUE_LEDGER_ROOT")
-    end
-  end
-end
-
-RSpec.describe "Timekeeping queue ledger root redirection" do
-  # A root must not become a way around the process-number check: "../x" would
-  # otherwise climb out of the private root toward another process's file.
-  it "a malformed process number is still refused when a private ledger root is set" do
-    Dir.mktmpdir("queue-ledger-root") do |dir|
-      ["../evil", "0", "2/../../x"].each do |value|
-        env = { "TIMEKEEPING_QUEUE_LEDGER_ROOT" => dir, "TEST_ENV_NUMBER" => value }
-
-        expect { TimekeepingQueueLedger.ledger_path(env) }
-          .to raise_error(ArgumentError, /#{Regexp.escape(value)}/)
-      end
-    end
-  end
-end
-
-RSpec.describe "Timekeeping queue ledger root redirection" do
-  # "The per-process file-operation example and the live per-process probe write and delete ledger files only under a private temporary root, never at tmp/timekeeping-integration/queue_ledger.N.json, so a bin/parallel_test run with -n 99 shares no ledger file with either test."
-  it "deleting process 96's ledger under a private root leaves process 97's private file intact and creates nothing at worker paths" do
-    Dir.mktmpdir("queue-ledger-root") do |dir|
-      first = TimekeepingQueueLedger.build_session({ "TIMEKEEPING_QUEUE_LEDGER_ROOT" => dir, "TEST_ENV_NUMBER" => "97" })
-      second = TimekeepingQueueLedger.build_session({ "TIMEKEEPING_QUEUE_LEDGER_ROOT" => dir, "TEST_ENV_NUMBER" => "96" })
-      contents = JSON.generate("records" => [], "controls" => [], "marker" => "process-97")
-
-      expect(first.path).to start_with(File.join(dir, ""))
-      expect(second.path).to start_with(File.join(dir, ""))
-      expect(File.basename(first.path)).to eq("queue_ledger.97.json")
-      expect(File.basename(second.path)).to eq("queue_ledger.96.json")
-      expect(File.dirname(first.path)).to eq(File.dirname(second.path))
-
-      FileUtils.mkdir_p(File.dirname(first.path))
-      File.write(first.path, contents)
-      File.write(second.path, contents)
-      FileUtils.rm_f(second.path)
-
-      expect(File.exist?(second.path)).to be(false)
-      expect(File.binread(first.path)).to eq(contents.b)
     end
   end
 end
