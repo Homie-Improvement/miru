@@ -318,29 +318,13 @@ RSpec.describe Timekeeping::Handoff::Runner do
     expect(after).to eq(before)
   end
 
-  # rubocop:disable Lint/DuplicateMethods
   context "with a failed rollback admit", :two_tenant_seed, :seeded_without_transaction do
     let(:calls) { [] }
     let(:clock) { Struct.new(:now).new(Time.utc(2026, 10, 27, 12)) }
     let(:report_root) { Pathname(Dir.mktmpdir("handoff-failed-admit")) }
     let(:admit_delivery_failed) { Class.new(StandardError) }
 
-    let(:timekeeping_store) do
-      log = calls
-      Class.new do
-        attr_reader :loaded, :corrections
-
-        define_method(:initialize) { @log = log; @corrections = []; @next_id = 1 }
-        define_method(:fence_admission) { @log << [:timekeeping, :fence]; nil }
-        define_method(:admit) { |generation:| @log << [:timekeeping, :admit, generation]; nil }
-        def enforces_fence? = true
-        def load_checkpoint(checkpoint) = (@loaded = checkpoint)
-        def export_checkpoint = @loaded
-        def highest_outbox_position = 0
-        def advance_entry_id_sequence(above:) = (@next_id = [@next_id, above + 1].max)
-        def write_correction_snapshots(snapshots:, version:, generation:) = (@corrections = snapshots).size
-      end.new
-    end
+    let(:timekeeping_store) { TimekeepingHandoffFakes::InMemoryTimekeepingStore.new(log: calls, tag: :timekeeping) }
 
     # The monolith admission logs every admit call once and is armed to raise on
     # one call only, so the failure lands exactly where the test arms it.
@@ -403,5 +387,4 @@ RSpec.describe Timekeeping::Handoff::Runner do
       expect(Dir.glob(File.join(report_root, "generation-4"))).to be_empty
     end
   end
-  # rubocop:enable Lint/DuplicateMethods
 end
