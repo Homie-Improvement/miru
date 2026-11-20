@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "rails_helper"
 
 RSpec.describe "relay_local_entries_to_projection" do
@@ -38,8 +40,6 @@ RSpec.describe "relay_local_entries_to_projection" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "relay_local_entries_to_projection" do
   it "relay_local_entries_to_projection raises only for the company whose outbox row stays unsent" do
     TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
@@ -78,8 +78,6 @@ RSpec.describe "relay_local_entries_to_projection" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping projection relay helper" do
   it "relay_local_entries_to_projection delivers a prepared-store entry with its multi-line note and marks the outbox sent", owner_state: "rollback" do
     TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
@@ -111,8 +109,6 @@ RSpec.describe "Timekeeping projection relay helper" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Timekeeping projection relay helper" do
   it "relay_local_entries_to_projection makes no relay call when the legacy store owns entries", owner_state: "legacy" do
     company = create(:company)
@@ -123,8 +119,6 @@ RSpec.describe "Timekeeping projection relay helper" do
     expect(Timekeeping::RelayJob).not_to have_received(:perform_now)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "relay_local_entries_to_projection" do
   it "relay helper raises when the generation moved after the write instead of leaving the row silently missing" do
@@ -151,8 +145,6 @@ RSpec.describe "relay_local_entries_to_projection" do
     expect(Timekeeping::LocalOutboxEntry.where(company_id: company.id, sent_at: nil)).to exist
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "relay_local_entries_to_projection" do
   it "relay helper delivers its own company and does not raise for another company's refused outbox row" do
