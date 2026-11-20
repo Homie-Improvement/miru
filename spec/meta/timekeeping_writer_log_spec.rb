@@ -468,3 +468,64 @@ RSpec.describe TimekeepingWriterLog do
     end
   end
 end
+
+RSpec.describe "TimekeepingWriterLog empty writer stored as NULL", committed_data: true do
+  # "either the function stores current_setting('miru.writer', true) without NULLIF, or the plan is changed to allow turning '' into NULL."
+  # The record function turns '' into NULL: '' and NULL both mean no writer marked this write, so the log stores
+  # NULL for both. See the comment above TimekeepingWriterLog::CREATE_LOG_TABLE_SQL.
+  it "stores NULL, not '', for an unmarked write on a session whose earlier SET LOCAL mark has ended, and still flags it in every state" do
+    connection = ActiveRecord::Base.connection
+    entry = create(:timesheet_entry)
+    company_id = entry.reload.company_id
+    fresh = nil
+    begin
+      TimekeepingWriterLog.install!(connection)
+
+      # Build the '' state on a connection no other example has touched.
+      fresh = ActiveRecord::Base.connection_pool.db_config.new_connection
+      fresh.execute("BEGIN")
+      fresh.execute("SET LOCAL miru.writer = 'projection'")
+      fresh.execute("COMMIT")
+      expect(fresh.select_value("SELECT current_setting('miru.writer', true)")).to eq("")
+
+      fresh.execute("UPDATE timesheet_entries SET note = 'unmarked' WHERE id = #{entry.id}")
+
+      logged = TimekeepingWriterLog.rows(connection)
+      expect(logged).to eq([{ writer: nil, company_id:, op: "UPDATE" }])
+
+      %w[legacy timekeeping rollback].each do |state|
+        expect(TimekeepingWriterLog.violations(state:, rows: logged)).to eq(logged)
+      end
+    ensure
+      fresh&.disconnect!
+      TimekeepingWriterLog.remove!(connection)
+    end
+  end
+end
+
+RSpec.describe "TimekeepingWriterLog empty writer restored mid-transaction", committed_data: true do
+  # "either the function stores current_setting('miru.writer', true) without NULLIF, or the plan is changed to allow turning '' into NULL."
+  # A legacy-gateway write puts a NULL mark back as '' with set_config(..., true); a later unmarked write in the
+  # same transaction must still be logged as NULL.
+  it "logs NULL for an unmarked write made after a mark is restored to '' inside the same transaction" do
+    connection = ActiveRecord::Base.connection
+    entry = create(:timesheet_entry)
+    fresh = nil
+    begin
+      TimekeepingWriterLog.install!(connection)
+
+      fresh = ActiveRecord::Base.connection_pool.db_config.new_connection
+      fresh.execute("BEGIN")
+      fresh.execute("SELECT set_config('miru.writer', 'legacy_gateway', true)")
+      fresh.execute("UPDATE timesheet_entries SET note = 'marked' WHERE id = #{entry.id}")
+      fresh.execute("SELECT set_config('miru.writer', '', true)")
+      fresh.execute("UPDATE timesheet_entries SET note = 'unmarked' WHERE id = #{entry.id}")
+      fresh.execute("COMMIT")
+
+      expect(TimekeepingWriterLog.rows(connection).pluck(:writer)).to eq(["legacy_gateway", nil])
+    ensure
+      fresh&.disconnect!
+      TimekeepingWriterLog.remove!(connection)
+    end
+  end
+end

@@ -41,9 +41,12 @@ module TimekeepingWriterLog
   # None of this belongs in db/migrate or db/schema.rb: it lives only while a
   # guard runs.
   #
-  # The function stores NULL for an unmarked write. A pooled session that once
-  # ran SET LOCAL miru.writer reads '' afterwards rather than NULL, and both
-  # mean the same thing: no writer marked this write.
+  # The function stores current_setting('miru.writer', true) with '' turned
+  # into NULL, on purpose, so an unmarked write always logs NULL. A session
+  # reads '' rather than NULL after a SET LOCAL miru.writer has ended, or after
+  # Timekeeping::LegacyWriterMark puts a NULL mark back with set_config. Both
+  # mean the same thing: no writer marked this write. Storing one value keeps
+  # an unmarked write's logged writer the same whatever the session ran before.
   CREATE_LOG_TABLE_SQL = <<~SQL
     CREATE UNLOGGED TABLE IF NOT EXISTS public.miru_writer_log (
       id bigserial PRIMARY KEY,
