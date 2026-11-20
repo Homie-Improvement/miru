@@ -671,8 +671,16 @@ RSpec.describe "CI spec coverage in validations.yml" do
         end
       end
 
-      push_context = { "workflow" => workflow.fetch("name"), "event_name" => "push", "ref_name" => "feature/x", "head_ref" => "" }
-      pull_request_context = { "workflow" => workflow.fetch("name"), "event_name" => "pull_request", "ref_name" => "12/merge", "head_ref" => "feature/x" }
+      push_context = {
+        "workflow" => workflow.fetch("name"), "event_name" => "push", "ref_name" => "feature/x", "head_ref" => "",
+        "sha" => "1111111", "run_id" => "101"
+      }
+      # A later push to the same branch differs only in its commit and run.
+      newer_push_context = push_context.merge("sha" => "2222222", "run_id" => "102")
+      pull_request_context = {
+        "workflow" => workflow.fetch("name"), "event_name" => "pull_request", "ref_name" => "12/merge", "head_ref" => "feature/x",
+        "sha" => "3333333", "run_id" => "103"
+      }
 
       live_job = workflow.fetch("jobs").fetch("timekeeping-alerts-live")
       [workflow["concurrency"], live_job["concurrency"]].compact.each do |concurrency|
@@ -682,7 +690,7 @@ RSpec.describe "CI spec coverage in validations.yml" do
         group = settings.fetch("group")
         expect(resolve_group.call(group, push_context)).not_to eq(resolve_group.call(group, pull_request_context))
         # A newer push to the same branch still cancels the older one.
-        expect(resolve_group.call(group, push_context)).to eq(resolve_group.call(group, push_context.dup))
+        expect(resolve_group.call(group, push_context)).to eq(resolve_group.call(group, newer_push_context))
       end
     end
   end
