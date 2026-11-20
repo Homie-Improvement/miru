@@ -200,7 +200,9 @@ module Timekeeping
         updates = columns.reject { |column| column == connection.quote_column_name("id") }
           .map { |column| "#{column} = EXCLUDED.#{column}" }
 
-        <<~SQL.squish
+        # Not squished: the values are already quoted into the text, and
+        # squish would collapse line breaks and spaces inside them.
+        <<~SQL
           INSERT INTO timesheet_entries (#{columns.join(", ")}) VALUES (#{values.join(", ")})
           ON CONFLICT (id) DO UPDATE SET #{updates.join(", ")}
           WHERE timesheet_entries.version < EXCLUDED.version

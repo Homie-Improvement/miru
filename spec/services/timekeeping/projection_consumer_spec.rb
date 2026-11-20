@@ -278,6 +278,159 @@ RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
       expect(rules_row(91_010)).to be_nil
     end
   end
+
+  context "more tests 10", "snapshot rules" do
+  it "stores a multi-line note shaped like SQL exactly as sent and leaves other companies' rows untouched" do
+    other_company = create(:company)
+    other_project = create(:project, client: create(:client, company: other_company))
+    bystander = create(:timesheet_entry, project: other_project, user: create(:user), note: "bystander")
+    bystander_before = bystander.reload.attributes
+
+    # A note is text a user typed, so it must reach timesheet_entries as data: quoted, never read as SQL,
+    # and with its line breaks and repeated spaces kept.
+    hostile_note = "it's C:\\temp\\\n');  DELETE FROM timesheet_entries; --\n  UPDATE timesheet_entries SET note = 'x'"
+
+    result = described_class.call(batch: rules_batch(rules_entry(id: 91_901, version: 1, note: hostile_note)),
+                                  idempotency_key: SecureRandom.uuid)
+
+    expect([result.status, result.body]).to eq(rules_applied)
+    expect(rules_row(91_901)).to include("note" => hostile_note, "company_id" => rules_company.id)
+    expect(bystander.reload.attributes).to eq(bystander_before)
+  end
+  end
+
+  context "more tests 11", "snapshot rules" do
+  it "keeps quotes, tabs and carriage returns in a relayed note byte for byte on a redelivery with the same key" do
+    note = "O'Brien\t\tsaid \"done\"\r\n  ''  twice"
+    batch = rules_batch(rules_entry(id: 91_902, version: 1, note:))
+    key = SecureRandom.uuid
+
+    first = described_class.call(batch:, idempotency_key: key)
+    again = described_class.call(batch:, idempotency_key: key)
+
+    expect(first.status).to eq(200)
+    expect(again.status).to eq(200)
+    expect(TimesheetEntry.unscoped.where(id: 91_902).count).to eq(1)
+    expect(rules_row(91_902)["note"]).to eq(note)
+    expect(rules_row(91_902)["note"].bytes).to eq(note.bytes)
+  end
+  end
+
+  context "more tests 12", "snapshot rules" do
+  context "when a note holds whitespace and quote characters" do
+    it "stores a relayed note with line breaks, repeated spaces, a tab, a quote and a backslash exactly as sent" do
+      multi_line_note = "Programming - Built landing\nand tests"
+      spaced_note = "Client's  review\tof  C:\\reports  \n\n  done"
+
+      expect(rules_deliver(rules_entry(id: 91_901, version: 1, note: multi_line_note))).to eq(rules_applied)
+      expect(rules_deliver(rules_entry(id: 91_902, version: 1, note: spaced_note))).to eq(rules_applied)
+
+      expect(TimesheetEntry.unscoped.find(91_901).note).to eq(multi_line_note)
+      expect(TimesheetEntry.unscoped.find(91_902).note).to eq(spaced_note)
+      expect(rules_row(91_902)).to include("company_id" => rules_company.id, "version" => 1)
+    end
+  end
+  end
+
+  context "more tests 13", "snapshot rules" do
+  context "when the relay resends a delivered batch" do
+    it "a resent batch with the same Idempotency-Key leaves one row holding the multi-line note unchanged" do
+      note = "Programming - Built landing\nand tests"
+      batch = rules_batch(rules_entry(id: 91_903, version: 1, note:))
+      key = SecureRandom.uuid
+
+      first = described_class.call(batch:, idempotency_key: key)
+      stored = rules_row(91_903)
+      second = described_class.call(batch:, idempotency_key: key)
+
+      expect(first.status).to eq(200)
+      expect(second.status).to eq(200)
+      expect(TimesheetEntry.unscoped.where(id: 91_903).count).to eq(1)
+      expect(TimesheetEntry.unscoped.find(91_903).note).to eq(note)
+      expect(rules_row(91_903)).to eq(stored)
+    end
+  end
+  end
+
+  context "more tests 14", "snapshot rules" do
+  it "stores a delivered note with a line break exactly as sent" do
+    note = "Programming - Built landing\nand tests"
+
+    expect(rules_deliver(rules_entry(id: 91_501, version: 1, note:))).to eq(rules_applied)
+
+    expect(rules_row(91_501)["note"]).to eq(note)
+  end
+  end
+
+  context "more tests 15", "snapshot rules" do
+  it "stores a note with repeated spaces, a tab, a quote and a backslash byte for byte" do
+    # The quote and backslash check that the values stay escaped; the spaces and tab check none are collapsed.
+    note = "two  spaces,\ttab, O'Brien's \\path\\  end  "
+
+    expect(rules_deliver(rules_entry(id: 91_502, version: 1, note:))).to eq(rules_applied)
+
+    expect(rules_row(91_502)["note"]).to eq(note)
+    expect(rules_row(91_502)["note"].bytes).to eq(note.bytes)
+  end
+  end
+
+  context "more tests 16", "snapshot rules" do
+  it "redelivering a multi-line note batch with the same key keeps one row with the note unchanged" do
+    note = "first line\n\nthird  line"
+    batch = rules_batch(rules_entry(id: 91_503, version: 1, note:))
+    key = SecureRandom.uuid
+
+    first = described_class.call(batch:, idempotency_key: key)
+    second = described_class.call(batch:, idempotency_key: key)
+
+    expect(first.status).to eq(200)
+    expect(second.status).to eq(200)
+    expect(TimesheetEntry.unscoped.where(id: 91_503).count).to eq(1)
+    expect(rules_row(91_503)).to include("note" => note, "company_id" => rules_company.id, "version" => 1)
+  end
+  end
+
+  context "more tests 17", "snapshot rules" do
+  it "stores a hostile note with line breaks, runs of spaces, a tab, quotes and a backslash byte for byte" do
+    # The upsert puts quoted values into its SQL text, so a note shaped like SQL must still be stored as plain text.
+    note = "Programming - Built landing\nand tests  two\tspaces 'quoted' \\ back'); DELETE FROM timesheet_entries; --"
+    other = rules_entry(id: 91_901, version: 1, note: "bystander")
+    expect(rules_deliver(other)).to eq(rules_applied)
+
+    expect(rules_deliver(rules_entry(id: 91_902, version: 1, note:))).to eq(rules_applied)
+
+    expect(rules_row(91_902)["note"]).to eq(note)
+    expect(rules_row(91_901)).to include("note" => "bystander", "company_id" => rules_company.id)
+  end
+  end
+
+  context "more tests 18", "snapshot rules" do
+  it "a batch with a multi-line note delivered twice under one Idempotency-Key leaves one row with the note unchanged" do
+    # The relay re-sends a batch with the same body and key, so a redelivery must neither add a row nor alter the note.
+    note = "Programming - Built landing\nand tests"
+    batch = rules_batch(rules_entry(id: 91_911, version: 1, note:))
+    key = SecureRandom.uuid
+
+    first = described_class.call(batch:, idempotency_key: key)
+    second = described_class.call(batch:, idempotency_key: key)
+
+    expect(first.status).to eq(200)
+    expect(second.status).to eq(200)
+    expect(ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM timesheet_entries WHERE id = 91911"))
+      .to eq(1)
+    expect(rules_row(91_911)).to include("note" => note, "version" => 1, "company_id" => rules_company.id)
+  end
+  end
+
+  context "more tests 19", "snapshot rules" do
+  it "an update snapshot whose note differs from the stored note only in whitespace replaces it exactly" do
+    # The UPDATE half of the upsert must keep whitespace too, not only the INSERT half.
+    expect(rules_deliver(rules_entry(id: 91_921, version: 1, note: "a b"))).to eq(rules_applied)
+    expect(rules_deliver(rules_entry(id: 91_921, version: 2, note: "a  \n  b"))).to eq(rules_applied)
+
+    expect(rules_row(91_921)).to include("note" => "a  \n  b", "version" => 2)
+  end
+  end
 end
 
 RSpec.describe Timekeeping::ProjectionConsumer, "references of applying snapshots" do
