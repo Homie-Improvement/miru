@@ -247,3 +247,93 @@ RSpec.describe "forwarded Timekeeping setup helpers in the legacy state" do
     expect(legacy_fake.generation).to eq(1)
   end
 end
+
+RSpec.describe "forwarded Timekeeping readers with the live adapter running" do
+  let(:reader_live) { double("live adapter instance", base_url: "http://127.0.0.1:4999") }
+  let(:reader_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+  let(:reader_entries_url) { "http://127.0.0.1:4999/v1/companies/7/entries" }
+
+  before do
+    allow(TimekeepingRegressionAdapter).to receive(:current).and_return(reader_live)
+    stub_request(:any, %r{\Ahttp://(127\.0\.0\.1:4999|127\.0\.0\.1:4998)/}).to_return(status: 200, body: "{}")
+  end
+
+  def send_reader_request(request_class, url, key: nil, body: nil)
+    uri = URI(url)
+    request = request_class.new(uri)
+    request["Idempotency-Key"] = key if key
+    request.body = JSON.generate(body) if body
+    Net::HTTP.start(uri.host, uri.port) { |http| http.request(request) }
+  end
+
+  it "records every entry request sent to the live app, in order, and shows only the creates as creates" do
+    send_reader_request(Net::HTTP::Post, reader_entries_url, key: "k1", body: { "note" => "a" })
+    send_reader_request(Net::HTTP::Patch, "#{reader_entries_url}/12", key: "k2", body: { "note" => "b" })
+
+    expect(forwarded_timekeeping_requests(reader_fake)).to eq(
+      [
+        { method: "POST", idempotency_key: "k1", body: { "note" => "a" } },
+        { method: "PATCH", idempotency_key: "k2", body: { "note" => "b" } }
+      ]
+    )
+    expect(forwarded_create_requests(reader_fake)).to eq([{ method: "POST", idempotency_key: "k1", body: { "note" => "a" } }])
+    # The fake is not read while the live app owns the connection.
+    expect(reader_fake.requests).to be_empty
+  end
+
+  # This example runs after the one above, which left two requests in the log.
+  it "starts each example with an empty log, records identical creates twice and every path on the live app, and leaves out other addresses" do
+    expect(forwarded_timekeeping_requests(reader_fake)).to eq([])
+
+    2.times { send_reader_request(Net::HTTP::Post, reader_entries_url, key: "k1", body: { "note" => "a" }) }
+    send_reader_request(Net::HTTP::Post, "http://127.0.0.1:4998/v1/companies/7/entries", key: "other-port")
+    send_reader_request(Net::HTTP::Post, "http://127.0.0.1:4999/v1/companies/7/reservations", key: "other-path")
+
+    expect(forwarded_timekeeping_requests(reader_fake).pluck(:idempotency_key)).to eq(%w[k1 k1 other-path])
+  end
+end
+
+RSpec.describe "forwarded Timekeeping readers against the fake" do
+  let(:reader_company) { create(:company) }
+  let(:reader_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  before { allow(TimekeepingRegressionAdapter).to receive(:current).and_return(nil) }
+
+  it "reads every request the fake received, on any path, with only the POST as a create" do
+    entries_path = "/v1/companies/#{reader_company.id}/entries"
+    reader_fake.call("POST", entries_path, headers: { "idempotency-key" => "k1" }, body: { "note" => "a" })
+    reader_fake.call("PATCH", "#{entries_path}/12", headers: { "Idempotency-Key" => "k2" }, body: { "note" => "b" })
+    reader_fake.call("GET", "/v1/companies/#{reader_company.id}/reservations")
+
+    expect(forwarded_timekeeping_requests(reader_fake)).to eq(
+      [
+        { method: "POST", idempotency_key: "k1", body: { "note" => "a" } },
+        { method: "PATCH", idempotency_key: "k2", body: { "note" => "b" } },
+        { method: "GET", idempotency_key: nil, body: {} }
+      ]
+    )
+    expect(forwarded_create_requests(reader_fake)).to eq([{ method: "POST", idempotency_key: "k1", body: { "note" => "a" } }])
+  end
+
+  it "counts each entry in the fake's outbox once, including an entry whose latest snapshot is discarded" do
+    outbox = [
+      { "entry" => { "id" => 1, "discarded_at" => nil } },
+      { "entry" => { "id" => 1, "discarded_at" => nil } },
+      { "entry" => { "id" => 2, "discarded_at" => nil } },
+      { "entry" => { "id" => 3, "discarded_at" => nil } },
+      { "entry" => { "id" => 3, "discarded_at" => "2026-01-07T00:00:00Z" } }
+    ]
+    allow(reader_fake).to receive(:outbox).and_return(outbox)
+
+    expect(forwarded_stored_entry_count(reader_fake, company: reader_company)).to eq(3)
+  end
+
+  it "admit_forwarded_generation moves the fake's generation and opens no live database connection" do
+    allow(PG).to receive(:connect)
+
+    admit_forwarded_generation(reader_fake, 3)
+
+    expect(reader_fake.generation).to eq(3)
+    expect(PG).not_to have_received(:connect)
+  end
+end
