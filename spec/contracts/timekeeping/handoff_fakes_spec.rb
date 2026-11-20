@@ -193,9 +193,9 @@ RSpec.describe TimekeepingHandoffFakes::InMemoryTimekeepingStore do
   end
 
   context "more tests 17" do
-    it "owners with relay :timekeeping_outbox gives Timekeeping the outbox relay and keeps the monolith's copy relay" do
+    it "owners by default gives Timekeeping the outbox relay and keeps the monolith's copy relay" do
       timekeeping = described_class.new
-      owners = TimekeepingHandoffFakes.owners(timekeeping:, relay: :timekeeping_outbox)
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
 
       expect(owners.fetch(:timekeeping).drain).to be_a(TimekeepingHandoffOutboxRelay)
       expect(owners.fetch(:timekeeping).drain).not_to be_a(TimekeepingHandoffFakeRelay)
@@ -203,11 +203,6 @@ RSpec.describe TimekeepingHandoffFakes::InMemoryTimekeepingStore do
       expect(owners.fetch(:monolith).drain).not_to be_a(TimekeepingHandoffOutboxRelay)
       expect(owners.fetch(:timekeeping).store).to equal(timekeeping)
       expect(owners.fetch(:timekeeping).admission).to equal(timekeeping)
-
-      # The default stays the copy relay for both owners.
-      TimekeepingHandoffFakes.owners(timekeeping:).each_value do |owner|
-        expect(owner.drain).to be_a(TimekeepingHandoffFakeRelay)
-      end
     end
   end
 
@@ -368,8 +363,9 @@ RSpec.describe TimekeepingHandoffFakes, ".owners" do
     owners.each_value do |owner|
       expect(owner.settle).to be_a(TimekeepingHandoffFakes::NoOpSettle)
       expect(owner.settle.settled?).to be(true)
-      expect(owner.drain).to be_a(TimekeepingHandoffFakeRelay)
     end
+    expect(monolith.drain).to be_a(TimekeepingHandoffFakeRelay)
+    expect(owners.fetch(:timekeeping).drain).to be_a(TimekeepingHandoffOutboxRelay)
   end
 
   it "takes injected admissions and stores, a nil settle, and no drains when relay is false" do
@@ -396,12 +392,11 @@ RSpec.describe TimekeepingHandoffFakes, ".owners" do
 
   # The outbox relay reads admitted generations from the store, so a separate
   # admission would leave it holding back every row.
-  it "refuses relay :timekeeping_outbox with a Timekeeping admission other than the store" do
+  it "refuses the default outbox relay with a Timekeeping admission other than the store" do
     timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
 
     expect do
-      described_class.owners(timekeeping:, timekeeping_admission: TimekeepingHandoffFakes::RecordingAdmission.new,
-                             relay: :timekeeping_outbox)
-    end.to raise_error(ArgumentError, /timekeeping_outbox/)
+      described_class.owners(timekeeping:, timekeeping_admission: TimekeepingHandoffFakes::RecordingAdmission.new)
+    end.to raise_error(ArgumentError, /outbox relay needs the store/)
   end
 end

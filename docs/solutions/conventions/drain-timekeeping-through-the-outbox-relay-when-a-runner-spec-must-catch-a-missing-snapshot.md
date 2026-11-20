@@ -26,36 +26,38 @@ applies_when:
 
 On a live rollback, the monolith's `timesheet_entries` projection changes only when Timekeeping's outbox relay delivers a snapshot to `Timekeeping::ProjectionConsumer`. If the runner forgets to write a snapshot for a raised or corrected entry, the projection keeps the old version. Reconcile then refuses the rollback.
 
-The default fake drain, `TimekeepingHandoffFakeRelay`, does not work that way. It copies every stored entry straight into the projection, with `locked` set from the entry's reservations through `Timekeeping::Handoff::ReservationLocks.build` rather than the stored column. A runner spec on the default `TimekeepingHandoffFakes.owners(timekeeping:)` therefore passes even when a snapshot is missing. The bug shows up only on a live run.
+The copy drain, `TimekeepingHandoffFakeRelay`, does not work that way. It copies every stored entry straight into the projection, with `locked` set from the entry's reservations through `Timekeeping::Handoff::ReservationLocks.build` rather than the stored column. A runner spec that drains Timekeeping through it passes even when a snapshot is missing. The bug shows up only on a live run.
 
 ## Solution
 
-When a spec must prove that every snapshot reached the outbox, build owners with the outbox relay:
+Drain Timekeeping through the outbox relay. The default owners already do:
 
 ```ruby
-owners = TimekeepingHandoffFakes.owners(timekeeping:, relay: :timekeeping_outbox)
+owners = TimekeepingHandoffFakes.owners(timekeeping:)
 ```
 
-This keeps the monolith's copy relay and gives Timekeeping a `TimekeepingHandoffOutboxRelay`. That relay:
+This gives the monolith the copy relay and gives Timekeeping a `TimekeepingHandoffOutboxRelay`. That relay:
 
 - delivers only rows in `InMemoryTimekeepingStore#outbox`, through the real `Timekeeping::ProjectionConsumer`, using the gem's own `TimekeepingRelay::Relay`;
 - never reads stored entries and never writes the projection itself, so there is no second write path that could hide the gap;
 - holds back rows of a generation the store never admitted, and rows above `through`;
 - raises `TimekeepingHandoffOutboxRelay::Undelivered` with the consumer's status and body when a batch is refused (409, 422 or any other answer), and `drained?` stays false.
 
-The relay reads admitted generations from the store's own `admit` calls. So the store must also be Timekeeping's admission; `owners` raises `ArgumentError` when you pass a different `timekeeping_admission` with this relay.
+The relay reads admitted generations from the store's own `admit` calls. So the store must also be Timekeeping's admission; `owners` raises `ArgumentError` when you pass a different `timekeeping_admission` with the default relay. A spec that needs a separate admission passes `relay: false`, which leaves both drains nil.
 
-To prove the spec discriminates, drop one snapshot in a spec-local store subclass that overrides `write_correction_snapshots` and calls `super` without it. Do not add a break switch to the shared fake.
+The store must also be an `InMemoryTimekeepingStore`, or a subclass of it, because the relay reads its `outbox`. A hand-built store without one cannot be drained this way.
+
+To prove the spec discriminates, drop one snapshot in a spec-local store subclass that overrides `write_correction_snapshots` and calls `super` without it. Do not add a break switch to the shared fake. This proof works only for a rollback that reaches reconcile, because reconcile is the step that compares the projection with the store. A rollback that ends in an abort finishes only settle and freeze, and reopens admission without that comparison, so a missing snapshot cannot fail it.
 
 ## Why it matters
 
 A fake that is more forgiving than the real path turns a live failure into a green spec. The loud `Undelivered` error matters too. Without it, a shape or generation mistake in the fake would look the same as a projection left behind, or would not fail at all. Then the spec could not tell a fake bug from a runner bug.
 
-The copy relay is still the default for both owners. Only specs that opt in get this protection, so a new runner spec about snapshot delivery must ask for it.
+The outbox relay is Timekeeping's default drain, so a new runner spec gets this protection without asking for it. Only the monolith keeps the copy relay.
 
 ## Evidence
 
-- PR #481 adds `TimekeepingHandoffOutboxRelay`, the store's `outbox`, and the `RELAY_DRAINS` table with the `:timekeeping_outbox` entry in `spec/support/timekeeping/handoff_fakes.rb`. The `RELAY_DRAINS` `true` entry keeps `TimekeepingHandoffFakeRelay` for both owners as the default.
+- PR #481 adds `TimekeepingHandoffOutboxRelay`, the store's `outbox`, and the `RELAY_DRAINS` table in `spec/support/timekeeping/handoff_fakes.rb`. The `RELAY_DRAINS` `true` entry, the default, gives the monolith `TimekeepingHandoffFakeRelay` and Timekeeping `TimekeepingHandoffOutboxRelay`. The `false` entry leaves both drains nil.
 - `spec/lib/timekeeping/handoff/runner_outbox_relay_spec.rb` ("a raised entry's snapshot left out of Timekeeping's outbox ...") omits one raised entry through a store subclass. The rollback raises `Timekeeping::Handoff::Runner::Refused`, and `reconciliation.json` lists that entry with check `projection`, field `version`, reason `changed`. Its sibling example, with nothing omitted, finishes the rollback with `abort` false.
-- `spec/contracts/timekeeping/handoff_fakes_spec.rb` covers the hold-back of an unadmitted generation, the `through` bound, the 422 and 409 `Undelivered` refusals, and the `ArgumentError` when `relay: :timekeeping_outbox` gets a separate admission.
-- `spec/lib/timekeeping/handoff/runner_legacy_handoff_spec.rb` switches two existing examples to `relay: :timekeeping_outbox` with unchanged assertions.
+- `spec/contracts/timekeeping/handoff_fakes_spec.rb` covers the hold-back of an unadmitted generation, the `through` bound, the 422 and 409 `Undelivered` refusals, and the `ArgumentError` when the default relay gets a separate admission.
+- `spec/lib/timekeeping/handoff/runner_spec.rb`, `runner_incomplete_checks_spec.rb` and `runner_legacy_handoff_spec.rb` drain Timekeeping through the outbox relay on rollback, with unchanged assertions. The stalled drain in `runner_incomplete_checks_spec.rb` subclasses `TimekeepingHandoffOutboxRelay`.

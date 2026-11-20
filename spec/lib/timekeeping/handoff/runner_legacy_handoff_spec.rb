@@ -183,7 +183,7 @@ RSpec.describe Timekeeping::Handoff::Runner do
     # "Versions continue from the checkpoint and never go backwards across cutover, rollback and re-cutover"
     it "entry versions never go backwards across cutover, rollback and re-cutover with an edit under each owner" do
       timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-      owners = TimekeepingHandoffFakes.owners(timekeeping:, relay: :timekeeping_outbox)
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
       report_root = Dir.mktmpdir("handoff-report")
       monolith_store = Timekeeping::Handoff::MonolithStore.new(connection: ActiveRecord::Base.connection)
       legacy = TimesheetEntry.unscoped.pluck(:id, :version).to_h
@@ -886,7 +886,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
   # are not legacy sources, so a second write would be a duplicate delivery.
   it "raised snapshots are written once at the first cutover and never again by rollback or a re-cutover after a monolith edit, which still reaches the flip" do
     timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    owners = TimekeepingHandoffFakes.owners(timekeeping:, relay: :timekeeping_outbox)
+    owners = TimekeepingHandoffFakes.owners(timekeeping:)
     report_root = Pathname(Dir.mktmpdir("handoff-report"))
     legacy_zero_ids = TimesheetEntry.unscoped.where(version: 0).pluck(:id)
     expect(legacy_zero_ids).not_to be_empty

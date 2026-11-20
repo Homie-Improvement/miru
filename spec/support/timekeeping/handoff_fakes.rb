@@ -312,22 +312,22 @@ module TimekeepingHandoffFakes
 
   # Builds the monolith and Timekeeping owners a runner spec hands to the
   # runner. By default the Timekeeping store is also Timekeeping's admission
-  # adapter, and each owner's drain relays that owner's entries into the
-  # projection, as the real outbox relay would, so reconcile sees the
-  # projection the drain left. relay: false leaves both drains nil;
-  # relay: :timekeeping_outbox keeps the monolith's copy relay and gives
-  # Timekeeping a TimekeepingHandoffOutboxRelay, which needs the store to be
-  # Timekeeping's admission so it sees which generations were admitted. log is
-  # passed to the relays so drains appear in a spec's shared call log.
+  # adapter, the monolith's drain copies its entries into the projection, and
+  # Timekeeping's drain is a TimekeepingHandoffOutboxRelay, which delivers only
+  # the snapshots the store wrote to its outbox, so a rollback spec fails when
+  # a snapshot is missing. That relay reads admitted generations from the
+  # store, so it needs the store to be Timekeeping's admission. relay: false
+  # leaves both drains nil. log is passed to the relays so drains appear in a
+  # spec's shared call log.
   def self.owners(timekeeping:, timekeeping_admission: timekeeping, monolith_admission: RecordingAdmission.new,
                   monolith_store: Timekeeping::Handoff::MonolithStore.new(connection: ActiveRecord::Base.connection),
                   settle: NoOpSettle.new, relay: true, log: nil)
-    if relay == :timekeeping_outbox && !timekeeping_admission.equal?(timekeeping)
-      raise ArgumentError, "relay: :timekeeping_outbox needs the store as Timekeeping's admission, " \
-                           "or the relay never sees which generations were admitted"
+    drains = RELAY_DRAINS.fetch(relay)
+    if drains.fetch(:timekeeping) == TimekeepingHandoffOutboxRelay && !timekeeping_admission.equal?(timekeeping)
+      raise ArgumentError, "the outbox relay needs the store as Timekeeping's admission, " \
+                           "or it never sees which generations were admitted"
     end
 
-    drains = RELAY_DRAINS.fetch(relay)
     drain_for = ->(name, store) { drains.fetch(name)&.new(store:, log:) }
     {
       monolith: Timekeeping::Handoff::Owner.new(
@@ -343,8 +343,7 @@ module TimekeepingHandoffFakes
 
   # The drain class each owner gets for each value of owners' relay: keyword.
   RELAY_DRAINS = {
-    true => { monolith: TimekeepingHandoffFakeRelay, timekeeping: TimekeepingHandoffFakeRelay },
-    false => { monolith: nil, timekeeping: nil },
-    timekeeping_outbox: { monolith: TimekeepingHandoffFakeRelay, timekeeping: TimekeepingHandoffOutboxRelay }
+    true => { monolith: TimekeepingHandoffFakeRelay, timekeeping: TimekeepingHandoffOutboxRelay },
+    false => { monolith: nil, timekeeping: nil }
   }.freeze
 end
