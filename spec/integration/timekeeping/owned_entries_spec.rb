@@ -561,7 +561,8 @@ RSpec.describe "owned_entry in the rollback state", committed_data: true, owner_
     missing_id = ActiveRecord::Base.connection.select_value(
       "SELECT nextval(pg_get_serial_sequence('timesheet_entries', 'id'))"
     ).to_i
-    create(:timesheet_entry, id: missing_id, user:, project:, note: "projection only") if false
+    # A projection row with no prepared entry behind it: the reader must not fall back to it.
+    create(:timesheet_entry, id: missing_id, user:, project:, note: "projection only")
     expect { owned_entry(missing_id, state: "rollback") }.to raise_error(StandardError)
   end
 end
