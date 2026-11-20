@@ -61,8 +61,9 @@ module TimekeepingRegressionAdapter
     # spec/rails_helper.rb's around hook disables net connect after every
     # example, so the live app's address is allowed again before each one, and
     # the live database is emptied so no rows carry over from the example
-    # before. Examples that enabled every connection on purpose (system and
-    # feature specs) keep it.
+    # before. The restriction also replaces the open network that the around
+    # hook gives system and feature specs, so no example of a live run can
+    # reach any other address.
     #
     # While VCR is on, its WebMock hook reports every connection as allowed,
     # so WebMock's allow list would block nothing. VCR is therefore turned off
@@ -70,11 +71,9 @@ module TimekeepingRegressionAdapter
     def prepare_example!(example)
       return unless current
 
-      unless WebMock::Config.instance.allow_net_connect
-        WebMock.disable_net_connect!(allow: [@allowed_address])
-        VCR.turn_off! unless example.metadata[:vcr] || VCR.current_cassette
-        stub_password_breach_lookup
-      end
+      WebMock.disable_net_connect!(allow: [@allowed_address])
+      VCR.turn_off! unless example.metadata[:vcr] || VCR.current_cassette
+      stub_password_breach_lookup
       TimekeepingDatabaseReset.reset!(OWNER_STATE, env: { DATABASE_URL_KEY => @database_url })
     end
 

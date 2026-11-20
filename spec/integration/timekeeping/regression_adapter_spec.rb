@@ -258,7 +258,11 @@ RSpec.describe "TimekeepingRegressionAdapter.start! from a stopped adapter", com
       # "The `config.before` passes `{ "TIMEKEEPING_DATABASE_URL" => <checked url> }` as the reset's `env:`, so the
       # reset also opens only the checked URL."
       allow(TimekeepingDatabaseReset).to receive(:reset!)
+      # System and feature specs start with every connection allowed; the restriction must replace that too.
+      WebMock.allow_net_connect!
       TimekeepingRegressionAdapter.prepare_example!(RSpec.current_example)
+      expect(WebMock::Config.instance.allow_net_connect).to be(false)
+      expect(Array(WebMock::Config.instance.allow)).to eq(["127.0.0.1:#{received[:port]}"])
       expect(TimekeepingDatabaseReset).to have_received(:reset!)
         .once.with("timekeeping", env: { "TIMEKEEPING_DATABASE_URL" => checked_url })
     ensure
