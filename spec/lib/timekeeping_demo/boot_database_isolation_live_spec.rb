@@ -7,7 +7,7 @@ require "tmpdir"
 require "uri"
 require Rails.root.join("lib", "timekeeping_demo", "version_record").to_s
 
-RSpec.describe TimekeepingDotenvTree do
+RSpec.describe TimekeepingDotenvTree, "with own_git: true" do
   it "building a tree with its own git repository leaves the checkout's HEAD, index and .env files untouched" do
     git = lambda do |dir, *args|
       output, status = Open3.capture2("git", *args, chdir: dir)
@@ -37,9 +37,7 @@ RSpec.describe TimekeepingDotenvTree do
     expect(Rails.root.glob(".env*").map(&:to_s).sort).to eq(env_files_before)
     expect(Rails.root.glob(".env*").any? { |path| File.read(path).include?(probe) }).to be(false)
   end
-end
 
-RSpec.describe "Timekeeping demo boot database isolation tree" do
   it "version capture succeeds in a dotenv tree built with its own git repository and records both applications" do
     checkout_env_files_before = Rails.root.glob(".env*").map(&:to_s).sort
 
@@ -58,9 +56,7 @@ RSpec.describe "Timekeeping demo boot database isolation tree" do
 
     expect(Rails.root.glob(".env*").map(&:to_s).sort).to eq(checkout_env_files_before)
   end
-end
 
-RSpec.describe "Timekeeping demo boot database isolation tree" do
   it "a dotenv tree with its own git leaves the checkout's env files and git history unchanged and repeated captures add no commit" do
     env_files_before = Rails.root.glob(".env*").map(&:to_s).sort
     checkout_head_before, = Open3.capture2("git", "rev-parse", "HEAD", chdir: Rails.root.to_s)
@@ -121,7 +117,10 @@ RSpec.describe TimekeepingDotenvTree, "entry points for a boot of bin/timekeepin
 end
 
 RSpec.describe IntegratedRuntime, "booted from a tree with a conflicting dotenv file" do
+  # The example runs inside a transaction, and PostgreSQL keeps one snapshot
+  # of pg_stat_activity per transaction, so each poll clears it first.
   def boot_isolation_users_tagged(probe)
+    ActiveRecord::Base.connection.execute("SELECT pg_stat_clear_snapshot()")
     sql = ActiveRecord::Base.sanitize_sql_array(
       ["SELECT DISTINCT usename FROM pg_stat_activity WHERE application_name = ?", probe]
     )
@@ -139,6 +138,11 @@ RSpec.describe IntegratedRuntime, "booted from a tree with a conflicting dotenv 
   it "booted through bin/timekeeping-demo with a conflicting dotenv file, each app's live connection runs as its own distinct database user" do
     skip "Set TIMEKEEPING_LIVE=1 to start the real demo runtime" unless ENV["TIMEKEEPING_LIVE"] == "1"
 
+    # start(root: tree) checks only the tree's groups file, but the tree shares
+    # the Timekeeping database and, through its timekeeping symlink, the
+    # checkout's Timekeeping pid file, so a runtime started from the checkout
+    # must not be running.
+    described_class.refuse_if_running!(root: Rails.root.to_s)
     WebMock.disable_net_connect!(allow_localhost: true)
     checkout_env_files_before = Rails.root.glob(".env*").map(&:to_s).sort
     monolith_probe = "boot-isolation-monolith-#{SecureRandom.hex(8)}"
@@ -197,12 +201,6 @@ RSpec.describe IntegratedRuntime, "booted from a tree with a conflicting dotenv 
     expect(groups.size).to be > 1
     expect(groups.select { |group| IntegratedRuntime.group_alive?(group) }).to eq([])
   end
-
-  # Without the dotenv file the monolith's connections carry no probe, and the
-  # boot example must then fail rather than pass on an empty list.
-  it "no live connection carries a probe that no dotenv file set" do
-    expect(boot_isolation_users_tagged("boot-isolation-unset-#{SecureRandom.hex(8)}")).to eq([])
-  end
 end
 
 RSpec.describe IntegratedRuntime, "booted from a tree without the empty DATABASE_URL deletion" do
@@ -210,6 +208,9 @@ RSpec.describe IntegratedRuntime, "booted from a tree without the empty DATABASE
   it "a tree whose application.rb keeps an empty DATABASE_URL fails to boot through bin/timekeeping-demo" do
     skip "Set TIMEKEEPING_LIVE=1 to start the real demo runtime" unless ENV["TIMEKEEPING_LIVE"] == "1"
 
+    # The tree shares the checkout's Timekeeping database and pid file, so a
+    # runtime started from the checkout must not be running.
+    described_class.refuse_if_running!(root: Rails.root.to_s)
     WebMock.disable_net_connect!(allow_localhost: true)
     checkout_env_files_before = Rails.root.glob(".env*").map(&:to_s).sort
     # The launcher hands the monolith DATABASE_URL="" only when the caller has none.
@@ -228,10 +229,14 @@ RSpec.describe IntegratedRuntime, "booted from a tree without the empty DATABASE
 
       runtime = nil
       begin
-        expect { runtime = described_class.start(root: tree, env:) }.to raise_error(IntegratedRuntime::BootError)
+        # Without the deletion, the monolith's db:prepare refuses the empty
+        # URL and the launcher exits; any other boot failure must not pass.
+        expect { runtime = described_class.start(root: tree, env:) }
+          .to raise_error(IntegratedRuntime::BootError, /launcher exited before the runtime was ready/)
       ensure
         runtime&.stop!
       end
+      expect(described_class.recorded_groups(tree).select { |group| described_class.group_alive?(group) }).to eq([])
     end
 
     expect(Rails.root.join("config", "application.rb").read).to include('ENV.delete("DATABASE_URL") if ENV["DATABASE_URL"] == ""')
