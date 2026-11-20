@@ -153,6 +153,7 @@ RSpec.describe IntegratedRuntime, "booted from a tree with a conflicting dotenv 
 
     observed = {}
     groups = []
+    tree_groups = []
     Dir.mktmpdir("boot-isolation-tree") do |dir|
       tree = File.realpath(dir)
       host = ENV["DB_HOST"].presence || "localhost"
@@ -179,7 +180,8 @@ RSpec.describe IntegratedRuntime, "booted from a tree with a conflicting dotenv 
 
           sleep 0.5
         end
-        groups = (runtime.process_groups + described_class.recorded_groups(tree)).uniq
+        tree_groups = described_class.recorded_groups(tree)
+        groups = (runtime.process_groups + tree_groups).uniq
       end
     end
 
@@ -189,8 +191,9 @@ RSpec.describe IntegratedRuntime, "booted from a tree with a conflicting dotenv 
     expect(observed.fetch(:timekeeping)).to eq([timekeeping_user])
     expect(observed.fetch(:monolith)).not_to eq(observed.fetch(:timekeeping))
     expect(Rails.root.glob(".env*").map(&:to_s).sort).to eq(checkout_env_files_before)
-    # The groups were read from the tree's own groups file, so this also shows
-    # the launcher ran with the tree as its root.
+    # The launcher writes its groups file under its own root, so groups
+    # recorded in the tree's file show the launcher ran with the tree as root.
+    expect(tree_groups).not_to be_empty
     expect(groups.size).to be > 1
     expect(groups.select { |group| IntegratedRuntime.group_alive?(group) }).to eq([])
   end
