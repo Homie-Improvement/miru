@@ -95,23 +95,32 @@ module TimekeepingHandoffFakes
   # replaces an entry with an older version of it. Corrections replace any
   # earlier correction of the same entry and raise the stored version, as the
   # service's correction writer does.
+  #
+  # It also keeps Timekeeping's outbox: every correction and every entry edit
+  # adds a row, so a relay that delivers only outbox rows sees exactly what the
+  # real service would publish, and an entry with no row stays behind.
   class InMemoryTimekeepingStore < RecordingAdmission
     # corrections holds what the service keeps, one per entry; correction_writes
     # holds every snapshot as sent, so a spec can catch a duplicated write that
-    # the replacement would otherwise absorb.
-    attr_reader :rows, :corrections, :correction_writes
+    # the replacement would otherwise absorb. outbox holds
+    # { "generation", "outbox_position", "entry" } rows in position order, each
+    # entry with its version.
+    attr_reader :rows, :corrections, :correction_writes, :outbox
 
     def initialize(log: nil, tag: nil)
       super
       @rows = Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }
       @corrections = []
       @correction_writes = []
+      @outbox = []
+      @next_outbox_position = 1
       @next_id = 1
     end
 
     def export_checkpoint = Timekeeping::Handoff::Checkpoint.build(tables: @rows)
 
-    def highest_outbox_position = 0
+    # 0 for an empty outbox, the position no snapshot is ever written at.
+    def highest_outbox_position = @outbox.map { |row| row.fetch("outbox_position") }.max || 0
 
     def load_checkpoint(checkpoint)
       not_positive = checkpoint.rows.fetch("entries").reject { |row| row["version"].is_a?(Integer) && row["version"].positive? }
@@ -135,22 +144,43 @@ module TimekeepingHandoffFakes
         entry_id = self.class.entry_id_of(snapshot)
         @corrections.reject! { |stored| self.class.entry_id_of(stored) == entry_id }
         @corrections << snapshot.merge("version" => version, "generation" => generation)
+        # Like the service's writer, a rewrite replaces this entry's row at this
+        # generation only; rows of other entries and generations stay.
+        @outbox.reject! { |row| row["generation"] == generation && self.class.entry_id_of(row["entry"]) == entry_id }
+        append_outbox_row(snapshot.merge("version" => version), generation:)
         entry = @rows.fetch("entries").find { |row| row["id"] == entry_id }
         entry["version"] = version if entry && entry["version"] < version
       end
       snapshots.size
     end
 
-    # An entry edit admitted while Timekeeping owns the entries.
+    # An entry edit admitted while Timekeeping owns the entries. Its snapshot
+    # goes to the outbox at the generation Timekeeping last admitted, as the
+    # service's writer publishes every edit.
     def edit_entry!(id)
+      generation = last_admitted_generation
+      raise ArgumentError, "edit_entry! needs an admitted generation; this store admitted none" if generation.nil?
+
       entry = @rows.fetch("entries").find { |row| row["id"] == id }
       entry["version"] += 1
       entry["note"] = "edited in Timekeeping"
+      append_outbox_row(entry.dup, generation:)
     end
 
     def self.entry_id_of(snapshot)
       snapshot["entry_id"] || snapshot.dig("snapshot", "id") || snapshot["id"]
     end
+
+    private
+
+      def append_outbox_row(entry, generation:)
+        @outbox << { "generation" => generation, "outbox_position" => @next_outbox_position, "entry" => entry }
+        @next_outbox_position += 1
+      end
+
+      def last_admitted_generation
+        calls.reverse_each.find { |call| call.first == :admit }&.last
+      end
   end
 
   # A settle integration with nothing left to settle.
