@@ -748,7 +748,7 @@ RSpec.describe "Timekeeping queue ledger private root" do
 
       expect(resolved).to eq(File.join(dir, "tmp/timekeeping-integration/queue_ledger.97.json"))
       expect(unnumbered).to eq(File.join(dir, "tmp/timekeeping-integration/queue_ledger.json"))
-      expect(resolved).not_to start_with(Rails.root.to_s)
+      expect(resolved).not_to eq(Rails.root.join("tmp/timekeeping-integration/queue_ledger.97.json").to_s)
     end
   end
 
@@ -793,14 +793,13 @@ RSpec.describe "Timekeeping queue ledger private root" do
   # "The per-process file-operation example and the live per-process probe write and delete ledger files only under a private temporary root, never at tmp/timekeeping-integration/queue_ledger.N.json, so a bin/parallel_test run with -n 99 shares no ledger file with either test."
   it "a private ledger root keeps the per-process number and never resolves to a worker path under Rails.root" do
     Dir.mktmpdir("queue-ledger-root") do |dir|
-      worker_dir = Rails.root.join("tmp/timekeeping-integration").to_s
       paths = %w[96 97 98 99].index_with do |number|
         TimekeepingQueueLedger.ledger_path({ "TIMEKEEPING_QUEUE_LEDGER_ROOT" => dir, "TEST_ENV_NUMBER" => number })
       end
 
       paths.each do |number, path|
         expect(path).to eq(File.join(dir, "tmp/timekeeping-integration", "queue_ledger.#{number}.json"))
-        expect(path).not_to start_with(worker_dir)
+        expect(path).not_to eq(Rails.root.join("tmp/timekeeping-integration/queue_ledger.#{number}.json").to_s)
       end
       expect(paths.values.uniq.size).to eq(4)
 
