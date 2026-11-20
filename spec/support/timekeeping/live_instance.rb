@@ -59,11 +59,14 @@ class TimekeepingLiveInstance
   HOST = "127.0.0.1"
   RAILS = %w[bundle exec rails].freeze
   # Runs once before the server starts: entry writes need the admission row at
-  # generation 1.
+  # the instance's generation. Rendered with format's %d, so only an Integer
+  # can reach the Ruby source that `rails runner` executes.
   ADMIT_SCRIPT = <<~RUBY
     Timekeeping::Admission.ensure_initial!
-    Timekeeping::Admission.admit!(generation: 1)
+    Timekeeping::Admission.admit!(generation: %<generation>d)
   RUBY
+  DEFAULT_ADMISSION_GENERATION = 1
+  PORTS = (1..65_535)
   # The service counts writes by company id, and the monolith specs restart
   # their id sequences, so counts left by an earlier example or run would be
   # added to a new company that reuses the id.
@@ -72,24 +75,40 @@ class TimekeepingLiveInstance
     WriteMetricWindow.delete_all
   RUBY
 
-  attr_reader :base_url, :service_token, :private_key
+  attr_reader :base_url, :service_token, :private_key, :admission_generation
 
-  def self.start(reference_stub:)
-    new(reference_stub:).tap(&:start)
+  # port nil picks a free port. database_url nil reads TIMEKEEPING_DATABASE_URL
+  # from ENV; a given URL is the only one the service's processes see, so a
+  # caller that checked it knows which database db:prepare opens.
+  def self.start(reference_stub:, admission_generation: DEFAULT_ADMISSION_GENERATION, port: nil, database_url: nil)
+    new(reference_stub:, admission_generation:, port:, database_url:).tap(&:start)
   end
 
-  def initialize(reference_stub:)
+  # Every argument is checked here, before any process starts.
+  def initialize(reference_stub:, admission_generation: DEFAULT_ADMISSION_GENERATION, port: nil, database_url: nil)
+    unless admission_generation.is_a?(Integer) && admission_generation.positive?
+      raise ArgumentError, "admission_generation must be a positive Integer"
+    end
+    raise ArgumentError, "port must be an Integer in #{PORTS}" unless port.nil? || (port.is_a?(Integer) && PORTS.cover?(port))
+    # A blank URL would let Rails fall back to another database.
+    unless database_url.nil? || (database_url.is_a?(String) && !database_url.strip.empty?)
+      raise ArgumentError, "database_url must be nil or a non-blank String"
+    end
+
     @reference_stub = reference_stub
+    @admission_generation = admission_generation
+    @port = port
+    @database_url = database_url
     @service_token = "live-service-#{SecureRandom.hex(24)}"
     @private_key = OpenSSL::PKey::RSA.generate(2048)
   end
 
   def start
     start_reference_server
-    port = free_port
+    port = @port || free_port
     @base_url = "http://#{HOST}:#{port}"
     run_in_service!(*RAILS, "db:prepare")
-    run_in_service!(*RAILS, "runner", ADMIT_SCRIPT)
+    run_in_service!(*RAILS, "runner", format(ADMIT_SCRIPT, generation: admission_generation))
     @log = Tempfile.new(["timekeeping-live", ".log"])
     # A pid file of its own, so a server left by an interrupted run never
     # stops this one from booting.
@@ -130,10 +149,10 @@ class TimekeepingLiveInstance
   end
 
   # Sends an entry write the way the monolith forwards one: a user token,
-  # the admitted generation and a fresh idempotency key.
+  # the generation this instance admitted and a fresh idempotency key.
   def write_entry(company_id:, token:, body:)
     post = Net::HTTP::Post.new(URI.join(base_url, "/v1/companies/#{Integer(company_id)}/entries"))
-    post["Ownership-Generation"] = "1"
+    post["Ownership-Generation"] = admission_generation.to_s
     post["Idempotency-Key"] = SecureRandom.uuid
     request(post, body, "Bearer #{token}")
   end
@@ -151,9 +170,7 @@ class TimekeepingLiveInstance
       {
         "RAILS_ENV" => "test",
         "BUNDLE_GEMFILE" => File.join(SERVICE_DIRECTORY, "Gemfile"),
-        "TIMEKEEPING_DATABASE_URL" => ENV.fetch("TIMEKEEPING_DATABASE_URL") do
-          raise BootError, "TIMEKEEPING_DATABASE_URL must name the live Timekeeping test database"
-        end,
+        "TIMEKEEPING_DATABASE_URL" => timekeeping_database_url,
         "TIMEKEEPING_TOKEN_PUBLIC_KEY" => private_key.public_key.to_pem,
         "TIMEKEEPING_SERVICE_TOKEN" => service_token,
         "MONOLITH_REFERENCE_URL" => reference_url,
@@ -162,19 +179,31 @@ class TimekeepingLiveInstance
       }
     end
 
+    def timekeeping_database_url
+      @database_url || ENV.fetch("TIMEKEEPING_DATABASE_URL") do
+        raise BootError, "TIMEKEEPING_DATABASE_URL must name the live Timekeeping test database"
+      end
+    end
+
     # The monolith runs under its own bundle; boot.rb keeps an inherited
     # BUNDLE_GEMFILE, so without a clean environment the service would load
     # the monolith's gems and miss its own path gems.
+    #
+    # The service env is built before entering the unbundled env, which swaps
+    # ENV for the one the process started with, so a TIMEKEEPING_DATABASE_URL
+    # removed or changed since start is read as it is now.
     def run_in_service!(*command)
+      env = service_env
       output, status = Bundler.with_unbundled_env do
-        Open3.capture2e(service_env, *command, chdir: SERVICE_DIRECTORY)
+        Open3.capture2e(env, *command, chdir: SERVICE_DIRECTORY)
       end
       raise BootError, "#{command.join(" ")} failed:\n#{output}" unless status.success?
     end
 
     def spawn_in_service(*command)
+      env = service_env
       Bundler.with_unbundled_env do
-        Process.spawn(service_env, *command, chdir: SERVICE_DIRECTORY, out: @log.path, err: [:child, :out])
+        Process.spawn(env, *command, chdir: SERVICE_DIRECTORY, out: @log.path, err: [:child, :out])
       end
     end
 
