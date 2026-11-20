@@ -129,7 +129,7 @@ module TimekeepingOwnedEntries
       raise ArgumentError, "entry ids already arranged in this example: #{repeated.join(', ')}" if repeated.any?
 
       store = state == "timekeeping" ? (timekeeping_store || live_owned_entry_store) : nil
-      entries = entries.map { |entry| entry.merge("id" => entry["id"] || next_timesheet_entry_id) }
+      entries = with_drawn_ids(entries)
 
       send(writer.fetch(:owner), entries, state:, store:)
       # Recorded once the owner holds the rows: a call that failed before this
@@ -157,6 +157,22 @@ module TimekeepingOwnedEntries
       # load replaces whole tables, so every load carries all of them.
       def timekeeping_owned_entry_rows
         @timekeeping_owned_entry_rows || []
+      end
+
+      # Gives each entry without an id one drawn from the timesheet_entries
+      # sequence. An explicit id does not move that sequence, so a drawn value
+      # equal to an id given in this batch or arranged earlier in the example
+      # is skipped; otherwise the write would fail after the owner row exists.
+      def with_drawn_ids(entries)
+        taken = Set.new(arranged_owned_entry_ids + entries.filter_map { |entry| entry["id"] })
+        entries.map do |entry|
+          next entry if entry["id"]
+
+          id = next_timesheet_entry_id
+          id = next_timesheet_entry_id while taken.include?(id)
+          taken << id
+          entry.merge("id" => id)
+        end
       end
 
       # Drawn from the timesheet_entries sequence, so the owner row and its

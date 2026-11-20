@@ -481,6 +481,25 @@ RSpec.describe "arrange_owned_entries with an id repeated across two calls", com
   end
 end
 
+RSpec.describe "arrange_owned_entries drawing ids past an explicit id", committed_data: true do
+  it "legacy state: a row without id skips a sequence value already arranged as an explicit id" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    project = create(:project, billable: true, client: create(:client, company:))
+    drawn = ApplicationRecord.connection.select_value(
+      "SELECT nextval(pg_get_serial_sequence('timesheet_entries', 'id'))"
+    ).to_i
+    # The sequence hands out drawn + 1 next, which this explicit id already holds.
+    explicit_id, = arrange_owned_entries([{ company:, user:, project:, id: drawn + 1 }], state: "legacy")
+
+    generated_id, = arrange_owned_entries([{ company:, user:, project:, note: "generated" }], state: "legacy")
+
+    expect(generated_id).not_to eq(explicit_id)
+    expect(TimesheetEntry.unscoped.where(id: [explicit_id, generated_id]).count).to eq(2)
+  end
+end
+
 RSpec.describe "owned_entry for an id the owning store does not hold", committed_data: true do
   it "rollback state: owned_entry raises for an id that only has a timesheet_entries row instead of returning the projection" do
     company = create(:company)
