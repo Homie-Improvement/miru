@@ -247,4 +247,169 @@ RSpec.describe "CI spec coverage in validations.yml" do
       expect(outcomes).to eq("success" => true, "failure" => false, "cancelled" => false, "skipped" => false)
     end
   end
+
+  # The handoff live spec skips itself unless TIMEKEEPING_LIVE is "1", so a job that
+  # names it with the wrong env, a skipped condition or ignored failures still goes green.
+  describe "guard for the live handoff job" do
+    let(:live_handoff_spec) { "spec/integration/timekeeping/handoff_live_spec.rb" }
+    let(:live_handoff_jobs) do
+      jobs.values.select { |job| Array(job["steps"]).any? { |step| runs_live_handoff?(step) } }
+    end
+    let(:live_handoff_step) { live_handoff_jobs.first.fetch("steps").find { |step| runs_live_handoff?(step) } }
+
+    def runs_live_handoff?(step)
+      step["run"].to_s.include?(live_handoff_spec)
+    end
+
+    # The handoff spec refuses, and its after hook would otherwise empty, any database
+    # the shared guard does not accept, so the meta spec asks that same guard.
+    def test_database_url?(url)
+      return false if url.to_s.empty?
+
+      TestDatabaseGuard.require_test_database_url!(url)
+      true
+    rescue TestDatabaseGuard::NotATestDatabase
+      false
+    end
+
+    def live_handoff_job_problems(name, job)
+      step = job.fetch("steps").find { |candidate| runs_live_handoff?(candidate) }
+      # A step's env overrides the job's, and the rspec process sees the merged values.
+      env = (job["env"] || {}).merge(step["env"] || {})
+      {
+        "does not set TIMEKEEPING_LIVE to \"1\"" => env["TIMEKEEPING_LIVE"] != "1",
+        "does not name a _test database in TIMEKEEPING_DATABASE_URL" => !test_database_url?(env["TIMEKEEPING_DATABASE_URL"]),
+        "ignores failures" => job["continue-on-error"] || step["continue-on-error"],
+        # Any condition, even one that looks harmless, can skip the proof on some push.
+        "runs only under a condition" => job.key?("if") || step.key?("if")
+      }.select { |_problem, present| present }.keys.map { |problem| "#{name} #{problem}" }
+    end
+
+    # Returns no messages when at least one job runs the handoff live spec for real on
+    # every push; otherwise one message per way each candidate job falls short.
+    # Taking the parsed workflow lets the failure cases run against altered copies.
+    def live_handoff_problems(workflow)
+      candidates = workflow.fetch("jobs").select do |_name, job|
+        Array(job["steps"]).any? { |step| runs_live_handoff?(step) }
+      end
+      return ["no job runs #{live_handoff_spec}"] if candidates.empty?
+
+      problems = candidates.map { |name, job| live_handoff_job_problems(name, job) }
+      problems.any?(&:empty?) ? [] : problems.flatten
+    end
+
+    it "finds a live handoff job in the real workflow" do
+      # "A CI job in .github/workflows/validations.yml sets TIMEKEEPING_LIVE=1 and TIMEKEEPING_DATABASE_URL
+      # and runs spec/integration/timekeeping/handoff_live_spec.rb on every push."
+      expect(live_handoff_problems(workflow)).to be_empty
+    end
+
+    it "fails when the live job leaves TIMEKEEPING_LIVE unset" do
+      live_handoff_jobs.each { |job| job.fetch("env").delete("TIMEKEEPING_LIVE") }
+
+      expect(live_handoff_problems(workflow)).not_to be_empty
+    end
+
+    it "fails when the live job sets TIMEKEEPING_LIVE to anything but \"1\"" do
+      live_handoff_jobs.each { |job| job.fetch("env")["TIMEKEEPING_LIVE"] = "0" }
+
+      expect(live_handoff_problems(workflow)).not_to be_empty
+    end
+
+    it "fails when the live job sets no TIMEKEEPING_DATABASE_URL" do
+      live_handoff_jobs.each { |job| job.fetch("env").delete("TIMEKEEPING_DATABASE_URL") }
+
+      expect(live_handoff_problems(workflow)).not_to be_empty
+    end
+
+    it "fails when TIMEKEEPING_DATABASE_URL names a database without the _test suffix" do
+      live_handoff_jobs.each do |job|
+        env = job.fetch("env")
+        env["TIMEKEEPING_DATABASE_URL"] = env.fetch("TIMEKEEPING_DATABASE_URL").sub(%r{/[^/?]+\z}, "/timekeeping_live")
+      end
+
+      expect(live_handoff_problems(workflow)).not_to be_empty
+    end
+
+    it "fails when TIMEKEEPING_DATABASE_URL overrides its database with a dbname query" do
+      live_handoff_jobs.each do |job|
+        env = job.fetch("env")
+        env["TIMEKEEPING_DATABASE_URL"] = "#{env.fetch('TIMEKEEPING_DATABASE_URL')}?dbname=timekeeping"
+      end
+
+      expect(live_handoff_problems(workflow)).not_to be_empty
+    end
+
+    it "fails when no run step names the live handoff spec" do
+      live_handoff_step["run"] = live_handoff_step.fetch("run").sub(live_handoff_spec, "").strip
+
+      expect(live_handoff_problems(workflow)).to eq(["no job runs #{live_handoff_spec}"])
+    end
+
+    it "fails when the live job ignores failures" do
+      live_handoff_jobs.each { |job| job["continue-on-error"] = true }
+
+      expect(live_handoff_problems(workflow)).not_to be_empty
+    end
+
+    it "fails when the live handoff step ignores failures" do
+      live_handoff_step["continue-on-error"] = true
+
+      expect(live_handoff_problems(workflow)).not_to be_empty
+    end
+
+    it "fails when the live job skips pushes whose message mentions skip ci" do
+      # A push titled "Fix skip ci handling" would skip the proof.
+      live_handoff_jobs.each do |job|
+        job["if"] = "github.event_name != 'push' || !contains(github.event.head_commit.message, 'skip ci')"
+      end
+
+      expect(live_handoff_problems(workflow)).not_to be_empty
+    end
+
+    it "fails when the live handoff step runs only for pull requests" do
+      live_handoff_step["if"] = "github.event_name == 'pull_request'"
+
+      expect(live_handoff_problems(workflow)).not_to be_empty
+    end
+
+    it "fails when the live job is disabled with if: false" do
+      live_handoff_jobs.each { |job| job["if"] = false }
+
+      expect(live_handoff_problems(workflow)).not_to be_empty
+    end
+
+    it "fails when the live handoff step is disabled with if: false" do
+      live_handoff_step["if"] = false
+
+      expect(live_handoff_problems(workflow)).not_to be_empty
+    end
+
+    it "fails when the live handoff step overrides TIMEKEEPING_LIVE to \"0\"" do
+      live_handoff_step["env"] = { "TIMEKEEPING_LIVE" => "0" }
+
+      expect(live_handoff_problems(workflow)).not_to be_empty
+    end
+
+    it "fails when the live handoff step overrides TIMEKEEPING_DATABASE_URL with a non-test database" do
+      job_url = live_handoff_jobs.first.fetch("env").fetch("TIMEKEEPING_DATABASE_URL")
+      live_handoff_step["env"] = { "TIMEKEEPING_DATABASE_URL" => job_url.sub(%r{/[^/?]+\z}, "/timekeeping_live") }
+
+      expect(live_handoff_problems(workflow)).not_to be_empty
+    end
+
+    it "names the live handoff spec in exactly one job, which still runs the live alerts spec" do
+      # Two jobs naming it would boot the live server and reload the seed twice per push.
+      expect(live_handoff_jobs.size).to eq(1)
+      expect(live_handoff_step.fetch("run")).to match(%r{rspec\b.*spec/integration/timekeeping/alerts_live_spec\.rb})
+    end
+
+    it "gives the live handoff job a read-only token and no secrets" do
+      # The job runs code from any pushed branch.
+      live_handoff_jobs.each do |job|
+        expect(job.fetch("permissions")).to eq("contents" => "read")
+        expect(job.to_yaml).not_to include("secrets.")
+      end
+    end
+  end
 end
