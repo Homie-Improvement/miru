@@ -10,6 +10,17 @@ require "tmpdir"
 # example below that commits a handoff therefore sits in its own context that
 # carries the seed tags itself; tagging this describe would give them one seed.
 RSpec.describe Timekeeping::Handoff::Runner do
+  # A settle integration that records each call in the context's shared calls
+  # log, so the order of settle, drain and admission calls can be read from one array.
+  let(:recording_settle) do
+    log = calls
+    Class.new do
+      define_method(:settle!) { |generation:| log << [:settle, generation] }
+      define_method(:stop_applying!) { log << [:stop_applying] }
+      def settled? = true
+    end.new
+  end
+
   context "with a money control run", :two_tenant_seed, :seeded_without_transaction do
     it "flips a first cutover when neither company's invoice money changed during the handoff" do
       TimekeepingOwnership.ensure_initial!
@@ -73,19 +84,9 @@ RSpec.describe Timekeeping::Handoff::Runner do
     end
 
     context "when cutover, rollback and re-cutover run in turn", :two_tenant_seed, :seeded_without_transaction do
-      # A settle integration that records each call in the shared log, so the
-      # order of settle, drain and admission calls can be read from one array.
-      let(:settle) do
-        log = calls
-        Class.new do
-          define_method(:settle!) { |generation:| log << [:settle, generation] }
-          define_method(:stop_applying!) { log << [:stop_applying] }
-          def settled? = true
-        end.new
-      end
-
       let(:owners) do
-        TimekeepingHandoffFakes.owners(timekeeping: timekeeping_store, monolith_admission:, settle:, log: calls)
+        TimekeepingHandoffFakes.owners(timekeeping: timekeeping_store, monolith_admission:, settle: recording_settle,
+                                       log: calls)
       end
 
       def run_handoff(direction)
@@ -354,17 +355,9 @@ RSpec.describe Timekeeping::Handoff::Runner do
       end.new
     end
 
-    let(:settle) do
-      log = calls
-      Class.new do
-        define_method(:settle!) { |generation:| log << [:settle, generation] }
-        define_method(:stop_applying!) { log << [:stop_applying] }
-        def settled? = true
-      end.new
-    end
-
     let(:owners) do
-      TimekeepingHandoffFakes.owners(timekeeping: timekeeping_store, monolith_admission:, settle:, log: calls)
+      TimekeepingHandoffFakes.owners(timekeeping: timekeeping_store, monolith_admission:, settle: recording_settle,
+                                     log: calls)
     end
 
     def admit_calls

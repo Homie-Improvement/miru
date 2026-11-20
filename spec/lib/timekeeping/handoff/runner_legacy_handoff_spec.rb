@@ -36,6 +36,15 @@ module RunnerLegacyHandoffSpecSupport
     checkpoint.rows.fetch("entries").to_h { |row| [row["id"], row["version"]] }
   end
 
+  # The files a handoff saves once per generation and must never rewrite on resume.
+  def saved_baselines(generation_dir)
+    %w[source_intents.json checkpoint.json money_before.json].index_with { |name| generation_dir.join(name).read }
+  end
+
+  def expect_saved_baselines_unchanged(generation_dir, baselines)
+    baselines.each { |name, text| expect(generation_dir.join(name).read).to eq(text), "#{name} was rewritten" }
+  end
+
   # The verdict shared by the uninterrupted first cutover and every restart
   # after an interruption: the finished cutover holds exactly what an
   # uninterrupted run at the first capture time would have loaded, and the
@@ -570,7 +579,7 @@ RSpec.describe Timekeeping::Handoff::Runner do
       expect([ownership.generation, ownership.owner, ownership.handoff_step]).to eq([2, "monolith", "reconcile"])
 
       generation_dir = Pathname(report_root).join("generation-2")
-      baselines = %w[source_intents.json checkpoint.json money_before.json].index_with { |name| generation_dir.join(name).read }
+      baselines = saved_baselines(generation_dir)
 
       InvoiceOperationsRecord.connection.execute(
         "DELETE FROM invoice_operation_intents WHERE operation_id = '#{operation_id}'"
@@ -590,7 +599,7 @@ RSpec.describe Timekeeping::Handoff::Runner do
         report = generation_dir.join("reconciliation.json").read
         expect(report).to include(operation_id)
         expect(report).to include("missing_in_checkpoint")
-        baselines.each { |name, text| expect(generation_dir.join(name).read).to eq(text), "#{name} was rewritten" }
+        expect_saved_baselines_unchanged(generation_dir, baselines)
       end
       expect(timekeeping.calls).not_to include([:admit, 2])
     end
@@ -610,7 +619,7 @@ RSpec.describe Timekeeping::Handoff::Runner do
                             observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_reconcile))
       end.to raise_error(TimekeepingHandoffHooks::Interrupted)
       generation_dir = Pathname(report_root).join("generation-2")
-      baselines = %w[source_intents.json checkpoint.json money_before.json].index_with { |name| generation_dir.join(name).read }
+      baselines = saved_baselines(generation_dir)
       # The first run's passing report is removed, so only a comparison made by the resume can name the change.
       generation_dir.join("reconciliation.json").delete
 
@@ -669,7 +678,7 @@ RSpec.describe Timekeeping::Handoff::Runner do
       end.to raise_error(TimekeepingHandoffHooks::Interrupted)
       expect(TimekeepingOwnership.current.handoff_step).to eq("reconcile")
       generation_dir = Pathname(report_root).join("generation-3")
-      baselines = %w[source_intents.json checkpoint.json money_before.json].index_with { |name| generation_dir.join(name).read }
+      baselines = saved_baselines(generation_dir)
       rollback_report = generation_dir.join("reconciliation.json")
       rollback_report.delete
       connection = InvoiceOperationsRecord.connection
@@ -701,7 +710,7 @@ RSpec.describe Timekeeping::Handoff::Runner do
       expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", generation: 3, handoff_step: nil)
       expect(owners.fetch(:monolith).admission.calls.count([:admit, 3])).to eq(1)
       expect(rollback_report).to exist
-      baselines.each { |name, text| expect(generation_dir.join(name).read).to eq(text), "#{name} was rewritten" }
+      expect_saved_baselines_unchanged(generation_dir, baselines)
     end
   end
 
