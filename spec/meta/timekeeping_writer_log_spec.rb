@@ -105,7 +105,7 @@ RSpec.describe "TimekeepingWriterLog company attribution across sessions", commi
         )
       end
       begin
-        worker.join
+        expect(worker.join(5)).to eq(worker), "the worker thread did not finish within 5 seconds"
       ensure
         stop_committed_data_threads(worker)
       end
@@ -212,7 +212,7 @@ RSpec.describe "TimekeepingWriterLog second connection", committed_data: true do
       worker = committed_data_thread(pids) do
         ActiveRecord::Base.connection.execute("UPDATE timesheet_entries SET note = 'other session' WHERE id = #{entry.id}")
       end
-      worker.join
+      expect(worker.join(5)).to eq(worker), "the worker thread did not finish within 5 seconds"
       worker_pid = pids.pop
 
       rows = TimekeepingWriterLog.rows(connection, include_backend_pid: true)
@@ -240,6 +240,9 @@ RSpec.describe "TimekeepingWriterLog remove twice", committed_data: true do
     SQL
     expect(connection.select_value("SELECT count(*) FROM pg_proc WHERE proname = 'miru_writer_log_record'")).to eq(0)
     expect(connection.select_value("SELECT to_regclass('public.miru_writer_log') IS NULL")).to be(true)
+  ensure
+    # A failing remove! above must not leave the trigger on for later examples.
+    TimekeepingWriterLog.remove!(ActiveRecord::Base.connection)
   end
 end
 
@@ -563,7 +566,9 @@ RSpec.describe "TimekeepingWriterLog section 10.1 parser edges" do
 end
 
 RSpec.describe "TimekeepingWriterLog clear!", committed_data: true do
-  it "clear! empties the log by delete, keeps the trigger live, and leaves no TRUNCATE for the reset-site scan" do
+  # "`clear!(connection = ActiveRecord::Base.connection)` empties the log with DELETE FROM." That it uses no
+  # TRUNCATE is enforced by spec/meta/test_database_cleanup_reset_sites_spec.rb, which scans this support file.
+  it "clear! empties the log and keeps the trigger live" do
     connection = ActiveRecord::Base.connection
     entry = create(:timesheet_entry)
 
@@ -581,14 +586,5 @@ RSpec.describe "TimekeepingWriterLog clear!", committed_data: true do
         [{ writer: nil, company_id: entry.reload.company_id, op: "UPDATE" }]
       )
     end
-
-    # "`clear!(connection = ActiveRecord::Base.connection)` empties the log with DELETE FROM. Never use TRUNCATE:
-    # `spec/meta/test_database_cleanup_reset_sites_spec.rb` refuses a raw TRUNCATE outside two allowed files."
-    # This is the scan's own "raw SQL truncate" pattern, applied to non-comment lines of the new support file.
-    raw_truncate = /(?:["'`]|^\s*)truncate(?:\s+(?:table\s+)?["#\w]|\s*$)/i
-    source = Rails.root.join("spec/support/timekeeping/writer_log.rb").read
-    offending = source.each_line.reject { |line| line.lstrip.start_with?("#") }
-                      .select { |line| line.match?(raw_truncate) || line.match?(/[.]truncate_tables?\b/) }
-    expect(offending).to eq([])
   end
 end
