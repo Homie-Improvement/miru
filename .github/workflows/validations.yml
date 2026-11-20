@@ -27,7 +27,13 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-    if: github.event_name != 'push' || !contains(github.event.head_commit.message, 'skip ci')
+    # The one condition every test job reads, through the full_suite_condition
+    # alias. A push runs the test jobs only on a release branch, and not when
+    # its commit message asks to skip CI; pull request and manual runs always
+    # run them. A feature branch gets the full suite from its pull request run,
+    # so its push run would only repeat it. timekeeping-alerts-live and
+    # security-audit carry no condition and run on every branch push.
+    if: &full_suite_condition github.event_name != 'push' || (contains(fromJSON('["develop","main","stable-3-0","production"]'), github.ref_name) && !contains(github.event.head_commit.message, 'skip ci'))
     env:
       RAILS_ENV: test
       DB_HOST: localhost
@@ -167,7 +173,7 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
-    if: github.event_name != 'push' || !contains(github.event.head_commit.message, 'skip ci')
+    if: *full_suite_condition
     strategy:
       # Let every group finish so one failure does not hide another.
       fail-fast: false
@@ -225,7 +231,9 @@ jobs:
     permissions:
       contents: read
     needs: timekeeping-handoff
-    if: always() && (github.event_name != 'push' || !contains(github.event.head_commit.message, 'skip ci'))
+    # Skipped exactly when the matrix was skipped, so a feature-branch push
+    # leaves no failed check behind.
+    if: always() && needs.timekeeping-handoff.result != 'skipped'
     steps:
       - name: Require every handoff spec group to pass
         env:
@@ -238,7 +246,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-    if: github.event_name != 'push' || !contains(github.event.head_commit.message, 'skip ci')
+    if: *full_suite_condition
     env:
       RAILS_ENV: test
       DB_HOST: localhost
@@ -314,7 +322,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-    if: github.event_name != 'push' || !contains(github.event.head_commit.message, 'skip ci')
+    if: *full_suite_condition
     defaults:
       run:
         working-directory: gems/timekeeping_rules
@@ -342,7 +350,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-    if: github.event_name != 'push' || !contains(github.event.head_commit.message, 'skip ci')
+    if: *full_suite_condition
     defaults:
       run:
         working-directory: gems/timekeeping_relay
@@ -370,7 +378,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-    if: github.event_name != 'push' || !contains(github.event.head_commit.message, 'skip ci')
+    if: *full_suite_condition
     env:
       RAILS_ENV: test
       TIMEKEEPING_DATABASE_URL: postgres://root:password@localhost:5432/timekeeping_test
@@ -496,7 +504,7 @@ jobs:
     timeout-minutes: 25
     permissions:
       contents: read
-    if: github.event_name != 'push' || !contains(github.event.head_commit.message, 'skip ci')
+    if: *full_suite_condition
     env:
       RAILS_ENV: test
       DB_HOST: localhost
@@ -556,6 +564,9 @@ jobs:
           spec/meta/timekeeping_tenant_state_digest_spec.rb
           spec/lib/timekeeping_demo/boot_database_isolation_live_spec.rb
 
+  # No condition, so this job runs on every branch push, feature branches and
+  # skip-CI messages included: it is short, and bundler-audit checks against
+  # newly published advisories, which a skipped run would miss.
   security-audit:
     name: Security audit
     runs-on: ubuntu-24.04
