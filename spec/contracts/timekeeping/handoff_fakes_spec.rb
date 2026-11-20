@@ -433,4 +433,15 @@ RSpec.describe TimekeepingHandoffFakes, ".owners" do
     unadmitted = described_class.owners(timekeeping: placeholder, monolith_admission: nil, relay: false)
     expect(unadmitted.fetch(:monolith).admission).to be_nil
   end
+
+  # The outbox relay reads admitted generations from the store, so a separate
+  # admission would leave it holding back every row.
+  it "refuses relay :timekeeping_outbox with a Timekeeping admission other than the store" do
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+
+    expect do
+      described_class.owners(timekeeping:, timekeeping_admission: TimekeepingHandoffFakes::RecordingAdmission.new,
+                             relay: :timekeeping_outbox)
+    end.to raise_error(ArgumentError, /timekeeping_outbox/)
+  end
 end

@@ -310,6 +310,11 @@ module TimekeepingHandoffFakes
   def self.owners(timekeeping:, timekeeping_admission: timekeeping, monolith_admission: RecordingAdmission.new,
                   monolith_store: Timekeeping::Handoff::MonolithStore.new(connection: ActiveRecord::Base.connection),
                   settle: NoOpSettle.new, relay: true, log: nil)
+    if relay == :timekeeping_outbox && !timekeeping_admission.equal?(timekeeping)
+      raise ArgumentError, "relay: :timekeeping_outbox needs the store as Timekeeping's admission, " \
+                           "or the relay never sees which generations were admitted"
+    end
+
     drains = RELAY_DRAINS.fetch(relay)
     drain_for = ->(name, store) { drains.fetch(name)&.new(store:, log:) }
     {
