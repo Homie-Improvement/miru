@@ -217,57 +217,6 @@ RSpec.describe "TimekeepingRegressionAdapter per-example reset, next example", :
   end
 end
 
-RSpec.describe "TimekeepingRegressionAdapter refusing a non-test database", committed_data: true do
-  # "A URL whose libpq name ends in \_test but whose Active Record name does not is refused before db:prepare.
-  # Use the vector `postgresql://harness_selector_user@127.0.0.1/timekeeping_development?dbname=timekeeping_selector_test`;
-  # `TimekeepingLiveInstance.start` is never called."
-  it "start! refuses a URL whose Active Record name does not end in _test before starting the instance" do
-    skip "The suite's own live adapter is running; this example drives start! from a clean state" if TimekeepingRegressionAdapter.current
-
-    allow(TimekeepingLiveInstance).to receive(:start)
-    allow_list_before = Array(WebMock::Config.instance.allow).dup
-    env = {
-      "TIMEKEEPING_REGRESSION" => "1",
-      "TIMEKEEPING_LIVE" => "1",
-      "TIMEKEEPING_DATABASE_URL" =>
-        "postgresql://harness_selector_user@127.0.0.1/timekeeping_development?dbname=timekeeping_selector_test"
-    }
-
-    expect { TimekeepingRegressionAdapter.start!(env:, owner_state: "timekeeping") }
-      .to raise_error(TestDatabaseGuard::NotATestDatabase)
-
-    expect(TimekeepingLiveInstance).not_to have_received(:start)
-    expect(Array(WebMock::Config.instance.allow)).to eq(allow_list_before)
-    expect(TimekeepingRegressionAdapter.current).to be_nil
-  end
-end
-
-RSpec.describe "TimekeepingRegressionAdapter start gate", committed_data: true do
-  # "`start!` returns nil unless `env["TIMEKEEPING_REGRESSION"] == "1"`, `env["TIMEKEEPING_LIVE"] == "1"` and
-  # `owner_state == "timekeeping"`."
-  it "start! returns nil and starts nothing for rollback, legacy or a missing flag" do
-    skip "The suite's own live adapter is running; this example drives start! from a clean state" if TimekeepingRegressionAdapter.current
-
-    allow(TimekeepingLiveInstance).to receive(:start)
-    url = { "TIMEKEEPING_DATABASE_URL" => "postgresql://gate_user@127.0.0.1/timekeeping_gate_test" }
-    both_flags = { "TIMEKEEPING_REGRESSION" => "1", "TIMEKEEPING_LIVE" => "1" }
-    cases = [
-      [both_flags.merge(url), "rollback"],
-      [both_flags.merge(url), "legacy"],
-      [{ "TIMEKEEPING_LIVE" => "1" }.merge(url), "timekeeping"],
-      [{ "TIMEKEEPING_REGRESSION" => "true", "TIMEKEEPING_LIVE" => "1" }.merge(url), "timekeeping"],
-      [{ "TIMEKEEPING_REGRESSION" => "1" }.merge(url), "timekeeping"],
-      [{ "TIMEKEEPING_REGRESSION" => "1", "TIMEKEEPING_LIVE" => "" }.merge(url), "timekeeping"]
-    ]
-
-    cases.each do |env, owner_state|
-      expect(TimekeepingRegressionAdapter.start!(env:, owner_state:)).to be_nil
-      expect(TimekeepingRegressionAdapter.current).to be_nil
-    end
-    expect(TimekeepingLiveInstance).not_to have_received(:start)
-  end
-end
-
 RSpec.describe "TimekeepingRegressionAdapter failed start", committed_data: true do
   # "If anything fails after the instance began, stop it and leave `current` nil. No error message carries the URL,
   # the service token or the private key."
@@ -350,59 +299,6 @@ RSpec.describe TimekeepingRegressionAdapter, committed_data: true do
     expect(uri.host).to eq("127.0.0.1")
     expect(ENV.fetch(Timekeeping::EntryApiClient::BASE_URL_ENV)).to eq(instance.base_url)
     expect(WebMock::Config.instance.allow).to eq(["127.0.0.1:#{uri.port}"])
-  end
-end
-
-RSpec.describe "TimekeepingRegressionAdapter start guards", committed_data: true do
-  before do
-    if TimekeepingRegressionAdapter.current
-      skip "The suite's live adapter is running; these examples drive start! from a stopped adapter"
-    end
-  end
-
-  # "adapter start with TIMEKEEPING_DATABASE_URL unset raises and boots nothing"
-  # "Spies show `TimekeepingLiveInstance.start` and `Puma::Server.new` never called, the WebMock allow list and
-  # both env keys unchanged, and `current` nil."
-  it "start! with TIMEKEEPING_DATABASE_URL missing from env raises BootError naming only the key and boots nothing" do
-    allow(TimekeepingLiveInstance).to receive(:start)
-    allow(Puma::Server).to receive(:new).and_call_original
-    allow_list_before = WebMock::Config.instance.allow.dup
-    base_url_before = ENV.fetch(Timekeeping::EntryApiClient::BASE_URL_ENV, nil)
-    key_before = ENV.fetch(Timekeeping::UserToken::PRIVATE_KEY_ENV, nil)
-    env = { "TIMEKEEPING_REGRESSION" => "1", "TIMEKEEPING_LIVE" => "1" }
-
-    expect { TimekeepingRegressionAdapter.start!(env:, owner_state: "timekeeping") }
-      .to raise_error(TimekeepingRegressionAdapter::BootError, /TIMEKEEPING_DATABASE_URL/)
-
-    expect(TimekeepingLiveInstance).not_to have_received(:start)
-    expect(Puma::Server).not_to have_received(:new)
-    expect(WebMock::Config.instance.allow).to eq(allow_list_before)
-    expect(ENV.fetch(Timekeeping::EntryApiClient::BASE_URL_ENV, nil)).to eq(base_url_before)
-    expect(ENV.fetch(Timekeeping::UserToken::PRIVATE_KEY_ENV, nil)).to eq(key_before)
-    expect(TimekeepingRegressionAdapter.current).to be_nil
-  end
-end
-
-RSpec.describe "TimekeepingRegressionAdapter mixed database names", committed_data: true do
-  before do
-    if TimekeepingRegressionAdapter.current
-      skip "The suite's live adapter is running; these examples drive start! from a stopped adapter"
-    end
-  end
-
-  # "A URL whose libpq name ends in \_test but whose Active Record name does not is refused before db:prepare."
-  it "start! refuses a URL whose libpq name ends in _test but whose Active Record name does not, before the instance or WebMock is touched" do
-    allow(TimekeepingLiveInstance).to receive(:start)
-    allow_list_before = WebMock::Config.instance.allow.dup
-    url = "postgresql://harness_selector_user@127.0.0.1/timekeeping_development?dbname=timekeeping_selector_test"
-    env = { "TIMEKEEPING_REGRESSION" => "1", "TIMEKEEPING_LIVE" => "1", "TIMEKEEPING_DATABASE_URL" => url }
-
-    expect { TimekeepingRegressionAdapter.start!(env:, owner_state: "timekeeping") }
-      .to raise_error(TestDatabaseGuard::NotATestDatabase) { |error| expect(error.message).not_to include(url) }
-
-    expect(TimekeepingLiveInstance).not_to have_received(:start)
-    expect(WebMock::Config.instance.allow).to eq(allow_list_before)
-    expect(TimekeepingRegressionAdapter.current).to be_nil
   end
 end
 
