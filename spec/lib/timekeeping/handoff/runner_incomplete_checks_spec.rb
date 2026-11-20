@@ -13,22 +13,9 @@ RSpec.describe Timekeeping::Handoff::Runner do
   let(:calls) { [] }
   let(:clock) { Struct.new(:now).new(Time.utc(2026, 10, 27, 12)) }
 
-  # Timekeeping's store stubbed at its client boundary: it keeps what is loaded
-  # and records every admission call in the shared log, tagged with its owner.
-  let(:timekeeping_store) do
-    log = calls
-    Class.new do
-      define_method(:initialize) { @next_id = 1 }
-      define_method(:fence_admission) { log << [:timekeeping, :fence]; nil }
-      define_method(:admit) { |generation:| log << [:timekeeping, :admit, generation]; nil }
-      def enforces_fence? = true
-      def load_checkpoint(checkpoint) = (@loaded = checkpoint)
-      def export_checkpoint = @loaded
-      def highest_outbox_position = 0
-      def advance_entry_id_sequence(above:) = (@next_id = [@next_id, above + 1].max)
-      def write_correction_snapshots(snapshots:, version:, generation:) = snapshots.size
-    end.new
-  end
+  # Timekeeping's store records every admission call in the shared log, tagged
+  # with its owner, and keeps an outbox the outbox relay drains on rollback.
+  let(:timekeeping_store) { TimekeepingHandoffFakes::InMemoryTimekeepingStore.new(log: calls, tag: :timekeeping) }
 
   let(:monolith_admission) do
     log = calls
@@ -222,9 +209,9 @@ RSpec.describe Timekeeping::Handoff::Runner do
       end.new
     end
 
-    # The relay delivers as usual, but reports nothing drained while stalled is set.
+    # The outbox relay delivers as usual, but reports nothing drained while stalled is set.
     let(:stalled_relay) do
-      Class.new(TimekeepingHandoffFakeRelay) do
+      Class.new(TimekeepingHandoffOutboxRelay) do
         attr_accessor :stalled
 
         def drained?(through:) = !stalled && super

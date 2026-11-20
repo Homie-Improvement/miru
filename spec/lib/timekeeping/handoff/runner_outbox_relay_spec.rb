@@ -9,7 +9,7 @@ RSpec.describe Timekeeping::Handoff::Runner do
       raised_ids = TimesheetEntry.unscoped.where(version: 0).pluck(:id)
       expect(raised_ids).not_to be_empty
       timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-      owners = TimekeepingHandoffFakes.owners(timekeeping:, relay: :timekeeping_outbox)
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
       report_root = Pathname(Dir.mktmpdir("handoff-report"))
 
       described_class.run(direction: :cutover, owners:, report_root:)
@@ -53,7 +53,7 @@ RSpec.describe Timekeeping::Handoff::Runner do
         end
       end
       timekeeping = store_class.new
-      owners = TimekeepingHandoffFakes.owners(timekeeping:, relay: :timekeeping_outbox)
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
       report_root = Pathname(Dir.mktmpdir("handoff-report"))
 
       described_class.run(direction: :cutover, owners:, report_root:)
