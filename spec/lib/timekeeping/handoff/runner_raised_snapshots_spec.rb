@@ -4,7 +4,7 @@ require "rails_helper"
 require "tmpdir"
 
 RSpec.describe Timekeeping::Handoff::Runner do
-  context "more tests 2", :two_tenant_seed, :seeded_without_transaction do
+  context "raised snapshots at the first cutover", :two_tenant_seed, :seeded_without_transaction do
     it "a first cutover resumed after its snapshots were written keeps exactly one version-1 snapshot for every raised or corrected legacy entry" do
       timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
       owners = TimekeepingHandoffFakes.owners(timekeeping:)
@@ -37,9 +37,7 @@ RSpec.describe Timekeeping::Handoff::Runner do
         expect(by_id.fetch(row["id"])).to eq(row.except("version").merge("locked" => row["locked"] == true))
       end
     end
-  end
 
-  context "more tests 3", :two_tenant_seed, :seeded_without_transaction do
     # The monolith's projection reaches version 1 only through a relayed snapshot, so
     # every legacy entry the load raises from version 0 must be written to Timekeeping's
     # outbox at the cutover. Otherwise a rollback finds "entries left at version 0 in
