@@ -598,237 +598,80 @@ RSpec.describe "CI spec coverage in validations.yml" do
     end
   end
 
-  context "more tests 10" do
-    it "keeps the security audit running on every branch push while the test jobs skip feature-branch pushes" do
-      # The audit checks dependencies against newly published advisories, so a
-      # condition on it would let a feature-branch push skip that check.
-      security_audit = jobs.fetch("security-audit")
-      expect(security_audit).not_to have_key("if")
-      expect(Array(security_audit["steps"]).none? { |step| step.key?("if") }).to be(true)
-      expect(security_audit.fetch("permissions")).to eq("contents" => "read")
-
-      # "Either the jobs other than timekeeping-alerts-live (such as `tests` and the handoff matrix)
-      # skip feature-branch pushes through one condition that reads a single branch list kept in one
-      # place, or a recorded decision says they keep running on every branch push."
-      shared_condition = tests_job.fetch("if")
-      expect(shared_condition).to eq(
-        "github.event_name != 'push' || " \
+  # Acceptance: "Either the jobs other than timekeeping-alerts-live (such as `tests` and the handoff matrix)
+  # skip feature-branch pushes through one condition that reads a single branch list kept in one place, or a
+  # recorded decision says they keep running on every branch push."
+  describe "guard for the feature-branch push skip" do
+    let(:workflow_text) { File.read(Rails.root.join(".github/workflows/validations.yml")) }
+    let(:shared_condition) do
+      "github.event_name != 'push' || " \
         "(contains(fromJSON('[\"develop\",\"main\",\"stable-3-0\",\"production\"]'), github.ref_name) && " \
         "!contains(github.event.head_commit.message, 'skip ci'))"
-      )
-      expect(handoff_job.fetch("if")).to eq(shared_condition)
     end
-  end
-
-  context "more tests 11" do
-    it "skips feature-branch pushes in every test job through one shared condition that lists the release branches" do
-      # Acceptance: "Either the jobs other than timekeeping-alerts-live (such as `tests` and the handoff matrix)
-      # skip feature-branch pushes through one condition that reads a single branch list kept in one place, or a
-      # recorded decision says they keep running on every branch push."
-      # The whole expression is compared, so swapping its inner && for || (which would run every job on a
-      # feature-branch push) fails here.
-      expected_condition = "github.event_name != 'push' || " \
-                           "(contains(fromJSON('[\"develop\",\"main\",\"stable-3-0\",\"production\"]'), github.ref_name) && " \
-                           "!contains(github.event.head_commit.message, 'skip ci'))"
-      shared_jobs = %w[
+    let(:shared_condition_jobs) do
+      %w[
         tests timekeeping-handoff responsive-system-specs timekeeping-rules
         timekeeping-relay timekeeping timekeeping-runtime-live
       ]
-
-      shared_jobs.each do |job_id|
-        expect(jobs.fetch(job_id).fetch("if").to_s.strip).to eq(expected_condition), "#{job_id} does not read the shared condition"
-      end
     end
-  end
+    # The live proof must run on every branch push; the security audit keeps running on every push by the
+    # decision recorded beside it in the workflow.
+    let(:unconditioned_jobs) { %w[timekeeping-alerts-live security-audit] }
 
-  context "more tests 12" do
-    it "runs the handoff summary check exactly when the handoff matrix ran, under always()" do
-      # The summary step runs `test "$HANDOFF_RESULT" = success`. If it ran while the matrix was skipped on a
-      # feature-branch push, it would fail every such push; deriving its skip from the matrix result keeps the
-      # two in step without repeating the branch list.
-      summary_job = jobs.fetch("timekeeping-handoff-result")
-
-      expect(summary_job.fetch("if").to_s.strip).to eq("always() && needs.timekeeping-handoff.result != 'skipped'")
-      expect(summary_job.fetch("if").to_s).not_to include("stable-3-0")
-    end
-  end
-
-  context "more tests 13" do
-    it "keeps the live proof and the security audit unconditioned and gives every other job a branch-aware condition" do
-      # The live proof runs on every branch push; the security audit keeps running on every push by a recorded
-      # decision. Every other job must read the release branch list, so a new job added without it fails here.
-      unconditioned = %w[timekeeping-alerts-live security-audit]
-
-      unconditioned.each do |job_id|
-        expect(jobs.fetch(job_id)).not_to have_key("if"), "#{job_id} gained a condition"
-      end
-
-      branch_aware = jobs.except(*unconditioned).reject do |_job_id, job|
-        job["if"].to_s.include?("fromJSON('[\"develop\",\"main\",\"stable-3-0\",\"production\"]')") ||
-          job["if"].to_s.include?("needs.timekeeping-handoff.result != 'skipped'")
-      end
-      expect(branch_aware.keys).to be_empty
-    end
-  end
-
-  context "more tests 14" do
-    it "writes the release branch list once in validations.yml and reuses it by alias" do
-      # Acceptance: "...skip feature-branch pushes through one condition that reads a single branch list kept in
-      # one place..." The parsed YAML resolves aliases into equal strings, so only the raw text shows whether the
-      # list was written once or copied.
-      raw_text = File.read(Rails.root.join(".github/workflows/validations.yml"))
-      branch_list = "fromJSON('[\"develop\",\"main\",\"stable-3-0\",\"production\"]')"
-
-      expect(raw_text.scan(branch_list).size).to eq(1)
-      expect(raw_text.scan("&full_suite_condition").size).to eq(1)
-      expect(raw_text.scan("*full_suite_condition").size).to eq(6)
-      expect(raw_text).not_to include("!contains(github.event.head_commit.message, 'skip ci'))\n    if:")
-    end
-  end
-
-  context "more tests 15" do
-    it "runs the suite jobs on feature-branch pushes only through the one shared release-branch condition" do
-      # "Either the jobs other than timekeeping-alerts-live (such as `tests` and the handoff matrix) skip
-      # feature-branch pushes through one condition that reads a single branch list kept in one place, or a
-      # recorded decision says they keep running on every branch push."
-      expected_condition =
-        "github.event_name != 'push' || " \
-        "(contains(fromJSON('[\"develop\",\"main\",\"stable-3-0\",\"production\"]'), github.ref_name) && " \
-        "!contains(github.event.head_commit.message, 'skip ci'))"
-      shared_jobs = %w[
-        tests timekeeping-handoff responsive-system-specs timekeeping-rules
-        timekeeping-relay timekeeping timekeeping-runtime-live
-      ]
-
-      shared_jobs.each do |job_id|
-        expect(jobs.fetch(job_id)["if"].to_s.strip).to eq(expected_condition), "#{job_id} does not read the shared condition"
-      end
-    end
-  end
-
-  context "more tests 16" do
-    it "skips the handoff summary check exactly when the handoff matrix was skipped" do
-      summary = jobs.fetch("timekeeping-handoff-result")
-
-      # A summary that ran while the matrix skipped would compare "skipped" with "success" and fail every
-      # feature-branch push, so it must follow the matrix result and never repeat the branch list.
-      expect(summary["if"].to_s.strip).to eq("always() && needs.timekeeping-handoff.result != 'skipped'")
-      expect(summary["if"].to_s).not_to include("fromJSON")
-      expect(summary["if"].to_s).not_to include("skip ci")
-    end
-  end
-
-  context "more tests 17" do
-    it "gives every workflow job either the shared condition, the derived summary condition or no condition at all" do
-      shared_condition = jobs.fetch("tests")["if"].to_s.strip
-      expect(shared_condition).to include("fromJSON")
-
-      unconditioned = %w[timekeeping-alerts-live security-audit]
-      unconditioned.each do |job_id|
-        expect(jobs.fetch(job_id)).not_to have_key("if"), "#{job_id} must keep running on every branch push"
-      end
-
-      jobs.except(*unconditioned, "timekeeping-handoff-result").each do |job_id, job|
-        expect(job["if"].to_s.strip).to eq(shared_condition), "#{job_id} does not read the shared condition"
-      end
-      # YAML 1.1 reads the bare key `on` as true.
-      expect(workflow.fetch(true) { workflow.fetch("on") }.dig("push", "branches")).to eq(["**"])
-    end
-  end
-
-  context "more tests 18" do
-    it "keeps the release branch list and the shared condition anchor written once in validations.yml" do
-      raw = File.read(Rails.root.join(".github/workflows/validations.yml"))
-
-      # "through one condition that reads a single branch list kept in one place"
-      expect(raw.scan(%q{fromJSON('["develop","main","stable-3-0","production"]')}).size).to eq(1)
-      expect(raw.scan("&full_suite_condition").size).to eq(1)
-      expect(raw.scan("*full_suite_condition").size).to eq(6)
-      expect(raw).not_to include("!contains(github.event.head_commit.message, 'skip ci')\n    if:")
-      expect(raw.scan("'skip ci'").size).to eq(1)
-    end
-  end
-
-  context "more tests 19" do
-    # Acceptance: "Either the jobs other than timekeeping-alerts-live (such as `tests` and the handoff
-    # matrix) skip feature-branch pushes through one condition that reads a single branch list kept
-    # in one place, or a recorded decision says they keep running on every branch push."
-    it "records beside security-audit why it keeps running on every branch push" do
-      raw_lines = File.read(Rails.root.join(".github/workflows/validations.yml")).lines
-      job_line = raw_lines.index { |line| line.match?(/\A  security-audit:\s*\z/) }
-      expect(job_line).not_to be_nil
-
-      comment_block = raw_lines[0...job_line].reverse.take_while { |line| line.match?(/\A\s*#/) }.reverse.join
-      expect(comment_block).not_to be_empty
-      expect(comment_block).to match(/every (branch )?push/i)
-
-      expect(jobs.fetch("security-audit")).not_to have_key("if")
-    end
-  end
-
-  context "more tests 20" do
-    # Acceptance: "Either the jobs other than timekeeping-alerts-live (such as `tests` and the handoff matrix)
-    # skip feature-branch pushes through one condition that reads a single branch list kept in one place, or a
-    # recorded decision says they keep running on every branch push."
     # Comparing the whole expression, not its fragments, rejects a swap of the inner && for ||, which would run
     # every job on a push to a feature branch such as feature/example.
     it "skips every test job on a feature-branch push through the exact shared release-branch condition, not an operator-swapped one" do
-      expected_condition = "github.event_name != 'push' || " \
-                           "(contains(fromJSON('[\"develop\",\"main\",\"stable-3-0\",\"production\"]'), github.ref_name) " \
-                           "&& !contains(github.event.head_commit.message, 'skip ci'))"
-      shared_jobs = %w[
-        tests timekeeping-handoff responsive-system-specs timekeeping-rules
-        timekeeping-relay timekeeping timekeeping-runtime-live
-      ]
+      conditions = shared_condition_jobs.index_with { |id| jobs.fetch(id)["if"] }
 
-      conditions = shared_jobs.index_with { |id| jobs.fetch(id)["if"].to_s.strip }
-
-      expect(conditions).to eq(shared_jobs.index_with(expected_condition))
+      expect(conditions).to eq(shared_condition_jobs.index_with(shared_condition))
     end
-  end
 
-  context "more tests 21" do
-    # Acceptance: "Either the jobs other than timekeeping-alerts-live (such as `tests` and the handoff matrix)
-    # skip feature-branch pushes through one condition that reads a single branch list kept in one place, or a
-    # recorded decision says they keep running on every branch push."
     # The summary runs under always(). If it kept its own copy of the old skip ci text while the matrix skipped a
     # feature branch, it would compare a skipped result against success and fail every feature-branch push.
     it "skips the handoff summary check exactly when the handoff matrix is skipped, so a feature-branch push leaves no failed summary" do
       summary_condition = jobs.fetch("timekeeping-handoff-result")["if"].to_s.strip
 
       expect(summary_condition).to eq("always() && needs.timekeeping-handoff.result != 'skipped'")
-      expect(summary_condition).not_to include("skip ci")
-      expect(summary_condition).not_to include("fromJSON")
     end
-  end
 
-  context "more tests 22" do
-    # Acceptance: "Either the jobs other than timekeeping-alerts-live (such as `tests` and the handoff matrix)
-    # skip feature-branch pushes through one condition that reads a single branch list kept in one place, or a
-    # recorded decision says they keep running on every branch push."
-    # The security audit takes the recorded keep-running arm; the live proof must run on every branch push.
-    # Either job picking up the shared condition would let a feature branch or a skip ci message skip it.
-    it "leaves the live proof and the security audit with no condition so a skip ci message or a feature branch cannot skip them" do
-      unconditioned = %w[timekeeping-alerts-live security-audit].index_with { |id| jobs.fetch(id).key?("if") }
-
+    # A job added later without the shared condition fails here instead of running on every feature push.
+    it "gives every workflow job either the shared condition, the derived summary condition or no condition at all" do
+      unconditioned = unconditioned_jobs.index_with { |id| jobs.fetch(id).key?("if") }
       expect(unconditioned).to eq("timekeeping-alerts-live" => false, "security-audit" => false)
-      expect(jobs.fetch("tests")["if"].to_s).to include("fromJSON")
-    end
-  end
 
-  context "more tests 23" do
-    # Acceptance: "Either the jobs other than timekeeping-alerts-live (such as `tests` and the handoff matrix)
-    # skip feature-branch pushes through one condition that reads a single branch list kept in one place, or a
-    # recorded decision says they keep running on every branch push."
+      jobs.except(*unconditioned_jobs, "timekeeping-handoff-result").each do |job_id, job|
+        expect(job["if"].to_s.strip).to eq(shared_condition), "#{job_id} does not read the shared condition"
+      end
+      # YAML 1.1 reads the bare key `on` as true.
+      expect(workflow.fetch(true) { workflow.fetch("on") }.dig("push", "branches")).to eq(["**"])
+    end
+
+    it "keeps the security audit running on every branch push while the test jobs skip feature-branch pushes" do
+      # The audit checks dependencies against newly published advisories, so a
+      # condition on it would let a feature-branch push skip that check.
+      security_audit = jobs.fetch("security-audit")
+      expect(Array(security_audit["steps"]).none? { |step| step.key?("if") }).to be(true)
+      expect(security_audit.fetch("permissions")).to eq("contents" => "read")
+    end
+
+    it "records beside security-audit why it keeps running on every branch push" do
+      raw_lines = workflow_text.lines
+      job_line = raw_lines.index { |line| line.match?(/\A  security-audit:\s*\z/) }
+      expect(job_line).not_to be_nil
+
+      comment_block = raw_lines[0...job_line].reverse.take_while { |line| line.match?(/\A\s*#/) }.reverse.join
+      expect(comment_block).to match(/every (branch )?push/i)
+    end
+
     # Parsing resolves aliases into equal strings, so only the raw text shows whether the list was copied into
     # each job, where a later edit to one copy would leave the jobs disagreeing.
     it "keeps the release branch list and its shared condition in one place in the workflow text instead of a copy per job" do
-      raw_text = File.read(Rails.root.join(".github/workflows/validations.yml"))
-
-      expect(raw_text.scan("fromJSON(").size).to eq(1)
-      expect(raw_text.scan("&full_suite_condition").size).to eq(1)
-      expect(raw_text.scan("*full_suite_condition").size).to eq(6)
-      expect(raw_text.scan("contains(github.event.head_commit.message, 'skip ci')").size).to eq(1)
+      expect(workflow_text.scan(%q{fromJSON('["develop","main","stable-3-0","production"]')}).size).to eq(1)
+      expect(workflow_text.scan("fromJSON(").size).to eq(1)
+      expect(workflow_text.scan("&full_suite_condition").size).to eq(1)
+      expect(workflow_text.scan("*full_suite_condition").size).to eq(6)
+      expect(workflow_text.scan("'skip ci'").size).to eq(1)
+      expect(workflow_text.scan("contains(github.event.head_commit.message, 'skip ci')").size).to eq(1)
     end
   end
 end
