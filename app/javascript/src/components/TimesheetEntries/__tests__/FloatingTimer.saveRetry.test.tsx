@@ -16,6 +16,7 @@ import {
   TIMER_DECK_VERSION,
   TIMER_STORAGE_KEY,
   type StoredTimerDeck,
+  type StoredTimerState,
 } from "utils/timeTrackingTimer";
 import { i18n } from "../../../i18n";
 import { queryClient } from "../../../lib/queryClient";
@@ -100,16 +101,16 @@ const saveRecordingAdapter = (
   };
 };
 
-const seedStoppedTimer = (description: string) => {
-  const timer = {
-    ...createTimerState(),
-    elapsedTime: 30 * 60 * 1000,
-    project: SEEDED_PROJECT.name,
-    client: SEEDED_PROJECT.client,
-    projectId: SEEDED_PROJECT.id,
-    description,
-  };
+const stoppedTimer = (): StoredTimerState => ({
+  ...createTimerState(),
+  elapsedTime: 30 * 60 * 1000,
+  project: SEEDED_PROJECT.name,
+  client: SEEDED_PROJECT.client,
+  projectId: SEEDED_PROJECT.id,
+  description: "timer save",
+});
 
+const seedTimer = (timer: StoredTimerState) => {
   const deck: StoredTimerDeck = {
     activeTimerId: timer.id,
     timers: [timer],
@@ -182,7 +183,8 @@ describe("FloatingTimer Save under the app's mutation retry", () => {
   it("retries a failed Save with the click's key and body, and a second Save gets a new key", async () => {
     const sends: SaveSend[] = [];
     api.defaults.adapter = saveRecordingAdapter(1, sends);
-    seedStoppedTimer("first save");
+    const timer = stoppedTimer();
+    seedTimer(timer);
     await renderTimer(0);
 
     // The render advanced the clock, so put it back just before midnight.
@@ -202,13 +204,17 @@ describe("FloatingTimer Save under the app's mutation retry", () => {
       timesheet_entry: { work_date: CLICK_DAY, duration: 30 },
     });
 
-    seedStoppedTimer("second save");
+    // The second Save repeats the same timer at the same moment, so its body
+    // matches the first and only the click itself can give it a new key.
+    seedTimer(timer);
     await renderTimer(1);
+    vi.setSystemTime(CLICK_TIME);
     await click(i18n.t("timer.stop"));
     await click(i18n.t("timeTracking.saveEntry"));
     await advance(PAST_RETRY_DELAY_MS);
 
     expect(sends).toHaveLength(3);
+    expect(sends[2].body).toEqual(sends[0].body);
     expect(sends[2].key).toEqual(expect.any(String));
     expect(sends[2].key).not.toBe(sends[0].key);
   });
