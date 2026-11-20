@@ -85,6 +85,7 @@ module TimekeepingDatabaseReset
   # Any other connection failure (server down, wrong password) raises, so a
   # caller never runs on rows that were not reset. The new error names only the
   # database and drops the original as its cause, which can carry the URL's host.
+  # Public so TenantStateDigest opens the Timekeeping database the same way.
   def connect(url, name)
     PG.connect(url)
   rescue PG::ConnectionBad => e
@@ -112,5 +113,5 @@ module TimekeepingDatabaseReset
       connection.exec_params("INSERT INTO admission (id, generation) VALUES ($1, $2)", [ADMISSION_ID, generation])
     end
   end
-  private_class_method :admission_generation, :connect, :truncate_tables, :insert_admission
+  private_class_method :admission_generation, :truncate_tables, :insert_admission
 end
