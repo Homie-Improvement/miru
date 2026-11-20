@@ -45,9 +45,6 @@ module TimekeepingOwnerState
   # Example metadata for specs that assert on writes forwarded to Timekeeping.
   # In a state where the monolith owns the entries nothing is forwarded, so
   # the hook below skips those examples with a stated reason.
-  # Metadata for examples that assert on writes forwarded to Timekeeping. They
-  # are skipped in states where the monolith owns the entries, because there
-  # the gateway writes locally and nothing is forwarded.
   FORWARDS_TAG = :forwards_to_timekeeping
 
   module_function
@@ -109,9 +106,6 @@ module TimekeepingOwnerState
   # asks Timekeeping::EntryOwner, the rule the gateway dispatches on, so no
   # list of forwarding states is kept here. Raises like fetch for an unknown
   # name, so a misspelt state fails instead of skipping forwarded examples.
-  # Whether the gateway forwards entry writes to Timekeeping in the state. It
-  # asks the gateway's own owner rule rather than listing states, so a new or
-  # remapped state answers correctly; an unknown name raises, as fetch does.
   def forwards_writes?(state_name)
     columns = fetch(state_name).slice(*OWNERSHIP_COLUMNS)
     Timekeeping::EntryOwner.for(TimekeepingOwnership.new(columns)) == :timekeeping
@@ -120,9 +114,6 @@ module TimekeepingOwnerState
   # Why an example tagged FORWARDS_TAG cannot run in its state, or nil when it
   # can: when it is untagged, when no state is selected (the forwarding helper
   # then hands ownership to Timekeeping), or when its state forwards writes.
-  # The reason to skip a FORWARDS_TAG example, or nil to run it. With no state
-  # selected the forwarding helper hands ownership to Timekeeping, so the
-  # example runs.
   def forwarding_skip_reason(metadata)
     return nil unless metadata[FORWARDS_TAG] == true
 
