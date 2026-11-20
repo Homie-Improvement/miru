@@ -40,7 +40,7 @@ RSpec.describe TenantStateDigest do
     skip "set TIMEKEEPING_LIVE=1 to use the Timekeeping test database" unless ENV["TIMEKEEPING_LIVE"] == "1"
 
     url = ENV.fetch("TIMEKEEPING_DATABASE_URL")
-    IntegratedRuntime.require_test_database_url!(url)
+    TestDatabaseGuard.require_test_database_url!(url)
     output, status = Bundler.with_unbundled_env do
       Open3.capture2e({ "RAILS_ENV" => "test", "BUNDLE_GEMFILE" => Rails.root.join("timekeeping/Gemfile").to_s,
                         "TIMEKEEPING_DATABASE_URL" => url, "DATABASE_URL" => nil },

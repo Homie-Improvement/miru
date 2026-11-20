@@ -2,7 +2,6 @@
 
 require "digest"
 require "pg"
-require_relative "integrated_runtime"
 require_relative "timekeeping_database_reset"
 
 # Per-company content digests of the Timekeeping tenant state in both
@@ -72,7 +71,7 @@ module TenantStateDigest
   # this module opens it only through libpq, so libpq's name is the one checked.
   def require_test_database!(timekeeping_url)
     if timekeeping_url.is_a?(String) && timekeeping_url.match?(URL_FORM)
-      IntegratedRuntime.require_test_database_url!(timekeeping_url)
+      TestDatabaseGuard.require_test_database_url!(timekeeping_url)
     else
       TestDatabaseGuard.require_test_database!(TimekeepingDatabaseReset.database_name(timekeeping_url))
     end
