@@ -26,7 +26,7 @@ applies_when:
 
 On a live rollback, the monolith's `timesheet_entries` projection changes only when Timekeeping's outbox relay delivers a snapshot to `Timekeeping::ProjectionConsumer`. If the runner forgets to write a snapshot for a raised or corrected entry, the projection keeps the old version. Reconcile then refuses the rollback.
 
-The default fake drain, `TimekeepingHandoffFakeRelay`, does not work that way. It copies every stored entry straight into the projection. A runner spec on the default `TimekeepingHandoffFakes.owners(timekeeping:)` therefore passes even when a snapshot is missing. The bug shows up only on a live run.
+The default fake drain, `TimekeepingHandoffFakeRelay`, does not work that way. It copies every stored entry straight into the projection, with `locked` set from the entry's reservations through `Timekeeping::Handoff::ReservationLocks.build` rather than the stored column. A runner spec on the default `TimekeepingHandoffFakes.owners(timekeeping:)` therefore passes even when a snapshot is missing. The bug shows up only on a live run.
 
 ## Solution
 
