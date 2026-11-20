@@ -559,6 +559,38 @@ RSpec.describe "arrange_owned_entries when only the admit fails", committed_data
   end
 end
 
+RSpec.describe "arrange_owned_entries keeping non-default fixture values", committed_data: true do
+  it "each state keeps a row's work date, duration and bill status in the owner and the projection" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    project = create(:project, billable: true, client: create(:client, company:))
+    values = { work_date: "2026-04-15", duration: 90.0, bill_status: "non_billable" }
+    expected = [Date.new(2026, 4, 15), 90.0, "non_billable"]
+    loaded_rows = []
+    store = Object.new
+    store.define_singleton_method(:fence_admission) { nil }
+    store.define_singleton_method(:load_checkpoint) { |checkpoint| loaded_rows.replace(checkpoint.rows.fetch("entries")) }
+    store.define_singleton_method(:advance_entry_id_sequence) { |above:| above + 1 }
+    store.define_singleton_method(:admit) { |generation:| nil }
+    projection_values = ->(id) { TimesheetEntry.unscoped.find(id).then { [_1.work_date, _1.duration, _1.bill_status] } }
+
+    legacy_id, = arrange_owned_entries([{ company:, user:, project:, **values }], state: "legacy")
+    expect(projection_values.call(legacy_id)).to eq(expected)
+
+    rollback_id, = arrange_owned_entries([{ company:, user:, project:, **values }], state: "rollback")
+    owner = Timekeeping::LocalEntry.find(rollback_id)
+    expect([owner.work_date, owner.duration, owner.bill_status]).to eq(expected)
+    expect(projection_values.call(rollback_id)).to eq(expected)
+
+    timekeeping_id, = arrange_owned_entries([{ company:, user:, project:, **values }], state: "timekeeping",
+                                                                                     timekeeping_store: store)
+    loaded = loaded_rows.find { |row| row.fetch("id") == timekeeping_id }
+    expect(loaded.values_at("work_date", "duration", "bill_status")).to eq(expected)
+    expect(projection_values.call(timekeeping_id)).to eq(expected)
+  end
+end
+
 RSpec.describe "owned_entry for an id the owning store does not hold", committed_data: true do
   it "rollback state: owned_entry raises for an id that only has a timesheet_entries row instead of returning the projection" do
     company = create(:company)
