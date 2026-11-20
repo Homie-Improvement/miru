@@ -468,7 +468,7 @@ RSpec.describe "CI spec coverage in validations.yml" do
         squash = ->(text) { text.to_s.gsub(/\s+/, "") }
         return [] if squash.call(settings["group"]) == squash.call(event_separated_group)
 
-        ["#{scope} cancels runs in a group that push and pull_request runs of one branch can share"]
+        ["#{scope} cancels runs in a group other than one per event and branch"]
       end
 
       def live_jobs_in(workflow)
@@ -505,56 +505,21 @@ RSpec.describe "CI spec coverage in validations.yml" do
         )
       end
 
-      it "matches the slash-named branch feature/x with every push branch pattern the workflow lists" do
-        # GitHub branch filters treat `*` as any run of characters except `/` and `**` as any run at
-        # all, so a `*` pattern would silently leave feature/x without the live proof.
-        glob_to_regexp = lambda do |pattern|
-          source = pattern.split(/(\*\*|\*)/).map do |part|
-            case part
-            when "**" then ".*"
-            when "*" then "[^/]*"
-            else Regexp.escape(part)
-            end
-          end.join
-          Regexp.new("\\A#{source}\\z")
-        end
+      it "fails when push lists branches as a single star, which does not match slash-named branches such as feature/x" do
+        push_trigger["branches"] = ["*"]
 
-        branches = Array((push_trigger || {}).fetch("branches", ["**"]))
-        expect(branches.any? { |pattern| glob_to_regexp.call(pattern.to_s).match?("feature/x") }).to be(true)
-        expect(glob_to_regexp.call("*").match?("feature/x")).to be(false)
+        expect(live_handoff_trigger_problems(workflow)).to include("push lists branches other than \"**\"")
       end
 
-      it "puts a push and a pull request run of feature/x in different cancelling groups while two pushes still share one" do
-        # Resolves the group the way GitHub does for the only expression shapes the workflow should
-        # use: `github.<field>` lookups joined by `||`, where an empty value falls through to the
-        # next one. Any other expression is refused, so an unexpected group cannot pass by accident.
-        resolve_group = lambda do |template, context|
-          template.to_s.gsub(/\$\{\{(.*?)\}\}/) do
-            operands = Regexp.last_match(1).split("||").map(&:strip)
-            unless operands.all? { |operand| operand.match?(/\Agithub\.[a-z_]+\z/) }
-              raise ArgumentError, "unsupported concurrency expression: #{Regexp.last_match(0)}"
-            end
+      # A group keyed on the commit or the run is unique per push, so a newer push to a branch
+      # would no longer cancel the older run.
+      it "fails when the cancelling group is keyed on github.sha or github.run_id" do
+        %w[github.sha github.run_id].each do |per_run_field|
+          workflow["concurrency"] = { "group" => "#{event_separated_group}-${{ #{per_run_field} }}", "cancel-in-progress" => true }
 
-            operands.map { |operand| context.fetch(operand.delete_prefix("github.")) }.find { |value| !value.empty? }.to_s
-          end
-        end
-
-        push_context = {
-          "workflow" => workflow.fetch("name"), "event_name" => "push", "ref_name" => "feature/x", "head_ref" => "",
-          "sha" => "1111111", "run_id" => "101"
-        }
-        # A later push to the same branch differs only in its commit and run.
-        newer_push_context = push_context.merge("sha" => "2222222", "run_id" => "102")
-        pull_request_context = {
-          "workflow" => workflow.fetch("name"), "event_name" => "pull_request", "ref_name" => "12/merge",
-          "head_ref" => "feature/x", "sha" => "3333333", "run_id" => "103"
-        }
-
-        groups = [workflow["concurrency"], *live_jobs_in(workflow).values.pluck("concurrency")]
-        groups.filter_map { |concurrency| cancelling_settings(concurrency) }.each do |settings|
-          group = settings.fetch("group")
-          expect(resolve_group.call(group, push_context)).not_to eq(resolve_group.call(group, pull_request_context))
-          expect(resolve_group.call(group, push_context)).to eq(resolve_group.call(group, newer_push_context))
+          expect(live_handoff_trigger_problems(workflow)).to include(
+            "the workflow cancels runs in a group other than one per event and branch"
+          )
         end
       end
 
@@ -565,7 +530,7 @@ RSpec.describe "CI spec coverage in validations.yml" do
         }
 
         expect(live_handoff_trigger_problems(workflow)).to include(
-          "the workflow cancels runs in a group that push and pull_request runs of one branch can share"
+          "the workflow cancels runs in a group other than one per event and branch"
         )
       end
 
@@ -585,7 +550,7 @@ RSpec.describe "CI spec coverage in validations.yml" do
         live_handoff_jobs.each { |job| job["concurrency"] = { "group" => base_group, "cancel-in-progress" => true } }
 
         expect(live_handoff_trigger_problems(workflow)).to include(
-          "timekeeping-alerts-live cancels runs in a group that push and pull_request runs of one branch can share"
+          "timekeeping-alerts-live cancels runs in a group other than one per event and branch"
         )
       end
 
