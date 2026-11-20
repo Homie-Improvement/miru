@@ -17,7 +17,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, committed_data: t
 
     # The live instance runs db:prepare on this URL and the after hook empties
     # its tables, so refuse any database that is not a test database first.
-    IntegratedRuntime.require_test_database_url!(ENV.fetch("TIMEKEEPING_DATABASE_URL"))
+    TestDatabaseGuard.require_test_database_url!(ENV.fetch("TIMEKEEPING_DATABASE_URL"))
     WebMock.disable_net_connect!(allow_localhost: true)
     @handoff_live_reference = TimekeepingLiveInstance::ReferenceStub.new
     @handoff_live_timekeeping = TimekeepingLiveInstance.start(
@@ -34,7 +34,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, committed_data: t
 
     # This hook also runs when before(:all) refused the database, so it checks
     # again; the shared reset then refuses the same names before it connects.
-    IntegratedRuntime.require_test_database_url!(ENV.fetch("TIMEKEEPING_DATABASE_URL"))
+    TestDatabaseGuard.require_test_database_url!(ENV.fetch("TIMEKEEPING_DATABASE_URL"))
     TimekeepingDatabaseReset.reset!(nil, env: ENV)
   end
 
