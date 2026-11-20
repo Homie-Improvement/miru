@@ -418,8 +418,9 @@ jobs:
   # example; the alerts spec writes its own entries, so it relies on none.
   #
   # The workflow runs on a push to any branch, and this job has no skip-ci
-  # condition, so every branch push runs the live handoff proof. The job id and name stay as they are because
-  # branch protection may require this check by name.
+  # condition, so every branch push runs the live handoff proof. The job id
+  # and name stay as they are because branch protection may require this
+  # check by name.
   timekeeping-alerts-live:
     name: Timekeeping alerts against a live service
     runs-on: ubuntu-24.04
