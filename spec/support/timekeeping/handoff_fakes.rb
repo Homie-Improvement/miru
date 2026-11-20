@@ -110,20 +110,19 @@ class TimekeepingHandoffOutboxRelay
     end
   end
 
-  # A stored entry as the contract's entry fields: times and dates as ISO 8601
-  # text and locked as a boolean, as the service's outbox serializes them.
-  # Fields the entry lacks stay missing, so the consumer refuses the batch.
+  # A stored entry as the contract's entry fields, with times and dates as
+  # ISO 8601 text, as the service's outbox serializes them. Every other value
+  # is sent as stored, so a missing field or a lock that is not a boolean
+  # reaches the consumer and is refused there, as it would be live.
   def self.wire_entry(entry)
-    entry.slice(*Timekeeping::SnapshotBatch::ENTRY_FIELDS).to_h do |field, value|
-      [field, wire_value(field, value)]
-    end
+    entry.slice(*Timekeeping::SnapshotBatch::ENTRY_FIELDS).transform_values { |value| wire_value(value) }
   end
 
-  def self.wire_value(field, value)
+  def self.wire_value(value)
     case value
     when ActiveSupport::TimeWithZone, Time, DateTime then value.to_time.utc.iso8601(6)
     when Date then value.iso8601
-    else field == "locked" ? value == true : value
+    else value
     end
   end
 
@@ -264,7 +263,9 @@ module TimekeepingHandoffFakes
 
     # An entry edit admitted while Timekeeping owns the entries. Its snapshot
     # goes to the outbox at the generation Timekeeping last admitted, as the
-    # service's writer publishes every edit.
+    # service's writer publishes every edit. Like Timekeeping::OutboxFields.row,
+    # the snapshot's locked is whether a reservation holds the entry, never the
+    # stored entries.locked column, which the service does not keep current.
     def edit_entry!(id)
       generation = last_admitted_generation
       raise ArgumentError, "edit_entry! needs an admitted generation; this store admitted none" if generation.nil?
@@ -272,7 +273,7 @@ module TimekeepingHandoffFakes
       entry = @rows.fetch("entries").find { |row| row["id"] == id }
       entry["version"] += 1
       entry["note"] = "edited in Timekeeping"
-      append_outbox_row(entry.dup, generation:)
+      append_outbox_row(entry.merge("locked" => reserved?(entry)), generation:)
     end
 
     def self.entry_id_of(snapshot)
@@ -284,6 +285,12 @@ module TimekeepingHandoffFakes
       def append_outbox_row(entry, generation:)
         @outbox << { "generation" => generation, "outbox_position" => @next_outbox_position, "entry" => entry }
         @next_outbox_position += 1
+      end
+
+      def reserved?(entry)
+        @rows.fetch("reservations").any? do |reservation|
+          reservation["company_id"] == entry["company_id"] && reservation["entry_id"] == entry["id"]
+        end
       end
 
       def last_admitted_generation
