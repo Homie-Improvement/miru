@@ -408,14 +408,21 @@ jobs:
 
   # Boots a real Timekeeping server from its own bundle and database, makes
   # real entry writes through it, and runs the monolith's timekeeping:alerts
-  # task against its metrics endpoint. The spec starts and stops the server.
+  # task against its metrics endpoint. The same job runs the live handoff
+  # proof: cutover, rollback and re-cutover against the seeded monolith
+  # database and a real Timekeeping server. Each spec starts and stops its own
+  # server, and the handoff spec empties the Timekeeping tables after its
+  # example; the alerts spec writes its own entries, so it relies on none.
+  #
+  # This job has no skip-ci condition, so every push the workflow runs on
+  # runs the live handoff proof. The job id and name stay as they are because
+  # branch protection may require this check by name.
   timekeeping-alerts-live:
     name: Timekeeping alerts against a live service
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
-    if: github.event_name != 'push' || !contains(github.event.head_commit.message, 'skip ci')
     env:
       RAILS_ENV: test
       DB_HOST: localhost
@@ -462,8 +469,8 @@ jobs:
       - name: Setup monolith test database
         run: bundle exec rails db:test:prepare
 
-      - name: Run live alert specs
-        run: bundle exec rspec spec/integration/timekeeping/alerts_live_spec.rb
+      - name: Run live alert and handoff specs
+        run: bundle exec rspec spec/integration/timekeeping/alerts_live_spec.rb spec/integration/timekeeping/handoff_live_spec.rb
 
   # Starts the local demo runtime with bin/timekeeping-demo up against the
   # seeded database, and fails if a job from default or any other queue
