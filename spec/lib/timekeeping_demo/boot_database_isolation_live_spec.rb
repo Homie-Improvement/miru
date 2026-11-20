@@ -1,7 +1,11 @@
+# frozen_string_literal: true
+
 require "rails_helper"
 require "open3"
 require "securerandom"
 require "tmpdir"
+require "uri"
+require Rails.root.join("lib", "timekeeping_demo", "version_record").to_s
 
 RSpec.describe TimekeepingDotenvTree do
   it "building a tree with its own git repository leaves the checkout's HEAD, index and .env files untouched" do
@@ -34,11 +38,6 @@ RSpec.describe TimekeepingDotenvTree do
   end
 end
 
-require "rails_helper"
-require "open3"
-require "tmpdir"
-require Rails.root.join("lib", "timekeeping_demo", "version_record").to_s
-
 RSpec.describe "Timekeeping demo boot database isolation tree" do
   it "version capture succeeds in a dotenv tree built with its own git repository and records both applications" do
     Dir.mktmpdir do |dir|
@@ -60,11 +59,6 @@ RSpec.describe "Timekeeping demo boot database isolation tree" do
     end
   end
 end
-
-require "rails_helper"
-require "open3"
-require "tmpdir"
-require Rails.root.join("lib", "timekeeping_demo", "version_record").to_s
 
 RSpec.describe "Timekeeping demo boot database isolation tree" do
   it "a dotenv tree with its own git leaves the checkout's env files and git history unchanged and repeated captures add no commit" do
@@ -94,9 +88,6 @@ RSpec.describe "Timekeeping demo boot database isolation tree" do
   end
 end
 
-require "rails_helper"
-require "tmpdir"
-
 RSpec.describe TimekeepingDotenvTree, "for a boot of bin/timekeeping-demo up" do
   it "the launcher's version capture succeeds in a dotenv tree built with its own git repository" do
     checkout_env_files_before = Rails.root.glob(".env*").map(&:to_s).sort
@@ -118,9 +109,6 @@ RSpec.describe TimekeepingDotenvTree, "for a boot of bin/timekeeping-demo up" do
     expect(Rails.root.glob(".env*").map(&:to_s).sort).to eq(checkout_env_files_before)
   end
 end
-
-require "rails_helper"
-require "tmpdir"
 
 RSpec.describe TimekeepingDotenvTree, "entry points for a boot of bin/timekeeping-demo up" do
   it "every monolith entry point in the dotenv tree is a real copy whose app root is the tree" do
@@ -154,11 +142,6 @@ RSpec.describe TimekeepingDotenvTree, "entry points for a boot of bin/timekeepin
   end
 end
 
-require "rails_helper"
-require "securerandom"
-require "tmpdir"
-require "uri"
-
 RSpec.describe IntegratedRuntime, "booted from a tree with a conflicting dotenv file" do
   def boot_isolation_users_tagged(probe)
     sql = ActiveRecord::Base.sanitize_sql_array(
@@ -191,6 +174,7 @@ RSpec.describe IntegratedRuntime, "booted from a tree with a conflicting dotenv 
     expect(timekeeping_user).not_to eq(monolith_user)
 
     observed = {}
+    groups = []
     Dir.mktmpdir("boot-isolation-tree") do |dir|
       tree = File.realpath(dir)
       host = ENV["DB_HOST"].presence || "localhost"
@@ -208,7 +192,7 @@ RSpec.describe IntegratedRuntime, "booted from a tree with a conflicting dotenv 
       DOTENV
       TimekeepingDotenvTree.build(tree, dotenv:, own_git: true)
 
-      described_class.run(root: tree, env:) do |_runtime|
+      described_class.run(root: tree, env:) do |runtime|
         deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 60
         loop do
           observed = { monolith: boot_isolation_users_tagged(monolith_probe),
@@ -217,6 +201,7 @@ RSpec.describe IntegratedRuntime, "booted from a tree with a conflicting dotenv 
 
           sleep 0.5
         end
+        groups = (runtime.process_groups + described_class.recorded_groups(tree)).uniq
       end
     end
 
@@ -226,12 +211,18 @@ RSpec.describe IntegratedRuntime, "booted from a tree with a conflicting dotenv 
     expect(observed.fetch(:timekeeping)).to eq([timekeeping_user])
     expect(observed.fetch(:monolith)).not_to eq(observed.fetch(:timekeeping))
     expect(Rails.root.glob(".env*").map(&:to_s).sort).to eq(checkout_env_files_before)
+    # The groups were read from the tree's own groups file, so this also shows
+    # the launcher ran with the tree as its root.
+    expect(groups.size).to be > 1
+    expect(groups.select { |group| IntegratedRuntime.group_alive?(group) }).to eq([])
+  end
+
+  # Without the dotenv file the monolith's connections carry no probe, and the
+  # boot example must then fail rather than pass on an empty list.
+  it "no live connection carries a probe that no dotenv file set" do
+    expect(boot_isolation_users_tagged("boot-isolation-unset-#{SecureRandom.hex(8)}")).to eq([])
   end
 end
-
-require "rails_helper"
-require "securerandom"
-require "tmpdir"
 
 RSpec.describe IntegratedRuntime, "booted from a tree without the empty DATABASE_URL deletion" do
   # "They do not exercise dotenv loading, the new deletion of an empty DATABASE_URL in config/application.rb, or the resulting database connection."
@@ -267,9 +258,6 @@ RSpec.describe IntegratedRuntime, "booted from a tree without the empty DATABASE
   end
 end
 
-require "rails_helper"
-require "tmpdir"
-
 RSpec.describe TimekeepingDotenvTree do
   # "A spec boots the monolith and Timekeeping through bin/timekeeping-demo with a temporary dotenv file that sets conflicting DATABASE_URL, DB_USER and PG\* values, and asserts that each app's live connection reports its own distinct current_user."
   # These files find the app root from their own resolved location. A symlink to the checkout
@@ -280,23 +268,19 @@ RSpec.describe TimekeepingDotenvTree do
       described_class.build(tree, dotenv: "PGAPPNAME=boot-isolation-entry-probe\n")
 
       scripts = %w[bin/timekeeping-demo bin/timekeeping-demo-queue bin/rails]
-      roots = scripts.to_h do |path|
-        [path, File.expand_path("..", File.dirname(File.realpath(File.join(tree, path))))]
+      roots = scripts.index_with do |path|
+        File.expand_path("..", File.dirname(File.realpath(File.join(tree, path))))
       end
-      top_level = %w[Rakefile config.ru].to_h do |path|
-        [path, File.dirname(File.realpath(File.join(tree, path)))]
+      top_level = %w[Rakefile config.ru].index_with do |path|
+        File.dirname(File.realpath(File.join(tree, path)))
       end
 
-      expect(roots).to eq(scripts.to_h { |path| [path, tree] })
+      expect(roots).to eq(scripts.index_with(tree))
       expect(top_level).to eq("Rakefile" => tree, "config.ru" => tree)
       expect(scripts.all? { |path| File.executable?(File.join(tree, path)) }).to be(true)
     end
   end
 end
-
-require "rails_helper"
-require "open3"
-require "tmpdir"
 
 RSpec.describe TimekeepingDotenvTree do
   # "A spec boots the monolith and Timekeeping through bin/timekeeping-demo with a temporary dotenv file that sets conflicting DATABASE_URL, DB_USER and PG\* values, and asserts that each app's live connection reports its own distinct current_user."

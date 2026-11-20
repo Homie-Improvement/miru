@@ -26,6 +26,9 @@ module TimekeepingDotenvTree
   COPIED_TOP_LEVEL_FILES = %w[Rakefile config.ru].freeze
   # Fresh directories, so the children's caches and logs stay out of the checkout.
   OWN_DIRS = %w[tmp log].freeze
+  # Puma writes its pid file here and does not create the directory, so the
+  # monolith web server started in a tree would exit without it.
+  PID_DIR = File.join("tmp", "pids")
   GIT_DIR = ".git"
   # Git refuses to read these files through a symlink, so a tree with its own
   # repository gets real copies; without .gitignore the files the apps write
@@ -50,6 +53,7 @@ module TimekeepingDotenvTree
       File.symlink(entry.to_s, File.join(tree, name))
     end
     OWN_DIRS.each { |dir| Dir.mkdir(File.join(tree, dir)) }
+    Dir.mkdir(File.join(tree, PID_DIR))
     COPIED_DIRS.each { |dir| build_copied_dir(root.join(dir), File.join(tree, dir)) }
     COPIED_TOP_LEVEL_FILES.each { |name| FileUtils.cp(root.join(name).to_s, File.join(tree, name), preserve: true) }
     File.write(File.join(tree, ".env.test.local"), dotenv)
