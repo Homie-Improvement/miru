@@ -70,6 +70,19 @@ RSpec.describe TimekeepingWriterLog do
         name: "a missing heading",
         text: "Some writers:\n\n- the agent (`app/models/agent.rb`);\n",
         raises: true
+      },
+      {
+        name: "an item whose only paths sit on its continuation line",
+        text: <<~MARKDOWN,
+          #{heading}
+
+          - the agent destroy (`app/models/agent.rb:17`), as the `detach-entries` command;
+          - the invoice boundary, replacing `Invoice#update_timesheet_entry_status!` and
+            the callbacks in `app/models/invoice.rb` and `app/models/invoice_line_item.rb`;
+
+          The gateway lives in `app/services/timekeeping/gateway.rb`.
+        MARKDOWN
+        paths: %w[app/models/agent.rb app/models/invoice.rb app/models/invoice_line_item.rb]
       }
     ].map(&:freeze).freeze
 
@@ -277,9 +290,12 @@ RSpec.describe TimekeepingWriterLog do
       expect(connection.select_value("SELECT count(*) FROM pg_trigger WHERE tgname = 'miru_writer_log_trigger'")).to eq(0)
       expect(connection.select_value("SELECT count(*) FROM pg_proc WHERE proname = 'miru_writer_log_record'")).to eq(0)
       expect(connection.select_value("SELECT to_regclass('public.miru_writer_log') IS NULL")).to be(true)
+      # The unqualified name follows search_path, pg_temp first, so a session-local leftover also fails.
+      expect(connection.select_value("SELECT to_regclass('miru_writer_log')")).to be_nil
 
       described_class.remove!(connection)
       expect(connection.select_value("SELECT to_regclass('public.miru_writer_log') IS NULL")).to be(true)
+      expect(connection.select_value("SELECT to_regclass('miru_writer_log')")).to be_nil
     end
   end
 
