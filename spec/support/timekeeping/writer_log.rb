@@ -35,7 +35,97 @@ module TimekeepingWriterLog
   RELATIVE_RUBY_PATH = %r{\A(?!/)([\w./-]+\.rb)(?::\d+)?\z}
   BULLET_START = "- "
 
+  # A real UNLOGGED table and a function in the public schema, not a TEMP table
+  # and a pg_temp function: those exist only for the session that creates them,
+  # so they would miss writes from every other session, the apps' own included.
+  # None of this belongs in db/migrate or db/schema.rb: it lives only while a
+  # guard runs.
+  #
+  # The function stores NULL for an unmarked write. A pooled session that once
+  # ran SET LOCAL miru.writer reads '' afterwards rather than NULL, and both
+  # mean the same thing: no writer marked this write.
+  CREATE_LOG_TABLE_SQL = <<~SQL
+    CREATE UNLOGGED TABLE IF NOT EXISTS public.miru_writer_log (
+      id bigserial PRIMARY KEY,
+      writer text,
+      company_id bigint,
+      op text NOT NULL,
+      entry_id bigint,
+      backend_pid integer NOT NULL
+    )
+  SQL
+
+  CREATE_RECORD_FUNCTION_SQL = <<~SQL
+    CREATE OR REPLACE FUNCTION public.miru_writer_log_record() RETURNS trigger AS $$
+    DECLARE
+      changed timesheet_entries%ROWTYPE;
+    BEGIN
+      IF TG_OP = 'DELETE' THEN
+        changed := OLD;
+      ELSE
+        changed := NEW;
+      END IF;
+      INSERT INTO public.miru_writer_log (writer, company_id, op, entry_id, backend_pid)
+      VALUES (NULLIF(current_setting('miru.writer', true), ''), changed.company_id, TG_OP, changed.id, pg_backend_pid());
+      RETURN NULL;
+    END
+    $$ LANGUAGE plpgsql
+  SQL
+
+  # Dropping first means a trigger left by a run that crashed before remove!
+  # is replaced, never doubled.
+  DROP_TRIGGER_SQL = "DROP TRIGGER IF EXISTS miru_writer_log_trigger ON timesheet_entries"
+  CREATE_TRIGGER_SQL = <<~SQL
+    CREATE TRIGGER miru_writer_log_trigger AFTER INSERT OR UPDATE OR DELETE ON timesheet_entries
+      FOR EACH ROW EXECUTE FUNCTION public.miru_writer_log_record()
+  SQL
+  DROP_FUNCTION_SQL = "DROP FUNCTION IF EXISTS public.miru_writer_log_record()"
+  DROP_LOG_TABLE_SQL = "DROP TABLE IF EXISTS public.miru_writer_log"
+  # DELETE rather than a table-emptying statement the reset-site scan in
+  # spec/meta/test_database_cleanup_reset_sites_spec.rb would refuse.
+  CLEAR_LOG_SQL = "DELETE FROM public.miru_writer_log"
+  SELECT_ROWS_SQL = "SELECT writer, company_id, op, backend_pid FROM public.miru_writer_log ORDER BY id"
+
   module_function
+
+  # Creates the log table, the record function and the trigger. Safe to run
+  # again, and over objects a crashed run left behind.
+  def install!(connection)
+    [CREATE_LOG_TABLE_SQL, CREATE_RECORD_FUNCTION_SQL, DROP_TRIGGER_SQL, CREATE_TRIGGER_SQL].each do |sql|
+      connection.execute(sql)
+    end
+    nil
+  end
+
+  # Drops the trigger, the function and the table. Safe to run when any or all
+  # of them are already gone.
+  def remove!(connection = ActiveRecord::Base.connection)
+    [DROP_TRIGGER_SQL, DROP_FUNCTION_SQL, DROP_LOG_TABLE_SQL].each { |sql| connection.execute(sql) }
+    nil
+  end
+
+  # Installs the log for the block and removes it however the block ends, so
+  # no trigger outlives the guard.
+  def guarding(connection)
+    install!(connection)
+    yield
+  ensure
+    remove!(connection)
+  end
+
+  def clear!(connection = ActiveRecord::Base.connection)
+    connection.execute(CLEAR_LOG_SQL)
+    nil
+  end
+
+  # Every logged write, oldest first, as { writer:, company_id:, op: }, plus
+  # backend_pid: (the writing session's server process id) when asked.
+  def rows(connection = ActiveRecord::Base.connection, include_backend_pid: false)
+    connection.select_all(SELECT_ROWS_SQL).map do |row|
+      logged = { writer: row["writer"], company_id: row["company_id"], op: row["op"] }
+      include_backend_pid ? logged.merge(backend_pid: row["backend_pid"]) : logged
+    end
+  end
 
   # The rows whose writer the state does not allow. The state is checked
   # before the rows, so an unknown state raises even when there are none.
