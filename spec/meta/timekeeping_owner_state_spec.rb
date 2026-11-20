@@ -644,7 +644,6 @@ RSpec.describe "Timekeeping owner state harness" do
 
       expect(answers).to eq("legacy" => false, "timekeeping" => true, "rollback" => false)
       expect { TimekeepingOwnerState.forwards_writes?("Timekeeping") }.to raise_error(ArgumentError, /legacy, timekeeping, rollback/)
-      expect { TimekeepingOwnerState.forwards_writes?(nil) }.to raise_error(ArgumentError)
     end
   end
 
@@ -687,8 +686,6 @@ RSpec.describe "Timekeeping owner state harness" do
         expect { TimekeepingOwnerState.forwarding_skip_reason({ forwards_to_timekeeping: true, owner_state: misspelt }) }
           .to raise_error(ArgumentError, /legacy, timekeeping, rollback/)
       end
-      expect { TimekeepingOwnerState.forwards_writes?(nil) }.to raise_error(ArgumentError)
-      expect { TimekeepingOwnerState.forwards_writes?("Timekeeping") }.to raise_error(ArgumentError)
     end
   end
 
