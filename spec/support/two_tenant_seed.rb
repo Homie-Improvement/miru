@@ -6,7 +6,9 @@
 # every table when it finishes, leaving the empty database other specs expect.
 #
 # The seed is loaded with the as_of recorded in the seed disposition, so the
-# data matches the checked-in record.
+# data matches the checked-in record. Only the first load in a test process
+# runs db/seeds.rb; later loads restore the copy TestDatabaseCleanup.seed_captures
+# holds, with the same rows, ids and sequence values.
 #
 # The load here is skipped when every example the group runs is a seeded
 # committed example: the committed_data hook in spec/support/database_cleaner.rb
@@ -19,7 +21,9 @@ RSpec.shared_context "two tenant seed" do
     next if examples.all? { |example| TestDatabaseCleanup.seeded_committed?(example.metadata) }
 
     TestDatabaseCleanup.clean_with!(:truncation, except: %w(ar_internal_metadata))
-    Timekeeping::SeedDispositionRecorder.load_fresh_seed!(as_of: TestDatabaseCleanup.seed_as_of)
+    Timekeeping::SeedDispositionRecorder.load_fresh_seed!(
+      as_of: TestDatabaseCleanup.seed_as_of, captures: TestDatabaseCleanup.seed_captures
+    )
   end
 
   after(:all) do

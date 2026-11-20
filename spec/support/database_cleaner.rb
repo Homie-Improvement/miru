@@ -27,6 +27,14 @@ module TestDatabaseCleanup
     YAML.load_file(Timekeeping::SeedDispositionRecorder::DEFAULT_PATH).fetch("as_of")
   end
 
+  # Copies of the seed this process has loaded, by as_of. Running db/seeds.rb
+  # takes about a minute; the first load in a process stores a copy, and every
+  # later load restores it in seconds. Each parallel test process has its own
+  # database and its own memory, so a copy never reaches another database.
+  def seed_captures
+    @seed_captures ||= Timekeeping::SeedCapture::Store.new
+  end
+
   # Empties every table, loads the seed, then puts the ownership row in the
   # given state (the run's selected state by default) and clears the
   # Timekeeping database.
@@ -40,7 +48,7 @@ module TestDatabaseCleanup
   # already the legacy default, and apply! rejects nil.
   def reset_seeded_committed!(as_of:, state: TimekeepingOwnerState::SELECTED, env: ENV)
     delete_all_tables!
-    Timekeeping::SeedDispositionRecorder.load_fresh_seed!(as_of:)
+    Timekeeping::SeedDispositionRecorder.load_fresh_seed!(as_of:, captures: seed_captures)
     TimekeepingOwnership.ensure_initial!
     TimekeepingOwnerState.apply!(state) if state
     TimekeepingDatabaseReset.reset!(state, env:)
