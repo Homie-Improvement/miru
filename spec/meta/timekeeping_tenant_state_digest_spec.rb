@@ -493,6 +493,34 @@ RSpec.describe TenantStateDigest do
       end
     end
 
+    # "A `bill_status` flip on one company changes only that company's monolith digest."
+    # Checked through take itself, so its monolith side must read the requested company.
+    it "take moves only B's monolith digest for a bill_status flip on B's timesheet entry" do
+      url = prepare_digest_timekeeping_database
+      company_a = create(:company)
+      company_b = create(:company)
+      create(:timesheet_entry).update_columns(company_id: company_a.id)
+      entry_b = create(:timesheet_entry)
+      entry_b.update_columns(company_id: company_b.id)
+
+      before_a = described_class.take(company_id: company_a.id, timekeeping_url: url)
+      before_b = described_class.take(company_id: company_b.id, timekeeping_url: url)
+      expect(before_b.fetch(:monolith)).to eq(described_class.monolith(company_id: company_b.id))
+      expect(before_b.fetch(:monolith).fetch(:projection))
+        .not_to eq(pinned_empty_group_digests.fetch(:monolith).fetch(:projection))
+      expect(before_a.fetch(:monolith).fetch(:projection)).not_to eq(before_b.fetch(:monolith).fetch(:projection))
+
+      ActiveRecord::Base.connection.exec_query(
+        "UPDATE timesheet_entries SET bill_status = CASE WHEN bill_status = 0 THEN 1 ELSE 0 END WHERE id = $1",
+        "digest", [entry_b.id]
+      )
+
+      after_b = described_class.take(company_id: company_b.id, timekeeping_url: url)
+      expect(after_b.fetch(:monolith).fetch(:projection)).not_to eq(before_b.fetch(:monolith).fetch(:projection))
+      expect(after_b.fetch(:timekeeping)).to eq(before_b.fetch(:timekeeping))
+      expect(described_class.take(company_id: company_a.id, timekeeping_url: url)).to eq(before_a)
+    end
+
     # "For every group in each database, a row inserted for B leaves A's digest equal, and the reverse also holds."
     # "Two takes with no write in between are equal, `reservations` rows included."
     it "a row inserted for one company in each Timekeeping table moves that company's group digest and leaves the other's digest equal, both ways, and two takes are then equal", :without_transaction do
