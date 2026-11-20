@@ -17,8 +17,17 @@ module Invoices
   # marks the row undeliverable instead, because the service refuses it on
   # every retry; no later sweep sends it. Every other result that is not
   # settled, including a failed adapter lookup or a raised error, is counted
-  # as an attempt and leaves the row for the next sweep. Delivery never raises
-  # to its caller, because by the time it runs the invoice change is already
+  # as an attempt and leaves the row for the next sweep.
+  #
+  # That includes a stale_generation answer from the monolith's prepared
+  # store (PreparedReservations). The store gives it only while a handoff
+  # step is recorded or its ownership row is missing, and applies the same
+  # request again once the handoff is aborted; after a flip the row goes to
+  # the Timekeeping service instead. Marking the row would stop the abort that
+  # releases its provisional reservations, or the commit that billing waits
+  # for.
+  #
+  # Delivery never raises to its caller, because by the time it runs the invoice change is already
   # committed or rolled back.
   class OutboxDelivery
     # The adapter answer that settles each kind of row under the legacy rule.
