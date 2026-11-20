@@ -6,6 +6,9 @@ require "rails_helper"
 require "tmpdir"
 
 module RunnerLegacyHandoffSpecSupport
+  # Matches an insert, update or delete on a billing table, quoted or not.
+  BILLING_WRITE = /\A\s*(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+(?:"?public"?\.)?"?(?:invoices|invoice_line_items|invoice_taxes|payments)"?(?:\s|\(|\z)/i
+
   def recorded_unlocked_entry_ids
     YAML.load_file(Timekeeping::SeedDispositionRecorder::DEFAULT_PATH).fetch("companies").values
       .flat_map { |invoices| invoices.values.flat_map { |listing| listing.fetch("entry_ids") } }
@@ -36,222 +39,51 @@ module RunnerLegacyHandoffSpecSupport
   def snapshot_entry_ids(corrected_ids)
     corrected_ids | TimesheetEntry.unscoped.where(version: 0).pluck(:id)
   end
-end
-
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-
-  # "The first cutover turns each recorded unlocked link into a committed reservation with one correction snapshot"
-  it "first cutover turns each recorded unlocked link into one committed reservation with exactly one correction snapshot" do
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    entry_ids = recorded_unlocked_entry_ids
-    expect(entry_ids).not_to be_empty
-
-    described_class.run(direction: :cutover, owners: TimekeepingHandoffFakes.owners(timekeeping:),
-                        report_root: Dir.mktmpdir("handoff-report"))
-
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
-    reservations = timekeeping.rows.fetch("reservations")
-    entry_ids.each do |entry_id|
-      owned = reservations.select { |row| row["entry_id"] == entry_id }
-      expect(owned.size).to eq(1)
-      expect(owned.first["state"]).to eq("committed")
-    end
-    expect(correction_entry_ids(timekeeping)).to match_array(snapshot_entry_ids(entry_ids))
-    expect(timekeeping.corrections.pluck("generation").uniq).to eq([2])
-    expect(timekeeping.corrections.pluck("version").uniq).to eq([1])
-  end
-end
-
-# Uses RunnerLegacyHandoffSpecSupport, defined at the top of this file.
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-
-  # "An aborted first cutover retried at a later generation still runs the pre-flight, copies legacy entries and derives every reservation and correction"
-  it "a first cutover aborted before the checkpoint load and retried at generation 3 runs the pre-flight and copies the changed legacy entry" do
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    owners = TimekeepingHandoffFakes.owners(timekeeping:)
-    report_root = Dir.mktmpdir("handoff-report")
-    entry_ids = recorded_unlocked_entry_ids
-
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:,
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :during_checkpoint))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    described_class.run(direction: :cutover, abort: true, owners:, report_root:)
-    expect(TimekeepingOwnership.current)
-      .to have_attributes(owner: "monolith", generation: 2, handoff_step: nil, legacy_retired_at: nil)
-
-    changed_id = entry_ids.first
-    TimesheetEntry.unscoped.where(id: changed_id).update_all(note: "changed before the retry")
-    allow(Timekeeping::Preflight).to receive(:classify).and_call_original
-
-    described_class.run(direction: :cutover, owners:, report_root:)
-
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 3, handoff_step: nil)
-    expect(Timekeeping::Preflight).to have_received(:classify).at_least(:once)
-    entries = timekeeping.rows.fetch("entries")
-    expect(entries.pluck("id")).to match_array(TimesheetEntry.unscoped.pluck(:id))
-    expect(entries.find { |row| row["id"] == changed_id }["note"]).to eq("changed before the retry")
-    committed = timekeeping.rows.fetch("reservations").filter_map { |row| row["entry_id"] if row["state"] == "committed" }
-    expect(committed).to include(*entry_ids)
-    expect(correction_entry_ids(timekeeping)).to match_array(snapshot_entry_ids(entry_ids))
-    expect(timekeeping.corrections.pluck("generation").uniq).to eq([3])
-  end
-end
-
-# Uses RunnerLegacyHandoffSpecSupport, defined at the top of this file.
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-
-  # "An aborted first cutover retried at a later generation still runs the pre-flight, copies legacy entries and derives every reservation and correction"
-  # After the aborted attempt, Timekeeping holds the corrected entries at version 1
-  # while the legacy rows are still version 0, so the retry must not load anything
-  # older than what Timekeeping stores.
-  it "a first cutover aborted after corrections were written retries at generation 3 without a version refusal and rederives every correction" do
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    owners = TimekeepingHandoffFakes.owners(timekeeping:)
-    report_root = Dir.mktmpdir("handoff-report")
-    entry_ids = recorded_unlocked_entry_ids
-
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:,
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_corrections))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    expect(correction_entry_ids(timekeeping)).to match_array(snapshot_entry_ids(entry_ids))
-    described_class.run(direction: :cutover, abort: true, owners:, report_root:)
-
-    changed_id = TimesheetEntry.unscoped.where.not(id: entry_ids).minimum(:id)
-    TimesheetEntry.unscoped.where(id: changed_id).update_all(note: "changed after the abort")
-    allow(Timekeeping::Preflight).to receive(:classify).and_call_original
-
-    described_class.run(direction: :cutover, owners:, report_root:)
-
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 3, handoff_step: nil)
-    expect(Timekeeping::Preflight).to have_received(:classify).at_least(:once)
-    entries = timekeeping.rows.fetch("entries")
-    expect(entries.find { |row| row["id"] == changed_id }["note"]).to eq("changed after the abort")
-    entry_ids.each do |entry_id|
-      expect(entries.find { |row| row["id"] == entry_id }["version"]).to be >= 1
-      expect(timekeeping.rows.fetch("reservations").count { |row| row["entry_id"] == entry_id && row["state"] == "committed" }).to eq(1)
-    end
-    expect(correction_entry_ids(timekeeping)).to match_array(snapshot_entry_ids(entry_ids))
-    expect(timekeeping.corrections.pluck("generation").uniq).to eq([3])
-  end
-end
-
-# Uses RunnerLegacyHandoffSpecSupport, defined at the top of this file.
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
 
   def entry_versions(checkpoint)
     checkpoint.rows.fetch("entries").to_h { |row| [row["id"], row["version"]] }
   end
 
-  # "Versions continue from the checkpoint and never go backwards across cutover, rollback and re-cutover"
-  it "entry versions never go backwards across cutover, rollback and re-cutover with an edit under each owner" do
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    owners = TimekeepingHandoffFakes.owners(timekeeping:)
-    report_root = Dir.mktmpdir("handoff-report")
-    monolith_store = Timekeeping::Handoff::MonolithStore.new(connection: ActiveRecord::Base.connection)
-    legacy = TimesheetEntry.unscoped.pluck(:id, :version).to_h
-    edited_id = legacy.keys.min
-
-    described_class.run(direction: :cutover, owners:, report_root:)
-    after_cutover = entry_versions(timekeeping.export_checkpoint)
-    timekeeping.edit_entry!(edited_id)
-    after_timekeeping_edit = entry_versions(timekeeping.export_checkpoint)
-
-    described_class.run(direction: :rollback, owners:, report_root:)
-    after_rollback = entry_versions(monolith_store.export_checkpoint)
-    ActiveRecord::Base.connection.execute(
-      "UPDATE entries SET version = version + 1, note = 'edited in the monolith' WHERE id = #{Integer(edited_id)}"
-    )
-    after_monolith_edit = entry_versions(monolith_store.export_checkpoint)
-
-    described_class.run(direction: :re_cutover, owners:, report_root:)
-    after_re_cutover = entry_versions(timekeeping.export_checkpoint)
-
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 4, handoff_step: nil)
-    stages = [legacy, after_cutover, after_timekeeping_edit, after_rollback, after_monolith_edit, after_re_cutover]
-    stages.each_cons(2) do |before, after|
-      expect(after.keys).to match_array(before.keys)
-      before.each { |id, version| expect(after.fetch(id)).to be >= version, "entry #{id} went from #{version} to #{after.fetch(id)}" }
-    end
-    expect(after_rollback.fetch(edited_id)).to eq(after_timekeeping_edit.fetch(edited_id))
-    expect(after_re_cutover.fetch(edited_id)).to eq(after_timekeeping_edit.fetch(edited_id) + 1)
+  # The files a handoff saves once per generation and must never rewrite on resume.
+  def saved_baselines(generation_dir)
+    %w[source_intents.json checkpoint.json money_before.json].index_with { |name| generation_dir.join(name).read }
   end
-end
 
-# Uses RunnerLegacyHandoffSpecSupport, defined at the top of this file.
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-
-  BILLING_WRITE = /\A\s*(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+(?:"?public"?\.)?"?(?:invoices|invoice_line_items|invoice_taxes|payments)"?(?:\s|\(|\z)/i
-
-  # "No handoff step writes a billing table."
-  it "no statement during cutover, rollback or re-cutover inserts, updates or deletes invoices, invoice_line_items, invoice_taxes or payments" do
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    owners = TimekeepingHandoffFakes.owners(timekeeping:)
-    report_root = Dir.mktmpdir("handoff-report")
-    writes = []
-    # The notification fires for every connection class, InvoiceOperationsRecord included.
-    subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
-      writes << payload[:sql] if payload[:sql].match?(BILLING_WRITE)
-    end
-
-    begin
-      # A planted no-op write shows the subscriber catches a quoted billing write.
-      ActiveRecord::Base.connection.execute('UPDATE "invoices" SET updated_at = updated_at WHERE false')
-      expect(writes.size).to eq(1)
-      writes.clear
-
-      described_class.run(direction: :cutover, owners:, report_root:)
-      described_class.run(direction: :rollback, owners:, report_root:)
-      described_class.run(direction: :re_cutover, owners:, report_root:)
-    ensure
-      ActiveSupport::Notifications.unsubscribe(subscriber)
-    end
-
-    expect(TimekeepingOwnership.current.generation).to eq(4)
-    expect(writes).to eq([])
+  def expect_saved_baselines_unchanged(generation_dir, baselines)
+    baselines.each { |name, text| expect(generation_dir.join(name).read).to eq(text), "#{name} was rewritten" }
   end
-end
 
-# Uses RunnerLegacyHandoffSpecSupport, defined at the top of this file. The
-# seed loads once per example group, so each case gets a group of its own.
-[[:uncorrected, 99], [:corrected, 0]].each do |kind, changed_version|
-  RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-    include RunnerLegacyHandoffSpecSupport
+  # The verdict shared by the uninterrupted first cutover and every restart
+  # after an interruption: the finished cutover holds exactly what an
+  # uninterrupted run at the first capture time would have loaded, and the
+  # saved checkpoint keeps that capture time.
+  def expect_uninterrupted_control_result(timekeeping, report_root:, captured_at:)
+    expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
+    expect(Timekeeping::Handoff::ReportDirectory.new(root: report_root, generation: 2).read_checkpoint.fetch(:captured_at))
+      .to eq(captured_at)
 
-    # "Versions continue from the checkpoint and never go backwards across cutover, rollback and re-cutover"
-    it "refuses a restart after the recorded checkpoint when an #{kind} entry's version drifted to #{changed_version}" do
-      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-      owners = TimekeepingHandoffFakes.owners(timekeeping:)
-      report_root = Dir.mktmpdir("handoff-report")
+    control = uninterrupted_control(captured_at:)
+    digest = timekeeping.export_checkpoint.digest
+    expect(digest).to eq(control.fetch(:load).digest)
+    expect(digest.keys).to match_array(Timekeeping::Handoff::Checkpoint::TABLES.keys)
+    seeded = Company.pluck(:id)
+    expect(seeded).not_to be_empty
+    %w(entries reservations entry_audits).each { |table| expect(digest.fetch(table).keys).to match_array(seeded) }
+    %w(invoice_operations idempotency_records).each { |table| expect(digest.fetch(table)).to eq({}) }
 
-      expect do
-        described_class.run(direction: :cutover, owners:, report_root:,
-                            observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
-      end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-      expect(TimekeepingOwnership.current.handoff_step).to eq("checkpoint")
-
-      corrected_ids = recorded_unlocked_entry_ids
-      row = timekeeping.rows.fetch("entries").find { |entry| corrected_ids.include?(entry["id"]) == (kind == :corrected) }
-      row["version"] = changed_version
-
-      expect { described_class.run(direction: :cutover, owners:, report_root:) }
-        .to raise_error(Timekeeping::Handoff::Runner::Refused)
-      # The restart stops before the flip: ownership stays with the monolith,
-      # the legacy source is not retired, and Timekeeping is not admitted.
-      expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", legacy_retired_at: nil)
-      expect(TimekeepingOwnership.current.handoff_step).not_to be_nil
-      expect(timekeeping.calls).not_to include([:admit, 2])
+    entry_ids = recorded_unlocked_entry_ids
+    expect(entry_ids).not_to be_empty
+    control_ids = control.fetch(:corrections).map { |snapshot| TimekeepingHandoffFakes::InMemoryTimekeepingStore.entry_id_of(snapshot) }
+    expect(control_ids).to match_array(entry_ids)
+    expect(correction_entry_ids(timekeeping)).to match_array(snapshot_entry_ids(control_ids))
+    expect(timekeeping.corrections.pluck("generation").uniq).to eq([2])
+    expect(timekeeping.corrections.pluck("version").uniq).to eq([1])
+    reservations = timekeeping.rows.fetch("reservations")
+    entry_ids.each do |entry_id|
+      expect(reservations.select { |row| row["entry_id"] == entry_id }.pluck("state")).to eq(["committed"])
     end
   end
 end
-
-# Generated by Descant: acceptance tests below.
 
 # Intents are written through InvoiceOperationsRecord's own connection, so the
 # runner reads them there; a committed intent on the first invoice stands in
@@ -268,428 +100,541 @@ module RunnerSourceIntentsSpecSupport
   end
 end
 
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
+# The seed loads in a before(:all) of a shared context that RSpec includes only
+# once per ancestry, and :seeded_without_transaction rolls nothing back. Every
+# example below commits a handoff, so each sits in its own context that carries
+# the seed tags itself; tagging this describe would give them one seed.
+RSpec.describe Timekeeping::Handoff::Runner do
   include RunnerLegacyHandoffSpecSupport
   include RunnerSourceIntentsSpecSupport
 
-  # "Source intents are saved at the checkpoint and reused on resume, and deleting or changing a terminal
-  # intent after the checkpoint makes reconcile report a difference."
-  it "a terminal intent deleted after the checkpoint makes the resumed reconcile report it and keep the monolith as owner" do
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    owners = TimekeepingHandoffFakes.owners(timekeeping:)
-    report_root = Dir.mktmpdir("handoff-report")
-    operation_id = "5d0b6a0e-1d7c-4f4e-9a52-6a1f1c0de001"
-    insert_committed_intent_for_source_intents_spec(operation_id)
+  context "when a first cutover aborted during the checkpoint load is retried", :two_tenant_seed, :seeded_without_transaction do
+    # "An aborted first cutover retried at a later generation still runs the pre-flight, copies legacy entries and derives every reservation and correction"
+    it "a first cutover aborted before the checkpoint load and retried at generation 3 runs the pre-flight and copies the changed legacy entry" do
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
+      report_root = Dir.mktmpdir("handoff-report")
+      entry_ids = recorded_unlocked_entry_ids
 
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:,
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    InvoiceOperationsRecord.connection.execute(
-      "DELETE FROM invoice_operation_intents WHERE operation_id = '#{operation_id}'"
-    )
+      expect do
+        described_class.run(direction: :cutover, owners:, report_root:,
+                            observer: TimekeepingHandoffHooks::Interrupt.new(at: :during_checkpoint))
+      end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+      described_class.run(direction: :cutover, abort: true, owners:, report_root:)
+      expect(TimekeepingOwnership.current)
+        .to have_attributes(owner: "monolith", generation: 2, handoff_step: nil, legacy_retired_at: nil)
 
-    expect { described_class.run(direction: :cutover, owners:, report_root:) }
-      .to raise_error(Timekeeping::Handoff::Runner::Refused)
+      changed_id = entry_ids.first
+      TimesheetEntry.unscoped.where(id: changed_id).update_all(note: "changed before the retry")
+      allow(Timekeeping::Preflight).to receive(:classify).and_call_original
 
-    report = Dir.glob(File.join(report_root, "generation-*", "reconciliation.json")).map { |path| File.read(path) }.join
-    expect(report).to include(operation_id)
-    expect(report).to include("missing_in_checkpoint")
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", legacy_retired_at: nil)
-    expect(timekeeping.calls).not_to include([:admit, 2])
-  end
-end
+      described_class.run(direction: :cutover, owners:, report_root:)
 
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-  include RunnerSourceIntentsSpecSupport
-
-  # "Source intents are saved at the checkpoint and reused on resume, and deleting or changing a terminal
-  # intent after the checkpoint makes reconcile report a difference."
-  it "a terminal intent whose desired_entry_ids change after the checkpoint makes the resumed reconcile report that field" do
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    owners = TimekeepingHandoffFakes.owners(timekeeping:)
-    report_root = Dir.mktmpdir("handoff-report")
-    operation_id = "5d0b6a0e-1d7c-4f4e-9a52-6a1f1c0de002"
-    insert_committed_intent_for_source_intents_spec(operation_id)
-
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:,
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    InvoiceOperationsRecord.connection.execute(
-      "UPDATE invoice_operation_intents SET desired_entry_ids = '{424242}' WHERE operation_id = '#{operation_id}'"
-    )
-
-    expect { described_class.run(direction: :cutover, owners:, report_root:) }
-      .to raise_error(Timekeeping::Handoff::Runner::Refused, /Reconciliation found unexplained differences/)
-
-    report = Dir.glob(File.join(report_root, "generation-*", "reconciliation.json")).map { |path| File.read(path) }.join
-    expect(report).to include(operation_id)
-    expect(report).to include("desired_entry_ids")
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", legacy_retired_at: nil)
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-  include RunnerSourceIntentsSpecSupport
-
-  # "Source intents are saved at the checkpoint and reused on resume, and deleting or changing a terminal
-  # intent after the checkpoint makes reconcile report a difference."
-  # With nothing changed, the saved intents must read back equal to a fresh read, so the resume passes.
-  it "a resume with unchanged intents reuses the saved source intents and finishes the cutover" do
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    owners = TimekeepingHandoffFakes.owners(timekeeping:)
-    report_root = Dir.mktmpdir("handoff-report")
-    insert_committed_intent_for_source_intents_spec("5d0b6a0e-1d7c-4f4e-9a52-6a1f1c0de003", desired_entry_ids: "{7,8}")
-
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:,
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    saved = Dir.glob(File.join(report_root, "generation-*", "source_intents.json"))
-    expect(saved.size).to eq(1)
-    saved_text = File.read(saved.first)
-
-    described_class.run(direction: :cutover, owners:, report_root:)
-
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
-    expect(File.read(saved.first)).to eq(saved_text)
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-
-  # "Source intents are saved at the checkpoint and reused on resume, and deleting or changing a terminal
-  # intent after the checkpoint makes reconcile report a difference."
-  # Capturing again at reconcile would compare current intents with themselves and hide any change.
-  it "a resume whose saved source intents file is gone refuses instead of capturing the intents again" do
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    owners = TimekeepingHandoffFakes.owners(timekeeping:)
-    report_root = Dir.mktmpdir("handoff-report")
-
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:,
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    saved = Dir.glob(File.join(report_root, "generation-*", "source_intents.json"))
-    expect(saved.size).to eq(1)
-    expect(Dir.glob(File.join(report_root, "generation-*", "checkpoint.json")).size).to eq(1)
-    File.delete(saved.first)
-
-    expect { described_class.run(direction: :cutover, owners:, report_root:) }
-      .to raise_error(Timekeeping::Handoff::ReportDirectory::Unreadable)
-
-    expect(File.exist?(saved.first)).to be(false)
-    expect(Dir.glob(File.join(report_root, "generation-*", "reconciliation.json"))).to be_empty
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", legacy_retired_at: nil)
-  end
-end
-
-# Uses RunnerLegacyHandoffSpecSupport, defined at the top of this file.
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-  include RunnerSourceIntentsSpecSupport
-
-  # "Capture and persist the source intents at the frozen checkpoint boundary, reuse them after restart, and pass a separate current read to reconciliation."
-  it "an intent written after the checkpoint appears only in the current read and makes the resumed reconcile report it missing from the source" do
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    owners = TimekeepingHandoffFakes.owners(timekeeping:)
-    report_root = Dir.mktmpdir("handoff-report")
-    operation_id = SecureRandom.uuid
-
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:,
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    generation_dir = Pathname(report_root).join("generation-#{TimekeepingOwnership.current.generation}")
-    saved_intents = generation_dir.join("source_intents.json").read
-
-    insert_committed_intent_for_source_intents_spec(operation_id)
-
-    expect { described_class.run(direction: :cutover, owners:, report_root:) }
-      .to raise_error(Timekeeping::Handoff::Runner::Refused)
-
-    expect(generation_dir.join("source_intents.json").read).to eq(saved_intents)
-    report = generation_dir.join("reconciliation.json").read
-    expect(report).to include(operation_id)
-    expect(report).to include("missing_in_source")
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", legacy_retired_at: nil)
-  end
-end
-
-# Uses RunnerLegacyHandoffSpecSupport, defined at the top of this file.
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-  include RunnerSourceIntentsSpecSupport
-
-  # "Keep the existing checks for pending intents and operation states."
-  it "an intent committed at the checkpoint and pending on resume is still reported as a pending intent from the current read" do
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    owners = TimekeepingHandoffFakes.owners(timekeeping:)
-    report_root = Dir.mktmpdir("handoff-report")
-    operation_id = SecureRandom.uuid
-    insert_committed_intent_for_source_intents_spec(operation_id)
-
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:,
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    generation_dir = Pathname(report_root).join("generation-#{TimekeepingOwnership.current.generation}")
-    expect(generation_dir.join("source_intents.json").read).to include(operation_id)
-
-    InvoiceOperationsRecord.connection.execute(
-      "UPDATE invoice_operation_intents SET state = 'pending', finished_at = NULL WHERE operation_id = '#{operation_id}'"
-    )
-
-    expect { described_class.run(direction: :cutover, owners:, report_root:) }
-      .to raise_error(Timekeeping::Handoff::Runner::Refused)
-
-    report = generation_dir.join("reconciliation.json").read
-    expect(report).to include(operation_id)
-    expect(report).to include("intent_pending")
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", legacy_retired_at: nil)
-    expect(timekeeping.calls).not_to include([:admit, TimekeepingOwnership.current.generation])
-  end
-end
-
-# Uses RunnerLegacyHandoffSpecSupport, defined at the top of this file.
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-  include RunnerSourceIntentsSpecSupport
-
-  # A legacy intent committed at the checkpoint is listed as an expected
-  # receipt difference; once it fails after the checkpoint, that listing must
-  # not explain away its state change.
-  it "a legacy intent committed at the checkpoint and failed on resume is reported, not listed as expected" do
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    owners = TimekeepingHandoffFakes.owners(timekeeping:)
-    report_root = Dir.mktmpdir("handoff-report")
-    operation_id = SecureRandom.uuid
-    insert_committed_intent_for_source_intents_spec(operation_id)
-
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:,
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    InvoiceOperationsRecord.connection.execute(
-      "UPDATE invoice_operation_intents SET state = 'failed' WHERE operation_id = '#{operation_id}'"
-    )
-
-    expect { described_class.run(direction: :cutover, owners:, report_root:) }
-      .to raise_error(Timekeeping::Handoff::Runner::Refused, /Reconciliation found unexplained differences/)
-
-    generation_dir = Pathname(report_root).join("generation-#{TimekeepingOwnership.current.generation}")
-    expect(generation_dir.join("reconciliation.json").read).to include(operation_id)
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", legacy_retired_at: nil)
-  end
-end
-
-# Uses RunnerLegacyHandoffSpecSupport, defined at the top of this file.
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-
-  # "A fresh-runner restart after corrections and after checkpoint is recorded, with the clock advanced, ends with per-company counts and checksums equal to an uninterrupted control run and keeps the saved capture time."
-  it "a fresh runner restarted a day later after the recorded checkpoint ends with the uninterrupted control's full per-company digest and keeps the saved capture time" do
-    captured_at = Time.utc(2026, 10, 27, 12)
-    later = captured_at + 1.day
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    owners = TimekeepingHandoffFakes.owners(timekeeping:)
-    report_root = Dir.mktmpdir("handoff-report")
-
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:, clock: Struct.new(:now).new(captured_at),
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    expect(TimekeepingOwnership.current.handoff_step).to eq("checkpoint")
-
-    expect do
-      described_class.run(direction: :cutover, owners: TimekeepingHandoffFakes.owners(timekeeping:), report_root:,
-                          clock: Struct.new(:now).new(later))
-    end.not_to raise_error
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
-
-    control = uninterrupted_control(captured_at:)
-    digest = timekeeping.export_checkpoint.digest
-    expect(digest).to eq(control.fetch(:load).digest)
-    expect(digest.keys).to match_array(Timekeeping::Handoff::Checkpoint::TABLES.keys)
-    seeded = Company.pluck(:id)
-    expect(seeded).not_to be_empty
-    %w(entries reservations entry_audits).each { |table| expect(digest.fetch(table).keys).to match_array(seeded) }
-    %w(invoice_operations idempotency_records).each { |table| expect(digest.fetch(table)).to eq({}) }
-
-    control_ids = control.fetch(:corrections).map { |snapshot| TimekeepingHandoffFakes::InMemoryTimekeepingStore.entry_id_of(snapshot) }
-    expect(control_ids).not_to be_empty
-    expect(correction_entry_ids(timekeeping)).to match_array(snapshot_entry_ids(control_ids))
-    expect(timekeeping.corrections.pluck("generation").uniq).to eq([2])
-    expect(timekeeping.corrections.pluck("version").uniq).to eq([1])
-
-    saved = Timekeeping::Handoff::ReportDirectory.new(root: report_root, generation: 2).read_checkpoint
-    expect(saved.fetch(:captured_at)).to eq(captured_at)
-    expect(saved.fetch(:captured_at)).not_to eq(later)
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-
-  # "A fresh-runner restart after corrections and after checkpoint is recorded, with the clock advanced, ends with per-company counts and checksums equal to an uninterrupted control run and keeps the saved capture time."
-  it "a fresh runner restarted a day later after corrections were written ends with the uninterrupted control's full per-company digest and keeps the saved capture time" do
-    captured_at = Time.utc(2026, 10, 27, 12)
-    later = captured_at + 1.day
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    report_root = Dir.mktmpdir("handoff-report")
-
-    expect do
-      described_class.run(direction: :cutover, owners: TimekeepingHandoffFakes.owners(timekeeping:), report_root:,
-                          clock: Struct.new(:now).new(captured_at),
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_corrections))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    expect(TimekeepingOwnership.current.handoff_step).to eq("freeze")
-    expect(timekeeping.corrections).not_to be_empty
-
-    expect do
-      described_class.run(direction: :cutover, owners: TimekeepingHandoffFakes.owners(timekeeping:), report_root:,
-                          clock: Struct.new(:now).new(later))
-    end.not_to raise_error
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
-
-    control = uninterrupted_control(captured_at:)
-    digest = timekeeping.export_checkpoint.digest
-    expect(digest).to eq(control.fetch(:load).digest)
-    seeded = Company.pluck(:id)
-    expect(seeded).not_to be_empty
-    %w(entries reservations entry_audits).each { |table| expect(digest.fetch(table).keys).to match_array(seeded) }
-    %w(invoice_operations idempotency_records).each { |table| expect(digest.fetch(table)).to eq({}) }
-
-    control_ids = control.fetch(:corrections).map { |snapshot| TimekeepingHandoffFakes::InMemoryTimekeepingStore.entry_id_of(snapshot) }
-    expect(control_ids).not_to be_empty
-    expect(correction_entry_ids(timekeeping)).to match_array(snapshot_entry_ids(control_ids))
-    expect(timekeeping.corrections.pluck("generation").uniq).to eq([2])
-    expect(timekeeping.corrections.pluck("version").uniq).to eq([1])
-
-    saved = Timekeeping::Handoff::ReportDirectory.new(root: report_root, generation: 2).read_checkpoint
-    expect(saved.fetch(:captured_at)).to eq(captured_at)
-    expect(saved.fetch(:captured_at)).not_to eq(later)
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-
-  # The restart examples compare with this derived control, so an executed
-  # uninterrupted run must end at the same digest for that comparison to stand
-  # for "an uninterrupted control run".
-  it "an uninterrupted first cutover at a fixed capture time ends with the derived control's full per-company digest and corrections" do
-    captured_at = Time.utc(2026, 10, 27, 12)
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    report_root = Dir.mktmpdir("handoff-report")
-
-    described_class.run(direction: :cutover, owners: TimekeepingHandoffFakes.owners(timekeeping:), report_root:,
-                        clock: Struct.new(:now).new(captured_at))
-
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
-    expect(Timekeeping::Handoff::ReportDirectory.new(root: report_root, generation: 2).read_checkpoint.fetch(:captured_at))
-      .to eq(captured_at)
-    control = uninterrupted_control(captured_at:)
-    digest = timekeeping.export_checkpoint.digest
-    expect(digest).to eq(control.fetch(:load).digest)
-    seeded = Company.pluck(:id)
-    expect(seeded).not_to be_empty
-    %w(entries reservations entry_audits).each { |table| expect(digest.fetch(table).keys).to match_array(seeded) }
-
-    control_ids = control.fetch(:corrections).map { |snapshot| TimekeepingHandoffFakes::InMemoryTimekeepingStore.entry_id_of(snapshot) }
-    expect(control_ids).not_to be_empty
-    expect(control_ids).to match_array(recorded_unlocked_entry_ids)
-    expect(correction_entry_ids(timekeeping)).to match_array(snapshot_entry_ids(control_ids))
-  end
-end
-
-# Uses RunnerLegacyHandoffSpecSupport, defined at the top of this file.
-# Two crashes in a row, with the clock moving
-# on before each restart. Rewriting the correction snapshots is harmless,
-# because the store keeps one correction per entry; what this checks is that
-# every restart reuses the first capture time and ends at the control's digest,
-# which carries each entry's version.
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-
-  # "A fresh-runner restart after corrections and after checkpoint is recorded, with the clock advanced, ends with per-company counts and checksums equal to an uninterrupted control run and keeps the saved capture time."
-  it "a cutover interrupted after corrections and again after the recorded checkpoint finishes on a third runner with the uninterrupted digest and the first capture time" do
-    first_time = Time.utc(2026, 10, 27, 12)
-    clock_at = ->(time) { Struct.new(:now).new(time) }
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    owners = TimekeepingHandoffFakes.owners(timekeeping:)
-    report_root = Dir.mktmpdir("handoff-report")
-
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:, clock: clock_at.call(first_time),
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_corrections))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    expect(TimekeepingOwnership.current.handoff_step).to eq("freeze")
-
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:, clock: clock_at.call(first_time + 1.day),
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    expect(TimekeepingOwnership.current.handoff_step).to eq("checkpoint")
-
-    described_class.run(direction: :cutover, owners:, report_root:, clock: clock_at.call(first_time + 2.days))
-
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
-    control = uninterrupted_control(captured_at: first_time)
-    digest = timekeeping.export_checkpoint.digest
-    expect(digest).to eq(control.fetch(:load).digest)
-    %w(entries reservations entry_audits).each do |table|
-      expect(digest.fetch(table).keys.size).to eq(Company.count), "#{table} is missing a seeded company"
+      expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 3, handoff_step: nil)
+      expect(Timekeeping::Preflight).to have_received(:classify).at_least(:once)
+      entries = timekeeping.rows.fetch("entries")
+      expect(entries.pluck("id")).to match_array(TimesheetEntry.unscoped.pluck(:id))
+      expect(entries.find { |row| row["id"] == changed_id }["note"]).to eq("changed before the retry")
+      committed = timekeeping.rows.fetch("reservations").filter_map { |row| row["entry_id"] if row["state"] == "committed" }
+      expect(committed).to include(*entry_ids)
+      expect(correction_entry_ids(timekeeping)).to match_array(snapshot_entry_ids(entry_ids))
+      expect(timekeeping.corrections.pluck("generation").uniq).to eq([3])
     end
-    expect(digest.fetch("invoice_operations")).to eq({})
-    expect(digest.fetch("idempotency_records")).to eq({})
-
-    expected_ids = control.fetch(:corrections).map { |correction| TimekeepingHandoffFakes::InMemoryTimekeepingStore.entry_id_of(correction) }
-    expect(expected_ids).not_to be_empty
-    expect(correction_entry_ids(timekeeping)).to match_array(snapshot_entry_ids(expected_ids))
-    expect(timekeeping.corrections.pluck("generation").uniq).to eq([2])
-
-    saved = Timekeeping::Handoff::ReportDirectory.new(root: report_root, generation: 2).read_checkpoint
-    expect(saved.fetch(:captured_at)).to eq(first_time)
   end
-end
 
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-  include RunnerSourceIntentsSpecSupport
+  context "when a first cutover aborted after corrections is retried", :two_tenant_seed, :seeded_without_transaction do
+    # "An aborted first cutover retried at a later generation still runs the pre-flight, copies legacy entries and derives every reservation and correction"
+    # After the aborted attempt, Timekeeping holds the corrected entries at version 1
+    # while the legacy rows are still version 0, so the retry must not load anything
+    # older than what Timekeeping stores.
+    it "a first cutover aborted after corrections were written retries at generation 3 without a version refusal and rederives every correction" do
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
+      report_root = Dir.mktmpdir("handoff-report")
+      entry_ids = recorded_unlocked_entry_ids
 
-  # "Interrupt at `:after_reconcile`, delete a terminal intent, then resume."
-  # "Require a fresh comparison with the saved intents before a resumed flip, and test this interruption with both deletion and `desired_entry_ids` changes."
-  it "a terminal intent deleted after the recorded reconcile refuses every resumed flip, keeps the row at reconcile and leaves the saved baselines untouched" do
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    owners = TimekeepingHandoffFakes.owners(timekeeping:)
-    report_root = Dir.mktmpdir("handoff-report")
-    operation_id = SecureRandom.uuid
-    insert_committed_intent_for_source_intents_spec(operation_id)
+      expect do
+        described_class.run(direction: :cutover, owners:, report_root:,
+                            observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_corrections))
+      end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+      expect(correction_entry_ids(timekeeping)).to match_array(snapshot_entry_ids(entry_ids))
+      described_class.run(direction: :cutover, abort: true, owners:, report_root:)
 
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:,
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_reconcile))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    ownership = TimekeepingOwnership.current
-    expect([ownership.generation, ownership.owner, ownership.handoff_step]).to eq([2, "monolith", "reconcile"])
+      changed_id = TimesheetEntry.unscoped.where.not(id: entry_ids).minimum(:id)
+      TimesheetEntry.unscoped.where(id: changed_id).update_all(note: "changed after the abort")
+      allow(Timekeeping::Preflight).to receive(:classify).and_call_original
 
-    generation_dir = Pathname(report_root).join("generation-2")
-    baselines = %w[source_intents.json checkpoint.json money_before.json].index_with { |name| generation_dir.join(name).read }
+      described_class.run(direction: :cutover, owners:, report_root:)
 
-    InvoiceOperationsRecord.connection.execute(
-      "DELETE FROM invoice_operation_intents WHERE operation_id = '#{operation_id}'"
-    )
+      expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 3, handoff_step: nil)
+      expect(Timekeeping::Preflight).to have_received(:classify).at_least(:once)
+      entries = timekeeping.rows.fetch("entries")
+      expect(entries.find { |row| row["id"] == changed_id }["note"]).to eq("changed after the abort")
+      entry_ids.each do |entry_id|
+        expect(entries.find { |row| row["id"] == entry_id }["version"]).to be >= 1
+        expect(timekeeping.rows.fetch("reservations").count { |row| row["entry_id"] == entry_id && row["state"] == "committed" }).to eq(1)
+      end
+      expect(correction_entry_ids(timekeeping)).to match_array(snapshot_entry_ids(entry_ids))
+      expect(timekeeping.corrections.pluck("generation").uniq).to eq([3])
+    end
+  end
 
-    # A second resume must reach the same verdict: the recheck reads the saved
-    # baseline again and never recaptures it from the post-deletion rows.
-    2.times do
-      # The previous report is removed, so only a comparison made by this resume can name the deletion.
+  context "when an entry is edited under each owner across cutover, rollback and re-cutover", :two_tenant_seed, :seeded_without_transaction do
+    # "Versions continue from the checkpoint and never go backwards across cutover, rollback and re-cutover"
+    it "entry versions never go backwards across cutover, rollback and re-cutover with an edit under each owner" do
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
+      report_root = Dir.mktmpdir("handoff-report")
+      monolith_store = Timekeeping::Handoff::MonolithStore.new(connection: ActiveRecord::Base.connection)
+      legacy = TimesheetEntry.unscoped.pluck(:id, :version).to_h
+      edited_id = legacy.keys.min
+
+      described_class.run(direction: :cutover, owners:, report_root:)
+      after_cutover = entry_versions(timekeeping.export_checkpoint)
+      timekeeping.edit_entry!(edited_id)
+      after_timekeeping_edit = entry_versions(timekeeping.export_checkpoint)
+
+      described_class.run(direction: :rollback, owners:, report_root:)
+      after_rollback = entry_versions(monolith_store.export_checkpoint)
+      ActiveRecord::Base.connection.execute(
+        "UPDATE entries SET version = version + 1, note = 'edited in the monolith' WHERE id = #{Integer(edited_id)}"
+      )
+      after_monolith_edit = entry_versions(monolith_store.export_checkpoint)
+
+      described_class.run(direction: :re_cutover, owners:, report_root:)
+      after_re_cutover = entry_versions(timekeeping.export_checkpoint)
+
+      expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 4, handoff_step: nil)
+      stages = [legacy, after_cutover, after_timekeeping_edit, after_rollback, after_monolith_edit, after_re_cutover]
+      stages.each_cons(2) do |before, after|
+        expect(after.keys).to match_array(before.keys)
+        before.each { |id, version| expect(after.fetch(id)).to be >= version, "entry #{id} went from #{version} to #{after.fetch(id)}" }
+      end
+      expect(after_rollback.fetch(edited_id)).to eq(after_timekeeping_edit.fetch(edited_id))
+      expect(after_re_cutover.fetch(edited_id)).to eq(after_timekeeping_edit.fetch(edited_id) + 1)
+    end
+  end
+
+  context "when billing writes are watched across cutover, rollback and re-cutover", :two_tenant_seed, :seeded_without_transaction do
+    # "No handoff step writes a billing table."
+    it "no statement during cutover, rollback or re-cutover inserts, updates or deletes invoices, invoice_line_items, invoice_taxes or payments" do
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
+      report_root = Dir.mktmpdir("handoff-report")
+      writes = []
+      # The notification fires for every connection class, InvoiceOperationsRecord included.
+      subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
+        writes << payload[:sql] if payload[:sql].match?(RunnerLegacyHandoffSpecSupport::BILLING_WRITE)
+      end
+
+      begin
+        # A planted no-op write shows the subscriber catches a quoted billing write.
+        ActiveRecord::Base.connection.execute('UPDATE "invoices" SET updated_at = updated_at WHERE false')
+        expect(writes.size).to eq(1)
+        writes.clear
+
+        described_class.run(direction: :cutover, owners:, report_root:)
+        described_class.run(direction: :rollback, owners:, report_root:)
+        described_class.run(direction: :re_cutover, owners:, report_root:)
+      ensure
+        ActiveSupport::Notifications.unsubscribe(subscriber)
+      end
+
+      expect(TimekeepingOwnership.current.generation).to eq(4)
+      expect(writes).to eq([])
+    end
+  end
+
+  # The seed loads once per example group, so each case gets a group of its own.
+  [[:uncorrected, 99], [:corrected, 0]].each do |kind, changed_version|
+    context "when an #{kind} entry's version drifted after the recorded checkpoint", :two_tenant_seed, :seeded_without_transaction do
+      # "Versions continue from the checkpoint and never go backwards across cutover, rollback and re-cutover"
+      it "refuses a restart after the recorded checkpoint when an #{kind} entry's version drifted to #{changed_version}" do
+        timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+        owners = TimekeepingHandoffFakes.owners(timekeeping:)
+        report_root = Dir.mktmpdir("handoff-report")
+
+        expect do
+          described_class.run(direction: :cutover, owners:, report_root:,
+                              observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
+        end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+        expect(TimekeepingOwnership.current.handoff_step).to eq("checkpoint")
+
+        corrected_ids = recorded_unlocked_entry_ids
+        row = timekeeping.rows.fetch("entries").find { |entry| corrected_ids.include?(entry["id"]) == (kind == :corrected) }
+        row["version"] = changed_version
+
+        expect { described_class.run(direction: :cutover, owners:, report_root:) }
+          .to raise_error(Timekeeping::Handoff::Runner::Refused)
+        # The restart stops before the flip: ownership stays with the monolith,
+        # the legacy source is not retired, and Timekeeping is not admitted.
+        expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", legacy_retired_at: nil)
+        expect(TimekeepingOwnership.current.handoff_step).not_to be_nil
+        expect(timekeeping.calls).not_to include([:admit, 2])
+      end
+    end
+  end
+
+  context "when a terminal intent is deleted after the recorded checkpoint", :two_tenant_seed, :seeded_without_transaction do
+    # "Source intents are saved at the checkpoint and reused on resume, and deleting or changing a terminal
+    # intent after the checkpoint makes reconcile report a difference."
+    it "a terminal intent deleted after the checkpoint makes the resumed reconcile report it and keep the monolith as owner" do
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
+      report_root = Dir.mktmpdir("handoff-report")
+      operation_id = "5d0b6a0e-1d7c-4f4e-9a52-6a1f1c0de001"
+      insert_committed_intent_for_source_intents_spec(operation_id)
+
+      expect do
+        described_class.run(direction: :cutover, owners:, report_root:,
+                            observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
+      end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+      InvoiceOperationsRecord.connection.execute(
+        "DELETE FROM invoice_operation_intents WHERE operation_id = '#{operation_id}'"
+      )
+
+      expect { described_class.run(direction: :cutover, owners:, report_root:) }
+        .to raise_error(Timekeeping::Handoff::Runner::Refused)
+
+      report = Dir.glob(File.join(report_root, "generation-*", "reconciliation.json")).map { |path| File.read(path) }.join
+      expect(report).to include(operation_id)
+      expect(report).to include("missing_in_checkpoint")
+      expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", legacy_retired_at: nil)
+      expect(timekeeping.calls).not_to include([:admit, 2])
+    end
+  end
+
+  context "when a terminal intent's desired_entry_ids change after the recorded checkpoint", :two_tenant_seed, :seeded_without_transaction do
+    # "Source intents are saved at the checkpoint and reused on resume, and deleting or changing a terminal
+    # intent after the checkpoint makes reconcile report a difference."
+    it "a terminal intent whose desired_entry_ids change after the checkpoint makes the resumed reconcile report that field" do
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
+      report_root = Dir.mktmpdir("handoff-report")
+      operation_id = "5d0b6a0e-1d7c-4f4e-9a52-6a1f1c0de002"
+      insert_committed_intent_for_source_intents_spec(operation_id)
+
+      expect do
+        described_class.run(direction: :cutover, owners:, report_root:,
+                            observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
+      end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+      InvoiceOperationsRecord.connection.execute(
+        "UPDATE invoice_operation_intents SET desired_entry_ids = '{424242}' WHERE operation_id = '#{operation_id}'"
+      )
+
+      expect { described_class.run(direction: :cutover, owners:, report_root:) }
+        .to raise_error(Timekeeping::Handoff::Runner::Refused, /Reconciliation found unexplained differences/)
+
+      report = Dir.glob(File.join(report_root, "generation-*", "reconciliation.json")).map { |path| File.read(path) }.join
+      expect(report).to include(operation_id)
+      expect(report).to include("desired_entry_ids")
+      expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", legacy_retired_at: nil)
+    end
+  end
+
+  context "when the intents are unchanged after the recorded checkpoint", :two_tenant_seed, :seeded_without_transaction do
+    # "Source intents are saved at the checkpoint and reused on resume, and deleting or changing a terminal
+    # intent after the checkpoint makes reconcile report a difference."
+    # With nothing changed, the saved intents must read back equal to a fresh read, so the resume passes.
+    it "a resume with unchanged intents reuses the saved source intents and finishes the cutover" do
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
+      report_root = Dir.mktmpdir("handoff-report")
+      insert_committed_intent_for_source_intents_spec("5d0b6a0e-1d7c-4f4e-9a52-6a1f1c0de003", desired_entry_ids: "{7,8}")
+
+      expect do
+        described_class.run(direction: :cutover, owners:, report_root:,
+                            observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
+      end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+      saved = Dir.glob(File.join(report_root, "generation-*", "source_intents.json"))
+      expect(saved.size).to eq(1)
+      saved_text = File.read(saved.first)
+
+      described_class.run(direction: :cutover, owners:, report_root:)
+
+      expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
+      expect(File.read(saved.first)).to eq(saved_text)
+    end
+  end
+
+  context "when the saved source intents file is gone after the recorded checkpoint", :two_tenant_seed, :seeded_without_transaction do
+    # "Source intents are saved at the checkpoint and reused on resume, and deleting or changing a terminal
+    # intent after the checkpoint makes reconcile report a difference."
+    # Capturing again at reconcile would compare current intents with themselves and hide any change.
+    it "a resume whose saved source intents file is gone refuses instead of capturing the intents again" do
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
+      report_root = Dir.mktmpdir("handoff-report")
+
+      expect do
+        described_class.run(direction: :cutover, owners:, report_root:,
+                            observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
+      end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+      saved = Dir.glob(File.join(report_root, "generation-*", "source_intents.json"))
+      expect(saved.size).to eq(1)
+      expect(Dir.glob(File.join(report_root, "generation-*", "checkpoint.json")).size).to eq(1)
+      File.delete(saved.first)
+
+      expect { described_class.run(direction: :cutover, owners:, report_root:) }
+        .to raise_error(Timekeeping::Handoff::ReportDirectory::Unreadable)
+
+      expect(File.exist?(saved.first)).to be(false)
+      expect(Dir.glob(File.join(report_root, "generation-*", "reconciliation.json"))).to be_empty
+      expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", legacy_retired_at: nil)
+    end
+  end
+
+  context "when an intent is written after the recorded checkpoint", :two_tenant_seed, :seeded_without_transaction do
+    # "Capture and persist the source intents at the frozen checkpoint boundary, reuse them after restart, and pass a separate current read to reconciliation."
+    it "an intent written after the checkpoint appears only in the current read and makes the resumed reconcile report it missing from the source" do
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
+      report_root = Dir.mktmpdir("handoff-report")
+      operation_id = SecureRandom.uuid
+
+      expect do
+        described_class.run(direction: :cutover, owners:, report_root:,
+                            observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
+      end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+      generation_dir = Pathname(report_root).join("generation-#{TimekeepingOwnership.current.generation}")
+      saved_intents = generation_dir.join("source_intents.json").read
+
+      insert_committed_intent_for_source_intents_spec(operation_id)
+
+      expect { described_class.run(direction: :cutover, owners:, report_root:) }
+        .to raise_error(Timekeeping::Handoff::Runner::Refused)
+
+      expect(generation_dir.join("source_intents.json").read).to eq(saved_intents)
+      report = generation_dir.join("reconciliation.json").read
+      expect(report).to include(operation_id)
+      expect(report).to include("missing_in_source")
+      expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", legacy_retired_at: nil)
+    end
+  end
+
+  context "when a committed intent turns pending after the recorded checkpoint", :two_tenant_seed, :seeded_without_transaction do
+    # "Keep the existing checks for pending intents and operation states."
+    it "an intent committed at the checkpoint and pending on resume is still reported as a pending intent from the current read" do
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
+      report_root = Dir.mktmpdir("handoff-report")
+      operation_id = SecureRandom.uuid
+      insert_committed_intent_for_source_intents_spec(operation_id)
+
+      expect do
+        described_class.run(direction: :cutover, owners:, report_root:,
+                            observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
+      end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+      generation_dir = Pathname(report_root).join("generation-#{TimekeepingOwnership.current.generation}")
+      expect(generation_dir.join("source_intents.json").read).to include(operation_id)
+
+      InvoiceOperationsRecord.connection.execute(
+        "UPDATE invoice_operation_intents SET state = 'pending', finished_at = NULL WHERE operation_id = '#{operation_id}'"
+      )
+
+      expect { described_class.run(direction: :cutover, owners:, report_root:) }
+        .to raise_error(Timekeeping::Handoff::Runner::Refused)
+
+      report = generation_dir.join("reconciliation.json").read
+      expect(report).to include(operation_id)
+      expect(report).to include("intent_pending")
+      expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", legacy_retired_at: nil)
+      expect(timekeeping.calls).not_to include([:admit, TimekeepingOwnership.current.generation])
+    end
+  end
+
+  context "when a committed legacy intent fails after the recorded checkpoint", :two_tenant_seed, :seeded_without_transaction do
+    # A legacy intent committed at the checkpoint is listed as an expected
+    # receipt difference; once it fails after the checkpoint, that listing must
+    # not explain away its state change.
+    it "a legacy intent committed at the checkpoint and failed on resume is reported, not listed as expected" do
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
+      report_root = Dir.mktmpdir("handoff-report")
+      operation_id = SecureRandom.uuid
+      insert_committed_intent_for_source_intents_spec(operation_id)
+
+      expect do
+        described_class.run(direction: :cutover, owners:, report_root:,
+                            observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
+      end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+      InvoiceOperationsRecord.connection.execute(
+        "UPDATE invoice_operation_intents SET state = 'failed' WHERE operation_id = '#{operation_id}'"
+      )
+
+      expect { described_class.run(direction: :cutover, owners:, report_root:) }
+        .to raise_error(Timekeeping::Handoff::Runner::Refused, /Reconciliation found unexplained differences/)
+
+      generation_dir = Pathname(report_root).join("generation-#{TimekeepingOwnership.current.generation}")
+      expect(generation_dir.join("reconciliation.json").read).to include(operation_id)
+      expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", legacy_retired_at: nil)
+    end
+  end
+
+  context "when a fresh runner restarts after the recorded checkpoint", :two_tenant_seed, :seeded_without_transaction do
+    # "A fresh-runner restart after corrections and after checkpoint is recorded, with the clock advanced, ends with per-company counts and checksums equal to an uninterrupted control run and keeps the saved capture time."
+    it "a fresh runner restarted a day later after the recorded checkpoint ends with the uninterrupted control's full per-company digest and keeps the saved capture time" do
+      captured_at = Time.utc(2026, 10, 27, 12)
+      later = captured_at + 1.day
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
+      report_root = Dir.mktmpdir("handoff-report")
+
+      expect do
+        described_class.run(direction: :cutover, owners:, report_root:, clock: Struct.new(:now).new(captured_at),
+                            observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
+      end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+      expect(TimekeepingOwnership.current.handoff_step).to eq("checkpoint")
+
+      expect do
+        described_class.run(direction: :cutover, owners: TimekeepingHandoffFakes.owners(timekeeping:), report_root:,
+                            clock: Struct.new(:now).new(later))
+      end.not_to raise_error
+
+      expect_uninterrupted_control_result(timekeeping, report_root:, captured_at:)
+    end
+  end
+
+  context "when a fresh runner restarts after corrections were written", :two_tenant_seed, :seeded_without_transaction do
+    # "A fresh-runner restart after corrections and after checkpoint is recorded, with the clock advanced, ends with per-company counts and checksums equal to an uninterrupted control run and keeps the saved capture time."
+    it "a fresh runner restarted a day later after corrections were written ends with the uninterrupted control's full per-company digest and keeps the saved capture time" do
+      captured_at = Time.utc(2026, 10, 27, 12)
+      later = captured_at + 1.day
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      report_root = Dir.mktmpdir("handoff-report")
+
+      expect do
+        described_class.run(direction: :cutover, owners: TimekeepingHandoffFakes.owners(timekeeping:), report_root:,
+                            clock: Struct.new(:now).new(captured_at),
+                            observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_corrections))
+      end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+      expect(TimekeepingOwnership.current.handoff_step).to eq("freeze")
+      expect(timekeeping.corrections).not_to be_empty
+
+      expect do
+        described_class.run(direction: :cutover, owners: TimekeepingHandoffFakes.owners(timekeeping:), report_root:,
+                            clock: Struct.new(:now).new(later))
+      end.not_to raise_error
+
+      expect_uninterrupted_control_result(timekeeping, report_root:, captured_at:)
+    end
+  end
+
+  context "when the first cutover runs uninterrupted at a fixed capture time", :two_tenant_seed, :seeded_without_transaction do
+    # The restart examples compare with this derived control, so an executed
+    # uninterrupted run must end at the same digest for that comparison to stand
+    # for "an uninterrupted control run".
+    # "The first cutover turns each recorded unlocked link into a committed reservation with one correction snapshot"
+    it "an uninterrupted first cutover at a fixed capture time ends with the derived control's full per-company digest and corrections" do
+      captured_at = Time.utc(2026, 10, 27, 12)
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      report_root = Dir.mktmpdir("handoff-report")
+
+      described_class.run(direction: :cutover, owners: TimekeepingHandoffFakes.owners(timekeeping:), report_root:,
+                          clock: Struct.new(:now).new(captured_at))
+
+      expect_uninterrupted_control_result(timekeeping, report_root:, captured_at:)
+    end
+  end
+
+  # Two crashes in a row, with the clock moving
+  # on before each restart. Rewriting the correction snapshots is harmless,
+  # because the store keeps one correction per entry; what this checks is that
+  # every restart reuses the first capture time and ends at the control's digest,
+  # which carries each entry's version.
+  context "when a cutover is interrupted after corrections and again after the recorded checkpoint", :two_tenant_seed, :seeded_without_transaction do
+    # "A fresh-runner restart after corrections and after checkpoint is recorded, with the clock advanced, ends with per-company counts and checksums equal to an uninterrupted control run and keeps the saved capture time."
+    it "a cutover interrupted after corrections and again after the recorded checkpoint finishes on a third runner with the uninterrupted digest and the first capture time" do
+      first_time = Time.utc(2026, 10, 27, 12)
+      clock_at = ->(time) { Struct.new(:now).new(time) }
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
+      report_root = Dir.mktmpdir("handoff-report")
+
+      expect do
+        described_class.run(direction: :cutover, owners:, report_root:, clock: clock_at.call(first_time),
+                            observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_corrections))
+      end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+      expect(TimekeepingOwnership.current.handoff_step).to eq("freeze")
+
+      expect do
+        described_class.run(direction: :cutover, owners:, report_root:, clock: clock_at.call(first_time + 1.day),
+                            observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_checkpoint))
+      end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+      expect(TimekeepingOwnership.current.handoff_step).to eq("checkpoint")
+
+      described_class.run(direction: :cutover, owners:, report_root:, clock: clock_at.call(first_time + 2.days))
+
+      expect_uninterrupted_control_result(timekeeping, report_root:, captured_at: first_time)
+    end
+  end
+
+  context "when a terminal intent is deleted after the recorded reconcile", :two_tenant_seed, :seeded_without_transaction do
+    # "Interrupt at `:after_reconcile`, delete a terminal intent, then resume."
+    # "Require a fresh comparison with the saved intents before a resumed flip, and test this interruption with both deletion and `desired_entry_ids` changes."
+    it "a terminal intent deleted after the recorded reconcile refuses every resumed flip, keeps the row at reconcile and leaves the saved baselines untouched" do
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
+      report_root = Dir.mktmpdir("handoff-report")
+      operation_id = SecureRandom.uuid
+      insert_committed_intent_for_source_intents_spec(operation_id)
+
+      expect do
+        described_class.run(direction: :cutover, owners:, report_root:,
+                            observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_reconcile))
+      end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+      ownership = TimekeepingOwnership.current
+      expect([ownership.generation, ownership.owner, ownership.handoff_step]).to eq([2, "monolith", "reconcile"])
+
+      generation_dir = Pathname(report_root).join("generation-2")
+      baselines = saved_baselines(generation_dir)
+
+      InvoiceOperationsRecord.connection.execute(
+        "DELETE FROM invoice_operation_intents WHERE operation_id = '#{operation_id}'"
+      )
+
+      # A second resume must reach the same verdict: the recheck reads the saved
+      # baseline again and never recaptures it from the post-deletion rows.
+      2.times do
+        # The previous report is removed, so only a comparison made by this resume can name the deletion.
+        generation_dir.join("reconciliation.json").delete
+        expect { described_class.run(direction: :cutover, owners:, report_root:) }
+          .to raise_error(Timekeeping::Handoff::Runner::Refused, /Reconciliation found unexplained differences/)
+
+        ownership = TimekeepingOwnership.current
+        expect([ownership.generation, ownership.owner, ownership.handoff_step]).to eq([2, "monolith", "reconcile"])
+        expect(ownership.legacy_retired_at).to be_nil
+        report = generation_dir.join("reconciliation.json").read
+        expect(report).to include(operation_id)
+        expect(report).to include("missing_in_checkpoint")
+        expect_saved_baselines_unchanged(generation_dir, baselines)
+      end
+      expect(timekeeping.calls).not_to include([:admit, 2])
+    end
+  end
+
+  context "when desired_entry_ids change after the recorded reconcile", :two_tenant_seed, :seeded_without_transaction do
+    # "Require a fresh comparison with the saved intents before a resumed flip, and test this interruption with both deletion and `desired_entry_ids` changes."
+    it "desired_entry_ids changed after the recorded reconcile refuses the resumed flip, and restoring them lets a later resume flip and admit once" do
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
+      report_root = Dir.mktmpdir("handoff-report")
+      operation_id = SecureRandom.uuid
+      insert_committed_intent_for_source_intents_spec(operation_id, desired_entry_ids: "{7,8}")
+
+      expect do
+        described_class.run(direction: :cutover, owners:, report_root:,
+                            observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_reconcile))
+      end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+      generation_dir = Pathname(report_root).join("generation-2")
+      baselines = saved_baselines(generation_dir)
+      # The first run's passing report is removed, so only a comparison made by the resume can name the change.
       generation_dir.join("reconciliation.json").delete
+
+      InvoiceOperationsRecord.connection.execute(
+        "UPDATE invoice_operation_intents SET desired_entry_ids = '{424242}' WHERE operation_id = '#{operation_id}'"
+      )
+
       expect { described_class.run(direction: :cutover, owners:, report_root:) }
         .to raise_error(Timekeeping::Handoff::Runner::Refused, /Reconciliation found unexplained differences/)
 
@@ -698,192 +643,145 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
       expect(ownership.legacy_retired_at).to be_nil
       report = generation_dir.join("reconciliation.json").read
       expect(report).to include(operation_id)
-      expect(report).to include("missing_in_checkpoint")
+      expect(report).to include("desired_entry_ids")
+      expect(timekeeping.calls).not_to include([:admit, 2])
+
+      # The refusal leaves the handoff resumable: once the intent matches the
+      # saved baseline again, nothing differs from it, so the next resume starts
+      # at the flip step, rechecks and flips.
+      InvoiceOperationsRecord.connection.execute(
+        "UPDATE invoice_operation_intents SET desired_entry_ids = '{7,8}' WHERE operation_id = '#{operation_id}'"
+      )
+      # The refused resume's report is removed, so a report after this resume shows the comparison ran again.
+      generation_dir.join("reconciliation.json").delete
+      started_steps = []
+      recorder = ->(event, step:) { started_steps << step if event == :before_step }
+      described_class.run(direction: :cutover, owners:, report_root:, observer: recorder)
+
+      expect(started_steps).to eq(["flip"])
+      expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
+      expect(TimekeepingOwnership.current.legacy_retired_at).not_to be_nil
+      expect(timekeeping.calls.count([:admit, 2])).to eq(1)
+      expect(generation_dir.join("reconciliation.json")).to exist
       baselines.each { |name, text| expect(generation_dir.join(name).read).to eq(text), "#{name} was rewritten" }
     end
-    expect(timekeeping.calls).not_to include([:admit, 2])
   end
-end
 
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-  include RunnerSourceIntentsSpecSupport
+  context "when a terminal intent is deleted after a rollback's recorded reconcile", :two_tenant_seed, :seeded_without_transaction do
+    # "Require a fresh comparison with the saved intents before a resumed flip, and test this interruption with both
+    # deletion and `desired_entry_ids` changes."
+    # Rollback resumes at the flip after a recorded reconcile too, so it needs the same comparison.
+    it "a terminal intent deleted after a rollback's reconcile was recorded makes the resumed rollback flip refuse, and restoring it lets the rollback finish" do
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
+      report_root = Dir.mktmpdir("handoff-report")
+      operation_id = "5d0b6a0e-1d7c-4f4e-9a52-6a1f1c0de255"
+      insert_committed_intent_for_source_intents_spec(operation_id)
+      described_class.run(direction: :cutover, owners:, report_root:)
+      expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
 
-  # "Require a fresh comparison with the saved intents before a resumed flip, and test this interruption with both deletion and `desired_entry_ids` changes."
-  it "desired_entry_ids changed after the recorded reconcile refuses the resumed flip, and restoring them lets a later resume flip and admit once" do
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    owners = TimekeepingHandoffFakes.owners(timekeeping:)
-    report_root = Dir.mktmpdir("handoff-report")
-    operation_id = SecureRandom.uuid
-    insert_committed_intent_for_source_intents_spec(operation_id, desired_entry_ids: "{7,8}")
-
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:,
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_reconcile))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    generation_dir = Pathname(report_root).join("generation-2")
-    baselines = %w[source_intents.json checkpoint.json money_before.json].index_with { |name| generation_dir.join(name).read }
-    # The first run's passing report is removed, so only a comparison made by the resume can name the change.
-    generation_dir.join("reconciliation.json").delete
-
-    InvoiceOperationsRecord.connection.execute(
-      "UPDATE invoice_operation_intents SET desired_entry_ids = '{424242}' WHERE operation_id = '#{operation_id}'"
-    )
-
-    expect { described_class.run(direction: :cutover, owners:, report_root:) }
-      .to raise_error(Timekeeping::Handoff::Runner::Refused, /Reconciliation found unexplained differences/)
-
-    ownership = TimekeepingOwnership.current
-    expect([ownership.generation, ownership.owner, ownership.handoff_step]).to eq([2, "monolith", "reconcile"])
-    expect(ownership.legacy_retired_at).to be_nil
-    report = generation_dir.join("reconciliation.json").read
-    expect(report).to include(operation_id)
-    expect(report).to include("desired_entry_ids")
-    expect(timekeeping.calls).not_to include([:admit, 2])
-
-    # The refusal leaves the handoff resumable: once the intent matches the
-    # saved baseline again, nothing differs from it, so the next resume starts
-    # at the flip step, rechecks and flips.
-    InvoiceOperationsRecord.connection.execute(
-      "UPDATE invoice_operation_intents SET desired_entry_ids = '{7,8}' WHERE operation_id = '#{operation_id}'"
-    )
-    # The refused resume's report is removed, so a report after this resume shows the comparison ran again.
-    generation_dir.join("reconciliation.json").delete
-    started_steps = []
-    recorder = ->(event, step:) { started_steps << step if event == :before_step }
-    described_class.run(direction: :cutover, owners:, report_root:, observer: recorder)
-
-    expect(started_steps).to eq(["flip"])
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
-    expect(TimekeepingOwnership.current.legacy_retired_at).not_to be_nil
-    expect(timekeeping.calls.count([:admit, 2])).to eq(1)
-    expect(generation_dir.join("reconciliation.json")).to exist
-    baselines.each { |name, text| expect(generation_dir.join(name).read).to eq(text), "#{name} was rewritten" }
-  end
-end
-
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-  include RunnerSourceIntentsSpecSupport
-
-  # "Require a fresh comparison with the saved intents before a resumed flip, and test this interruption with both
-  # deletion and `desired_entry_ids` changes."
-  # Rollback resumes at the flip after a recorded reconcile too, so it needs the same comparison.
-  it "a terminal intent deleted after a rollback's reconcile was recorded makes the resumed rollback flip refuse, and restoring it lets the rollback finish" do
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    owners = TimekeepingHandoffFakes.owners(timekeeping:)
-    report_root = Dir.mktmpdir("handoff-report")
-    operation_id = "5d0b6a0e-1d7c-4f4e-9a52-6a1f1c0de255"
-    insert_committed_intent_for_source_intents_spec(operation_id)
-    described_class.run(direction: :cutover, owners:, report_root:)
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
-
-    expect do
-      described_class.run(direction: :rollback, owners:, report_root:,
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_reconcile))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    expect(TimekeepingOwnership.current.handoff_step).to eq("reconcile")
-    generation_dir = Pathname(report_root).join("generation-3")
-    baselines = %w[source_intents.json checkpoint.json money_before.json].index_with { |name| generation_dir.join(name).read }
-    rollback_report = generation_dir.join("reconciliation.json")
-    rollback_report.delete
-    connection = InvoiceOperationsRecord.connection
-    # The deleted row is kept whole, timestamps and id included, so restoring it later matches the saved intents exactly.
-    connection.execute(
-      "CREATE TEMP TABLE rollback_deleted_intent_spec AS " \
-      "SELECT * FROM invoice_operation_intents WHERE operation_id = '#{operation_id}'"
-    )
-    connection.execute("DELETE FROM invoice_operation_intents WHERE operation_id = '#{operation_id}'")
-
-    begin
-      expect { described_class.run(direction: :rollback, owners:, report_root:) }
-        .to raise_error(Timekeeping::Handoff::Runner::Refused, /Reconciliation found unexplained differences/)
-
-      expect(rollback_report.read).to include(operation_id)
-      ownership = TimekeepingOwnership.current
-      expect([ownership.generation, ownership.owner, ownership.handoff_step]).to eq([3, "timekeeping", "reconcile"])
-      expect(owners.fetch(:monolith).admission.calls).not_to include([:admit, 3])
-
-      # With the intent restored, nothing differs from the saved baseline, so the
-      # rollback's comparison passes too and an interrupted rollback can finish.
-      connection.execute("INSERT INTO invoice_operation_intents SELECT * FROM rollback_deleted_intent_spec")
+      expect do
+        described_class.run(direction: :rollback, owners:, report_root:,
+                            observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_reconcile))
+      end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+      expect(TimekeepingOwnership.current.handoff_step).to eq("reconcile")
+      generation_dir = Pathname(report_root).join("generation-3")
+      baselines = saved_baselines(generation_dir)
+      rollback_report = generation_dir.join("reconciliation.json")
       rollback_report.delete
-      described_class.run(direction: :rollback, owners:, report_root:)
-    ensure
-      connection.execute("DROP TABLE IF EXISTS rollback_deleted_intent_spec")
+      connection = InvoiceOperationsRecord.connection
+      # The deleted row is kept whole, timestamps and id included, so restoring it later matches the saved intents exactly.
+      connection.execute(
+        "CREATE TEMP TABLE rollback_deleted_intent_spec AS " \
+        "SELECT * FROM invoice_operation_intents WHERE operation_id = '#{operation_id}'"
+      )
+      connection.execute("DELETE FROM invoice_operation_intents WHERE operation_id = '#{operation_id}'")
+
+      begin
+        expect { described_class.run(direction: :rollback, owners:, report_root:) }
+          .to raise_error(Timekeeping::Handoff::Runner::Refused, /Reconciliation found unexplained differences/)
+
+        expect(rollback_report.read).to include(operation_id)
+        ownership = TimekeepingOwnership.current
+        expect([ownership.generation, ownership.owner, ownership.handoff_step]).to eq([3, "timekeeping", "reconcile"])
+        expect(owners.fetch(:monolith).admission.calls).not_to include([:admit, 3])
+
+        # With the intent restored, nothing differs from the saved baseline, so the
+        # rollback's comparison passes too and an interrupted rollback can finish.
+        connection.execute("INSERT INTO invoice_operation_intents SELECT * FROM rollback_deleted_intent_spec")
+        rollback_report.delete
+        described_class.run(direction: :rollback, owners:, report_root:)
+      ensure
+        connection.execute("DROP TABLE IF EXISTS rollback_deleted_intent_spec")
+      end
+
+      expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", generation: 3, handoff_step: nil)
+      expect(owners.fetch(:monolith).admission.calls.count([:admit, 3])).to eq(1)
+      expect(rollback_report).to exist
+      expect_saved_baselines_unchanged(generation_dir, baselines)
     end
-
-    expect(TimekeepingOwnership.current).to have_attributes(owner: "monolith", generation: 3, handoff_step: nil)
-    expect(owners.fetch(:monolith).admission.calls.count([:admit, 3])).to eq(1)
-    expect(rollback_report).to exist
-    baselines.each { |name, text| expect(generation_dir.join(name).read).to eq(text), "#{name} was rewritten" }
   end
-end
 
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
+  context "when the saved source intents file is gone after the recorded reconcile", :two_tenant_seed, :seeded_without_transaction do
+    # "Require a fresh comparison with the saved intents before a resumed flip, and test this interruption with both
+    # deletion and `desired_entry_ids` changes."
+    # Without the saved file there is nothing to compare with; capturing the current rows again would compare them with
+    # themselves, so the resumed flip must refuse.
+    it "a resumed flip whose saved source intents file is gone refuses instead of moving ownership or capturing the intents again" do
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
+      report_root = Dir.mktmpdir("handoff-report")
 
-  # "Require a fresh comparison with the saved intents before a resumed flip, and test this interruption with both
-  # deletion and `desired_entry_ids` changes."
-  # Without the saved file there is nothing to compare with; capturing the current rows again would compare them with
-  # themselves, so the resumed flip must refuse.
-  it "a resumed flip whose saved source intents file is gone refuses instead of moving ownership or capturing the intents again" do
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    owners = TimekeepingHandoffFakes.owners(timekeeping:)
-    report_root = Dir.mktmpdir("handoff-report")
+      expect do
+        described_class.run(direction: :cutover, owners:, report_root:,
+                            observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_reconcile))
+      end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+      generation = TimekeepingOwnership.current.generation
+      saved = Dir.glob(File.join(report_root, "generation-*", "source_intents.json"))
+      expect(saved.size).to eq(1)
+      File.delete(saved.first)
 
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:,
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_reconcile))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    generation = TimekeepingOwnership.current.generation
-    saved = Dir.glob(File.join(report_root, "generation-*", "source_intents.json"))
-    expect(saved.size).to eq(1)
-    File.delete(saved.first)
+      expect { described_class.run(direction: :cutover, owners:, report_root:) }
+        .to raise_error(Timekeeping::Handoff::ReportDirectory::Unreadable)
 
-    expect { described_class.run(direction: :cutover, owners:, report_root:) }
-      .to raise_error(Timekeeping::Handoff::ReportDirectory::Unreadable)
-
-    expect(File.exist?(saved.first)).to be(false)
-    current = TimekeepingOwnership.current
-    expect([current.generation, current.owner, current.handoff_step]).to eq([generation, "monolith", "reconcile"])
-    expect(current.legacy_retired_at).to be_nil
-    expect(timekeeping.calls).not_to include([:admit, generation])
+      expect(File.exist?(saved.first)).to be(false)
+      current = TimekeepingOwnership.current
+      expect([current.generation, current.owner, current.handoff_step]).to eq([generation, "monolith", "reconcile"])
+      expect(current.legacy_retired_at).to be_nil
+      expect(timekeeping.calls).not_to include([:admit, generation])
+    end
   end
-end
 
-RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
-  include RunnerLegacyHandoffSpecSupport
-  include RunnerSourceIntentsSpecSupport
+  context "when an intent is written after the recorded reconcile", :two_tenant_seed, :seeded_without_transaction do
+    # "Require a fresh comparison with the saved intents before a resumed flip, and test this interruption with both
+    # deletion and `desired_entry_ids` changes."
+    # An intent that only the fresh read holds is a difference too; the saved file must stay as it was written.
+    it "an intent written after the recorded reconcile makes the resumed flip refuse it as missing from the source" do
+      timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:)
+      report_root = Dir.mktmpdir("handoff-report")
+      operation_id = "5d0b6a0e-1d7c-4f4e-9a52-6a1f1c0d0252"
 
-  # "Require a fresh comparison with the saved intents before a resumed flip, and test this interruption with both
-  # deletion and `desired_entry_ids` changes."
-  # An intent that only the fresh read holds is a difference too; the saved file must stay as it was written.
-  it "an intent written after the recorded reconcile makes the resumed flip refuse it as missing from the source" do
-    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
-    owners = TimekeepingHandoffFakes.owners(timekeeping:)
-    report_root = Dir.mktmpdir("handoff-report")
-    operation_id = "5d0b6a0e-1d7c-4f4e-9a52-6a1f1c0d0252"
+      expect do
+        described_class.run(direction: :cutover, owners:, report_root:,
+                            observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_reconcile))
+      end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+      generation = TimekeepingOwnership.current.generation
+      generation_dir = Pathname(report_root).join("generation-#{generation}")
+      saved_intents = generation_dir.join("source_intents.json").read
+      insert_committed_intent_for_source_intents_spec(operation_id)
 
-    expect do
-      described_class.run(direction: :cutover, owners:, report_root:,
-                          observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_reconcile))
-    end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    generation = TimekeepingOwnership.current.generation
-    generation_dir = Pathname(report_root).join("generation-#{generation}")
-    saved_intents = generation_dir.join("source_intents.json").read
-    insert_committed_intent_for_source_intents_spec(operation_id)
+      expect { described_class.run(direction: :cutover, owners:, report_root:) }
+        .to raise_error(Timekeeping::Handoff::Runner::Refused)
 
-    expect { described_class.run(direction: :cutover, owners:, report_root:) }
-      .to raise_error(Timekeeping::Handoff::Runner::Refused)
-
-    expect(generation_dir.join("source_intents.json").read).to eq(saved_intents)
-    report = generation_dir.join("reconciliation.json").read
-    expect(report).to include(operation_id)
-    expect(report).to include("missing_in_source")
-    current = TimekeepingOwnership.current
-    expect([current.generation, current.owner, current.handoff_step]).to eq([generation, "monolith", "reconcile"])
-    expect(timekeeping.calls).not_to include([:admit, generation])
+      expect(generation_dir.join("source_intents.json").read).to eq(saved_intents)
+      report = generation_dir.join("reconciliation.json").read
+      expect(report).to include(operation_id)
+      expect(report).to include("missing_in_source")
+      current = TimekeepingOwnership.current
+      expect([current.generation, current.owner, current.handoff_step]).to eq([generation, "monolith", "reconcile"])
+      expect(timekeeping.calls).not_to include([:admit, generation])
+    end
   end
 end
 
