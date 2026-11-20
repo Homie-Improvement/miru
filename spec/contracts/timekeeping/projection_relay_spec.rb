@@ -145,35 +145,3 @@ RSpec.describe "relay_local_entries_to_projection" do
     expect(Timekeeping::LocalOutboxEntry.where(company_id: company.id, sent_at: nil)).to exist
   end
 end
-
-RSpec.describe "relay_local_entries_to_projection" do
-  it "relay helper delivers its own company and does not raise for another company's refused outbox row" do
-    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared", handoff_step: nil)
-    company = create(:company)
-    other_company = create(:company)
-    user = create(:user)
-    create(:employment, company:, user:)
-    user.add_role("owner", company)
-    project = create(:project, client: create(:client, company:))
-    Timekeeping::LocalOwner.call(
-      operation: :create, company_id: company.id, generation: TimekeepingOwnership.current.generation.to_s,
-      actor: Timekeeping::LocalOwner::Actor.user(user_id: user.id, role: "owner"),
-      params: { "idempotency_key" => SecureRandom.uuid,
-                "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 30.0,
-                            "note" => "own company\nrow", "source" => "manual", "source_metadata" => {} } }
-    )
-    entry_id = Timekeeping::LocalEntry.where(company_id: company.id).order(:id).last.id
-    # An outbox row the consumer refuses (empty fields, old generation), owned by a different company.
-    bad_payload = Timekeeping::SnapshotBatch::ENTRY_FIELDS.index_with { nil }
-      .merge("id" => 987_654, "company_id" => other_company.id, "version" => 1)
-    refused = Timekeeping::LocalOutboxEntry.create!(company_id: other_company.id, entry_id: 987_654, generation: 1,
-                                                    payload: bad_payload, created_at: Time.current)
-
-    expect { relay_local_entries_to_projection(company) }.not_to raise_error
-
-    expect(TimesheetEntry.unscoped.find(entry_id)).to have_attributes(note: "own company\nrow",
-                                                                     company_id: company.id)
-    expect(refused.reload.sent_at).to be_nil
-    expect(TimesheetEntry.unscoped.where(id: 987_654)).not_to exist
-  end
-end

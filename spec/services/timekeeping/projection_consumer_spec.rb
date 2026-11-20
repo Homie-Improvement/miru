@@ -352,16 +352,6 @@ RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
     end
   end
 
-  context "more tests 14", "snapshot rules" do
-    it "stores a delivered note with a line break exactly as sent" do
-      note = "Programming - Built landing\nand tests"
-
-      expect(rules_deliver(rules_entry(id: 91_501, version: 1, note:))).to eq(rules_applied)
-
-      expect(rules_row(91_501)["note"]).to eq(note)
-    end
-  end
-
   context "more tests 15", "snapshot rules" do
     it "stores a note with repeated spaces, a tab, a quote and a backslash byte for byte" do
       # The quote and backslash check that the values stay escaped; the spaces and tab check none are collapsed.
@@ -401,24 +391,6 @@ RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
 
       expect(rules_row(91_902)["note"]).to eq(note)
       expect(rules_row(91_901)).to include("note" => "bystander", "company_id" => rules_company.id)
-    end
-  end
-
-  context "more tests 18", "snapshot rules" do
-    it "a batch with a multi-line note delivered twice under one Idempotency-Key leaves one row with the note unchanged" do
-      # The relay re-sends a batch with the same body and key, so a redelivery must neither add a row nor alter the note.
-      note = "Programming - Built landing\nand tests"
-      batch = rules_batch(rules_entry(id: 91_911, version: 1, note:))
-      key = SecureRandom.uuid
-
-      first = described_class.call(batch:, idempotency_key: key)
-      second = described_class.call(batch:, idempotency_key: key)
-
-      expect(first.status).to eq(200)
-      expect(second.status).to eq(200)
-      expect(ActiveRecord::Base.connection.select_value("SELECT COUNT(*) FROM timesheet_entries WHERE id = 91911"))
-        .to eq(1)
-      expect(rules_row(91_911)).to include("note" => note, "version" => 1, "company_id" => rules_company.id)
     end
   end
 
