@@ -411,5 +411,190 @@ RSpec.describe "CI spec coverage in validations.yml" do
         expect(job.to_yaml).not_to include("secrets.")
       end
     end
+
+    # The live job runs only when the workflow starts, so a narrowed push trigger skips the
+    # proof on some branches, and a cancelling concurrency group shared by push and
+    # pull_request runs lets one kind of run cancel the other's proof mid-run.
+    describe "guard for the live handoff trigger" do
+      # The event keeps a push and a pull request of one branch apart; the branch keeps two
+      # pushes of one branch together, so a newer push still cancels the older run. Only this
+      # exact group is accepted: an expression that merely mentions github.event_name can
+      # still resolve to the same value for both events.
+      let(:event_separated_group) do
+        "${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.ref_name }}"
+      end
+      let(:base_group) { "${{ github.workflow }}-${{ github.head_ref || github.ref_name }}" }
+      # Psych reads the bare workflow key `on` as the boolean true.
+      let(:triggers) { workflow.fetch(true) { workflow.fetch("on") } }
+      let(:push_trigger) { triggers["push"] ||= {} }
+
+      def push_trigger_problems(triggers)
+        # `on: push` and `on: [push]` name the trigger without any filter.
+        trigger_map = triggers.is_a?(Hash) ? triggers : Array(triggers).index_with(nil)
+        return ["the workflow does not run on push"] unless trigger_map.key?("push")
+
+        push = trigger_map.fetch("push") || {}
+        {
+          "push lists branches other than \"**\"" => push.key?("branches") && push.fetch("branches") != ["**"],
+          "push skips branches through branches-ignore" => push.key?("branches-ignore"),
+          "push runs only when some paths change" => push.key?("paths"),
+          "push skips changes through paths-ignore" => push.key?("paths-ignore"),
+          "push runs only for tags" => push.key?("tags") && !push.key?("branches")
+        }.select { |_problem, present| present }.keys
+      end
+
+      # These triggers run branch code with the base repository's token and secrets, which the
+      # live job must never get now that it runs code from any pushed branch.
+      def privileged_trigger_problems(triggers)
+        names = triggers.is_a?(Hash) ? triggers.keys : Array(triggers)
+        (names & %w[pull_request_target workflow_run]).map do |name|
+          "the workflow runs on #{name}, which gives branch code the base repository's privileges"
+        end
+      end
+
+      # Returns the group settings when they can cancel a run, or nil when they never do.
+      def cancelling_settings(concurrency)
+        return nil if concurrency.nil?
+
+        settings = concurrency.is_a?(Hash) ? concurrency : { "group" => concurrency }
+        # Anything but an explicit false may cancel, including an expression.
+        settings.fetch("cancel-in-progress", false) == false ? nil : settings
+      end
+
+      def concurrency_problems(scope, concurrency)
+        settings = cancelling_settings(concurrency)
+        return [] if settings.nil?
+
+        squash = ->(text) { text.to_s.gsub(/\s+/, "") }
+        return [] if squash.call(settings["group"]) == squash.call(event_separated_group)
+
+        ["#{scope} cancels runs in a group other than one per event and branch"]
+      end
+
+      def live_jobs_in(workflow)
+        workflow.fetch("jobs").select { |_name, job| Array(job["steps"]).any? { |step| runs_live_handoff?(step) } }
+      end
+
+      # Returns no messages when a push to any branch starts the workflow, no trigger gives branch
+      # code base privileges, and no cancelling concurrency group lets push and pull_request runs
+      # of one branch cancel each other.
+      def live_handoff_trigger_problems(workflow)
+        workflow_triggers = workflow.fetch(true) { workflow.fetch("on") }
+
+        push_trigger_problems(workflow_triggers) +
+          privileged_trigger_problems(workflow_triggers) +
+          concurrency_problems("the workflow", workflow["concurrency"]) +
+          live_jobs_in(workflow).flat_map { |name, job| concurrency_problems(name, job["concurrency"]) }
+      end
+
+      it "finds no trigger or concurrency problem in the real workflow" do
+        expect(live_handoff_trigger_problems(workflow)).to be_empty
+        # A newer push to one branch still cancels the older push run of that branch.
+        expect(workflow.fetch("concurrency").fetch("cancel-in-progress")).to be(true)
+        # Branch protection may require this check by job name, so the proof stays in this job.
+        expect(live_jobs_in(workflow).keys).to eq(["timekeeping-alerts-live"])
+      end
+
+      it "fails when the workflow gains a trigger that runs branch code with base privileges" do
+        triggers["pull_request_target"] = { "branches" => ["main"] }
+        triggers["workflow_run"] = { "workflows" => ["CI Test Suite"] }
+
+        expect(live_handoff_trigger_problems(workflow)).to include(
+          "the workflow runs on pull_request_target, which gives branch code the base repository's privileges",
+          "the workflow runs on workflow_run, which gives branch code the base repository's privileges"
+        )
+      end
+
+      it "fails when push lists branches as a single star, which does not match slash-named branches such as feature/x" do
+        push_trigger["branches"] = ["*"]
+
+        expect(live_handoff_trigger_problems(workflow)).to include("push lists branches other than \"**\"")
+      end
+
+      # A group keyed on the commit or the run is unique per push, so a newer push to a branch
+      # would no longer cancel the older run.
+      it "fails when the cancelling group is keyed on github.sha or github.run_id" do
+        %w[github.sha github.run_id].each do |per_run_field|
+          workflow["concurrency"] = { "group" => "#{event_separated_group}-${{ #{per_run_field} }}", "cancel-in-progress" => true }
+
+          expect(live_handoff_trigger_problems(workflow)).to include(
+            "the workflow cancels runs in a group other than one per event and branch"
+          )
+        end
+      end
+
+      it "fails when the group puts github.event_name inside an expression that merges both events" do
+        workflow["concurrency"] = {
+          "group" => "${{ github.workflow }}-${{ github.event_name == 'push' && github.ref_name || github.head_ref }}",
+          "cancel-in-progress" => true
+        }
+
+        expect(live_handoff_trigger_problems(workflow)).to include(
+          "the workflow cancels runs in a group other than one per event and branch"
+        )
+      end
+
+      it "fails when the cancelling group goes back to branch only" do
+        workflow["concurrency"] = { "group" => base_group, "cancel-in-progress" => true }
+
+        expect(live_handoff_trigger_problems(workflow)).not_to be_empty
+      end
+
+      it "accepts a branch-only group that never cancels" do
+        workflow["concurrency"] = { "group" => base_group, "cancel-in-progress" => false }
+
+        expect(concurrency_problems("the workflow", workflow["concurrency"])).to be_empty
+      end
+
+      it "fails when the live job adds a cancelling branch-only group of its own" do
+        live_handoff_jobs.each { |job| job["concurrency"] = { "group" => base_group, "cancel-in-progress" => true } }
+
+        expect(live_handoff_trigger_problems(workflow)).to include(
+          "timekeeping-alerts-live cancels runs in a group other than one per event and branch"
+        )
+      end
+
+      it "fails when push goes back to the release branch list" do
+        push_trigger["branches"] = %w[develop main stable-3-0 production]
+
+        expect(live_handoff_trigger_problems(workflow)).to include("push lists branches other than \"**\"")
+      end
+
+      it "fails when push skips branches through branches-ignore" do
+        push_trigger["branches-ignore"] = ["dependabot/**"]
+
+        expect(live_handoff_trigger_problems(workflow)).to include("push skips branches through branches-ignore")
+      end
+
+      it "fails when push runs only when some paths change" do
+        push_trigger["paths"] = ["app/**"]
+
+        expect(live_handoff_trigger_problems(workflow)).to include("push runs only when some paths change")
+      end
+
+      it "fails when push skips changes through paths-ignore" do
+        push_trigger["paths-ignore"] = ["docs/**"]
+
+        expect(live_handoff_trigger_problems(workflow)).to include("push skips changes through paths-ignore")
+      end
+
+      it "fails when the workflow no longer runs on push" do
+        triggers.delete("push")
+
+        expect(live_handoff_trigger_problems(workflow)).to include("the workflow does not run on push")
+      end
+
+      it "fails when push runs only for tags" do
+        triggers["push"] = { "tags" => ["v*"] }
+
+        expect(live_handoff_trigger_problems(workflow)).to include("push runs only for tags")
+      end
+
+      it "accepts a push trigger with no filter at all" do
+        triggers["push"] = nil
+
+        expect(push_trigger_problems(triggers)).to be_empty
+      end
+    end
   end
 end
