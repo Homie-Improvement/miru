@@ -44,7 +44,7 @@ module TenantStateDigest
       outbox: [Table.new("entry_outbox_items", BY_COMPANY, BY_OUTBOX_POSITION)],
       invoice_operations: [Table.new("invoice_operations", BY_COMPANY, BY_ID),
                            Table.new("reservations", BY_COMPANY, BY_WHOLE_ROW)]
-    }.freeze,
+    }.transform_values(&:freeze).freeze,
     timekeeping: {
       entries: [Table.new("entries", BY_COMPANY, BY_ID)],
       receipts: [Table.new("idempotency_receipts", BY_COMPANY, BY_ID),
@@ -52,7 +52,7 @@ module TenantStateDigest
       outbox: [Table.new("outbox_snapshots", BY_COMPANY, BY_OUTBOX_POSITION)],
       invoice_operations: [Table.new("invoice_operations", BY_COMPANY, BY_ID),
                            Table.new("reservations", BY_COMPANY, BY_WHOLE_ROW)]
-    }.freeze
+    }.transform_values(&:freeze).freeze
   }.freeze
 
   TABLE_FRAME = "T"

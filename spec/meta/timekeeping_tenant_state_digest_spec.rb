@@ -183,6 +183,9 @@ RSpec.describe TenantStateDigest do
       end
 
       expect(described_class::GROUPS).to be_frozen
+      # Every level is frozen, so no code in the suite can drop or add a table for later takes.
+      expect(described_class::GROUPS.values).to all(be_frozen)
+      described_class::GROUPS.each_value { |groups| expect(groups.values).to all(be_frozen) }
       expect(tables.keys).to contain_exactly(:monolith, :timekeeping)
       # "Monolith (`db/schema.rb`). Projection: `timesheet_entries`. Entries: `entries`. Receipts: `idempotency_records`,
       # plus `entry_snapshot_receipts` matched by `company_id = ANY(company_ids)`, because that table has only a
