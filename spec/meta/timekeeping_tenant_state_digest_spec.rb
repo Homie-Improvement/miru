@@ -432,7 +432,7 @@ RSpec.describe "TenantStateDigest Timekeeping group isolation", :without_transac
                               "disposition, generation, created_at) VALUES ($1, 77, $2, 'monolith', 'committed', " \
                               "'active', 1, now())", [writer, operation_id]],
         [:invoice_operations, "INSERT INTO reservations (company_id, entry_id, invoice_id, state, disposition, " \
-                              "operation_id, created_at) VALUES ($1, $1 * 10, 77, 'committed', 'active', $2, now())",
+                              "operation_id, created_at) VALUES ($1::bigint, $1::bigint * 10, 77, 'committed', 'active', $2, now())",
          [writer, operation_id]]
       ]
       steps.each do |group, sql, params|
@@ -1041,5 +1041,219 @@ RSpec.describe "TenantStateDigest" do
     expect(in_first).to match(/\A\h{64}\z/)
     expect(in_first).not_to eq(in_second)
     expect(one_row).not_to eq(two_rows)
+  end
+end
+
+RSpec.describe "TenantStateDigest empty group literals" do
+  # Written out by hand rather than recomputed through group_digest, so a change to the framing or to
+  # a group's table list fails here instead of moving the expected value with it.
+  pinned_empty_group_digests = {
+    monolith: {
+      projection: "ebf10c374d459d6297f061a05441601366ab40c96fdd62a58c03e7c959e9956c",
+      entries: "0f408c1ec978a88e9d2ff359dc0e121014fc386f33cb507b7cc93172bb42f3fb",
+      receipts: "97e16cb48ce14bd39e9e49eb38ecd3921743fc5be208e75b974c07ff70f541ef",
+      outbox: "f4f74d1ce7f54c6fcf73626627229a1a33909bf5583a99516cf147902ca9ccac",
+      invoice_operations: "5a9c45e6bb9806b5f44147096339b5acd720380b4228d4a7e2adee5dd06760e4"
+    },
+    timekeeping: {
+      entries: "0f408c1ec978a88e9d2ff359dc0e121014fc386f33cb507b7cc93172bb42f3fb",
+      receipts: "d073b2d2c3a58f067acbfd57f3f39ca9b5e98378359a04ee127a2594dc73f48f",
+      outbox: "18fcb8fba70dee8a29763a3d23ed09763c375e64a44a2cccb7d039171fd9785d",
+      invoice_operations: "5a9c45e6bb9806b5f44147096339b5acd720380b4228d4a7e2adee5dd06760e4"
+    }
+  }
+
+  # "An empty group has a fixed, pinned digest."
+  it "every group of each database with no rows digests to its pinned literal" do
+    pinned_empty_group_digests.each do |database, groups|
+      expect(TenantStateDigest::GROUPS.fetch(database).keys).to eq(groups.keys), database.to_s
+      groups.each do |group, literal|
+        empty_tables = TenantStateDigest::GROUPS.fetch(database).fetch(group).map { |spec| [spec.table, []] }
+        expect(TenantStateDigest.group_digest(empty_tables)).to eq(literal), "#{database} #{group}"
+      end
+    end
+  end
+
+  it "a monolith company with no rows takes exactly the pinned literals" do
+    expect(TenantStateDigest.monolith(company_id: 9_437_301)).to eq(pinned_empty_group_digests.fetch(:monolith))
+  end
+
+  it "a Timekeeping company with no rows takes exactly the pinned literals" do
+    skip "set TIMEKEEPING_LIVE=1 to use the Timekeeping test database" unless ENV["TIMEKEEPING_LIVE"] == "1"
+
+    url = ENV.fetch("TIMEKEEPING_DATABASE_URL")
+    IntegratedRuntime.require_test_database_url!(url)
+    output, status = Bundler.with_unbundled_env do
+      Open3.capture2e({ "RAILS_ENV" => "test", "BUNDLE_GEMFILE" => Rails.root.join("timekeeping/Gemfile").to_s,
+                        "TIMEKEEPING_DATABASE_URL" => url, "DATABASE_URL" => nil },
+                      "bundle", "exec", "rails", "db:prepare", chdir: Rails.root.join("timekeeping").to_s)
+    end
+    raise "db:prepare failed:\n#{output}" unless status.success?
+
+    expect(TenantStateDigest.timekeeping(company_id: 9_437_302, timekeeping_url: url))
+      .to eq(pinned_empty_group_digests.fetch(:timekeeping))
+  end
+end
+
+RSpec.describe "TenantStateDigest isolation for every monolith table in GROUPS" do
+  # "For every group in each database, a row inserted for B leaves A's digest equal, and the reverse also holds."
+  # The table list comes from GROUPS itself, so a table added there without a row writer here fails.
+  it "a row inserted for one company in each monolith table moves that company's group digest and leaves the other's digest equal, both ways" do
+    connection = ActiveRecord::Base.connection
+    company_a = create(:company)
+    company_b = create(:company)
+    insert_entry_sql = "INSERT INTO entries (bill_status, company_id, created_at, updated_at, duration, project_id, " \
+                       "user_id, work_date) VALUES ('unbilled', $1, now(), now(), 60, 1, 1, CURRENT_DATE)"
+    row_writers = {
+      "timesheet_entries" => lambda { |company_id|
+        create(:timesheet_entry).update_columns(company_id:)
+      },
+      "entries" => ->(company_id) { connection.exec_query(insert_entry_sql, "digest", [company_id]) },
+      "idempotency_records" => lambda { |company_id|
+        connection.exec_query(
+          "INSERT INTO idempotency_records (actor_id, actor_type, body, company_id, created_at, fingerprint, key, " \
+          "operation, status) VALUES (1, 'user', '{}', $1, now(), 'digest', $2, 'create', 201)",
+          "digest", [company_id, SecureRandom.uuid]
+        )
+      },
+      "entry_snapshot_receipts" => lambda { |company_id|
+        connection.exec_query(
+          "INSERT INTO entry_snapshot_receipts (actor, company_ids, created_at, expires_at, key, request_digest, " \
+          "response_status) VALUES ('digest-spec', ARRAY[$1]::bigint[], now(), now() + interval '1 day', $2, 'rd', 200)",
+          "digest", [company_id, SecureRandom.uuid]
+        )
+      },
+      "entry_outbox_items" => lambda { |company_id|
+        connection.exec_query(
+          "INSERT INTO entry_outbox_items (company_id, created_at, entry_id, generation, payload) " \
+          "VALUES ($1, now(), 1, 1, '{}')",
+          "digest", [company_id]
+        )
+      },
+      "invoice_operations" => lambda { |company_id|
+        connection.exec_query(
+          "INSERT INTO invoice_operations (company_id, invoice_id, operation_id, actor_name, state, disposition, " \
+          "generation, created_at) VALUES ($1, 77, gen_random_uuid(), 'monolith', 'committed', 'active', 1, now())",
+          "digest", [company_id]
+        )
+      },
+      # reservations needs an entries row of the same company for its foreign key.
+      "reservations" => lambda { |company_id|
+        connection.exec_query(
+          "WITH entry AS (#{insert_entry_sql} RETURNING id, company_id) " \
+          "INSERT INTO reservations (company_id, created_at, disposition, entry_id, invoice_id, operation_id, state) " \
+          "SELECT company_id, now(), 'active', id, 77, gen_random_uuid(), 'provisional' FROM entry",
+          "digest", [company_id]
+        )
+      }
+    }
+    tables_by_group = TenantStateDigest::GROUPS.fetch(:monolith).transform_values { |specs| specs.map(&:table) }
+    expect(row_writers.keys).to match_array(tables_by_group.values.flatten)
+
+    [[company_b.id, company_a.id], [company_a.id, company_b.id]].each do |writer, other|
+      tables_by_group.each do |group, tables|
+        tables.each do |table|
+          writer_before = TenantStateDigest.monolith(company_id: writer)
+          other_before = TenantStateDigest.monolith(company_id: other)
+
+          row_writers.fetch(table).call(writer)
+
+          expect(TenantStateDigest.monolith(company_id: writer).fetch(group))
+            .not_to eq(writer_before.fetch(group)), "#{table} for #{writer}"
+          expect(TenantStateDigest.monolith(company_id: other)).to eq(other_before), "#{table} for #{writer}"
+        end
+      end
+    end
+  end
+end
+
+RSpec.describe "TenantStateDigest isolation for every Timekeeping table in GROUPS", :without_transaction do
+  # "For every group in each database, a row inserted for B leaves A's digest equal, and the reverse also holds."
+  it "a row inserted for one company in each Timekeeping table moves that company's group digest and leaves the other's digest equal, both ways" do
+    skip "set TIMEKEEPING_LIVE=1 to use the Timekeeping test database" unless ENV["TIMEKEEPING_LIVE"] == "1"
+
+    url = ENV.fetch("TIMEKEEPING_DATABASE_URL")
+    IntegratedRuntime.require_test_database_url!(url)
+    output, status = Bundler.with_unbundled_env do
+      Open3.capture2e({ "RAILS_ENV" => "test", "BUNDLE_GEMFILE" => Rails.root.join("timekeeping/Gemfile").to_s,
+                        "TIMEKEEPING_DATABASE_URL" => url, "DATABASE_URL" => nil },
+                      "bundle", "exec", "rails", "db:prepare", chdir: Rails.root.join("timekeeping").to_s)
+    end
+    raise "db:prepare failed:\n#{output}" unless status.success?
+
+    company_a = 9_437_401
+    company_b = 9_437_402
+    connection = PG.connect(url)
+    insert_entry_sql = "INSERT INTO entries (company_id, project_id, user_id, work_date, duration, bill_status, " \
+                       "created_at, updated_at) VALUES ($1, 1, 1, CURRENT_DATE, 60, 'unbilled', now(), now())"
+    row_writers = {
+      "entries" => ->(company_id) { connection.exec_params(insert_entry_sql, [company_id]) },
+      "idempotency_receipts" => lambda { |company_id|
+        connection.exec_params(
+          "INSERT INTO idempotency_receipts (company_id, actor_type, actor_id, operation, key, fingerprint, status, " \
+          "body, created_at) VALUES ($1, 'user', 1, 'create', $2, 'digest', 201, '{}', now())",
+          [company_id, SecureRandom.uuid]
+        )
+      },
+      "service_idempotency_receipts" => lambda { |company_id|
+        connection.exec_params(
+          "INSERT INTO service_idempotency_receipts (company_id, actor_name, operation, key, fingerprint, status, " \
+          "body, created_at) VALUES ($1, 'monolith', 'prepare', $2, 'digest', 200, '{}', now())",
+          [company_id, SecureRandom.uuid]
+        )
+      },
+      "outbox_snapshots" => lambda { |company_id|
+        connection.exec_params(
+          "INSERT INTO outbox_snapshots (id, project_id, user_id, work_date, duration, bill_status, review_status, " \
+          "locked, source, source_metadata, proof_metadata, created_at, updated_at, company_id, version, generation) " \
+          "VALUES (1, 1, 1, CURRENT_DATE, 60, 'unbilled', 'not_required', false, 'manual', '{}', '{}', now(), now(), " \
+          "$1, 1, 1)",
+          [company_id]
+        )
+      },
+      "invoice_operations" => lambda { |company_id|
+        connection.exec_params(
+          "INSERT INTO invoice_operations (company_id, invoice_id, operation_id, actor_name, state, disposition, " \
+          "generation, created_at) VALUES ($1, 77, gen_random_uuid(), 'monolith', 'committed', 'active', 1, now())",
+          [company_id]
+        )
+      },
+      # reservations needs an entries row of the same company for its foreign key.
+      "reservations" => lambda { |company_id|
+        connection.exec_params(
+          "WITH entry AS (#{insert_entry_sql} RETURNING id, company_id) " \
+          "INSERT INTO reservations (company_id, entry_id, invoice_id, state, disposition, operation_id, created_at) " \
+          "SELECT company_id, id, 77, 'provisional', 'active', gen_random_uuid(), now() FROM entry",
+          [company_id]
+        )
+      }
+    }
+    tables_by_group = TenantStateDigest::GROUPS.fetch(:timekeeping).transform_values { |specs| specs.map(&:table) }
+    expect(row_writers.keys).to match_array(tables_by_group.values.flatten)
+    digest = ->(company_id) { TenantStateDigest.timekeeping(company_id:, timekeeping_url: url) }
+
+    [[company_b, company_a], [company_a, company_b]].each do |writer, other|
+      tables_by_group.each do |group, tables|
+        tables.each do |table|
+          writer_before = digest.call(writer)
+          other_before = digest.call(other)
+
+          row_writers.fetch(table).call(writer)
+
+          expect(digest.call(writer).fetch(group)).not_to eq(writer_before.fetch(group)), "#{table} for #{writer}"
+          expect(digest.call(other)).to eq(other_before), "#{table} for #{writer}"
+        end
+      end
+    end
+  ensure
+    if connection
+      [company_a, company_b].each do |id|
+        %w[reservations invoice_operations outbox_snapshots service_idempotency_receipts idempotency_receipts
+           entries].each do |table|
+          connection.exec_params("DELETE FROM #{connection.quote_ident(table)} WHERE company_id = $1", [id])
+        end
+      end
+      connection.close
+    end
   end
 end
