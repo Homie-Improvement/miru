@@ -446,7 +446,7 @@ end
 
 # committed_data: the live Timekeeping app reads the company, users and project
 # over its own database connection, so they must be committed to be seen.
-RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true do
+RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true, forwards_to_timekeeping: true do
   let(:fwd_company) { create(:company, base_currency: "INR", date_format: "MM-DD-YYYY") }
   let(:fwd_actor) { create(:user, current_workspace_id: fwd_company.id) }
   let(:fwd_paul) { create(:user, first_name: "Paul", last_name: "Connors", email: "paul.fwd@example.com", current_workspace_id: fwd_company.id) }
@@ -631,7 +631,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   end
 end
 
-RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true do
+RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true, forwards_to_timekeeping: true do
   let(:billed_fwd_company) { create(:company) }
   let(:billed_fwd_actor) { create(:user, current_workspace_id: billed_fwd_company.id) }
   let(:billed_fwd_paul) do
@@ -820,7 +820,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   end
 end
 
-RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true do
+RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true, forwards_to_timekeeping: true do
   let(:rerun_company) { create(:company, base_currency: "INR", date_format: "MM-DD-YYYY") }
   let(:rerun_actor) { create(:user, current_workspace_id: rerun_company.id) }
   let(:rerun_paul) do
@@ -946,7 +946,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   end
 end
 
-RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true do
+RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true, forwards_to_timekeeping: true do
   let(:drift_company) { create(:company) }
   let(:drift_actor) { create(:user, current_workspace_id: drift_company.id) }
   let(:drift_paul) do
