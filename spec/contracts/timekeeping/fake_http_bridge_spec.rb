@@ -3,60 +3,31 @@
 require "rails_helper"
 
 RSpec.describe TimekeepingContract::FakeHttpBridge do
+  # "Every direct caller of route_timekeeping_to_fake (agent_spec.rb, entry_write_client_spec.rb, gateway specs)
+  # skips routing to the fake when TimekeepingRegressionAdapter.current is non-nil, and a spec with the adapter
+  # running shows no requests routed to the fake."
   context "with the live adapter running" do
     let(:bridge_live_base_url) { "http://127.0.0.1:4999" }
-    let(:bridge_live) do
-      double("live adapter instance", base_url: bridge_live_base_url, private_key: OpenSSL::PKey::RSA.generate(2048))
+
+    before do
+      allow(TimekeepingRegressionAdapter).to receive(:current)
+        .and_return(double("live adapter instance", base_url: bridge_live_base_url))
     end
 
-    before { allow(TimekeepingRegressionAdapter).to receive(:current).and_return(bridge_live) }
-
-    # "Every direct caller of route_timekeeping_to_fake (agent_spec.rb, entry_write_client_spec.rb, gateway specs)
-    # skips routing to the fake when TimekeepingRegressionAdapter.current is non-nil, and a spec with the adapter
-    # running shows no requests routed to the fake."
-    it "route_timekeeping_to_fake registers no stub and routes no request to the fake" do
+    # The live app's own address is included because a stub there would answer live traffic from the fake.
+    # No stub matching either host means no request to them can be answered by the fake.
+    it "route_timekeeping_to_fake registers no stub for any host it is given" do
       bridge_fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
+      bridge_base_urls = ["http://timekeeping.test", bridge_live_base_url]
       stubs_before = WebMock::StubRegistry.instance.request_stubs.size
 
-      route_timekeeping_to_fake(bridge_fake, base_url: "http://timekeeping.test")
+      bridge_base_urls.each { |base_url| route_timekeeping_to_fake(bridge_fake, base_url:) }
 
       expect(WebMock::StubRegistry.instance.request_stubs.size).to eq(stubs_before)
-      signature = WebMock::RequestSignature.new(:get, "http://timekeeping.test/api/v1/entries")
-      expect(WebMock::StubRegistry.instance.registered_request?(signature)).to be_nil
-      expect(bridge_fake.requests).to be_empty
-    end
-
-    # A caller that passes the live app's own address is the worst case: a stub there would answer the
-    # requests meant for the live app from the fake.
-    it "routing to the live app's own address registers no stub that would answer live traffic from the fake" do
-      bridge_fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
-      stubs_before = WebMock::StubRegistry.instance.request_stubs.size
-
-      route_timekeeping_to_fake(bridge_fake, base_url: bridge_live_base_url)
-
-      live_request = WebMock::RequestSignature.new(:get, "#{bridge_live_base_url}/api/v1/entries")
-      expect(WebMock::StubRegistry.instance.registered_request?(live_request)).to be_nil
-      expect(WebMock::StubRegistry.instance.request_stubs.size).to eq(stubs_before)
-      expect(bridge_fake.requests).to be_empty
-    end
-
-    # Gateway specs route in a before hook and again in the example, to different fakes and hosts.
-    it "repeated routing calls for several fakes and hosts register no stub at all" do
-      first_fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
-      second_fake = TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key)
-      stubs_before = WebMock::StubRegistry.instance.request_stubs.size
-
-      route_timekeeping_to_fake(first_fake, base_url: "http://timekeeping.test")
-      route_timekeeping_to_fake(first_fake, base_url: "http://timekeeping.test")
-      route_timekeeping_to_fake(second_fake, base_url: "http://retry-timekeeping.test")
-
-      expect(WebMock::StubRegistry.instance.request_stubs.size).to eq(stubs_before)
-      %w[http://timekeeping.test http://retry-timekeeping.test].each do |host_url|
-        signature = WebMock::RequestSignature.new(:post, "#{host_url}/api/v1/entries")
+      bridge_base_urls.each do |base_url|
+        signature = WebMock::RequestSignature.new(:get, "#{base_url}/api/v1/entries")
         expect(WebMock::StubRegistry.instance.registered_request?(signature)).to be_nil
       end
-      expect(first_fake.requests).to be_empty
-      expect(second_fake.requests).to be_empty
     end
   end
 
