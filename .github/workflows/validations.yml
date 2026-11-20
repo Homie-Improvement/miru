@@ -475,8 +475,8 @@ jobs:
   # completed, claimed and failed Solid Queue rows in the Timekeeping test
   # database, and boots the runtime from a temporary tree whose dotenv file
   # sets conflicting database settings, to check that each app still connects
-  # as its own database user. Every other job leaves TIMEKEEPING_LIVE unset or does not name
-  # this spec, so the spec skips or does not run there.
+  # as its own database user. Every other job leaves TIMEKEEPING_LIVE unset or
+  # does not name these specs, so they skip or do not run there.
   timekeeping-runtime-live:
     name: Timekeeping demo runtime starts only the dedicated workers
     runs-on: ubuntu-24.04
