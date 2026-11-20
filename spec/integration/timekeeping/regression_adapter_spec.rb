@@ -167,6 +167,64 @@ RSpec.describe "TimekeepingRegressionAdapter.start! from a stopped adapter", com
     expect(WebMock::Config.instance.allow).to eq(allow_list_before)
   end
 
+  # "If anything fails after the instance began, stop it and leave `current` nil."
+  it "a failure while writing the private key, after the base URL was written, restores both client env keys and stops the instance" do
+    url = "postgresql://partial_env_user@127.0.0.1/timekeeping_partial_env_test"
+    private_key = OpenSSL::PKey::RSA.generate(2048)
+    instance = instance_double(TimekeepingLiveInstance, base_url: "http://127.0.0.1:4996", service_token: "live-service-partial",
+                                                        private_key:, stop: nil)
+    allow(TimekeepingLiveInstance).to receive(:start).and_return(instance)
+    allow(ENV).to receive(:[]=).and_call_original
+    allow(ENV).to receive(:[]=).with(key_env, private_key.to_pem).and_raise(RuntimeError, "could not write the key")
+    allow_list_before = WebMock::Config.instance.allow.dup
+
+    error = nil
+    with_timekeeping_env(base_url_env => "http://outer-before.test", key_env => "outer-before-key") do
+      TimekeepingRegressionAdapter.start!(env: live_flags.merge("TIMEKEEPING_DATABASE_URL" => url), owner_state: "timekeeping")
+    rescue StandardError => e
+      error = e
+      expect_outer_client_env_kept
+    end
+
+    expect(ENV).to have_received(:[]=).with(base_url_env, "http://127.0.0.1:4996")
+    expect(error).to be_a(TimekeepingRegressionAdapter::BootError)
+    expect(error.cause).to be_nil
+    expect(instance).to have_received(:stop)
+    expect(TimekeepingRegressionAdapter.current).to be_nil
+    expect(WebMock::Config.instance.allow).to eq(allow_list_before)
+  end
+
+  # "No error message carries the URL, the service token or the private key."
+  it "a failed start whose instance also fails to stop still raises the clean BootError and restores WebMock and env" do
+    url = "postgresql://stop_fails_user@127.0.0.1/timekeeping_stop_fails_test"
+    token = "live-service-stopfails0123456789"
+    instance = instance_double(TimekeepingLiveInstance, base_url: "http://127.0.0.1:4995", service_token: token,
+                                                        private_key: OpenSSL::PKey::RSA.generate(2048))
+    allow(instance).to receive(:stop).and_raise(IOError, "shutdown failed for #{url}")
+    allow(TimekeepingLiveInstance).to receive(:start).and_return(instance)
+    allow_any_instance_of(TimekeepingLiveInstance::ReferenceStub) # rubocop:disable RSpec/AnyInstance
+      .to receive(:service_token=).and_raise(RuntimeError, "startup failed with #{token} for #{url}")
+    allow_list_before = WebMock::Config.instance.allow.dup
+    allow_net_connect_before = WebMock::Config.instance.allow_net_connect
+
+    error = nil
+    with_timekeeping_env(base_url_env => "http://outer-before.test", key_env => "outer-before-key") do
+      TimekeepingRegressionAdapter.start!(env: live_flags.merge("TIMEKEEPING_DATABASE_URL" => url), owner_state: "timekeeping")
+    rescue StandardError => e
+      error = e
+      expect_outer_client_env_kept
+    end
+
+    expect(error).to be_a(TimekeepingRegressionAdapter::BootError)
+    expect(error.cause).to be_nil
+    expect(error.message).not_to include(url)
+    expect(error.message).not_to include(token)
+    expect(instance).to have_received(:stop)
+    expect(TimekeepingRegressionAdapter.current).to be_nil
+    expect(WebMock::Config.instance.allow).to eq(allow_list_before)
+    expect(WebMock::Config.instance.allow_net_connect).to eq(allow_net_connect_before)
+  end
+
   # "A \_test URL given in `env:` reaches `TimekeepingLiveInstance.start` as `database_url:` even when global ENV
   # names another URL."
   it "start! passes the env: test URL to the live instance once, allows only its port and points the client at it" do
@@ -196,6 +254,13 @@ RSpec.describe "TimekeepingRegressionAdapter.start! from a stopped adapter", com
       expect(Array(WebMock::Config.instance.allow)).to eq(["127.0.0.1:#{received[:port]}"])
       expect(ENV.fetch(base_url_env, nil)).to eq("http://127.0.0.1:#{received[:port]}")
       expect(ENV.fetch(key_env, nil)).to eq(key.to_pem)
+
+      # "The `config.before` passes `{ "TIMEKEEPING_DATABASE_URL" => <checked url> }` as the reset's `env:`, so the
+      # reset also opens only the checked URL."
+      allow(TimekeepingDatabaseReset).to receive(:reset!)
+      TimekeepingRegressionAdapter.prepare_example!(RSpec.current_example)
+      expect(TimekeepingDatabaseReset).to have_received(:reset!)
+        .once.with("timekeeping", env: { "TIMEKEEPING_DATABASE_URL" => checked_url })
     ensure
       TimekeepingRegressionAdapter.stop!
       saved.each { |name, value| value.nil? ? ENV.delete(name) : ENV[name] = value }
@@ -243,6 +308,19 @@ RSpec.describe "TimekeepingRegressionAdapter during live examples", :without_tra
   # spec/rails_helper.rb's around hook calls WebMock.disable_net_connect! after every example, so this example
   # reaches the live app only if the adapter's config.before re-allowed its address first.
   it "with the live adapter running, the next example reaches the live app, finds the earlier row gone and WebMock blocks every other address" do
+    2.times { expect(live_metrics_response).to be_a(Net::HTTPOK) }
+    live_uri = URI(live_instance.base_url)
+    expect(live_uri.host).to eq("127.0.0.1")
+    expect(ENV.fetch(Timekeeping::EntryApiClient::BASE_URL_ENV)).to eq(live_instance.base_url)
+    expect(WebMock::Config.instance.allow).to eq(["127.0.0.1:#{live_uri.port}"])
+
+    probe = TCPServer.new("127.0.0.1", 0)
+    other_port = probe.addr[1]
+    probe.close
+    expect { Net::HTTP.get(URI("http://127.0.0.1:#{other_port}/")) }.to raise_error(WebMock::NetConnectNotAllowedError)
+    expect { Net::HTTP.get(URI("http://example.com/")) }.to raise_error(WebMock::NetConnectNotAllowedError)
+
+    # The network checks above run first, so running this example alone skips only the reset check below.
     connection = PG.connect(ENV.fetch("TIMEKEEPING_DATABASE_URL"))
     begin
       probe_exists = connection.exec("SELECT to_regclass('regression_adapter_reset_probe_rows') IS NOT NULL")
@@ -257,17 +335,5 @@ RSpec.describe "TimekeepingRegressionAdapter during live examples", :without_tra
       connection.exec("DROP TABLE IF EXISTS regression_adapter_reset_probe_rows")
       connection.close
     end
-
-    2.times { expect(live_metrics_response).to be_a(Net::HTTPOK) }
-    live_uri = URI(live_instance.base_url)
-    expect(live_uri.host).to eq("127.0.0.1")
-    expect(ENV.fetch(Timekeeping::EntryApiClient::BASE_URL_ENV)).to eq(live_instance.base_url)
-    expect(WebMock::Config.instance.allow).to eq(["127.0.0.1:#{live_uri.port}"])
-
-    probe = TCPServer.new("127.0.0.1", 0)
-    other_port = probe.addr[1]
-    probe.close
-    expect { Net::HTTP.get(URI("http://127.0.0.1:#{other_port}/")) }.to raise_error(WebMock::NetConnectNotAllowedError)
-    expect { Net::HTTP.get(URI("http://example.com/")) }.to raise_error(WebMock::NetConnectNotAllowedError)
   end
 end

@@ -113,15 +113,24 @@ module TimekeepingRegressionAdapter
           ENV[BASE_URL_ENV] = instance.base_url
           ENV[PRIVATE_KEY_ENV] = instance.private_key.to_pem
         rescue StandardError
-          instance&.stop
           saved_env.each { |key, value| value.nil? ? ENV.delete(key) : ENV[key] = value }
           saved_webmock.each { |name, value| WebMock::Config.instance.public_send(:"#{name}=", value) }
+          stop_after_failed_start(instance)
           raise BootError, "the live Timekeeping instance did not start; its output is withheld because it can hold " \
                            "the database URL", cause: nil
         end
         @database_url = url
         @allowed_address = address
         @current = instance
+      end
+
+      # A failed start already raises a BootError of its own. An error from stopping
+      # the instance would replace it and keep the start error, which can hold the
+      # database URL, as its cause, so that error is dropped.
+      def stop_after_failed_start(instance)
+        instance&.stop
+      rescue StandardError
+        nil
       end
 
       def free_port
