@@ -442,9 +442,9 @@ end
 
 RSpec.describe "TimekeepingWriterLog crashed-run install", committed_data: true do
   # "TimekeepingWriterLog.install! and remove! each succeed when run twice, and install twice logs a write once"
-  # A run that crashed before remove! leaves the table, function and trigger behind; the next install!
-  # must still end with exactly one trigger.
-  it "install! over a crashed run's leftover trigger still logs one write exactly once" do
+  # A second install! meets the table, function and trigger the first one left, as the next run meets
+  # what a run that crashed before remove! left. The catalog must still hold exactly one trigger.
+  it "install! over an installed trigger leaves exactly one trigger in the catalog" do
     connection = ActiveRecord::Base.connection
     TimekeepingWriterLog.install!(connection)
     TimekeepingWriterLog.install!(connection)
