@@ -400,7 +400,8 @@ RSpec.describe "Timekeeping owner state harness" do
     def run_probe(fixture, owner_state)
       probe = Rails.root.join("spec/fixtures/timekeeping_harness", fixture).to_s
       Dir.mktmpdir("owner-state-probe-ledger") do |dir|
-        env = { "TIMEKEEPING_OWNER_STATE" => owner_state,
+        # A probe is never a regression child, even when this run is one.
+        env = { "TIMEKEEPING_OWNER_STATE" => owner_state, "TIMEKEEPING_REGRESSION" => nil,
                 TimekeepingQueueLedger::PATH_KEY => File.join(dir, "queue_ledger.json") }
         stdout, stderr, status = Open3.capture3(env, "bundle", "exec", "rspec", probe, chdir: Rails.root.to_s)
         ["#{stdout}\n#{stderr}", status]
@@ -455,6 +456,17 @@ RSpec.describe "Timekeeping owner state harness" do
     # "An unknown `TIMEKEEPING_OWNER_STATE` raises at load and names the three values."
     it "with TIMEKEEPING_OWNER_STATE=bogus the run fails at load naming the three values" do
       output, status = run_probe("owner_state_probe.rb", "bogus")
+
+      expect(status).not_to be_success
+      expect(output.lines.find { |line| line.include?("ArgumentError") }).not_to be_nil
+      expect(output).to match(/legacy.*timekeeping.*rollback/m)
+      expect(output).to include("error occurred while loading").or include("errors occurred outside of examples")
+    end
+
+    # Only a regression child reads an empty value as no state, so a blank value
+    # set anywhere else still reaches the harness and is reported at load.
+    it "with TIMEKEEPING_OWNER_STATE empty outside a regression child the run fails at load naming the three values" do
+      output, status = run_probe("owner_state_probe.rb", "")
 
       expect(status).not_to be_success
       expect(output.lines.find { |line| line.include?("ArgumentError") }).not_to be_nil

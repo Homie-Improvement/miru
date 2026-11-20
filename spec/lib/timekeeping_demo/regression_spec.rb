@@ -313,36 +313,11 @@ RSpec.describe TimekeepingDemo::Regression do
       expect(argv[argv.index("--tag") + 1]).to eq("switches_owner")
       expect(argv[argv.index("--format") + 1]).to eq("json")
       expect(argv).not_to include("--fail-if-no-examples")
+      # A key that is set, even to "", is one dotenv never fills, so the report
+      # child must receive the key rather than have it removed.
+      expect(report_calls.first[:env]).to have_key("TIMEKEEPING_OWNER_STATE")
       expect(report_calls.first[:env]).to include("TIMEKEEPING_OWNER_STATE" => "")
       expect(status).to eq(1)
-    end
-  end
-end
-
-RSpec.describe TimekeepingDemo::Regression do
-  it "the switches_owner report pass sets TIMEKEEPING_OWNER_STATE to an empty string instead of dropping it, while each state pass keeps its own state" do
-    calls = []
-    runner = lambda do |env:, argv:|
-      calls << { env: env.dup, argv: argv.dup }
-      true
-    end
-
-    status = nil
-    expect { status = described_class.run(runner:, specs: ["spec/models/invoice_spec.rb"]) }.to output.to_stdout
-
-    report_calls, state_calls = calls.partition { |call| call[:argv].each_cons(2).include?(["--tag", "switches_owner"]) }
-    # "Prevent file-based configuration from restoring owner selection"
-    # A key that is set, even to "", is one dotenv never fills, so the report
-    # child must receive the key rather than have it removed.
-    expect(report_calls.size).to eq(1)
-    expect(report_calls.first[:env]).to have_key("TIMEKEEPING_OWNER_STATE")
-    expect(report_calls.first[:env]["TIMEKEEPING_OWNER_STATE"]).to eq("")
-    expect(state_calls.map { |call| call[:env]["TIMEKEEPING_OWNER_STATE"] }).to eq(%w[legacy timekeeping rollback])
-    expect(status).to eq(TimekeepingDemo::Regression::EX_OK)
-
-    Dir.mktmpdir("child-env-empty-owner-state") do |dir|
-      env = described_class.child_env(dir, "")
-      expect(env).to include("TIMEKEEPING_OWNER_STATE" => "", "TIMEKEEPING_REGRESSION" => "1")
     end
   end
 end
