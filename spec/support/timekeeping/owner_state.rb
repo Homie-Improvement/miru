@@ -1,15 +1,16 @@
 # frozen_string_literal: true
 
 # Runs the suite with the Timekeeping ownership row in one named state, chosen
-# by TIMEKEEPING_OWNER_STATE, so the regression, guard and integration suites
-# can prove behaviour under each owner without running a handoff.
+# by TIMEKEEPING_OWNER_STATE for the run or by an example's owner_state
+# metadata, so the regression, guard and integration suites can prove
+# behaviour under each owner without running a handoff.
 #
 # The cleaners in spec/support/database_cleaner.rb and
 # spec/support/committed_data.rb put the row back to its column defaults
 # (legacy) after they empty tables. spec/rails_helper.rb requires support files
 # in sorted order, so the hook below is registered after theirs and re-applies
-# the state before every example. With the variable unset, nothing is
-# registered and the suite runs as before.
+# the example's state before every example. When neither the variable nor the
+# example names a state, the hook writes nothing and the suite runs as before.
 module TimekeepingOwnerState
   ENV_KEY = "TIMEKEEPING_OWNER_STATE"
 
@@ -75,11 +76,28 @@ module TimekeepingOwnerState
 
   SELECTED = selected(ENV)
 
+  # The state this run expects the row to be in: the selected one, or the
+  # cleaners' default when none is selected.
+  def current
+    SELECTED || DEFAULT_STATE
+  end
+
+  # The state one example runs in: its owner_state metadata, else the state
+  # selected for the run. nil when neither names one, so an unset run leaves
+  # the row as the cleaners wrote it; any other unknown value raises.
+  def for_example(metadata)
+    state_name = metadata[:owner_state] || SELECTED
+    return nil if state_name.nil?
+
+    fetch(state_name)
+    state_name
+  end
+
   module Expectations
     # Asserts the stored row is in the state. EntryOwner.for cannot tell
     # generations apart, so the owner columns, generation and whether the
     # legacy table is retired are compared too.
-    def expect_owner_state!(state_name = TimekeepingOwnerState::SELECTED || TimekeepingOwnerState::DEFAULT_STATE)
+    def expect_owner_state!(state_name = TimekeepingOwnerState.current)
       columns = TimekeepingOwnerState.fetch(state_name)
       expected = TimekeepingOwnership.new(columns.slice(*TimekeepingOwnerState::OWNERSHIP_COLUMNS))
 
@@ -103,9 +121,8 @@ end
 RSpec.configure do |config|
   config.include TimekeepingOwnerState::Expectations
 
-  if TimekeepingOwnerState::SELECTED
-    config.before do
-      TimekeepingOwnerState.apply!(TimekeepingOwnerState::SELECTED)
-    end
+  config.before do |example|
+    state_name = TimekeepingOwnerState.for_example(example.metadata)
+    TimekeepingOwnerState.apply!(state_name) if state_name
   end
 end

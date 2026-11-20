@@ -8,19 +8,21 @@ require "rbconfig"
 RSpec.describe "bin/parallel_test" do
   # Runs bin/parallel_test with a stand-in `bundle` on PATH that records the
   # parallel_rspec arguments instead of running the suite. Returns the script's
-  # output, its exit status and the recorded arguments.
-  def run_parallel_test_with_fake_bundle(*args, runtime_log: nil)
+  # output, its exit status and the recorded arguments. The queue ledger
+  # override is unset by default because the script refuses to run with one,
+  # and an override left in this process's ENV would otherwise leak in.
+  def run_parallel_test_with_fake_bundle(*args, runtime_log: nil, env: { "TIMEKEEPING_QUEUE_LEDGER_PATH" => nil })
     Dir.mktmpdir do |fake_bin|
       args_file = File.join(fake_bin, "args")
       fake_bundle = File.join(fake_bin, "bundle")
       File.write(fake_bundle, "#!/bin/sh\nfor arg in \"$@\"; do echo \"$arg\"; done > #{args_file}\n")
       File.chmod(0o755, fake_bundle)
-      env = {
+      run_env = {
         "PATH" => [fake_bin, File.dirname(RbConfig.ruby), "/usr/bin", "/bin"].join(File::PATH_SEPARATOR),
         "PARALLEL_RUNTIME_LOG" => runtime_log || File.join(fake_bin, "missing_runtime.log")
-      }
+      }.merge(env)
 
-      output, status = Open3.capture2e(env, RbConfig.ruby, "bin/parallel_test", *args, chdir: Rails.root.to_s)
+      output, status = Open3.capture2e(run_env, RbConfig.ruby, "bin/parallel_test", *args, chdir: Rails.root.to_s)
       recorded_args = File.exist?(args_file) ? File.readlines(args_file, chomp: true) : []
       [output, status, recorded_args]
     end
@@ -123,6 +125,53 @@ RSpec.describe "bin/parallel_test" do
       expect(recorded_args.fetch(group_index + 1)).to eq("runtime")
       expect(output.lines.find { |line| line.start_with?("Command:") }).to include("--group-by runtime")
       expect(output).not_to include("Ignoring stale parallel runtime log")
+    end
+  end
+
+  # One override inherited by every process would make them all share one
+  # ledger file, so one process's suite-start delete would remove the others'.
+  # Acceptance: "Under bin/parallel_test each process resolves its own ledger path, so one process's suite-start delete cannot remove another process's ledger file."
+  it "refuses an inherited TIMEKEEPING_QUEUE_LEDGER_PATH that every parallel process would share, and starts nothing" do
+    Dir.mktmpdir do |dir|
+      output, status, recorded_args = run_parallel_test_with_fake_bundle(
+        "-n", "2", env: { "TIMEKEEPING_QUEUE_LEDGER_PATH" => File.join(dir, "shared_ledger.json") }
+      )
+
+      expect(status).not_to be_success, output
+      expect(output).to include("TIMEKEEPING_QUEUE_LEDGER_PATH")
+      expect(recorded_args).to be_empty
+    end
+  end
+
+  # A worker's dotenv load would otherwise fill in an override from .env or .env.test,
+  # and dotenv leaves a key alone once it is set, even to "".
+  it "hands parallel_rspec an empty TIMEKEEPING_QUEUE_LEDGER_PATH so dotenv cannot set a shared one" do
+    Dir.mktmpdir do |fake_bin|
+      env_file = File.join(fake_bin, "ledger_env")
+      fake_bundle = File.join(fake_bin, "bundle")
+      File.write(fake_bundle, "#!/bin/sh\nprintf '%s' \"${TIMEKEEPING_QUEUE_LEDGER_PATH-unset}\" > #{env_file}\n")
+      File.chmod(0o755, fake_bundle)
+      env = {
+        "PATH" => [fake_bin, File.dirname(RbConfig.ruby), "/usr/bin", "/bin"].join(File::PATH_SEPARATOR),
+        "PARALLEL_RUNTIME_LOG" => File.join(fake_bin, "missing_runtime.log"),
+        "TIMEKEEPING_QUEUE_LEDGER_PATH" => nil
+      }
+
+      output, status = Open3.capture2e(env, RbConfig.ruby, "bin/parallel_test", "-n", "2", chdir: Rails.root.to_s)
+
+      expect(status).to be_success, output
+      expect(File.read(env_file)).to eq("")
+    end
+  end
+
+  it "starts parallel_rspec when TIMEKEEPING_QUEUE_LEDGER_PATH is unset, empty or blank" do
+    [nil, "", "  "].each do |blank|
+      output, status, recorded_args = run_parallel_test_with_fake_bundle(
+        "-n", "2", env: { "TIMEKEEPING_QUEUE_LEDGER_PATH" => blank }
+      )
+
+      expect(status).to be_success, output
+      expect(recorded_args).to include("parallel_rspec")
     end
   end
 end

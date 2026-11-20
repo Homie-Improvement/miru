@@ -157,26 +157,17 @@ RSpec.describe TimekeepingDemo::CLI, "up with a recording supervisor" do
 end
 
 RSpec.describe TimekeepingDemo::CLI, "up with caller-supplied credentials" do
-  let(:caller_credentials_supervisor_class) do
-    Class.new do
-      attr_reader :specs
-
-      def initialize
-        @specs = []
-      end
-
-      def method_missing(_name, *args, **_kwargs, &)
-        args.flatten.each { |arg| @specs << arg if arg.is_a?(TimekeepingDemo::ProcessSpec) }
-        0
-      end
-
-      def respond_to_missing?(*)
-        true
-      end
-    end
+  # Starts nothing: collects the process specs the CLI hands the supervisor.
+  # prepare spawns real children with each spec's env, so its specs are a
+  # credential boundary too and are recorded beside the run specs.
+  def caller_credentials_recording_supervisor(started, prepared)
+    supervisor = instance_double(TimekeepingDemo::Supervisor)
+    allow(supervisor).to receive(:prepare) { |specs| prepared.concat(specs) }
+    allow(supervisor).to receive(:run) { |specs, **| started.concat(specs) }
+    supervisor
   end
 
-  it "up with caller credentials gives each app exactly its permitted values and writes none to versions.json or output" do
+  it "up with all three caller credentials gives each app exactly its permitted values and writes none of them out" do
     supplied = TimekeepingDemo::Credentials.generate
     keys = TimekeepingDemo::Credentials::ENV_KEYS
     private_key = keys.fetch(:private_key_pem)
@@ -186,7 +177,9 @@ RSpec.describe TimekeepingDemo::CLI, "up with caller-supplied credentials" do
       "TIMEKEEPING_DATABASE_URL" => "postgres://timekeeping_demo_role@127.0.0.1/timekeeping_demo",
       "DB_USER" => "monolith_demo_role"
     ).merge(supplied.to_env)
-    supervisor = caller_credentials_supervisor_class.new
+    started = []
+    prepared = []
+    supervisor = caller_credentials_recording_supervisor(started, prepared)
     captured_out = StringIO.new
     captured_err = StringIO.new
     original_out = $stdout
@@ -202,29 +195,37 @@ RSpec.describe TimekeepingDemo::CLI, "up with caller-supplied credentials" do
         $stderr = original_err
       end
       expect(status).to eq(0)
+      # Preparation gets exactly the checked run specs; a boolean, so a failure prints no credential.
+      expect(prepared == started).to be(true)
 
-      monolith_envs = supervisor.specs.filter_map { |spec| spec.env if spec.app == :monolith }
-      timekeeping_envs = supervisor.specs.filter_map { |spec| spec.env if spec.app == :timekeeping }
-      expect(monolith_envs).not_to be_empty
-      expect(timekeeping_envs).not_to be_empty
+      monolith = started.select { |spec| spec.app == :monolith }
+      timekeeping = started.select { |spec| spec.app == :timekeeping }
+      expect(monolith).not_to be_empty
+      expect(timekeeping).not_to be_empty
 
-      # "`CLI.up` with all three keys in caller_env gives each app exactly its permitted values, byte for byte. The Timekeeping env holds no private key. Comparisons report booleans, never the values."
-      monolith_envs.each do |env|
-        expect(env[private_key] == supplied.private_key_pem).to be(true)
-        expect(env[token] == supplied.service_token).to be(true)
-        expect(env.key?(public_key)).to be(false)
+      # "`CLI.up` uses credentials from `caller_env` when all are present, and otherwise generates them as before."
+      # "`CLI.up` with all three keys in caller_env gives each app exactly its permitted values, byte for byte.
+      # The Timekeeping env holds no private key. Comparisons report booleans, never the values."
+      monolith.each do |spec|
+        expect(spec.env[private_key] == supplied.private_key_pem).to be(true)
+        expect(spec.env[token] == supplied.service_token).to be(true)
+        expect(spec.env.key?(public_key)).to be(false)
       end
-      timekeeping_envs.each do |env|
-        expect(env[public_key] == supplied.public_key_pem).to be(true)
-        expect(env[token] == supplied.service_token).to be(true)
+      timekeeping.each do |spec|
+        expect(spec.env[public_key] == supplied.public_key_pem).to be(true)
+        expect(spec.env[token] == supplied.service_token).to be(true)
         # "Timekeeping gets the public key and the token, and never the private key."
-        expect(env.key?(private_key)).to be(false)
-        expect(env.values.any? { |value| value == supplied.private_key_pem }).to be(false)
+        expect(spec.env.key?(private_key)).to be(false)
+        expect(spec.env.values.any? { |value| value == supplied.private_key_pem }).to be(false)
       end
 
+      # "Never log, print or write them to versions.json."
       # "versions.json, the captured stdout and stderr, and the runtime output hold none of the values."
-      written = [File.read(File.join(state_dir, "versions.json")), captured_out.string, captured_err.string].join
-      supplied.to_env.each_value { |value| expect(written.include?(value)).to be(false) }
+      versions_text = File.read(File.join(state_dir, "versions.json"))
+      secrets = supplied.to_env.values
+      [versions_text, captured_out.string, captured_err.string].each do |text|
+        expect(secrets.any? { |secret| text.include?(secret) }).to be(false)
+      end
     end
   end
 
@@ -233,36 +234,51 @@ RSpec.describe TimekeepingDemo::CLI, "up with caller-supplied credentials" do
     private_key = keys.fetch(:private_key_pem)
     public_key = keys.fetch(:public_key_pem)
     token = keys.fetch(:service_token)
-    supplied = TimekeepingDemo::Credentials.generate
-    base_env = ENV.to_h.slice("PATH", "HOME", "GEM_HOME", "GEM_PATH").merge(
-      "TIMEKEEPING_DATABASE_URL" => "postgres://timekeeping_demo_role@127.0.0.1/timekeeping_demo",
-      "DB_USER" => "monolith_demo_role"
+    supplied = TimekeepingDemo::Credentials.generate.to_env
+    # The inherited environment minus the credential keys, so every other caller value is in play.
+    base_env = ENV.to_h.except(*keys.values).merge(
+      "DB_USER" => "monolith_user",
+      "TIMEKEEPING_DATABASE_URL" => "postgres://timekeeping_user@127.0.0.1:5432/timekeeping_test"
     )
-    partial_sets = keys.values.flat_map do |key|
-      [supplied.to_env.except(key), supplied.to_env.merge(key => " ")]
+    variants = keys.values.flat_map do |key|
+      [["#{key} missing", supplied.except(key)],
+       ["#{key} empty", supplied.merge(key => "")],
+       ["#{key} whitespace", supplied.merge(key => "  ")]]
     end
 
-    partial_sets.each do |partial|
-      supervisor = caller_credentials_supervisor_class.new
-      Dir.mktmpdir("timekeeping-demo-state") do |state_dir|
-        expect(described_class.run(["up"], root: Rails.root.to_s, supervisor:, state_dir:,
-                                           caller_env: base_env.merge(partial))).to eq(0)
+    variants.each do |label, credential_env|
+      started = []
+      prepared = []
+      supervisor = caller_credentials_recording_supervisor(started, prepared)
+      status = Dir.mktmpdir("timekeeping-demo-state") do |state_dir|
+        described_class.run(["up"], root: Rails.root.to_s, supervisor:, state_dir:,
+                                    caller_env: base_env.merge(credential_env))
       end
 
-      monolith = supervisor.specs.find { |spec| spec.app == :monolith }.env
-      timekeeping = supervisor.specs.find { |spec| spec.app == :timekeeping }.env
+      expect(status).to eq(0), "expected status 0 with #{label}"
+      expect(prepared == started).to be(true), "expected preparation to get the run specs with #{label}"
+      monolith = started.select { |spec| spec.app == :monolith }
+      timekeeping = started.select { |spec| spec.app == :timekeeping }
+      expect(monolith.empty? || timekeeping.empty?).to be(false), "expected both apps to start with #{label}"
 
-      # "A partial or blank set therefore gets a whole fresh set and is never mixed with supplied values."
-      supplied.to_env.each_value do |value|
-        expect((monolith.values + timekeeping.values).include?(value)).to be(false)
-      end
-      expect(monolith.fetch(token) == timekeeping.fetch(token)).to be(true)
-      signer = OpenSSL::PKey::RSA.new(monolith.fetch(private_key))
-      verifier = OpenSSL::PKey::RSA.new(timekeeping.fetch(public_key))
+      # "`CLI.up` uses `Credentials.from_env(caller_env) || Credentials.generate`. A partial or blank set therefore
+      # gets a whole fresh set and is never mixed with supplied values."
+      all_values = started.flat_map { |spec| spec.env.values }
+      mixed_in = supplied.values.any? { |value| all_values.include?(value) }
+      expect(mixed_in).to be(false), "expected no supplied value with #{label}"
+      monolith_env = monolith.first.env
+      timekeeping_env = timekeeping.first.env
+      # fetch, so a token missing from both apps fails here instead of comparing nil to nil.
+      shared_token = monolith_env.fetch(token) == timekeeping_env.fetch(token)
+      expect(shared_token).to be(true), "expected one shared token with #{label}"
+      signer = OpenSSL::PKey::RSA.new(monolith_env.fetch(private_key))
+      verifier = OpenSSL::PKey::RSA.new(timekeeping_env.fetch(public_key))
       signature = signer.sign("SHA256", "timekeeping-demo")
-      expect(verifier.verify("SHA256", signature, "timekeeping-demo")).to be(true)
+      paired = verifier.verify("SHA256", signature, "timekeeping-demo")
+      expect(paired).to be(true), "expected a matching key pair with #{label}"
       # "Timekeeping gets the public key and the token, and never the private key."
-      expect(timekeeping.key?(private_key)).to be(false)
+      private_key_in_timekeeping = timekeeping.any? { |spec| spec.env.key?(private_key) }
+      expect(private_key_in_timekeeping).to be(false), "expected no private key in Timekeeping with #{label}"
     end
   end
 end
@@ -300,57 +316,6 @@ RSpec.describe TimekeepingDemo::CLI do
 end
 
 RSpec.describe TimekeepingDemo::CLI do
-  it "up with all three caller credentials starts the apps with them and writes none to versions.json or the output" do
-    started = []
-    supervisor = instance_double(TimekeepingDemo::Supervisor)
-    allow(supervisor).to receive(:prepare) { |*_args, **_kwargs| true }
-    allow(supervisor).to receive(:run) do |specs, *_rest, **_kwargs|
-      started.concat(specs)
-      0
-    end
-    supplied = TimekeepingDemo::Credentials.generate
-    caller_env = {
-      "PATH" => ENV.fetch("PATH"),
-      "DB_USER" => "monolith_user",
-      "TIMEKEEPING_DATABASE_URL" => "postgres://timekeeping_user@127.0.0.1:5432/timekeeping_test"
-    }.merge(supplied.to_env)
-    secrets = [supplied.private_key_pem, supplied.public_key_pem, supplied.service_token]
-    keys = TimekeepingDemo::Credentials::ENV_KEYS
-
-    Dir.mktmpdir("timekeeping-demo-state") do |state_dir|
-      captured_out = StringIO.new
-      captured_err = StringIO.new
-      original_out = $stdout
-      original_err = $stderr
-      begin
-        $stdout = captured_out
-        $stderr = captured_err
-        described_class.run(["up"], root: Rails.root.to_s, supervisor:, state_dir:, caller_env:)
-      ensure
-        $stdout = original_out
-        $stderr = original_err
-      end
-
-      monolith = started.find { |spec| spec.app == :monolith }.env
-      timekeeping = started.find { |spec| spec.app == :timekeeping }.env
-      # "`CLI.up` uses credentials from `caller_env` when all are present, and otherwise generates them as before."
-      expect(monolith[keys.fetch(:private_key_pem)] == supplied.private_key_pem).to be(true)
-      expect(monolith[keys.fetch(:service_token)] == supplied.service_token).to be(true)
-      expect(timekeeping[keys.fetch(:public_key_pem)] == supplied.public_key_pem).to be(true)
-      expect(timekeeping[keys.fetch(:service_token)] == supplied.service_token).to be(true)
-      # "Timekeeping gets the public key and the token, and never the private key."
-      expect(timekeeping.key?(keys.fetch(:private_key_pem))).to be(false)
-
-      # "Never log, print or write them to versions.json."
-      versions_text = File.read(File.join(state_dir, "versions.json"))
-      written = [versions_text, captured_out.string, captured_err.string]
-      leaked = written.any? { |text| secrets.any? { |secret| text.include?(secret) } }
-      expect(leaked).to be(false)
-    end
-  end
-end
-
-RSpec.describe TimekeepingDemo::CLI do
   it "run without a supervisor builds one that records groups in tmp/timekeeping-demo/process_groups" do
     root = Rails.root.to_s
     built_with = []
@@ -374,117 +339,6 @@ RSpec.describe TimekeepingDemo::CLI do
     expect(built_with.size).to eq(1)
     expect(built_with.first[:groups_path]).to eq(File.join(root, "tmp", "timekeeping-demo", "process_groups"))
     expect(status).to eq(described_class::EX_FAILURE)
-  end
-end
-
-RSpec.describe TimekeepingDemo::CLI, "up with caller credentials" do
-  it "up with all three credential keys in caller_env gives each app exactly its permitted values and writes none of them out" do
-    supplied = TimekeepingDemo::Credentials.generate
-    caller_env = {
-      "PATH" => ENV.fetch("PATH"),
-      "TIMEKEEPING_DATABASE_URL" => "postgres://timekeeping_caller_role@127.0.0.1/timekeeping_caller_test",
-      "DB_USER" => "monolith_caller_role",
-      "TIMEKEEPING_TOKEN_PRIVATE_KEY" => supplied.private_key_pem,
-      "TIMEKEEPING_TOKEN_PUBLIC_KEY" => supplied.public_key_pem,
-      "TIMEKEEPING_SERVICE_TOKEN" => supplied.service_token
-    }
-    started = []
-    supervisor = instance_double(TimekeepingDemo::Supervisor)
-    allow(supervisor).to receive(:prepare)
-    allow(supervisor).to receive(:run) { |specs, **| started.concat(specs) }
-
-    Dir.mktmpdir("timekeeping-demo-state") do |state_dir|
-      captured_out = StringIO.new
-      captured_err = StringIO.new
-      original_out = $stdout
-      original_err = $stderr
-      begin
-        $stdout = captured_out
-        $stderr = captured_err
-        status = described_class.run(["up"], root: Rails.root.to_s, supervisor:, state_dir:, caller_env:)
-        expect(status).to eq(0)
-      ensure
-        $stdout = original_out
-        $stderr = original_err
-      end
-
-      monolith = started.select { |spec| spec.app == :monolith }
-      timekeeping = started.select { |spec| spec.app == :timekeeping }
-      expect(monolith).not_to be_empty
-      expect(timekeeping).not_to be_empty
-
-      # "`CLI.up` with all three keys in caller_env gives each app exactly its permitted values, byte for byte.
-      # The Timekeeping env holds no private key. Comparisons report booleans, never the values."
-      monolith.each do |spec|
-        expect(spec.env["TIMEKEEPING_TOKEN_PRIVATE_KEY"] == supplied.private_key_pem).to be(true)
-        expect(spec.env["TIMEKEEPING_SERVICE_TOKEN"] == supplied.service_token).to be(true)
-        expect(spec.env.key?("TIMEKEEPING_TOKEN_PUBLIC_KEY")).to be(false)
-      end
-      timekeeping.each do |spec|
-        expect(spec.env["TIMEKEEPING_TOKEN_PUBLIC_KEY"] == supplied.public_key_pem).to be(true)
-        expect(spec.env["TIMEKEEPING_SERVICE_TOKEN"] == supplied.service_token).to be(true)
-        expect(spec.env.key?("TIMEKEEPING_TOKEN_PRIVATE_KEY")).to be(false)
-        expect(spec.env.values.any? { |value| value == supplied.private_key_pem }).to be(false)
-      end
-
-      # "versions.json, the captured stdout and stderr, and the runtime output hold none of the values."
-      versions_text = File.read(File.join(state_dir, "versions.json"))
-      secrets = [supplied.private_key_pem, supplied.public_key_pem, supplied.service_token]
-      [versions_text, captured_out.string, captured_err.string].each do |text|
-        expect(secrets.any? { |secret| text.include?(secret) }).to be(false)
-      end
-    end
-  end
-end
-
-RSpec.describe TimekeepingDemo::CLI, "up with an incomplete caller credential set" do
-  it "up with a partial or blank credential set in caller_env starts the apps with a fresh matching set and none of the supplied values" do
-    supplied = TimekeepingDemo::Credentials.generate
-    complete = {
-      "TIMEKEEPING_TOKEN_PRIVATE_KEY" => supplied.private_key_pem,
-      "TIMEKEEPING_TOKEN_PUBLIC_KEY" => supplied.public_key_pem,
-      "TIMEKEEPING_SERVICE_TOKEN" => supplied.service_token
-    }
-    base_env = {
-      "PATH" => ENV.fetch("PATH"),
-      "TIMEKEEPING_DATABASE_URL" => "postgres://timekeeping_caller_role@127.0.0.1/timekeeping_caller_test",
-      "DB_USER" => "monolith_caller_role"
-    }
-    variants = complete.keys.flat_map do |key|
-      [complete.except(key), complete.merge(key => ""), complete.merge(key => "  ")]
-    end
-
-    variants.each do |credential_env|
-      started = []
-      supervisor = instance_double(TimekeepingDemo::Supervisor)
-      allow(supervisor).to receive(:prepare)
-      allow(supervisor).to receive(:run) { |specs, **| started.concat(specs) }
-
-      Dir.mktmpdir("timekeeping-demo-state") do |state_dir|
-        status = described_class.run(["up"], root: Rails.root.to_s, supervisor:, state_dir:,
-                                             caller_env: base_env.merge(credential_env))
-        expect(status).to eq(0)
-      end
-
-      # "`CLI.up` uses `Credentials.from_env(caller_env) || Credentials.generate`. A partial or blank set therefore
-      # gets a whole fresh set and is never mixed with supplied values."
-      monolith = started.find { |spec| spec.app == :monolith }
-      timekeeping = started.find { |spec| spec.app == :timekeeping }
-      private_pem = monolith.env.fetch("TIMEKEEPING_TOKEN_PRIVATE_KEY")
-      public_pem = timekeeping.env.fetch("TIMEKEEPING_TOKEN_PUBLIC_KEY")
-      private_key = OpenSSL::PKey::RSA.new(private_pem)
-      public_key = OpenSSL::PKey::RSA.new(public_pem)
-      signature = private_key.sign("SHA256", "timekeeping harness check")
-      expect(public_key.verify("SHA256", signature, "timekeeping harness check")).to be(true)
-      # fetch, so a token missing from both apps fails here instead of comparing nil to nil.
-      expect(monolith.env.fetch("TIMEKEEPING_SERVICE_TOKEN") == timekeeping.env.fetch("TIMEKEEPING_SERVICE_TOKEN")).to be(true)
-
-      supplied_values = complete.values
-      all_values = started.flat_map { |spec| spec.env.values }
-      expect(all_values.any? { |value| supplied_values.include?(value) }).to be(false)
-      # "Timekeeping gets the public key and the token, and never the private key."
-      expect(started.select { |spec| spec.app == :timekeeping }.any? { |spec| spec.env.key?("TIMEKEEPING_TOKEN_PRIVATE_KEY") }).to be(false)
-    end
   end
 end
 
@@ -528,34 +382,237 @@ RSpec.describe TimekeepingDemo::CLI do
 end
 
 RSpec.describe TimekeepingDemo::CLI do
-  it "up with a partial credential set starts both apps on one fresh matching set and never mixes in a supplied value" do
-    keys = TimekeepingDemo::Credentials::ENV_KEYS
-    supplied = TimekeepingDemo::Credentials.generate.to_env
-    supplied.delete(keys.fetch(:public_key_pem))
-    started = []
-    supervisor = instance_double(TimekeepingDemo::Supervisor)
-    allow(supervisor).to receive(:prepare)
-    allow(supervisor).to receive(:run) { |specs, **| started.concat(specs) }
-    caller_env = ENV.to_h.except(*keys.values).merge(supplied).merge(
-      "DB_USER" => "monolith_user",
-      "TIMEKEEPING_DATABASE_URL" => "postgres://timekeeping_user@127.0.0.1:5432/timekeeping_test"
-    )
-
-    Dir.mktmpdir do |state_dir|
-      described_class.run(["up"], root: Rails.root.to_s, supervisor:, state_dir:, caller_env:)
+  it "default regression runner hands argv to system as separate arguments and never as a shell string" do
+    root = Dir.mktmpdir("regression root with space")
+    calls = []
+    allow(described_class).to receive(:system) do |*args, **opts|
+      calls << [args, opts]
+      false
     end
 
-    monolith = started.find { |spec| spec.app == :monolith }.env
-    timekeeping = started.find { |spec| spec.app == :timekeeping }.env
-    # "A partial or blank set therefore gets a whole fresh set and is never mixed with supplied values."
-    all_values = started.flat_map { |spec| spec.env.values }
-    expect(supplied.values.any? { |value| all_values.include?(value) }).to be(false)
-    private_key = OpenSSL::PKey::RSA.new(monolith.fetch(keys.fetch(:private_key_pem)))
-    public_key = OpenSSL::PKey::RSA.new(timekeeping.fetch(keys.fetch(:public_key_pem)))
-    signature = private_key.sign("SHA256", "pairing check")
-    expect(public_key.verify("SHA256", signature, "pairing check")).to be(true)
-    expect(monolith.fetch(keys.fetch(:service_token)) == timekeeping.fetch(keys.fetch(:service_token))).to be(true)
-    # "Timekeeping gets the public key and the token, and never the private key."
-    expect(timekeeping.key?(keys.fetch(:private_key_pem))).to be(false)
+    runner = described_class.default_regression_runner(root:, caller_env: { "KEEP_ME" => "1" })
+    hostile = "spec/x_spec.rb; touch #{root}/pwned"
+    result = runner.call(env: { "TIMEKEEPING_OWNER_STATE" => "legacy" }, argv: [hostile, "--tag", "~switches_owner"])
+
+    # "The default runner, built by `CLI.run` from `root:` and `caller_env:`, uses `system(env, "bundle", "exec", "rspec", *argv, chdir: root)` with an argv array, never a shell string."
+    expect(calls.size).to eq(1)
+    args, opts = calls.first
+    expect(args).to eq([{ "KEEP_ME" => "1", "DATABASE_URL" => "", "RAILS_ENV" => "test",
+                          "TIMEKEEPING_OWNER_STATE" => "legacy" },
+                        "bundle", "exec", "rspec", hostile, "--tag", "~switches_owner"])
+    expect(opts).to eq(chdir: root)
+    expect(result).to be(false)
+    expect(File).not_to exist(File.join(root, "pwned"))
+  ensure
+    FileUtils.rm_rf(root) if root
+  end
+end
+
+RSpec.describe TimekeepingDemo::CLI do
+  it "regression children never inherit the caller's owner state or queue ledger path" do
+    envs = []
+    allow(described_class).to receive(:system) do |env, *_args, **_opts|
+      envs << env
+      true
+    end
+    supervisor = double("timekeeping demo supervisor")
+    parent_ledger = "/parent/queue_ledger.json"
+    caller_env = { "TIMEKEEPING_OWNER_STATE" => "rollback", "TIMEKEEPING_QUEUE_LEDGER_PATH" => parent_ledger }
+
+    Dir.mktmpdir do |dir|
+      state_dir = File.join(dir, "state")
+      expect do
+        described_class.run(["regression"], root: Rails.root.to_s, supervisor:, state_dir:, caller_env:)
+      end.to output.to_stdout
+
+      expect(Dir).not_to exist(state_dir)
+    end
+
+    # "Each child env sets `TIMEKEEPING_OWNER_STATE` to its state (overriding any caller value), `TIMEKEEPING_REGRESSION=1`, `TIMEKEEPING_LIVE=1`, and its own `TIMEKEEPING_QUEUE_LEDGER_PATH` in a fresh temp directory (a child rspec that inherits the parent's ledger path deletes the parent's ledger at suite start)."
+    state_envs = envs.select { |env| env["TIMEKEEPING_OWNER_STATE"] }
+    expect(state_envs.pluck("TIMEKEEPING_OWNER_STATE")).to eq(%w[legacy timekeeping rollback])
+    ledgers = envs.pluck("TIMEKEEPING_QUEUE_LEDGER_PATH")
+    expect(ledgers).to all(be_a(String))
+    expect(ledgers).not_to include(parent_ledger)
+    expect(ledgers.uniq.size).to eq(envs.size)
+
+    # The report pass runs with "no owner state": a nil value makes system remove the inherited key.
+    report_envs = envs - state_envs
+    expect(report_envs.size).to eq(1)
+    expect(report_envs.first).to have_key("TIMEKEEPING_OWNER_STATE")
+    expect(report_envs.first["TIMEKEEPING_OWNER_STATE"]).to be_nil
+  end
+end
+
+RSpec.describe TimekeepingDemo::CLI do
+  it "an unknown verb or a regression verb with extra arguments returns 64 and starts neither the supervisor nor the runner" do
+    supervisor = double("timekeeping demo supervisor")
+    regression_runner = double("regression runner")
+
+    [["nope"], ["regression", "; rm -rf /"]].each do |argv|
+      Dir.mktmpdir do |dir|
+        state_dir = File.join(dir, "state")
+        status = nil
+        # "`CLI.run(["nope"])` returns 64 and calls neither the supervisor nor the runner"
+        expect do
+          status = described_class.run(argv, root: Rails.root.to_s, supervisor:, state_dir:, regression_runner:)
+        end.to output(/regression/).to_stderr
+
+        expect(status).to eq(described_class::EX_USAGE)
+        expect(status).to eq(64)
+        expect(Dir).not_to exist(state_dir)
+      end
+    end
+  end
+end
+
+RSpec.describe TimekeepingDemo::CLI do
+  it "regression calls the runner once per state, in order, with the full 12.1 list and never builds the supervisor" do
+    # The literal 12.1 list, characterization specs included, is pinned in regression_spec.rb.
+    expected_specs = TimekeepingDemo::Regression::SPECS
+    flags = ["--tag", "~switches_owner"]
+    calls = []
+    runner = lambda do |env:, argv:|
+      calls << { env:, argv: }
+      true
+    end
+    supervisor = double("timekeeping demo supervisor")
+
+    Dir.mktmpdir do |parent|
+      state_dir = File.join(parent, "state")
+      status = nil
+      expect do
+        status = described_class.run(["regression"], root: Rails.root.to_s, supervisor:, state_dir:,
+                                                     caller_env: {}, regression_runner: runner)
+      end.to output.to_stdout
+
+      expect(status).to eq(0)
+      # "`CLI.run([\"regression\"])` never calls the supervisor."
+      expect(File).not_to exist(state_dir)
+    end
+
+    state_calls = calls.select { |call| call[:argv].include?("~switches_owner") }
+    # "`CLI.run([\"regression\"])` calls the runner three times with each state (legacy, timekeeping, rollback) and the full list, including the three characterization specs"
+    expect(state_calls.map { |call| call[:env]["TIMEKEEPING_OWNER_STATE"] }).to eq(%w[legacy timekeeping rollback])
+    state_calls.each do |call|
+      expect(call[:argv] - flags).to contain_exactly(*expected_specs)
+      expect(call[:argv]).to include(*flags)
+      expect(call[:argv][call[:argv].index("--tag") + 1]).to eq("~switches_owner")
+    end
+  end
+end
+
+RSpec.describe TimekeepingDemo::CLI do
+  it "USAGE names both the up and the regression commands" do
+    # "USAGE names up and regression, and `CLI.run([\"nope\"])` still returns `EX_USAGE` and starts nothing"
+    expect(described_class::USAGE).to match(/\bup\b/)
+    expect(described_class::USAGE).to match(/\bregression\b/)
+  end
+end
+
+RSpec.describe TimekeepingDemo::CLI do
+  it "the default regression runner calls system with an argv array, the child state over the caller's, chdir root, and passes nil through" do
+    caller_env = { "TIMEKEEPING_OWNER_STATE" => "rollback", "KEEP_ME" => "x" }
+    # "The default runner, built by `CLI.run` from `root:` and `caller_env:`, uses `system(env, \"bundle\", \"exec\", \"rspec\", *argv, chdir: root)` with an argv array, never a shell string."
+    expect(described_class).to receive(:system)
+      .with({ "TIMEKEEPING_OWNER_STATE" => "legacy", "KEEP_ME" => "x", "DATABASE_URL" => "", "RAILS_ENV" => "test" },
+            "bundle", "exec", "rspec", "spec/a b_spec.rb", "--tag", "~switches_owner", chdir: "/srv/app")
+      .and_return(nil)
+
+    runner = described_class.default_regression_runner(root: "/srv/app", caller_env:)
+    result = runner.call(env: { "TIMEKEEPING_OWNER_STATE" => "legacy" },
+                         argv: ["spec/a b_spec.rb", "--tag", "~switches_owner"])
+
+    # "Only `true` counts as a pass; `false` and `nil` (spawn failure, killed by a signal) fail."
+    expect(result).to be_nil
+    expect(caller_env).to eq("TIMEKEEPING_OWNER_STATE" => "rollback", "KEEP_ME" => "x")
+  end
+end
+
+RSpec.describe TimekeepingDemo::CLI do
+  # "Each child env sets `TIMEKEEPING_OWNER_STATE` to its state (overriding any caller value), `TIMEKEEPING_REGRESSION=1`,
+  # `TIMEKEEPING_LIVE=1`, and its own `TIMEKEEPING_QUEUE_LEDGER_PATH` in a fresh temp directory (a child rspec that
+  # inherits the parent's ledger path deletes the parent's ledger at suite start)."
+  it "regression overrides a caller TIMEKEEPING_OWNER_STATE per state and sends no owner state to the report pass" do
+    calls = []
+    runner = ->(env:, argv:) { calls << [env, argv] and true }
+
+    Dir.mktmpdir do |state_dir|
+      caller_env = { "TIMEKEEPING_OWNER_STATE" => "rollback", "TIMEKEEPING_QUEUE_LEDGER_PATH" => "/caller/ledger.json" }
+      expect do
+        described_class.run(["regression"], root: Rails.root.to_s, supervisor: double("timekeeping demo supervisor"),
+                                            state_dir:, caller_env:, regression_runner: runner)
+      end.to output.to_stdout
+
+      state_calls = calls.reject { |_env, argv| argv.include?("switches_owner") }
+      report_calls = calls.select { |_env, argv| argv.include?("switches_owner") }
+      expect(state_calls.map { |env, _argv| env["TIMEKEEPING_OWNER_STATE"] }).to eq(%w[legacy timekeeping rollback])
+      expect(report_calls.size).to eq(1)
+      # The child env is merged over the caller's, so the report pass must clear the key, not omit it or blank it.
+      report_env = caller_env.merge(report_calls.first.first)
+      expect(report_env["TIMEKEEPING_OWNER_STATE"]).to be_nil
+      expect(calls.map { |env, _argv| env["TIMEKEEPING_QUEUE_LEDGER_PATH"] }).not_to include("/caller/ledger.json")
+      expect(Dir.children(state_dir)).to be_empty
+    end
+  end
+end
+
+RSpec.describe TimekeepingDemo::CLI, "regression database guard" do
+  def run_regression_with(database_url)
+    status = nil
+    expect do
+      status = described_class.run(["regression"], root: Rails.root.to_s,
+                                                   caller_env: { "DATABASE_URL" => database_url })
+    end.to output(/timekeeping-demo: DATABASE_URL/).to_stderr
+    status
+  end
+
+  it "refuses a caller DATABASE_URL that any reader would open as a non-test database before running anything" do
+    expect(described_class).not_to receive(:system)
+
+    [
+      "postgresql://user@127.0.0.1/miru_web_development",
+      "postgresql://user@127.0.0.1/miru_web_test?dbname=miru_web_development",
+      "postgresql://user@127.0.0.1/miru_web_test?database=miru_web_development",
+      "not a url"
+    ].each do |url|
+      expect(run_regression_with(url)).to eq(described_class::EX_CONFIG)
+    end
+  end
+
+  it "passes a _test DATABASE_URL through and sets an absent one to empty so dotenv cannot fill it" do
+    envs = []
+    allow(described_class).to receive(:system) do |env, *_args, **_opts|
+      envs << env
+      true
+    end
+
+    test_url = "postgresql://user@127.0.0.1/miru_web_test"
+    expect do
+      described_class.run(["regression"], root: Rails.root.to_s, caller_env: { "DATABASE_URL" => test_url })
+    end.to output.to_stdout
+    expect(envs.pluck("DATABASE_URL").uniq).to eq([test_url])
+
+    envs.clear
+    expect { described_class.run(["regression"], root: Rails.root.to_s, caller_env: {}) }.to output.to_stdout
+    expect(envs.pluck("DATABASE_URL").uniq).to eq([""])
+  end
+
+  # With no URL, config/database.yml picks the database by Rails environment;
+  # development would select miru_web_development.
+  it "runs every child in the test Rails environment when the caller has no URL and selects development" do
+    envs = []
+    allow(described_class).to receive(:system) do |env, *_args, **_opts|
+      envs << env
+      true
+    end
+
+    [{ "RAILS_ENV" => "development" }, { "RAILS_ENV" => "development", "DATABASE_URL" => "" }].each do |caller_env|
+      envs.clear
+      expect { described_class.run(["regression"], root: Rails.root.to_s, caller_env:) }.to output.to_stdout
+      expect(envs.size).to eq(4)
+      expect(envs.pluck("RAILS_ENV").uniq).to eq(["test"])
+      expect(envs.pluck("DATABASE_URL").uniq).to eq([""])
+    end
   end
 end

@@ -61,4 +61,29 @@ RSpec.describe Timekeeping::Handoff::Capabilities do
     expect(described_class.new.refusal(source_legacy: true, outgoing: monolith, incoming: unfenced)).to include("timekeeping")
     expect(described_class.new.refusal(source_legacy: true, outgoing: monolith, incoming: unfenced.with(admission: store))).to be_nil
   end
+
+  # The gate checks only method names, so a misnamed method on the real
+  # integrations would otherwise surface only when a real handoff starts.
+  it "accepts the real settle and drain integrations of either outgoing owner for a non-legacy source" do
+    store = Timekeeping::Handoff::TimekeepingStore.new(base_url: "http://timekeeping.test", token: "token")
+    reservations = Object.new
+    monolith = Timekeeping::Handoff::Owner.new(
+      name: "monolith", store: Object.new, admission: Timekeeping::Handoff::MonolithAdmission.new,
+      settle: Timekeeping::Handoff::OperationsSettle.new(
+        owner: Timekeeping::Handoff::OperationsSettle::MonolithPort.new, reservations:
+      ),
+      drain: Timekeeping::Handoff::RelayDrain.new(owner: Timekeeping::Handoff::RelayDrain::MonolithPort.new)
+    )
+    timekeeping = Timekeeping::Handoff::Owner.new(
+      name: "timekeeping", store:, admission: store,
+      settle: Timekeeping::Handoff::OperationsSettle.new(
+        owner: Timekeeping::Handoff::OperationsSettle::TimekeepingPort.new(store:), reservations:
+      ),
+      drain: Timekeeping::Handoff::RelayDrain.new(owner: Timekeeping::Handoff::RelayDrain::TimekeepingPort.new(store:))
+    )
+    gate = described_class.new
+
+    expect(gate.refusal(source_legacy: false, outgoing: monolith, incoming: timekeeping)).to be_nil
+    expect(gate.refusal(source_legacy: false, outgoing: timekeeping, incoming: monolith)).to be_nil
+  end
 end

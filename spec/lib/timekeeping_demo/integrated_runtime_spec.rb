@@ -34,14 +34,47 @@ RSpec.describe IntegratedRuntime do
     TimekeepingDemo::Credentials::ENV_KEYS.each_value do |key|
       expect(ENV[key].nil? || !secrets.include?(ENV[key])).to be(true)
     end
+    expect(argv.last).to eq("up")
+    expect(argv.any? { |argument| argument.end_with?("bin/timekeeping-demo") }).to be(true)
+    # "It starts `bin/timekeeping-demo up` in its own process group"
+    expect(options[:pgroup]).to be(true)
   end
 
-  it "parse_groups never answers a group id that would signal the test process group or every process" do
-    groups = described_class.parse_groups("4242\n\n0\n1\nabc\n-7\n4243\n42")
+  it "parse_groups reads back only whole recorded group ids above 1, so teardown cannot signal its own group or every process" do
+    # A launcher killed mid-write can leave a blank or partial last line; "".to_i is 0,
+    # and Process.kill(sig, -0) would hit the rspec process group, -1 every user process.
+    text = "4242\n\n0\n1\n-7\n-5\nabc\n12x\n 99\n4243\n4343\n9001\n31337\n5"
 
-    expect(groups).to all(be > 1)
-    expect(groups).to include(4242, 4243)
-    expect(groups).not_to include(0, 1, -7)
+    # The final "5" has no newline, so it may be a partial write and is skipped.
+    expect(described_class.parse_groups(text)).to eq([4242, 4243, 4343, 9001, 31_337])
+    expect(described_class.parse_groups("")).to eq([])
+  end
+
+  it "refuse_if_running! refuses while the groups file lists a live group, leaves the file untouched, and passes once it is gone" do
+    Dir.mktmpdir("integrated-runtime-root") do |root|
+      groups_path = File.join(root, "tmp", "timekeeping-demo", "process_groups")
+      FileUtils.mkdir_p(File.dirname(groups_path))
+      pid = Process.spawn("sleep", "60", pgroup: true)
+      begin
+        baseline = "#{pid}\n"
+        File.write(groups_path, baseline)
+        expect(File.read(groups_path)).to eq(baseline)
+
+        # "Refuse to start while the groups file lists a live group."
+        expect { described_class.refuse_if_running!(root:) }.to raise_error(IntegratedRuntime::BootError)
+        # The refusal leaves the record in place, so a later teardown still finds the live group.
+        expect(File.read(groups_path)).to eq(baseline)
+      ensure
+        begin
+          Process.kill("KILL", -pid)
+        rescue Errno::ESRCH
+          nil
+        end
+        Process.wait(pid)
+      end
+
+      expect(described_class.refuse_if_running!(root:)).to be_nil
+    end
   end
 end
 
@@ -108,44 +141,6 @@ RSpec.describe IntegratedRuntime do
   ensure
     $stdout = original_stdout
     $stderr = original_stderr
-  end
-end
-
-RSpec.describe "IntegratedRuntime" do
-  it "refuse_if_running! refuses while the groups file lists a live group and allows a start once it is gone" do
-    Dir.mktmpdir("integrated-runtime-root") do |root|
-      groups_dir = File.join(root, "tmp", "timekeeping-demo")
-      FileUtils.mkdir_p(groups_dir)
-      groups_path = File.join(groups_dir, "process_groups")
-      pid = Process.spawn("sleep", "60", pgroup: true)
-      begin
-        File.write(groups_path, "#{pid}\n")
-
-        # "Refuse to start while the groups file lists a live group."
-        expect { IntegratedRuntime.refuse_if_running!(root:) }.to raise_error(IntegratedRuntime::BootError)
-        # The refusal leaves the record in place, so a later teardown still finds the live group.
-        expect(File.read(groups_path)).to eq("#{pid}\n")
-      ensure
-        begin
-          Process.kill("KILL", -pid)
-        rescue Errno::ESRCH
-          nil
-        end
-        Process.wait(pid)
-      end
-
-      expect(IntegratedRuntime.refuse_if_running!(root:)).to be_nil
-    end
-  end
-end
-
-RSpec.describe "IntegratedRuntime" do
-  it "parse_groups reads back only whole recorded group ids from a torn groups file" do
-    # A launcher killed mid-write can leave a blank or partial last line; 0 and 1
-    # would signal the caller's own group or every process the user owns.
-    text = "4242\n\n0\n1\nabc\n4343\n12x\n"
-
-    expect(IntegratedRuntime.parse_groups(text)).to eq([4242, 4343])
   end
 end
 
@@ -236,124 +231,6 @@ RSpec.describe "IntegratedRuntime" do
     expect(steps.first).to eq(:prepare_timekeeping)
     expect(steps.last).to eq([:reset, "timekeeping", true])
     expect(steps).not_to include(:other_spawn)
-  end
-end
-
-RSpec.describe IntegratedRuntime do
-  it "parse_groups keeps only recorded group ids above 1 and skips blank, non-numeric, 0 and 1 lines" do
-    # Signalling -0 would hit the test process's own group and -1 every process the user owns.
-    text = "4242\n\nabc\n0\n1\n-5\n9001\n12x\n"
-
-    expect(described_class.parse_groups(text)).to eq([4242, 9001])
-    expect(described_class.parse_groups("")).to eq([])
-  end
-end
-
-RSpec.describe IntegratedRuntime do
-  it "refuse_if_running! raises while the groups file lists a live group and passes once it is gone" do
-    Dir.mktmpdir("integrated-runtime-root") do |root|
-      groups_path = File.join(root, "tmp", "timekeeping-demo", "process_groups")
-      FileUtils.mkdir_p(File.dirname(groups_path))
-      pid = Process.spawn("sleep", "60", pgroup: true)
-      begin
-        File.write(groups_path, "#{pid}\n")
-
-        # "Refuse to start while the groups file lists a live group."
-        expect { described_class.refuse_if_running!(root:) }.to raise_error(IntegratedRuntime::BootError)
-      ensure
-        begin
-          Process.kill("KILL", -pid)
-        rescue Errno::ESRCH
-          nil
-        end
-        Process.wait(pid)
-      end
-
-      expect(described_class.refuse_if_running!(root:)).to be_nil
-    end
-  end
-end
-
-RSpec.describe IntegratedRuntime do
-  it "launch passes the harness credentials only in the spawn env hash, over stale ones, and never in argv or ENV" do
-    harness = TimekeepingDemo::Credentials.generate
-    stale = TimekeepingDemo::Credentials.generate
-    env = {
-      "PATH" => ENV.fetch("PATH"),
-      "TIMEKEEPING_TOKEN_PRIVATE_KEY" => stale.private_key_pem,
-      "TIMEKEEPING_TOKEN_PUBLIC_KEY" => stale.public_key_pem,
-      "TIMEKEEPING_SERVICE_TOKEN" => stale.service_token
-    }
-    env_before = ENV.to_h
-
-    spawn_env, argv, options = described_class.launch(root: Rails.root.to_s, env:, credentials: harness,
-                                                      ports: { monolith: 3301, timekeeping: 3401 })
-
-    # "The harness passes credentials only in the `Process.spawn` env hash, never in the test process ENV or argv."
-    expect(spawn_env["TIMEKEEPING_TOKEN_PRIVATE_KEY"] == harness.private_key_pem).to be(true)
-    expect(spawn_env["TIMEKEEPING_TOKEN_PUBLIC_KEY"] == harness.public_key_pem).to be(true)
-    expect(spawn_env["TIMEKEEPING_SERVICE_TOKEN"] == harness.service_token).to be(true)
-    secrets = [harness.private_key_pem, harness.public_key_pem, harness.service_token]
-    expect(argv.any? { |arg| secrets.any? { |secret| arg.include?(secret) } }).to be(false)
-    expect(argv.last).to eq("up")
-    expect(argv.any? { |arg| arg.end_with?("bin/timekeeping-demo") }).to be(true)
-    expect(ENV.to_h == env_before).to be(true)
-    # "It starts `bin/timekeeping-demo up` in its own process group"
-    expect(options[:pgroup]).to be(true)
-  end
-end
-
-RSpec.describe IntegratedRuntime do
-  it "parse_groups never yields 0, 1 or a torn line, so teardown cannot signal its own group or every process" do
-    # A launcher killed mid-write can leave a blank or partial last line; "".to_i is 0,
-    # and Process.kill(sig, -0) would hit the rspec process group, -1 every user process.
-    text = "4242\n\n0\n1\n-7\nabc\n12x\n 99\n31337\n5"
-
-    # The final "5" has no newline, so it may be a partial write and is skipped.
-    expect(described_class.parse_groups(text)).to eq([4242, 31_337])
-  end
-end
-
-RSpec.describe IntegratedRuntime do
-  it "refuse_if_running! raises while the groups file lists a live group left by an earlier run" do
-    Dir.mktmpdir do |root|
-      groups_dir = File.join(root, "tmp", "timekeeping-demo")
-      FileUtils.mkdir_p(groups_dir)
-      groups_file = File.join(groups_dir, "process_groups")
-      survivor = Process.spawn("sleep", "60", pgroup: true)
-      begin
-        File.write(groups_file, "#{survivor}\n")
-
-        # "Refuse to start while the groups file lists a live group."
-        expect { described_class.refuse_if_running!(root:) }.to raise_error(IntegratedRuntime::BootError)
-        expect(File.read(groups_file)).to eq("#{survivor}\n")
-      ensure
-        Process.kill("KILL", -survivor)
-        Process.wait(survivor)
-      end
-
-      expect(described_class.refuse_if_running!(root:)).to be_nil
-    end
-  end
-end
-
-RSpec.describe IntegratedRuntime do
-  it "launch overrides stale credentials in the caller env and keeps every value out of argv and ENV" do
-    stale = TimekeepingDemo::Credentials.generate.to_env
-    harness = TimekeepingDemo::Credentials.generate
-    env_before = ENV.to_h
-
-    spawn_env, argv, options = described_class.launch(
-      root: Rails.root.to_s, env: ENV.to_h.merge(stale), credentials: harness,
-      ports: { monolith: 40_001, timekeeping: 40_002 }
-    )
-
-    # "The harness passes credentials only in the `Process.spawn` env hash, never in the test process ENV or argv."
-    expect(harness.to_env.all? { |key, value| spawn_env[key] == value }).to be(true)
-    expect(stale.values.any? { |value| spawn_env.value?(value) }).to be(false)
-    expect(harness.to_env.values.any? { |value| argv.any? { |arg| arg.to_s.include?(value) } }).to be(false)
-    expect(options[:pgroup]).to be(true)
-    expect(ENV.to_h == env_before).to be(true)
   end
 end
 
@@ -601,5 +478,39 @@ RSpec.describe IntegratedRuntime do
       .to raise_error(TestDatabaseGuard::NotATestDatabase, /timekeeping_development/)
     expect(Process).not_to have_received(:spawn)
     expect(TimekeepingDatabaseReset).not_to have_received(:reset!)
+  end
+end
+
+RSpec.describe IntegratedRuntime, ".require_test_database_url!" do
+  # The collector probe writes rows that break the queue rule on purpose, so it must never reach a
+  # database that is not a test database. Active Record reads the URL's path; libpq, which PG.connect
+  # uses to insert and delete the probe's rows, reads its dbname parameter.
+  it "is public" do
+    expect(described_class.public_methods).to include(:require_test_database_url!)
+  end
+
+  it "returns nil for a URL that names a _test database under both readings" do
+    url = "postgresql://collector_guard_user@127.0.0.1/timekeeping_collector_guard_test"
+
+    expect(described_class.require_test_database_url!(url)).to be_nil
+  end
+
+  it "refuses a URL whose path names a non-test database" do
+    expect { described_class.require_test_database_url!("postgres://localhost:5432/timekeeping_collector_rows_demo") }
+      .to raise_error(TestDatabaseGuard::NotATestDatabase)
+  end
+
+  it "refuses a URL whose path names a non-test database behind a _test dbname parameter" do
+    url = "postgresql://collector_guard_user@127.0.0.1/timekeeping_development?dbname=timekeeping_collector_guard_test"
+
+    expect { described_class.require_test_database_url!(url) }
+      .to raise_error(TestDatabaseGuard::NotATestDatabase, /timekeeping_development/)
+  end
+
+  it "refuses a URL whose dbname parameter names a non-test database behind a _test path" do
+    url = "postgresql://collector_guard_user@127.0.0.1/timekeeping_collector_guard_test?dbname=timekeeping_production"
+
+    expect { described_class.require_test_database_url!(url) }
+      .to raise_error(TestDatabaseGuard::NotATestDatabase, /timekeeping_production/)
   end
 end

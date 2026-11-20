@@ -44,7 +44,7 @@ This applies to runners that have nothing to do with the ledger, such as the own
 
 A runner without its own path still passes its own test. The damage happens elsewhere: the parent's recorded violation disappears, and the final verdict passes a run that should fail.
 
-The same gap remains under `bin/parallel_test`. The processes share `tmp/`, and the pull request defers that case as follow-up work.
+Under `bin/parallel_test` the processes share `tmp/`. That case is now handled by the default path, not by this convention. With no override, `ledger_path` adds the process's `TEST_ENV_NUMBER` to the default file name, so process N writes `queue_ledger.N.json`. The first process, whose number is empty, keeps `queue_ledger.json`. An explicit `PATH_KEY` is still used exactly as written, so a subprocess's private file is never renamed. `bin/parallel_test` refuses to start when `TIMEKEEPING_QUEUE_LEDGER_PATH` is set, because every process would inherit and share that one file. It also hands its workers the key set to an empty string, so a value in `.env` cannot fill it in.
 
 ## Evidence
 
