@@ -3,7 +3,11 @@
 # A drain integration for Timekeeping::Handoff::Runner specs that stands in
 # for the outbox relay: drain! copies every entry the outgoing owner's store
 # holds into the monolith's timesheet_entries projection, as delivering the
-# outbox through P would. The runner's reconcile step compares that
+# outbox through P would. The outbox publishes locked as the entry's
+# reservations say, not the stored entries.locked column, which neither
+# Timekeeping nor the monolith's prepared store keeps current, so each entry
+# is written with locked from ReservationLocks.build, the same rule the
+# runner applies to a non-legacy load. The runner's reconcile step compares that
 # projection with the checkpoint, so a fake drain that wrote nothing would
 # leave every change made under the outgoing owner as an unexplained
 # difference.
@@ -22,7 +26,8 @@ class TimekeepingHandoffFakeRelay
   def drain!(through:)
     @log&.push([:drain, through])
     checkpoint = @store.export_checkpoint
-    checkpoint&.rows&.fetch("entries")&.each { |row| write_projection_row(row) }
+    published = checkpoint && Timekeeping::Handoff::ReservationLocks.build(checkpoint)
+    published&.rows&.fetch("entries")&.each { |row| write_projection_row(row) }
     @drained_through = through
   end
 

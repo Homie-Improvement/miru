@@ -982,3 +982,85 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     end
   end
 end
+
+RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
+  # [state, operation_id] of each invoice_operations row of the invoice; the
+  # monolith has no model for the table, so it is read by SQL.
+  def recutover_invoice_operations(company_id, invoice_id)
+    sql = ActiveRecord::Base.sanitize_sql_array(
+      ["SELECT state, operation_id FROM invoice_operations WHERE company_id = ? AND invoice_id = ?", company_id, invoice_id]
+    )
+    ActiveRecord::Base.connection.select_all(sql).cast_values
+  end
+
+  def recutover_reservations(company_id, entry_id)
+    sql = ActiveRecord::Base.sanitize_sql_array(
+      ["SELECT state, disposition, operation_id FROM reservations WHERE company_id = ? AND entry_id = ?", company_id, entry_id]
+    )
+    ActiveRecord::Base.connection.select_all(sql).cast_values
+  end
+
+  def recutover_loaded_operation_ids(timekeeping, table, company_id)
+    timekeeping.rows.fetch(table).filter_map { |row| row["operation_id"].to_s if row["company_id"] == company_id }
+  end
+
+  # "the monolith commits a new invoice intent through the prepared adapter
+  # between rollback and re-cutover, and the re-cutover then reaches its checkpoint"
+  # The save locks the entry only through its reservation and outbox snapshot:
+  # the prepared store never updates the stored entries.locked column.
+  it "an invoice saved through the prepared adapter after rollback reaches the re-cutover checkpoint with its operation and reservation once" do
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+    owners = TimekeepingHandoffFakes.owners(timekeeping:)
+    report_root = Pathname(Dir.mktmpdir("handoff-report"))
+
+    described_class.run(direction: :cutover, owners:, report_root:)
+    described_class.run(direction: :rollback, owners:, report_root:)
+    expect(TimekeepingOwnership.current)
+      .to have_attributes(owner: "monolith", generation: 3, handoff_step: nil, monolith_store: "prepared")
+
+    # The seed reserves every unbilled entry on one of its invoices, so the
+    # only entries free to reserve are non-billable ones.
+    reserved_ids = ActiveRecord::Base.connection.select_values("SELECT entry_id FROM reservations")
+    local_entry = Timekeeping::LocalEntry.where(bill_status: "non_billable", id: TimesheetEntry.kept.select(:id))
+      .where.not(id: reserved_ids).order(:id).first
+    expect(local_entry).not_to be_nil
+    company_id = local_entry.company_id
+    other_company_id = Company.where.not(id: company_id).pick(:id)
+    other_before = %w[invoice_operations reservations].index_with do |table|
+      recutover_loaded_operation_ids(timekeeping, table, other_company_id)
+    end
+    raised_version = local_entry.version + 1
+    timesheet_entry = TimesheetEntry.unscoped.find(local_entry.id)
+    invoice = create(:invoice, company_id:, client: Client.where(company_id:).first)
+    outbox_before = Timekeeping::LocalOutboxEntry.where(company_id:, entry_id: local_entry.id).count
+
+    create(:invoice_line_item, invoice:, timesheet_entry:, rate: 100, quantity: 60)
+
+    expect(InvoiceOperationIntent.where(company_id:, invoice_id: invoice.id).pluck(:state)).to eq(["committed"])
+    operations = recutover_invoice_operations(company_id, invoice.id)
+    expect(operations.map(&:first)).to eq(["committed"])
+    operation_id = operations.first.last
+    expect(recutover_reservations(company_id, local_entry.id)).to eq([["committed", "active", operation_id]])
+    snapshots = Timekeeping::LocalOutboxEntry.where(company_id:, entry_id: local_entry.id).order(:outbox_position)
+    expect(snapshots.count).to eq(outbox_before + 1)
+    expect(snapshots.last.payload).to include("locked" => true, "version" => raised_version)
+    expect(local_entry.reload.locked).to be(false)
+
+    described_class.run(direction: :re_cutover, owners:, report_root:)
+
+    expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 4, handoff_step: nil)
+    reconciliation = JSON.parse(File.read(report_root.join("generation-4", "reconciliation.json")))
+    expect(reconciliation.fetch("abort")).to be(false)
+    expect(recutover_loaded_operation_ids(timekeeping, "invoice_operations", company_id).count(operation_id)).to eq(1)
+    expect(recutover_loaded_operation_ids(timekeeping, "reservations", company_id).count(operation_id)).to eq(1)
+    loaded_operation = timekeeping.rows.fetch("invoice_operations").find { |row| row["operation_id"].to_s == operation_id }
+    expect(loaded_operation).to include("company_id" => company_id, "state" => "committed")
+    expect(TimesheetEntry.unscoped.find(local_entry.id)).to have_attributes(locked: true, version: raised_version)
+    other_after = %w[invoice_operations reservations].index_with do |table|
+      recutover_loaded_operation_ids(timekeeping, table, other_company_id)
+    end
+    expect(other_after).to eq(other_before)
+  ensure
+    FileUtils.rm_rf(report_root) if report_root
+  end
+end
