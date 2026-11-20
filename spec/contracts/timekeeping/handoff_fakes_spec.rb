@@ -116,6 +116,197 @@ RSpec.describe TimekeepingHandoffFakes::InMemoryTimekeepingStore do
     expect(store.advance_entry_id_sequence(above: 4)).to eq(11)
     expect(store.highest_outbox_position).to eq(0)
   end
+
+  context "more tests 14" do
+    it "a batch the projection consumer refuses with 422 stays unsent, so a second drain raises again and drained? stays false" do
+      store = described_class.new
+      store.admit(generation: 2)
+      # A snapshot missing most contract fields, so the consumer answers 422 invalid_snapshot.
+      store.write_correction_snapshots(snapshots: [{ "id" => 5, "note" => "incomplete" }], version: 1, generation: 2)
+      through = store.highest_outbox_position
+      expect(through).to be_positive
+      relay = TimekeepingHandoffOutboxRelay.new(store:)
+
+      expect { relay.drain!(through:) }.to raise_error(TimekeepingHandoffOutboxRelay::Undelivered, /422/)
+      expect(relay.drained?(through:)).to be(false)
+
+      # The refused row was never marked sent, so retrying sends it again and is refused again.
+      expect { relay.drain!(through:) }.to raise_error(TimekeepingHandoffOutboxRelay::Undelivered, /422/)
+      expect(relay.drained?(through:)).to be(false)
+    end
+  end
+
+  context "more tests 15" do
+    it "outbox relay store: a rewritten correction replaces its entry's row at that generation, keeps other entries and generations, and raises the highest position" do
+      entry_row = ->(id) { handoff_fakes_entry_row(id:, version: 1) }
+      store = described_class.new
+      store.load_checkpoint(handoff_fakes_checkpoint(entry_row.call(5), entry_row.call(6)))
+
+      expect(store.outbox).to eq([])
+      expect(store.highest_outbox_position).to eq(0)
+
+      store.write_correction_snapshots(snapshots: [entry_row.call(5).except("version")], version: 2, generation: 2)
+      store.write_correction_snapshots(snapshots: [entry_row.call(6).except("version")], version: 2, generation: 2)
+      first_position_of_five = store.outbox.find { |row| row.dig("entry", "id") == 5 }.fetch("outbox_position")
+      store.write_correction_snapshots(snapshots: [entry_row.call(5).except("version").merge("note" => "again")], version: 2, generation: 2)
+      store.write_correction_snapshots(snapshots: [entry_row.call(5).except("version")], version: 3, generation: 3)
+
+      outbox = store.outbox
+      positions = outbox.map { |row| row.fetch("outbox_position") }
+      expect(positions).to eq(positions.sort)
+      expect(positions.uniq.size).to eq(positions.size)
+      expect(positions).to all(be_a(Integer).and(be_positive))
+      expect(outbox.map { |row| [row.dig("entry", "id"), row.fetch("generation")] })
+        .to contain_exactly([6, 2], [5, 2], [5, 3])
+
+      rewritten = outbox.find { |row| row.dig("entry", "id") == 5 && row.fetch("generation") == 2 }
+      expect(rewritten.dig("entry", "note")).to eq("again")
+      expect(rewritten.fetch("outbox_position")).to be > first_position_of_five
+      expect(rewritten.fetch("entry").keys).to match_array(Timekeeping::Handoff::Checkpoint::TABLES.fetch("entries"))
+      expect(rewritten.dig("entry", "version")).to eq(2)
+      expect(store.highest_outbox_position).to eq(positions.max)
+    end
+  end
+
+  context "more tests 16" do
+    it "outbox relay store: an entry edit is written to the outbox at the last admitted generation, and refused before any admission" do
+      store = described_class.new
+      store.load_checkpoint(handoff_fakes_checkpoint(handoff_fakes_entry_row(id: 7, version: 1)))
+
+      expect { store.edit_entry!(7) }.to raise_error(ArgumentError)
+      expect(store.outbox).to eq([])
+      expect(store.highest_outbox_position).to eq(0)
+
+      store.admit(generation: 2)
+      store.admit(generation: 3)
+      store.edit_entry!(7)
+
+      expect(store.outbox.size).to eq(1)
+      edited = store.outbox.first
+      expect(edited.fetch("generation")).to eq(3)
+      expect(edited.dig("entry", "id")).to eq(7)
+      expect(edited.dig("entry", "version")).to eq(store.rows.fetch("entries").first.fetch("version"))
+      expect(edited.dig("entry", "version")).to eq(2)
+      expect(edited.dig("entry", "note")).to eq("edited in Timekeeping")
+      expect(store.highest_outbox_position).to eq(edited.fetch("outbox_position"))
+    end
+  end
+
+  context "more tests 17" do
+    it "owners with relay :timekeeping_outbox gives Timekeeping the outbox relay and keeps the monolith's copy relay" do
+      timekeeping = described_class.new
+      owners = TimekeepingHandoffFakes.owners(timekeeping:, relay: :timekeeping_outbox)
+
+      expect(owners.fetch(:timekeeping).drain).to be_a(TimekeepingHandoffOutboxRelay)
+      expect(owners.fetch(:timekeeping).drain).not_to be_a(TimekeepingHandoffFakeRelay)
+      expect(owners.fetch(:monolith).drain).to be_a(TimekeepingHandoffFakeRelay)
+      expect(owners.fetch(:monolith).drain).not_to be_a(TimekeepingHandoffOutboxRelay)
+      expect(owners.fetch(:timekeeping).store).to equal(timekeeping)
+      expect(owners.fetch(:timekeeping).admission).to equal(timekeeping)
+
+      # The default stays the copy relay for both owners.
+      TimekeepingHandoffFakes.owners(timekeeping:).each_value do |owner|
+        expect(owner.drain).to be_a(TimekeepingHandoffFakeRelay)
+      end
+    end
+  end
+
+  context "more tests 21" do
+    # "a snapshot left out of the outbox leaves the projection behind and fails the spec"
+    # A refused batch must not pass for a drained outbox, or a shape bug in the
+    # fake would read as a projection left behind (or as no failure at all).
+    it "the outbox relay holds back an unadmitted generation and fails loudly on a refused batch once it is admitted" do
+      store = described_class.new
+      invalid = handoff_fakes_entry_row(id: 9, version: 1).except("version").merge("bill_status" => "no_such_status")
+      store.write_correction_snapshots(snapshots: [invalid], version: 1, generation: 2)
+      log = []
+      relay = TimekeepingHandoffOutboxRelay.new(store:, log:)
+      through = store.highest_outbox_position
+      expect(through).to be_positive
+      allow(Timekeeping::ProjectionConsumer).to receive(:call).and_call_original
+
+      # Generation 2 was never admitted, so nothing is sent before the flip.
+      expect { relay.drain!(through:) }.not_to raise_error
+      expect(Timekeeping::ProjectionConsumer).not_to have_received(:call)
+      expect(relay.drained?(through:)).to be(true)
+
+      # A position above the drain's bound is not this drain's to deliver.
+      store.admit(generation: 2)
+      expect { relay.drain!(through: 0) }.not_to raise_error
+      expect(relay.drained?(through: 0)).to be(true)
+
+      expect { relay.drain!(through:) }.to raise_error(TimekeepingHandoffOutboxRelay::Undelivered, /422/)
+      expect(log).to eq([[:drain, through], [:drain, 0], [:drain, through]])
+      expect(relay.drained?(through:)).to be(false)
+      expect(TimesheetEntry.unscoped.where(id: 9)).not_to exist
+      # The refused row stays unsent, so a second drain refuses again rather than passing.
+      expect { relay.drain!(through:) }.to raise_error(TimekeepingHandoffOutboxRelay::Undelivered, /422/)
+    end
+  end
+
+  context "more tests 22" do
+    # "Fake-path runner specs can use a test relay that delivers only Timekeeping's outbox snapshots through `Timekeeping::ProjectionConsumer`, so a snapshot left out of the outbox leaves the projection behind and fails the spec."
+    # The scenario: the store holds a newer version of an entry with no outbox row.
+    # A relay that copied stored rows, as the old fake drain does, would move the projection.
+    it "the outbox relay leaves the projection untouched for an entry the store holds at a newer version but never wrote to its outbox" do
+      entry = create(:timesheet_entry)
+      projected = TimesheetEntry.unscoped.find(entry.id)
+      row = handoff_fakes_entry_row(id: projected.id, version: projected.version.to_i + 5).merge(
+        "company_id" => projected.company_id, "project_id" => projected.project_id, "user_id" => projected.user_id,
+        "note" => "held only in the store"
+      )
+      store = described_class.new
+      store.load_checkpoint(handoff_fakes_checkpoint(row))
+      store.admit(generation: TimekeepingOwnership.current.generation)
+      expect(store.outbox).to eq([])
+
+      relay = TimekeepingHandoffOutboxRelay.new(store:)
+      relay.drain!(through: store.highest_outbox_position)
+
+      expect(relay.drained?(through: store.highest_outbox_position)).to be(true)
+      after = TimesheetEntry.unscoped.find(entry.id)
+      expect(after.version).to eq(projected.version)
+      expect(after.note).to eq(projected.note)
+    end
+  end
+
+  # The relay sends a stored lock as it is, as the real outbox does, so a
+  # snapshot whose lock is not a boolean is refused here as it would be live.
+  # Every other field is valid for an existing entry, so only the lock can
+  # make the consumer refuse.
+  it "the outbox relay sends a nil lock unchanged, so the consumer refuses it with 422 and the projection stays put" do
+    entry = create(:timesheet_entry)
+    projected = TimesheetEntry.unscoped.find(entry.id)
+    snapshot = handoff_fakes_entry_row(id: projected.id, version: 1).except("version").merge(
+      "company_id" => projected.company_id, "project_id" => projected.project_id, "user_id" => projected.user_id,
+      "locked" => nil
+    )
+    store = described_class.new
+    store.write_correction_snapshots(snapshots: [snapshot], version: projected.version.to_i + 1,
+                                     generation: TimekeepingOwnership.current.generation)
+    store.admit(generation: TimekeepingOwnership.current.generation)
+    relay = TimekeepingHandoffOutboxRelay.new(store:)
+    through = store.highest_outbox_position
+
+    expect { relay.drain!(through:) }.to raise_error(TimekeepingHandoffOutboxRelay::Undelivered, /422/)
+    expect(relay.drained?(through:)).to be(false)
+    expect(TimesheetEntry.unscoped.find(entry.id).version).to eq(projected.version)
+  end
+
+  # A well-formed snapshot at a generation the ownership row does not accept
+  # must fail the drain with the consumer's 409, not pass as drained.
+  it "the outbox relay raises Undelivered naming 409 for a generation the ownership row refuses and stays undrained" do
+    refused_generation = TimekeepingOwnership.current.generation + 5
+    store = described_class.new
+    store.write_correction_snapshots(snapshots: [handoff_fakes_entry_row(id: 5, version: 1).except("version")],
+                                     version: 1, generation: refused_generation)
+    store.admit(generation: refused_generation)
+    relay = TimekeepingHandoffOutboxRelay.new(store:)
+    through = store.highest_outbox_position
+
+    expect { relay.drain!(through:) }.to raise_error(TimekeepingHandoffOutboxRelay::Undelivered, /409/)
+    expect(relay.drained?(through:)).to be(false)
+  end
 end
 
 RSpec.describe TimekeepingHandoffFakes::RecordingAdmission do
@@ -201,5 +392,16 @@ RSpec.describe TimekeepingHandoffFakes, ".owners" do
 
     unadmitted = described_class.owners(timekeeping: placeholder, monolith_admission: nil, relay: false)
     expect(unadmitted.fetch(:monolith).admission).to be_nil
+  end
+
+  # The outbox relay reads admitted generations from the store, so a separate
+  # admission would leave it holding back every row.
+  it "refuses relay :timekeeping_outbox with a Timekeeping admission other than the store" do
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+
+    expect do
+      described_class.owners(timekeeping:, timekeeping_admission: TimekeepingHandoffFakes::RecordingAdmission.new,
+                             relay: :timekeeping_outbox)
+    end.to raise_error(ArgumentError, /timekeeping_outbox/)
   end
 end
