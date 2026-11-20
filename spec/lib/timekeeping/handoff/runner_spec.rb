@@ -147,13 +147,13 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     # Timekeeping's correction writer takes each corrected entry row, and each entry row the load raised,
     # without its version, and stores it with the correction version and the handoff's generation.
     # correction_writes holds the snapshots exactly as the runner sent them.
-    uninterrupted_load = Timekeeping::Handoff::LegacyLoadVersions.build(
-      source: uninterrupted[:checkpoint], corrections: uninterrupted[:corrections], stored: nil
-    )
+    # A raised entry is a legacy row below version 1 with no correction; its snapshot is that row without
+    # its version and with a true-or-false lock.
+    corrected_ids = uninterrupted[:corrections].map { |c| c.fetch("entry_id") }
+    raised_rows = uninterrupted[:checkpoint].rows.fetch("entries")
+      .select { |row| row["version"] < 1 }.reject { |row| corrected_ids.include?(row["id"]) }
     expected_snapshots = uninterrupted[:corrections].map { |c| c.fetch("snapshot").except("version") } +
-      Timekeeping::Handoff::LegacyLoadVersions.raised_snapshots(
-        source: uninterrupted[:checkpoint], loaded: uninterrupted_load, corrections: uninterrupted[:corrections]
-      )
+      raised_rows.map { |row| row.except("version").merge("locked" => row["locked"] == true) }
     expect(timekeeping_store.correction_writes.sort_by { |c| c["id"] }).to eq(expected_snapshots.sort_by { |c| c["id"] })
     corrections = timekeeping_store.corrections
     expect(corrections.map { |c| c.except("version", "generation") }.sort_by { |c| c["id"] })
