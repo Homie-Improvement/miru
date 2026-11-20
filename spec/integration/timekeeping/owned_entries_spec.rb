@@ -500,6 +500,65 @@ RSpec.describe "arrange_owned_entries drawing ids past an explicit id", committe
   end
 end
 
+RSpec.describe "arrange_owned_entries moving the prepared entries sequence", committed_data: true do
+  it "rollback state: a prepared entry created after arranging gets an id above every arranged id" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    project = create(:project, billable: true, client: create(:client, company:))
+    arranged_ids = arrange_owned_entries([{ company:, user:, project: }, { company:, user:, project: }],
+                                         state: "rollback")
+
+    later = Timekeeping::LocalEntry.create!(
+      TimekeepingContract::LocalOwnerArrange::ENTRY_DEFAULTS.merge("company_id" => company.id, "user_id" => user.id,
+                                                                    "project_id" => project.id)
+    )
+
+    expect(later.id).to be > arranged_ids.max
+  end
+end
+
+RSpec.describe "arrange_owned_entries when only the admit fails", committed_data: true do
+  it "timekeeping state: an admit failure after a successful load propagates" do
+    admit_error = Class.new(StandardError)
+    store = Class.new do
+      attr_reader :calls
+
+      def initialize(admit_error)
+        @calls = []
+        @admit_error = admit_error
+      end
+
+      def fence_admission = @calls << [:fence_admission]
+      def load_checkpoint(checkpoint) = (@calls << [:load_checkpoint]) && checkpoint
+
+      def advance_entry_id_sequence(above:)
+        @calls << [:advance_entry_id_sequence, above]
+        above + 1
+      end
+
+      def admit(generation:)
+        @calls << [:admit, generation]
+        raise @admit_error, "admit refused"
+      end
+    end.new(admit_error)
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    project = create(:project, billable: true, client: create(:client, company:))
+    entry_id = ApplicationRecord.connection.select_value(
+      "SELECT nextval(pg_get_serial_sequence('timesheet_entries', 'id'))"
+    ).to_i
+
+    expect do
+      arrange_owned_entries([{ id: entry_id, company:, user:, project: }], state: "timekeeping",
+                                                                           timekeeping_store: store)
+    end.to raise_error(admit_error, "admit refused")
+    expect(store.calls.last).to eq([:admit, 2])
+    expect(TimesheetEntry.unscoped.where(id: entry_id)).not_to exist
+  end
+end
+
 RSpec.describe "owned_entry for an id the owning store does not hold", committed_data: true do
   it "rollback state: owned_entry raises for an id that only has a timesheet_entries row instead of returning the projection" do
     company = create(:company)

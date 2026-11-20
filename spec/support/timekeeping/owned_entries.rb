@@ -203,6 +203,19 @@ module TimekeepingOwnedEntries
           Timekeeping::LocalEntry.create!(entry)
           insert_fixture_reservation(entry) if entry.fetch("locked")
         end
+        advance_prepared_entry_ids(above: entries.pluck("id").max)
+      end
+
+      # The rows above carry ids from the timesheet_entries sequence, which
+      # leaves the entries sequence behind. The local owner draws new entry ids
+      # from that sequence, so it is moved past the arranged ids, never back.
+      def advance_prepared_entry_ids(above:)
+        connection = ApplicationRecord.connection
+        sequence = connection.select_value("SELECT pg_get_serial_sequence('entries', 'id')")
+        last_value = connection.select_value("SELECT last_value FROM #{sequence}").to_i
+        connection.select_value(
+          ApplicationRecord.sanitize_sql_array(["SELECT setval(?, ?, true)", sequence, [last_value, above].max])
+        )
       end
 
       # EntryLookup.local_entry reads locked from the reservations table, never
@@ -261,10 +274,17 @@ module TimekeepingOwnedEntries
         row.attributes.except("reserved").merge("locked" => row.reserved)
       end
 
+      # Timekeeping, like the prepared store, treats an entry as locked exactly
+      # when a reservation of the same company holds it, so locked is read from
+      # the exported reservations rather than the stored column.
       def read_timekeeping_owned_entry(id)
-        rows = live_owned_entry_store.export_checkpoint.rows.fetch("entries")
-        rows.find { |row| row.fetch("id") == id } ||
-          raise(ActiveRecord::RecordNotFound, "Timekeeping holds no entry #{id}")
+        tables = live_owned_entry_store.export_checkpoint.rows
+        row = tables.fetch("entries").find { |entry| entry.fetch("id") == id } ||
+              raise(ActiveRecord::RecordNotFound, "Timekeeping holds no entry #{id}")
+        reserved = tables.fetch("reservations").any? do |reservation|
+          reservation.fetch("entry_id") == id && reservation.fetch("company_id") == row.fetch("company_id")
+        end
+        row.merge("locked" => reserved)
       end
   end
 end
