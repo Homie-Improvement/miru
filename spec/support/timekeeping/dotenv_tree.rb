@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "active_support/core_ext/enumerable"
 require "fileutils"
 require "open3"
 require "tmpdir"
@@ -84,8 +85,13 @@ module TimekeepingDotenvTree
     git(tree, *GIT_IDENTITY, "commit", "--quiet", "--no-verify", "--message", "Temporary dotenv tree")
   end
 
+  # Inherited GIT_* variables (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE and the
+  # like) override the working directory's repository, so a caller that set
+  # them would have these writes land in its own repository. They are unset
+  # for every git command run here.
   def git(tree, *args)
-    output, status = Open3.capture2e("git", *args, chdir: tree)
+    unset_git_variables = ENV.keys.grep(/\AGIT_/).index_with(nil)
+    output, status = Open3.capture2e(unset_git_variables, "git", *args, chdir: tree)
     raise GitError, "git failed in #{tree}: #{output}" unless status.success?
 
     output
