@@ -6,6 +6,12 @@ require "json"
 require "tmpdir"
 
 RSpec.describe TimekeepingDemo::Regression do
+  # A stub report pass that runs no tagged example still writes the json
+  # report a real rspec run writes, so the command can read it.
+  def write_empty_switches_owner_report(argv)
+    File.write(argv[argv.index("--out") + 1], JSON.generate("examples" => []))
+  end
+
   context "more tests 10" do
     it "a hostile state after a valid one raises ArgumentError before any child is spawned" do
       calls = []
@@ -26,8 +32,8 @@ RSpec.describe TimekeepingDemo::Regression do
     it "gives a repeated regression run fresh ledger paths that share nothing with the first run" do
       recorded = []
       runner = lambda do |env:, argv:|
-        _ = argv
         recorded << env.fetch("TIMEKEEPING_QUEUE_LEDGER_PATH")
+        write_empty_switches_owner_report(argv) if argv.include?("switches_owner")
         true
       end
 
@@ -55,7 +61,10 @@ RSpec.describe TimekeepingDemo::Regression do
         states_called = []
         runner = lambda do |env:, argv:|
           state = env["TIMEKEEPING_OWNER_STATE"]
-          next true if state.nil? && argv.include?("switches_owner")
+          if state == "" && argv.include?("switches_owner")
+            write_empty_switches_owner_report(argv)
+            next true
+          end
 
           states_called << state
           state == "rollback" ? last_result : true
@@ -78,7 +87,7 @@ RSpec.describe TimekeepingDemo::Regression do
   end
 
   context "more tests 16" do
-    it "the switches_owner report prints none when its pass writes no examples or no file at all" do
+    it "the switches_owner report prints none for a written empty report and unreadable when its pass writes no file" do
       empty_report = lambda do |env:, argv:|
         next true unless argv.include?("switches_owner")
 
@@ -93,7 +102,7 @@ RSpec.describe TimekeepingDemo::Regression do
 
       spawn_failed = ->(env:, argv:) { argv.include?("switches_owner") ? nil : true }
       expect { status = described_class.run(runner: spawn_failed, specs: ["spec/models/invoice_spec.rb"]) }
-        .to output(/^none$/).to_stdout
+        .to output(/^unreadable report: /).to_stdout
       expect(status).to eq(1)
     end
   end
@@ -143,7 +152,10 @@ RSpec.describe TimekeepingDemo::Regression do
     it "keeps running the later states after the middle state fails and returns EX_FAILURE" do
       states_run = []
       runner = lambda do |env:, argv:|
-        next true if argv.include?("switches_owner")
+        if argv.include?("switches_owner")
+          write_empty_switches_owner_report(argv)
+          next true
+        end
 
         states_run << env.fetch("TIMEKEEPING_OWNER_STATE")
         env.fetch("TIMEKEEPING_OWNER_STATE") != "timekeeping"
@@ -165,7 +177,10 @@ RSpec.describe TimekeepingDemo::Regression do
     it "counts a nil or truthy non-true runner result as a failed state" do
       [nil, 0, "true"].each do |bad_result|
         runner = lambda do |env:, argv:|
-          next true if argv.include?("switches_owner")
+          if argv.include?("switches_owner")
+            write_empty_switches_owner_report(argv)
+            next true
+          end
 
           env.fetch("TIMEKEEPING_OWNER_STATE") == "legacy" ? bad_result : true
         end
@@ -329,8 +344,128 @@ RSpec.describe TimekeepingDemo::Regression do
       expect(argv[argv.index("--tag") + 1]).to eq("switches_owner")
       expect(argv[argv.index("--format") + 1]).to eq("json")
       expect(argv).not_to include("--fail-if-no-examples")
-      expect(report_calls.first[:env]).to include("TIMEKEEPING_OWNER_STATE" => nil)
+      # A key that is set, even to "", is one dotenv never fills, so the report
+      # child must receive the key rather than have it removed.
+      expect(report_calls.first[:env]).to have_key("TIMEKEEPING_OWNER_STATE")
+      expect(report_calls.first[:env]).to include("TIMEKEEPING_OWNER_STATE" => "")
       expect(status).to eq(1)
+    end
+  end
+end
+
+RSpec.describe TimekeepingDemo::Regression, "with a switches_owner report the command cannot read" do
+  # The switches_owner pass passes only when its runner returns true and its
+  # json report can be read; these examples pin each way the report can be
+  # unreadable.
+
+  # Runs the command with every state passing. The switches_owner pass hands
+  # its --out path to the block, if one is given, then answers report_result.
+  def run_regression_with_switches_owner_report(report_result: true)
+    runner = lambda do |env:, argv:|
+      _ = env
+      next true unless argv.include?("switches_owner")
+
+      yield argv[argv.index("--out") + 1] if block_given?
+      report_result
+    end
+    original = $stdout
+    $stdout = StringIO.new
+    status = described_class.run(runner:, specs: ["spec/models/invoice_spec.rb"])
+    [status, $stdout.string]
+  ensure
+    $stdout = original
+  end
+
+  it "fails the command and says the report is unreadable when the runner returns true but writes no report" do
+    status, printed = run_regression_with_switches_owner_report
+
+    expect(printed).to match(/^unreadable report: /)
+    expect(status).to eq(described_class::EX_FAILURE)
+  end
+
+  it "fails the command when the runner returns true but its report is not complete JSON shaped as rspec writes it" do
+    ["not json", "", '{"examples":[{"id":', '{"examples": [', '{"examples":[{"id":"./spec/models/invoice_spec.rb[1:1]"',
+     '{"examples":"x"}', "{}", "[]"].each do |contents|
+      status, printed = run_regression_with_switches_owner_report { |out| File.write(out, contents) }
+
+      expect(printed).to match(/^unreadable report: /), "report #{contents.inspect} printed no unreadable line"
+      expect(status).to eq(described_class::EX_FAILURE), "report #{contents.inspect} was counted as a pass"
+    end
+  end
+
+  it "fails the command without raising when the report path cannot be read as a file" do
+    status = printed = nil
+    expect do
+      status, printed = run_regression_with_switches_owner_report { |out| Dir.mkdir(out) }
+    end.not_to raise_error
+
+    expect(printed).to match(/^unreadable report: /)
+    expect(status).to eq(described_class::EX_FAILURE)
+  end
+
+  it "never lets a report written by an earlier run pass a later run whose pass writes none" do
+    first_status, first_printed = run_regression_with_switches_owner_report do |out|
+      File.write(out, JSON.generate("examples" => []))
+    end
+    second_status, second_printed = run_regression_with_switches_owner_report
+
+    expect(first_printed).to match(/^none$/)
+    expect(second_printed).to match(/^unreadable report: /)
+    expect([first_status, second_status]).to eq([described_class::EX_OK, described_class::EX_FAILURE])
+  end
+
+  it "passes with a readable report listing one id and prints no unreadable line" do
+    tagged_id = "./spec/models/invoice_spec.rb[1:9]"
+    status, printed = run_regression_with_switches_owner_report do |out|
+      File.write(out, JSON.generate("examples" => [{ "id" => tagged_id, "status" => "passed" }]))
+    end
+
+    expect(status).to eq(described_class::EX_OK)
+    expect(printed.scan(tagged_id).size).to eq(1)
+    expect(printed).not_to include("unreadable report")
+  end
+
+  it "lists a readable report's ids exactly once and still fails when the runner returns false or nil" do
+    tagged_id = "./spec/models/invoice_spec.rb[1:9]"
+
+    [false, nil].each do |report_result|
+      status, printed = run_regression_with_switches_owner_report(report_result:) do |out|
+        File.write(out, JSON.generate("examples" => [{ "id" => tagged_id, "status" => "failed" }]))
+      end
+
+      expect(printed.scan(tagged_id).size).to eq(1)
+      expect(printed).not_to include("unreadable report")
+      expect(printed).not_to match(/^none$/)
+      expect(status).to eq(described_class::EX_FAILURE),
+                        "a readable report passed a switches_owner run whose runner returned #{report_result.inspect}"
+    end
+  end
+
+  it "read_report answers Report for a readable report and UnreadableReport with a reason otherwise" do
+    Dir.mktmpdir("read-report") do |dir|
+      readable = File.join(dir, "readable.json")
+      File.write(readable, JSON.generate("examples" => [{ "id" => "./spec/models/invoice_spec.rb[1:4]" }]))
+      empty = File.join(dir, "empty.json")
+      File.write(empty, JSON.generate("examples" => []))
+
+      expect(described_class.read_report(readable))
+        .to eq(described_class::Report.new(ids: ["./spec/models/invoice_spec.rb[1:4]"]))
+      expect(described_class.read_report(empty)).to eq(described_class::Report.new(ids: []))
+
+      unreadable = { "not_json.json" => "not json", "blank.json" => "", "open_brace.json" => "{",
+                     "truncated.json" => '{"examples":[', "string_examples.json" => '{"examples":"x"}',
+                     "null_examples.json" => '{"examples":null}', "array.json" => "[]" }.map do |name, contents|
+        File.join(dir, name).tap { |path| File.write(path, contents) }
+      end
+      directory = File.join(dir, "a_directory.json")
+      Dir.mkdir(directory)
+
+      [File.join(dir, "missing.json"), *unreadable, directory, dir].each do |path|
+        result = nil
+        expect { result = described_class.read_report(path) }.not_to raise_error
+        expect(result).to be_a(described_class::UnreadableReport), "#{File.basename(path)} was read as a report"
+        expect(result.reason).to be_a(String).and(satisfy { |reason| !reason.empty? })
+      end
     end
   end
 end

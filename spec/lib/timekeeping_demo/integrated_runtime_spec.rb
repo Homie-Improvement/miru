@@ -481,36 +481,28 @@ RSpec.describe IntegratedRuntime do
   end
 end
 
-RSpec.describe IntegratedRuntime, ".require_test_database_url!" do
-  # The collector probe writes rows that break the queue rule on purpose, so it must never reach a
-  # database that is not a test database. Active Record reads the URL's path; libpq, which PG.connect
-  # uses to insert and delete the probe's rows, reads its dbname parameter.
-  it "is public" do
-    expect(described_class.public_methods).to include(:require_test_database_url!)
-  end
+RSpec.describe IntegratedRuntime do
+  include_context "integrated runtime on an accepted monolith test database"
 
-  it "returns nil for a URL that names a _test database under both readings" do
-    url = "postgresql://collector_guard_user@127.0.0.1/timekeeping_collector_guard_test"
+  it "start checks the caller monolith URL and the Timekeeping URL through TestDatabaseGuard.require_test_database_url! before any spawn" do
+    allow(TimekeepingDatabaseReset).to receive(:reset!)
+    allow(Process).to receive(:spawn).and_call_original
+    allow(TestDatabaseGuard).to receive(:require_test_database_url!).and_call_original
+    monolith_url = "postgresql://guard_move_user@127.0.0.1/miru_web_guard_move_test"
+    timekeeping_url =
+      "postgresql://harness_selector_user@127.0.0.1/timekeeping_development?dbname=timekeeping_selector_test"
+    env = {
+      "PATH" => ENV.fetch("PATH", ""),
+      TimekeepingDemo::RuntimePlan::MONOLITH_DATABASE_URL => monolith_url,
+      "TIMEKEEPING_DATABASE_URL" => timekeeping_url
+    }
 
-    expect(described_class.require_test_database_url!(url)).to be_nil
-  end
-
-  it "refuses a URL whose path names a non-test database" do
-    expect { described_class.require_test_database_url!("postgres://localhost:5432/timekeeping_collector_rows_demo") }
-      .to raise_error(TestDatabaseGuard::NotATestDatabase)
-  end
-
-  it "refuses a URL whose path names a non-test database behind a _test dbname parameter" do
-    url = "postgresql://collector_guard_user@127.0.0.1/timekeeping_development?dbname=timekeeping_collector_guard_test"
-
-    expect { described_class.require_test_database_url!(url) }
+    # "IntegratedRuntime no longer defines `require_test_database_url!` or `active_record_database_name` and calls the TestDatabaseGuard method instead"
+    expect { described_class.start(root: Rails.root.to_s, env:) }
       .to raise_error(TestDatabaseGuard::NotATestDatabase, /timekeeping_development/)
-  end
-
-  it "refuses a URL whose dbname parameter names a non-test database behind a _test path" do
-    url = "postgresql://collector_guard_user@127.0.0.1/timekeeping_collector_guard_test?dbname=timekeeping_production"
-
-    expect { described_class.require_test_database_url!(url) }
-      .to raise_error(TestDatabaseGuard::NotATestDatabase, /timekeeping_production/)
+    expect(TestDatabaseGuard).to have_received(:require_test_database_url!).with(monolith_url).once
+    expect(TestDatabaseGuard).to have_received(:require_test_database_url!).with(timekeeping_url).once
+    expect(Process).not_to have_received(:spawn)
+    expect(TimekeepingDatabaseReset).not_to have_received(:reset!)
   end
 end

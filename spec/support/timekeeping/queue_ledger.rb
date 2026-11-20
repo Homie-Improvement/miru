@@ -416,6 +416,9 @@ module TimekeepingQueueLedger
   LEDGER_NAME = "queue_ledger"
   DEFAULT_PATH = "#{LEDGER_DIR}/#{LEDGER_NAME}.json".freeze
   PATH_KEY = "TIMEKEEPING_QUEUE_LEDGER_PATH"
+  # An absolute directory that replaces Rails.root as the base of the default
+  # per-process path, so a spec can exercise that naming in a private directory.
+  ROOT_KEY = "TIMEKEEPING_QUEUE_LEDGER_ROOT"
   # parallel_tests gives its first process an empty number and the others "2", "3" and so on.
   PROCESS_NUMBER_KEY = "TEST_ENV_NUMBER"
   PROCESS_NUMBER = /\A[1-9]\d*\z/
@@ -425,12 +428,22 @@ module TimekeepingQueueLedger
   # An explicit override is used exactly as written, so a spec that hands a
   # child process its own file reads back that same file. Otherwise every
   # parallel process gets its own default file, because each one deletes its
-  # ledger at suite start.
+  # ledger at suite start. That default sits under ROOT_KEY when it is set,
+  # otherwise under Rails.root.
   def ledger_path(env = ENV)
     override = env[PATH_KEY].to_s
     return override unless override.strip.empty?
 
-    Rails.root.join(default_ledger_file(env[PROCESS_NUMBER_KEY].to_s)).to_s
+    File.join(ledger_root(env[ROOT_KEY].to_s), default_ledger_file(env[PROCESS_NUMBER_KEY].to_s))
+  end
+
+  # The suite-start hook deletes a path under this root, so a relative root,
+  # which would depend on the directory the process started in, is refused.
+  def ledger_root(root)
+    return Rails.root.to_s if root.strip.empty?
+    raise ArgumentError, "#{ROOT_KEY} must be an absolute path, got #{root.inspect}" unless Pathname.new(root).absolute?
+
+    root
   end
 
   # The number becomes part of a path the suite-start hook deletes, so anything

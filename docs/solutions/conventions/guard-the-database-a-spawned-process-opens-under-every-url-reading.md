@@ -36,16 +36,19 @@ Resolve the target from the child's environment, then check it under every parse
 
 ```ruby
 child_monolith_url = env[TimekeepingDemo::RuntimePlan::MONOLITH_DATABASE_URL].to_s
-require_test_database_url!(child_monolith_url) unless child_monolith_url.strip.empty?
-require_test_database_url!(timekeeping_database_url(env))
+TestDatabaseGuard.require_test_database_url!(child_monolith_url) unless child_monolith_url.strip.empty?
+TestDatabaseGuard.require_test_database_url!(timekeeping_database_url(env))
 
-def self.require_test_database_url!(url)
-  TestDatabaseGuard.require_test_database!(TimekeepingDatabaseReset.database_name(url))
-  TestDatabaseGuard.require_test_database!(active_record_database_name(url))
+# spec/support/timekeeping/timekeeping_database_reset.rb
+module TestDatabaseGuard
+  def require_test_database_url!(url)
+    require_test_database!(TimekeepingDatabaseReset.database_name(url))
+    require_test_database!(active_record_database_name(url))
+  end
 end
 ```
 
-`active_record_database_name` builds an `ActiveRecord::DatabaseConfigurations::UrlConfig` without connecting. Run all of these checks before the first spawn, because a pending migration cannot be undone once `db:prepare` starts.
+The guard lives in `TestDatabaseGuard`, so every helper that hands a URL to a spawned process (`IntegratedRuntime.start`, `TimekeepingLiveInstance#start` and the collector probe today) applies the same two readings. `active_record_database_name` builds an `ActiveRecord::DatabaseConfigurations::UrlConfig` without connecting. Run all of these checks before the first spawn, because a pending migration cannot be undone once `db:prepare` starts.
 
 ## Why it matters
 
@@ -53,7 +56,7 @@ A guard that reads a different database than the destructive step is worse than 
 
 ## Evidence
 
-- PR #378 adds `require_test_database_url!`, `active_record_database_name` and the caller `DATABASE_URL` check to `IntegratedRuntime.start` in `spec/support/timekeeping/integrated_runtime.rb`.
+- PR #378 adds `require_test_database_url!`, `active_record_database_name` and the caller `DATABASE_URL` check to `IntegratedRuntime.start` in `spec/support/timekeeping/integrated_runtime.rb`. Both methods later moved, unchanged, to `TestDatabaseGuard` in `spec/support/timekeeping/timekeeping_database_reset.rb`; `spec/meta/test_database_guard_spec.rb` pins them there.
 - `spec/lib/timekeeping_demo/integrated_runtime_spec.rb` adds "start refuses a Timekeeping URL whose path names a non-test database behind a _test dbname parameter". Its comment states that libpq reads the parameter and Rails reads the path, and it expects `NotATestDatabase` naming `timekeeping_development` with no spawn and no reset.
 - The same spec adds "start refuses a caller DATABASE_URL naming a non-test monolith database before anything is spawned", which expects a refusal naming `miru_web_development`.
 - `spec/support/timekeeping/timekeeping_database_reset.rb` drops `database_name` from its private methods in this change so the harness can reuse the libpq reading.

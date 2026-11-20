@@ -18,7 +18,7 @@ RSpec.describe TimekeepingQueueLedger::TimekeepingCollector, :without_transactio
 
     url = ENV.fetch("TIMEKEEPING_DATABASE_URL")
     env = { "TIMEKEEPING_DATABASE_URL" => url }
-    IntegratedRuntime.require_test_database_url!(url)
+    TestDatabaseGuard.require_test_database_url!(url)
     output, status = Bundler.with_unbundled_env do
       Open3.capture2e({ "RAILS_ENV" => "test", "BUNDLE_GEMFILE" => Rails.root.join("timekeeping/Gemfile").to_s,
                         "TIMEKEEPING_DATABASE_URL" => url, "DATABASE_URL" => nil },
