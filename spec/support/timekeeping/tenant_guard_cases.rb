@@ -51,10 +51,14 @@ module TenantGuardCases
     "Idempotency-Replay" => "only", "If-Match" => "replay-only", "Ownership-Generation" => "replay-only"
   }.freeze
 
-  # [contract, route, mode, covers, first, expected, headers]. Probes on routes
-  # that change data run the requester first, so the owner's positive control
-  # cannot make the requester miss for the wrong reason; replays and reads run
-  # the owner first.
+  # [contract, route, mode, covers, first, expected, headers]. Identifier
+  # probes on update, destroy, bulk_move, bulk_delete, prepare, commit, abort,
+  # mark_billed and detach_entries run the requester first: the owner's
+  # positive control discards or changes its row, which would make the
+  # requester miss for the wrong reason. Every other identifier case (replays,
+  # reads and snapshot delivery) runs the owner first, so the owner's row or
+  # receipt is shown to exist. No-identifier cases send only the requester's
+  # request, so the requester runs first.
   ROWS = [
     [:entry_api, :create, :replay, %i[idempotency_key], :owner, NOT_FOUND, {}],
     [:entry_api, :update, :probe, %i[entry_id], :requester, NOT_FOUND, {}],
@@ -96,7 +100,6 @@ module TenantGuardCases
     "source_metadata" => {}
   }.freeze
   DRAIN_THROUGH = 0
-  SNAPSHOT_OUTBOX_POSITION = 1
 
   PATH_PARAM_PATTERN = /\{(\w+)\}/
   COMPANY_PATH_PATTERN = %r{/companies/\d+}
@@ -157,6 +160,8 @@ module TenantGuardCases
       # swap replaces the operation id.
       def swap(kase, values, owner)
         kind = kase.covers.first
+        return values if kind == :none
+
         kind = :operation_id if kind == :idempotency_key && kase.contract == :reservations
         owner_value = kind == :entry_id ? owner.fetch(:entry_ids).first : owner.fetch(kind)
         values.merge(kind => owner_value)
@@ -217,16 +222,14 @@ module TenantGuardCases
         end
       end
 
+      # The batch shape comes from TimekeepingSnapshots, so it holds every
+      # contract entry field and is not refused before the tenant check.
       def snapshot_batch(values)
-        entry = ENTRY_BODY.merge(
-          "id" => values.fetch(:entry_id), "company_id" => values.fetch(:company_id),
-          "user_id" => values.fetch(:user_id), "project_id" => values.fetch(:project_id),
-          "version" => values.fetch(:entry_version)
+        entry = TimekeepingSnapshots.entry(
+          id: values.fetch(:entry_id), company_id: values.fetch(:company_id), version: values.fetch(:entry_version),
+          project_id: values.fetch(:project_id), user_id: values.fetch(:user_id)
         )
-        snapshot = { "generation" => values.fetch(:generation), "outbox_position" => SNAPSHOT_OUTBOX_POSITION,
-                     "entry" => entry }
-        { "schema_version" => TimekeepingContract.load(:entry_snapshots).fetch("schema_version"),
-          "snapshots" => [snapshot] }
+        TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation: values.fetch(:generation)))
       end
 
       def with_snapshot_company(body, company_id)

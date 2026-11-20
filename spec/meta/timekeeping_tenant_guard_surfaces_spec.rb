@@ -95,6 +95,36 @@ RSpec.describe "Timekeeping tenant guard surfaces and cases" do
     end
   end
 
+  describe "TenantGuardSurfaces.pairs on extra query and snapshot envelope names" do
+    it "reports an identifier added to the reference show query string, and raises on an unlisted one" do
+      with_invoice = guard_surfaces_contracts_copy
+      with_invoice[:reference]["routes"]["show"]["query"] = "project_ids=1,2&invoice_id=601 (a comma-separated list)"
+
+      expect(TenantGuardSurfaces.uncovered(contracts: with_invoice, cases: TenantGuardCases::ALL)[:pairs])
+        .to eq([%i[reference show invoice_id]])
+
+      with_unlisted = guard_surfaces_contracts_copy
+      with_unlisted[:reference]["routes"]["show"]["query"] = "project_ids=1,2&tenant_ref=1"
+
+      expect { TenantGuardSurfaces.pairs(with_unlisted) }
+        .to raise_error(TenantGuardSurfaces::UnknownFieldError, /tenant_ref/)
+    end
+
+    it "reads the snapshot item_fields and batch_fields, reporting an added identifier and raising on an unlisted name" do
+      with_invoice = guard_surfaces_contracts_copy
+      with_invoice[:entry_snapshots]["item_fields"] << "invoice_id"
+
+      expect(TenantGuardSurfaces.uncovered(contracts: with_invoice, cases: TenantGuardCases::ALL)[:pairs])
+        .to eq([%i[entry_snapshots deliver invoice_id]])
+
+      with_unlisted = guard_surfaces_contracts_copy
+      with_unlisted[:entry_snapshots]["batch_fields"] << "tenant_ref"
+
+      expect { TenantGuardSurfaces.pairs(with_unlisted) }
+        .to raise_error(TenantGuardSurfaces::UnknownFieldError, /tenant_ref/)
+    end
+  end
+
   describe "TenantGuardSurfaces.pairs without a key source" do
     it "raises when a contract with write routes has no idempotency key source, instead of dropping its key pairs" do
       changed = guard_surfaces_contracts_copy
@@ -216,7 +246,7 @@ RSpec.describe "Timekeeping tenant guard surfaces and cases" do
     it "R4 each handoff route has one probe covering only none that expects 401 unauthorized" do
       # "The handoff routes in `contracts/timekeeping/handoff.yml` (settle, stop_applying, drain) carry none of the
       # four kinds, and each still gets a case."
-      expect(TenantGuardCases::ALL.select { |kase| kase.contract == :handoff }.map(&:route))
+      expect(TenantGuardCases::ALL.filter_map { |kase| kase.route if kase.contract == :handoff })
         .to contain_exactly(:settle, :stop_applying, :drain)
 
       %i[settle stop_applying drain].each do |route|
@@ -319,6 +349,33 @@ RSpec.describe "Timekeeping tenant guard surfaces and cases" do
         )
         expect(request.to_s).not_to include("1501")
         expect(request.to_s).not_to include("1502")
+      end
+    end
+
+    it "builds a no-identifier probe equal to the requester's valid request" do
+      no_identifier = TenantGuardCases::ALL.select { |kase| kase.covers == [:none] }
+      expect(no_identifier.map { |kase| [kase.contract, kase.route] }).to contain_exactly(
+        %i[entry_api index], %i[reference show], %i[handoff settle], %i[handoff stop_applying], %i[handoff drain]
+      )
+
+      no_identifier.each do |kase|
+        expect(TenantGuardCases.probe_request(kase, requester: requester_ids, owner: owner_ids))
+          .to eq(TenantGuardCases.valid_request(kase, ids: requester_ids)), "#{kase.contract} #{kase.route}"
+      end
+    end
+
+    it "builds delivery baseline, probe and replay batches that the snapshot parser accepts" do
+      %i[probe replay].each do |mode|
+        covers = mode == :probe ? [:entry_id] : [:idempotency_key]
+        kase = guard_cases_find(:entry_snapshots, :deliver, mode, covers)
+        baseline = TenantGuardCases.valid_request(kase, ids: requester_ids)
+        probe = TenantGuardCases.probe_request(kase, requester: requester_ids, owner: owner_ids)
+        replay = TenantGuardCases.replay_request(TenantGuardCases.valid_request(kase, ids: owner_ids),
+                                                 company_id: 101, authorization: "Bearer requester-token")
+
+        [baseline, probe, replay].each do |request|
+          expect(Timekeeping::SnapshotBatch.parse(request.fetch(:body))).not_to be_nil, mode.to_s
+        end
       end
     end
 

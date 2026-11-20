@@ -40,6 +40,13 @@ module TenantGuardSurfaces
     review_status locked version discarded_at created_at updated_at
   ].freeze
 
+  # Names that carry no identifier only inside one contract's body lists. In a
+  # snapshot batch, snapshots and entry hold the item_fields and entry_fields
+  # lists read beside them, and outbox_position is the producer's outbox order.
+  CONTRACT_NON_IDENTIFIER_FIELDS = {
+    entry_snapshots: %w[snapshots entry outbox_position].freeze
+  }.freeze
+
   ENTRY_BODY_FIELDS_PATTERN = /\Aentry_\w+_fields\z/
 
   # Contract-level lists a route's body is read from, as key paths into the contract.
@@ -51,7 +58,7 @@ module TenantGuardSurfaces
       bulk_delete: [%w[request bulk_delete_fields]]
     },
     entry_snapshots: {
-      deliver: [%w[entry_fields]]
+      deliver: [%w[batch_fields], %w[item_fields], %w[entry_fields]]
     }
   }.freeze
 
@@ -83,7 +90,7 @@ module TenantGuardSurfaces
   ].map(&:freeze).freeze
 
   PATH_PARAM_PATTERN = /\{(\w+)\}/
-  QUERY_STRING_NAME_PATTERN = /\A(\w+)=/
+  QUERY_STRING_NAME_PATTERN = /(?:\A|&)(\w+)=/
 
   class << self
     # Returns sorted, frozen [contract_name, route_name, kind] entries. kind is
@@ -152,9 +159,16 @@ module TenantGuardSurfaces
         case query
         when nil then []
         when Array then query
-        when String then [query[QUERY_STRING_NAME_PATTERN, 1] || unreadable_query!(contract_name, route_name, query)]
+        when String then query_string_names(contract_name, route_name, query)
         else unreadable_query!(contract_name, route_name, query)
         end
+      end
+
+      # Every name= parameter of a query written as a string, such as
+      # reference.yml's "project_ids=1,2 (a comma-separated list ...)".
+      def query_string_names(contract_name, route_name, query)
+        names = query.scan(QUERY_STRING_NAME_PATTERN).flatten
+        names.empty? ? unreadable_query!(contract_name, route_name, query) : names
       end
 
       def unreadable_query!(contract_name, route_name, query)
@@ -171,7 +185,7 @@ module TenantGuardSurfaces
       def field_kinds(contract_name, route_name, name, key_source, non_identifiers)
         kinds = CONTRACT_IDENTIFIER_FIELDS.fetch(contract_name, {})[name] || IDENTIFIER_FIELDS[name]
         if kinds.nil?
-          return [] if non_identifiers.include?(name)
+          return [] if non_identifiers.include?(name) || CONTRACT_NON_IDENTIFIER_FIELDS.fetch(contract_name, []).include?(name)
 
           raise UnknownFieldError, "#{contract_name}.#{route_name} carries unlisted field #{name.inspect}"
         end
