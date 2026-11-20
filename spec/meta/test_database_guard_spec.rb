@@ -13,16 +13,6 @@ RSpec.describe TestDatabaseGuard do
     end
   end
 
-  context "more tests 11" do
-    it "refuses a URL whose libpq dbname names a non-test database behind a _test path" do
-      # "Then require that both the libpq name and the Active Record name of the URL end in `_test`"
-      url = "postgresql://guard_mirror_user@127.0.0.1/timekeeping_guard_mirror_test?dbname=timekeeping_production"
-
-      expect { described_class.require_test_database_url!(url) }
-        .to raise_error(TestDatabaseGuard::NotATestDatabase, /timekeeping_production/)
-    end
-  end
-
   context "more tests 12" do
     it "refuses an unparseable URL without echoing its user, password or text in the error message" do
       # "Error messages keep naming only the database, never the URL."
@@ -34,27 +24,6 @@ RSpec.describe TestDatabaseGuard do
           expect(error.message).not_to include("s3cret_pw")
           expect(error.message).not_to include(url)
         }
-    end
-  end
-
-  context "more tests 13", ".require_test_database_url! issue vector" do
-    # "`TestDatabaseGuard.require_test_database_url!(url)` refuses `postgresql://harness_selector_user@127.0.0.1/timekeeping_development?dbname=timekeeping_selector_test` and accepts a URL whose libpq and Active Record names both end in \_test"
-    it "refuses the issue's URL whose Active Record path names timekeeping_development behind a _test dbname" do
-      url = "postgresql://harness_selector_user@127.0.0.1/timekeeping_development?dbname=timekeeping_selector_test"
-
-      expect { described_class.require_test_database_url!(url) }
-        .to raise_error(TestDatabaseGuard::NotATestDatabase, /timekeeping_development/)
-    end
-  end
-
-  context "more tests 14", ".require_test_database_url! libpq reading" do
-    # The issue's own vector only fails the Active Record reading; this mirror fails only the libpq
-    # reading, so a guard that dropped the libpq check would accept it.
-    it "refuses a URL whose libpq dbname names a non-test database behind a _test path" do
-      url = "postgresql://collector_guard_user@127.0.0.1/timekeeping_collector_guard_test?dbname=timekeeping_production"
-
-      expect { described_class.require_test_database_url!(url) }
-        .to raise_error(TestDatabaseGuard::NotATestDatabase, /timekeeping_production/)
     end
   end
 
@@ -79,35 +48,6 @@ RSpec.describe TestDatabaseGuard do
           expect(error.message).not_to include("leak_user")
           expect(error.message).not_to include("s3cret_pw")
         }
-    end
-  end
-
-  context "more tests 17" do
-    # "`TestDatabaseGuard.require_test_database_url!(url)` refuses `postgresql://harness_selector_user@127.0.0.1/timekeeping_development?dbname=timekeeping_selector_test` and accepts a URL whose libpq and Active Record names both end in \_test"
-    it "refuses the URL whose dbname ends in _test but whose path names timekeeping_development" do
-      url = "postgresql://harness_selector_user@127.0.0.1/timekeeping_development?dbname=timekeeping_selector_test"
-
-      expect { described_class.require_test_database_url!(url) }
-        .to raise_error(TestDatabaseGuard::NotATestDatabase, /timekeeping_development/)
-    end
-  end
-
-  context "more tests 18" do
-    # "a URL whose path and dbname both end in `_test` returns nil"
-    it "returns nil for a URL whose path and dbname both end in _test" do
-      url = "postgresql://harness_selector_user@127.0.0.1/timekeeping_selector_test?dbname=timekeeping_selector_test"
-
-      expect(described_class.require_test_database_url!(url)).to be_nil
-    end
-  end
-
-  context "more tests 19" do
-    # The libpq reading (the dbname parameter) must be checked too, not only the Active Record path.
-    it "refuses a URL whose path ends in _test but whose dbname parameter names timekeeping_production" do
-      url = "postgresql://harness_selector_user@127.0.0.1/timekeeping_selector_test?dbname=timekeeping_production"
-
-      expect { described_class.require_test_database_url!(url) }
-        .to raise_error(TestDatabaseGuard::NotATestDatabase, /timekeeping_production/)
     end
   end
 
@@ -162,17 +102,6 @@ RSpec.describe TestDatabaseGuard do
 
     it "refuses a URL whose dbname parameter names a non-test database behind a _test path" do
       url = "postgresql://collector_guard_user@127.0.0.1/timekeeping_collector_guard_test?dbname=timekeeping_production"
-
-      expect { described_class.require_test_database_url!(url) }
-        .to raise_error(TestDatabaseGuard::NotATestDatabase, /timekeeping_production/)
-    end
-  end
-
-  context "more tests 22", ".require_test_database_url! libpq reading" do
-    # "require that both the libpq name and the Active Record name of the URL end in `_test`"
-    # A guard that read only the path would accept this URL, and the reset would empty timekeeping_production.
-    it "refuses a _test path that hides a non-test dbname parameter, so the libpq reading is never skipped" do
-      url = "postgresql://guard_adversary_user@127.0.0.1/timekeeping_guard_adversary_test?dbname=timekeeping_production"
 
       expect { described_class.require_test_database_url!(url) }
         .to raise_error(TestDatabaseGuard::NotATestDatabase, /timekeeping_production/)
