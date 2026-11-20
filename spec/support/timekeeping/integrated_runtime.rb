@@ -58,8 +58,8 @@ class IntegratedRuntime
     # The launcher's monolith prefers a caller DATABASE_URL over the test
     # process's own database, so that target is checked as well.
     child_monolith_url = env[TimekeepingDemo::RuntimePlan::MONOLITH_DATABASE_URL].to_s
-    require_test_database_url!(child_monolith_url) unless child_monolith_url.strip.empty?
-    require_test_database_url!(timekeeping_database_url(env))
+    TestDatabaseGuard.require_test_database_url!(child_monolith_url) unless child_monolith_url.strip.empty?
+    TestDatabaseGuard.require_test_database_url!(timekeeping_database_url(env))
     credentials = TimekeepingDemo::Credentials.generate
     ports = { monolith: free_port, timekeeping: free_port }
     clear_leftovers!(root)
@@ -140,22 +140,6 @@ class IntegratedRuntime
     env.fetch(TIMEKEEPING_DATABASE_URL)
   end
 
-  # libpq (used by the reset) and Active Record (used by db:prepare and the
-  # apps) can read different databases from one URL, for example a path name
-  # and a dbname query parameter. Both readings must name a test database.
-  # Public so specs that write rows into the Timekeeping database apply the
-  # same check before they touch it.
-  def self.require_test_database_url!(url)
-    TestDatabaseGuard.require_test_database!(TimekeepingDatabaseReset.database_name(url))
-    TestDatabaseGuard.require_test_database!(active_record_database_name(url))
-  end
-
-  def self.active_record_database_name(url)
-    ActiveRecord::DatabaseConfigurations::UrlConfig.new("test", "harness_guard", url, { adapter: "postgresql" }).database
-  rescue ActiveRecord::DatabaseConfigurations::InvalidConfigurationError, URI::Error
-    nil
-  end
-
   def self.free_port
     server = TCPServer.new(HOST, 0)
     server.addr[1]
@@ -227,8 +211,7 @@ class IntegratedRuntime
   rescue Errno::ESRCH, Errno::EPERM
     nil
   end
-  private_class_method :monolith_database_name, :timekeeping_database_url, :active_record_database_name,
-                       :free_port, :clear_leftovers!, :prepare_timekeeping!, :wait_for_prepare, :reset_timekeeping!
+  private_class_method :monolith_database_name, :timekeeping_database_url, :free_port, :clear_leftovers!, :prepare_timekeeping!, :wait_for_prepare, :reset_timekeeping!
 
   def initialize(root:, env:, credentials:, ports:, ledger: TimekeepingQueueLedger.session)
     @root = root
