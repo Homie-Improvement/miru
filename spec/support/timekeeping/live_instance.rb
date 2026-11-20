@@ -78,8 +78,8 @@ class TimekeepingLiveInstance
   attr_reader :base_url, :service_token, :private_key, :admission_generation
 
   # port nil picks a free port. database_url nil reads TIMEKEEPING_DATABASE_URL
-  # from ENV; a given URL is the only one the service's processes see, so a
-  # caller that checked it knows which database db:prepare opens.
+  # from ENV; a given URL is the only one the service's processes see. Either
+  # way start refuses the URL unless TestDatabaseGuard accepts it.
   def self.start(reference_stub:, admission_generation: DEFAULT_ADMISSION_GENERATION, port: nil, database_url: nil)
     new(reference_stub:, admission_generation:, port:, database_url:).tap(&:start)
   end
@@ -104,6 +104,7 @@ class TimekeepingLiveInstance
   end
 
   def start
+    @database_url = checked_database_url
     start_reference_server
     port = @port || free_port
     @base_url = "http://#{HOST}:#{port}"
@@ -170,7 +171,7 @@ class TimekeepingLiveInstance
       {
         "RAILS_ENV" => "test",
         "BUNDLE_GEMFILE" => File.join(SERVICE_DIRECTORY, "Gemfile"),
-        "TIMEKEEPING_DATABASE_URL" => timekeeping_database_url,
+        "TIMEKEEPING_DATABASE_URL" => @database_url,
         "TIMEKEEPING_TOKEN_PUBLIC_KEY" => private_key.public_key.to_pem,
         "TIMEKEEPING_SERVICE_TOKEN" => service_token,
         "MONOLITH_REFERENCE_URL" => reference_url,
@@ -179,31 +180,30 @@ class TimekeepingLiveInstance
       }
     end
 
-    def timekeeping_database_url
-      @database_url || ENV.fetch("TIMEKEEPING_DATABASE_URL") do
+    # db:prepare, the admit runner and clear_metrics! all write to this
+    # database, so both readings of its name must end in _test before any of
+    # them runs. It is read once, so every child opens the database checked here.
+    def checked_database_url
+      url = @database_url || ENV.fetch("TIMEKEEPING_DATABASE_URL") do
         raise BootError, "TIMEKEEPING_DATABASE_URL must name the live Timekeeping test database"
       end
+      TestDatabaseGuard.require_test_database_url!(url)
+      url
     end
 
     # The monolith runs under its own bundle; boot.rb keeps an inherited
     # BUNDLE_GEMFILE, so without a clean environment the service would load
     # the monolith's gems and miss its own path gems.
-    #
-    # The service env is built before entering the unbundled env, which swaps
-    # ENV for the one the process started with, so a TIMEKEEPING_DATABASE_URL
-    # removed or changed since start is read as it is now.
     def run_in_service!(*command)
-      env = service_env
       output, status = Bundler.with_unbundled_env do
-        Open3.capture2e(env, *command, chdir: SERVICE_DIRECTORY)
+        Open3.capture2e(service_env, *command, chdir: SERVICE_DIRECTORY)
       end
       raise BootError, "#{command.join(" ")} failed:\n#{output}" unless status.success?
     end
 
     def spawn_in_service(*command)
-      env = service_env
       Bundler.with_unbundled_env do
-        Process.spawn(env, *command, chdir: SERVICE_DIRECTORY, out: @log.path, err: [:child, :out])
+        Process.spawn(service_env, *command, chdir: SERVICE_DIRECTORY, out: @log.path, err: [:child, :out])
       end
     end
 

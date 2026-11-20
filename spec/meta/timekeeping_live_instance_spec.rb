@@ -53,6 +53,34 @@ RSpec.describe TimekeepingLiveInstance do
       expect(Process).not_to have_received(:spawn)
     end
 
+    it "start refuses a database_url whose path names a non-test database behind a _test dbname before any child process runs" do
+      allow(Open3).to receive(:capture2e)
+      allow(Process).to receive(:spawn)
+      url = "postgresql://live_guard_user@127.0.0.1/timekeeping_development?dbname=timekeeping_selector_test"
+
+      # Active Record would open timekeeping_development, so db:prepare and the admit runner must never run.
+      expect { described_class.start(reference_stub: described_class::ReferenceStub.new, database_url: url) }
+        .to raise_error(TestDatabaseGuard::NotATestDatabase, /timekeeping_development/)
+      expect(Open3).not_to have_received(:capture2e)
+      expect(Process).not_to have_received(:spawn)
+    end
+
+    it "start refuses a global TIMEKEEPING_DATABASE_URL whose dbname names a non-test database before any child process runs" do
+      allow(Open3).to receive(:capture2e)
+      allow(Process).to receive(:spawn)
+      saved_url = ENV.fetch("TIMEKEEPING_DATABASE_URL", nil)
+      ENV["TIMEKEEPING_DATABASE_URL"] = "postgresql://live_guard_user@127.0.0.1/timekeeping_live_guard_test?dbname=timekeeping_production"
+
+      begin
+        expect { described_class.start(reference_stub: described_class::ReferenceStub.new) }
+          .to raise_error(TestDatabaseGuard::NotATestDatabase, /timekeeping_production/)
+      ensure
+        saved_url.nil? ? ENV.delete("TIMEKEEPING_DATABASE_URL") : ENV["TIMEKEEPING_DATABASE_URL"] = saved_url
+      end
+      expect(Open3).not_to have_received(:capture2e)
+      expect(Process).not_to have_received(:spawn)
+    end
+
     it "start with database_url nil and no global TIMEKEEPING_DATABASE_URL raises BootError before db:prepare" do
       allow(Open3).to receive(:capture2e).and_return(["", instance_double(Process::Status, success?: true)])
       allow(Process).to receive(:spawn).and_return(4242)
