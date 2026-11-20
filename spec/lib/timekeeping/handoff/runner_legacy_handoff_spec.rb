@@ -28,6 +28,14 @@ module RunnerLegacyHandoffSpecSupport
   def correction_entry_ids(timekeeping)
     timekeeping.corrections.map { |snapshot| TimekeepingHandoffFakes::InMemoryTimekeepingStore.entry_id_of(snapshot) }
   end
+
+  # The entries a first cutover writes a snapshot for: the corrected ones, and
+  # every legacy entry still at version 0, which the load raises to version 1.
+  # A cutover writes no timesheet_entries row, so the legacy versions read here
+  # are the ones the cutover loaded from.
+  def snapshot_entry_ids(corrected_ids)
+    corrected_ids | TimesheetEntry.unscoped.where(version: 0).pluck(:id)
+  end
 end
 
 RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
@@ -49,7 +57,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
       expect(owned.size).to eq(1)
       expect(owned.first["state"]).to eq("committed")
     end
-    expect(correction_entry_ids(timekeeping)).to match_array(entry_ids)
+    expect(correction_entry_ids(timekeeping)).to match_array(snapshot_entry_ids(entry_ids))
     expect(timekeeping.corrections.pluck("generation").uniq).to eq([2])
     expect(timekeeping.corrections.pluck("version").uniq).to eq([1])
   end
@@ -87,7 +95,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     expect(entries.find { |row| row["id"] == changed_id }["note"]).to eq("changed before the retry")
     committed = timekeeping.rows.fetch("reservations").filter_map { |row| row["entry_id"] if row["state"] == "committed" }
     expect(committed).to include(*entry_ids)
-    expect(correction_entry_ids(timekeeping)).to match_array(entry_ids)
+    expect(correction_entry_ids(timekeeping)).to match_array(snapshot_entry_ids(entry_ids))
     expect(timekeeping.corrections.pluck("generation").uniq).to eq([3])
   end
 end
@@ -110,7 +118,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
       described_class.run(direction: :cutover, owners:, report_root:,
                           observer: TimekeepingHandoffHooks::Interrupt.new(at: :after_corrections))
     end.to raise_error(TimekeepingHandoffHooks::Interrupted)
-    expect(correction_entry_ids(timekeeping)).to match_array(entry_ids)
+    expect(correction_entry_ids(timekeeping)).to match_array(snapshot_entry_ids(entry_ids))
     described_class.run(direction: :cutover, abort: true, owners:, report_root:)
 
     changed_id = TimesheetEntry.unscoped.where.not(id: entry_ids).minimum(:id)
@@ -127,7 +135,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
       expect(entries.find { |row| row["id"] == entry_id }["version"]).to be >= 1
       expect(timekeeping.rows.fetch("reservations").count { |row| row["entry_id"] == entry_id && row["state"] == "committed" }).to eq(1)
     end
-    expect(correction_entry_ids(timekeeping)).to match_array(entry_ids)
+    expect(correction_entry_ids(timekeeping)).to match_array(snapshot_entry_ids(entry_ids))
     expect(timekeeping.corrections.pluck("generation").uniq).to eq([3])
   end
 end
@@ -228,7 +236,7 @@ end
       end.to raise_error(TimekeepingHandoffHooks::Interrupted)
       expect(TimekeepingOwnership.current.handoff_step).to eq("checkpoint")
 
-      corrected_ids = correction_entry_ids(timekeeping)
+      corrected_ids = recorded_unlocked_entry_ids
       row = timekeeping.rows.fetch("entries").find { |entry| corrected_ids.include?(entry["id"]) == (kind == :corrected) }
       row["version"] = changed_version
 
@@ -514,7 +522,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
 
     control_ids = control.fetch(:corrections).map { |snapshot| TimekeepingHandoffFakes::InMemoryTimekeepingStore.entry_id_of(snapshot) }
     expect(control_ids).not_to be_empty
-    expect(correction_entry_ids(timekeeping)).to match_array(control_ids)
+    expect(correction_entry_ids(timekeeping)).to match_array(snapshot_entry_ids(control_ids))
     expect(timekeeping.corrections.pluck("generation").uniq).to eq([2])
     expect(timekeeping.corrections.pluck("version").uniq).to eq([1])
 
@@ -558,7 +566,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
 
     control_ids = control.fetch(:corrections).map { |snapshot| TimekeepingHandoffFakes::InMemoryTimekeepingStore.entry_id_of(snapshot) }
     expect(control_ids).not_to be_empty
-    expect(correction_entry_ids(timekeeping)).to match_array(control_ids)
+    expect(correction_entry_ids(timekeeping)).to match_array(snapshot_entry_ids(control_ids))
     expect(timekeeping.corrections.pluck("generation").uniq).to eq([2])
     expect(timekeeping.corrections.pluck("version").uniq).to eq([1])
 
@@ -595,7 +603,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     control_ids = control.fetch(:corrections).map { |snapshot| TimekeepingHandoffFakes::InMemoryTimekeepingStore.entry_id_of(snapshot) }
     expect(control_ids).not_to be_empty
     expect(control_ids).to match_array(recorded_unlocked_entry_ids)
-    expect(correction_entry_ids(timekeeping)).to match_array(control_ids)
+    expect(correction_entry_ids(timekeeping)).to match_array(snapshot_entry_ids(control_ids))
   end
 end
 
@@ -642,7 +650,7 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
 
     expected_ids = control.fetch(:corrections).map { |correction| TimekeepingHandoffFakes::InMemoryTimekeepingStore.entry_id_of(correction) }
     expect(expected_ids).not_to be_empty
-    expect(correction_entry_ids(timekeeping)).to match_array(expected_ids)
+    expect(correction_entry_ids(timekeeping)).to match_array(snapshot_entry_ids(expected_ids))
     expect(timekeeping.corrections.pluck("generation").uniq).to eq([2])
 
     saved = Timekeeping::Handoff::ReportDirectory.new(root: report_root, generation: 2).read_checkpoint
@@ -876,5 +884,86 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     current = TimekeepingOwnership.current
     expect([current.generation, current.owner, current.handoff_step]).to eq([generation, "monolith", "reconcile"])
     expect(timekeeping.calls).not_to include([:admit, generation])
+  end
+end
+
+require "json"
+
+RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
+  # Stands in for a relay that has delivered nothing: the projection keeps the
+  # legacy version 0 rows the first cutover raised to version 1 in Timekeeping.
+  let(:undelivered_drain) do
+    Class.new do
+      def drain!(through:) = nil
+      def drained?(through:) = true
+    end.new
+  end
+
+  # "The reconciliation rules and the intent and receipt handling are unchanged."
+  # Snapshots, not a rollback listing, are what make the projection match; with
+  # no snapshot delivered, the version difference must still stop the rollback.
+  it "a rollback whose drain never delivers the raised entries' snapshots is refused at reconcile and leaves Timekeeping the owner with the handoff resumable" do
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+    owners = TimekeepingHandoffFakes.owners(timekeeping:)
+    report_root = Pathname(Dir.mktmpdir("handoff-report"))
+    raised = TimesheetEntry.unscoped.where(version: 0).count
+    expect(raised).to be_positive
+
+    described_class.run(direction: :cutover, owners:, report_root:)
+    expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 2, handoff_step: nil)
+
+    rollback_owners = owners.merge(
+      timekeeping: Timekeeping::Handoff::Owner.new(
+        name: :timekeeping, store: timekeeping, admission: timekeeping,
+        settle: TimekeepingHandoffFakes::NoOpSettle.new, drain: undelivered_drain
+      )
+    )
+
+    expect do
+      described_class.run(direction: :rollback, owners: rollback_owners, report_root:)
+    end.to raise_error(Timekeeping::Handoff::Runner::Refused)
+
+    ownership = TimekeepingOwnership.current
+    expect(ownership.owner).to eq("timekeeping")
+    expect(ownership.generation).to eq(3)
+    expect(ownership.handoff_step).not_to be_nil
+    reconciliation = JSON.parse(File.read(report_root.join("generation-3", "reconciliation.json")))
+    expect(reconciliation.fetch("abort")).to be(true)
+  ensure
+    FileUtils.rm_rf(report_root) if report_root
+  end
+end
+
+RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_transaction do
+  include RunnerLegacyHandoffSpecSupport
+
+  # "Until then, the proof that rollback and re-cutover reach the flip against both real databases is not shown."
+  # A snapshot per raised entry must be sent exactly once: rollback and re-cutover
+  # are not legacy sources, so a second write would be a duplicate delivery.
+  it "raised snapshots are written once at the first cutover and never again by rollback or a re-cutover after a monolith edit, which still reaches the flip" do
+    timekeeping = TimekeepingHandoffFakes::InMemoryTimekeepingStore.new
+    owners = TimekeepingHandoffFakes.owners(timekeeping:)
+    report_root = Pathname(Dir.mktmpdir("handoff-report"))
+    legacy_zero_ids = TimesheetEntry.unscoped.where(version: 0).pluck(:id)
+    expect(legacy_zero_ids).not_to be_empty
+
+    described_class.run(direction: :cutover, owners:, report_root:)
+    written_after_cutover = timekeeping.correction_writes.pluck("id")
+    expect(written_after_cutover).to include(*legacy_zero_ids)
+    expect(written_after_cutover.tally.values.uniq).to eq([1])
+
+    described_class.run(direction: :rollback, owners:, report_root:)
+    edited_id = legacy_zero_ids.min
+    ActiveRecord::Base.connection.execute(
+      "UPDATE entries SET version = version + 1, note = 'edited after rollback' WHERE id = #{Integer(edited_id)}"
+    )
+    described_class.run(direction: :re_cutover, owners:, report_root:)
+
+    expect(TimekeepingOwnership.current).to have_attributes(owner: "timekeeping", generation: 4, handoff_step: nil)
+    expect(timekeeping.correction_writes.pluck("id")).to eq(written_after_cutover)
+    [2, 3, 4].each do |generation|
+      reconciliation = JSON.parse(File.read(report_root.join("generation-#{generation}", "reconciliation.json")))
+      expect(reconciliation.fetch("abort")).to be(false)
+    end
   end
 end

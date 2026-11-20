@@ -440,11 +440,19 @@ module Timekeeping
           planned.merge(legacy_receipts) { |_company_id, differences, receipts| differences + receipts }
         end
 
-        # The first cutover's corrections as the outbox rows Timekeeping's
-        # correction writer takes: the corrected entry without its version,
-        # which travels as its own argument.
+        # The first cutover's snapshots as the outbox rows Timekeeping's
+        # correction writer takes: each corrected entry, and each entry the
+        # load raised without correcting it, without its version, which
+        # travels as its own argument. The relay delivers only outbox rows, so
+        # a raised entry without a snapshot would stay at its legacy version in
+        # the monolith's projection and a later rollback would refuse it.
         def correction_snapshots
-          source_copy.fetch(:corrections).map { |correction| correction.fetch("snapshot").except("version") }
+          corrections = source_copy.fetch(:corrections)
+          corrected = corrections.map { |correction| correction.fetch("snapshot").except("version") }
+          raised = LegacyLoadVersions.raised_snapshots(
+            source: source_copy.fetch(:source), loaded: source_copy.fetch(:load), corrections:
+          )
+          corrected + raised
         end
 
         def recorded_disposition

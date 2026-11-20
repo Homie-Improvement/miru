@@ -144,14 +144,20 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     loaded_ids = timekeeping_store.rows.fetch("entries").pluck("id")
     expect(loaded_ids.sort).to eq(uninterrupted[:checkpoint].rows.fetch("entries").pluck("id").sort)
     expect(loaded_ids.size).to eq(TimesheetEntry.unscoped.count)
-    # Timekeeping's correction writer takes each corrected entry row without its version, and stores it with
-    # the correction version and the handoff's generation.
+    # Timekeeping's correction writer takes each corrected entry row, and each entry row the load raised,
+    # without its version, and stores it with the correction version and the handoff's generation.
     # correction_writes holds the snapshots exactly as the runner sent them.
-    expect(timekeeping_store.correction_writes.sort_by { |c| c["id"] })
-      .to eq(uninterrupted[:corrections].map { |c| c.fetch("snapshot").except("version") }.sort_by { |c| c["id"] })
+    uninterrupted_load = Timekeeping::Handoff::LegacyLoadVersions.build(
+      source: uninterrupted[:checkpoint], corrections: uninterrupted[:corrections], stored: nil
+    )
+    expected_snapshots = uninterrupted[:corrections].map { |c| c.fetch("snapshot").except("version") } +
+      Timekeeping::Handoff::LegacyLoadVersions.raised_snapshots(
+        source: uninterrupted[:checkpoint], loaded: uninterrupted_load, corrections: uninterrupted[:corrections]
+      )
+    expect(timekeeping_store.correction_writes.sort_by { |c| c["id"] }).to eq(expected_snapshots.sort_by { |c| c["id"] })
     corrections = timekeeping_store.corrections
     expect(corrections.map { |c| c.except("version", "generation") }.sort_by { |c| c["id"] })
-      .to eq(uninterrupted[:corrections].map { |c| c.fetch("snapshot").except("version") }.sort_by { |c| c["id"] })
+      .to eq(expected_snapshots.sort_by { |c| c["id"] })
     expect(corrections.pluck("version").uniq).to eq([Timekeeping::ReservationDerivation::CORRECTION_VERSION])
     expect(corrections.pluck("generation").uniq).to eq([2])
     expect(calls.count([:timekeeping, :admit, 2])).to eq(1)
@@ -191,7 +197,8 @@ RSpec.describe Timekeeping::Handoff::Runner, :two_tenant_seed, :seeded_without_t
     # replace-by-entry would absorb still shows up here.
     corrected = timekeeping_store.correction_writes.pluck("id")
     expect(corrected.tally.values.uniq).to eq([1])
-    expect(corrected.sort).to eq(reserved_ids.sort)
+    # Every legacy entry still at version 0 is raised by the load, so it is written too.
+    expect(corrected.sort).to eq((reserved_ids | TimesheetEntry.unscoped.where(version: 0).pluck(:id)).sort)
     expect(timekeeping_store.rows.fetch("entries").size).to eq(TimesheetEntry.unscoped.count)
   end
 end
