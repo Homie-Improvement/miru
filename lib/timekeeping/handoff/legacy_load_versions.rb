@@ -25,10 +25,12 @@ module Timekeeping
     #
     # A corrected entry also carries its correction's `locked` value, so the
     # entry Timekeeping stores equals the correction snapshot it relays to the
-    # monolith's projection, and a later rollback reconciles the two. An
+    # monolith's projection, and a later rollback reconciles the two. A raised,
     # uncorrected entry carries `locked` as true or false: a legacy row may
-    # hold nil, which a checkpoint accepts but a snapshot refuses, and an
-    # uncorrected entry is locked exactly when its legacy value is true.
+    # hold nil, which a checkpoint accepts but its snapshot would refuse, and
+    # an uncorrected entry is locked exactly when its legacy value is true.
+    # An entry the load does not raise gets no snapshot, so it keeps its
+    # legacy row unchanged, matching the projection.
     #
     # Reading Timekeeping's stored versions is safe only while the source is
     # legacy: no handoff has admitted writes to Timekeeping yet, so its rows
@@ -51,7 +53,10 @@ module Timekeeping
         entries = source.rows.fetch("entries").map do |row|
           floors = [LOWEST_LOADABLE_VERSION, stored_versions[row["id"]]]
           unless corrected_locked.key?(row["id"])
-            next with_version(row.merge("locked" => row["locked"] == true), floors.compact.max)
+            version = floors.compact.max
+            next row if version <= row["version"]
+
+            next row.merge("locked" => row["locked"] == true, "version" => version)
           end
 
           corrected = row.merge("locked" => corrected_locked.fetch(row["id"]))
