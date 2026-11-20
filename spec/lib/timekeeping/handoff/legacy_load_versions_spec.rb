@@ -117,7 +117,7 @@ RSpec.describe Timekeeping::Handoff::LegacyLoadVersions, "raised snapshots and l
 
     expect(snapshots.size).to eq(2)
     expect(snapshots).to all(satisfy { |snapshot| !snapshot.key?("version") })
-    by_id = snapshots.to_h { |snapshot| [snapshot["id"], snapshot] }
+    by_id = snapshots.index_by { |snapshot| snapshot["id"] }
     expect(by_id.keys).to contain_exactly(7, 9)
     expect(by_id.fetch(7)).to eq(null_lock.except("version").merge("locked" => false))
     expect(by_id.fetch(9)["company_id"]).to eq(2)
