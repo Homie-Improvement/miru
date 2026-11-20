@@ -778,243 +778,129 @@ RSpec.describe Invoices::LegacyReservations, committed_data: true do
   end
 end
 
+# "Inside a spec-opened transaction with a caller mark set, prepare, commit (apply_release) and mark_billed each
+# read legacy_gateway during the timesheet_entries write and the caller's mark afterwards"
 RSpec.describe Invoices::LegacyReservations do
-  # "Inside a spec-opened transaction with a caller mark set, prepare, commit (apply_release) and mark_billed each read legacy_gateway during the timesheet_entries write and the caller's mark afterwards"
-  it "prepare locks the entry under the legacy_gateway writer mark and puts back the caller's mark" do
-    company = create(:company)
-    client = create(:client, company:)
-    project = create(:project, client:, billable: true)
-    user = create(:user, current_workspace_id: company.id)
-    entry = create(:timesheet_entry, user:, project:, bill_status: "unbilled")
-    entry.update_columns(locked: false)
-    invoice = create(:invoice, company:, client:)
-    request = Invoices::ReservationRequest.new(
-      company_id: company.id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
-      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [entry.id]
+  let(:writer_mark_company) { create(:company) }
+  let(:writer_mark_client) { create(:client, company: writer_mark_company) }
+  let(:writer_mark_project) { create(:project, client: writer_mark_client, billable: true) }
+  let(:writer_mark_user) { create(:user, current_workspace_id: writer_mark_company.id) }
+  let(:writer_mark_invoice) { create(:invoice, company: writer_mark_company, client: writer_mark_client) }
+
+  def writer_mark_entry(**columns)
+    entry = create(:timesheet_entry, user: writer_mark_user, project: writer_mark_project, bill_status: "unbilled")
+    entry.update_columns(columns) if columns.any?
+    entry
+  end
+
+  def writer_mark_request(entries)
+    Invoices::ReservationRequest.new(
+      company_id: writer_mark_company.id, invoice_id: writer_mark_invoice.id, operation_id: SecureRandom.uuid,
+      generation: TimekeepingOwnership.current.generation, disposition: "active", entries:
     )
-    connection = ApplicationRecord.connection
-    marks_during_entry_writes = []
-    subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
-      next unless payload[:sql].start_with?('UPDATE "timesheet_entries"')
+  end
 
-      marks_during_entry_writes << connection.select_value("SELECT current_setting('miru.writer', true)")
+  def writer_mark_current
+    ApplicationRecord.connection.select_value("SELECT current_setting('miru.writer', true)")
+  end
+
+  # Runs the block in a transaction that first sets a caller mark. Returns the
+  # miru.writer values read right after each UPDATE of timesheet_entries, and
+  # the value read after the block, before that transaction ends: a read after
+  # the transaction ends would prove nothing, since SET LOCAL is gone by then.
+  def writer_marks_in_caller_transaction(&)
+    marks = []
+    on_sql = lambda do |*, payload|
+      marks << writer_mark_current if payload[:sql].to_s.start_with?('UPDATE "timesheet_entries"')
     end
+    seen_after = ApplicationRecord.transaction do
+      ApplicationRecord.connection.execute("SET LOCAL miru.writer = 'caller_mark'")
+      ActiveSupport::Notifications.subscribed(on_sql, "sql.active_record", &)
+      writer_mark_current
+    end
+    [marks, seen_after]
+  end
 
+  it "prepare locks the entry under the legacy_gateway writer mark and puts back the caller's mark" do
+    entry = writer_mark_entry(locked: false)
+    request = writer_mark_request([entry.id])
     outcome = nil
-    seen_after = begin
-      ApplicationRecord.transaction do
-        connection.execute("SET LOCAL miru.writer = 'caller_mark'")
-        outcome = described_class.new.prepare(request)
-        connection.select_value("SELECT current_setting('miru.writer', true)")
-      end
-    ensure
-      ActiveSupport::Notifications.unsubscribe(subscriber)
-    end
+
+    marks, seen_after = writer_marks_in_caller_transaction { outcome = described_class.new.prepare(request) }
 
     expect(outcome.state).to eq("prepared")
     expect(entry.reload.locked).to be(true)
-    expect(marks_during_entry_writes).not_to be_empty
-    expect(marks_during_entry_writes).to all(eq("legacy_gateway"))
+    expect(marks).not_to be_empty
+    expect(marks).to all(eq("legacy_gateway"))
     expect(seen_after).to eq("caller_mark")
   end
-end
 
-RSpec.describe Invoices::LegacyReservations do
-  # "Inside a spec-opened transaction with a caller mark set, prepare, commit (apply_release) and mark_billed each read legacy_gateway during the timesheet_entries write and the caller's mark afterwards"
-  it "commit unlocks a released entry under the legacy_gateway writer mark, puts back the caller's mark, and a redelivered commit writes no entry" do
-    company = create(:company)
-    client = create(:client, company:)
-    project = create(:project, client:, billable: true)
-    user = create(:user, current_workspace_id: company.id)
-    entry = create(:timesheet_entry, user:, project:, bill_status: "unbilled")
-    invoice = create(:invoice, company:, client:)
-    request = Invoices::ReservationRequest.new(
-      company_id: company.id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
-      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [entry.id]
-    )
-    entry.update_columns(locked: true)
+  it "a commit delivered twice in one caller transaction marks only the unlock write and leaves the caller's writer mark after both" do
+    entry = writer_mark_entry(locked: true)
+    request = writer_mark_request([])
     LegacyEntryRelease.insert(
-      { company_id: company.id, invoice_id: invoice.id, operation_id: request.operation_id,
+      { company_id: writer_mark_company.id, invoice_id: writer_mark_invoice.id, operation_id: request.operation_id,
         entry_ids: [entry.id], created_at: Time.current }
     )
-    connection = ApplicationRecord.connection
-    marks_during_entry_writes = []
-    subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
-      next unless payload[:sql].start_with?('UPDATE "timesheet_entries"')
+    outcomes = []
 
-      marks_during_entry_writes << connection.select_value("SELECT current_setting('miru.writer', true)")
+    marks, seen_after = writer_marks_in_caller_transaction do
+      2.times { outcomes << described_class.new.commit(request) }
     end
 
-    begin
-      seen_after = ApplicationRecord.transaction do
-        connection.execute("SET LOCAL miru.writer = 'caller_mark'")
-        described_class.new.commit(request)
-        connection.select_value("SELECT current_setting('miru.writer', true)")
-      end
-
-      expect(entry.reload.locked).to be(false)
-      expect(marks_during_entry_writes).not_to be_empty
-      expect(marks_during_entry_writes).to all(eq("legacy_gateway"))
-      expect(seen_after).to eq("caller_mark")
-
-      writes_before_redelivery = marks_during_entry_writes.size
-      outcome = described_class.new.commit(request)
-
-      expect(outcome.state).to eq("committed")
-      expect(marks_during_entry_writes.size).to eq(writes_before_redelivery)
-    ensure
-      ActiveSupport::Notifications.unsubscribe(subscriber)
-    end
+    expect(outcomes.map(&:state)).to eq(%w[committed committed])
+    expect(entry.reload.locked).to be(false)
+    expect(marks).to eq(["legacy_gateway"])
+    expect(seen_after).to eq("caller_mark")
   end
-end
 
-RSpec.describe Invoices::LegacyReservations do
-  # "Inside a spec-opened transaction with a caller mark set, prepare, commit (apply_release) and mark_billed each read legacy_gateway during the timesheet_entries write and the caller's mark afterwards"
   it "mark_billed bills the entry under the legacy_gateway writer mark and puts back the caller's mark" do
-    company = create(:company)
-    client = create(:client, company:)
-    project = create(:project, client:, billable: true)
-    user = create(:user, current_workspace_id: company.id)
-    entry = create(:timesheet_entry, user:, project:, bill_status: "unbilled")
-    invoice = create(:invoice, company:, client:)
-    request = Invoices::ReservationRequest.new(
-      company_id: company.id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
-      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [entry.id]
-    )
-    connection = ApplicationRecord.connection
-    marks_during_entry_writes = []
-    subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
-      next unless payload[:sql].start_with?('UPDATE "timesheet_entries"')
-
-      marks_during_entry_writes << connection.select_value("SELECT current_setting('miru.writer', true)")
-    end
-
+    entry = writer_mark_entry
+    request = writer_mark_request([entry.id])
     outcome = nil
-    seen_after = begin
-      ApplicationRecord.transaction do
-        connection.execute("SET LOCAL miru.writer = 'caller_mark'")
-        outcome = described_class.new.mark_billed(request)
-        connection.select_value("SELECT current_setting('miru.writer', true)")
-      end
-    ensure
-      ActiveSupport::Notifications.unsubscribe(subscriber)
-    end
+
+    marks, seen_after = writer_marks_in_caller_transaction { outcome = described_class.new.mark_billed(request) }
 
     expect(outcome.state).to eq("committed")
     expect(outcome.counts).to eq({ billed: 1 })
     expect(entry.reload.bill_status).to eq("billed")
-    expect(marks_during_entry_writes).not_to be_empty
-    expect(marks_during_entry_writes).to all(eq("legacy_gateway"))
+    expect(marks).not_to be_empty
+    expect(marks).to all(eq("legacy_gateway"))
     expect(seen_after).to eq("caller_mark")
   end
-end
 
-RSpec.describe Invoices::LegacyReservations do
   # "A failing mark_billed raises its own original error and the caller's mark is restored afterwards"
+  # Validation stops update! before any UPDATE runs, so no mark is read during a write here.
   it "a failing mark_billed raises its own validation error and the caller's writer mark is back afterwards" do
-    company = create(:company)
-    client = create(:client, company:)
-    project = create(:project, client:, billable: true)
-    user = create(:user, current_workspace_id: company.id)
-    entry = create(:timesheet_entry, user:, project:, bill_status: "unbilled")
-    entry.update_columns(duration: -5)
-    invoice = create(:invoice, company:, client:)
-    request = Invoices::ReservationRequest.new(
-      company_id: company.id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
-      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: [entry.id]
-    )
-    connection = ApplicationRecord.connection
+    entry = writer_mark_entry(duration: -5)
+    request = writer_mark_request([entry.id])
     raised = nil
 
-    seen_after = ApplicationRecord.transaction do
-      connection.execute("SET LOCAL miru.writer = 'caller_mark'")
-      begin
-        described_class.new.mark_billed(request)
-      rescue ActiveRecord::RecordInvalid => error
-        raised = error
-      end
-      connection.select_value("SELECT current_setting('miru.writer', true)")
+    _marks, seen_after = writer_marks_in_caller_transaction do
+      described_class.new.mark_billed(request)
+    rescue ActiveRecord::RecordInvalid => error
+      raised = error
     end
 
     expect(raised).to be_a(ActiveRecord::RecordInvalid)
     expect(seen_after).to eq("caller_mark")
     expect(entry.reload.bill_status).to eq("unbilled")
   end
-end
-
-RSpec.describe Invoices::LegacyReservations do
-  let(:partial_bill_company) { create(:company) }
-  let(:partial_bill_client) { create(:client, company: partial_bill_company) }
-  let(:partial_bill_project) { create(:project, client: partial_bill_client, billable: true) }
-  let(:partial_bill_user) { create(:user, current_workspace_id: partial_bill_company.id) }
 
   # "A failing mark_billed raises its own original error and the caller's mark is restored afterwards"
   it "mark_billed that fails on its second entry after billing the first raises RecordInvalid and puts back the caller's writer mark" do
-    valid_entry = create(:timesheet_entry, user: partial_bill_user, project: partial_bill_project, bill_status: "unbilled")
-    invalid_entry = create(:timesheet_entry, user: partial_bill_user, project: partial_bill_project, bill_status: "unbilled")
-    invalid_entry.update_columns(duration: -5)
-    invoice = create(:invoice, company: partial_bill_company, client: partial_bill_client)
-    request = Invoices::ReservationRequest.new(
-      company_id: partial_bill_company.id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
-      generation: TimekeepingOwnership.current.generation, disposition: "active",
-      entries: [valid_entry.id, invalid_entry.id]
-    )
-    connection = ApplicationRecord.connection
+    valid_entry = writer_mark_entry
+    invalid_entry = writer_mark_entry(duration: -5)
+    request = writer_mark_request([valid_entry.id, invalid_entry.id])
     raised = nil
 
-    seen_after = ApplicationRecord.transaction do
-      connection.execute("SET LOCAL miru.writer = 'caller_mark'")
-      begin
-        described_class.new.mark_billed(request)
-      rescue ActiveRecord::RecordInvalid => error
-        raised = error
-      end
-      connection.select_value("SELECT current_setting('miru.writer', true)")
+    _marks, seen_after = writer_marks_in_caller_transaction do
+      described_class.new.mark_billed(request)
+    rescue ActiveRecord::RecordInvalid => error
+      raised = error
     end
 
     expect(raised).to be_a(ActiveRecord::RecordInvalid)
-    expect(seen_after).to eq("caller_mark")
-  end
-end
-
-RSpec.describe Invoices::LegacyReservations do
-  let(:twice_commit_company) { create(:company) }
-  let(:twice_commit_client) { create(:client, company: twice_commit_company) }
-  let(:twice_commit_project) { create(:project, client: twice_commit_client, billable: true) }
-  let(:twice_commit_user) { create(:user, current_workspace_id: twice_commit_company.id) }
-
-  # "Inside a spec-opened transaction with a caller mark set, prepare, commit (apply_release) and mark_billed each
-  # read legacy_gateway during the timesheet_entries write and the caller's mark afterwards"
-  it "a commit delivered twice in one caller transaction marks only the unlock write and leaves the caller's writer mark after both" do
-    entry = create(:timesheet_entry, user: twice_commit_user, project: twice_commit_project, bill_status: "unbilled")
-    entry.update_columns(locked: true)
-    invoice = create(:invoice, company: twice_commit_company, client: twice_commit_client)
-    request = Invoices::ReservationRequest.new(
-      company_id: twice_commit_company.id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
-      generation: TimekeepingOwnership.current.generation, disposition: "active", entries: []
-    )
-    LegacyEntryRelease.insert(
-      { company_id: twice_commit_company.id, invoice_id: invoice.id, operation_id: request.operation_id,
-        entry_ids: [entry.id], created_at: Time.current }
-    )
-    connection = ApplicationRecord.connection
-    marks_during_entry_updates = []
-    subscriber = lambda do |*, payload|
-      next unless payload[:sql].to_s.start_with?('UPDATE "timesheet_entries"')
-
-      marks_during_entry_updates << connection.select_value("SELECT current_setting('miru.writer', true)")
-    end
-
-    seen_after = ApplicationRecord.transaction do
-      connection.execute("SET LOCAL miru.writer = 'caller_mark'")
-      ActiveSupport::Notifications.subscribed(subscriber, "sql.active_record") do
-        described_class.new.commit(request)
-        described_class.new.commit(request)
-      end
-      connection.select_value("SELECT current_setting('miru.writer', true)")
-    end
-
-    expect(marks_during_entry_updates).to eq(["legacy_gateway"])
     expect(seen_after).to eq("caller_mark")
   end
 end
