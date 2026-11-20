@@ -61,7 +61,7 @@ RSpec.describe TimekeepingDemo::Regression do
         states_called = []
         runner = lambda do |env:, argv:|
           state = env["TIMEKEEPING_OWNER_STATE"]
-          if state.nil? && argv.include?("switches_owner")
+          if state == "" && argv.include?("switches_owner")
             write_empty_switches_owner_report(argv)
             next true
           end
@@ -344,7 +344,10 @@ RSpec.describe TimekeepingDemo::Regression do
       expect(argv[argv.index("--tag") + 1]).to eq("switches_owner")
       expect(argv[argv.index("--format") + 1]).to eq("json")
       expect(argv).not_to include("--fail-if-no-examples")
-      expect(report_calls.first[:env]).to include("TIMEKEEPING_OWNER_STATE" => nil)
+      # A key that is set, even to "", is one dotenv never fills, so the report
+      # child must receive the key rather than have it removed.
+      expect(report_calls.first[:env]).to have_key("TIMEKEEPING_OWNER_STATE")
+      expect(report_calls.first[:env]).to include("TIMEKEEPING_OWNER_STATE" => "")
       expect(status).to eq(1)
     end
   end

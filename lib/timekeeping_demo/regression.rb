@@ -45,6 +45,11 @@ module TimekeepingDemo
     ].freeze
 
     OWNER_STATE_KEY = "TIMEKEEPING_OWNER_STATE"
+    # The switches_owner pass sends the key set to "" rather than removing it:
+    # dotenv fills only absent keys, so a removed key would come back from a
+    # local .env file. config/application.rb deletes an empty value right
+    # after dotenv loads, so the child's harness sees no state.
+    NO_OWNER_STATE = ""
     LEDGER_PATH_KEY = "TIMEKEEPING_QUEUE_LEDGER_PATH"
     LEDGER_FILE = "queue_ledger.json"
     REPORT_FILE = "switches_owner.json"
@@ -102,7 +107,7 @@ module TimekeepingDemo
         # The json formatter replaces the default one, so progress is named
         # again to keep rspec's failure details on stdout.
         argv = [*specs, "--tag", SWITCHES_OWNER_TAG, "--format", "json", "--out", out, "--format", "progress"]
-        runner_passed = runner.call(env: child_env(dir, nil), argv:).equal?(true)
+        runner_passed = runner.call(env: child_env(dir, NO_OWNER_STATE), argv:).equal?(true)
         report = read_report(out)
         puts REPORT_HEADING
         case report
@@ -117,10 +122,9 @@ module TimekeepingDemo
       end
     end
 
-    # A nil owner state removes the key from the child's environment, so a
-    # value the caller holds is not inherited; an empty string would make the
-    # child's harness reject it at load. Each child gets a ledger of its own
-    # because a child rspec deletes the ledger it is given at suite start.
+    # The owner state always overrides the caller's value. Each child gets a
+    # ledger of its own because a child rspec deletes the ledger it is given at
+    # suite start.
     def child_env(dir, owner_state)
       { OWNER_STATE_KEY => owner_state, LEDGER_PATH_KEY => File.join(dir, LEDGER_FILE) }.merge(CHILD_ENV)
     end
