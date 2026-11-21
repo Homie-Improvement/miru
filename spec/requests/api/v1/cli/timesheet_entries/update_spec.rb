@@ -8,7 +8,6 @@ RSpec.describe "Api::V1::Cli::TimesheetEntries#update", type: :request do
   let(:client) { create(:client, company:) }
   let(:project) { create(:project, billable: true, client:) }
   let(:other_project) { create(:project, billable: true, client:) }
-  let(:timesheet_entry) { create(:timesheet_entry, user:, project:, work_date: Date.current - 1.day, duration: 30) }
   let(:cli_token) { CliSession.issue_for(user:, company:).last }
 
   before do
@@ -18,8 +17,14 @@ RSpec.describe "Api::V1::Cli::TimesheetEntries#update", type: :request do
     create(:project_member, project: other_project, user:)
   end
 
-  it "updates one of the authenticated user's timesheet entries" do
-    send_request :patch, api_v1_cli_timesheet_entry_path(timesheet_entry), params: {
+  it "updates one of the authenticated user's timesheet entries", committed_data: true do
+    entry_id, = arrange_owned_entries(
+      [{ company:, user:, project:, work_date: Date.current - 1.day, duration: 30, note: "Did that", bill_status: "non_billable" }],
+      state: TimekeepingOwnerState.current
+    )
+    expect_owner_state!
+
+    send_request :patch, api_v1_cli_timesheet_entry_path(entry_id), params: {
       timesheet_entry: {
         project_id: other_project.id,
         duration_minutes: 45,
@@ -32,12 +37,19 @@ RSpec.describe "Api::V1::Cli::TimesheetEntries#update", type: :request do
     expect(response).to have_http_status(:ok)
     expect(json_response.dig("entry", "project_id")).to eq(other_project.id)
     expect(json_response.dig("entry", "duration")).to eq(45.0)
-    expect(timesheet_entry.reload.note).to eq("Updated from CLI")
-    expect(timesheet_entry.reload.source).to eq("cli")
+    updated_entry = owned_entry(entry_id, state: TimekeepingOwnerState.current)
+    expect(updated_entry.fetch("note")).to eq("Updated from CLI")
+    expect(updated_entry.fetch("source")).to eq("cli")
   end
 
-  it "updates AI source metadata on an existing timesheet entry" do
-    send_request :patch, api_v1_cli_timesheet_entry_path(timesheet_entry), params: {
+  it "updates AI source metadata on an existing timesheet entry", committed_data: true do
+    entry_id, = arrange_owned_entries(
+      [{ company:, user:, project:, work_date: Date.current - 1.day, duration: 30, note: "Did that", bill_status: "non_billable" }],
+      state: TimekeepingOwnerState.current
+    )
+    expect_owner_state!
+
+    send_request :patch, api_v1_cli_timesheet_entry_path(entry_id), params: {
       timesheet_entry: {
         project_id: other_project.id,
         duration_minutes: 45,
@@ -53,20 +65,23 @@ RSpec.describe "Api::V1::Cli::TimesheetEntries#update", type: :request do
 
     expect(response).to have_http_status(:ok)
     expect(json_response.dig("entry", "source_label")).to eq("Claude Code via Automation")
-    expect(timesheet_entry.reload.source_metadata).to include(
+    expect(owned_entry(entry_id, state: TimekeepingOwnerState.current).fetch("source_metadata")).to include(
       "tool" => "claude-code",
       "skill" => "gstack-review"
     )
   end
 
-  it "preserves optional fields when they are omitted" do
-    timesheet_entry.update!(
-      note: "Keep me",
-      bill_status: "non_billable",
-      source_metadata: { "tool" => "codex", "skill" => "existing" }
+  it "preserves optional fields when they are omitted", committed_data: true do
+    entry_id, = arrange_owned_entries(
+      [{
+        company:, user:, project:, work_date: Date.current - 1.day, duration: 30,
+        note: "Keep me", bill_status: "non_billable", source_metadata: { "tool" => "codex", "skill" => "existing" }
+      }],
+      state: TimekeepingOwnerState.current
     )
+    expect_owner_state!
 
-    send_request :patch, api_v1_cli_timesheet_entry_path(timesheet_entry), params: {
+    send_request :patch, api_v1_cli_timesheet_entry_path(entry_id), params: {
       timesheet_entry: {
         project_id: other_project.id,
         duration_minutes: 45,
@@ -75,17 +90,22 @@ RSpec.describe "Api::V1::Cli::TimesheetEntries#update", type: :request do
     }, headers: cli_auth_headers(cli_token)
 
     expect(response).to have_http_status(:ok)
-    expect(timesheet_entry.reload.note).to eq("Keep me")
-    expect(timesheet_entry.reload.bill_status).to eq("non_billable")
-    expect(timesheet_entry.reload.source_metadata).to eq({ "tool" => "codex", "skill" => "existing" })
+    kept_entry = owned_entry(entry_id, state: TimekeepingOwnerState.current)
+    expect(kept_entry.fetch("note")).to eq("Keep me")
+    expect(kept_entry.fetch("bill_status")).to eq("non_billable")
+    expect(kept_entry.fetch("source_metadata")).to eq({ "tool" => "codex", "skill" => "existing" })
   end
 
-  it "does not allow updating another user's timesheet entry" do
+  it "does not allow updating another user's timesheet entry", committed_data: true do
     other_user = create(:user, current_workspace_id: company.id)
     create(:employment, company:, user: other_user)
-    other_entry = create(:timesheet_entry, user: other_user, project:)
+    other_entry_id, = arrange_owned_entries(
+      [{ company:, user: other_user, project:, work_date: Date.current, duration: 480, note: "Did that", bill_status: "non_billable" }],
+      state: TimekeepingOwnerState.current
+    )
+    expect_owner_state!
 
-    send_request :patch, api_v1_cli_timesheet_entry_path(other_entry), params: {
+    send_request :patch, api_v1_cli_timesheet_entry_path(other_entry_id), params: {
       timesheet_entry: {
         project_id: project.id,
         duration_minutes: 15,

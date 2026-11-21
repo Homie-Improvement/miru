@@ -156,10 +156,12 @@ module Timekeeping
       end
 
       # An agent of another company or user would show its name beside this
-      # company's entry. An agent id that names no agent row is not decided
-      # here: the timesheet_entries -> agents foreign key, which the schema
-      # still keeps, refuses it. The share lock keeps each agent's company and
-      # user until this batch commits.
+      # company's entry, so an existing agent row must match the snapshot's
+      # company and user. An agent id that names no agent row is applied and
+      # stored as given, with no tenant check and no database key behind it:
+      # the agent can be deleted while the relay is still behind, and refusing
+      # the snapshot would stop every later delivery. The share lock keeps each
+      # agent's company and user until this batch commits.
       def refuse_foreign_agents!(items)
         agent_ids = items.filter_map(&:agent_id).uniq
         return if agent_ids.empty?

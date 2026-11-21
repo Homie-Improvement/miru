@@ -21,7 +21,7 @@ end
 RSpec.describe Timekeeping::ReservationAccess do
   # "The background credential (`TIMEKEEPING_SERVICE_TOKEN`) is bound to one `company_id` per request and
   # allowed only these operations: `reservations.prepare`, `reservations.commit`, `reservations.abort`,
-  # `invoices.mark_billed`, `entries.import`, `agents.detach_entries`."
+  # `invoices.mark_billed`, `agents.detach_entries`."
   it "binds a signed service token to its company and its named operations" do
     secret = "reservation-access-secret-#{SecureRandom.hex(16)}"
     resolve = lambda do |company_id, operations|
