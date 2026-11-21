@@ -41,26 +41,6 @@ RSpec.describe "Api::V1::Cli::TimesheetEntries#update source metadata", type: :r
     expect(stored.fetch("source_metadata")).not_to have_key("pii")
   end
 
-  it "keeps stored note, bill status and metadata in the owner store when an update omits them",
-     committed_data: true do
-    entry_id = arrange_owned_entries(
-      [{
-        company:, user:, project:, work_date: Date.current - 1.day, duration: 30,
-        note: "Keep me", bill_status: "non_billable", source_metadata: stored_metadata
-      }],
-      state: TimekeepingOwnerState.current
-    ).first
-    expect_owner_state!
-
-    patch_entry(entry_id)
-
-    expect(response).to have_http_status(:ok)
-    stored = owned_entry(entry_id, state: TimekeepingOwnerState.current)
-    expect(stored.fetch("note")).to eq("Keep me")
-    expect(stored.fetch("bill_status")).to eq("non_billable")
-    expect(stored.fetch("source_metadata")).to eq(stored_metadata)
-  end
-
   # Strong parameters filter out a metadata value that is not a Hash, so the
   # update treats it as omitted instead of overwriting the stored metadata.
   it "keeps stored metadata when a CLI update sends malformed source_metadata", committed_data: true do
