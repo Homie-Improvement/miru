@@ -53,6 +53,122 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded token", type: :request
     expect(claims.company_id).to eq(company.id)
     expect(create_request[:body]["user_id"]).to eq(colleague.id)
   end
+
+  it "more tests 2 prepared retry reusing a carried legacy key with other values answers only the generic 422 body and echoes nothing stored", type: :request do
+    client_key = "prepared-carried-reused-#{SecureRandom.hex(4)}"
+    private_note = "Stored-note-#{SecureRandom.hex(6)}"
+    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "legacy", handoff_step: nil)
+
+    send_request :post, api_v1_timesheet_entry_index_path, params: {
+      project_id: project.id, user_id: admin.id,
+      timesheet_entry: { duration: 30, work_date: Date.current, note: private_note, bill_status: :unbilled }
+    }, headers: auth_headers(admin).merge("Idempotency-Key" => client_key)
+    expect(response).to be_successful
+
+    receipt = Timekeeping::LegacyCreateReceipt.find_by!(company_id: company.id, actor_id: admin.id, key: client_key)
+    committed = TimesheetEntry.instantiate(receipt.entry_attributes)
+    entry_values = Timekeeping::LocalOwner::RESPONSE_FIELDS.index_with do |field|
+      Timekeeping::EntryOutbox.json_value(committed.read_attribute(field))
+    end
+    row = Timekeeping::LegacyCreateReceiptConversion.convert(
+      receipts: [receipt.attributes.except("entry_attributes").symbolize_keys.merge(entry_values:)],
+      captured_at: Time.current
+    )[:rows].first
+    Timekeeping::LocalOwner::Receipt.create!(row.except("id"))
+    prepare_local_ownership!
+    before_counts = timekeeping_row_counts
+    legacy_count = TimesheetEntry.count
+
+    send_request :post, api_v1_timesheet_entry_index_path, params: {
+      project_id: project.id, user_id: admin.id,
+      timesheet_entry: { duration: 45, work_date: Date.current, note: "Different values", bill_status: :unbilled }
+    }, headers: auth_headers(admin).merge("Idempotency-Key" => client_key)
+
+    # "The 422 key-reused refusal on the prepared path renders exactly the monolith's `errors.entry_write_rejected` body, the one the live replay table (#525, `MONOLITH_REFUSALS`) expects"
+    expect(response.status).to eq(422)
+    # The monolith renders a reused key as its rejected body plus the key-reused reason (ErrorHandler).
+    expect(response.parsed_body).to eq({ "errors" => I18n.t("errors.entry_write_rejected"),
+                                         "reason" => Timekeeping::Gateway::KEY_REUSED_REASON })
+    # The refusal must not let a caller who reuses a key read what the first request stored.
+    expect(response.body).not_to include(private_note)
+    expect(response.body).not_to include(receipt.fingerprint)
+    expect(response.body).not_to include(row["key"])
+    expect(response.body).not_to include(client_key)
+    # "The same key with different values is refused as key reused and writes nothing; an expired legacy receipt is not matched"
+    expect(timekeeping_row_counts).to eq(before_counts)
+    expect(TimesheetEntry.count).to eq(legacy_count)
+    expect(fake.requests.select { |request| request[:method] == "POST" }).to be_empty
+  end
+
+  it "more tests 3 renders exactly the entry_write_rejected 422 body when a prepared retry reuses a carried legacy create key with other values", type: :request do
+    key = "prepared-carried-key-reused-body"
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+      .update_columns(owner: "monolith", monolith_store: "legacy", generation: 1, handoff_step: nil)
+    send_request :post, api_v1_timesheet_entry_index_path, params: {
+      project_id: project.id, user_id: admin.id,
+      timesheet_entry: { duration: 30, work_date: Date.current, note: "First attempt", bill_status: :unbilled }
+    }, headers: auth_headers(admin).merge("Idempotency-Key" => key)
+    expect(response).to be_successful
+
+    receipt = Timekeeping::LegacyCreateReceipt.find_by!(company_id: company.id, actor_id: admin.id, key:)
+    committed = TimesheetEntry.instantiate(receipt.entry_attributes)
+    entry_values = Timekeeping::LocalOwner::RESPONSE_FIELDS.index_with do |field|
+      Timekeeping::EntryOutbox.json_value(committed.read_attribute(field))
+    end
+    row = Timekeeping::LegacyCreateReceiptConversion.convert(
+      receipts: [receipt.attributes.except("entry_attributes").symbolize_keys.merge(entry_values:)],
+      captured_at: Time.current
+    )[:rows].first
+    Timekeeping::LocalOwner::Receipt.create!(row.except("id"))
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+      .update_columns(owner: "monolith", monolith_store: "prepared", generation: 2)
+    counts_before = timekeeping_row_counts
+    legacy_count = TimesheetEntry.count
+
+    send_request :post, api_v1_timesheet_entry_index_path, params: {
+      project_id: project.id, user_id: admin.id,
+      timesheet_entry: { duration: 45, work_date: Date.current, note: "Other values", bill_status: :unbilled }
+    }, headers: auth_headers(admin).merge("Idempotency-Key" => key)
+
+    # "The 422 key-reused refusal on the prepared path renders exactly the monolith's `errors.entry_write_rejected` body, the one the live replay table (#525, `MONOLITH_REFUSALS`) expects"
+    expect(response.status).to eq(422)
+    expect(response.parsed_body).to eq({ "errors" => I18n.t("errors.entry_write_rejected"),
+                                         "reason" => Timekeeping::Gateway::KEY_REUSED_REASON })
+    expect(response.body).not_to include("First attempt")
+    expect(timekeeping_row_counts).to eq(counts_before)
+    expect(TimesheetEntry.count).to eq(legacy_count)
+  end
+
+  it "more tests 4 renders exactly the entry_write_rejected 422 body when a prepared retry meets a derived-key receipt with another fingerprint", type: :request do
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+      .update_columns(owner: "monolith", monolith_store: "prepared", generation: 2, handoff_step: nil)
+    client_key = "k-prepared-derived-#{SecureRandom.hex(4)}"
+    params = {
+      project_id: project.id, user_id: admin.id,
+      timesheet_entry: { duration: 30, work_date: Date.current, note: "Prepared first", bill_status: :unbilled }
+    }
+    headers = auth_headers(admin).merge("Idempotency-Key" => client_key)
+
+    send_request :post, api_v1_timesheet_entry_index_path, params:, headers: headers
+    expect(response).to be_successful
+    receipts = Timekeeping::LocalOwner::Receipt.where(company_id: company.id, actor_id: admin.id, operation: "create ")
+    expect(receipts.pluck(:key))
+      .to eq([Timekeeping::EntryWriteClient.idempotency_key(request_id: client_key, operation: "create")])
+    # Stands for a receipt the other owner stored for this key under its own fingerprint rule.
+    receipts.update_all(fingerprint: "another-owner-fingerprint")
+    entries_before = Timekeeping::LocalEntry.where(company_id: company.id).count
+    receipts_before = Timekeeping::LocalOwner::Receipt.where(company_id: company.id).count
+
+    send_request :post, api_v1_timesheet_entry_index_path, params:, headers: headers
+
+    # "The 422 key-reused refusal on the prepared path renders exactly the monolith's `errors.entry_write_rejected` body, the one the live replay table (#525, `MONOLITH_REFUSALS`) expects"
+    expect(response.status).to eq(422)
+    expect(response.parsed_body).to eq({ "errors" => I18n.t("errors.entry_write_rejected"),
+                                         "reason" => Timekeeping::Gateway::KEY_REUSED_REASON })
+    expect(Timekeeping::LocalEntry.where(company_id: company.id).count).to eq(entries_before)
+    expect(Timekeeping::LocalOwner::Receipt.where(company_id: company.id).count).to eq(receipts_before)
+    expect(TimesheetEntry.where(company_id: company.id)).not_to exist
+  end
 end
 
 RSpec.describe "Api::V1::TimesheetEntry gateway employee target", type: :request do
