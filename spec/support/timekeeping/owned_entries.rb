@@ -18,9 +18,9 @@ require_relative "regression_adapter"
 # entry attributes and checkpoint rows. TimekeepingOwnedEntries::Arrange,
 # included into every example, does the writes and reads.
 module TimekeepingOwnedEntries
-  ROW_KEYS = %i[company user project id work_date duration note bill_status locked].freeze
+  ROW_KEYS = %i[company user project id work_date duration note bill_status locked source_metadata].freeze
   REQUIRED_ROW_KEYS = %i[company user project].freeze
-  OPTIONAL_COLUMNS = %w[work_date duration note bill_status locked].freeze
+  OPTIONAL_COLUMNS = %w[work_date duration note bill_status locked source_metadata].freeze
 
   # LocalOwnerArrange's defaults, plus the values the entries table and the
   # checkpoint expect when a row names no note or lock.
@@ -194,7 +194,7 @@ module TimekeepingOwnedEntries
       def create_timesheet_entries(entries, **)
         entries.each do |entry|
           TimesheetEntry.create!(entry.slice("id", "user_id", "project_id", "work_date", "duration", "note",
-                                             "bill_status", "locked"))
+                                             "bill_status", "locked", "source_metadata"))
         end
       end
 
