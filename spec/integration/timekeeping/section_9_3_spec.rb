@@ -181,6 +181,30 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
       .fetch("locked")
   end
 
+  # Every stored column of the invoice, read fresh; nil once the row is gone.
+  def section_9_3_stored_invoice(invoice)
+    Invoice.uncached { Invoice.unscoped.find_by(id: invoice.id)&.attributes }
+  end
+
+  # Every stored column of the invoice's line items, read fresh, in id order.
+  def section_9_3_stored_lines(invoice)
+    InvoiceLineItem.uncached { InvoiceLineItem.where(invoice_id: invoice.id).order(:id).map(&:attributes) }
+  end
+
+  # The monolith's operation ledger for one invoice (intents, holding and
+  # outbox rows), which has no foreign key to invoices so a hard delete keeps it.
+  def section_9_3_monolith_ledger(company, invoice)
+    scope = { company_id: company.id, invoice_id: invoice.id }
+    InvoiceOperationIntent.uncached do
+      {
+        intents: InvoiceOperationIntent.where(scope).order(:created_at, :id)
+          .pluck(:operation_id, :state, :disposition, :desired_entry_ids),
+        holding: InvoiceEntryHolding.where(scope).pick(:entry_ids, :disposition),
+        outbox: InvoiceOperationOutboxItem.where(scope).order(:id).pluck(:operation_id, :kind)
+      }
+    end
+  end
+
   def section_9_3_bulk_delete(company, invoice)
     owner = company.users.with_role(:owner, company).order(:id).first!
     sign_in owner
@@ -401,7 +425,8 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
           entry = section_9_3_fresh_entry(company:, employee:, project:, note: "On the paid invoice")
           invoice = section_9_3_non_draft_holding(company:, project:, entries: [entry])
           create(:payment, invoice:, amount: 10)
-          lines_before = invoice.invoice_line_items.order(:id).pluck(:id, :timesheet_entry_id)
+          invoice_before = section_9_3_stored_invoice(invoice)
+          lines_before = section_9_3_stored_lines(invoice)
           baseline = section_9_3_reservations(company, [entry])
           expect(section_9_3_committed_by(baseline, entry, invoice).size).to eq(1),
             "#{name}: the non-draft should hold its entry committed before the delete; saw #{baseline.inspect}"
@@ -411,9 +436,10 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
           expect(answer.status).to eq(422), "#{name}: the bulk delete answered #{answer.status}"
           expect(JSON.parse(answer.body).fetch("undeletable_invoice_ids")).to eq([invoice.id]),
             "#{name}: the refusal should name the paid invoice"
-          expect(Invoice.unscoped.exists?(id: invoice.id)).to be(true), "#{name}: the paid invoice should remain"
-          expect(InvoiceLineItem.where(invoice_id: invoice.id).order(:id).pluck(:id, :timesheet_entry_id))
-            .to eq(lines_before), "#{name}: the paid invoice's line items should be unchanged"
+          expect(section_9_3_stored_invoice(invoice)).to eq(invoice_before),
+            "#{name}: the paid invoice's stored row should be unchanged"
+          expect(section_9_3_stored_lines(invoice)).to eq(lines_before),
+            "#{name}: the paid invoice's stored line items should be unchanged"
           after = section_9_3_reservations(company, [entry])
           expect(after).to eq(baseline),
             "#{name}: reservations after the refused delete #{after.inspect} differ from before #{baseline.inspect}"
@@ -450,6 +476,16 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
           expect(operations.map { |operation| operation.fetch(:operation_id) })
             .to include(retained.first&.fetch(:operation_id)),
               "#{name}: the retained reservation should name an operation the ledger kept; saw #{operations.inspect}"
+          ledger = section_9_3_monolith_ledger(company, invoice)
+          expect(ledger[:intents].map { |intent| intent.drop(1) })
+            .to eq([["committed", "active", [entry.id]], ["committed", "retained", [entry.id]]]),
+              "#{name}: the deleted invoice's intents should stay in the monolith ledger; saw #{ledger.inspect}"
+          expect(ledger[:intents].map(&:first).map(&:to_s)).to eq(operations.map { |operation| operation.fetch(:operation_id) }),
+            "#{name}: the monolith intents and Timekeeping operations should name the same operations; saw #{ledger.inspect}"
+          expect(ledger[:holding]).to eq([[entry.id], "retained"]),
+            "#{name}: the deleted invoice's holding should stay, retained; saw #{ledger.inspect}"
+          expect(ledger[:outbox]).to eq(ledger[:intents].map { |intent| [intent.first, "commit"] }),
+            "#{name}: each kept intent should keep its commit outbox row; saw #{ledger.inspect}"
           status = section_9_3_employee_edit_status(employee:, project:, entry:)
           expect(status).to be_between(400, 499),
             "#{name}: an employee edit of the retained entry answered #{status}, not a refusal"
