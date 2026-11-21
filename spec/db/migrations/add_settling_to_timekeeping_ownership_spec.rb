@@ -42,7 +42,7 @@ RSpec.describe AddSettlingToTimekeepingOwnership do
 
     expect(earlier).to include(20261117120000, 20261118120000)
     expect(own.version).to be > earlier.max
-    # The schema is dumped at the latest migration, which may be a later one than this.
+    # Later migrations move the schema version on, so check the schema includes this one rather than ends at it.
     schema_version = Rails.root.join("db/schema.rb").read[/define\(version: ([\d_]+)\)/, 1].delete("_").to_i
     expect(schema_version).to be >= own.version
   end
