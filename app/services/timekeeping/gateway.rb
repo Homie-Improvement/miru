@@ -337,7 +337,7 @@ module Timekeeping
       def bulk_write(operation:, identity:, entry_ids:, check:, expected_generation:, scope:)
         perform(expected_generation) do |ownership, owner|
           replayed = replay_committed(ownership:, owner:, operation:, identity:,
-                                      keys: bulk_replay_keys(operation, identity.fetch("entry_ids")))
+                                      keys: replay_keys(bulk_request_key(operation, identity.fetch("entry_ids"))))
           if replayed
             next BulkResult.new(entries: replayed_bulk_entries(ownership:, owner:, entry_ids:, scope:), refusal: nil,
                                 written: reported?(replayed, BULK_RESULTS.fetch(operation)))
@@ -538,7 +538,7 @@ module Timekeeping
       # identity is nil, for a receipt that fingerprints the body itself.
       # :reek:LongParameterList
       def replay_local(ownership:, operation:, identity:, entry_id: nil, body: nil,
-                       keys: replay_keys(operation, entry_id))
+                       keys: replay_keys(request_key(operation, entry_id)))
         params = { "entry_id" => entry_id }
         params["body"] = as_json_value(body) unless body.nil?
         json_identity = identity.nil? ? nil : as_json_value(identity)
@@ -559,7 +559,7 @@ module Timekeeping
       # store keeps receipts for creates only, which legacy_create reads.
       # :reek:LongParameterList
       def replay_committed(ownership:, owner:, operation:, identity:, entry_id: nil,
-                           keys: replay_keys(operation, entry_id))
+                           keys: replay_keys(request_key(operation, entry_id)))
         case owner
         when :prepared then replay_local(ownership:, operation:, identity:, entry_id:, keys:)
         when :timekeeping then replay_pre_change_receipt(operation:, identity:, entry_id:)
@@ -583,21 +583,14 @@ module Timekeeping
         local_answer(operation, outcome) unless outcome.nil?
       end
 
-      # The keys a retry of a single-entry write may have been stored under:
-      # the key this change derives, then the raw client key that receipts
-      # written before it used. A key derived from the request id alone is new
-      # on every retry, so a request without a client key looks up nothing.
-      def replay_keys(operation, entry_id)
+      # The keys a retry may have been stored under: derived_key, then the raw
+      # client key that receipts written before keys were derived used. A key
+      # derived from the request id alone is new on every retry, so a request
+      # without a client key looks up nothing.
+      def replay_keys(derived_key)
         return [] if context.idempotency_key.nil?
 
-        [request_key(operation, entry_id), context.idempotency_key]
-      end
-
-      # As replay_keys, for a bulk write keyed over the requested ids.
-      def bulk_replay_keys(operation, entry_ids)
-        return [] if context.idempotency_key.nil?
-
-        [bulk_request_key(operation, entry_ids), context.idempotency_key]
+        [derived_key, context.idempotency_key]
       end
 
       # A success answers its body; a refusal raises the error a Timekeeping
