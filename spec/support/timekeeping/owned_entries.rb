@@ -206,10 +206,16 @@ module TimekeepingOwnedEntries
         Timekeeping::Handoff::TimekeepingStore.new(base_url: live.base_url, token: live.service_token)
       end
 
+      # TimesheetEntry refuses to create a billed row, so a billed entry is
+      # created non-billable and then marked billed without callbacks.
       def create_timesheet_entries(entries, **)
         entries.each do |entry|
-          TimesheetEntry.create!(entry.slice("id", "user_id", "project_id", "work_date", "duration", "note",
-                                             "bill_status", "locked"))
+          attributes = entry.slice("id", "user_id", "project_id", "work_date", "duration", "note", "bill_status",
+                                   "locked")
+          billed = attributes.fetch("bill_status") == "billed"
+          attributes = attributes.merge("bill_status" => "non_billable") if billed
+          record = TimesheetEntry.create!(attributes)
+          record.update_column(:bill_status, "billed") if billed
         end
       end
 
