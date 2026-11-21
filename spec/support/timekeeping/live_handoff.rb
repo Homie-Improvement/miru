@@ -208,6 +208,9 @@ module LiveHandoff
     http_request = build_http_request(uri, request)
     response = Net::HTTP.start(uri.host, uri.port, open_timeout: OPEN_TIMEOUT_SECONDS,
                                                    read_timeout: READ_TIMEOUT_SECONDS) do |http|
+      # Net::HTTP resends an idempotent request (GET, PUT, DELETE) once when
+      # the connection drops; a replay proof must see exactly one attempt.
+      http.max_retries = 0
       http.request(http_request)
     end
     Reply.new(status: Integer(response.code, 10), body: response.body.to_s.b)

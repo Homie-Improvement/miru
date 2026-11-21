@@ -73,7 +73,14 @@ RSpec.describe "Timekeeping handoff sequence", :integrated_runtime, :two_tenant_
 
       expect(report.fetch("companies").keys.map { |id| Integer(id) }).to match_array(company_ids)
       expect([by_id.call(entry_id), by_values.call]).to eq([1, 1])
-      drained = timekeeping.exec_params("SELECT project_id, user_id FROM entries WHERE id = $1", [entry_id]).first
+      # The row the response named must itself hold every written value, not only share a count with one that does.
+      drained = timekeeping.exec_params(
+        "SELECT note, duration, work_date, project_id, user_id FROM entries WHERE id = $1 AND company_id = $2",
+        [entry_id, copper_kettle.id]
+      ).first
+      expect(drained.fetch("note")).to eq(note)
+      expect(Float(drained.fetch("duration"))).to eq(duration)
+      expect(drained.fetch("work_date")).to eq(work_date)
       expect(drained.fetch("project_id").to_i).to eq(project.id)
       expect(drained.fetch("user_id").to_i).to eq(owner.id)
     end

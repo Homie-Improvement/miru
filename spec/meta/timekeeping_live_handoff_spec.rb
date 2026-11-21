@@ -3,6 +3,7 @@
 require "rails_helper"
 require "pg"
 require "securerandom"
+require "socket"
 
 RSpec.describe LiveHandoff do
   it "web_replay_request carries only the replaying company's X-Auth credentials and drops the recorded Authorization header" do
@@ -172,28 +173,33 @@ RSpec.describe LiveHandoff do
     # "Every query filters by that one company id (or its `company_ids` list); counts of two companies are never added together."
     a_counts = described_class.monolith_counts(company_id: company_a)
     b_counts = described_class.monolith_counts(company_id: company_b)
-    # Nine monolith counts: eight row counts of 2 for A, and A's version sum 2 * 3 = 6.
-    expect(a_counts.size).to eq(9)
-    expect(a_counts.values.sort).to eq([2, 2, 2, 2, 2, 2, 2, 2, 6])
-    expect(b_counts.values).to eq([1] * 9)
+    # Two rows per table for A, with a version sum of 2 * 3 = 6; one row per table for B, version sum 1.
+    expect(a_counts).to eq(
+      timesheet_entries: 2, entries: 2, entry_versions: 6, timesheet_entry_audits: 2, entry_audits: 2,
+      legacy_create_receipts: 2, idempotency_records: 2, entry_snapshot_receipts: 2, entry_outbox_items: 2
+    )
+    expect(b_counts).to eq(
+      timesheet_entries: 1, entries: 1, entry_versions: 1, timesheet_entry_audits: 1, entry_audits: 1,
+      legacy_create_receipts: 1, idempotency_records: 1, entry_snapshot_receipts: 1, entry_outbox_items: 1
+    )
 
-    changed_amounts = lambda do |before, after|
+    changed_counts = lambda do |before, after|
       expect(after.keys).to match_array(before.keys)
-      before.keys.filter_map { |key| after.fetch(key) - before.fetch(key) unless after.fetch(key) == before.fetch(key) }.sort
+      after.to_h { |key, value| [key, value - before.fetch(key)] }.reject { |_key, delta| delta.zero? }
     end
 
     # "adding an entry, raising one entry's version, adding an audit row and adding a receipt for company A changes
     # exactly the matching counts of A and leaves every count of company B unchanged."
     writes = {
-      "an entry" => [-> { insert_entry.call(company_a, 1) }, [1, 1]],
-      "a raised version" => [-> { connection.exec_query("UPDATE entries SET version = version + 1 WHERE id = (SELECT min(id) FROM entries WHERE company_id = $1)", "live_handoff_counts", [company_a]) }, [1]],
-      "an audit row" => [-> { insert_audit.call(company_a) }, [1]],
-      "a receipt" => [-> { insert_legacy_receipt.call(company_a) }, [1]]
+      "an entry" => [-> { insert_entry.call(company_a, 1) }, { entries: 1, entry_versions: 1 }],
+      "a raised version" => [-> { connection.exec_query("UPDATE entries SET version = version + 1 WHERE id = (SELECT min(id) FROM entries WHERE company_id = $1)", "live_handoff_counts", [company_a]) }, { entry_versions: 1 }],
+      "an audit row" => [-> { insert_audit.call(company_a) }, { timesheet_entry_audits: 1 }],
+      "a receipt" => [-> { insert_legacy_receipt.call(company_a) }, { legacy_create_receipts: 1 }]
     }
     writes.each do |label, (write, expected_changes)|
       a_before = described_class.monolith_counts(company_id: company_a)
       write.call
-      expect(changed_amounts.call(a_before, described_class.monolith_counts(company_id: company_a))).to eq(expected_changes), label
+      expect(changed_counts.call(a_before, described_class.monolith_counts(company_id: company_a))).to eq(expected_changes), label
       expect(described_class.monolith_counts(company_id: company_b)).to eq(b_counts), label
     end
   end
@@ -230,20 +236,42 @@ RSpec.describe LiveHandoff do
           [company_id, SecureRandom.uuid]
         )
       end
-      # Distinguishable seeds: A has one entry at version 2 and one receipt; B has three entries, two audit rows
-      # and three receipts, so a query that drops its company filter or adds both companies together fails.
+      add_service_receipt = lambda do |company_id|
+        connection.exec_params(
+          "INSERT INTO service_idempotency_receipts (company_id, actor_name, operation, key, fingerprint, status, " \
+          "body, created_at) VALUES ($1, 'live_handoff_spec', 'prepare', $2, 'live_handoff', 200, '{}', now())",
+          [company_id, SecureRandom.uuid]
+        )
+      end
+      # Written as already sent, so the runtime's relay never delivers these rows to the monolith.
+      add_outbox_snapshot = lambda do |company_id, entry_id|
+        connection.exec_params(
+          "INSERT INTO outbox_snapshots (id, company_id, project_id, user_id, work_date, duration, bill_status, " \
+          "review_status, locked, source, source_metadata, proof_metadata, created_at, updated_at, version, " \
+          "generation, sent_at) VALUES ($2, $1, 1, 1, CURRENT_DATE, 60, 'unbilled', 'not_required', false, " \
+          "'manual', '{}', '{}', now(), now(), 1, 1, now())",
+          [company_id, entry_id]
+        )
+      end
+      # Distinguishable seeds: A has one entry at version 2, one receipt, one service receipt and one outbox
+      # snapshot; B has three entries, two audit rows, three receipts, two service receipts and three outbox
+      # snapshots, so a query that drops its company filter or adds both companies together fails.
       a_entry = add_entry.call(company_a, 2)
       add_receipt.call(company_a)
+      add_service_receipt.call(company_a)
+      add_outbox_snapshot.call(company_a, a_entry)
       b_entries = Array.new(3) { add_entry.call(company_b, 1) }
       b_entries.first(2).each { |id| add_audit.call(company_b, id) }
       3.times { add_receipt.call(company_b) }
+      2.times { add_service_receipt.call(company_b) }
+      b_entries.each { |id| add_outbox_snapshot.call(company_b, id) }
 
       a_before = described_class.timekeeping_counts(company_id: company_a)
       b_before = described_class.timekeeping_counts(company_id: company_b)
       expect(a_before).to eq(entries: 1, entry_versions: 2, audit_events: 0, idempotency_receipts: 1,
-                             service_idempotency_receipts: 0, outbox_snapshots: 0)
+                             service_idempotency_receipts: 1, outbox_snapshots: 1)
       expect(b_before).to eq(entries: 3, entry_versions: 3, audit_events: 2, idempotency_receipts: 3,
-                             service_idempotency_receipts: 0, outbox_snapshots: 0)
+                             service_idempotency_receipts: 2, outbox_snapshots: 3)
       expect(described_class.tenant_counts(company_id: company_a).fetch(:timekeeping)).to eq(a_before)
 
       writes = {
@@ -253,7 +281,9 @@ RSpec.describe LiveHandoff do
           { entry_versions: 4 }
         ],
         "add an audit row" => [-> { add_audit.call(company_a, a_entry) }, { audit_events: 1 }],
-        "add a receipt" => [-> { add_receipt.call(company_a) }, { idempotency_receipts: 1 }]
+        "add a receipt" => [-> { add_receipt.call(company_a) }, { idempotency_receipts: 1 }],
+        "add a service receipt" => [-> { add_service_receipt.call(company_a) }, { service_idempotency_receipts: 1 }],
+        "add an outbox snapshot" => [-> { add_outbox_snapshot.call(company_a, a_entry) }, { outbox_snapshots: 1 }]
       }
       writes.each do |label, (write, expected_deltas)|
         before = described_class.timekeeping_counts(company_id: company_a)
@@ -266,7 +296,7 @@ RSpec.describe LiveHandoff do
     ensure
       if connection
         [company_a, company_b].each do |id|
-          %w[audit_events idempotency_receipts entries].each do |table|
+          %w[audit_events idempotency_receipts service_idempotency_receipts outbox_snapshots entries].each do |table|
             connection.exec_params("DELETE FROM #{connection.quote_ident(table)} WHERE company_id = $1", [id])
           end
         end
@@ -450,10 +480,36 @@ RSpec.describe LiveHandoff do
     expect(reply.body.encoding).to eq(Encoding::BINARY)
     expect(reply.body.bytesize).to eq(raw.bytesize)
   end
+
+  it "send_request sends a request once and raises when the connection drops, without a transport retry" do
+    WebMock.disable_net_connect!(allow_localhost: true)
+    listener = TCPServer.new("127.0.0.1", 0)
+    attempts = Queue.new
+    # Drops the first connection without a reply, and answers any second attempt.
+    server = Thread.new do
+      loop do
+        socket = listener.accept
+        while (line = socket.gets) && line != "\r\n"; end
+        attempts << :attempt
+        socket.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok") if attempts.size > 1
+        socket.close
+      end
+    end
+    request = { method: "PUT", path: "/entry", headers: {}, body: "" }
+
+    expect { described_class.send_request("http://127.0.0.1:#{listener.addr[1]}", request) }
+      .to raise_error(EOFError, "PUT /entry could not be sent")
+    expect(attempts.size).to eq(1)
+  ensure
+    server&.kill
+    listener&.close
+  end
 end
 
 
-RSpec.describe LiveHandoff, type: :request do
+# The receipt this example reads is written only by the legacy store's create
+# path, so it pins the legacy owner state whatever state the run selects.
+RSpec.describe LiveHandoff, type: :request, owner_state: "legacy" do
   it "expected_web_reply equals the body the web controller rendered for a legacy create with an Idempotency-Key" do
     company = create(:company)
     user = create(:user, current_workspace_id: company.id)
