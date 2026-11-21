@@ -17,6 +17,7 @@ RSpec.describe MCP::Miru::IdempotencyStore do
 
     it "does not cache results when idempotency key is blank" do
       calls = 0
+      expect_owner_state!
 
       2.times do
         described_class.fetch(tool_name:, idempotency_key: nil, authorization:) do
@@ -30,6 +31,7 @@ RSpec.describe MCP::Miru::IdempotencyStore do
 
     it "returns cached result for repeated key and authorization" do
       calls = 0
+      expect_owner_state!
 
       first = described_class.fetch(tool_name:, idempotency_key: "abc-123", authorization:) do
         calls += 1
@@ -47,6 +49,7 @@ RSpec.describe MCP::Miru::IdempotencyStore do
 
     it "isolates cache entries by authorization digest" do
       calls = 0
+      expect_owner_state!
 
       described_class.fetch(tool_name:, idempotency_key: "abc-123", authorization: "Bearer token-1") do
         calls += 1
@@ -69,6 +72,7 @@ RSpec.describe MCP::Miru::IdempotencyStore do
         body: '{"error":"temporary"}',
         json: { "error" => "temporary" }
       )
+      expect_owner_state!
 
       2.times do
         described_class.fetch(tool_name:, idempotency_key: "retryable", authorization:) do
@@ -82,6 +86,7 @@ RSpec.describe MCP::Miru::IdempotencyStore do
 
     it "does not run a duplicate request while the first request is in progress", committed_data: true do
       duplicate_error = nil
+      expect_owner_state!
 
       described_class.fetch(tool_name:, idempotency_key: "in-progress", authorization:) do
         Thread.new do
@@ -111,6 +116,7 @@ RSpec.describe MCP::Miru::IdempotencyStore do
       )
 
       calls = 0
+      expect_owner_state!
       described_class.fetch(tool_name:, idempotency_key: "expired", authorization:) do
         calls += 1
         result
