@@ -36,9 +36,11 @@ class Api::V1::Cli::TimesheetEntriesController < Api::V1::Cli::BaseController
 
   private
 
-    # A replayed update or delete returns a write already committed, so
-    # reading it back needs only show?: the edit policy may refuse the entry
-    # by now, such as one the edit billed or one past its edit window.
+    # A replayed update, or a delete replayed by the legacy store, returns a
+    # write already committed, so reading it back needs only show?: the edit
+    # policy may refuse the entry by now, such as one the edit billed or one
+    # past its edit window. The gateway's prepared and Timekeeping delete
+    # replays still check the delete policy instead.
     def authorize_replayed_entry(entry)
       authorize(entry, :show?)
     end
