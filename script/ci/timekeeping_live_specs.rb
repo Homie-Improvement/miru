@@ -53,6 +53,9 @@ module TimekeepingLiveSpecs
 
       "origin/#{base_ref}"
     when "push"
+      # A push event does not say which branch a feature branch was cut from, so it
+      # diffs against main. A branch cut from another release branch can then pick
+      # up that branch's own commits and run more live specs than it needs, never fewer.
       full_run_branches.include?(ref_name) ? nil : "origin/#{DEFAULT_BRANCH}"
     end
   end
