@@ -140,7 +140,9 @@ RSpec.describe "Timekeeping relay paused", :integrated_runtime, :two_tenant_seed
           live_handoff_catch_up!(through:)
 
           expect(relay_paused_projection_row(company_id: company.id, entry_id:)).not_to be_nil
-          expect(relay_paused_outbox_rows(company_id: company.id, entry_id:).map(&:last)).to all(be(true))
+          # The same rows queued before resume, each now sent, not removed.
+          expect(relay_paused_outbox_rows(company_id: company.id, entry_id:))
+            .to eq(outbox_rows.map { |position, _sent| [position, true] })
         end
       end
 
