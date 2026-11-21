@@ -1564,15 +1564,19 @@ RSpec.describe "Api::V1::TimesheetEntry legacy writes through the gateway", type
       entry = create(:timesheet_entry, user: employee, project:, bill_status: :unbilled, work_date: last_editable_day)
       sign_in employee
       headers = auth_headers(employee).merge("Idempotency-Key" => "legacy-delete-deadline-1")
+      # The first delete runs at midday, so just past the next midnight is always inside the 24-hour receipt.
+      midday = Time.current.beginning_of_day + 12.hours
 
-      send_request :delete, api_v1_timesheet_entry_path(entry), headers: headers
+      travel_to(midday) do
+        send_request :delete, api_v1_timesheet_entry_path(entry), headers: headers
+      end
       expect(response).to have_http_status(:ok)
       discarded_at = TimesheetEntry.find(entry.id).discarded_at
 
       # "a retried delete that carries the same Idempotency-Key as a delete this actor already committed answers success from the stored answer, not 404, and discards nothing else"
       # Just past midnight closes the edit window while the 24-hour receipt is still unexpired; a full day
       # later would land on the receipt's expiry boundary.
-      travel_to(Time.current.tomorrow.beginning_of_day + 1.minute) do
+      travel_to(midday.tomorrow.beginning_of_day + 1.minute) do
         send_request :delete, api_v1_timesheet_entry_path(entry), headers: headers
       end
 
@@ -1817,8 +1821,12 @@ RSpec.describe "Api::V1::TimesheetEntry legacy writes through the gateway", type
       entry = create(:timesheet_entry, user: employee, project:, bill_status: :unbilled, work_date: last_editable_day)
       sign_in employee
       headers = auth_headers(employee).merge("Idempotency-Key" => "legacy-delete-past-deadline")
+      # The first delete runs at midday, so just past the next midnight is always inside the 24-hour receipt.
+      midday = Time.current.beginning_of_day + 12.hours
 
-      send_request :delete, api_v1_timesheet_entry_path(entry), headers: headers
+      travel_to(midday) do
+        send_request :delete, api_v1_timesheet_entry_path(entry), headers: headers
+      end
       expect(response).to have_http_status(:ok)
       discarded_at = TimesheetEntry.find(entry.id).discarded_at
       audits_after_first = Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count
@@ -1827,7 +1835,7 @@ RSpec.describe "Api::V1::TimesheetEntry legacy writes through the gateway", type
       # committed answers success from the stored answer, not 404, and discards nothing else"; the edit deadline
       # passing between the attempts must not turn the committed delete into a refusal.
       # Just past midnight closes the edit window while the 24-hour receipt is still unexpired.
-      travel_to(Time.current.tomorrow.beginning_of_day + 1.minute) do
+      travel_to(midday.tomorrow.beginning_of_day + 1.minute) do
         send_request :delete, api_v1_timesheet_entry_path(entry), headers: headers
       end
 
