@@ -203,7 +203,7 @@ RSpec.describe Timekeeping::ReferenceFacts, "agents under deletion", committed_d
       expect(facts[:agents].pluck(:id)).not_to include(locked_agent.id)
     ensure
       release << true
-      holder.join(10)
+      stop_committed_data_threads(holder, wait: 10)
     end
   end
 end
