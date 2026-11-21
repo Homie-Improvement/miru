@@ -36,12 +36,13 @@ RSpec.describe "Api::V1::Cli::TimesheetEntries#create", type: :request do
     expect(created_entry.fetch("source")).to eq("cli")
   end
 
-  describe "event attribution" do
+  describe "event attribution", committed_data: true do
     let(:params) { { timesheet_entry: { project_id: project.id, duration_minutes: 30, work_date: Date.current.iso8601 } } }
 
     before { create(:project_member, project:, user:) }
 
     it "tags CLI writes with the CLI user and source" do
+      expect_owner_state!
       event = assert_event_reported("TimesheetEntries::Created") do
         send_request :post, api_v1_cli_timesheet_entries_path, params:, headers: cli_auth_headers(cli_token)
       end
@@ -51,6 +52,7 @@ RSpec.describe "Api::V1::Cli::TimesheetEntries#create", type: :request do
     end
 
     it "tags MCP proxied writes with the mcp source" do
+      expect_owner_state!
       event = assert_event_reported("TimesheetEntries::Created") do
         MCP::Miru::ApiProxy.request(
           method: :post, path: "/api/v1/cli/timesheet_entries", authorization: "Bearer #{cli_token}", body: params
@@ -62,8 +64,9 @@ RSpec.describe "Api::V1::Cli::TimesheetEntries#create", type: :request do
     end
   end
 
-  it "creates a timesheet entry with AI source metadata" do
+  it "creates a timesheet entry with AI source metadata", committed_data: true do
     create(:project_member, project:, user:)
+    expect_owner_state!
 
     send_request :post, api_v1_cli_timesheet_entries_path, params: {
       timesheet_entry: {
@@ -85,15 +88,18 @@ RSpec.describe "Api::V1::Cli::TimesheetEntries#create", type: :request do
     expect(json_response.dig("entry", "source")).to eq("mcp")
     expect(json_response.dig("entry", "source_label")).to eq("Codex via MCP")
     expect(json_response.dig("entry", "source_metadata", "skill")).to eq("gstack-qa")
-    expect(TimesheetEntry.last.source_metadata).to include(
+    created_entry = owned_entry(json_response.dig("entry", "id"), state: TimekeepingOwnerState.current)
+    expect(created_entry.fetch("source_metadata")).to include(
       "tool" => "codex",
       "skill" => "gstack-qa",
       "mcp_server" => "github"
     )
-    expect(TimesheetEntry.last.source_metadata).not_to have_key("pii")
+    expect(created_entry.fetch("source_metadata")).not_to have_key("pii")
   end
 
-  it "does not allow an employee to create an entry for an unassigned project" do
+  it "does not allow an employee to create an entry for an unassigned project", committed_data: true do
+    expect_owner_state!
+
     send_request :post, api_v1_cli_timesheet_entries_path, params: {
       timesheet_entry: {
         project_id: project.id,
@@ -105,8 +111,9 @@ RSpec.describe "Api::V1::Cli::TimesheetEntries#create", type: :request do
     expect(response).to have_http_status(:not_found)
   end
 
-  it "returns an error for an invalid bill status" do
+  it "returns an error for an invalid bill status", committed_data: true do
     create(:project_member, project:, user:)
+    expect_owner_state!
 
     send_request :post, api_v1_cli_timesheet_entries_path, params: {
       timesheet_entry: {
