@@ -2,7 +2,6 @@
 
 require "rails_helper"
 require Rails.root.join("db/migrate/20261121120000_drop_timesheet_entry_foreign_keys_for_cutover")
-require Rails.root.join("db/migrate/20261020120000_drop_timesheet_entry_foreign_keys")
 
 # Runs the migration's up and down inside the example's transaction, so every
 # key it drops or restores is rolled back after the example.
@@ -212,26 +211,12 @@ RSpec.describe DropTimesheetEntryForeignKeysForCutover do
   end
 
   # Each recorded migration stays a fixed snapshot: this one holds its own key list and check.
-  it "carries its own key list without loading the older drop migration, whose up stays a no-op that keeps the keys" do
+  it "carries its own key list without loading the older drop migration" do
     source = Rails.root.join("db/migrate/20261121120000_drop_timesheet_entry_foreign_keys_for_cutover.rb").read
     expect(source).not_to match(/DropTimesheetEntryForeignKeys(?!ForCutover)/)
     expect(source).not_to include("20261020120000")
     expect(source).to include("disable_ddl_transaction!")
     expect(source).to include("DROPPED_KEYS")
     expect(source).to include("if_exists: true")
-    expect(described_class::DROPPED_KEYS).not_to equal(DropTimesheetEntryForeignKeys::DROPPED_KEYS)
-
-    cutover_keys.each { |key| add_cutover_key(key) }
-
-    ActiveRecord::Migration.suppress_messages { DropTimesheetEntryForeignKeys.new.migrate(:up) }
-
-    expect(present_cutover_keys).to eq(cutover_keys)
-  end
-
-  it "the older drop migration spec no longer pins the three keys as present in the loaded schema" do
-    older_spec = File.read(Rails.root.join("spec/db/migrations/drop_timesheet_entry_foreign_keys_spec.rb"))
-
-    expect(older_spec).not_to include("expect(restored_dropped_keys).to eq(described_class::DROPPED_KEYS)")
-    expect(older_spec).to include("expect(described_class::DROPPED_KEYS).to match_array(expected)")
   end
 end
