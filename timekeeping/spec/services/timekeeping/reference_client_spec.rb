@@ -180,35 +180,35 @@ RSpec.describe Timekeeping::ReferenceClient do
   end
 
   context "more tests 2" do
-  # "Timekeeping cannot yet tell another company's agent from one of the company's own agents that has no entries."
-  # The monolith answers only the requested ids that are the path company's agents.
-  it "returns owned_agent_ids for the requested agent ids sent with the service token" do
-    stub = stub_request(:get, reference_url)
-      .with(query: hash_including("agent_ids" => "31,99"), headers: { "Authorization" => "Bearer #{service_token}" })
-      .to_return(status: 200, body: facts_body.merge("owned_agent_ids" => [31]).to_json)
+    # "Timekeeping cannot yet tell another company's agent from one of the company's own agents that has no entries."
+    # The monolith answers only the requested ids that are the path company's agents.
+    it "returns owned_agent_ids for the requested agent ids sent with the service token" do
+      stub = stub_request(:get, reference_url)
+        .with(query: hash_including("agent_ids" => "31,99"), headers: { "Authorization" => "Bearer #{service_token}" })
+        .to_return(status: 200, body: facts_body.merge("owned_agent_ids" => [31]).to_json)
 
-    expect(client.owned_agent_ids(company_id: 5, agent_ids: [31, 99])).to eq([31])
-    expect(stub).to have_been_requested.once
-  end
+      expect(client.owned_agent_ids(company_id: 5, agent_ids: [31, 99])).to eq([31])
+      expect(stub).to have_been_requested.once
+    end
   end
 
   context "more tests 3" do
-  it "raises Unavailable rather than reading an agent as not owned when owned_agent_ids is missing or malformed" do
-    answers = [
-      { status: 200, body: facts_body.to_json },
-      { status: 200, body: facts_body.merge("owned_agent_ids" => ["31"]).to_json },
-      { status: 200, body: facts_body.merge("owned_agent_ids" => nil).to_json },
-      { status: 500, body: { reason: "boom" }.to_json }
-    ]
+    it "raises Unavailable rather than reading an agent as not owned when owned_agent_ids is missing or malformed" do
+      answers = [
+        { status: 200, body: facts_body.to_json },
+        { status: 200, body: facts_body.merge("owned_agent_ids" => ["31"]).to_json },
+        { status: 200, body: facts_body.merge("owned_agent_ids" => nil).to_json },
+        { status: 500, body: { reason: "boom" }.to_json }
+      ]
 
-    answers.each do |answer|
-      WebMock.reset!
-      stub_request(:get, reference_url).with(query: hash_including("agent_ids" => "31")).to_return(**answer)
+      answers.each do |answer|
+        WebMock.reset!
+        stub_request(:get, reference_url).with(query: hash_including("agent_ids" => "31")).to_return(**answer)
 
-      expect { client.owned_agent_ids(company_id: 5, agent_ids: [31]) }
-        .to raise_error(described_class::Unavailable)
+        expect { client.owned_agent_ids(company_id: 5, agent_ids: [31]) }
+          .to raise_error(described_class::Unavailable)
+      end
     end
-  end
   end
 end
 

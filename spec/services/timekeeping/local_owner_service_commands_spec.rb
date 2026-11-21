@@ -241,61 +241,61 @@ RSpec.describe Timekeeping::LocalOwner, "service command access refusals" do
   end
 
   context "more tests 2", "service command access refusals" do
-  it "local detach_entries naming a real agent of the other company leaves every timekeeping row count unchanged, in both directions" do
-    generation = prepare_local_ownership!.generation.to_s
-    first = create(:company)
-    second = create(:company)
-    agents = [first, second].to_h { |company| [company, create(:agent, company:)] }
-    entries = agents.to_h do |company, agent|
-      [company, service_command_company_entry(company, role: "owner", work_date: "2026-03-02", duration: 60.0,
-                                                       agent_id: agent.id)]
-    end
-    before = entries.transform_values { |entry| entry.reload.attributes }
-    baseline = timekeeping_row_counts
+    it "local detach_entries naming a real agent of the other company leaves every timekeeping row count unchanged, in both directions" do
+      generation = prepare_local_ownership!.generation.to_s
+      first = create(:company)
+      second = create(:company)
+      agents = [first, second].index_with { |company| create(:agent, company:) }
+      entries = agents.to_h do |company, agent|
+        [company, service_command_company_entry(company, role: "owner", work_date: "2026-03-02", duration: 60.0,
+                                                         agent_id: agent.id)]
+      end
+      before = entries.transform_values { |entry| entry.reload.attributes }
+      baseline = timekeeping_row_counts
 
-    [[first, second], [second, first]].each do |requester, owner|
-      caller = described_class::Actor.service(name: "agent-destroy", company_id: requester.id,
-                                              operations: ["agents.detach_entries"])
-      outcome = described_class.call(
-        operation: :detach_entries, company_id: requester.id, generation:, actor: caller,
-        params: { "agent_id" => agents.fetch(owner).id, "operation_id" => SecureRandom.uuid }
-      )
+      [[first, second], [second, first]].each do |requester, owner|
+        caller = described_class::Actor.service(name: "agent-destroy", company_id: requester.id,
+                                                operations: ["agents.detach_entries"])
+        outcome = described_class.call(
+          operation: :detach_entries, company_id: requester.id, generation:, actor: caller,
+          params: { "agent_id" => agents.fetch(owner).id, "operation_id" => SecureRandom.uuid }
+        )
 
-      # "The change still stores a receipt for the requesting company when a detach-entries call names another company's agent and detaches nothing."
-      expect([outcome.status, outcome.body]).to eq([200, { "detached" => 0 }])
-      expect(timekeeping_row_counts).to eq(baseline)
-      expect(entries.transform_values { |entry| entry.reload.attributes }).to eq(before)
+        # "The change still stores a receipt for the requesting company when a detach-entries call names another company's agent and detaches nothing."
+        expect([outcome.status, outcome.body]).to eq([200, { "detached" => 0 }])
+        expect(timekeeping_row_counts).to eq(baseline)
+        expect(entries.transform_values { |entry| entry.reload.attributes }).to eq(before)
+      end
     end
-  end
   end
 
   context "more tests 3", "service command access refusals" do
-  it "local detach_entries of an own agent with no entries leaves a marker for that company only, and a foreign detach leaves none" do
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    other_company = create(:company)
-    own_agent = create(:agent, company:)
-    foreign_agent = create(:agent, company: other_company)
-    caller = described_class::Actor.service(name: "agent-destroy", company_id: company.id,
-                                            operations: ["agents.detach_entries"])
-    detach = lambda do |agent|
-      described_class.call(operation: :detach_entries, company_id: company.id, generation:, actor: caller,
-                           params: { "agent_id" => agent.id, "operation_id" => SecureRandom.uuid })
+    it "local detach_entries of an own agent with no entries leaves a marker for that company only, and a foreign detach leaves none" do
+      generation = prepare_local_ownership!.generation.to_s
+      company = create(:company)
+      other_company = create(:company)
+      own_agent = create(:agent, company:)
+      foreign_agent = create(:agent, company: other_company)
+      caller = described_class::Actor.service(name: "agent-destroy", company_id: company.id,
+                                              operations: ["agents.detach_entries"])
+      detach = lambda do |agent|
+        described_class.call(operation: :detach_entries, company_id: company.id, generation:, actor: caller,
+                             params: { "agent_id" => agent.id, "operation_id" => SecureRandom.uuid })
+      end
+
+      # "That receipt is also the marker that blocks a later entry write naming an agent that is being deleted."
+      own = own_agent.with_lock { detach.call(own_agent) }
+      foreign = detach.call(foreign_agent)
+
+      expect([own.status, own.body]).to eq([200, { "detached" => 0 }])
+      expect([foreign.status, foreign.body]).to eq([200, { "detached" => 0 }])
+      marker = Timekeeping::LocalOwner::ServiceCommands
+      expect(marker.agent_detached?(company.id, own_agent.id, after: 0)).to be(true)
+      expect(marker.agent_detached?(other_company.id, own_agent.id, after: 0)).to be(false)
+      # "The change still stores a receipt for the requesting company when a detach-entries call names another company's agent and detaches nothing."
+      expect(marker.agent_detached?(company.id, foreign_agent.id, after: 0)).to be(false)
+      expect(marker.agent_detached?(other_company.id, foreign_agent.id, after: 0)).to be(false)
     end
-
-    # "That receipt is also the marker that blocks a later entry write naming an agent that is being deleted."
-    own = own_agent.with_lock { detach.call(own_agent) }
-    foreign = detach.call(foreign_agent)
-
-    expect([own.status, own.body]).to eq([200, { "detached" => 0 }])
-    expect([foreign.status, foreign.body]).to eq([200, { "detached" => 0 }])
-    marker = Timekeeping::LocalOwner::ServiceCommands
-    expect(marker.agent_detached?(company.id, own_agent.id, after: 0)).to be(true)
-    expect(marker.agent_detached?(other_company.id, own_agent.id, after: 0)).to be(false)
-    # "The change still stores a receipt for the requesting company when a detach-entries call names another company's agent and detaches nothing."
-    expect(marker.agent_detached?(company.id, foreign_agent.id, after: 0)).to be(false)
-    expect(marker.agent_detached?(other_company.id, foreign_agent.id, after: 0)).to be(false)
-  end
   end
 end
 

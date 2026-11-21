@@ -210,44 +210,44 @@ RSpec.describe Timekeeping::ServiceCommands do
   end
 
   context "more tests 2" do
-  # "The change still stores a receipt for the requesting company when a detach-entries call names
-  # another company's agent and detaches nothing." The change must close this gap.
-  it "stores no receipt for either company when the agent_owned reader says the detached agent is not the requesting company's" do
-    foreign_entry = plain_entry(other_company, agent_id: 91)
-    asked = []
-    agent_owned = lambda do |company_id, agent_id|
-      asked << [company_id, agent_id]
-      false
+    # "The change still stores a receipt for the requesting company when a detach-entries call names
+    # another company's agent and detaches nothing." The change must close this gap.
+    it "stores no receipt for either company when the agent_owned reader says the detached agent is not the requesting company's" do
+      foreign_entry = plain_entry(other_company, agent_id: 91)
+      asked = []
+      agent_owned = lambda do |company_id, agent_id|
+        asked << [company_id, agent_id]
+        false
+      end
+      request = described_class::Request.new(route: :detach_entries, company_id: company, actor_name: "agent-destroy",
+                                             target_id: 91, operation_id: SecureRandom.uuid,
+                                             generation: timekeeping_arrange.current_generation)
+
+      outcome = described_class.new(agent_owned:).call(request)
+
+      expect([outcome.status, JSON.parse(outcome.body)]).to eq([200, { "detached" => 0 }])
+      expect(asked).to eq([[company, 91]])
+      expect(Entry.find(foreign_entry).agent_id).to eq(91)
+      expect(ServiceIdempotencyReceipt.where(company_id: [company, other_company]).count).to eq(0)
+      expect(described_class.agent_detached?(company, 91, after: 0)).to be(false)
     end
-    request = described_class::Request.new(route: :detach_entries, company_id: company, actor_name: "agent-destroy",
-                                           target_id: 91, operation_id: SecureRandom.uuid,
-                                           generation: timekeeping_arrange.current_generation)
-
-    outcome = described_class.new(agent_owned:).call(request)
-
-    expect([outcome.status, JSON.parse(outcome.body)]).to eq([200, { "detached" => 0 }])
-    expect(asked).to eq([[company, 91]])
-    expect(Entry.find(foreign_entry).agent_id).to eq(91)
-    expect(ServiceIdempotencyReceipt.where(company_id: [company, other_company]).count).to eq(0)
-    expect(described_class.agent_detached?(company, 91, after: 0)).to be(false)
-  end
   end
 
   context "more tests 3" do
-  # "That receipt is also the marker that blocks a later entry write naming an agent that is being deleted."
-  it "stores the detach marker for an owned agent with no entries so agent_detached? is true after the earlier fence" do
-    fence = described_class.detach_fence
-    request = described_class::Request.new(route: :detach_entries, company_id: company, actor_name: "agent-destroy",
-                                           target_id: 92, operation_id: SecureRandom.uuid,
-                                           generation: timekeeping_arrange.current_generation)
+    # "That receipt is also the marker that blocks a later entry write naming an agent that is being deleted."
+    it "stores the detach marker for an owned agent with no entries so agent_detached? is true after the earlier fence" do
+      fence = described_class.detach_fence
+      request = described_class::Request.new(route: :detach_entries, company_id: company, actor_name: "agent-destroy",
+                                             target_id: 92, operation_id: SecureRandom.uuid,
+                                             generation: timekeeping_arrange.current_generation)
 
-    outcome = described_class.new(agent_owned: ->(_company_id, _agent_id) { true }).call(request)
+      outcome = described_class.new(agent_owned: ->(_company_id, _agent_id) { true }).call(request)
 
-    expect([outcome.status, JSON.parse(outcome.body)]).to eq([200, { "detached" => 0 }])
-    expect(ServiceIdempotencyReceipt.where(company_id: company).count).to eq(1)
-    expect(ServiceIdempotencyReceipt.where(company_id: other_company).count).to eq(0)
-    expect(described_class.agent_detached?(company, 92, after: fence)).to be(true)
-    expect(described_class.agent_detached?(other_company, 92, after: fence)).to be(false)
-  end
+      expect([outcome.status, JSON.parse(outcome.body)]).to eq([200, { "detached" => 0 }])
+      expect(ServiceIdempotencyReceipt.where(company_id: company).count).to eq(1)
+      expect(ServiceIdempotencyReceipt.where(company_id: other_company).count).to eq(0)
+      expect(described_class.agent_detached?(company, 92, after: fence)).to be(true)
+      expect(described_class.agent_detached?(other_company, 92, after: fence)).to be(false)
+    end
   end
 end
