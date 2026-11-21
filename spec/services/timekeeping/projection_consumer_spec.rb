@@ -361,170 +361,170 @@ RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
   end
 
   context "more tests 2", "snapshot rules" do
-  context "when a snapshot names an agent with no agents row" do
-    # "A projection snapshot naming an agent id with no agents row is applied with that id, and the consumer comment says so"
-    # "Foreign-company and other-user agents stay refused."
-    it "applies a snapshot naming a deleted agent under its own company and user, while another company's agent is still refused" do
-      missing_agent_id = Agent.maximum(:id).to_i + 1_000
-      foreign_agent = create(:agent)
+    context "when a snapshot names an agent with no agents row" do
+      # "A projection snapshot naming an agent id with no agents row is applied with that id, and the consumer comment says so"
+      # "Foreign-company and other-user agents stay refused."
+      it "applies a snapshot naming a deleted agent under its own company and user, while another company's agent is still refused" do
+        missing_agent_id = Agent.maximum(:id).to_i + 1_000
+        foreign_agent = create(:agent)
 
-      expect(rules_deliver(rules_entry(id: 95_101, version: 1, agent_id: missing_agent_id))).to eq(rules_applied)
-      expect(rules_row(95_101)).to include("agent_id" => missing_agent_id, "company_id" => rules_company.id,
-                                           "user_id" => rules_user.id)
+        expect(rules_deliver(rules_entry(id: 95_101, version: 1, agent_id: missing_agent_id))).to eq(rules_applied)
+        expect(rules_row(95_101)).to include("agent_id" => missing_agent_id, "company_id" => rules_company.id,
+                                             "user_id" => rules_user.id)
 
-      expect(rules_deliver(rules_entry(id: 95_102, version: 1, agent_id: foreign_agent.id))).to eq(rules_invalid)
-      expect(rules_row(95_102)).to be_nil
+        expect(rules_deliver(rules_entry(id: 95_102, version: 1, agent_id: foreign_agent.id))).to eq(rules_invalid)
+        expect(rules_row(95_102)).to be_nil
+      end
     end
-  end
   end
 
   context "more tests 3", "snapshot rules" do
-  context "when a batch mixes a deleted agent with another user's agent" do
-    # "Foreign-company and other-user agents stay refused."
-    # Accepting an agent id with no agents row must not let an existing agent of another user through in the
-    # same batch.
-    it "refuses a whole batch that pairs a deleted agent with another user's agent, and applies the deleted agent alone" do
-      missing_agent_id = Agent.maximum(:id).to_i + 1_000
-      other_users_agent = create(:agent, company: rules_company)
-      mixed = TimekeepingSnapshots.batch(
-        rules_item(rules_entry(id: 95_111, version: 1, agent_id: missing_agent_id), outbox_position: 1),
-        rules_item(rules_entry(id: 95_112, version: 1, agent_id: other_users_agent.id), outbox_position: 2)
-      )
+    context "when a batch mixes a deleted agent with another user's agent" do
+      # "Foreign-company and other-user agents stay refused."
+      # Accepting an agent id with no agents row must not let an existing agent of another user through in the
+      # same batch.
+      it "refuses a whole batch that pairs a deleted agent with another user's agent, and applies the deleted agent alone" do
+        missing_agent_id = Agent.maximum(:id).to_i + 1_000
+        other_users_agent = create(:agent, company: rules_company)
+        mixed = TimekeepingSnapshots.batch(
+          rules_item(rules_entry(id: 95_111, version: 1, agent_id: missing_agent_id), outbox_position: 1),
+          rules_item(rules_entry(id: 95_112, version: 1, agent_id: other_users_agent.id), outbox_position: 2)
+        )
 
-      refused = described_class.call(batch: mixed, idempotency_key: nil)
-      expect([refused.status, refused.body]).to eq(rules_invalid)
-      expect(rules_row(95_111)).to be_nil
-      expect(rules_row(95_112)).to be_nil
+        refused = described_class.call(batch: mixed, idempotency_key: nil)
+        expect([refused.status, refused.body]).to eq(rules_invalid)
+        expect(rules_row(95_111)).to be_nil
+        expect(rules_row(95_112)).to be_nil
 
-      # "A projection snapshot naming an agent id with no agents row is applied with that id, and the consumer comment says so"
-      expect(rules_deliver(rules_entry(id: 95_111, version: 1, agent_id: missing_agent_id))).to eq(rules_applied)
-      expect(rules_row(95_111)).to include("agent_id" => missing_agent_id)
+        # "A projection snapshot naming an agent id with no agents row is applied with that id, and the consumer comment says so"
+        expect(rules_deliver(rules_entry(id: 95_111, version: 1, agent_id: missing_agent_id))).to eq(rules_applied)
+        expect(rules_row(95_111)).to include("agent_id" => missing_agent_id)
+      end
     end
-  end
   end
 
   context "more tests 4", "snapshot rules" do
-  # "A projection snapshot naming an agent id with no agents row is applied with that id, and the consumer comment says so"
-  it "applies a snapshot naming an agent id with no agents row, stores that id, and a repeated delivery adds no second row" do
-    missing_agent_id = Agent.maximum(:id).to_i + 1_000
-    snapshot = rules_entry(id: 94_031, version: 1, agent_id: missing_agent_id)
+    # "A projection snapshot naming an agent id with no agents row is applied with that id, and the consumer comment says so"
+    it "applies a snapshot naming an agent id with no agents row, stores that id, and a repeated delivery adds no second row" do
+      missing_agent_id = Agent.maximum(:id).to_i + 1_000
+      snapshot = rules_entry(id: 94_031, version: 1, agent_id: missing_agent_id)
 
-    expect(rules_deliver(snapshot)).to eq([200, { "applied" => 1, "ignored" => 0 }])
-    stored = ActiveRecord::Base.connection.select_one("SELECT * FROM timesheet_entries WHERE id = 94031")
-    expect(stored).to include("agent_id" => missing_agent_id, "version" => 1)
+      expect(rules_deliver(snapshot)).to eq([200, { "applied" => 1, "ignored" => 0 }])
+      stored = ActiveRecord::Base.connection.select_one("SELECT * FROM timesheet_entries WHERE id = 94031")
+      expect(stored).to include("agent_id" => missing_agent_id, "version" => 1)
 
-    redelivered_status, = rules_deliver(snapshot)
-    expect(redelivered_status).to eq(200)
-    rows = ActiveRecord::Base.connection.select_all("SELECT agent_id FROM timesheet_entries WHERE id = 94031").to_a
-    expect(rows).to eq([{ "agent_id" => missing_agent_id }])
-  end
+      redelivered_status, = rules_deliver(snapshot)
+      expect(redelivered_status).to eq(200)
+      rows = ActiveRecord::Base.connection.select_all("SELECT agent_id FROM timesheet_entries WHERE id = 94031").to_a
+      expect(rows).to eq([{ "agent_id" => missing_agent_id }])
+    end
   end
 
   context "more tests 5", "a snapshot naming a deleted agent" do
-  let(:missing_agent_company) { create(:company) }
-  let(:missing_agent_project) { create(:project, client: create(:client, company: missing_agent_company)) }
-  let(:missing_agent_user) do
-    create(:user).tap { |user| create(:employment, company: missing_agent_company, user:) }
-  end
+    let(:missing_agent_company) { create(:company) }
+    let(:missing_agent_project) { create(:project, client: create(:client, company: missing_agent_company)) }
+    let(:missing_agent_user) do
+      create(:user).tap { |user| create(:employment, company: missing_agent_company, user:) }
+    end
 
-  # "A projection snapshot naming an agent id with no agents row is applied with that id, and the consumer comment says so"
-  it "applies a snapshot naming an agent id that no agents row has, storing that id unchanged" do
-    # An id above every existing agent cannot belong to another company or user, so this checks the missing-agent
-    # path and not the foreign-agent refusal.
-    missing_agent_id = Agent.maximum(:id).to_i + 1_000
-    entry = TimekeepingSnapshots.entry(id: 94_051, company_id: missing_agent_company.id, version: 1,
-                                       project_id: missing_agent_project.id, user_id: missing_agent_user.id,
-                                       agent_id: missing_agent_id)
-    batch = TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation: 1, outbox_position: 1))
+    # "A projection snapshot naming an agent id with no agents row is applied with that id, and the consumer comment says so"
+    it "applies a snapshot naming an agent id that no agents row has, storing that id unchanged" do
+      # An id above every existing agent cannot belong to another company or user, so this checks the missing-agent
+      # path and not the foreign-agent refusal.
+      missing_agent_id = Agent.maximum(:id).to_i + 1_000
+      entry = TimekeepingSnapshots.entry(id: 94_051, company_id: missing_agent_company.id, version: 1,
+                                         project_id: missing_agent_project.id, user_id: missing_agent_user.id,
+                                         agent_id: missing_agent_id)
+      batch = TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation: 1, outbox_position: 1))
 
-    result = described_class.call(batch:, idempotency_key: nil)
+      result = described_class.call(batch:, idempotency_key: nil)
 
-    expect([result.status, result.body]).to eq([200, { "applied" => 1, "ignored" => 0 }])
-    stored = ActiveRecord::Base.connection.select_one("SELECT agent_id FROM timesheet_entries WHERE id = 94051")
-    expect(stored).to eq("agent_id" => missing_agent_id)
-  end
+      expect([result.status, result.body]).to eq([200, { "applied" => 1, "ignored" => 0 }])
+      stored = ActiveRecord::Base.connection.select_one("SELECT agent_id FROM timesheet_entries WHERE id = 94051")
+      expect(stored).to eq("agent_id" => missing_agent_id)
+    end
   end
 
   context "more tests 6", "a deleted agent beside a foreign agent" do
-  let(:mixed_agent_company) { create(:company) }
-  let(:mixed_agent_project) { create(:project, client: create(:client, company: mixed_agent_company)) }
-  let(:mixed_agent_user) do
-    create(:user).tap { |user| create(:employment, company: mixed_agent_company, user:) }
-  end
+    let(:mixed_agent_company) { create(:company) }
+    let(:mixed_agent_project) { create(:project, client: create(:client, company: mixed_agent_company)) }
+    let(:mixed_agent_user) do
+      create(:user).tap { |user| create(:employment, company: mixed_agent_company, user:) }
+    end
 
-  def mixed_agent_entry(id, agent_id)
-    TimekeepingSnapshots.entry(id:, company_id: mixed_agent_company.id, version: 1,
-                               project_id: mixed_agent_project.id, user_id: mixed_agent_user.id, agent_id:)
-  end
+    def mixed_agent_entry(id, agent_id)
+      TimekeepingSnapshots.entry(id:, company_id: mixed_agent_company.id, version: 1,
+                                 project_id: mixed_agent_project.id, user_id: mixed_agent_user.id, agent_id:)
+    end
 
-  # "Foreign-company and other-user agents stay refused."
-  # Accepting a missing agent id must not let an existing agent of another company through in the same batch.
-  it "still refuses a batch that pairs a deleted agent with another company's agent, and writes neither entry" do
-    foreign_agent = create(:agent)
-    missing_agent_id = Agent.maximum(:id).to_i + 1_000
-    batch = TimekeepingSnapshots.batch(
-      TimekeepingSnapshots.item(mixed_agent_entry(94_061, missing_agent_id), generation: 1, outbox_position: 1),
-      TimekeepingSnapshots.item(mixed_agent_entry(94_062, foreign_agent.id), generation: 1, outbox_position: 2)
-    )
+    # "Foreign-company and other-user agents stay refused."
+    # Accepting a missing agent id must not let an existing agent of another company through in the same batch.
+    it "still refuses a batch that pairs a deleted agent with another company's agent, and writes neither entry" do
+      foreign_agent = create(:agent)
+      missing_agent_id = Agent.maximum(:id).to_i + 1_000
+      batch = TimekeepingSnapshots.batch(
+        TimekeepingSnapshots.item(mixed_agent_entry(94_061, missing_agent_id), generation: 1, outbox_position: 1),
+        TimekeepingSnapshots.item(mixed_agent_entry(94_062, foreign_agent.id), generation: 1, outbox_position: 2)
+      )
 
-    result = described_class.call(batch:, idempotency_key: nil)
+      result = described_class.call(batch:, idempotency_key: nil)
 
-    expect([result.status, result.body]).to eq([422, { "reason" => "invalid_snapshot" }])
-    written = ActiveRecord::Base.connection.select_value(
-      "SELECT count(*) FROM timesheet_entries WHERE id IN (94061, 94062)"
-    )
-    expect(written).to eq(0)
-  end
+      expect([result.status, result.body]).to eq([422, { "reason" => "invalid_snapshot" }])
+      written = ActiveRecord::Base.connection.select_value(
+        "SELECT count(*) FROM timesheet_entries WHERE id IN (94061, 94062)"
+      )
+      expect(written).to eq(0)
+    end
   end
 
   context "more tests 7", "snapshot rules" do
-  # "A projection snapshot naming an agent id with no agents row is applied with that id, and the consumer comment
-  # says so"
-  it "applies a snapshot naming an agent id with no agents row and stores that id" do
-    # An id past every agent row, so it can never name another company's or user's agent.
-    missing_agent_id = Agent.maximum(:id).to_i + 1_000
+    # "A projection snapshot naming an agent id with no agents row is applied with that id, and the consumer comment
+    # says so"
+    it "applies a snapshot naming an agent id with no agents row and stores that id" do
+      # An id past every agent row, so it can never name another company's or user's agent.
+      missing_agent_id = Agent.maximum(:id).to_i + 1_000
 
-    expect(rules_deliver(rules_entry(id: 94_071, version: 1, agent_id: missing_agent_id))).to eq(rules_applied)
-    expect(rules_row(94_071)).to include("agent_id" => missing_agent_id)
-    expect(Agent.exists?(missing_agent_id)).to be(false)
-  end
+      expect(rules_deliver(rules_entry(id: 94_071, version: 1, agent_id: missing_agent_id))).to eq(rules_applied)
+      expect(rules_row(94_071)).to include("agent_id" => missing_agent_id)
+      expect(Agent.exists?(missing_agent_id)).to be(false)
+    end
   end
 
   context "more tests 8", "snapshot rules" do
-  # "A projection snapshot naming an agent id with no agents row is applied with that id, and the consumer comment
-  # says so"
-  # The update path writes the row a second way, so it is checked apart from the insert.
-  it "applies a later version that moves an entry onto a deleted agent and stores the new agent id" do
-    expect(rules_deliver(rules_entry(id: 94_072, version: 1))).to eq(rules_applied)
-    missing_agent_id = Agent.maximum(:id).to_i + 1_000
+    # "A projection snapshot naming an agent id with no agents row is applied with that id, and the consumer comment
+    # says so"
+    # The update path writes the row a second way, so it is checked apart from the insert.
+    it "applies a later version that moves an entry onto a deleted agent and stores the new agent id" do
+      expect(rules_deliver(rules_entry(id: 94_072, version: 1))).to eq(rules_applied)
+      missing_agent_id = Agent.maximum(:id).to_i + 1_000
 
-    expect(rules_deliver(rules_entry(id: 94_072, version: 2, agent_id: missing_agent_id))).to eq(rules_applied)
-    expect(rules_row(94_072)).to include("agent_id" => missing_agent_id, "version" => 2)
-  end
+      expect(rules_deliver(rules_entry(id: 94_072, version: 2, agent_id: missing_agent_id))).to eq(rules_applied)
+      expect(rules_row(94_072)).to include("agent_id" => missing_agent_id, "version" => 2)
+    end
   end
 
   context "more tests 9" do
-  # "A projection snapshot naming an agent id with no agents row is applied with that id, and the consumer comment says so"
-  # The relay retries until it sees 200, so a repeat of the same snapshot must not turn into a refusal.
-  it "a redelivered snapshot naming a missing agent answers 200 both times and keeps the agent id" do
-    company = create(:company)
-    project = create(:project, client: create(:client, company:))
-    user = create(:user).tap { |member| create(:employment, company:, user: member) }
-    missing_agent_id = Agent.maximum(:id).to_i + 1_000
-    entry = TimekeepingSnapshots.entry(id: 94_031, company_id: company.id, version: 1, project_id: project.id,
-                                       user_id: user.id, agent_id: missing_agent_id)
-    deliver = lambda do
-      batch = TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation: 1, outbox_position: 1))
-      result = described_class.call(batch:, idempotency_key: nil)
-      [result.status, result.body]
+    # "A projection snapshot naming an agent id with no agents row is applied with that id, and the consumer comment says so"
+    # The relay retries until it sees 200, so a repeat of the same snapshot must not turn into a refusal.
+    it "a redelivered snapshot naming a missing agent answers 200 both times and keeps the agent id" do
+      company = create(:company)
+      project = create(:project, client: create(:client, company:))
+      user = create(:user).tap { |member| create(:employment, company:, user: member) }
+      missing_agent_id = Agent.maximum(:id).to_i + 1_000
+      entry = TimekeepingSnapshots.entry(id: 94_031, company_id: company.id, version: 1, project_id: project.id,
+                                         user_id: user.id, agent_id: missing_agent_id)
+      deliver = lambda do
+        batch = TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation: 1, outbox_position: 1))
+        result = described_class.call(batch:, idempotency_key: nil)
+        [result.status, result.body]
+      end
+
+      expect(deliver.call).to eq([200, { "applied" => 1, "ignored" => 0 }])
+      expect(deliver.call).to eq([200, { "applied" => 0, "ignored" => 1 }])
+
+      row = ActiveRecord::Base.connection.select_one("SELECT agent_id FROM timesheet_entries WHERE id = 94031")
+      expect(row).to include("agent_id" => missing_agent_id)
     end
-
-    expect(deliver.call).to eq([200, { "applied" => 1, "ignored" => 0 }])
-    expect(deliver.call).to eq([200, { "applied" => 0, "ignored" => 1 }])
-
-    row = ActiveRecord::Base.connection.select_one("SELECT agent_id FROM timesheet_entries WHERE id = 94031")
-    expect(row).to include("agent_id" => missing_agent_id)
-  end
   end
 end
 
