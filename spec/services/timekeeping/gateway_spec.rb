@@ -45,8 +45,7 @@ RSpec.describe Timekeeping::Gateway do
     expect([audit.actor_type, audit.actor_id]).to eq(["user", prepared_user.id])
   end
 
-  context "more tests 10", committed_data: true do
-  it "prepared create from another company's user with a carried key of the first company gets its own entry under the derived key" do
+  it "more tests 10 prepared create from another company's user with a carried key of the first company gets its own entry under the derived key", committed_data: true do
     client_key = "tenant-carried-key-#{SecureRandom.hex(4)}"
     attributes = { duration: 30, work_date: Date.current, note: "First company's private note", bill_status: "unbilled" }
 
@@ -93,10 +92,8 @@ RSpec.describe Timekeeping::Gateway do
     expect(Timekeeping::LocalOwner::Receipt.where(company_id: first_company.id).pluck(:id, :key, :fingerprint, :body))
       .to eq(first_company_receipts)
   end
-  end
 
-  context "more tests 11", committed_data: true do
-  it "prepared create from a colleague in the same company with a carried key of another user never replays that user's entry" do
+  it "more tests 11 prepared create from a colleague in the same company with a carried key of another user never replays that user's entry", committed_data: true do
     client_key = "actor-carried-key-#{SecureRandom.hex(4)}"
     company = create(:company)
     project = create(:project, billable: true, client: create(:client, company:))
@@ -138,10 +135,8 @@ RSpec.describe Timekeeping::Gateway do
     expect(Timekeeping::LocalOwner::Receipt.where(company_id: company.id, actor_id: colleague.id).pluck(:key))
       .to eq([Timekeeping::EntryWriteClient.idempotency_key(request_id: client_key, operation: "create")])
   end
-  end
 
-  context "more tests 12", committed_data: true do
-  it "a prepared-state retry of a committed legacy create is answered from its carried receipt and adds no entry, audit, outbox or receipt row" do
+  it "more tests 12 a prepared-state retry of a committed legacy create is answered from its carried receipt and adds no entry, audit, outbox or receipt row", committed_data: true do
     company = create(:company)
     project = create(:project, billable: true, client: create(:client, company:))
     user = timekeeping_member(company, "admin")
@@ -180,10 +175,8 @@ RSpec.describe Timekeeping::Gateway do
     expect(timekeeping_row_counts).to eq(before_counts)
     expect(TimesheetEntry.count).to eq(legacy_count)
   end
-  end
 
-  context "more tests 13", committed_data: true do
-  it "a prepared-state retry that reuses a carried legacy key with other values is refused as key reused and writes nothing" do
+  it "more tests 13 a prepared-state retry that reuses a carried legacy key with other values is refused as key reused and writes nothing", committed_data: true do
     company = create(:company)
     project = create(:project, billable: true, client: create(:client, company:))
     user = timekeeping_member(company, "admin")
@@ -223,10 +216,8 @@ RSpec.describe Timekeeping::Gateway do
     expect(timekeeping_row_counts).to eq(before_counts)
     expect(TimesheetEntry.count).to eq(legacy_count)
   end
-  end
 
-  context "more tests 14", committed_data: true do
-  it "a prepared-state retry matching a legacy receipt whose carried row is missing is refused and never writes a second entry" do
+  it "more tests 14 a prepared-state retry matching a legacy receipt whose carried row is missing is refused and never writes a second entry", committed_data: true do
     company = create(:company)
     project = create(:project, billable: true, client: create(:client, company:))
     user = timekeeping_member(company, "admin")
@@ -253,10 +244,8 @@ RSpec.describe Timekeeping::Gateway do
     expect(timekeeping_row_counts).to eq(before_counts)
     expect(TimesheetEntry.count).to eq(legacy_count)
   end
-  end
 
-  context "more tests 15", committed_data: true do
-  it "a keyed prepared create is stored under the derived key and its retry under a new request id adds no rows" do
+  it "more tests 15 a keyed prepared create is stored under the derived key and its retry under a new request id adds no rows", committed_data: true do
     TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
     company = create(:company)
     project = create(:project, billable: true, client: create(:client, company:))
@@ -283,10 +272,8 @@ RSpec.describe Timekeeping::Gateway do
     expect(retried.id).to eq(first.id)
     expect(timekeeping_row_counts).to eq(after_first)
   end
-  end
 
-  context "more tests 16", committed_data: true do
-  it "a raw-key prepared create receipt answers its retry in the prepared state and again after a re-cutover without forwarding or new rows" do
+  it "more tests 16 a raw-key prepared create receipt answers its retry in the prepared state and again after a re-cutover without forwarding or new rows", committed_data: true do
     TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
     company = create(:company)
     project = create(:project, billable: true, client: create(:client, company:))
@@ -320,10 +307,8 @@ RSpec.describe Timekeeping::Gateway do
     expect(timekeeping_row_counts).to eq(stored)
     expect(TimesheetEntry.count).to eq(entry_count)
   end
-  end
 
-  context "more tests 17", "prepared retries across companies", committed_data: true do
-  it "a prepared retry by another company's user with the same client key never receives the first company's carried entry" do
+  it "more tests 17 prepared retries across companies a prepared retry by another company's user with the same client key never receives the first company's carried entry", committed_data: true do
     first_company = create(:company)
     first_project = create(:project, billable: true, client: create(:client, company: first_company))
     first_user = create(:user, current_workspace_id: first_company.id).tap do |member|
@@ -377,10 +362,8 @@ RSpec.describe Timekeeping::Gateway do
     stored = Timekeeping::LocalOwner::Receipt.where(company_id: second_company.id, actor_id: second_user.id)
     expect(stored.pluck(:key)).to eq([Timekeeping::EntryWriteClient.idempotency_key(request_id: key, operation: "create")])
   end
-  end
 
-  context "more tests 18", "prepared retries across actors", committed_data: true do
-  it "a prepared retry by a colleague in the same company with the same client key never receives the first user's carried entry" do
+  it "more tests 18 prepared retries across actors a prepared retry by a colleague in the same company with the same client key never receives the first user's carried entry", committed_data: true do
     company = create(:company)
     project = create(:project, billable: true, client: create(:client, company:))
     first_user, colleague = Array.new(2) do
@@ -426,9 +409,7 @@ RSpec.describe Timekeeping::Gateway do
     stored = Timekeeping::LocalOwner::Receipt.where(company_id: company.id, actor_id: colleague.id)
     expect(stored.pluck(:key)).to eq([Timekeeping::EntryWriteClient.idempotency_key(request_id: key, operation: "create")])
   end
-  end
 
-  context "more tests 19", committed_data: true do
   def carried_legacy_create_for_retry(company:, user:, project:, key:, attributes:)
     TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
       .update_columns(owner: "monolith", monolith_store: "legacy", generation: 1, handoff_step: nil)
@@ -458,7 +439,7 @@ RSpec.describe Timekeeping::Gateway do
                                   read_client: instance_double(Timekeeping::EntryApiClient))
   end
 
-  it "answers a prepared retry of a committed legacy create from its carried receipt and adds no entry, audit, outbox or receipt row" do
+  it "more tests 19 answers a prepared retry of a committed legacy create from its carried receipt and adds no entry, audit, outbox or receipt row", committed_data: true do
     company = create(:company)
     project = create(:project, billable: true, client: create(:client, company:))
     user = timekeeping_member(company, "admin", user: create(:user, current_workspace_id: company.id))
@@ -478,9 +459,7 @@ RSpec.describe Timekeeping::Gateway do
     expect(replayed.company_id).to eq(company.id)
     expect(timekeeping_row_counts).to eq(counts_before)
   end
-  end
 
-  context "more tests 20", committed_data: true do
   def carried_legacy_create_for_reuse(company:, user:, project:, key:, attributes:)
     TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
       .update_columns(owner: "monolith", monolith_store: "legacy", generation: 1, handoff_step: nil)
@@ -502,7 +481,7 @@ RSpec.describe Timekeeping::Gateway do
     entry
   end
 
-  it "refuses a prepared retry of a carried legacy create sent with other values as key reused and writes nothing" do
+  it "more tests 20 refuses a prepared retry of a carried legacy create sent with other values as key reused and writes nothing", committed_data: true do
     company = create(:company)
     project = create(:project, billable: true, client: create(:client, company:))
     user = timekeeping_member(company, "admin", user: create(:user, current_workspace_id: company.id))
@@ -527,9 +506,7 @@ RSpec.describe Timekeeping::Gateway do
     expect(timekeeping_row_counts).to eq(counts_before)
     expect(Timekeeping::LocalEntry.where(company_id: company.id, note: "Other values")).not_to exist
   end
-  end
 
-  context "more tests 21", committed_data: true do
   def carried_legacy_create_then_expire(company:, user:, project:, key:, attributes:)
     TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
       .update_columns(owner: "monolith", monolith_store: "legacy", generation: 1, handoff_step: nil)
@@ -555,7 +532,7 @@ RSpec.describe Timekeeping::Gateway do
     entry
   end
 
-  it "does not match an expired legacy receipt in the prepared state and stores the new create under the derived key" do
+  it "more tests 21 does not match an expired legacy receipt in the prepared state and stores the new create under the derived key", committed_data: true do
     company = create(:company)
     project = create(:project, billable: true, client: create(:client, company:))
     user = timekeeping_member(company, "admin", user: create(:user, current_workspace_id: company.id))
@@ -577,10 +554,8 @@ RSpec.describe Timekeeping::Gateway do
     expect(Timekeeping::LocalOwner::Receipt.where(company_id: company.id, actor_id: user.id, key: derived_key).count)
       .to eq(1)
   end
-  end
 
-  context "more tests 22", committed_data: true do
-  it "refuses a prepared create whose carried legacy receipt matches but whose carried row is missing and writes nothing" do
+  it "more tests 22 refuses a prepared create whose carried legacy receipt matches but whose carried row is missing and writes nothing", committed_data: true do
     company = create(:company)
     project = create(:project, billable: true, client: create(:client, company:))
     user = timekeeping_member(company, "admin", user: create(:user, current_workspace_id: company.id))
@@ -607,10 +582,8 @@ RSpec.describe Timekeeping::Gateway do
 
     expect(timekeeping_row_counts).to eq(counts_before)
   end
-  end
 
-  context "more tests 23", committed_data: true do
-  it "refuses a prepared retry when a receipt under the derived create key holds another fingerprint and writes nothing" do
+  it "more tests 23 refuses a prepared retry when a receipt under the derived create key holds another fingerprint and writes nothing", committed_data: true do
     company = create(:company)
     project = create(:project, billable: true, client: create(:client, company:))
     user = timekeeping_member(company, "admin", user: create(:user, current_workspace_id: company.id))
@@ -640,10 +613,8 @@ RSpec.describe Timekeeping::Gateway do
 
     expect(timekeeping_row_counts).to eq(counts_before)
   end
-  end
 
-  context "more tests 24", committed_data: true do
-  it "stores a new keyed prepared create under the derived key and replays its retry under a new request id with no new rows" do
+  it "more tests 24 stores a new keyed prepared create under the derived key and replays its retry under a new request id with no new rows", committed_data: true do
     company = create(:company)
     project = create(:project, billable: true, client: create(:client, company:))
     user = timekeeping_member(company, "admin", user: create(:user, current_workspace_id: company.id))
@@ -672,10 +643,8 @@ RSpec.describe Timekeeping::Gateway do
     expect(timekeeping_row_counts).to eq(counts_before)
     expect(Timekeeping::LocalEntry.where(company_id: company.id, note: "Derived key create").count).to eq(1)
   end
-  end
 
-  context "more tests 25", committed_data: true do
-  it "answers a raw-key prepared create receipt in the prepared state and again after a re-cutover without forwarding" do
+  it "more tests 25 answers a raw-key prepared create receipt in the prepared state and again after a re-cutover without forwarding", committed_data: true do
     company = create(:company)
     project = create(:project, billable: true, client: create(:client, company:))
     user = timekeeping_member(company, "admin", user: create(:user, current_workspace_id: company.id))
@@ -708,10 +677,8 @@ RSpec.describe Timekeeping::Gateway do
     expect(after_recutover.note).to eq("Raw key receipt")
     expect(timekeeping_row_counts).to eq(counts_before)
   end
-  end
 
-  context "more tests 26", committed_data: true do
-  it "gives another company's user who sends the same key a new entry of their own and never the first company's carried entry" do
+  it "more tests 26 gives another company's user who sends the same key a new entry of their own and never the first company's carried entry", committed_data: true do
     first_company = create(:company)
     first_project = create(:project, billable: true, client: create(:client, company: first_company))
     first_user = timekeeping_member(first_company, "admin", user: create(:user, current_workspace_id: first_company.id))
@@ -760,10 +727,8 @@ RSpec.describe Timekeeping::Gateway do
     expect(Timekeeping::LocalOwner::Receipt.where(company_id: first_company.id).pluck(:id, :key, :fingerprint))
       .to eq(first_company_receipts)
   end
-  end
 
-  context "more tests 27" do
-  it "stores a keyed prepared bulk delete under the derived bulk key and replays its retry under a new request id with no new rows" do
+  it "more tests 27 stores a keyed prepared bulk delete under the derived bulk key and replays its retry under a new request id with no new rows" do
     TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
     entries = Array.new(2) do |index|
       Timekeeping::LocalEntry.create!(
@@ -800,10 +765,8 @@ RSpec.describe Timekeeping::Gateway do
     expect(second.refusal).to be_nil
     expect(timekeeping_row_counts).to eq(after_first)
   end
-  end
 
-  context "more tests 28", committed_data: true do
-  it "refuses a prepared retry of a committed legacy create whose carried row is missing and writes nothing" do
+  it "more tests 28 refuses a prepared retry of a committed legacy create whose carried row is missing and writes nothing", committed_data: true do
     company = create(:company)
     project = create(:project, billable: true, client: create(:client, company:))
     user = timekeeping_member(company, "admin")
@@ -827,10 +790,8 @@ RSpec.describe Timekeeping::Gateway do
     expect(timekeeping_row_counts).to eq(rows_before)
     expect(TimesheetEntry.count).to eq(legacy_before)
   end
-  end
 
-  context "more tests 29", committed_data: true do
-  it "refuses a prepared retry whose derived-key receipt has another fingerprint without falling through to the raw-key receipt or a write" do
+  it "more tests 29 refuses a prepared retry whose derived-key receipt has another fingerprint without falling through to the raw-key receipt or a write", committed_data: true do
     TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
     company = create(:company)
     project = create(:project, billable: true, client: create(:client, company:))
@@ -856,10 +817,8 @@ RSpec.describe Timekeeping::Gateway do
     expect { gateway.create(user:, project:, attributes:) }.to raise_error(Timekeeping::EntryWriteClient::Rejected)
     expect(timekeeping_row_counts).to eq(rows_before)
   end
-  end
 
-  context "more tests 30", committed_data: true do
-  it "answers or refuses a create retried after a re-cutover from its pre-change raw-key prepared receipt and forwards nothing" do
+  it "more tests 30 answers or refuses a create retried after a re-cutover from its pre-change raw-key prepared receipt and forwards nothing", committed_data: true do
     ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
     ownership.update_columns(monolith_store: "prepared", generation: 2)
     company = create(:company)
@@ -890,10 +849,8 @@ RSpec.describe Timekeeping::Gateway do
     end.to raise_error(Timekeeping::EntryWriteClient::Rejected)
     expect(timekeeping_row_counts).to eq(rows_before)
   end
-  end
 
-  context "more tests 31", committed_data: true do
-  it "answers a bulk delete retried after a re-cutover from its pre-change raw-key prepared receipt as a bulk result and forwards nothing" do
+  it "more tests 31 answers a bulk delete retried after a re-cutover from its pre-change raw-key prepared receipt as a bulk result and forwards nothing", committed_data: true do
     ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
     ownership.update_columns(monolith_store: "prepared", generation: 2)
     company = create(:company)
@@ -926,10 +883,8 @@ RSpec.describe Timekeeping::Gateway do
     expect(result.refusal).to be_nil
     expect(timekeeping_row_counts).to eq(rows_before)
   end
-  end
 
-  context "more tests 32", "raw-key bulk move receipt across a re-cutover", committed_data: true do
-  it "answers a bulk move retried after a re-cutover from its pre-change raw-key prepared receipt as a bulk result and forwards nothing" do
+  it "more tests 32 raw-key bulk move receipt across a re-cutover answers a bulk move retried after a re-cutover from its pre-change raw-key prepared receipt as a bulk result and forwards nothing", committed_data: true do
     company = create(:company)
     client = create(:client, company:)
     source = create(:project, billable: true, client:)
@@ -980,7 +935,6 @@ RSpec.describe Timekeeping::Gateway do
     expect(timekeeping_row_counts).to eq(after_first)
     expect(TimesheetEntry.count).to eq(timesheet_entries_before)
     expect(Timekeeping::LocalEntry.where(id: ids).pluck(:project_id)).to all(eq(target.id))
-  end
   end
 end
 

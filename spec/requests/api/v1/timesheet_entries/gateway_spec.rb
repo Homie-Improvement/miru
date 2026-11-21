@@ -54,8 +54,7 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded token", type: :request
     expect(create_request[:body]["user_id"]).to eq(colleague.id)
   end
 
-  context "more tests 2", type: :request do
-  it "prepared retry reusing a carried legacy key with other values answers only the generic 422 body and echoes nothing stored" do
+  it "more tests 2 prepared retry reusing a carried legacy key with other values answers only the generic 422 body and echoes nothing stored", type: :request do
     client_key = "prepared-carried-reused-#{SecureRandom.hex(4)}"
     private_note = "Stored-note-#{SecureRandom.hex(6)}"
     TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "legacy", handoff_step: nil)
@@ -98,10 +97,8 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded token", type: :request
     expect(TimesheetEntry.count).to eq(legacy_count)
     expect(fake.requests.select { |request| request[:method] == "POST" }).to be_empty
   end
-  end
 
-  context "more tests 3", type: :request do
-  it "renders exactly the entry_write_rejected 422 body when a prepared retry reuses a carried legacy create key with other values" do
+  it "more tests 3 renders exactly the entry_write_rejected 422 body when a prepared retry reuses a carried legacy create key with other values", type: :request do
     key = "prepared-carried-key-reused-body"
     TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
       .update_columns(owner: "monolith", monolith_store: "legacy", generation: 1, handoff_step: nil)
@@ -138,10 +135,8 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded token", type: :request
     expect(timekeeping_row_counts).to eq(counts_before)
     expect(TimesheetEntry.count).to eq(legacy_count)
   end
-  end
 
-  context "more tests 4", type: :request do
-  it "renders exactly the entry_write_rejected 422 body when a prepared retry meets a derived-key receipt with another fingerprint" do
+  it "more tests 4 renders exactly the entry_write_rejected 422 body when a prepared retry meets a derived-key receipt with another fingerprint", type: :request do
     TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
       .update_columns(owner: "monolith", monolith_store: "prepared", generation: 2, handoff_step: nil)
     client_key = "k-prepared-derived-#{SecureRandom.hex(4)}"
@@ -169,7 +164,6 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded token", type: :request
     expect(Timekeeping::LocalEntry.where(company_id: company.id).count).to eq(entries_before)
     expect(Timekeeping::LocalOwner::Receipt.where(company_id: company.id).count).to eq(receipts_before)
     expect(TimesheetEntry.where(company_id: company.id)).not_to exist
-  end
   end
 end
 
