@@ -86,7 +86,9 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded token", type: :request
 
     # "The 422 key-reused refusal on the prepared path renders exactly the monolith's `errors.entry_write_rejected` body, the one the live replay table (#525, `MONOLITH_REFUSALS`) expects"
     expect(response.status).to eq(422)
-    expect(response.parsed_body).to eq({ "errors" => I18n.t("errors.entry_write_rejected") })
+    # The monolith renders a reused key as its rejected body plus the key-reused reason (ErrorHandler).
+    expect(response.parsed_body).to eq({ "errors" => I18n.t("errors.entry_write_rejected"),
+                                         "reason" => Timekeeping::Gateway::KEY_REUSED_REASON })
     # The refusal must not let a caller who reuses a key read what the first request stored.
     expect(response.body).not_to include(private_note)
     expect(response.body).not_to include(receipt.fingerprint)
@@ -130,7 +132,8 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded token", type: :request
 
     # "The 422 key-reused refusal on the prepared path renders exactly the monolith's `errors.entry_write_rejected` body, the one the live replay table (#525, `MONOLITH_REFUSALS`) expects"
     expect(response.status).to eq(422)
-    expect(response.parsed_body).to eq({ "errors" => I18n.t("errors.entry_write_rejected") })
+    expect(response.parsed_body).to eq({ "errors" => I18n.t("errors.entry_write_rejected"),
+                                         "reason" => Timekeeping::Gateway::KEY_REUSED_REASON })
     expect(response.body).not_to include("First attempt")
     expect(timekeeping_row_counts).to eq(counts_before)
     expect(TimesheetEntry.count).to eq(legacy_count)
@@ -160,7 +163,8 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded token", type: :request
 
     # "The 422 key-reused refusal on the prepared path renders exactly the monolith's `errors.entry_write_rejected` body, the one the live replay table (#525, `MONOLITH_REFUSALS`) expects"
     expect(response.status).to eq(422)
-    expect(response.parsed_body).to eq({ "errors" => I18n.t("errors.entry_write_rejected") })
+    expect(response.parsed_body).to eq({ "errors" => I18n.t("errors.entry_write_rejected"),
+                                         "reason" => Timekeeping::Gateway::KEY_REUSED_REASON })
     expect(Timekeeping::LocalEntry.where(company_id: company.id).count).to eq(entries_before)
     expect(Timekeeping::LocalOwner::Receipt.where(company_id: company.id).count).to eq(receipts_before)
     expect(TimesheetEntry.where(company_id: company.id)).not_to exist
