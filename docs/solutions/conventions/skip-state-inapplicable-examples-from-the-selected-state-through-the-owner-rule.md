@@ -29,35 +29,38 @@ A skip is easy to get wrong in ways that keep the run green while removing cover
 
 ## Solution
 
-Tag the examples, and let one suite-level `before` hook in `spec/support/timekeeping/owner_state.rb` decide:
+Tag the examples, and let one suite-level `before` hook in `spec/support/timekeeping/owner_state.rb` decide. Each tag in `OWNER_TAGS` names the `Timekeeping::EntryOwner` value its examples need and the reason given when they are skipped. `FORWARDS_TAG` (`:forwards_to_timekeeping`) needs `:timekeeping`; `LEGACY_STORE_TAG` (`:writes_legacy_store`) needs `:legacy`, for assertions on the legacy model's own write path:
 
 ```ruby
-FORWARDS_TAG = :forwards_to_timekeeping
-
-def forwards_writes?(state_name)
+def entry_owner(state_name)
   columns = fetch(state_name).slice(*OWNERSHIP_COLUMNS)
-  Timekeeping::EntryOwner.for(TimekeepingOwnership.new(columns)) == :timekeeping
+  Timekeeping::EntryOwner.for(TimekeepingOwnership.new(columns))
 end
 
-def forwarding_skip_reason(metadata)
-  return nil unless metadata[FORWARDS_TAG] == true
+def skip_reason(metadata)
+  tags = OWNER_TAGS.select { |tag, _rule| metadata[tag] == true }
+  return nil if tags.empty?
 
   state_name = for_example(metadata)
-  return nil if state_name.nil? || forwards_writes?(state_name)
-  "Writes are forwarded only when Timekeeping owns the entries; ..."
+  return nil if state_name.nil?
+
+  owner = entry_owner(state_name)
+  tags.each_value.find { |rule| rule[:owner] != owner }&.then { |rule| rule[:reason].call(state_name) }
 end
 
 config.before do |example|
-  reason = TimekeepingOwnerState.forwarding_skip_reason(example.metadata)
+  reason = TimekeepingOwnerState.skip_reason(example.metadata)
   skip reason if reason
 end
 ```
 
+`forwarding_skip_reason(metadata)` remains, as `skip_reason` for the forwarding tag alone, and `forwards_writes?(state_name)` remains as `entry_owner(state_name) == :timekeeping`.
+
 Four rules make this safe:
 
 1. **Read the selected state with `for_example`, never `current`.** `TimekeepingOwnerState.current` answers `"legacy"` when nothing is selected, because that is the row the cleaners leave. A skip keyed on it would hide the tagged examples in every ordinary run. `for_example` returns nil when no state is selected, and nil means "run".
-2. **Ask the app's own rule.** `forwards_writes?` builds a `TimekeepingOwnership` from the state's columns and asks `Timekeeping::EntryOwner.for`, the rule the gateway dispatches on. No list of forwarding states is kept in the spec harness, so it cannot drift from the gateway.
-3. **An unknown state raises.** `forwards_writes?` goes through `fetch`, which raises `ArgumentError` naming `legacy, timekeeping, rollback`. A typo such as `"legcy"`, `"Rollback"` or `"rollback "` fails the example. If it answered false instead, the typo would skip the forwarded examples and the run would stay green.
+2. **Ask the app's own rule.** `entry_owner` builds a `TimekeepingOwnership` from the state's columns and asks `Timekeeping::EntryOwner.for`, the rule the gateway dispatches on. No list of states per owner is kept in the spec harness, so it cannot drift from the gateway.
+3. **An unknown state raises.** `entry_owner` goes through `fetch`, which raises `ArgumentError` naming `legacy, timekeeping, rollback`. A typo such as `"legcy"`, `"Rollback"` or `"rollback "` fails the example. If it answered false instead, the typo would skip the forwarded examples and the run would stay green.
 4. **Decide per example, in a suite hook, with `skip` and a reason.** The check reads `== true` on the example's own metadata, so one example can opt out with `forwards_to_timekeeping: false`. A suite `before` hook runs before group hooks, so a skipped example builds no committed rows, fake registrations or HTTP routes. A runtime `skip` shows the reason in the output; a filter would drop the examples without saying so.
 
 ## Why it matters
@@ -71,3 +74,4 @@ Each mistake above produces a passing run. The cost is lost coverage that nobody
 - The same spec checks that misspelt states (`"Legacy"`, `"rollback "`, `"bogus"`, `""`, nil, `"legcy"`) raise `ArgumentError` instead of skipping, and that a tagged example in the `timekeeping` state runs and a failing body fails ("more tests 19", "more tests 26").
 - "more tests 20" and "more tests 28" check that untagged examples and examples with `forwards_to_timekeeping: false` run in the `legacy` state.
 - `spec/services/imports/harvest_time_entries_importer_spec.rb` tags the four forwarded `RSpec.describe` groups with `forwards_to_timekeeping: true`.
+- PR #491 turns the single forwarding check into the `OWNER_TAGS` table read by `skip_reason`, adds `LEGACY_STORE_TAG`, and tags the importer's two legacy-model assertions with `writes_legacy_store: true`. `spec/meta/timekeeping_owner_state_spec.rb` ("more tests 3", "more tests 4") checks the new tag in each state and for an unknown state.

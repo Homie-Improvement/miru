@@ -759,6 +759,37 @@ RSpec.describe "Timekeeping owner state harness" do
       expect(bodies_run).to eq(%i[untagged overridden])
     end
   end
+
+  context "more tests 3" do
+    it "skip_reason skips a writes_legacy_store example only where the legacy store does not own entries" do
+      rollback_reason = TimekeepingOwnerState.skip_reason({ writes_legacy_store: true, owner_state: "rollback" })
+      expect(rollback_reason).to be_a(String)
+      expect(rollback_reason).to include("rollback")
+
+      expect(TimekeepingOwnerState.skip_reason({ writes_legacy_store: true, owner_state: "timekeeping" })).to be_a(String)
+      expect(TimekeepingOwnerState.skip_reason({ writes_legacy_store: true, owner_state: "legacy" })).to be_nil
+      expect(TimekeepingOwnerState.skip_reason({ writes_legacy_store: true })).to be_nil
+
+      %w[legacy timekeeping rollback].each do |state|
+        expect(TimekeepingOwnerState.skip_reason({ owner_state: state })).to be_nil
+        expect(TimekeepingOwnerState.skip_reason({ writes_legacy_store: false, owner_state: state })).to be_nil
+      end
+    end
+  end
+
+  context "more tests 4" do
+    it "skip_reason raises for a writes_legacy_store example in an unknown owner state and keeps the forwarding skip" do
+      expect { TimekeepingOwnerState.skip_reason({ writes_legacy_store: true, owner_state: "bogus" }) }
+        .to raise_error(ArgumentError, /bogus/)
+
+      forwarded_rollback = TimekeepingOwnerState.skip_reason({ forwards_to_timekeeping: true, owner_state: "rollback" })
+      expect(forwarded_rollback).to eq(
+        TimekeepingOwnerState.forwarding_skip_reason({ forwards_to_timekeeping: true, owner_state: "rollback" })
+      )
+      expect(forwarded_rollback).to be_a(String)
+      expect(TimekeepingOwnerState.skip_reason({ forwards_to_timekeeping: true, owner_state: "timekeeping" })).to be_nil
+    end
+  end
 end
 
 RSpec.describe "Seeded committed_data owner state probe run (rollback)", :without_transaction, committed_data: true do

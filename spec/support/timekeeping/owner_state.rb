@@ -47,6 +47,31 @@ module TimekeepingOwnerState
   # the hook below skips those examples with a stated reason.
   FORWARDS_TAG = :forwards_to_timekeeping
 
+  # Example metadata for assertions on the legacy store's own mechanism, such
+  # as a TimesheetEntry model callback or a stub of a legacy model write. They
+  # mean nothing where another store owns the entries, so the hook below skips
+  # them there with a stated reason.
+  LEGACY_STORE_TAG = :writes_legacy_store
+
+  # Each tag that limits an example to one owner: the Timekeeping::EntryOwner
+  # value the example needs, and why it is skipped in a state without it.
+  OWNER_TAGS = {
+    FORWARDS_TAG => {
+      owner: :timekeeping,
+      reason: lambda { |state_name|
+        "Writes are forwarded only when Timekeeping owns the entries; in the #{state_name} owner state " \
+          "the monolith owns them and writes locally, which the local-write examples cover."
+      }
+    }.freeze,
+    LEGACY_STORE_TAG => {
+      owner: :legacy,
+      reason: lambda { |state_name|
+        "This checks the legacy store's own write path; in the #{state_name} owner state another store " \
+          "owns the entries and the legacy model is never written."
+      }
+    }.freeze
+  }.freeze
+
   module_function
 
   # The state's columns; raises ArgumentError naming the valid states for any
@@ -102,26 +127,38 @@ module TimekeepingOwnerState
     state_name
   end
 
-  # Whether the gateway forwards entry writes to Timekeeping in the state. It
-  # asks Timekeeping::EntryOwner, the rule the gateway dispatches on, so no
-  # list of forwarding states is kept here. Raises like fetch for an unknown
-  # name, so a misspelt state fails instead of skipping forwarded examples.
-  def forwards_writes?(state_name)
+  # The Timekeeping::EntryOwner value of the state: the rule the gateway
+  # dispatches on, so no list of states per owner is kept here. Raises like
+  # fetch for an unknown name, so a misspelt state fails instead of skipping.
+  def entry_owner(state_name)
     columns = fetch(state_name).slice(*OWNERSHIP_COLUMNS)
-    Timekeeping::EntryOwner.for(TimekeepingOwnership.new(columns)) == :timekeeping
+    Timekeeping::EntryOwner.for(TimekeepingOwnership.new(columns))
   end
 
-  # Why an example tagged FORWARDS_TAG cannot run in its state, or nil when it
-  # can: when it is untagged, when no state is selected (the forwarding helper
-  # then hands ownership to Timekeeping), or when its state forwards writes.
-  def forwarding_skip_reason(metadata)
-    return nil unless metadata[FORWARDS_TAG] == true
+  # Whether the gateway forwards entry writes to Timekeeping in the state.
+  def forwards_writes?(state_name)
+    entry_owner(state_name) == :timekeeping
+  end
+
+  # Why an example cannot run in its state, or nil when it can. Only a tag in
+  # OWNER_TAGS limits an example, and only in a selected state whose entry
+  # owner differs from the one the tag needs. With no state selected the
+  # example runs: the forwarding helper then hands ownership to Timekeeping,
+  # and the cleaners leave the legacy store owning entries.
+  def skip_reason(metadata)
+    tags = OWNER_TAGS.select { |tag, _rule| metadata[tag] == true }
+    return nil if tags.empty?
 
     state_name = for_example(metadata)
-    return nil if state_name.nil? || forwards_writes?(state_name)
+    return nil if state_name.nil?
 
-    "Writes are forwarded only when Timekeeping owns the entries; in the #{state_name} owner state " \
-      "the monolith owns them and writes locally, which the local-write examples cover."
+    owner = entry_owner(state_name)
+    tags.each_value.find { |rule| rule[:owner] != owner }&.then { |rule| rule[:reason].call(state_name) }
+  end
+
+  # skip_reason for the forwarding tag alone.
+  def forwarding_skip_reason(metadata)
+    skip_reason(metadata.slice(FORWARDS_TAG, :owner_state))
   end
 
   module Expectations
@@ -160,7 +197,7 @@ RSpec.configure do |config|
   # Suite hooks run before group hooks, so a skipped example builds none of
   # its group's committed rows, fake registrations or HTTP routes.
   config.before do |example|
-    reason = TimekeepingOwnerState.forwarding_skip_reason(example.metadata)
+    reason = TimekeepingOwnerState.skip_reason(example.metadata)
     skip reason if reason
   end
 end

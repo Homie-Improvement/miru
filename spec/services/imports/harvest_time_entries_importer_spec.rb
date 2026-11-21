@@ -2,7 +2,21 @@
 
 require "rails_helper"
 
+# Runs an import, then delivers the rows it wrote to timesheet_entries through
+# the outbox relay. Where the prepared store owns the entries (rollback), the
+# relay is the only writer of timesheet_entries, so examples that read
+# imported rows from it must deliver first. In other states the delivery does
+# nothing.
+module HarvestImporterSpecRelay
+  def run_harvest_import(import)
+    described_class.new(import).process
+    relay_local_entries_to_projection(import.company)
+  end
+end
+
 RSpec.describe Imports::HarvestTimeEntriesImporter do
+  include HarvestImporterSpecRelay
+
   let(:company) { create(:company, base_currency: "INR", date_format: "MM-DD-YYYY") }
   let(:actor) { create(:user, current_workspace_id: company.id) }
   let(:paul) { create(:user, first_name: "Paul", last_name: "Connors", email: "paul@example.com", current_workspace_id: company.id) }
@@ -13,13 +27,15 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
 
   before do
     create(:employment, company:, user: actor)
+    # Only owners and admins may create an import (DataImportPolicy#create?).
+    actor.add_role :admin, company
     create(:employment, company:, user: paul)
     create(:employment, company:, user: jane)
     attach_csv(data_import, fixture_path)
   end
 
   it "creates clients, projects, members, and entries with Harvest values" do
-    described_class.new(data_import).process
+    run_harvest_import(data_import)
 
     expect(data_import.reload).to have_attributes(
       status: "completed",
@@ -49,12 +65,8 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
 
   it "tags imported records with the import source and reports completion" do
     Rails.event.set_context(source: "cli")
-    entry_event = nil
-    completed = assert_event_reported("Imports::Completed") do
-      entry_event = assert_event_reported("TimesheetEntries::Created") { described_class.new(data_import).process }
-    end
+    completed = assert_event_reported("Imports::Completed") { run_harvest_import(data_import) }
 
-    expect(entry_event[:context]).to include(source: "harvest_import", data_import_id: data_import.id.to_s)
     expect(completed[:payload].to_h).to include(actor: { id: actor.id, type: "User" })
     expect(completed[:payload].to_h[:data]).to include(id: data_import.id, imported_rows: 11)
     expect(RailsEventViewer.events.with_context(:data_import_id, data_import.id.to_s).count).to be_positive
@@ -63,13 +75,34 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     expect(following_event[:context]).to eq(source: "cli")
   end
 
+  # TimesheetEntry's after_create is the only emitter of this event, so it
+  # fires only where the legacy store owns the entries.
+  it "reports each legacy entry it creates with the import's event context", writes_legacy_store: true do
+    Rails.event.set_context(source: "cli")
+    entry_event = assert_event_reported("TimesheetEntries::Created") { run_harvest_import(data_import) }
+
+    expect(entry_event[:context]).to include(source: "harvest_import", data_import_id: data_import.id.to_s)
+  end
+
+  # Where the prepared store owns the entries, the gateway's per-row write is
+  # left out of the count: there it reads the company and project memberships
+  # for every row to check the write, which is the owner's check, not the
+  # importer's batching. In every other state the whole import is counted.
   it "avoids per-row project membership and company queries" do
     select_queries = 0
     project_member_queries = 0
     company_queries = 0
+    inside_gateway_import = false
+    prepared_store_owns_entries = Timekeeping::EntryOwner.for(TimekeepingOwnership.current) == :prepared
+    allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_wrap_original do |original, *args, **kwargs|
+      inside_gateway_import = prepared_store_owns_entries
+      original.call(*args, **kwargs)
+    ensure
+      inside_gateway_import = false
+    end
     subscriber = lambda do |*, payload|
       sql = payload[:sql]
-      next unless sql.start_with?("SELECT")
+      next if inside_gateway_import || !sql.start_with?("SELECT")
 
       select_queries += 1
       project_member_queries += 1 if sql.include?('FROM "project_members"')
@@ -86,7 +119,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   end
 
   it "matches users by name and rounds decimal hours to minutes" do
-    described_class.new(data_import).process
+    run_harvest_import(data_import)
 
     advisory = company.projects.kept.find_by!(name: "Advisory")
     entry = advisory.timesheet_entries.kept.find_by!(note: "Research - Memo")
@@ -102,7 +135,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     let(:options) { { "user_map" => { "Jane Doe" => "jane@example.com" } } }
 
     it "maps a Harvest name to a workspace email" do
-      described_class.new(data_import).process
+      run_harvest_import(data_import)
 
       expect(company.projects.kept.find_by!(name: "Advisory").timesheet_entries.kept.pluck(:user_id)).to all(eq(jane.id))
     end
@@ -112,7 +145,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     before { jane.employments.find_by!(company:).discard! }
 
     it "records an error for every unmatched row and continues" do
-      described_class.new(data_import).process
+      run_harvest_import(data_import)
 
       expect(data_import.reload).to have_attributes(status: "completed", imported_rows: 7, failed_rows: 4)
       expect(data_import.row_errors).to all(include("message" => include("No team member in this Miru workspace matches Harvest user \"Jane Doe\"")))
@@ -127,7 +160,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     end
 
     it "requires an explicit user mapping" do
-      described_class.new(data_import).process
+      run_harvest_import(data_import)
 
       messages = data_import.reload.row_errors.pluck("message")
       expect(messages).to all(eq(
@@ -147,7 +180,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     end
 
     it "assigns otherwise unmatched rows to the selected user" do
-      described_class.new(data_import).process
+      run_harvest_import(data_import)
 
       expect(data_import.reload.failed_rows).to eq(0)
       expect(company.projects.kept.find_by!(name: "Advisory").timesheet_entries.kept.pluck(:user_id)).to all(eq(fallback.id))
@@ -159,7 +192,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
 
     it "only writes import bookkeeping and reports the plan" do
       expect do
-        described_class.new(data_import).process
+        run_harvest_import(data_import)
       end.not_to change { [Client.count, Project.count, ProjectMember.count, TimesheetEntry.count] }
 
       expect(data_import.reload).to have_attributes(status: "completed", imported_rows: 0, skipped_rows: 1)
@@ -185,7 +218,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     client = create(:client, company:, name: "acme llc")
     project = create(:project, client:, name: "website", billable: true)
 
-    described_class.new(data_import).process
+    run_harvest_import(data_import)
 
     expect(company.clients.where("LOWER(name) = ?", "acme llc").count).to eq(1)
     expect(client.projects.where("LOWER(name) = ?", "website").count).to eq(1)
@@ -199,9 +232,11 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
       07-01-2026,Acme LLC,Website,1,Paul,Connors
     CSV
 
-    described_class.new(data_import).process
+    run_harvest_import(data_import)
 
-    expect(TimesheetEntry.kept.last.work_date).to eq(Date.new(2026, 1, 7))
+    # Read from this company's projects: in rollback, rows another spec left in the
+    # projection can carry higher ids than the prepared store gives this entry.
+    expect(TimesheetEntry.kept.where(project_id: company.projects.select(:id)).sole.work_date).to eq(Date.new(2026, 1, 7))
   end
 
   it "keeps project names distinct when their 30-character prefixes collide" do
@@ -210,14 +245,14 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
       2026-01-01,Acme LLC,Acme 1H 2025 Committed Hours (PC),PC,1,Paul,Connors
     CSV
 
-    described_class.new(data_import).process
+    run_harvest_import(data_import)
 
     second_import = create(:data_import, company:, user: actor)
     attach_csv_contents(second_import, <<~CSV)
       Date,Client,Project,Hours,First Name,Last Name
       2026-01-02,Acme LLC,Acme 1H 2025 Committed Hours (LW),1,Paul,Connors
     CSV
-    described_class.new(second_import).process
+    run_harvest_import(second_import)
 
     projects = company.projects.kept.order(:name)
     expect(projects.pluck(:name).uniq.size).to eq(2)
@@ -240,8 +275,8 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     CSV
 
     expect do
-      described_class.new(reimport).process
-    end.not_to change { [company.projects.kept.count, TimesheetEntry.kept.count] }
+      run_harvest_import(reimport)
+    end.not_to change { [company.projects.kept.count, TimesheetEntry.kept.count, Timekeeping::LocalEntry.count] }
     expect(reimport.reload).to have_attributes(imported_rows: 0, skipped_rows: 2)
   end
 
@@ -251,14 +286,14 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
       2026-01-01,Acme Corporate Legal Services Alpha,Website,1,Paul,Connors
     CSV
 
-    described_class.new(data_import).process
+    run_harvest_import(data_import)
 
     second_import = create(:data_import, company:, user: actor)
     attach_csv_contents(second_import, <<~CSV)
       Date,Client,Project,Hours,First Name,Last Name
       2026-01-02,Acme Corporate Legal Services Bravo,Website,1,Paul,Connors
     CSV
-    described_class.new(second_import).process
+    run_harvest_import(second_import)
 
     expect(company.clients.kept.pluck(:name).uniq.size).to eq(2)
     expect(company.projects.kept.count).to eq(2)
@@ -280,7 +315,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     CSV
 
     expect do
-      described_class.new(data_import).process
+      run_harvest_import(data_import)
     end.not_to change { [company.clients.count, company.projects.count, TimesheetEntry.count] }
 
     expect(data_import.reload).to have_attributes(imported_rows: 0, skipped_rows: 1)
@@ -295,7 +330,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     CSV
 
     expect do
-      described_class.new(data_import).process
+      run_harvest_import(data_import)
     end.not_to change(TimesheetEntry, :count)
 
     expect(data_import.reload.row_errors).to eq([
@@ -306,13 +341,13 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   end
 
   it "skips entries already imported without de-duplicating rows within the file" do
-    described_class.new(data_import).process
+    run_harvest_import(data_import)
     second_import = create(:data_import, company:, user: actor)
     attach_csv(second_import, fixture_path)
 
     expect do
-      described_class.new(second_import).process
-    end.not_to change(TimesheetEntry, :count)
+      run_harvest_import(second_import)
+    end.not_to change { [TimesheetEntry.count, Timekeeping::LocalEntry.count] }
 
     expect(second_import.reload).to have_attributes(imported_rows: 0, skipped_rows: 12)
     expect(second_import.summary["duplicates_skipped"]).to eq(11)
@@ -329,7 +364,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   end
 
   it "reports client name truncation" do
-    described_class.new(data_import).process
+    run_harvest_import(data_import)
 
     expect(data_import.reload.summary["warnings"]).to include(
       "Client name truncated: Very Long Client Name That Exceeds Thirty Characters"
@@ -343,7 +378,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
       2026-01-01,Acme LLC,A Project Name Longer Than Thirty Characters,1,Paul,Connors,Yes
     CSV
 
-    described_class.new(data_import).process
+    run_harvest_import(data_import)
 
     project = client.projects.find_by!(name: "A Project Name Longer T-ae2f52")
     expect(project.timesheet_entries.kept).to exist
@@ -358,15 +393,15 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     CSV
 
     expect do
-      described_class.new(reimport).process
-    end.not_to change { [client.projects.count, TimesheetEntry.kept.count] }
+      run_harvest_import(reimport)
+    end.not_to change { [client.projects.count, TimesheetEntry.kept.count, Timekeeping::LocalEntry.count] }
   end
 
   it "restores an archived client before importing entries" do
     client = create(:client, company:, name: "Acme LLC")
     client.discard!
 
-    described_class.new(data_import).process
+    run_harvest_import(data_import)
 
     expect(client.reload).to be_kept
     expect(client.projects.kept.find_by!(name: "Website").timesheet_entries.kept).to exist
@@ -378,7 +413,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     project = create(:project, client:, name: "Website", billable: true)
     project.discard!
 
-    described_class.new(data_import).process
+    run_harvest_import(data_import)
 
     expect(project.reload).to be_kept
     expect(project.timesheet_entries.kept).to exist
@@ -387,7 +422,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
 
   it "schedules the uploaded CSV for purge after a real run" do
     expect do
-      described_class.new(data_import).process
+      run_harvest_import(data_import)
     end.to have_enqueued_job(ActiveStorage::PurgeJob).with(data_import.file.blob)
   end
 
@@ -395,7 +430,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     client = create(:client, company:, name: "Acme LLC")
     project = create(:project, client:, name: "Website", billable: false)
 
-    described_class.new(data_import).process
+    run_harvest_import(data_import)
 
     expect(project.timesheet_entries.kept).to all(be_non_billable)
     warnings = data_import.reload.summary["warnings"].grep(/Acme LLC \/ Website/)
@@ -410,6 +445,31 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
 
   def attach_csv_contents(import, contents)
     import.file.attach(io: StringIO.new(contents), filename: "harvest.csv", content_type: "text/csv")
+  end
+
+  context "more tests 2" do
+    # "With TIMEKEEPING_OWNER_STATE=rollback, spec/services/imports/harvest_time_entries_importer_spec.rb runs with
+    # no failing non-forwarded examples, and `bin/timekeeping-demo regression` no longer reports `rollback: failed`."
+    it "rollback import of the Harvest file stores the multi-line note once and a reimport adds no entry", owner_state: "rollback" do
+      run_harvest_import(data_import)
+
+      expect(data_import.reload).to have_attributes(status: "completed", imported_rows: 11, failed_rows: 0)
+      website = company.projects.kept.find_by!(name: "Website")
+      note = "Programming - Built landing\nand tests"
+      expect(website.timesheet_entries.kept.where(note:).count).to eq(1)
+      local_count = Timekeeping::LocalEntry.where(company_id: company.id, discarded_at: nil).count
+      projected_count = TimesheetEntry.kept.where(project_id: company.projects.select(:id)).count
+      expect(local_count).to eq(11)
+      expect(projected_count).to eq(11)
+
+      reimport = create(:data_import, company:, user: actor, options: {})
+      attach_csv(reimport, fixture_path)
+      run_harvest_import(reimport)
+
+      expect(Timekeeping::LocalEntry.where(company_id: company.id, discarded_at: nil).count).to eq(local_count)
+      expect(TimesheetEntry.kept.where(project_id: company.projects.select(:id)).count).to eq(projected_count)
+      expect(website.timesheet_entries.kept.where(note:).count).to eq(1)
+    end
   end
 end
 
@@ -585,6 +645,8 @@ RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true, forwar
 end
 
 RSpec.describe Imports::HarvestTimeEntriesImporter do
+  include HarvestImporterSpecRelay
+
   let(:fold_gen_company) { create(:company, base_currency: "INR", date_format: "MM-DD-YYYY") }
   let(:fold_gen_actor) { create(:user, current_workspace_id: fold_gen_company.id) }
   let(:fold_gen_paul) do
@@ -611,7 +673,11 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_wrap_original do |original, *args, **kwargs|
       result = original.call(*args, **kwargs)
       calls += 1
-      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).increment!(:generation) if calls == 1
+      if calls == 1
+        # Delivered before the change: the projection refuses an earlier generation's snapshot after it.
+        relay_local_entries_to_projection(fold_gen_company)
+        TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).increment!(:generation)
+      end
       result
     end
 
@@ -623,7 +689,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     expect(fold_gen_import.reload).to have_attributes(status: "failed", imported_rows: 1, failed_rows: 0, skipped_rows: 0)
     expect(fold_gen_import.row_errors).to eq([])
 
-    described_class.new(fold_gen_import.reload).process
+    run_harvest_import(fold_gen_import.reload)
 
     # Both identical rows end up stored once each: the rerun skips the row already written and writes the other.
     expect(TimesheetEntry.where(user: fold_gen_paul, note: "same work", source: "import").count).to eq(2)
@@ -688,7 +754,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   end
 
   # "On the legacy branch, today's `TimesheetEntry.create!` then `entry.update!(bill_status: :billed)` run inside one gateway call and one transaction."
-  it "leaves no unbilled entry when the legacy billing step of a billed row is refused" do
+  it "leaves no unbilled entry when the legacy billing step of a billed row is refused", writes_legacy_store: true do
     allow_any_instance_of(TimesheetEntry).to receive(:update!).and_wrap_original do |original, *_args, **_kwargs|
       original.receiver.errors.add(:base, "billing refused")
       raise ActiveRecord::RecordInvalid.new(original.receiver)
@@ -703,6 +769,8 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
 end
 
 RSpec.describe Imports::HarvestTimeEntriesImporter do
+  include HarvestImporterSpecRelay
+
   let(:company) { create(:company, base_currency: "INR", date_format: "MM-DD-YYYY") }
   let(:actor) { create(:user, current_workspace_id: company.id) }
   let(:paul) { create(:user, first_name: "Paul", last_name: "Connors", email: "paul@example.com", current_workspace_id: company.id) }
@@ -711,6 +779,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
 
   before do
     create(:employment, company:, user: actor)
+    actor.add_role :admin, company
     create(:employment, company:, user: paul)
     create(:employment, company:, user: jane)
     File.open(Rails.root.join("spec/fixtures/files/harvest_detailed_time.csv")) do |file|
@@ -726,7 +795,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
       original.call(*args, **kwargs)
     end
 
-    described_class.new(data_import).process
+    run_harvest_import(data_import)
 
     expect(data_import.reload).to have_attributes(status: "completed", imported_rows: 11, failed_rows: 0)
     expect(import_calls).to eq(11)
@@ -755,6 +824,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
 
   before do
     [stale_actor, stale_paul, stale_jane].each { |user| create(:employment, company: stale_company, user:) }
+    stale_actor.add_role :admin, stale_company
     File.open(Rails.root.join("spec/fixtures/files/harvest_detailed_time.csv")) do |file|
       stale_import.file.attach(io: file, filename: "harvest.csv", content_type: "text/csv")
     end
@@ -769,6 +839,8 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
       result = original.call(*args, **kwargs)
       writes += 1
       if writes == 1
+        # Delivered before the change: the projection refuses an earlier generation's snapshot after it.
+        relay_local_entries_to_projection(stale_company)
         ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
         ownership.update_columns(generation: ownership.generation + 1)
       end
@@ -796,6 +868,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
 
   before do
     [fold_handoff_actor, fold_handoff_paul, fold_handoff_jane].each { |user| create(:employment, company: fold_handoff_company, user:) }
+    fold_handoff_actor.add_role :admin, fold_handoff_company
     File.open(Rails.root.join("spec/fixtures/files/harvest_detailed_time.csv")) do |file|
       fold_handoff_import.file.attach(io: file, filename: "harvest.csv", content_type: "text/csv")
     end
@@ -807,7 +880,11 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_wrap_original do |original, *args, **kwargs|
       result = original.call(*args, **kwargs)
       writes += 1
-      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(handoff_step: "close_admission") if writes == 1
+      if writes == 1
+        # Delivered before the handoff starts, as the drain would deliver it.
+        relay_local_entries_to_projection(fold_handoff_company)
+        TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(handoff_step: "close_admission")
+      end
       result
     end
 
@@ -1009,8 +1086,11 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     create(:project, name: "Website", billable: true, client: create(:client, company: rerun_dup_company, name: "Acme LLC"))
   end
 
+  include HarvestImporterSpecRelay
+
   before do
     create(:employment, company: rerun_dup_company, user: rerun_dup_actor)
+    rerun_dup_actor.add_role :admin, rerun_dup_company
     create(:employment, company: rerun_dup_company, user: rerun_dup_paul)
     rerun_dup_project
   end
@@ -1044,6 +1124,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
 
     rerun_dup_refuse_import_call(2)
     expect { described_class.new(import).process }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
+    relay_local_entries_to_projection(rerun_dup_company)
     expect(rerun_dup_entries("same work")).to eq(1)
 
     rerun_dup_refuse_import_call(1)
@@ -1051,7 +1132,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     expect(import.reload).to have_attributes(status: "failed", imported_rows: 0)
 
     allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_call_original
-    described_class.new(import.reload).process
+    run_harvest_import(import.reload)
 
     expect(rerun_dup_entries("same work")).to eq(2)
     expect(import.reload).to have_attributes(status: "completed", imported_rows: 1, skipped_rows: 1)
@@ -1070,10 +1151,11 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
 
     rerun_dup_refuse_import_call(2)
     expect { described_class.new(import).process }.to raise_error(Timekeeping::Gateway::OwnershipMoving)
+    relay_local_entries_to_projection(rerun_dup_company)
     expect(rerun_dup_entries("second")).to eq(1)
 
     allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_call_original
-    described_class.new(import.reload).process
+    run_harvest_import(import.reload)
 
     expect(rerun_dup_entries("earlier")).to eq(1)
     expect(rerun_dup_entries("second")).to eq(1)
@@ -1098,10 +1180,11 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     end
 
     expect { described_class.new(import).process }.to raise_error(IOError)
+    relay_local_entries_to_projection(rerun_dup_company)
     expect(rerun_dup_entries("same work")).to eq(1)
 
     allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_call_original
-    described_class.new(import.reload).process
+    run_harvest_import(import.reload)
 
     expect(rerun_dup_entries("same work")).to eq(2)
     expect(import.reload).to have_attributes(status: "completed", imported_rows: 1, skipped_rows: 1)
@@ -1139,8 +1222,8 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
       2026-01-05,Acme LLC,Website,1,Paul,Connors,Yes,queued
     CSV
 
-    described_class.new(first_import).process
-    described_class.new(second_import).process
+    run_harvest_import(first_import)
+    run_harvest_import(second_import)
 
     expect(rerun_dup_entries("queued")).to eq(1)
     expect(second_import.reload).to have_attributes(status: "completed", imported_rows: 0, skipped_rows: 2)
@@ -1168,7 +1251,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
       2026-01-07,Acme LLC,Website,1,Paul,Connors,Yes,after
     CSV
 
-    described_class.new(import).process
+    run_harvest_import(import)
 
     expect(rerun_dup_entries("before")).to eq(1)
     expect(rerun_dup_entries("after")).to eq(1)

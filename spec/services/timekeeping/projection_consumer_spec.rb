@@ -278,6 +278,87 @@ RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
       expect(rules_row(91_010)).to be_nil
     end
   end
+
+  context "more tests 10", "snapshot rules" do
+    it "stores a multi-line note shaped like SQL exactly as sent and leaves other companies' rows untouched" do
+      other_company = create(:company)
+      other_project = create(:project, client: create(:client, company: other_company))
+      bystander = create(:timesheet_entry, project: other_project, user: create(:user), note: "bystander")
+      bystander_before = bystander.reload.attributes
+
+      # A note is text a user typed, so it must reach timesheet_entries as data: quoted, never read as SQL,
+      # and with its line breaks and repeated spaces kept.
+      hostile_note = "it's C:\\temp\\\n');  DELETE FROM timesheet_entries; --\n  UPDATE timesheet_entries SET note = 'x'"
+
+      tabbed_hostile_note = "Programming - Built landing\nand tests  two\tspaces 'quoted' \\ back'); " \
+                            "DELETE FROM timesheet_entries; --"
+      expect(rules_deliver(rules_entry(id: 91_902, version: 1, note: "same-company bystander"))).to eq(rules_applied)
+
+      result = described_class.call(batch: rules_batch(rules_entry(id: 91_901, version: 1, note: hostile_note)),
+                                    idempotency_key: SecureRandom.uuid)
+      expect(rules_deliver(rules_entry(id: 91_903, version: 1, note: tabbed_hostile_note))).to eq(rules_applied)
+
+      expect([result.status, result.body]).to eq(rules_applied)
+      expect(rules_row(91_901)).to include("note" => hostile_note, "company_id" => rules_company.id)
+      expect(rules_row(91_903)["note"]).to eq(tabbed_hostile_note)
+      expect(rules_row(91_902)).to include("note" => "same-company bystander", "company_id" => rules_company.id)
+      expect(bystander.reload.attributes).to eq(bystander_before)
+    end
+  end
+
+  context "more tests 11", "snapshot rules" do
+    it "keeps quotes, tabs and carriage returns in a relayed note byte for byte on a redelivery with the same key" do
+      # The relay re-sends a batch with the same body and key, so a redelivery must neither add a row nor change one.
+      { 91_902 => "O'Brien\t\tsaid \"done\"\r\n  ''  twice", 91_903 => "first line\n\nthird  line" }.each do |id, note|
+        batch = rules_batch(rules_entry(id:, version: 1, note:))
+        key = SecureRandom.uuid
+
+        first = described_class.call(batch:, idempotency_key: key)
+        stored = rules_row(id)
+        again = described_class.call(batch:, idempotency_key: key)
+
+        expect(first.status).to eq(200)
+        expect(again.status).to eq(200)
+        expect(TimesheetEntry.unscoped.where(id:).count).to eq(1)
+        expect(rules_row(id)["note"]).to eq(note)
+        expect(rules_row(id)["note"].bytes).to eq(note.bytes)
+        expect(rules_row(id)).to eq(stored)
+        expect(rules_row(id)).to include("company_id" => rules_company.id, "version" => 1)
+      end
+    end
+  end
+
+  context "more tests 12", "snapshot rules" do
+    context "when a note holds whitespace and quote characters" do
+      it "stores a relayed note with line breaks, repeated spaces, a tab, a quote and a backslash exactly as sent" do
+        # The quote and backslash check that the values stay escaped; the spaces and tab check none are collapsed.
+        notes = {
+          91_901 => "Programming - Built landing\nand tests",
+          91_902 => "Client's  review\tof  C:\\reports  \n\n  done",
+          91_903 => "two  spaces,\ttab, O'Brien's \\path\\  end  "
+        }
+        notes.each do |id, note|
+          expect(rules_deliver(rules_entry(id:, version: 1, note:))).to eq(rules_applied)
+        end
+
+        notes.each do |id, note|
+          expect(TimesheetEntry.unscoped.find(id).note).to eq(note)
+          expect(rules_row(id)["note"].bytes).to eq(note.bytes)
+        end
+        expect(rules_row(91_902)).to include("company_id" => rules_company.id, "version" => 1)
+      end
+    end
+  end
+
+  context "more tests 19", "snapshot rules" do
+    it "an update snapshot whose note differs from the stored note only in whitespace replaces it exactly" do
+      # The UPDATE half of the upsert must keep whitespace too, not only the INSERT half.
+      expect(rules_deliver(rules_entry(id: 91_921, version: 1, note: "a b"))).to eq(rules_applied)
+      expect(rules_deliver(rules_entry(id: 91_921, version: 2, note: "a  \n  b"))).to eq(rules_applied)
+
+      expect(rules_row(91_921)).to include("note" => "a  \n  b", "version" => 2)
+    end
+  end
 end
 
 RSpec.describe Timekeeping::ProjectionConsumer, "references of applying snapshots" do
