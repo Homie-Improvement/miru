@@ -430,9 +430,20 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
           baseline = section_9_3_reservations(company, [entry])
           expect(section_9_3_committed_by(baseline, entry, invoice).size).to eq(1),
             "#{name}: the non-draft should hold its entry committed before the delete; saw #{baseline.inspect}"
+          # The draft save's operation proves this read sees the invoice's
+          # operations, so an unchanged set after the delete means the refused
+          # delete sent none.
+          draft_save_only = [%w[committed active]]
+          operations_before = section_9_3_timekeeping_operations(company_id: company.id, invoice_id: invoice.id)
+          expect(operations_before.map { |operation| operation.values_at(:state, :disposition) }).to eq(draft_save_only),
+            "#{name}: before the delete Timekeeping should hold only the draft save's operation; " \
+            "saw #{operations_before.inspect}"
 
           answer = section_9_3_bulk_delete(company, invoice)
 
+          operations_after = section_9_3_timekeeping_operations(company_id: company.id, invoice_id: invoice.id)
+          expect(operations_after.map { |operation| operation.values_at(:state, :disposition) }).to eq(draft_save_only),
+            "#{name}: the refused delete should send no operation to Timekeeping; saw #{operations_after.inspect}"
           expect(answer.status).to eq(422), "#{name}: the bulk delete answered #{answer.status}"
           expect(JSON.parse(answer.body).fetch("undeletable_invoice_ids")).to eq([invoice.id]),
             "#{name}: the refusal should name the paid invoice"
