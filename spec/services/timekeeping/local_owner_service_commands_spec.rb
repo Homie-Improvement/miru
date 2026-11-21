@@ -125,6 +125,123 @@ RSpec.describe Timekeeping::LocalOwner, "service command access refusals" do
       end
     end
   end
+
+  context "with a mark-billed carrying only another company's invoice" do
+    include LocalOwnerServiceCommandSetup
+
+    it "local mark_billed of the other company's invoice bills nothing and stores no receipt for either company, in both directions" do
+      generation = prepare_local_ownership!.generation.to_s
+      first = create(:company)
+      second = create(:company)
+      seeded = [first, second].to_h do |company|
+        entry = service_command_company_entry(company, role: "owner", work_date: "2026-03-02", duration: 60.0)
+        invoice_id = create(:invoice, company:, client: create(:client, company:)).id
+        reserve_service_command_entry(entry, invoice_id, state: "committed")
+        [company, { entry:, invoice_id: }]
+      end
+      entries = seeded.values.map { |seed| seed.fetch(:entry) }
+      before = entries.map { |entry| entry.reload.attributes }
+      # The baseline holds entries the command would bill, so "nothing changed" is not empty against empty.
+      expect(before.map { |attributes| attributes.fetch("bill_status") }).to eq(%w[unbilled unbilled])
+      baseline = timekeeping_row_counts
+
+      [[first, second], [second, first]].each do |requester, owner|
+        caller = described_class::Actor.service(name: "invoice-boundary", company_id: requester.id,
+                                                operations: ["invoices.mark_billed"])
+        outcome = described_class.call(
+          operation: :mark_billed, company_id: requester.id, generation:, actor: caller,
+          params: { "invoice_id" => seeded.fetch(owner).fetch(:invoice_id), "operation_id" => SecureRandom.uuid }
+        )
+
+        # A request carrying another company's invoice id "returns `404` or no match and changes nothing in either database, in both directions".
+        expect([[200, { "billed" => 0 }], [404, { "reason" => "not_found" }]]).to include([outcome.status, outcome.body])
+        # "a 2xx answer that changed nothing stores no receipt"
+        expect(timekeeping_row_counts).to eq(baseline)
+        expect(entries.map { |entry| entry.reload.attributes }).to eq(before)
+      end
+    end
+  end
+
+  context "with a detach_entries carrying only another company's agent" do
+    include LocalOwnerServiceCommandSetup
+
+    it "local detach_entries naming only the other company's agent detaches nothing and leaves the other company's entries and receipts unchanged, in both directions" do
+      generation = prepare_local_ownership!.generation.to_s
+      first = create(:company)
+      second = create(:company)
+      agents = { first => 91, second => 92 }
+      entries = agents.to_h do |company, agent_id|
+        [company, service_command_company_entry(company, role: "owner", work_date: "2026-03-02", duration: 60.0, agent_id:)]
+      end
+      receipts_for = lambda do |company|
+        ActiveRecord::Base.connection.select_value(
+          ActiveRecord::Base.sanitize_sql_array(["SELECT COUNT(*) FROM idempotency_records WHERE company_id = ?", company.id])
+        ).to_i
+      end
+      before = entries.transform_values { |entry| entry.reload.attributes }
+      # The baseline holds entries naming each agent, so "nothing changed" is not empty against empty.
+      expect(before.transform_values { |attributes| attributes.fetch("agent_id") }).to eq(first => 91, second => 92)
+
+      [[first, second], [second, first]].each do |requester, owner|
+        owner_receipts = receipts_for.call(owner)
+        caller = described_class::Actor.service(name: "agent-destroy", company_id: requester.id,
+                                                operations: ["agents.detach_entries"])
+        outcome = described_class.call(
+          operation: :detach_entries, company_id: requester.id, generation:, actor: caller,
+          params: { "agent_id" => agents.fetch(owner), "operation_id" => SecureRandom.uuid }
+        )
+
+        # A request carrying another company's id "returns `404` or no match and changes nothing in either database, in both directions".
+        expect([[200, { "detached" => 0 }], [404, { "reason" => "not_found" }]]).to include([outcome.status, outcome.body])
+        # Only the owning company's receipts are checked: the requester's detach receipt is still stored
+        # (COMMANDS store_unchanged), because it is the marker that refuses a racing create naming an agent
+        # the monolith deleted, and a foreign agent id cannot be told apart from an own agent with no entries.
+        expect(receipts_for.call(owner)).to eq(owner_receipts)
+        expect(entries.transform_values { |entry| entry.reload.attributes }).to eq(before)
+      end
+    end
+  end
+
+  context "with a mark-billed that changes nothing, retried" do
+    include LocalOwnerServiceCommandSetup
+
+    # "mark-billed and detach-entries with zero targets for another company's ids store no receipt, pinned by request specs"
+    # "A request that changes nothing stores no receipt, and a retry of it is evaluated again."
+    it "local mark_billed of another company's invoice stores no receipt, bills nothing, and a retry is evaluated again" do
+      generation = prepare_local_ownership!.generation.to_s
+      company = create(:company)
+      other_company = create(:company)
+      other_project = create(:project, client: create(:client, company: other_company))
+      foreign_invoice_id = create(:invoice, company: other_company, client: other_project.client).id
+      foreign_entry = service_command_company_entry(other_company, role: "employee", work_date: "2026-03-02", duration: 60.0)
+      reserve_service_command_entry(foreign_entry, foreign_invoice_id, state: "committed")
+      foreign_before = foreign_entry.reload.attributes
+      expect(foreign_before.fetch("bill_status")).to eq("unbilled")
+      baseline = timekeeping_row_counts
+      service = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
+                                               operations: ["invoices.mark_billed"])
+      operation_id = SecureRandom.uuid
+      mark_billed = lambda do
+        described_class.call(operation: :mark_billed, company_id: company.id, generation:, actor: service,
+                             params: { "invoice_id" => foreign_invoice_id, "operation_id" => operation_id })
+      end
+
+      first = mark_billed.call
+      expect([[200, { "billed" => 0 }], [404, { "reason" => "not_found" }]]).to include([first.status, first.body])
+      # "a 2xx answer that changed nothing stores no receipt"
+      expect(timekeeping_row_counts).to eq(baseline)
+      expect(foreign_entry.reload.attributes).to eq(foreign_before)
+
+      # The requesting company now commits its own entry under the same invoice id.
+      own_entry = service_command_company_entry(company, role: "employee", work_date: "2026-03-02", duration: 30.0)
+      reserve_service_command_entry(own_entry, foreign_invoice_id, state: "committed")
+      retried = mark_billed.call
+
+      expect([retried.status, retried.body]).to eq([200, { "billed" => 1 }])
+      expect(own_entry.reload.bill_status).to eq("billed")
+      expect(foreign_entry.reload.attributes).to eq(foreign_before)
+    end
+  end
 end
 
 RSpec.describe Timekeeping::LocalOwner, "service command target checks" do
@@ -805,9 +922,14 @@ RSpec.describe Timekeeping::LocalOwner, "mark_billed waiting on a successor invo
 end
 
 RSpec.describe Timekeeping::LocalOwner, "stored service command receipts" do
+  include LocalOwnerServiceCommandSetup
+
   it "stores each command's receipt as a service receipt with the target-qualified operation and its SHA256 fingerprint" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
+    # A mark-billed that bills nothing stores no receipt, so invoice 501 holds one entry to bill.
+    billable = service_command_company_entry(company, role: "employee", work_date: "2026-03-02", duration: 60.0)
+    reserve_service_command_entry(billable, 501, state: "committed")
     actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
                                            operations: %w[invoices.mark_billed agents.detach_entries])
     commands = { mark_billed: ["invoice_id", 501, "mark_billed 501"], detach_entries: ["agent_id", 77, "detach_entries 77"] }
