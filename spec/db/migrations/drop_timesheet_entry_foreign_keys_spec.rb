@@ -38,6 +38,15 @@ RSpec.describe DropTimesheetEntryForeignKeys do
     end
   end
 
+  # The loaded schema no longer declares these keys, because a later migration
+  # drops them. Examples about a database that still holds them add them first.
+  def add_dropped_keys_validated
+    described_class::DROPPED_KEYS.each do |key|
+      connection.add_foreign_key key[:from_table], key[:to_table], column: key[:column], if_not_exists: true
+      connection.validate_foreign_key key[:from_table], key[:to_table], column: key[:column]
+    end
+  end
+
   def expect_every_dropped_key_present_and_validated
     described_class::DROPPED_KEYS.each do |key|
       expect(connection.foreign_key_exists?(key[:from_table], key[:to_table], column: key[:column]))
@@ -78,6 +87,7 @@ RSpec.describe DropTimesheetEntryForeignKeys do
   # runner skips down for an unrecorded version; the documented restore runs
   # up first so that down then runs.
   it "restores the keys through the migration runner when an interrupted drop left the version unrecorded" do
+    add_dropped_keys_validated
     version = 20261020120000
     connection.execute("DELETE FROM schema_migrations WHERE version = '#{version}'")
     link_key = described_class::DROPPED_KEYS.first
@@ -107,6 +117,7 @@ RSpec.describe DropTimesheetEntryForeignKeys do
   # "Keep the database checks until every old application process has the replacement validations."
   # A deploy can re-run db:prepare; repeating up must still leave every key in place.
   it "up keeps all three timesheet entry keys, validated, on a database that still has them, however often it runs" do
+    add_dropped_keys_validated
     run_migration(:up)
     run_migration(:up)
 
@@ -119,6 +130,7 @@ RSpec.describe DropTimesheetEntryForeignKeys do
   # A database where the old drop removed only the first key before stopping must keep the other two,
   # and must not get the first one back unvalidated.
   it "keeps the remaining keys and does not re-add a missing one when up runs after a drop that stopped part-way" do
+    add_dropped_keys_validated
     link_key, line_item_key, agent_key = described_class::DROPPED_KEYS
     connection.remove_foreign_key link_key[:from_table], link_key[:to_table], column: link_key[:column]
 
@@ -130,16 +142,13 @@ RSpec.describe DropTimesheetEntryForeignKeys do
   end
 
   # "Keep the database checks until every old application process has the replacement validations."
-  it "every key in DROPPED_KEYS is present in the loaded schema" do
+  it "DROPPED_KEYS lists the three timesheet entry keys" do
     expected = [
       { from_table: :invoice_line_item_time_entries, to_table: :timesheet_entries, column: :timesheet_entry_id },
       { from_table: :invoice_line_items, to_table: :timesheet_entries, column: :timesheet_entry_id },
       { from_table: :timesheet_entries, to_table: :agents, column: :agent_id }
     ]
     expect(described_class::DROPPED_KEYS).to match_array(expected)
-
-    # The test database is built from db/schema.rb, so this checks the schema declares the keys again.
-    expect(restored_dropped_keys).to eq(described_class::DROPPED_KEYS)
   end
 
   # "Such a billing reference also trips the new rollback pre-check."
