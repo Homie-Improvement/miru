@@ -130,6 +130,7 @@ RSpec.describe "Characterization: timesheet entry rules", type: :request, commit
     { "inside the timesheet_entry payload" => true, "at the top level" => false }.each do |placement, inside|
       it "ignores a user_id supplied #{placement} and saves the entry for the agent's user" do
         other_user = rules_spec_member(:employee)
+        agent_token
 
         expect_owner_state!
         agent_entry_request_with_user_override(other_user, inside_entry_payload: inside)
@@ -147,6 +148,7 @@ RSpec.describe "Characterization: timesheet entry rules", type: :request, commit
 
     it "refuses a project from another company and creates no entry" do
       foreign_project = create(:project, client: create(:client, company: create(:company)), billable: true)
+      agent_token
 
       expect_owner_state!
       expect do
@@ -199,6 +201,8 @@ RSpec.describe "Characterization: timesheet entry rules", type: :request, commit
     [:owner, :admin].each do |role|
       it "lets an #{role} create an entry for a same-company user" do
         actor = rules_spec_member(role)
+        project
+        target_user
         sign_in actor
 
         expect_owner_state!
@@ -215,6 +219,7 @@ RSpec.describe "Characterization: timesheet entry rules", type: :request, commit
     it "refuses an employee who targets another user and creates no entry" do
       employee = rules_spec_member(:employee)
       create(:project_member, project:, user: employee)
+      target_user
       sign_in employee
 
       expect_owner_state!
