@@ -104,11 +104,12 @@ RSpec.describe LiveHandoff do
         "live_handoff_counts", [auditable_type, company_id]
       )
     end
-    insert_entry_audit = lambda do |company_id|
+    # entry_audits has a foreign key to entries on (company_id, entry_id), so each audit names an entry of its company.
+    insert_entry_audit = lambda do |company_id, entry_id|
       connection.exec_query(
         "INSERT INTO entry_audits (action, actor_type, actor_id, after, company_id, created_at, entry_created_at, " \
-        "entry_id) VALUES ('create', 'user', 1, '{}', $1, now(), now(), 1)",
-        "live_handoff_counts", [company_id]
+        "entry_id) VALUES ('create', 'user', 1, '{}', $1, now(), now(), $2)",
+        "live_handoff_counts", [company_id, entry_id]
       )
     end
     insert_legacy_receipt = lambda do |company_id|
@@ -143,10 +144,10 @@ RSpec.describe LiveHandoff do
     end
     seed_rows = lambda do |company_id, rows_per_table, entry_version|
       rows_per_table.times do
-        insert_entry.call(company_id, entry_version)
+        entry_id = insert_entry.call(company_id, entry_version)
         insert_projection_row.call(company_id)
         insert_audit.call(company_id)
-        insert_entry_audit.call(company_id)
+        insert_entry_audit.call(company_id, entry_id)
         insert_legacy_receipt.call(company_id)
         insert_idempotency_record.call(company_id)
         insert_snapshot_receipt.call(company_id)
@@ -914,5 +915,25 @@ RSpec.describe LiveHandoff do
     expect(changed.bytesize).to eq(original.bytesize)
     differing = original.bytes.zip(changed.bytes).count { |left, right| left != right }
     expect(differing).to eq(1)
+  end
+end
+
+require "rails_helper"
+
+RSpec.describe LiveHandoff do
+  # "The live `tenant_counts` meta example carries `committed_data` and `:integrated_runtime` and follows the
+  # database reset rule, though it lives under `spec/meta`". The integration tag check reads only
+  # spec/integration/timekeeping, so this example keeps the live groups of this file tagged.
+  it "keeps every live Timekeeping counts group in this file tagged :integrated_runtime and committed_data" do
+    this_file = File.expand_path(__FILE__)
+    live_groups = RSpec.world.example_groups.flat_map(&:descendants).select do |group|
+      group.metadata[:absolute_file_path] == this_file &&
+        group.description == "live Timekeeping counts for two companies"
+    end
+
+    expect(live_groups.size).to eq(2)
+    live_groups.each do |group|
+      expect(group.metadata).to include(integrated_runtime: true, committed_data: true)
+    end
   end
 end
