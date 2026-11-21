@@ -405,6 +405,11 @@ RSpec.describe "CI spec coverage in validations.yml" do
       # Two jobs calling it would boot the live server and reload the seed twice per push.
       expect(live_handoff_jobs.size).to eq(1)
       expect(live_handoff_step.fetch("run")).not_to include("${{")
+      # A job that names a live spec directly would also boot the live server and bypass the selector.
+      direct_runs = jobs.flat_map do |name, job|
+        Array(job["steps"]).filter_map { |step| name if step["run"].to_s.include?("spec/integration/timekeeping/") }
+      end
+      expect(direct_runs).to eq([])
       # Asking the selector itself keeps its live-spec rule in one place.
       expect(TimekeepingLiveSpecs.live_specs(root: Rails.root.to_s)).to include(
         "spec/integration/timekeeping/handoff_live_spec.rb", "spec/integration/timekeeping/alerts_live_spec.rb"

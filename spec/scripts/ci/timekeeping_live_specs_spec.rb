@@ -56,31 +56,6 @@ RSpec.describe TimekeepingLiveSpecs do
     ).to eq(["spec/integration/timekeeping/handoff_live_spec.rb"])
   end
 
-  it "full_set_trigger? matches the issue's paths only on a directory boundary" do
-    # "A pull request that changes `lib/timekeeping`, `timekeeping/`, `app/services/timekeeping`, `db/`, the live
-    # support files or the workflow itself runs the full `spec/integration/timekeeping` live set"
-    triggers = %w[
-      lib/timekeeping/handoff.rb
-      timekeeping/Gemfile.lock
-      app/services/timekeeping/relay.rb
-      db/schema.rb
-      spec/support/timekeeping/live_instance.rb
-      .github/workflows/validations.yml
-    ]
-    near_misses = %w[
-      lib/timekeeping_demo/x.rb
-      dbx/x.rb
-      db_tools/x.rb
-      spec/lib/timekeeping/x.rb
-      app/services/timekeeping_extra/x.rb
-      spec/support/timekeeping_other/x.rb
-      .github/workflows/validations.yml.bak
-    ]
-
-    expect(triggers.reject { |path| described_class.full_set_trigger?(path) }).to eq([])
-    expect(near_misses.select { |path| described_class.full_set_trigger?(path) }).to eq([])
-  end
-
   # "When the selection is empty, the job still reports success with a line that says no live spec was selected,
   # so a required check never hangs" - a git failure is not an empty selection, so it must not take that green path.
   it "fails the live step instead of reporting an empty selection when the pull request diff cannot be read" do
@@ -166,6 +141,7 @@ RSpec.describe TimekeepingLiveSpecs do
     # support files or the workflow itself runs the full `spec/integration/timekeeping` live set"
     full_set_paths = %w[
       lib/timekeeping/handoff.rb
+      timekeeping/Gemfile
       timekeeping/Gemfile.lock
       app/services/timekeeping/relay.rb
       db/schema.rb
@@ -173,41 +149,39 @@ RSpec.describe TimekeepingLiveSpecs do
       .github/workflows/validations.yml
       script/ci/timekeeping_live_specs.rb
     ]
+    # Each shares a prefix with a trigger but not its directory boundary.
     near_misses = %w[
       lib/timekeeping_demo/x.rb
       dbx/x.rb
+      db_tools/x.rb
       spec/lib/timekeeping/x.rb
+      app/services/timekeeping_extra/x.rb
+      spec/support/timekeeping_other/x.rb
       spec/integration/timekeeping_other/x_live_spec.rb
       spec/integration/timekeeping/local_relay_spec.rb
+      .github/workflows/validations.yml.bak
       app/models/user.rb
     ]
 
     full_set_paths.each do |path|
+      expect(described_class.full_set_trigger?(path)).to be(true), path
       expect(described_class.selection(changed_paths: [path], live_specs: live)).to eq(live), path
     end
     near_misses.each do |path|
+      expect(described_class.full_set_trigger?(path)).to be(false), path
       expect(described_class.selection(changed_paths: [path], live_specs: live)).to eq([]), path
     end
   end
 
-  it "on a pull request that changes lib/timekeeping, timekeeping/, app/services/timekeeping, db/, a live support file or the workflow, runs the full live set" do
+  it "on a pull request that changes a full-set path beside one live spec, runs the full live set" do
     # "A pull request that changes `lib/timekeeping`, `timekeeping/`, `app/services/timekeeping`, `db/`,
     # the live support files or the workflow itself runs the full `spec/integration/timekeeping` live set"
-    %w[
-      lib/timekeeping/handoff.rb
-      timekeeping/Gemfile
-      app/services/timekeeping/relay.rb
-      db/schema.rb
-      spec/support/timekeeping/live_instance.rb
-      .github/workflows/validations.yml
-    ].each do |trigger|
-      _status, _out, _err, rspec_calls = run_timekeeping_live_selector(
-        env: pull_request_env,
-        changed_paths: ->(_base) { ["spec/integration/timekeeping/alerts_live_spec.rb", trigger] }
-      )
+    _status, _out, _err, rspec_calls = run_timekeeping_live_selector(
+      env: pull_request_env,
+      changed_paths: ->(_base) { ["spec/integration/timekeeping/alerts_live_spec.rb", "db/schema.rb"] }
+    )
 
-      expect(rspec_calls).to eq([live]), "#{trigger} did not select the full live set"
-    end
+    expect(rspec_calls).to eq([live])
   end
 
   it "selects an added live spec and a renamed one by its new path, and never a deleted one" do
@@ -254,6 +228,38 @@ RSpec.describe TimekeepingLiveSpecs do
     expect(described_class.live_specs(root: Rails.root.to_s)).to eq(live)
   end
 
+  it "recognises a single-quoted gate, and fails the run on a TIMEKEEPING_LIVE gate it cannot recognise" do
+    Dir.mktmpdir do |root|
+      dir = File.join(root, "spec/integration/timekeeping")
+      FileUtils.mkdir_p(dir)
+      File.write(File.join(dir, "quoted_live_spec.rb"), "skip unless ENV['TIMEKEEPING_LIVE'] == '1'\n")
+      File.write(File.join(dir, "plain_spec.rb"), "it { expect(1).to eq(1) }\n")
+
+      expect(described_class.live_specs(root:)).to eq(["spec/integration/timekeeping/quoted_live_spec.rb"])
+
+      File.write(File.join(dir, "fetch_live_spec.rb"), "skip unless ENV.fetch(\"TIMEKEEPING_LIVE\", nil) == \"1\"\n")
+
+      expect { described_class.live_specs(root:) }
+        .to raise_error(TimekeepingLiveSpecs::ConfigError, /fetch_live_spec\.rb/)
+
+      # Leaving the spec out would let the required check pass with it unrun.
+      out = StringIO.new
+      err = StringIO.new
+      rspec_calls = []
+      status = Dir.chdir(root) do
+        described_class.run(
+          env: main_push_env, out:, err:, full_run_branches: release_branches,
+          changed_paths: ->(_base) { [] }, run_rspec: ->(specs) { rspec_calls << specs; 0 }
+        )
+      end
+
+      expect(status).to eq(1)
+      expect(err.string).to include("fetch_live_spec.rb")
+      expect(out.string).not_to include("No live Timekeeping spec was selected")
+      expect(rspec_calls).to be_empty
+    end
+  end
+
   it "reads the release branches from the workflow's pull_request trigger" do
     workflow_path = Rails.root.join(".github/workflows/validations.yml").to_s
 
@@ -284,10 +290,22 @@ RSpec.describe TimekeepingLiveSpecs do
     expect(described_class.live_spec?("")).to be(false)
   end
 
+  # Inherited GIT_* variables (GIT_DIR, GIT_WORK_TREE and the like, exported by a git hook)
+  # override chdir:, so fixture git commands would otherwise act on the developer's checkout.
+  def without_inherited_git_variables_for_live_selector
+    saved = ENV.to_h.select { |key, _value| key.start_with?("GIT_") }
+    saved.each_key { |key| ENV.delete(key) }
+    yield
+  ensure
+    ENV.update(saved)
+  end
+
   it "lists only the files the branch adds, edits or deletes since its merge base, not commits main gained later" do
     Dir.mktmpdir do |tmp|
+      unset_git_variables = ENV.keys.grep(/\AGIT_/).index_with(nil)
       git = lambda do |dir, *args|
         output, status = Open3.capture2e(
+          unset_git_variables,
           "git", "-c", "user.name=Spec", "-c", "user.email=spec@example.com",
           "-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false", *args, chdir: dir
         )
@@ -306,7 +324,7 @@ RSpec.describe TimekeepingLiveSpecs do
       write.call(origin, "spec/integration/timekeeping/alerts_live_spec.rb", "one\n")
       write.call(origin, "spec/integration/timekeeping/handoff_live_spec.rb", "one\n")
       git.call(origin, "add", "-A")
-      git.call(origin, "commit", "-q", "-m", "base")
+      git.call(origin, "commit", "-q", "--no-verify", "-m", "base")
 
       clone = File.join(tmp, "clone")
       git.call(tmp, "clone", "-q", origin, clone)
@@ -315,14 +333,16 @@ RSpec.describe TimekeepingLiveSpecs do
       write.call(clone, "spec/integration/timekeeping/new_live_spec.rb", "new\n")
       git.call(clone, "rm", "-q", "spec/integration/timekeeping/handoff_live_spec.rb")
       git.call(clone, "add", "-A")
-      git.call(clone, "commit", "-q", "-m", "feature")
+      git.call(clone, "commit", "-q", "--no-verify", "-m", "feature")
 
       # main moves on after the branch was cut; its commit is not part of the change.
       write.call(origin, "app/models/later_on_main.rb", "later\n")
       git.call(origin, "add", "-A")
-      git.call(origin, "commit", "-q", "-m", "later on main")
+      git.call(origin, "commit", "-q", "--no-verify", "-m", "later on main")
 
-      paths = Dir.chdir(clone) { described_class.changed_paths("origin/main") }
+      paths = without_inherited_git_variables_for_live_selector do
+        Dir.chdir(clone) { described_class.changed_paths("origin/main") }
+      end
 
       expect(paths.sort).to eq(
         %w[

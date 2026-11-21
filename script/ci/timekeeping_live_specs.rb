@@ -20,7 +20,9 @@ module TimekeepingLiveSpecs
   class ConfigError < StandardError; end
 
   LIVE_SPEC_GLOB = "spec/integration/timekeeping/*_spec.rb"
-  LIVE_GATE = 'ENV["TIMEKEEPING_LIVE"] == "1"'
+  LIVE_FLAG = "TIMEKEEPING_LIVE"
+  # Matches ENV["TIMEKEEPING_LIVE"] == "1" in either quote style and any spacing.
+  LIVE_GATE = /ENV\[\s*(["'])TIMEKEEPING_LIVE\1\s*\]\s*==\s*(["'])1\2/
   # Specs that also need this flag skip their live examples in this job.
   REGRESSION_FLAG = "TIMEKEEPING_REGRESSION"
 
@@ -73,11 +75,19 @@ module TimekeepingLiveSpecs
   end
 
   def live_spec?(source)
-    source.include?(LIVE_GATE) && !source.include?(REGRESSION_FLAG)
+    source.match?(LIVE_GATE) && !source.include?(REGRESSION_FLAG)
   end
 
+  # A spec that reads TIMEKEEPING_LIVE through a gate this script does not recognise
+  # raises ConfigError: leaving it out would let the check pass with that spec unrun.
   def live_specs(root: Dir.pwd)
-    Dir.glob(LIVE_SPEC_GLOB, base: root).sort.select { |path| live_spec?(File.read(File.join(root, path))) }
+    Dir.glob(LIVE_SPEC_GLOB, base: root).sort.select do |path|
+      source = File.read(File.join(root, path))
+      next true if live_spec?(source)
+      next false unless source.include?(LIVE_FLAG) && !source.include?(REGRESSION_FLAG)
+
+      raise ConfigError, "#{path} reads #{LIVE_FLAG} without the gate #{LIVE_GATE.source}"
+    end
   end
 
   # The pull_request branches are the release branches: their pushes run the full set.
@@ -115,8 +125,11 @@ module TimekeepingLiveSpecs
   end
 
   # Returns the exit status for the job. run_rspec receives a non-empty list.
-  def run(env:, out: $stdout, err: $stderr, live_specs: self.live_specs,
+  # The live specs and release branches are read here rather than as argument
+  # defaults so that a ConfigError while reading them reaches the rescue below.
+  def run(env:, out: $stdout, err: $stderr, live_specs: nil,
           full_run_branches: nil, changed_paths: method(:changed_paths), run_rspec: method(:exec_rspec))
+    live_specs ||= self.live_specs
     base = comparison_base(
       event_name: env["GITHUB_EVENT_NAME"], ref_name: env["GITHUB_REF_NAME"], base_ref: env["GITHUB_BASE_REF"],
       full_run_branches: full_run_branches || self.full_run_branches
