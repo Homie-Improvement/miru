@@ -25,6 +25,7 @@ RSpec.describe "forwarded Timekeeping setup helpers" do
   # keep all of them, or forwarded imports in the migrated groups stop reaching the fake.
   # What a forwarded import then sends is checked by the importer and job specs, not here.
   it "arrange_forwarded_timekeeping hands ownership to the fake at generation 2 and routes Timekeeping HTTP to it" do
+    stub_const("TimekeepingOwnerState::SELECTED", nil)
     %i[register_company register_user register_project].each do |method|
       allow(arrange_fake).to receive(method).and_call_original
     end
@@ -49,6 +50,7 @@ RSpec.describe "forwarded Timekeeping setup helpers" do
   # Every copied setup this helper replaces set owner "timekeeping" with generation 2 on the ownership row
   # and on the fake, so a generation-bump example that starts from a leftover generation would not bump past it.
   it "resets ownership to timekeeping at generation 2 on both sides even when an earlier step left a later generation" do
+    stub_const("TimekeepingOwnerState::SELECTED", nil)
     TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "monolith", generation: 7)
     arrange_fake.generation = 7
     allow(arrange_fake).to receive(:register_user).and_call_original
@@ -100,6 +102,31 @@ RSpec.describe "forwarded Timekeeping setup helpers" do
     ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
     expect(ownership).to have_attributes(owner: "monolith", monolith_store: "prepared", generation: 3)
     expect(arrange_fake.generation).to eq(3)
+  end
+
+  # A helper that sets only owner and generation leaves monolith_store and the retired flag at the
+  # leftover row's values, so the row starts different from the timekeeping state in every compared column.
+  it "arrange_forwarded_timekeeping with no state selected leaves the whole ownership row equal to the timekeeping state" do
+    stub_const("TimekeepingOwnerState::SELECTED", nil)
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+      .update_columns(owner: "monolith", monolith_store: "prepared", generation: 7, legacy_retired_at: nil)
+    arrange_fake.generation = 7
+    allow(arrange_fake).to receive(:register_user).and_call_original
+    allow(arrange_fake).to receive(:register_project).and_call_original
+
+    arrange_forwarded_timekeeping(arrange_fake, company: arrange_company,
+                                                users: { arrange_paul => "employee" },
+                                                project: arrange_project)
+
+    expect_owner_state!("timekeeping")
+    expect(TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID))
+      .to have_attributes(owner: "timekeeping", monolith_store: "legacy", generation: 2,
+                          legacy_retired_at: TimekeepingOwnerState::LEGACY_RETIRED_AT)
+    expect(arrange_fake.generation).to eq(2)
+    expect(arrange_fake).to have_received(:register_user)
+      .once.with(id: arrange_paul.id, company_id: arrange_company.id, role: "employee")
+    expect(arrange_fake).to have_received(:register_project)
+      .once.with(id: arrange_project.id, company_id: arrange_company.id)
   end
 end
 
@@ -224,6 +251,16 @@ RSpec.describe "forwarded Timekeeping helpers with the live adapter running" do
       end
     end
   end
+
+  it "arrange_forwarded_timekeeping under the live adapter stores the timekeeping row and sends the fake no message at all" do
+    # A double with no allowed messages fails the example on any call, a generation write included.
+    untouchable_fake = double("FakeTimekeeping that must not be reached")
+
+    arrange_forwarded_timekeeping(untouchable_fake, company: adapter_company, users: { adapter_user => "admin" },
+                                                    project: adapter_project, owner_state: "timekeeping")
+
+    expect_owner_state!("timekeeping")
+  end
 end
 
 RSpec.describe "forwarded Timekeeping setup helpers in the legacy state" do
@@ -231,6 +268,9 @@ RSpec.describe "forwarded Timekeeping setup helpers in the legacy state" do
   let(:legacy_paul) { create(:user, current_workspace_id: legacy_company.id) }
   let(:legacy_project) { create(:project, client: create(:client, company: legacy_company)) }
   let(:legacy_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
+
+  # The helper leaves the fake untouched while the live adapter runs, so this pins the fake path without it.
+  before { allow(TimekeepingRegressionAdapter).to receive(:current).and_return(nil) }
 
   it "arrange_forwarded_timekeeping with owner_state legacy leaves owner monolith, store legacy, generation 1 and fake generation 1" do
     TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 5)
@@ -290,6 +330,19 @@ RSpec.describe "forwarded Timekeeping readers with the live adapter running" do
     send_reader_request(Net::HTTP::Post, "http://127.0.0.1:4999/v1/companies/7/reservations", key: "other-path")
 
     expect(forwarded_timekeeping_requests(reader_fake).pluck(:idempotency_key)).to eq(%w[k1 k1 other-path])
+  end
+
+  it "admit_forwarded_generation with the live adapter running moves only the live admission row and sends the fake no message" do
+    # A double with no allowed messages fails the example on any call, a generation write included.
+    untouchable_fake = double("FakeTimekeeping that must not be reached")
+    connection = double("live connection", close: nil)
+    allow(connection).to receive(:exec_params).and_return(double("update result", cmd_tuples: 1))
+    allow(PG).to receive(:connect).and_return(connection)
+
+    admit_forwarded_generation(untouchable_fake, 3)
+
+    expect(connection).to have_received(:exec_params)
+      .with("UPDATE admission SET generation = $1 WHERE id = $2", [3, TimekeepingDatabaseReset::ADMISSION_ID]).once
   end
 end
 

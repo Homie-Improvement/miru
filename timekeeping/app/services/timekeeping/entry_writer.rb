@@ -23,7 +23,9 @@ module Timekeeping
   #    agent the write commits is one of the company's agents for its user.
   # 5. Write the entries with version + 1 and one audit row per change.
   # 6. Under the outbox lock, insert one outbox snapshot per change.
-  # 7. Insert the receipt.
+  # 7. Insert the receipt, only when the write changed an entry. A bulk
+  #    route that changed nothing stores none, so a retry of it is evaluated
+  #    again (contracts/timekeeping/idempotency.yml).
   #
   # checkpoint is called with the name of each step as it finishes, so a spec
   # can hold a transaction at a known point or fail it after a given insert.
@@ -36,7 +38,13 @@ module Timekeeping
 
     # The entries a route changed, the status to answer with and how to build
     # the answer from the changed rows as committed.
-    Written = Data.define(:status, :changes, :payload)
+    Written = Data.define(:status, :changes, :payload) do
+      # A bulk route whose ids matched no entry it may change answers 200 and
+      # changes nothing; idempotency.yml stores no receipt for that answer.
+      def changed?
+        changes.any?
+      end
+    end
     # One changed entry and its stored values before the change; before is nil
     # for a create.
     Change = Data.define(:entry_id, :before)
@@ -103,8 +111,10 @@ module Timekeeping
         WriteSteps.write_outbox(written.changes.map { |change| rows.fetch(change.entry_id) }, generation)
         checkpoint.call(:outbox_written)
         outcome = WriteOutcome.success(written.status, written.payload.call(rows))
-        store_receipt(command, outcome)
-        checkpoint.call(:receipt_written)
+        if written.changed?
+          store_receipt(command, outcome)
+          checkpoint.call(:receipt_written)
+        end
         outcome
       end
 
@@ -139,7 +149,7 @@ module Timekeeping
       def answer_from(receipt, command)
         return WriteOutcome.refusal(:idempotency_key_reused) unless receipt.fingerprint == command.fingerprint
 
-        WriteOutcome.new(status: receipt.status, body: receipt.body)
+        WriteOutcome.new(status: receipt.status, body: receipt.body, replayed: true)
       end
 
       # The one generation Timekeeping admits, read FOR SHARE so a fence waits

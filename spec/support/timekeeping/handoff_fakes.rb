@@ -133,18 +133,23 @@ class TimekeepingHandoffOutboxRelay
 
   # store: Timekeeping's InMemoryTimekeepingStore. log, when given, receives
   # [:drain, through] for each drain, so specs can check the call order.
-  def initialize(store:, log: nil)
+  # paused is handed to the gem's relay, which checks it before every POST, so
+  # a spec can pause delivery the way the live relay is paused.
+  def initialize(store:, log: nil, paused: TimekeepingRelay::Relay::NEVER_PAUSED)
     @store = store
     @log = log
+    @paused = paused
     @sent_positions = Set.new
   end
 
+  # A paused relay holds rows back without losing them, so only a drain that
+  # ran unpaused and still left rows owed is a failed delivery.
   def drain!(through:)
     @log&.push([:drain, through])
     source = source_through(through)
     endpoint = ConsumerEndpoint.new
-    TimekeepingRelay::Relay.new(source:, endpoint:).deliver(limit: BATCH_LIMIT)
-    return if source.owed.empty?
+    TimekeepingRelay::Relay.new(source:, endpoint:, paused: @paused).deliver(limit: BATCH_LIMIT)
+    return if source.owed.empty? || @paused.call
 
     answer = endpoint.last_response
     raise Undelivered, "outbox rows at or below position #{through} were not delivered: " \

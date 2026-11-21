@@ -22,5 +22,13 @@ module Timekeeping
     def replay(**)
       nil
     end
+
+    def stored_answer_for(**)
+      nil
+    end
+
+    def stored_bulk_receipts(**)
+      []
+    end
   end
 end

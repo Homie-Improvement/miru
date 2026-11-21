@@ -40,7 +40,10 @@ module Timekeeping
   # 6. Lock the target entries FOR UPDATE, by company, in id order, then check
   #    If-Match and the entry rules on the locked rows.
   # 7. Write the entries with version + 1, one audit row per change, one
-  #    outbox row per change under the outbox lock, and the receipt last.
+  #    outbox row per change under the outbox lock, and the receipt last,
+  #    only when the write changed an entry. A bulk route that changed
+  #    nothing stores none, so a retry of it is evaluated again
+  #    (contracts/timekeeping/idempotency.yml).
   #
   # A refusal at any step writes nothing. checkpoint is called with each name
   # in STEPS as that step finishes, so a spec can fail the transaction at a
@@ -109,7 +112,13 @@ module Timekeeping
 
     # The entries a route changed, the status to answer with, and how to build
     # the answer from the changed rows as committed.
-    Written = Data.define(:status, :changes, :payload)
+    Written = Data.define(:status, :changes, :payload) do
+      # A bulk route whose ids matched no entry it may change answers 200 and
+      # changes nothing; idempotency.yml stores no receipt for that answer.
+      def changed?
+        changes.any?
+      end
+    end
     # One changed entry and its stored values before the change; before is
     # nil for a create.
     Change = Data.define(:entry_id, :before)
@@ -155,6 +164,32 @@ module Timekeeping
       new(operation:, company_id:, generation:, actor:, params:, checkpoint: ->(_step) { }, identity:).stored_answer
     end
 
+    # The stored answer to an earlier entry write, read as replay reads it
+    # but without the generation fence, or nil when none is stored. It lets
+    # the gateway answer a retry from a receipt this store wrote before
+    # Timekeeping took the entries back, while the fence refuses every
+    # request. It reads only: nothing is locked or written.
+    def self.stored_answer_for(operation:, company_id:, actor:, params:, identity: nil)
+      new(operation:, company_id:, generation: nil, actor:, params:, checkpoint: ->(_step) { }, identity:)
+        .stored_answer_without_fence
+    end
+
+    # One stored bulk receipt: its key and the entry ids its answer lists.
+    StoredBulkReceipt = Data.define(:key, :entry_ids)
+
+    # Every bulk receipt this store holds for the company, user actor and
+    # bulk operation, whatever its key, so a caller can find one whose key it
+    # can only rebuild from the ids the stored answer lists. It reads only.
+    def self.stored_bulk_receipts(operation:, company_id:, actor:)
+      return [] unless actor.user? && BULK_ROUTES.include?(operation.to_sym)
+
+      Receipt.where(company_id:, actor_type: ACTOR_TYPE, actor_id: actor.user_id, operation: "#{operation} ")
+        .pluck(:key, :body).map do |key, body|
+          entry_ids = Array(JSON.parse(body)["results"]).filter_map { |result| result["entry_id"] }
+          StoredBulkReceipt.new(key:, entry_ids:)
+        end
+    end
+
     # :reek:LongParameterList
     def initialize(operation:, company_id:, generation:, actor:, params:, checkpoint:, identity: nil)
       @operation = operation.to_sym
@@ -188,11 +223,16 @@ module Timekeeping
       ApplicationRecord.transaction(requires_new: true) do
         lock_receipt_key unless key.empty?
         next Outcome.refusal(:stale_generation) unless generation_matches?(admitted_generation)
-        next if key.empty? || !actor.user?
 
-        receipt = find_receipt
-        answer_from(receipt) if receipt
+        stored_answer_without_fence
       end
+    end
+
+    def stored_answer_without_fence
+      return if key.empty? || !actor.user?
+
+      receipt = find_receipt
+      answer_from(receipt) if receipt
     end
 
     private
@@ -268,8 +308,10 @@ module Timekeeping
         write_outbox(written.changes.map { |change| rows.fetch(change.entry_id) }, stored_generation)
         checkpoint.call(:outbox_written)
         outcome = Outcome.success(written.status, written.payload.call(rows))
-        store_receipt(outcome)
-        checkpoint.call(:receipt_written)
+        if written.changed?
+          store_receipt(outcome)
+          checkpoint.call(:receipt_written)
+        end
         outcome
       end
 
@@ -392,7 +434,7 @@ module Timekeeping
       def answer_from(receipt)
         return Outcome.refusal(:idempotency_key_reused) unless receipt.fingerprint == fingerprint
 
-        Outcome.new(status: receipt.status, body: JSON.parse(receipt.body))
+        Outcome.new(status: receipt.status, body: JSON.parse(receipt.body), replayed: true)
       end
 
       def store_receipt(outcome)

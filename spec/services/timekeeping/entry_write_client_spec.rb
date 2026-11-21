@@ -43,6 +43,29 @@ RSpec.describe Timekeeping::EntryWriteClient do
       end
     end
   end
+
+  context "more tests 2" do
+    it "reports a create answered with Idempotency-Replayed true as replayed and one answered without it as fresh" do
+      row = { "id" => 4242, "company_id" => write_client_company.id, "user_id" => write_client_admin.id }
+      stub_request(:post, write_client_create_url).to_return(
+        { status: 201, body: row.to_json, headers: { "Content-Type" => "application/json" } },
+        { status: 201, body: row.to_json,
+          headers: { "Content-Type" => "application/json", "Idempotency-Replayed" => "true" } }
+      )
+      body = { "project_id" => 1, "work_date" => Date.current.iso8601, "duration" => 30, "note" => "x",
+               "source" => "manual", "source_metadata" => {} }
+
+      answers = with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
+        client = described_class.new(base_url: write_client_base_url)
+        [client.create_entry(context: write_client_context, generation: 2, body:),
+         client.create_entry(context: write_client_context, generation: 2, body:)]
+      end
+
+      # "A forwarded create that Timekeeping refuses, or that is replayed from a stored idempotency receipt, raises no event"
+      expect(answers.map(&:replayed)).to eq([false, true])
+      expect(answers.map { |answer| answer.row["id"] }).to eq([4242, 4242])
+    end
+  end
 end
 
 RSpec.describe Timekeeping::EntryWriteClient do
@@ -79,7 +102,8 @@ RSpec.describe Timekeeping::EntryWriteClient do
     first = described_class.new.create_entry(context:, generation: fake.generation, body:)
     second = described_class.new.create_entry(context:, generation: fake.generation, body:)
 
-    expect(second["id"]).to eq(first["id"])
+    expect(second.row["id"]).to eq(first.row["id"])
+    expect([first.replayed, second.replayed]).to eq([false, true])
     keys = fake.requests.filter_map { |request| request[:headers]["Idempotency-Key"] if request[:method] == "POST" }
     expect(keys.size).to eq(2)
     expect(keys.uniq.size).to eq(1)
@@ -287,10 +311,10 @@ RSpec.describe Timekeeping::EntryWriteClient, "import creates" do
 
     context = Timekeeping::WriteContext.new(company: import_company, actor: import_admin, actor_kind: "import",
                                             request_id: SecureRandom.uuid)
-    entry = described_class.new.create_entry(context:, generation: import_fake.generation, body:,
-                                             idempotency_key: SecureRandom.uuid)
+    answer = described_class.new.create_entry(context:, generation: import_fake.generation, body:,
+                                              idempotency_key: SecureRandom.uuid)
 
-    expect(entry["bill_status"]).to eq("billed")
+    expect(answer.row["bill_status"]).to eq("billed")
     expect(import_fake.requests.pluck(:method)).to eq(["POST"])
     expect(import_fake.requests.first[:body]).to include("bill_status" => "billed", "source" => "import")
   end
@@ -344,8 +368,8 @@ RSpec.describe Timekeeping::EntryWriteClient, "caller-supplied Idempotency-Key" 
     other = client.create_entry(context: keyed_context, generation: keyed_fake.generation,
                                 body: keyed_body("row two"), idempotency_key: row_two_key)
 
-    expect(rerun["id"]).to eq(first["id"])
-    expect(other["id"]).not_to eq(first["id"])
+    expect(rerun.row["id"]).to eq(first.row["id"])
+    expect(other.row["id"]).not_to eq(first.row["id"])
     sent_keys = keyed_fake.requests.filter_map { |request| request[:headers]["Idempotency-Key"] if request[:method] == "POST" }
     expect(sent_keys).to eq([row_one_key, row_one_key, row_two_key])
   end
@@ -956,7 +980,7 @@ RSpec.describe Timekeeping::EntryWriteClient, "client idempotency key" do
     created = %w[req-client-key-1 req-client-key-2].map do |request_id|
       client.create_entry(context: client_key_context(request_id, "k"), generation: client_key_fake.generation,
                           body: client_key_body)
-    end
+    end.map(&:row)
     entry_id = created.first.fetch("id")
     version = client_key_fake.stored_entry(entry_id).fetch("version").to_s
     %w[req-client-key-3 req-client-key-4].each do |request_id|

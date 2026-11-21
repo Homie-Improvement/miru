@@ -38,6 +38,8 @@ headers:
   x_request_id: "X-Request-Id: <monolith request id>"
   # Optional, DELETE and bulk-delete only. See rules.replay_only.
   idempotency_replay: "Idempotency-Replay: only"
+  # Response only, on every entry write route. See rules.replayed_answer.
+  idempotency_replayed: "Idempotency-Replayed: true"
 
 # Claims the provider reads from the signed bearer token. purpose is "read"
 # or "write"; a token signed for reads is refused on every write route.
@@ -111,6 +113,13 @@ rules:
     provider that does not read the header still replays a stored receipt or
     refuses with stale_generation, and never discards.
     Every other route, and any other header value, ignores the header.
+  replayed_answer: >-
+    A write answered from a stored receipt carries Idempotency-Replayed: true,
+    with the stored status and body unchanged. A first answer, and every
+    refusal, carries no such header. A replay looks the same as the first
+    answer in every other way, so the header is how the caller tells them
+    apart, for example to report a create only once. A provider released
+    before this rule sends no header, and its replays read as first answers.
   credential_in_body: >-
     A write whose body holds, anywhere, a credential the provider issued or
     holds (a user token or a service identity) answers credential_in_body and
