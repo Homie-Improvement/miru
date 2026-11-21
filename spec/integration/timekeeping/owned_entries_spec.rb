@@ -606,3 +606,88 @@ RSpec.describe "owned_entry for an id the owning store does not hold", committed
     expect { owned_entry(legacy_id, state: "rollback") }.to raise_error(StandardError)
   end
 end
+
+RSpec.describe "owned_entries in the rollback state", committed_data: true, owner_state: "rollback" do
+  it "owned_entries in the rollback state lists the LocalEntry note, not the changed projection note" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    project = create(:project, billable: true, client: create(:client, company:))
+    entry_id, = arrange_owned_entries([{ company:, user:, project:, note: "owner note", locked: true }],
+                                      state: "rollback")
+    TimesheetEntry.unscoped.find(entry_id).update_columns(note: "projection note", locked: false)
+
+    entries = owned_entries(state: "rollback")
+
+    expect(entries.map { |entry| entry.fetch("id") }).to eq([entry_id])
+    expect(entries.first.fetch("note")).to eq("owner note")
+    expect(entries.first.fetch("locked")).to be(true)
+  end
+end
+
+RSpec.describe "owned_entries in the legacy state", committed_data: true, owner_state: "legacy" do
+  it "owned_entries in the legacy state lists the timesheet_entries rows in id order" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    project = create(:project, billable: true, client: create(:client, company:))
+    first_id, second_id = arrange_owned_entries([{ company:, user:, project:, note: "first" },
+                                                  { company:, user:, project:, note: "second" }], state: "legacy")
+    TimesheetEntry.unscoped.find(first_id).update_columns(note: "changed legacy note")
+
+    entries = owned_entries(state: "legacy")
+
+    expect(entries.map { |entry| entry.fetch("id") }).to eq([first_id, second_id])
+    expect(entries.map { |entry| entry.fetch("note") }).to eq(["changed legacy note", "second"])
+    expect(entries.first.fetch("project_id")).to eq(project.id)
+    expect(entries.first.fetch("user_id")).to eq(user.id)
+  end
+end
+
+RSpec.describe "owned_entries when the owning store holds no entries", committed_data: true do
+  it "owned_entries is empty in the legacy state with no entries and in the rollback state when only a projection row exists" do
+    expect(owned_entries(state: "legacy")).to eq([])
+
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    project = create(:project, billable: true, client: create(:client, company:))
+    # The legacy writer fills timesheet_entries only, so the prepared store stays empty.
+    arrange_owned_entries([{ company:, user:, project:, note: "projection only" }], state: "legacy")
+
+    expect(owned_entries(state: "rollback")).to eq([])
+  end
+end
+
+RSpec.describe "owned_entries with an unknown state", committed_data: true do
+  it "owned_entries raises ArgumentError for an unknown owner state" do
+    expect { owned_entries(state: "Legacy") }.to raise_error(ArgumentError)
+  end
+end
+
+RSpec.describe "owned_entries against the live Timekeeping app", :without_transaction, committed_data: true do
+  it "live owned_entries in the timekeeping state lists only the entries loaded into the Timekeeping app" do
+    unless ENV["TIMEKEEPING_REGRESSION"] == "1" && ENV["TIMEKEEPING_LIVE"] == "1"
+      skip "Set TIMEKEEPING_REGRESSION=1 and TIMEKEEPING_LIVE=1 to run against the live Timekeeping app"
+    end
+    live = TimekeepingRegressionAdapter.current
+    skip "The live adapter is not running: select the timekeeping owner state and a _test TIMEKEEPING_DATABASE_URL" unless live
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role(:admin, company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    # A projection-only row that the Timekeeping app never holds.
+    arrange_owned_entries([{ company:, user:, project:, note: "projection only" }], state: "legacy")
+
+    expect(owned_entries(state: "timekeeping")).to eq([])
+
+    entry_id, = arrange_owned_entries([{ company:, user:, project:, note: "loaded note" }], state: "timekeeping")
+    TimesheetEntry.unscoped.find(entry_id).update_columns(note: "projection note")
+
+    entries = owned_entries(state: "timekeeping")
+    expect(entries.map { |entry| entry.fetch("id") }).to eq([entry_id])
+    expect(entries.first.fetch("note")).to eq("loaded note")
+    expect(entries.first.fetch("locked")).to be(false)
+  end
+end
