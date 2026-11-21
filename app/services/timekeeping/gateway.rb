@@ -337,7 +337,7 @@ module Timekeeping
       def bulk_write(operation:, identity:, entry_ids:, check:, expected_generation:, scope:)
         perform(expected_generation) do |ownership, owner|
           replayed = replay_committed(ownership:, owner:, operation:, identity:,
-                                      keys: replay_keys(bulk_request_key(operation, identity.fetch("entry_ids"))))
+                                      keys: replay_keys(local_bulk_key(operation, identity)))
           if replayed
             next BulkResult.new(entries: replayed_bulk_entries(ownership:, owner:, entry_ids:, scope:), refusal: nil,
                                 written: reported?(replayed, BULK_RESULTS.fetch(operation)))
@@ -492,7 +492,7 @@ module Timekeeping
         return false if ids.empty?
 
         answer = local_write(ownership:, operation: :bulk_move, body: { "entry_ids" => ids, "project_id" => project.id },
-                             identity:, idempotency_key: bulk_request_key(:bulk_move, ids))
+                             identity:, idempotency_key: local_bulk_key(:bulk_move, identity))
         reported?(answer, MOVED_RESULT)
       end
 
@@ -501,8 +501,16 @@ module Timekeeping
         return false if ids.empty?
 
         answer = local_write(ownership:, operation: :bulk_delete, body: { "entry_ids" => ids }, identity:,
-                             idempotency_key: bulk_request_key(:bulk_delete, ids))
+                             idempotency_key: local_bulk_key(:bulk_delete, identity))
         reported?(answer, DELETED_RESULT)
+      end
+
+      # A prepared bulk receipt is keyed over the requested ids, the key
+      # bulk_write's replay looks up before the lookup runs. Keying it over
+      # the ids written instead would let a retry whose found or movable ids
+      # changed since the first attempt miss its receipt and write again.
+      def local_bulk_key(operation, identity)
+        bulk_request_key(operation, identity.fetch("entry_ids"))
       end
 
       # The ids of the entries the legacy save would not skip.

@@ -940,6 +940,133 @@ RSpec.describe Timekeeping::Gateway do
     expect(TimesheetEntry.count).to eq(timesheet_entries_before)
     expect(Timekeeping::LocalEntry.where(id: ids).pluck(:project_id)).to all(eq(target.id))
   end
+
+  def raw_key_retry_gateway(company:, user:, client_key:)
+    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user",
+                                            request_id: SecureRandom.uuid, idempotency_key: client_key)
+    # Doubles with no allowed methods: any forward or remote lookup fails the example.
+    described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient),
+                        read_client: instance_double(Timekeeping::EntryApiClient))
+  end
+
+  it "answers or refuses an update retried after a re-cutover from its pre-change raw-key prepared receipt and forwards nothing",
+     committed_data: true do
+    ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+    ownership.update_columns(monolith_store: "prepared", generation: 2)
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "admin")
+    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: user.id, project_id: project.id,
+                                            work_date: Date.current, duration: 30.0, note: "before",
+                                            bill_status: "unbilled")
+    client_key = "recutover-raw-update-key-#{SecureRandom.hex(4)}"
+    update = lambda do |note|
+      raw_key_retry_gateway(company:, user:, client_key:).update(
+        entry_id: entry.id.to_s, project:, attributes: { note: }, authorize: ->(_entry) { true },
+        expected_generation: ownership.reload.generation
+      )
+    end
+    expect(update.call("after").note).to eq("after")
+    # Stands for a receipt the prepared store wrote before this change, under the raw client key.
+    Timekeeping::LocalOwner::Receipt.where(company_id: company.id, actor_id: user.id, operation: "update #{entry.id}")
+      .update_all(key: client_key)
+    ownership.update_columns(owner: "timekeeping", generation: 3)
+    rows_before = timekeeping_row_counts
+
+    # "A retry of a write stored under the other owner's receipt is refused or answered, never written a second time"
+    replayed = update.call("after")
+    expect([replayed.id, replayed.note]).to eq([entry.id, "after"])
+    expect { update.call("other values") }.to raise_error(Timekeeping::EntryWriteClient::Rejected)
+    expect(timekeeping_row_counts).to eq(rows_before)
+  end
+
+  it "answers a destroy retried after a re-cutover from its pre-change raw-key prepared receipt and forwards nothing",
+     committed_data: true do
+    ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+    ownership.update_columns(monolith_store: "prepared", generation: 2)
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "admin")
+    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: user.id, project_id: project.id,
+                                            work_date: Date.current, duration: 30.0, note: "to discard",
+                                            bill_status: "unbilled")
+    client_key = "recutover-raw-destroy-key-#{SecureRandom.hex(4)}"
+    authorized = []
+    destroy = lambda do
+      raw_key_retry_gateway(company:, user:, client_key:).destroy(
+        entry_id: entry.id.to_s, authorize: ->(found) { authorized << found.id },
+        expected_generation: ownership.reload.generation
+      )
+    end
+    expect(destroy.call).to be(true)
+    # Stands for a receipt the prepared store wrote before this change, under the raw client key.
+    Timekeeping::LocalOwner::Receipt.where(company_id: company.id, actor_id: user.id, operation: "destroy #{entry.id}")
+      .update_all(key: client_key)
+    ownership.update_columns(owner: "timekeeping", generation: 3)
+    rows_before = timekeeping_row_counts
+
+    # "A retry of a write stored under the other owner's receipt is refused or answered, never written a second time"
+    expect(destroy.call).to be(true)
+    expect(authorized).to eq([entry.id, entry.id])
+    expect(timekeeping_row_counts).to eq(rows_before)
+  end
+
+  it "answers a prepared bulk delete retry that named a missing id from the receipt of its first attempt", committed_data: true do
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "admin")
+    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: user.id, project_id: project.id,
+                                            work_date: Date.current, duration: 30.0, note: "to delete",
+                                            bill_status: "unbilled")
+    missing_id = entry.id + 1_000_000
+    client_key = "prepared-bulk-missing-id-key-#{SecureRandom.hex(4)}"
+    bulk_delete = lambda do
+      raw_key_retry_gateway(company:, user:, client_key:)
+        .bulk_delete(entry_ids: [entry.id, missing_id], check: ->(_entries) { }, expected_generation: 2)
+    end
+
+    expect(bulk_delete.call.written).to be(true)
+    rows_after_first = timekeeping_row_counts
+
+    # "A retry of a write stored under the other owner's receipt is refused or answered, never written a second time"
+    retried = bulk_delete.call
+    expect(retried.written).to be(true)
+    expect(retried.refusal).to be_nil
+    expect(timekeeping_row_counts).to eq(rows_after_first)
+  end
+
+  it "answers a partly skipped prepared bulk move retry from its first receipt after the movable entries change", committed_data: true do
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+    company = create(:company)
+    client = create(:client, company:)
+    source = create(:project, billable: true, client:)
+    non_billable_target = create(:project, billable: false, client:)
+    user = timekeeping_member(company, "admin")
+    movable, skipped = %w[non_billable unbilled].map do |bill_status|
+      Timekeeping::LocalEntry.create!(company_id: company.id, user_id: user.id, project_id: source.id,
+                                      work_date: Date.current, duration: 30.0, note: "partial move", bill_status:)
+    end
+    client_key = "prepared-partial-bulk-move-key-#{SecureRandom.hex(4)}"
+    bulk_move = lambda do
+      raw_key_retry_gateway(company:, user:, client_key:)
+        .bulk_move(entry_ids: [movable.id, skipped.id], project: non_billable_target, check: ->(_entries) { },
+                   expected_generation: 2)
+    end
+
+    expect(bulk_move.call.written).to be(true)
+    expect(skipped.reload.project_id).to eq(source.id)
+    # An edit made after the first attempt: the moved entry goes back, and the skipped one becomes movable.
+    movable.update_columns(project_id: source.id)
+    skipped.update_columns(bill_status: "non_billable")
+    rows_after_edit = timekeeping_row_counts
+
+    # "A retry of a write stored under the other owner's receipt is refused or answered, never written a second time"
+    retried = bulk_move.call
+    expect(retried.written).to be(true)
+    expect(timekeeping_row_counts).to eq(rows_after_edit)
+    expect([movable.reload.project_id, skipped.reload.project_id]).to eq([source.id, source.id])
+  end
 end
 
 RSpec.describe Timekeeping::Gateway, committed_data: true do
