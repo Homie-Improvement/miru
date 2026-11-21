@@ -16,8 +16,6 @@ module TimekeepingGuardDrain
 
   DEFAULT_WITHIN_SECONDS = 60
   POLL_INTERVAL_SECONDS = 0.1
-  # The expected state of an entry the case deleted outright.
-  ABSENT = :absent
 
   module_function
 
@@ -57,8 +55,8 @@ module TimekeepingGuardDrain
 
   # Waits until every projection row in expected reads as expected.
   # expected maps an entry id to the attributes its row must hold, as a hash
-  # such as { "bill_status" => "billed" }, or to ABSENT when the row must be
-  # gone. An empty attributes hash only requires the row to exist.
+  # such as { "bill_status" => "billed" }. An empty attributes hash only
+  # requires the row to exist.
   def entries_settled!(case_name:, expected:, within: DEFAULT_WITHIN_SECONDS)
     poll_until(case_name:, awaiting: "entries #{expected.keys.inspect} in their expected state", within:) do
       rows = TimesheetEntry.uncached { TimesheetEntry.unscoped.where(id: expected.keys).index_by(&:id) }
@@ -68,13 +66,25 @@ module TimekeepingGuardDrain
 
   # Waits until the Timekeeping service has sent every outbox snapshot it
   # held when the wait began. store is a Timekeeping::Handoff::TimekeepingStore.
-  # drain answers only whether the snapshots are sent yet, so it is polled.
+  # drain answers false whenever the runtime's own relay worker holds the
+  # relay lock, even after that worker has sent every row, so a false answer
+  # is checked against the unsent positions in the Timekeeping database, the
+  # same rule TimekeepingLiveHandoff.catch_up! applies.
   def timekeeping_outbox_drained!(case_name:, store:, within: DEFAULT_WITHIN_SECONDS)
     through = store.highest_outbox_position
-    poll_until(case_name:, awaiting: "Timekeeping outbox drained through #{through}", within:) do
-      store.drain(through:)
+    awaiting = "Timekeeping outbox drained through #{through} " \
+               "(a false drain answer can mean the relay worker held the relay lock)"
+    poll_until(case_name:, awaiting:, within:) do
+      store.drain(through:) || timekeeping_unsent_positions(through).empty?
     end
   end
+
+  def timekeeping_unsent_positions(through)
+    TimekeepingLiveHandoff.with_timekeeping_database do |connection|
+      TimekeepingLiveHandoff.unsent_outbox_positions(connection, through:)
+    end
+  end
+  private_class_method :timekeeping_unsent_positions
 
   # Waits until the prepared monolith's relay worker has sent every entry
   # snapshot in its outbox.
@@ -85,8 +95,6 @@ module TimekeepingGuardDrain
   end
 
   def entry_matches?(row, state)
-    return row.nil? if state == ABSENT
-
     !row.nil? && state.all? { |attribute, value| row.public_send(attribute) == value }
   end
   private_class_method :entry_matches?
