@@ -881,6 +881,8 @@ RSpec.describe Timekeeping::Gateway do
 
     expect(result.written).to be(true)
     expect(result.refusal).to be_nil
+    # The answer comes from this database alone, so no entries are looked up in Timekeeping.
+    expect(result.entries).to eq([])
     expect(timekeeping_row_counts).to eq(rows_before)
   end
 
@@ -932,6 +934,8 @@ RSpec.describe Timekeeping::Gateway do
     expect(recut_retry).to be_a(Timekeeping::Gateway::BulkResult)
     expect(recut_retry.refusal).to be_nil
     expect(recut_retry.written).to be(true)
+    # The answer comes from this database alone, so no entries are looked up in Timekeeping.
+    expect(recut_retry.entries).to eq([])
     expect(timekeeping_row_counts).to eq(after_first)
     expect(TimesheetEntry.count).to eq(timesheet_entries_before)
     expect(Timekeeping::LocalEntry.where(id: ids).pluck(:project_id)).to all(eq(target.id))
