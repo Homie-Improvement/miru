@@ -37,6 +37,14 @@ RSpec.describe Timekeeping::Handoff::Runner do
 
   def incomplete_check_admits = calls.select { |call| call[1] == :admit }
 
+  # Stands in for an operator interrupting an abort that is waiting for an incomplete step.
+  let(:incomplete_check_abort_interrupted) { Class.new(StandardError) }
+
+  def incomplete_check_interrupting_sleeper
+    interrupted = incomplete_check_abort_interrupted
+    ->(_seconds) { raise interrupted }
+  end
+
   context "with a legacy source" do
     # A legacy source settles and drains through LegacyOperationsCheck, so the owners carry no integrations.
     let(:owners) do
@@ -69,11 +77,11 @@ RSpec.describe Timekeeping::Handoff::Runner do
           expect(incomplete_check_admits).to be_empty
           expect(Timekeeping::Handoff::ReportDirectory.new(root: report_root, generation: 2).money_before?).to be(false)
 
-          # "Assert that progress does not advance, neither owner is admitted, and abort also refuses to reopen
-          # writes until completion."
+          # An abort waits for the incomplete step; interrupted while waiting, it reopens no writes.
           expect do
-            described_class.run(direction: :cutover, abort: true, owners:, report_root:, clock:)
-          end.to raise_error(Timekeeping::Handoff::Runner::Refused)
+            described_class.run(direction: :cutover, abort: true, owners:, report_root:, clock:,
+                                sleeper: incomplete_check_interrupting_sleeper)
+          end.to raise_error(incomplete_check_abort_interrupted)
           expect(incomplete_check_row_state).to eq(baseline)
           expect(incomplete_check_admits).to be_empty
 
@@ -118,11 +126,11 @@ RSpec.describe Timekeeping::Handoff::Runner do
           expect(baseline).to eq([2, "monolith", "settle"])
           expect(incomplete_check_admits).to be_empty
 
-          # "Assert that progress does not advance, neither owner is admitted, and abort also refuses to reopen
-          # writes until completion."
+          # An abort waits for the incomplete step; interrupted while waiting, it reopens no writes.
           expect do
-            described_class.run(direction: :cutover, abort: true, owners:, report_root:, clock:)
-          end.to raise_error(Timekeeping::Handoff::Runner::Refused)
+            described_class.run(direction: :cutover, abort: true, owners:, report_root:, clock:,
+                                sleeper: incomplete_check_interrupting_sleeper)
+          end.to raise_error(incomplete_check_abort_interrupted)
           expect(incomplete_check_row_state).to eq(baseline)
           expect(incomplete_check_admits).to be_empty
 
@@ -180,11 +188,11 @@ RSpec.describe Timekeeping::Handoff::Runner do
       expect(incomplete_check_admits).to be_empty
       expect(Timekeeping::Handoff::ReportDirectory.new(root: rollback_root, generation: 3).money_before?).to be(false)
 
-      # "Assert that progress does not advance, neither owner is admitted, and abort also refuses to reopen
-      # writes until completion."
+      # An abort waits for the incomplete step; interrupted while waiting, it reopens no writes.
       expect do
-        described_class.run(direction: :rollback, abort: true, owners:, report_root: rollback_root, clock:)
-      end.to raise_error(Timekeeping::Handoff::Runner::Refused)
+        described_class.run(direction: :rollback, abort: true, owners:, report_root: rollback_root, clock:,
+                            sleeper: incomplete_check_interrupting_sleeper)
+      end.to raise_error(incomplete_check_abort_interrupted)
       expect(incomplete_check_row_state).to eq(baseline)
       expect(incomplete_check_admits).to be_empty
 
@@ -242,11 +250,11 @@ RSpec.describe Timekeeping::Handoff::Runner do
       expect(baseline).to eq([3, "timekeeping", "settle"])
       expect(incomplete_check_admits).to be_empty
 
-      # "Assert that progress does not advance, neither owner is admitted, and abort also refuses to reopen
-      # writes until completion."
+      # An abort waits for the incomplete step; interrupted while waiting, it reopens no writes.
       expect do
-        described_class.run(direction: :rollback, abort: true, owners:, report_root: rollback_root, clock:)
-      end.to raise_error(Timekeeping::Handoff::Runner::Refused)
+        described_class.run(direction: :rollback, abort: true, owners:, report_root: rollback_root, clock:,
+                            sleeper: incomplete_check_interrupting_sleeper)
+      end.to raise_error(incomplete_check_abort_interrupted)
       expect(incomplete_check_row_state).to eq(baseline)
       expect(incomplete_check_admits).to be_empty
 
