@@ -109,7 +109,8 @@ module TimekeepingContract
         credentials.any? { |credential| serialized.include?(credential) }
       end,
       receipt_key: IdempotencyReceipts::SCOPED_RECEIPT_KEY,
-      reject_reused_key: true
+      reject_reused_key: true,
+      store_unchanged: IdempotencyReceipts::STORE_CONTRACT_UNCHANGED
     }.freeze
 
     ENTRY_WRITE_ROUTES = %w[create update destroy bulk_move bulk_delete].freeze
@@ -128,7 +129,8 @@ module TimekeepingContract
       @snapshot_contract = TimekeepingContract.load(:entry_snapshots)
       @entry_router = Router.new(@entry_contract.fetch("routes"))
       @reservation_router = Router.new(@reservation_contract.fetch("routes"))
-      @receipts = IdempotencyReceipts.new(receipt_key: @policies[:receipt_key], reject_reused_key: @policies[:reject_reused_key])
+      @receipts = IdempotencyReceipts.new(receipt_key: @policies[:receipt_key], reject_reused_key: @policies[:reject_reused_key],
+                                          store_unchanged: @policies[:store_unchanged])
       @generation = INITIAL_GENERATION
       @next_id = FIRST_ID
       @ticks = 0
@@ -459,7 +461,13 @@ module TimekeepingContract
         results = Array(body["entry_ids"]).map do |entry_id|
           { "entry_id" => entry_id, "result" => applied_ids.include?(integer(entry_id)) ? result : "not_found" }
         end
-        respond(200, "results" => results)
+        success(respond(200, "results" => results), changed: applied.any?)
+      end
+
+      # A successful answer, marked for the receipts when it changed nothing
+      # (idempotency.yml unchanged_stored_operations).
+      def success(response, changed:)
+        changed ? response : IdempotencyReceipts::Unchanged.new(response:)
       end
 
       # In token mode an employee's bulk request sees only their own entries,
@@ -756,7 +764,7 @@ module TimekeepingContract
           if @policies[:service_command_writes].call(route: "mark_billed")
             entries.each { |entry| write_entry(entry.merge("bill_status" => "billed")) }
           end
-          respond(200, "billed" => entries.size)
+          success(respond(200, "billed" => entries.size), changed: entries.any?)
         end
       end
 
@@ -774,7 +782,7 @@ module TimekeepingContract
             # through the agent_owner rule, as Timekeeping refuses it.
             @agents.delete(agent_id) if @agents[agent_id]&.fetch("company_id") == company_id
           end
-          respond(200, "detached" => entries.size)
+          success(respond(200, "detached" => entries.size), changed: entries.any?)
         end
       end
 
