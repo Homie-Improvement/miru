@@ -24,14 +24,20 @@ module Timekeeping
 
       # What a write answers: an HTTP status and a JSON-ready body with string
       # keys. A replayed receipt answers the body parsed from the stored text,
-      # so every body is built to survive that round trip unchanged.
-      Outcome = Data.define(:status, :body) do
+      # so every body is built to survive that round trip unchanged. replayed
+      # is true only for an answer served from a stored receipt, so the caller
+      # can tell a replay from a first answer whose status and body are the same.
+      Outcome = Data.define(:status, :body, :replayed) do
         def self.refusal(reason)
           new(status: LocalOwner::STATUS.fetch(reason), body: { "reason" => reason.to_s })
         end
 
         def self.success(status, payload)
           new(status:, body: JSON.parse(JSON.generate(payload)))
+        end
+
+        def initialize(status:, body:, replayed: false)
+          super
         end
       end
 

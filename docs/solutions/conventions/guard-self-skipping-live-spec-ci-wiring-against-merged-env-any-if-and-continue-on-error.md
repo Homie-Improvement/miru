@@ -44,7 +44,7 @@ env = (job["env"] || {}).merge(step["env"] || {})
 }
 ```
 
-Find the job by the run step that names the spec, not by job id. For each hole, write one example that changes the parsed workflow in memory and expects problems: step env override, job and step `if: false`, job and step `continue-on-error`, and the old skip-ci `if:`.
+Find the job by its run step, not by job id. When this guard was written, that step named the spec. The live step now runs `ruby script/ci/timekeeping_live_specs.rb`, which picks the live specs, so the guard finds the job by the step that calls that script. For each hole, write one example that changes the parsed workflow in memory and expects problems: step env override, job and step `if: false`, job and step `continue-on-error`, and the old skip-ci `if:`.
 
 ## Why it matters
 

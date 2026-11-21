@@ -6,7 +6,9 @@ require "uri"
 module TimekeepingContract
   # What every implementation under the contract examples answers: an HTTP
   # status and a JSON body parsed into string-keyed Hashes and Arrays.
-  Response = Struct.new(:status, :body, keyword_init: true)
+  # headers holds only the response headers a contract defines, such as
+  # Idempotency-Replayed on an entry write replay, and is nil when none apply.
+  Response = Struct.new(:status, :body, :headers, keyword_init: true)
 
   # Passes values through JSON, so the fakes accept and return only what the
   # wire carries: string keys, and floats that stay floats.
