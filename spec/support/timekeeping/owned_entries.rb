@@ -112,6 +112,18 @@ module TimekeepingOwnedEntries
       "rollback" => :read_prepared_owned_entry
     }.freeze
 
+    # Methods of this module, keyed by owner state, that list the owner's
+    # entries, discarded ones included, for one company or for every company.
+    OWNED_ENTRIES_READERS = {
+      "legacy" => :read_legacy_owned_entries,
+      "timekeeping" => :read_timekeeping_owned_entries,
+      "rollback" => :read_prepared_owned_entries
+    }.freeze
+
+    # The entry fields owned_entries can filter on. Any other key raises, so a
+    # misspelt filter cannot widen a read that is expected to find nothing.
+    OWNED_ENTRIES_FILTERS = %w[project_id user_id note duration work_date bill_status source].freeze
+
     # reservations.invoice_id has no foreign key. A locked fixture only needs a
     # reservation row to exist for its entry, so no invoice is created.
     LOCKED_FIXTURE_INVOICE_ID = 1
@@ -145,6 +157,25 @@ module TimekeepingOwnedEntries
     def owned_entry(id, state: TimekeepingOwnerState.current)
       TimekeepingOwnerState.fetch(state)
       send(OWNED_ENTRY_READERS.fetch(state), TimekeepingOwnedEntries.integer_id(id))
+    end
+
+    # The entries the store that owns them in state holds, as Hashes with
+    # string keys; never the projection in the timekeeping and rollback
+    # states. company limits them to one company; nil reads every company, so
+    # a check on the whole table keeps its reach. Discarded entries are left
+    # out unless include_discarded is true. filters keeps the entries whose
+    # fields equal the given values. Raises ArgumentError for an unknown state
+    # or filter key before anything is read.
+    def owned_entries(company: nil, state: TimekeepingOwnerState.current, include_discarded: false, **filters)
+      TimekeepingOwnerState.fetch(state)
+      filters = filters.transform_keys(&:to_s)
+      unknown = filters.keys - OWNED_ENTRIES_FILTERS
+      raise ArgumentError, "unknown owned entry filters: #{unknown.join(', ')}" if unknown.any?
+
+      send(OWNED_ENTRIES_READERS.fetch(state), company&.id).select do |entry|
+        (include_discarded || entry["discarded_at"].nil?) &&
+          filters.all? { |field, value| entry[field] == value }
+      end
     end
 
     private
@@ -285,6 +316,28 @@ module TimekeepingOwnedEntries
           reservation.fetch("entry_id") == id && reservation.fetch("company_id") == row.fetch("company_id")
         end
         row.merge("locked" => reserved)
+      end
+
+      # timesheet_entries has no company column, so a company is reached
+      # through its clients' projects.
+      def read_legacy_owned_entries(company_id)
+        scope = TimesheetEntry.unscoped.order(:id)
+        if company_id
+          scope = scope.where(project_id: Project.unscoped.joins(:client).where(clients: { company_id: }).select(:id))
+        end
+        scope.map(&:attributes)
+      end
+
+      def read_prepared_owned_entries(company_id)
+        scope = Timekeeping::LocalEntry.order(:id)
+        scope = scope.where(company_id:) if company_id
+        scope.map(&:attributes)
+      end
+
+      def read_timekeeping_owned_entries(company_id)
+        entries = live_owned_entry_store.export_checkpoint.rows.fetch("entries")
+        entries = entries.select { |entry| entry.fetch("company_id") == company_id } if company_id
+        entries.sort_by { |entry| entry.fetch("id") }
       end
   end
 end

@@ -377,6 +377,33 @@ RSpec.describe "owned_entry against the live Timekeeping app", :without_transact
     expect(fields.fetch("id")).to eq(entry_id)
     expect(fields.fetch("note")).to eq("loaded note")
   end
+
+  it "live owned_entries in the timekeeping state reads the Timekeeping app, not the projection, and scopes by company only when one is given" do
+    unless ENV["TIMEKEEPING_REGRESSION"] == "1" && ENV["TIMEKEEPING_LIVE"] == "1"
+      skip "Set TIMEKEEPING_REGRESSION=1 and TIMEKEEPING_LIVE=1 to run against the live Timekeeping app"
+    end
+    skip "The live adapter is not running: select the timekeeping owner state and a _test TIMEKEEPING_DATABASE_URL" unless
+      TimekeepingRegressionAdapter.current
+    first, second = Array.new(2) do
+      company = create(:company)
+      user = create(:user, current_workspace_id: company.id)
+      create(:employment, company:, user:)
+      user.add_role(:admin, company)
+      { company:, user:, project: create(:project, billable: true, client: create(:client, company:)) }
+    end
+    first_id, second_id = arrange_owned_entries(
+      [first.merge(note: "loaded note"), second.merge(note: "other company")], state: "timekeeping"
+    )
+    TimesheetEntry.unscoped.find(first_id).update_columns(note: "projection note")
+    # A row only the projection holds: Timekeeping does not own it, so it must not be read.
+    TimesheetEntry.create!(user_id: first[:user].id, project_id: first[:project].id, work_date: Date.new(2026, 1, 5),
+                           duration: 30, note: "projection only")
+
+    company_rows = owned_entries(company: first[:company], state: "timekeeping")
+    expect(company_rows.pluck("id", "note")).to eq([[first_id, "loaded note"]])
+    expect(owned_entries(company: first[:company], state: "timekeeping", note: "projection note")).to eq([])
+    expect(owned_entries(state: "timekeeping").pluck("id")).to include(first_id, second_id)
+  end
 end
 
 RSpec.describe "arrange_owned_entries when the checkpoint load and the admit both fail", committed_data: true do
@@ -604,5 +631,269 @@ RSpec.describe "owned_entry for an id the owning store does not hold", committed
     expect(Timekeeping::LocalEntry.where(id: legacy_id)).not_to exist
     # "It reads one entry's fields from the owning store, never from the projection in the timekeeping and rollback states"
     expect { owned_entry(legacy_id, state: "rollback") }.to raise_error(StandardError)
+  end
+end
+
+RSpec.describe "owned_entry in the rollback state", committed_data: true, owner_state: "rollback" do
+  it "owned_entries in the rollback state reads the prepared store, skips projection-only rows, and scopes by company only when one is given" do
+    tenants = Array.new(2) do
+      company = create(:company)
+      user = create(:user, current_workspace_id: company.id)
+      create(:employment, company:, user:)
+      user.add_role(:admin, company)
+      project = create(:project, billable: true, client: create(:client, company:))
+      { company:, user:, project: }
+    end
+    first, second = tenants
+
+    first_ids = arrange_owned_entries([first.merge(note: "owned one"), first.merge(note: "owned two")], state: "rollback")
+    second_ids = arrange_owned_entries([second.merge(note: "other company")], state: "rollback")
+    # A row only the projection holds: the prepared store does not own it, so it must not be counted.
+    create(:timesheet_entry, project: first[:project], user: first[:user], note: "projection only")
+
+    # "Replace its `Timekeeping::LocalEntry` and projection counts, which are direct store reads, with a count of the entries the owning store holds for the company."
+    company_rows = owned_entries(company: first[:company], state: "rollback")
+    expect(company_rows.map { |row| row.fetch("id") }).to match_array(first_ids)
+    expect(company_rows.map { |row| row.fetch("note") }).not_to include("projection only", "other company")
+
+    # A global read keeps its global reach, so a write under another company is still seen.
+    every_row = owned_entries(state: "rollback")
+    expect(every_row.map { |row| row.fetch("id") }).to include(*first_ids, *second_ids)
+    expect(every_row.map { |row| row.fetch("note") }).not_to include("projection only")
+  end
+end
+
+RSpec.describe "owned_entry in the rollback state", committed_data: true, owner_state: "rollback" do
+  it "owned_entries in the rollback state leaves a discarded prepared entry out by default and counts it with include_discarded" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role(:admin, company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    kept_id, discarded_id = arrange_owned_entries(
+      [{ company:, user:, project:, note: "kept" }, { company:, user:, project:, note: "discarded" }],
+      state: "rollback"
+    )
+    Timekeeping::LocalEntry.find(discarded_id).update_columns(discarded_at: Time.current)
+
+    expect(owned_entries(company:, state: "rollback").map { |row| row.fetch("id") }).to eq([kept_id])
+    expect(owned_entries(company:, state: "rollback", include_discarded: true).map { |row| row.fetch("id") })
+      .to contain_exactly(kept_id, discarded_id)
+  end
+end
+
+RSpec.describe "owned_entry in the legacy state", committed_data: true, owner_state: "legacy" do
+  it "owned_entries in the legacy state narrows by note, duration, project and user, counts discarded rows only on request, and rejects an unknown filter" do
+    company = create(:company)
+    paul = create(:user, current_workspace_id: company.id)
+    jane = create(:user, current_workspace_id: company.id)
+    [paul, jane].each { |user| create(:employment, company:, user:) }
+    website = create(:project, billable: true, client: create(:client, company:))
+    # Billable, because the fixture rows default to unbilled and a non-billable project refuses them.
+    internal = create(:project, billable: true, client: create(:client, company:))
+    match_id, other_duration_id, other_project_id, other_user_id, discarded_id = arrange_owned_entries(
+      [
+        { company:, user: paul, project: website, note: "same work", duration: 60 },
+        { company:, user: paul, project: website, note: "same work", duration: 90 },
+        { company:, user: paul, project: internal, note: "same work", duration: 60 },
+        { company:, user: jane, project: website, note: "same work", duration: 60 },
+        { company:, user: paul, project: website, note: "gone", duration: 60 }
+      ],
+      state: "legacy"
+    )
+    TimesheetEntry.unscoped.find(discarded_id).update_columns(discarded_at: Time.current)
+
+    ids = ->(rows) { rows.map { |row| row.fetch("id") } }
+    expect(ids.call(owned_entries(company:, state: "legacy", note: "same work")))
+      .to contain_exactly(match_id, other_duration_id, other_project_id, other_user_id)
+    expect(ids.call(owned_entries(company:, state: "legacy", note: "same work", duration: 60, project_id: website.id,
+                                  user_id: paul.id))).to eq([match_id])
+    expect(owned_entries(company:, state: "legacy", note: "gone")).to be_empty
+    expect(ids.call(owned_entries(company:, state: "legacy", note: "gone", include_discarded: true))).to eq([discarded_id])
+
+    expect { owned_entries(company:, state: "legacy", invoice_id: 1) }.to raise_error(ArgumentError)
+    expect { owned_entries(company:, state: "handoff") }.to raise_error(ArgumentError)
+  end
+end
+
+RSpec.describe "arrange_owned_entries" do
+  it "owned_entries in the rollback state returns only the given company's prepared entries and never another company's" do
+    first_company, second_company = Array.new(2) { create(:company) }
+    first_user = create(:user, current_workspace_id: first_company.id)
+    second_user = create(:user, current_workspace_id: second_company.id)
+    first_project = create(:project, billable: true, client: create(:client, company: first_company))
+    second_project = create(:project, billable: true, client: create(:client, company: second_company))
+
+    first_id, second_id = arrange_owned_entries(
+      [{ company: first_company, user: first_user, project: first_project, note: "tenant one row" },
+       { company: second_company, user: second_user, project: second_project, note: "tenant two row" }],
+      state: "rollback"
+    )
+
+    first_rows = owned_entries(company: first_company, state: "rollback")
+    expect(first_rows.map { |row| row.fetch("id") }).to eq([first_id])
+    expect(first_rows.map { |row| row.fetch("company_id") }).to all(eq(first_company.id))
+
+    second_rows = owned_entries(company: second_company, state: "rollback")
+    expect(second_rows.map { |row| row.fetch("id") }).to eq([second_id])
+    expect(second_rows.map { |row| row.fetch("note") }).not_to include("tenant one row")
+  end
+end
+
+RSpec.describe "arrange_owned_entries" do
+  it "owned_entries in the legacy state keeps one company's entries apart and reads every company only when no company is given" do
+    first_company, second_company = Array.new(2) { create(:company) }
+    first_user = create(:user, current_workspace_id: first_company.id)
+    second_user = create(:user, current_workspace_id: second_company.id)
+    first_project = create(:project, billable: true, client: create(:client, company: first_company))
+    second_project = create(:project, billable: true, client: create(:client, company: second_company))
+
+    first_id, second_id = arrange_owned_entries(
+      [{ company: first_company, user: first_user, project: first_project, note: "same note" },
+       { company: second_company, user: second_user, project: second_project, note: "same note" }],
+      state: "legacy"
+    )
+
+    # The same note under another company must not leak into a company-scoped read.
+    scoped = owned_entries(company: first_company, state: "legacy", note: "same note")
+    expect(scoped.map { |row| row.fetch("id") }).to eq([first_id])
+
+    # A global read keeps its reach, so a stray write under another company is still seen.
+    global_ids = owned_entries(state: "legacy", note: "same note").map { |row| row.fetch("id") }
+    expect(global_ids).to include(first_id, second_id)
+  end
+end
+
+RSpec.describe "arrange_owned_entries" do
+  it "owned_entries returns nothing when a company read is filtered by another company's project or user" do
+    first_company, second_company = Array.new(2) { create(:company) }
+    first_user = create(:user, current_workspace_id: first_company.id)
+    second_user = create(:user, current_workspace_id: second_company.id)
+    first_project = create(:project, billable: true, client: create(:client, company: first_company))
+    second_project = create(:project, billable: true, client: create(:client, company: second_company))
+
+    %w[legacy rollback].each do |state|
+      arrange_owned_entries(
+        [{ company: first_company, user: first_user, project: first_project, note: "#{state} one" },
+         { company: second_company, user: second_user, project: second_project, note: "#{state} two" }],
+        state:
+      )
+
+      # A filter naming another company's project or user cannot widen a company-scoped read.
+      expect(owned_entries(company: first_company, state:, project_id: second_project.id)).to eq([])
+      expect(owned_entries(company: first_company, state:, user_id: second_user.id)).to eq([])
+      expect(owned_entries(company: first_company, state:, project_id: first_project.id).size).to eq(1)
+    end
+  end
+end
+
+RSpec.describe "owned_entries" do
+  # "Replace its `Timekeeping::LocalEntry` and projection counts, which are direct store reads, with a count of the entries the owning store holds for the company."
+  it "owned_entries in the rollback state counts the prepared store's entries, not projection-only rows, and scopes by company only when one is given" do
+    tenants = Array.new(2) do
+      company = create(:company)
+      user = create(:user, current_workspace_id: company.id)
+      create(:employment, company:, user:)
+      user.add_role(:admin, company)
+      project = create(:project, billable: true, client: create(:client, company:))
+      { company:, user:, project: }
+    end
+    first, second = tenants
+
+    first_ids = arrange_owned_entries(
+      [first.merge(note: "owned one"), first.merge(note: "owned two")], state: "rollback"
+    )
+    arrange_owned_entries([second.merge(note: "other company")], state: "rollback")
+    # A projection row with no prepared-store owner: the owner does not hold it.
+    TimesheetEntry.create!(user_id: first[:user].id, project_id: first[:project].id, work_date: Date.new(2026, 1, 5),
+                           duration: 30, note: "projection only", bill_status: "unbilled")
+
+    company_rows = owned_entries(company: first[:company], state: "rollback")
+    expect(company_rows.map { |row| row.fetch("id") }).to match_array(first_ids)
+    expect(company_rows.map { |row| row.fetch("note") }).not_to include("projection only", "other company")
+
+    # With no company, a global check still sees an entry written under another company.
+    all_notes = owned_entries(state: "rollback").map { |row| row.fetch("note") }
+    expect(all_notes).to include("owned one", "owned two", "other company")
+    expect(all_notes).not_to include("projection only")
+  end
+end
+
+RSpec.describe "owned_entries" do
+  # "Adapt only the assertions that read a store directly. The behaviour they pin stays the same."
+  # A replaced `.kept` read must not count discarded rows, and a read that counted them must still be able to.
+  it "owned_entries in the legacy state leaves discarded entries out unless asked, filters by note and duration together, and rejects an unknown filter" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role(:admin, company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    row = { company:, user:, project: }
+
+    kept_id, same_note_other_duration_id, discarded_id = arrange_owned_entries(
+      [row.merge(note: "same work", duration: 60), row.merge(note: "same work", duration: 90),
+       row.merge(note: "same work", duration: 60)],
+      state: "legacy"
+    )
+    TimesheetEntry.unscoped.find(discarded_id).discard!
+
+    kept = owned_entries(company:, state: "legacy", note: "same work", duration: 60)
+    expect(kept.map { |entry| entry.fetch("id") }).to eq([kept_id])
+
+    with_discarded = owned_entries(company:, state: "legacy", include_discarded: true, note: "same work", duration: 60)
+    expect(with_discarded.map { |entry| entry.fetch("id") }).to contain_exactly(kept_id, discarded_id)
+
+    expect(owned_entries(company:, state: "legacy", note: "same work").map { |entry| entry.fetch("id") })
+      .to contain_exactly(kept_id, same_note_other_duration_id)
+    expect(owned_entries(company:, state: "legacy", note: "no such note")).to eq([])
+
+    expect { owned_entries(company:, state: "legacy", colour: "red") }.to raise_error(ArgumentError)
+    expect { owned_entries(company:, state: "handoff") }.to raise_error(ArgumentError)
+  end
+end
+
+RSpec.describe "arrange_owned_entries", :without_transaction, committed_data: true do
+  it "owned_entries in the rollback state ignores projection-only rows and keeps company and discarded scope as asked" do
+    tenants = Array.new(2) do
+      company = create(:company)
+      user = create(:user, current_workspace_id: company.id)
+      create(:employment, company:, user:)
+      user.add_role(:admin, company)
+      project = create(:project, billable: true, client: create(:client, company:))
+      { company:, user:, project: }
+    end
+    first, second = tenants
+
+    kept_id, discarded_id, = arrange_owned_entries(
+      [first.merge(note: "kept"), first.merge(note: "discarded"), second.merge(note: "other company")],
+      state: "rollback"
+    )
+    Timekeeping::LocalEntry.where(id: discarded_id).update_all(discarded_at: Time.current)
+    # A row only the projection holds: the prepared store does not own it, so it must never be counted.
+    TimesheetEntry.create!(user_id: first[:user].id, project_id: first[:project].id, work_date: Date.new(2026, 1, 5),
+                           duration: 60, note: "projection only")
+
+    # "Adapt only the assertions that read a store directly. The behaviour they pin stays the same."
+    expect(owned_entries(company: first[:company], state: "rollback").pluck("id")).to eq([kept_id])
+    expect(owned_entries(company: first[:company], state: "rollback", include_discarded: true).pluck("id"))
+      .to contain_exactly(kept_id, discarded_id)
+    # A global read keeps its reach, so a stray write under another company is still seen.
+    expect(owned_entries(state: "rollback").pluck("note")).to contain_exactly("kept", "other company")
+    expect(owned_entries(company: first[:company], state: "rollback", note: "projection only")).to eq([])
+  end
+end
+
+RSpec.describe "arrange_owned_entries", :without_transaction, committed_data: true do
+  it "owned_entries refuses an unknown filter key or state instead of silently matching every entry" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    project = create(:project, billable: true, client: create(:client, company:))
+    arrange_owned_entries([{ company:, user:, project:, note: "only" }], state: "legacy")
+
+    # A misspelt filter ignored would widen the read, so an assertion of zero rows could pass while entries exist.
+    expect { owned_entries(company:, state: "legacy", notes: "only") }.to raise_error(ArgumentError)
+    expect { owned_entries(company:, state: "Legacy") }.to raise_error(ArgumentError)
+    expect(owned_entries(company:, state: "legacy", note: "only").size).to eq(1)
   end
 end
