@@ -429,11 +429,25 @@ module Timekeeping
         target_user_id = user ? user.id : requested_user_id
         fields = EntryWriteClient.forwarded_fields(attributes, actor_kind: context.actor_kind, operation: :create)
         identity = create_identity(user_id: target_user_id, project:, fields:)
-        row = replay_local(ownership:, operation: :create, identity:) || local_write(
+        replayed_row = replay_local(ownership:, operation: :create, identity:)
+        return hydrate(replayed_row, user_id: replayed_row["user_id"]) if replayed_row
+
+        outcome = local_call(
           ownership:, operation: :create, identity:, idempotency_key: request_key(:create),
           body: create_body(user: draft_user, project:, attributes:).merge("user_id" => target_user_id)
         )
-        hydrate(row, user_id: row["user_id"])
+        row = local_answer(:create, outcome)
+        created_entry(hydrate(row, user_id: row["user_id"]), replayed: outcome.replayed)
+      end
+
+      # Raises TimesheetEntries::Created for a create another store owns,
+      # which saves no TimesheetEntry and so runs no after_create. An answer
+      # served from a stored receipt raises nothing: the write that stored it
+      # already did. The event is raised inside the gateway's transaction, as
+      # after_create raises it, so a rollback also drops its stored copy.
+      def created_entry(entry, replayed:)
+        entry.notify_created(actor: context.actor) unless replayed
+        entry
       end
 
       # The request's own If-Match wins; with none, the version the lookup read
@@ -486,13 +500,20 @@ module Timekeeping
       # the lookup still finds) that the write itself can change.
       # :reek:LongParameterList
       def local_write(ownership:, operation:, body:, identity:, idempotency_key:, entry_id: nil, if_match: nil)
-        outcome = local_owner.call(
+        local_answer(operation, local_call(ownership:, operation:, body:, identity:, idempotency_key:, entry_id:,
+                                           if_match:))
+      end
+
+      # The local owner's outcome of one write, before a refusal is raised,
+      # for a caller that also needs to know whether it was replayed.
+      # :reek:LongParameterList
+      def local_call(ownership:, operation:, body:, identity:, idempotency_key:, entry_id: nil, if_match: nil)
+        local_owner.call(
           operation:, company_id: context.company.id, generation: ownership.generation, actor: local_actor,
           params: { "idempotency_key" => idempotency_key, "if_match" => if_match, "entry_id" => entry_id,
                     "body" => as_json_value(body) },
           identity: as_json_value(identity)
         )
-        local_answer(operation, outcome)
       end
 
       # The local owner's stored answer to an earlier write of the same request
@@ -673,7 +694,7 @@ module Timekeeping
         target = user || resolve_user.call
         answer = write_client.create_entry(context:, generation: ownership.generation,
                                            body: create_body(user: target, project:, attributes:))
-        hydrate(answer.row, user_id: target.id)
+        created_entry(hydrate(answer.row, user_id: target.id), replayed: answer.replayed)
       end
 
       # The stored body names the user the first attempt wrote for, so the
