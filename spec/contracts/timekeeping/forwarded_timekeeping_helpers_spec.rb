@@ -380,6 +380,9 @@ RSpec.describe "forwarded Timekeeping setup helpers in the legacy state" do
   let(:legacy_project) { create(:project, client: create(:client, company: legacy_company)) }
   let(:legacy_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
 
+  # The helper leaves the fake untouched while the live adapter runs, so this pins the fake path without it.
+  before { allow(TimekeepingRegressionAdapter).to receive(:current).and_return(nil) }
+
   it "arrange_forwarded_timekeeping with owner_state legacy leaves owner monolith, store legacy, generation 1 and fake generation 1" do
     TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 5)
     legacy_fake.generation = 5
