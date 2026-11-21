@@ -28,7 +28,6 @@ module TimekeepingRules
       reservations.commit
       reservations.abort
       invoices.mark_billed
-      entries.import
       agents.detach_entries
     ].freeze
 

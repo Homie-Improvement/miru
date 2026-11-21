@@ -54,7 +54,7 @@ RSpec.describe TimekeepingRules::EntryRules, ".bulk_decision" do
   end
 
   it "applies a background move of a locked entry" do
-    expect(decide(entries: [locked], caller: "entries.import", role: nil, acting_user_id: nil)).to eq(10 => :apply)
+    expect(decide(entries: [locked], caller: "reservations.abort", role: nil, acting_user_id: nil)).to eq(10 => :apply)
   end
 
   it "refuses the whole request when a refused copy of a repeated id comes first or last" do
