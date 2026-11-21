@@ -42,6 +42,8 @@ RSpec.describe AddSettlingToTimekeepingOwnership do
 
     expect(earlier).to include(20261117120000, 20261118120000)
     expect(own.version).to be > earlier.max
-    expect(Rails.root.join("db/schema.rb").read).to include("define(version: #{own.version.to_s.sub(/\A(\d{4})(\d{2})(\d{2})(\d{6})\z/, '\1_\2_\3_\4')})")
+    # The schema is dumped at the latest migration, which may be a later one than this.
+    schema_version = Rails.root.join("db/schema.rb").read[/define\(version: ([\d_]+)\)/, 1].delete("_").to_i
+    expect(schema_version).to be >= own.version
   end
 end
