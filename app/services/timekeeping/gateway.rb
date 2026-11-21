@@ -203,8 +203,8 @@ module Timekeeping
     # The replayed entry passes the lookup's company, id and scope checks and
     # then authorize_replay, the permission to read back a committed answer.
     # It defaults to authorize for callers that grant no separate one. After a
-    # re-cutover, a receipt the prepared store kept under the raw client key
-    # is replayed the same way (see replay_pre_change_receipt).
+    # re-cutover, a receipt the prepared store kept is replayed the same way
+    # (see replay_prepared_receipt).
     # :reek:LongParameterList
     def update(entry_id:, project:, attributes:, authorize:, authorize_replay: authorize, expected_generation: nil,
                scope: :company)
@@ -246,7 +246,7 @@ module Timekeeping
     # In the prepared store, a retry with the request's own Idempotency-Key
     # replays this actor's stored answer before the lookup, which no longer
     # finds the discarded entry. After a re-cutover, a receipt the prepared
-    # store kept under the raw client key is replayed the same way.
+    # store kept is replayed the same way.
     def destroy(entry_id:, authorize:, expected_generation: nil, scope: :company)
       perform(expected_generation) do |ownership, owner|
         replayed = replay_committed(ownership:, owner:, operation: :destroy, entry_id:, identity: {})
@@ -331,32 +331,24 @@ module Timekeeping
       # In the prepared store, a retry with the request's own Idempotency-Key
       # replays this actor's stored answer before the lookup and the check,
       # since the first write may have discarded or moved the entries. After a
-      # re-cutover, a receipt the prepared store kept under the raw client key
-      # is replayed the same way.
+      # re-cutover, a receipt the prepared store kept is replayed the same way.
+      # A replayed answer is returned with the entries the lookup finds now,
+      # as a first answer is.
       # :reek:LongParameterList
       def bulk_write(operation:, identity:, entry_ids:, check:, expected_generation:, scope:)
         perform(expected_generation) do |ownership, owner|
           replayed = replay_committed(ownership:, owner:, operation:, identity:,
                                       keys: replay_keys(local_bulk_key(operation, identity)))
+          entries = bulk_entries(ownership:, entry_ids:, scope:)
           if replayed
-            next BulkResult.new(entries: replayed_bulk_entries(ownership:, owner:, entry_ids:, scope:), refusal: nil,
-                                written: reported?(replayed, BULK_RESULTS.fetch(operation)))
+            next BulkResult.new(entries:, refusal: nil, written: reported?(replayed, BULK_RESULTS.fetch(operation)))
           end
 
-          entries = bulk_entries(ownership:, entry_ids:, scope:)
           refusal = check.call(entries)
           next BulkResult.new(entries:, refusal:, written: false) unless refusal.nil?
 
           BulkResult.new(entries:, refusal: nil, written: yield(ownership, owner, entries))
         end
-      end
-
-      # The entries a replayed bulk answer is returned with. The prepared store
-      # reads them locally. A receipt read while Timekeeping owns the entries
-      # was answered from this database alone, so no remote lookup is made
-      # and the answer carries no entries.
-      def replayed_bulk_entries(ownership:, owner:, entry_ids:, scope:)
-        owner == :prepared ? bulk_entries(ownership:, entry_ids:, scope:) : []
       end
 
       # Only a not-found answer drops an id, so a foreign id looks exactly like
@@ -491,7 +483,8 @@ module Timekeeping
         ids = movable_entry_ids(entries, project).sort
         return false if ids.empty?
 
-        answer = local_write(ownership:, operation: :bulk_move, body: { "entry_ids" => ids, "project_id" => project.id },
+        answer = replay_forwarded_bulk(ownership:, operation: :bulk_move, ids:, identity:) ||
+                 local_write(ownership:, operation: :bulk_move, body: { "entry_ids" => ids, "project_id" => project.id },
                              identity:, idempotency_key: local_bulk_key(:bulk_move, identity))
         reported?(answer, MOVED_RESULT)
       end
@@ -500,7 +493,8 @@ module Timekeeping
         ids = entries.map(&:id).sort
         return false if ids.empty?
 
-        answer = local_write(ownership:, operation: :bulk_delete, body: { "entry_ids" => ids }, identity:,
+        answer = replay_forwarded_bulk(ownership:, operation: :bulk_delete, ids:, identity:) ||
+                 local_write(ownership:, operation: :bulk_delete, body: { "entry_ids" => ids }, identity:,
                              idempotency_key: local_bulk_key(:bulk_delete, identity))
         reported?(answer, DELETED_RESULT)
       end
@@ -511,6 +505,17 @@ module Timekeeping
       # changed since the first attempt miss its receipt and write again.
       def local_bulk_key(operation, identity)
         bulk_request_key(operation, identity.fetch("entry_ids"))
+      end
+
+      # A forwarded bulk write is keyed over the ids it sent, and a rollback
+      # carries its receipt into this store under that key. So before writing
+      # ids, the receipt under the key a forwarded write of them would use is
+      # read too: its fingerprint is Timekeeping's, so a match is refused as a
+      # reused key rather than written a second time.
+      def replay_forwarded_bulk(ownership:, operation:, ids:, identity:)
+        return if context.idempotency_key.nil?
+
+        replay_local(ownership:, operation:, identity:, keys: [bulk_request_key(operation, ids)])
       end
 
       # The ids of the entries the legacy save would not skip.
@@ -570,25 +575,28 @@ module Timekeeping
                            keys: replay_keys(request_key(operation, entry_id)))
         case owner
         when :prepared then replay_local(ownership:, operation:, identity:, entry_id:, keys:)
-        when :timekeeping then replay_pre_change_receipt(operation:, identity:, entry_id:)
+        when :timekeeping then replay_prepared_receipt(operation:, identity:, entry_id:, keys:)
         end
       end
 
-      # A backstop for receipts the prepared store wrote under the raw client
-      # key before its keys were derived as forwarded ones. A re-cutover
-      # leaves them in this database, while Timekeeping looks a retry up only
-      # under the derived key it is sent and would write it again. The local
-      # owner's generation fence refuses every request while Timekeeping owns
-      # the entries, so this read skips it; it never writes.
-      def replay_pre_change_receipt(operation:, identity:, entry_id: nil)
-        key = context.idempotency_key
-        return if key.nil?
-
-        outcome = local_owner.stored_answer_for(
-          operation:, company_id: context.company.id, actor: local_actor,
-          params: { "idempotency_key" => key, "entry_id" => entry_id }, identity: as_json_value(identity)
-        )
-        local_answer(operation, outcome) unless outcome.nil?
+      # A backstop for receipts the prepared store wrote before a re-cutover:
+      # those under the raw client key from before keys were derived, and bulk
+      # receipts keyed over the requested ids, which Timekeeping keys over the
+      # ids it is sent instead. A re-cutover leaves them in this database,
+      # while Timekeeping looks a retry up only under the key it is sent and
+      # would write it again. The local owner's generation fence refuses every
+      # request while Timekeeping owns the entries, so this read skips it; it
+      # never writes. As in replay_local, the first stored answer wins.
+      def replay_prepared_receipt(operation:, identity:, keys:, entry_id: nil)
+        json_identity = as_json_value(identity)
+        keys.each do |key|
+          outcome = local_owner.stored_answer_for(
+            operation:, company_id: context.company.id, actor: local_actor,
+            params: { "idempotency_key" => key, "entry_id" => entry_id }, identity: json_identity
+          )
+          return local_answer(operation, outcome) unless outcome.nil?
+        end
+        nil
       end
 
       # The keys a retry may have been stored under: derived_key, then the raw
@@ -772,8 +780,9 @@ module Timekeeping
         receipt = carried_legacy_create(project:, attributes:, user_id: target_user_id)
         return forward_carried_create(ownership:, receipt:) if receipt
 
-        stored = replay_pre_change_receipt(
-          operation: :create, identity: request_create_identity(project:, attributes:, user_id: target_user_id)
+        stored = replay_prepared_receipt(
+          operation: :create, identity: request_create_identity(project:, attributes:, user_id: target_user_id),
+          keys: replay_keys(request_key(:create))
         )
         return hydrate(stored, user_id: stored["user_id"]) if stored
 

@@ -881,7 +881,7 @@ RSpec.describe Timekeeping::Gateway do
 
     expect(result.written).to be(true)
     expect(result.refusal).to be_nil
-    # The answer comes from this database alone, so no entries are looked up in Timekeeping.
+    # Timekeeping's lookup no longer finds the deleted entry, so the replayed answer lists none.
     expect(result.entries).to eq([])
     expect(timekeeping_row_counts).to eq(rows_before)
   end
@@ -903,11 +903,15 @@ RSpec.describe Timekeeping::Gateway do
     client_key = "raw-bulk-move-key-#{SecureRandom.hex(4)}"
     ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
     ownership.update_columns(monolith_store: "prepared", generation: 2)
+    # Timekeeping's lookup answers the entries as the move left them; the write client allows no call.
+    read_client = instance_double(Timekeeping::EntryApiClient)
+    allow(read_client).to receive(:show_entry) do |entry_id:, **|
+      timekeeping_show_answer_for(Timekeeping::LocalEntry.find(entry_id))
+    end
     gateway_for = lambda do
       context = Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user",
                                               request_id: SecureRandom.uuid, idempotency_key: client_key)
-      described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient),
-                          read_client: instance_double(Timekeeping::EntryApiClient))
+      described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient), read_client:)
     end
 
     first = gateway_for.call.bulk_move(entry_ids: ids, project: target, check: ->(_entries) { },
@@ -928,17 +932,25 @@ RSpec.describe Timekeeping::Gateway do
     ownership.update_columns(owner: "timekeeping", generation: 3)
 
     # "A retry of a write stored under the other owner's receipt is refused or answered, never written a second time"
-    # The write and read clients are doubles with no allowed methods, so a forward to Timekeeping fails the example.
+    # The write client is a double with no allowed methods, so a forward to Timekeeping fails the example.
     recut_retry = gateway_for.call.bulk_move(entry_ids: ids, project: target, check: ->(_entries) { },
                                              expected_generation: 3)
     expect(recut_retry).to be_a(Timekeeping::Gateway::BulkResult)
     expect(recut_retry.refusal).to be_nil
     expect(recut_retry.written).to be(true)
-    # The answer comes from this database alone, so no entries are looked up in Timekeeping.
-    expect(recut_retry.entries).to eq([])
+    # The replayed answer carries the moved entries, as the first answer did.
+    expect(recut_retry.entries.map(&:id)).to match_array(ids)
+    expect(recut_retry.entries.map(&:project_id)).to all(eq(target.id))
     expect(timekeeping_row_counts).to eq(after_first)
     expect(TimesheetEntry.count).to eq(timesheet_entries_before)
     expect(Timekeeping::LocalEntry.where(id: ids).pluck(:project_id)).to all(eq(target.id))
+  end
+
+  # The entry API's show answer for a stored entry, as Timekeeping would send it once it owns the entries.
+  def timekeeping_show_answer_for(entry)
+    Timekeeping::LocalOwner::RESPONSE_FIELDS.index_with do |field|
+      Timekeeping::EntryOutbox.json_value(field == "locked" ? false : entry.read_attribute(field))
+    end
   end
 
   def raw_key_retry_gateway(company:, user:, client_key:)
@@ -1066,6 +1078,84 @@ RSpec.describe Timekeeping::Gateway do
     expect(retried.written).to be(true)
     expect(timekeeping_row_counts).to eq(rows_after_edit)
     expect([movable.reload.project_id, skipped.reload.project_id]).to eq([source.id, source.id])
+  end
+
+  it "answers a partial prepared bulk move retried after a re-cutover from its receipt and forwards nothing", committed_data: true do
+    ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+    ownership.update_columns(monolith_store: "prepared", generation: 2)
+    company = create(:company)
+    client = create(:client, company:)
+    source = create(:project, billable: true, client:)
+    target = create(:project, billable: true, client:)
+    user = timekeeping_member(company, "admin")
+    live = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: user.id, project_id: source.id,
+                                           work_date: Date.current, duration: 30.0, note: "partial handoff",
+                                           bill_status: "unbilled")
+    missing_id = live.id + 1_000_000
+    client_key = "partial-bulk-move-recutover-#{SecureRandom.hex(4)}"
+    read_client = instance_double(Timekeeping::EntryApiClient)
+    allow(read_client).to receive(:show_entry) do |entry_id:, **|
+      found = Timekeeping::LocalEntry.find_by(id: entry_id)
+      raise ActiveRecord::RecordNotFound.new("Couldn't find TimesheetEntry", "TimesheetEntry") if found.nil?
+
+      timekeeping_show_answer_for(found)
+    end
+    bulk_move = lambda do
+      context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user",
+                                              request_id: SecureRandom.uuid, idempotency_key: client_key)
+      described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient), read_client:)
+        .bulk_move(entry_ids: [live.id, missing_id], project: target, check: ->(_entries) { },
+                   expected_generation: ownership.reload.generation)
+    end
+    expect(bulk_move.call.written).to be(true)
+    ownership.update_columns(owner: "timekeeping", generation: 3)
+    # An edit made after the first attempt moves the entry back.
+    live.update_columns(project_id: source.id)
+    rows_before = timekeeping_row_counts
+
+    # "A retry of a write stored under the other owner's receipt is refused or answered, never written a second time"
+    retried = bulk_move.call
+    expect(retried.written).to be(true)
+    expect(timekeeping_row_counts).to eq(rows_before)
+    expect(live.reload.project_id).to eq(source.id)
+  end
+
+  it "refuses a partial prepared bulk move whose forwarded receipt a rollback carried in under the sent-ids key",
+     committed_data: true do
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+    company = create(:company)
+    client = create(:client, company:)
+    source = create(:project, billable: true, client:)
+    target = create(:project, billable: true, client:)
+    user = timekeeping_member(company, "admin")
+    live = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: user.id, project_id: source.id,
+                                           work_date: Date.current, duration: 30.0, note: "forwarded move",
+                                           bill_status: "unbilled")
+    missing_id = live.id + 1_000_000
+    client_key = "forwarded-partial-bulk-move-#{SecureRandom.hex(4)}"
+    # Stands for the receipt Timekeeping stored for the forwarded move of the one found entry, carried in by a
+    # rollback: keyed over the ids it sent, and fingerprinted over the body it received.
+    forwarded_body = { "entry_ids" => [live.id], "project_id" => target.id }
+    Timekeeping::LocalOwner::Receipt.create!(
+      company_id: company.id, actor_type: "user", actor_id: user.id, operation: "bulk_move ",
+      key: Timekeeping::EntryWriteClient.bulk_idempotency_key(request_id: client_key, operation: "bulk_move",
+                                                               entry_ids: [live.id]),
+      fingerprint: Digest::SHA256.hexdigest(JSON.generate(forwarded_body)), status: 200,
+      body: JSON.generate({ "results" => [{ "entry_id" => live.id, "result" => "moved" }] }), created_at: Time.current
+    )
+    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user",
+                                            request_id: SecureRandom.uuid, idempotency_key: client_key)
+    gateway = described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient),
+                                  read_client: instance_double(Timekeeping::EntryApiClient))
+    rows_before = timekeeping_row_counts
+
+    # "A retry of a write stored under the other owner's receipt is refused or answered, never written a second time"
+    expect do
+      gateway.bulk_move(entry_ids: [live.id, missing_id], project: target, check: ->(_entries) { },
+                        expected_generation: 2)
+    end.to raise_error(Timekeeping::EntryWriteClient::Rejected)
+    expect(timekeeping_row_counts).to eq(rows_before)
+    expect(live.reload.project_id).to eq(source.id)
   end
 end
 
