@@ -27,6 +27,14 @@ module TimekeepingIntegrationTags
   RUNTIME_BLOCK_METHODS = %i[
     before after around prepend_before append_before prepend_after append_after let let! subject subject!
   ].freeze
+  # The only example methods whose names count as passing examples: the x
+  # forms, skip and pending never run, and the f forms are focus filters
+  # that should not be committed.
+  COUNTED_EXAMPLE_METHODS = %i[it specify example].freeze
+  DISABLED_GROUP_METHODS = %i[xdescribe xcontext].freeze
+  # Metadata keys that stop an example, or every example in a group, from
+  # running. Written as a bare symbol or as a key, whatever its value.
+  SKIP_METADATA = %i[skip pending].freeze
   LOAD_METHODS = %i[require require_relative load].freeze
   HANDOFF_FAKES_BASENAME = "handoff_fakes"
   # Object::Name and ::Name both name the top-level constant Name.
@@ -51,6 +59,64 @@ module TimekeepingIntegrationTags
     raise ArgumentError, "the handoff fakes source declares no class or module" if names.empty?
 
     names
+  end
+
+  # The names of the examples in one spec file's source that would run and
+  # pass, in source order. Examples that are skipped, pending, focused, or
+  # under a skipped group are left out, so none of them can count as proof.
+  # Raises ArgumentError naming the line of a counted example whose name is
+  # not a plain string literal, because its text cannot be read from source.
+  def example_names(source)
+    example_names_in(Prism.parse(source).value, false).freeze
+  end
+
+  # disabled is whether a group above node is skipped or pending. It is
+  # never cleared, so a plain group inside a skipped one stays skipped.
+  # Example bodies and hooks are not read: calls there are not declarations.
+  def example_names_in(node, disabled)
+    if node.is_a?(Prism::CallNode)
+      return counted_example?(node) && !disabled ? [example_name(node)] : [] if example_call?(node)
+      return [] if RUNTIME_BLOCK_METHODS.include?(node.name)
+
+      disabled ||= group_call?(node) && disabled_group?(node)
+    end
+    node.compact_child_nodes.flat_map { |child| example_names_in(child, disabled) }
+  end
+
+  # An example with no block is reported by RSpec as pending, not run.
+  def counted_example?(node)
+    COUNTED_EXAMPLE_METHODS.include?(node.name) && !node.block.nil? && !skip_metadata?(node)
+  end
+
+  def disabled_group?(node)
+    DISABLED_GROUP_METHODS.include?(node.name) || skip_metadata?(node)
+  end
+
+  def skip_metadata?(node)
+    (node.arguments&.arguments || []).any? do |argument|
+      case argument
+      when Prism::SymbolNode
+        skip_symbol?(argument)
+      when Prism::KeywordHashNode, Prism::HashNode
+        argument.elements.any? { |element| element.is_a?(Prism::AssocNode) && skip_symbol?(element.key) }
+      else
+        false
+      end
+    end
+  end
+
+  def skip_symbol?(node)
+    node.is_a?(Prism::SymbolNode) && SKIP_METADATA.include?(node.unescaped.to_sym)
+  end
+
+  def example_name(node)
+    name = node.arguments&.arguments&.first
+    unless name.is_a?(Prism::StringNode)
+      raise ArgumentError,
+            "the example name at line #{node.location.start_line} is not a plain string literal: #{node.slice.lines.first.strip}"
+    end
+
+    name.unescaped.dup.freeze
   end
 
   # tagged is whether the nearest committed_data setting above node is true.
@@ -171,7 +237,9 @@ module TimekeepingIntegrationTags
       node.compact_child_nodes.flat_map { |child| declared_constants(child, namespace) }
     end
   end
-  private_class_method :walk, :walk_call, :group_call?, :example_call?, :rspec_receiver?, :tag_setting,
+  private_class_method :example_names_in, :counted_example?, :disabled_group?, :skip_metadata?, :skip_symbol?,
+                       :example_name,
+                       :walk, :walk_call, :group_call?, :example_call?, :rspec_receiver?, :tag_setting,
                        :tag_key?, :loads_handoff_fakes?, :fake_reference?, :top_level_segments,
                        :constant_segments, :declared_constants
 end
