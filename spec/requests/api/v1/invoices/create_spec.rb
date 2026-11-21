@@ -92,45 +92,6 @@ RSpec.describe "Api::V1::Invoices#create", type: :request do
         ).to eq(company.current_address.address_line_1)
       end
 
-      it "creates invoice line items with date and timesheet entry associations" do
-        project = create(:project, client:)
-        timesheet_entry = create(
-          :timesheet_entry,
-          user:,
-          project:,
-          work_date: Date.current,
-          duration: 120
-        )
-
-        send_request :post, api_v1_invoices_path(
-          invoice: {
-            client_id: client.id,
-            invoice_number: "INV-TIMESHEET-001",
-            issue_date: Date.current.iso8601,
-            due_date: 30.days.from_now.to_date.iso8601,
-            status: "draft",
-            currency: company.base_currency,
-            invoice_line_items_attributes: [
-              {
-                name: "Timesheet entry",
-                description: "Linked entry",
-                date: timesheet_entry.work_date.iso8601,
-                rate: 100,
-                quantity: 120,
-                timesheet_entry_id: timesheet_entry.id
-              }
-            ]
-          }), headers: auth_headers(user)
-
-        expect(response).to have_http_status(:ok)
-
-        invoice = Invoice.find_by!(invoice_number: "INV-TIMESHEET-001")
-        line_item = invoice.invoice_line_items.last
-
-        expect(line_item.date).to eq(timesheet_entry.work_date)
-        expect(line_item.timesheet_entry_id).to eq(timesheet_entry.id)
-      end
-
       it "accepts zero line-item rates and rejects negative rates" do
         invoice_params = lambda do |invoice_number, rate|
           {
@@ -767,6 +728,63 @@ RSpec.describe "Api::V1::Invoices#create refused over a kept invoice's entry", t
     expect(InvoiceEntryHolding.find_by(company_id: abort_replay_company.id, invoice_id: kept.id).attributes)
       .to eq(holding_before)
     expect(abort_rows.count).to eq(1)
+  end
+end
+
+# The live Timekeeping app reads company and project rows on its own database
+# connections, so this example's rows must be committed. The let_it_be rows of
+# the first group sit in one open transaction for that whole group, which
+# committed_data does not lift, so the example lives in its own group.
+RSpec.describe "Api::V1::Invoices#create line items linked to an owned entry", type: :request,
+  committed_data: true do
+  let(:owned_entry_company) { create(:company, :with_logo, base_currency: "USD") }
+  let(:owned_entry_client) { create(:client, company: owned_entry_company) }
+  let(:owned_entry_admin) do
+    create(:user, email: "invoice-create-admin@example.com", current_workspace_id: owned_entry_company.id)
+  end
+
+  before do
+    create(:employment, company: owned_entry_company, user: owned_entry_admin)
+    owned_entry_admin.add_role :admin, owned_entry_company
+    sign_in owned_entry_admin
+  end
+
+  it "creates invoice line items with date and timesheet entry associations" do
+    project = create(:project, client: owned_entry_client)
+    work_date = Date.current
+    timesheet_entry_id, = arrange_owned_entries([
+      { company: owned_entry_company, user: owned_entry_admin, project:, work_date:, duration: 120,
+        bill_status: "non_billable" }
+    ])
+    expect_owner_state!
+
+    send_request :post, api_v1_invoices_path(
+      invoice: {
+        client_id: owned_entry_client.id,
+        invoice_number: "INV-TIMESHEET-001",
+        issue_date: Date.current.iso8601,
+        due_date: 30.days.from_now.to_date.iso8601,
+        status: "draft",
+        currency: owned_entry_company.base_currency,
+        invoice_line_items_attributes: [
+          {
+            name: "Timesheet entry",
+            description: "Linked entry",
+            date: work_date.iso8601,
+            rate: 100,
+            quantity: 120,
+            timesheet_entry_id:
+          }
+        ]
+      }), headers: auth_headers(owned_entry_admin)
+
+    expect(response).to have_http_status(:ok)
+
+    invoice = Invoice.find_by!(invoice_number: "INV-TIMESHEET-001")
+    line_item = invoice.invoice_line_items.last
+
+    expect(line_item.date).to eq(work_date)
+    expect(line_item.timesheet_entry_id).to eq(timesheet_entry_id)
   end
 end
 
