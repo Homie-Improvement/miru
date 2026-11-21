@@ -183,7 +183,7 @@ module Timekeeping
           import_legacy(user:, project:, final:)
         when :prepared
           identity = create_identity(user_id: user.id, project:, fields: final)
-          row = replay_local(ownership:, operation: :create, identity:, idempotency_key:) ||
+          row = replay_local(ownership:, operation: :create, identity:, keys: [idempotency_key].compact) ||
                 local_write(ownership:, operation: :create, body: import_body(user:, project:, final:), identity:,
                             idempotency_key:)
           hydrate(row, user_id: user.id)
@@ -331,7 +331,9 @@ module Timekeeping
       # :reek:LongParameterList
       def bulk_write(operation:, identity:, entry_ids:, check:, expected_generation:, scope:)
         perform(expected_generation) do |ownership, owner|
-          replayed = owner == :prepared && replay_local(ownership:, operation:, identity:)
+          replayed = owner == :prepared &&
+                     replay_local(ownership:, operation:, identity:,
+                                  keys: bulk_replay_keys(operation, identity.fetch("entry_ids")))
           entries = bulk_entries(ownership:, entry_ids:, scope:)
           if replayed
             next BulkResult.new(entries:, refusal: nil, written: reported?(replayed, BULK_RESULTS.fetch(operation)))
@@ -423,16 +425,36 @@ module Timekeeping
       # create rules check is then built for the acting user, since no target
       # record was resolved. The answer is hydrated for the user the owner
       # wrote the entry for.
+      #
+      # A retry of a create the legacy store committed is matched to its
+      # legacy receipt first, as in forward_create, and answered from the row
+      # the rollback carried into this store.
       # :reek:LongParameterList
       def local_create(ownership:, project:, attributes:, user:, requested_user_id:)
-        draft_user = user || context.actor
         target_user_id = user ? user.id : requested_user_id
+        receipt = carried_legacy_create(project:, attributes:, user_id: target_user_id)
+        return local_carried_create(ownership:, receipt:) if receipt
+
+        draft_user = user || context.actor
         fields = EntryWriteClient.forwarded_fields(attributes, actor_kind: context.actor_kind, operation: :create)
         identity = create_identity(user_id: target_user_id, project:, fields:)
         row = replay_local(ownership:, operation: :create, identity:) || local_write(
           ownership:, operation: :create, identity:, idempotency_key: request_key(:create),
           body: create_body(user: draft_user, project:, attributes:).merge("user_id" => target_user_id)
         )
+        hydrate(row, user_id: row["user_id"])
+      end
+
+      # The carried row is stored under the carried key with the fingerprint
+      # of the forwarded body, so the replay sends that body with no identity.
+      # The legacy receipt proves the create committed, so when the carried
+      # row is missing the retry is refused rather than written again.
+      def local_carried_create(ownership:, receipt:)
+        carried_key = LegacyCreateReplay.carried_key(actor_kind: receipt.actor_kind, key: receipt.key)
+        row = replay_local(ownership:, operation: :create, identity: nil, body: JSON.parse(receipt.forwarded_body),
+                           keys: [carried_key])
+        raise EntryWriteClient::Error, "the carried receipt of a committed legacy create is missing" if row.nil?
+
         hydrate(row, user_id: row["user_id"])
       end
 
@@ -495,20 +517,45 @@ module Timekeeping
         local_answer(operation, outcome)
       end
 
-      # The local owner's stored answer to an earlier write of the same request
-      # under the same stable key, or nil when there is none. Read before any
-      # check of current state, so a retry whose first attempt committed
-      # replays instead of being refused by what that attempt changed. A key
-      # derived from the request id is new on every retry, so only a key the
-      # client or the import chose is looked up.
-      def replay_local(ownership:, operation:, identity:, idempotency_key: context.idempotency_key, entry_id: nil)
-        return if idempotency_key.nil?
+      # The local owner's stored answer to an earlier write of the same request,
+      # or nil when there is none. Read before any check of current state, so a
+      # retry whose first attempt committed replays instead of being refused by
+      # what that attempt changed. keys are looked up in order and the first
+      # stored answer wins, a key-reused refusal included, so a refusal never
+      # falls through to a later key or to a write. body is sent only when
+      # identity is nil, for a receipt that fingerprints the body itself.
+      # :reek:LongParameterList
+      def replay_local(ownership:, operation:, identity:, entry_id: nil, body: nil,
+                       keys: replay_keys(operation, entry_id))
+        params = { "entry_id" => entry_id }
+        params["body"] = as_json_value(body) unless body.nil?
+        json_identity = identity.nil? ? nil : as_json_value(identity)
 
-        outcome = local_owner.replay(
-          operation:, company_id: context.company.id, generation: ownership.generation, actor: local_actor,
-          params: { "idempotency_key" => idempotency_key, "entry_id" => entry_id }, identity: as_json_value(identity)
-        )
-        local_answer(operation, outcome) unless outcome.nil?
+        keys.each do |key|
+          outcome = local_owner.replay(
+            operation:, company_id: context.company.id, generation: ownership.generation, actor: local_actor,
+            params: params.merge("idempotency_key" => key), identity: json_identity
+          )
+          return local_answer(operation, outcome) unless outcome.nil?
+        end
+        nil
+      end
+
+      # The keys a retry of a single-entry write may have been stored under:
+      # the key this change derives, then the raw client key that receipts
+      # written before it used. A key derived from the request id alone is new
+      # on every retry, so a request without a client key looks up nothing.
+      def replay_keys(operation, entry_id)
+        return [] if context.idempotency_key.nil?
+
+        [request_key(operation, entry_id), context.idempotency_key]
+      end
+
+      # As replay_keys, for a bulk write keyed over the requested ids.
+      def bulk_replay_keys(operation, entry_ids)
+        return [] if context.idempotency_key.nil?
+
+        [bulk_request_key(operation, entry_ids), context.idempotency_key]
       end
 
       # A success answers its body; a refusal raises the error a Timekeeping
@@ -563,16 +610,20 @@ module Timekeeping
         local_answer(:detach_entries, outcome).fetch("detached")
       end
 
-      # The request's own Idempotency-Key, or the key a forwarded write derives
-      # from the request id when the request sent none.
+      # The key a forwarded write of the same request sends, so a receipt
+      # stored by either owner answers a retry after ownership moves. It is
+      # seeded by the request's own Idempotency-Key, or by the request id when
+      # the request sent none, as EntryWriteClient seeds it.
       def request_key(operation, entry_id = nil)
-        context.idempotency_key ||
-          EntryWriteClient.idempotency_key(request_id: context.request_id, operation: operation.to_s, entry_id:)
+        EntryWriteClient.idempotency_key(request_id: key_seed, operation: operation.to_s, entry_id:)
       end
 
       def bulk_request_key(operation, entry_ids)
-        context.idempotency_key ||
-          EntryWriteClient.bulk_idempotency_key(request_id: context.request_id, operation: operation.to_s, entry_ids:)
+        EntryWriteClient.bulk_idempotency_key(request_id: key_seed, operation: operation.to_s, entry_ids:)
+      end
+
+      def key_seed
+        context.idempotency_key || context.request_id
       end
 
       # The create body a forwarded and a local create both send. Only the
