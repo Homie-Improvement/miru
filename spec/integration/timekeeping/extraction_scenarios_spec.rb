@@ -537,7 +537,7 @@ RSpec.describe "Timekeeping extraction scenarios", type: :request do
   # Creates the target's first entry through the web API, which forwards it to
   # Timekeeping while Timekeeping owns the entries, and answers its id.
   def extraction_create_entry(company, target)
-    extraction_super_admin.update!(current_workspace_id: company.id)
+    extraction_act_in(company)
     send_request :post, api_v1_timesheet_entry_index_path, params: {
       project_id: target[:project].id, user_id: target[:user].id,
       timesheet_entry: { duration: 30, work_date: Date.current.iso8601, note: "First entry", bill_status: "unbilled" }
