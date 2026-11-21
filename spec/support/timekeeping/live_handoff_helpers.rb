@@ -19,10 +19,15 @@ module TimekeepingLiveHandoff
   PAUSE_ROUTE = "/internal/v1/test-hooks/relay/pause"
   RESUME_ROUTE = "/internal/v1/test-hooks/relay/resume"
   HOOK_ANSWERED = "204"
-  # Each drain request runs the relay synchronously inside Timekeeping, so an
-  # attempt only fails when the runtime's own relay worker holds the relay
-  # lock. Retrying a fixed number of times covers that without waiting.
-  CATCH_UP_ATTEMPTS = 10
+  # Each drain request runs the relay synchronously inside Timekeeping, but
+  # answers false whenever the runtime's own relay worker holds the relay lock,
+  # even after that worker has sent every row. catch_up! therefore also reads
+  # the unsent positions after each false answer, so a worker run that
+  # delivered the rows counts as caught up. The count bounds only how long a
+  # worker run still delivering can keep the lock: attempts run back to back,
+  # with no wait, so a worker run longer than these attempts still fails the
+  # catch-up, and its message says the lock may be the cause.
+  CATCH_UP_ATTEMPTS = 30
   # Example metadata key holding every teardown step that raised and every
   # pause file found after an example.
   TEARDOWN_FAILURES_KEY = :live_handoff_teardown_failures
@@ -68,17 +73,23 @@ module TimekeepingLiveHandoff
     raise NotLegacy, "a setup cutover starts from the legacy owner state, but the ownership row holds #{ownership.inspect}"
   end
 
-  # drain: a Timekeeping::Handoff::RelayDrain. Only drained? decides, because
-  # drain! returns without sending when it could not take the relay lock.
-  # unsent_positions: ->(through:) { [Integer, ...] }, read only on failure.
+  # drain: a Timekeeping::Handoff::RelayDrain. drain! returning says nothing,
+  # because it returns without sending when it could not take the relay lock.
+  # unsent_positions: ->(through:) { [Integer, ...] }, the outbox positions at
+  # or below through with no sent_at: the same rows Timekeeping's drained?
+  # checks after its relay run. An empty list means every row is sent.
   def catch_up!(drain:, through:, unsent_positions:, attempts: CATCH_UP_ATTEMPTS)
+    unsent = []
     attempts.times do
       drain.drain!(through:)
       return nil if drain.drained?(through:)
+
+      unsent = unsent_positions.call(through:)
+      return nil if unsent.empty?
     end
 
-    raise CatchUpIncomplete, "outbox positions #{unsent_positions.call(through:).inspect} at or below " \
-                             "#{through} were still unsent after #{attempts} drain attempts"
+    raise CatchUpIncomplete, "outbox positions #{unsent.inspect} at or below #{through} were still unsent after " \
+                             "#{attempts} drain attempts; the runtime's relay worker may have held the relay lock"
   end
 
   # Runs the body, then every step in order. Each step runs even when the body

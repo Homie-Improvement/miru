@@ -33,18 +33,32 @@ RSpec.describe TimekeepingLiveHandoff do
 
       expect { described_class.catch_up!(drain:, through: 42, unsent_positions:, attempts: 3) }
         .to raise_error(described_class::CatchUpIncomplete,
-                        "outbox positions [41, 42] at or below 42 were still unsent after 3 drain attempts")
+                        "outbox positions [41, 42] at or below 42 were still unsent after 3 drain attempts; " \
+                        "the runtime's relay worker may have held the relay lock")
 
       expect(drain).to have_received(:drain!).with(through: 42).exactly(3).times
       expect(drain).to have_received(:drained?).with(through: 42).exactly(3).times
-      expect(read_through).to eq([42])
+      expect(read_through).to eq([42, 42, 42])
       expect(described_class).not_to have_received(:sleep)
     end
 
     it "returns as soon as drained? answers true" do
       drain = live_handoff_drain_double(drained_on_attempt: 2)
 
-      expect(described_class.catch_up!(drain:, through: 7, unsent_positions: ->(through:) { raise "unread #{through}" },
+      expect(described_class.catch_up!(drain:, through: 7, unsent_positions: ->(through:) { [through] },
+                                       attempts: 3)).to be_nil
+
+      expect(drain).to have_received(:drain!).twice
+      expect(drain).to have_received(:drained?).twice
+    end
+
+    # Timekeeping's drain answers false while the runtime's relay worker holds
+    # the relay lock, even once that worker has sent every row.
+    it "returns once no position at or below through is unsent, though drained? never answers true" do
+      drain = live_handoff_drain_double(drained_on_attempt: nil)
+      answers = [[6, 7], []]
+
+      expect(described_class.catch_up!(drain:, through: 7, unsent_positions: ->(through:) { answers.shift },
                                        attempts: 3)).to be_nil
 
       expect(drain).to have_received(:drain!).twice
