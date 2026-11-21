@@ -293,11 +293,12 @@ RSpec.describe "Timekeeping single-writer guard", type: :request, committed_data
     guard_entries_projected(case_name, edited => {}, deleted => {})
 
     guard_request(session, :patch, api_v1_cli_timesheet_entry_path(edited), case_name:, headers:, params: {
-      timesheet_entry: { project_id:, duration_minutes: 50, work_date: Date.current.iso8601, note: "Guard cli edit" }
+      timesheet_entry: { project_id:, duration_minutes: 50, work_date: Date.current.iso8601, note: "Guard cli edited" }
     })
     guard_request(session, :delete, api_v1_cli_timesheet_entry_path(deleted), case_name:, headers:)
 
-    { edited => { "note" => "Guard cli edit" }, deleted => { "discarded?" => true } }
+    # The created note is "Guard cli edit", so only a written update reaches this one.
+    { edited => { "note" => "Guard cli edited" }, deleted => { "discarded?" => true } }
   end
 
   def guard_agent_case(context, case_name:)
