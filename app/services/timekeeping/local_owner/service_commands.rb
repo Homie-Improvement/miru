@@ -198,6 +198,12 @@ module Timekeeping
           entries = locked_targets
           checkpoint.call(:rows_locked)
           change_entries(entries, stored_generation)
+          finish(entries)
+        end
+
+        # Answers with the count of changed entries. The receipt is stored only
+        # when an entry changed, or for a command that stores it regardless.
+        def finish(entries)
           outcome = Outcome.success(200, command.fetch(:count) => entries.size)
           if entries.any? || command.fetch(:store_unchanged)
             store_receipt(outcome)
