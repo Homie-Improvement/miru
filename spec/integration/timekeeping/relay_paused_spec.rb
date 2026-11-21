@@ -5,9 +5,9 @@ require "json"
 require "net/http"
 
 # Section 12.4 of docs/architecture/timekeeping-soa.md, "Relay paused", run
-# against the live demo runtime on both seeded companies. It needs
-# TIMEKEEPING_LIVE=1, so the default suite skips it, and the CI live job does
-# not run it.
+# against the live demo runtime on both seeded companies. The :integrated_runtime
+# tag skips it unless the live flag is set (spec/support/timekeeping/integrated_runtime.rb),
+# so the default suite skips it, and the CI live job does not run it.
 #
 # Each example cuts over from the legacy owner state for real, drives the relay
 # to a delivered baseline, then pauses it, so the entry created next can only
@@ -25,8 +25,8 @@ RSpec.describe "Timekeeping relay paused", :integrated_runtime, :two_tenant_seed
     "AC5 waits on the follow-up invoice change: the draft invoice save answers 422 " \
       "\"Invoice line items timesheet entry not found\" because the projection-backed " \
       "validation InvoiceLineItem#timesheet_entry_found_in_invoice_company reads " \
-      "timesheet_entries, and the keys invoice_line_items → timesheet_entries and " \
-      "invoice_line_item_time_entries → timesheet_entries refuse the row before the " \
+      "timesheet_entries, and the keys invoice_line_items -> timesheet_entries and " \
+      "invoice_line_item_time_entries -> timesheet_entries refuse the row before the " \
       "relay delivers it"
   end
 
