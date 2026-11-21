@@ -3,6 +3,10 @@
 class Timekeeping::V1::EntriesController < ApplicationController
   LIST_FILTERS = %w[from to user_id project_id].freeze
   WRITE_ACTIONS = %i[create update destroy bulk_move bulk_delete].freeze
+  # Sent on an answer served from a stored receipt
+  # (contracts/timekeeping/entry_api.yml headers.idempotency_replayed).
+  REPLAYED_HEADER = "Idempotency-Replayed"
+  REPLAYED_VALUE = "true"
 
   include Timekeeping::WriteMetricsRecording
 
@@ -51,6 +55,7 @@ class Timekeeping::V1::EntriesController < ApplicationController
         reference_client: Timekeeping::ReferenceClient.configured
       )
       outcome = command.is_a?(Timekeeping::WriteOutcome) ? command : Timekeeping::EntryWriter.new.call(command)
+      response.set_header(REPLAYED_HEADER, REPLAYED_VALUE) if outcome.replayed
       render json: outcome.body, status: outcome.status
     end
 end

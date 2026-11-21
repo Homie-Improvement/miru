@@ -27,6 +27,9 @@ module Timekeeping
       # ownership row FOR SHARE, as Timekeeping::Admission.fence! waits for
       # its own admitted writes.
       CLOSE_ADMISSION_LOCK_TIMEOUT = 60.seconds
+      # How long an abort sleeps before running an incomplete settle or
+      # freeze step and its check again.
+      ABORT_POLL_INTERVAL = 5.seconds
       # One session advisory lock for every run, forward, resume or abort, so
       # a second run anywhere fails fast instead of racing the first.
       LOCK_SQL = "SELECT pg_try_advisory_lock(hashtextextended('timekeeping_handoff', 0))"
@@ -44,8 +47,8 @@ module Timekeeping
 
       def self.run(direction:, resume: true, abort: false, owners: configured_owners, observer: NullObserver.new,
                    report_root: DEFAULT_REPORT_ROOT, clock: Time,
-                   close_admission_lock_timeout: CLOSE_ADMISSION_LOCK_TIMEOUT)
-        new(owners:, observer:, report_root:, clock:, close_admission_lock_timeout:)
+                   close_admission_lock_timeout: CLOSE_ADMISSION_LOCK_TIMEOUT, sleeper: Kernel.method(:sleep))
+        new(owners:, observer:, report_root:, clock:, close_admission_lock_timeout:, sleeper:)
           .run(direction: direction.to_sym, resume:, abort:)
       end
 
@@ -68,12 +71,13 @@ module Timekeeping
         }
       end
 
-      def initialize(owners:, observer:, report_root:, clock:, close_admission_lock_timeout:)
+      def initialize(owners:, observer:, report_root:, clock:, close_admission_lock_timeout:, sleeper:)
         @owners = owners.to_h.transform_keys(&:to_s)
         @observer = observer
         @report_root = Pathname(report_root)
         @clock = clock
         @close_admission_lock_timeout = close_admission_lock_timeout
+        @sleeper = sleeper
       end
 
       def run(direction:, resume:, abort:)
@@ -135,25 +139,45 @@ module Timekeeping
         # its completion check, and records the step only when the check
         # passed. close_admission and flip write the row in their own
         # transaction, so recording them again is skipped.
-        def carry_out(names)
+        #
+        # With wait_until_complete, a step whose check fails sleeps one poll
+        # interval and runs its action and check again, until the check
+        # passes; nothing is recorded or admitted before that. An exception
+        # from the sleep, such as an operator's interrupt, leaves the step
+        # unrecorded, so the handoff stays fenced and resumable.
+        def carry_out(names, wait_until_complete: false)
           names.each do |name|
             step = Steps::TABLE.find { |row| row[:name] == name }
             observer.call(:before_step, step: name)
-            send(step.fetch(:action))
-            raise Refused, "The #{name} step did not finish; resume or abort the handoff" unless send(step.fetch(:completion_check))
+            until step_completed?(step)
+              raise Refused, "The #{name} step did not finish; resume or abort the handoff" unless wait_until_complete
+
+              @sleeper.call(ABORT_POLL_INTERVAL)
+            end
 
             record(name) unless %w[close_admission flip].include?(name)
             observer.call(:after_step, step: name)
           end
         end
 
-        # Finishes settle and freeze if they are owed, then reopens the
-        # outgoing owner at the raised generation. The incoming owner stays
-        # fenced, and the generation stays raised. The settle step is closed
-        # in the same save, raising the stop mark to its generation, so no
-        # aborted handoff leaves one open and a late begin cannot reopen it.
+        # Runs the step's action, then answers its completion check afresh.
+        def step_completed?(step)
+          send(step.fetch(:action))
+          send(step.fetch(:completion_check))
+        end
+
+        # Finishes settle and freeze if they are owed, waiting for each to
+        # complete, then reopens the outgoing owner at the raised generation.
+        # The wait has no timeout: a refusal would make the operator abort
+        # again, and the handoff must stay fenced until the outbox is drained.
+        # It holds the handoff lock throughout, so a resume is refused until
+        # the abort completes or the operator interrupts it. The incoming
+        # owner stays fenced, and the generation stays raised. The settle
+        # step is closed in the same save, raising the stop mark to its
+        # generation, so no aborted handoff leaves one open and a late begin
+        # cannot reopen it.
         def abort_handoff(owed)
-          carry_out(owed)
+          carry_out(owed, wait_until_complete: true)
           update_row do |row|
             row.handoff_step = nil
             row.close_settling_step

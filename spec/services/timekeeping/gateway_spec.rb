@@ -45,6 +45,1487 @@ RSpec.describe Timekeeping::Gateway do
     expect([audit.actor_type, audit.actor_id]).to eq(["user", prepared_user.id])
   end
 
+  context "when a forwarded create raises TimesheetEntries::Created" do
+    it "a fresh forwarded create attributes TimesheetEntries::Created to the write context actor, not Current.user, and carries only identifying fields" do
+      company = create(:company)
+      project = create(:project, billable: true, client: create(:client, company:))
+      actor = timekeeping_member(company, "admin")
+      unrelated_user = create(:user)
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+      client_key = "client-key-forwarded-event-actor"
+      row = {
+        "id" => 9_200_001, "company_id" => company.id, "version" => 1, "project_id" => project.id,
+        "user_id" => actor.id, "work_date" => Date.current.iso8601, "duration" => 45.0, "note" => "Private note text",
+        "bill_status" => "unbilled", "review_status" => "approved", "source" => "manual", "source_metadata" => {},
+        "agent_id" => nil, "proof_url" => nil, "proof_metadata" => nil, "external_run_id" => nil,
+        "external_session_id" => nil, "locked" => false
+      }
+      write_client = instance_double(Timekeeping::EntryWriteClient)
+      allow(write_client).to receive(:create_entry)
+        .and_return(Timekeeping::EntryWriteClient::CreateAnswer.new(row:, replayed: false))
+      context = Timekeeping::WriteContext.new(company:, actor:, actor_kind: "user", request_id: "req-event-actor",
+                                              idempotency_key: client_key)
+
+      created_events = timesheet_entries_created_events do
+        # Current names someone else, so an emitter that reads Current instead of the write context is caught.
+        Current.set(user: unrelated_user) do
+          described_class.new(context:, write_client:).create(
+            user: actor, project:,
+            attributes: { duration: 45, work_date: Date.current, note: "Private note text", bill_status: "unbilled" }
+          )
+        end
+      end
+
+      # "A time entry create forwarded to Timekeeping raises exactly one `TimesheetEntries::Created` event, with the same actor and data shape as a create in the legacy state, once Timekeeping answers the create with success"
+      expect(created_events.size).to eq(1)
+      payload = created_events.first[:payload].to_h
+      expect(payload[:actor]).to eq(id: actor.id, type: "User")
+      expect(payload.keys).to contain_exactly(:actor, :data)
+      expect(payload[:data]).to eq(timesheet_entry_id: 9_200_001, project_id: project.id, user_id: actor.id, duration: 45.0)
+      # Events are stored and shown to event viewers across workspaces, so the request's
+      # key and the entry's note must never reach the payload.
+      expect(payload.to_s).not_to include(client_key)
+      expect(payload.to_s).not_to include("Private note text")
+    end
+  end
+
+  context "when Timekeeping answers a forwarded create from its stored receipt" do
+    it "raises no TimesheetEntries::Created for a forwarded create answered from a stored receipt and one with the request actor for a fresh answer" do
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+      context = Timekeeping::WriteContext.new(
+        company: prepared_company, actor: prepared_user, actor_kind: "user", request_id: "req-forwarded-created-event"
+      )
+      row = {
+        "id" => 98_765, "company_id" => prepared_company.id, "version" => 1, "project_id" => prepared_project.id,
+        "user_id" => prepared_user.id, "work_date" => Date.current.iso8601, "duration" => 30.0, "note" => "forwarded",
+        "bill_status" => "unbilled", "review_status" => "not_required", "source" => "manual", "source_metadata" => {},
+        "agent_id" => nil, "proof_url" => nil, "proof_metadata" => nil, "external_run_id" => nil,
+        "external_session_id" => nil, "locked" => false
+      }
+      write_client = instance_double(Timekeeping::EntryWriteClient)
+      allow(write_client).to receive(:create_entry).and_return(
+        Timekeeping::EntryWriteClient::CreateAnswer.new(row:, replayed: true),
+        Timekeeping::EntryWriteClient::CreateAnswer.new(row:, replayed: false)
+      )
+      gateway = described_class.new(context:, write_client:, read_client: instance_double(Timekeeping::EntryApiClient))
+      attributes = { duration: 30, work_date: Date.current, note: "forwarded", bill_status: "unbilled" }
+
+      replayed_events = timesheet_entries_created_events do
+        replayed_entry = gateway.create(user: prepared_user, project: prepared_project, attributes:)
+        expect(replayed_entry.id).to eq(98_765)
+      end
+      fresh_events = timesheet_entries_created_events do
+        gateway.create(user: prepared_user, project: prepared_project, attributes:)
+      end
+
+      # "A forwarded create that Timekeeping refuses, or that is replayed from a stored idempotency receipt, raises no event"
+      expect(replayed_events).to be_empty
+      # "A time entry create forwarded to Timekeeping raises exactly one `TimesheetEntries::Created` event, with the same actor and data shape as a create in the legacy state, once Timekeeping answers the create with success"
+      expect(fresh_events.map { |event| event[:payload].to_h }).to eq([
+        { actor: { id: prepared_user.id, type: "User" },
+          data: { timesheet_entry_id: 98_765, project_id: prepared_project.id, user_id: prepared_user.id, duration: 30.0 } }
+      ])
+    end
+  end
+
+  context "when the prepared store answers a create" do
+    it "raises one TimesheetEntries::Created for a fresh prepared create and none when the local owner answers from its receipt" do
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+      context = Timekeeping::WriteContext.new(
+        company: prepared_company, actor: prepared_user, actor_kind: "user", request_id: "req-prepared-created-event"
+      )
+      body = {
+        "id" => 54_321, "company_id" => prepared_company.id, "version" => 1, "project_id" => prepared_project.id,
+        "user_id" => prepared_user.id, "work_date" => Date.current.iso8601, "duration" => 15.0, "note" => "prepared",
+        "bill_status" => "unbilled", "review_status" => "not_required", "source" => "manual", "source_metadata" => {},
+        "agent_id" => nil, "proof_url" => nil, "proof_metadata" => nil, "external_run_id" => nil,
+        "external_session_id" => nil, "locked" => false
+      }
+      attributes = { duration: 15, work_date: Date.current, note: "prepared", bill_status: "unbilled" }
+      gateway_for = lambda do |replayed|
+        local_owner = Timekeeping::FakeLocalOwner.new(
+          outcome: Timekeeping::LocalOwner::Outcome.new(status: 201, body:, replayed:)
+        )
+        described_class.new(context:, local_owner:, write_client: instance_double(Timekeeping::EntryWriteClient),
+                            read_client: instance_double(Timekeeping::EntryApiClient))
+      end
+
+      fresh_events = timesheet_entries_created_events do
+        gateway_for.call(false).create(user: prepared_user, project: prepared_project, attributes:)
+      end
+      # A concurrent retry that the local owner answers from the receipt the first attempt stored.
+      replayed_entry = nil
+      replayed_events = timesheet_entries_created_events do
+        replayed_entry = gateway_for.call(true).create(user: prepared_user, project: prepared_project, attributes:)
+      end
+
+      # "A create in the legacy and rollback states raises the event exactly as today (one event, from the model)"
+      # In the rollback state no event is raised before this change; the change must disclose that it adds one.
+      expect(fresh_events.map { |event| event[:payload].to_h }).to eq([
+        { actor: { id: prepared_user.id, type: "User" },
+          data: { timesheet_entry_id: 54_321, project_id: prepared_project.id, user_id: prepared_user.id, duration: 15.0 } }
+      ])
+      expect(replayed_entry.id).to eq(54_321)
+      expect(replayed_events).to be_empty
+    end
+  end
+
+  context "when Timekeeping refuses a forwarded create" do
+    it "raises no TimesheetEntries::Created when Timekeeping refuses a forwarded create" do
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+      context = Timekeeping::WriteContext.new(
+        company: prepared_company, actor: prepared_user, actor_kind: "user", request_id: "req-forwarded-refused-event"
+      )
+      attributes = { duration: 30, work_date: Date.current, note: "refused", bill_status: "unbilled" }
+      refusals = [
+        Timekeeping::EntryWriteClient::Rejected.new("refused"),
+        Timekeeping::EntryWriteClient::Forbidden.new("refused"),
+        Timekeeping::EntryWriteClient::Conflict.new("refused"),
+        ActiveRecord::RecordNotFound.new("refused")
+      ]
+
+      events = timesheet_entries_created_events do
+        refusals.each do |refusal|
+          write_client = instance_double(Timekeeping::EntryWriteClient)
+          allow(write_client).to receive(:create_entry).and_raise(refusal)
+          gateway = described_class.new(context:, write_client:, read_client: instance_double(Timekeeping::EntryApiClient))
+
+          expect { gateway.create(user: prepared_user, project: prepared_project, attributes:) }
+            .to raise_error(refusal.class)
+          # The gateway never retries a refused create.
+          expect(write_client).to have_received(:create_entry).once
+        end
+      end
+
+      # "A forwarded create that Timekeeping refuses, or that is replayed from a stored idempotency receipt, raises no event"
+      expect(events).to be_empty
+    end
+  end
+
+  context "when a forwarded answer names another company" do
+    it "a fresh forwarded create answered with another company's entry is refused and raises no TimesheetEntries::Created, while its own company's answer raises one" do
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+      company = create(:company)
+      project = create(:project, billable: true, client: create(:client, company:))
+      user = timekeeping_member(company, "owner")
+      other_company = create(:company)
+      other_project = create(:project, billable: true, client: create(:client, company: other_company))
+      context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: "req-tenant-created")
+      row_for = lambda do |id, row_company, row_project|
+        { "id" => id, "company_id" => row_company.id, "version" => 1, "project_id" => row_project.id,
+          "user_id" => user.id, "work_date" => Date.current.iso8601, "duration" => 30.0, "note" => "Tenant check",
+          "bill_status" => "unbilled", "review_status" => "not_required", "source" => "manual", "source_metadata" => {},
+          "agent_id" => nil, "proof_url" => nil, "proof_metadata" => nil, "external_run_id" => nil,
+          "external_session_id" => nil, "locked" => false }
+      end
+      write_client = instance_double(Timekeeping::EntryWriteClient)
+      allow(write_client).to receive(:create_entry).and_return(
+        Timekeeping::EntryWriteClient::CreateAnswer.new(row: row_for.call(9_516_001, other_company, other_project), replayed: false),
+        Timekeeping::EntryWriteClient::CreateAnswer.new(row: row_for.call(9_516_002, company, project), replayed: false)
+      )
+      attributes = { duration: 30, work_date: Date.current, note: "Tenant check", bill_status: "unbilled" }
+
+      foreign_events = timesheet_entries_created_events do
+        # A forwarded answer outside the request's company is never rendered or announced.
+        expect do
+          described_class.new(context:, write_client:).create(user:, project:, attributes:)
+        end.to raise_error(Timekeeping::EntryWriteClient::Error)
+      end
+      created_events = timesheet_entries_created_events do
+        described_class.new(context:, write_client:).create(user:, project:, attributes:)
+      end
+
+      expect(foreign_events).to be_empty
+      # "A time entry create forwarded to Timekeeping raises exactly one `TimesheetEntries::Created` event, with the same actor and data shape as a create in the legacy state, once Timekeeping answers the create with success"
+      expect(created_events.size).to eq(1)
+      payload = created_events.first[:payload].to_h
+      expect(payload[:data]).to include(timesheet_entry_id: 9_516_002, project_id: project.id, user_id: user.id)
+      expect(payload[:actor]).to eq(id: user.id, type: "User")
+    end
+  end
+
+  context "when a prepared-store answer names another company" do
+    it "a prepared-store create raises TimesheetEntries::Created for its own company's entry and none when the local answer names another company" do
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+      company = create(:company)
+      project = create(:project, billable: true, client: create(:client, company:))
+      user = timekeeping_member(company, "owner")
+      other_company = create(:company)
+      other_project = create(:project, billable: true, client: create(:client, company: other_company))
+      context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: "req-1")
+      row_for = lambda do |id, row_company, row_project|
+        { "id" => id, "company_id" => row_company.id, "version" => 1, "project_id" => row_project.id,
+          "user_id" => user.id, "work_date" => Date.current.iso8601, "duration" => 15.0, "note" => "prepared tenant",
+          "bill_status" => "unbilled", "review_status" => "not_required", "source" => "manual", "source_metadata" => {},
+          "agent_id" => nil, "proof_url" => nil, "proof_metadata" => nil, "external_run_id" => nil,
+          "external_session_id" => nil, "locked" => false }
+      end
+      gateway_for = lambda do |row|
+        local_owner = Timekeeping::FakeLocalOwner.new(outcome: Timekeeping::LocalOwner::Outcome.new(status: 201, body: row))
+        described_class.new(context:, local_owner:, write_client: instance_double(Timekeeping::EntryWriteClient),
+                            read_client: instance_double(Timekeeping::EntryApiClient))
+      end
+      attributes = { duration: 15, work_date: Date.current, note: "prepared tenant", bill_status: "unbilled" }
+
+      foreign_events = timesheet_entries_created_events do
+        expect do
+          gateway_for.call(row_for.call(9_516_101, other_company, other_project)).create(user:, project:, attributes:)
+        end.to raise_error(Timekeeping::EntryWriteClient::Error)
+      end
+      created_events = timesheet_entries_created_events do
+        gateway_for.call(row_for.call(9_516_102, company, project)).create(user:, project:, attributes:)
+      end
+
+      expect(foreign_events).to be_empty
+      # "A create in the legacy and rollback states raises the event exactly as today (one event, from the model)"
+      # The rollback state writes the prepared store, where no event is raised today; the change discloses that.
+      expect(created_events.size).to eq(1)
+      payload = created_events.first[:payload].to_h
+      expect(payload[:data]).to include(timesheet_entry_id: 9_516_102, project_id: project.id, user_id: user.id)
+      expect(payload[:actor]).to eq(id: user.id, type: "User")
+    end
+  end
+
+  context "when the legacy store owns the entries" do
+    it "raises exactly one TimesheetEntries::Created for a legacy-store create through the gateway" do
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "monolith", monolith_store: "legacy")
+      company = create(:company)
+      project = create(:project, billable: true, client: create(:client, company:))
+      admin = timekeeping_member(company, "admin")
+      context = Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id: "req-legacy-once")
+
+      entry = nil
+      events = timesheet_entries_created_events do
+        entry = described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient)).create(
+          user: admin, project:, attributes: { duration: 30, work_date: Date.current, note: "legacy once", bill_status: "unbilled" }
+        )
+      end
+
+      expect(entry).to be_persisted
+      # "A create in the legacy and rollback states raises the event exactly as today (one event, from the model)"
+      expect(events.size).to eq(1)
+      expect(events.first[:payload].to_h[:data]).to include(timesheet_entry_id: entry.id, user_id: admin.id)
+    end
+  end
+
+  context "when a forwarded create's first answer is lost" do
+    it "raises no TimesheetEntries::Created across a lost forwarded create answer and its replayed retry" do
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+      company = create(:company)
+      project = create(:project, billable: true, client: create(:client, company:))
+      member = timekeeping_member(company, "employee")
+      context = Timekeeping::WriteContext.new(company:, actor: member, actor_kind: "user", request_id: "req-lost-answer")
+      row = {
+        "id" => 9102, "company_id" => company.id, "version" => 1, "project_id" => project.id,
+        "user_id" => member.id, "work_date" => Date.current.iso8601, "duration" => 30.0, "note" => "lost answer",
+        "bill_status" => "unbilled", "review_status" => "not_required", "source" => "manual", "source_metadata" => {},
+        "agent_id" => nil, "proof_url" => nil, "proof_metadata" => nil, "external_run_id" => nil,
+        "external_session_id" => nil, "locked" => false
+      }
+      write_client = instance_double(Timekeeping::EntryWriteClient)
+      attempts = 0
+      # The first answer is lost after Timekeeping committed; the retry is served from Timekeeping's receipt.
+      allow(write_client).to receive(:create_entry) do
+        attempts += 1
+        raise Timekeeping::EntryWriteClient::Error, "Timekeeping entry create failed: Net::ReadTimeout" if attempts == 1
+
+        Timekeeping::EntryWriteClient::CreateAnswer.new(row:, replayed: true)
+      end
+      attributes = { duration: 30, work_date: Date.current, note: "lost answer", bill_status: "unbilled" }
+
+      created_events = timesheet_entries_created_events do
+        expect do
+          described_class.new(context:, write_client:).create(user: member, project:, attributes:)
+        end.to raise_error(Timekeeping::EntryWriteClient::Error)
+        described_class.new(context:, write_client:).create(user: member, project:, attributes:)
+      end
+
+      expect(attempts).to eq(2)
+      # "A forwarded create that Timekeeping refuses, or that is replayed from a stored idempotency receipt, raises no event"
+      # So a create whose only fresh answer was lost raises no event at all.
+      expect(created_events).to be_empty
+    end
+  end
+
+  it "more tests 10 prepared create from another company's user with a carried key of the first company gets its own entry under the derived key", committed_data: true do
+    client_key = "tenant-carried-key-#{SecureRandom.hex(4)}"
+    attributes = { duration: 30, work_date: Date.current, note: "First company's private note", bill_status: "unbilled" }
+
+    first_company = create(:company)
+    first_project = create(:project, billable: true, client: create(:client, company: first_company))
+    first_user = timekeeping_member(first_company, "admin", user: create(:user, current_workspace_id: first_company.id))
+    first_context = Timekeeping::WriteContext.new(company: first_company, actor: first_user, actor_kind: "user",
+                                                  request_id: SecureRandom.uuid, idempotency_key: client_key)
+    legacy_entry = described_class.new(context: first_context).create(user: first_user, project: first_project, attributes:)
+    receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: legacy_entry.id)
+    committed = TimesheetEntry.instantiate(receipt.entry_attributes)
+    entry_values = Timekeeping::LocalOwner::RESPONSE_FIELDS.index_with do |field|
+      Timekeeping::EntryOutbox.json_value(committed.read_attribute(field))
+    end
+    row = Timekeeping::LegacyCreateReceiptConversion.convert(
+      receipts: [receipt.attributes.except("entry_attributes").symbolize_keys.merge(entry_values:)],
+      captured_at: Time.current
+    )[:rows].first
+    Timekeeping::LocalOwner::Receipt.create!(row.except("id"))
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+    first_company_receipts = Timekeeping::LocalOwner::Receipt.where(company_id: first_company.id)
+                                                             .pluck(:id, :key, :fingerprint, :body)
+
+    second_company = create(:company)
+    second_project = create(:project, billable: true, client: create(:client, company: second_company))
+    second_user = timekeeping_member(second_company, "admin", user: create(:user, current_workspace_id: second_company.id))
+    second_context = Timekeeping::WriteContext.new(company: second_company, actor: second_user, actor_kind: "user",
+                                                   request_id: SecureRandom.uuid, idempotency_key: client_key)
+    # Doubles with no allowed methods: any forwarded write or remote lookup fails the example.
+    gateway = described_class.new(context: second_context, write_client: instance_double(Timekeeping::EntryWriteClient),
+                                  read_client: instance_double(Timekeeping::EntryApiClient))
+
+    answer = gateway.create(user: second_user, project: second_project, attributes:)
+
+    # "Another company's user sending the same key never receives the first company's entry"
+    stored = Timekeeping::LocalEntry.find(answer.id)
+    expect(stored.company_id).to eq(second_company.id)
+    expect(stored.user_id).to eq(second_user.id)
+    expect(answer.user_id).to eq(second_user.id)
+    expect(answer.project_id).to eq(second_project.id)
+    # "Keep every lookup scoped by company, actor type, actor id, operation and key."
+    expect(Timekeeping::LocalOwner::Receipt.where(company_id: second_company.id).pluck(:key))
+      .to eq([Timekeeping::EntryWriteClient.idempotency_key(request_id: client_key, operation: "create")])
+    expect(Timekeeping::LocalOwner::Receipt.where(company_id: first_company.id).pluck(:id, :key, :fingerprint, :body))
+      .to eq(first_company_receipts)
+  end
+
+  it "more tests 11 prepared create from a colleague in the same company with a carried key of another user never replays that user's entry", committed_data: true do
+    client_key = "actor-carried-key-#{SecureRandom.hex(4)}"
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    first_user = timekeeping_member(company, "admin", user: create(:user, current_workspace_id: company.id))
+    colleague = timekeeping_member(company, "admin", user: create(:user, current_workspace_id: company.id))
+    first_context = Timekeeping::WriteContext.new(company:, actor: first_user, actor_kind: "user",
+                                                  request_id: SecureRandom.uuid, idempotency_key: client_key)
+    legacy_entry = described_class.new(context: first_context).create(
+      user: first_user, project:,
+      attributes: { duration: 30, work_date: Date.current, note: "First user's private note", bill_status: "unbilled" }
+    )
+    receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: legacy_entry.id)
+    committed = TimesheetEntry.instantiate(receipt.entry_attributes)
+    entry_values = Timekeeping::LocalOwner::RESPONSE_FIELDS.index_with do |field|
+      Timekeeping::EntryOutbox.json_value(committed.read_attribute(field))
+    end
+    row = Timekeeping::LegacyCreateReceiptConversion.convert(
+      receipts: [receipt.attributes.except("entry_attributes").symbolize_keys.merge(entry_values:)],
+      captured_at: Time.current
+    )[:rows].first
+    Timekeeping::LocalOwner::Receipt.create!(row.except("id"))
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+
+    colleague_context = Timekeeping::WriteContext.new(company:, actor: colleague, actor_kind: "user",
+                                                      request_id: SecureRandom.uuid, idempotency_key: client_key)
+    # Doubles with no allowed methods: any forwarded write or remote lookup fails the example.
+    gateway = described_class.new(context: colleague_context, write_client: instance_double(Timekeeping::EntryWriteClient),
+                                  read_client: instance_double(Timekeeping::EntryApiClient))
+
+    answer = gateway.create(
+      user: colleague, project:,
+      attributes: { duration: 30, work_date: Date.current, note: "Colleague's own note", bill_status: "unbilled" }
+    )
+
+    # "a key or operation id from another company or actor never matches"
+    expect(answer.user_id).to eq(colleague.id)
+    expect(answer.note).to eq("Colleague's own note")
+    expect(Timekeeping::LocalEntry.find(answer.id).user_id).to eq(colleague.id)
+    expect(Timekeeping::LocalOwner::Receipt.where(company_id: company.id, actor_id: colleague.id).pluck(:key))
+      .to eq([Timekeeping::EntryWriteClient.idempotency_key(request_id: client_key, operation: "create")])
+  end
+
+  it "more tests 12 a prepared-state retry of a committed legacy create is answered from its carried receipt and adds no entry, audit, outbox or receipt row", committed_data: true do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "admin")
+    client_key = "carried-prepared-retry-data"
+    attributes = { duration: 30, work_date: Date.current, note: "Carried into prepared", bill_status: "unbilled" }
+    context_for = lambda do |request_id|
+      Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id:, idempotency_key: client_key)
+    end
+
+    legacy = described_class.new(context: context_for.call("req-carried-data-1")).create(user:, project:, attributes:)
+    receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: legacy.id)
+    committed = TimesheetEntry.instantiate(receipt.entry_attributes)
+    entry_values = Timekeeping::LocalOwner::RESPONSE_FIELDS.index_with do |field|
+      Timekeeping::EntryOutbox.json_value(committed.read_attribute(field))
+    end
+    row = Timekeeping::LegacyCreateReceiptConversion.convert(
+      receipts: [receipt.attributes.except("entry_attributes").symbolize_keys.merge(entry_values:)],
+      captured_at: Time.current
+    )[:rows].first
+    Timekeeping::LocalOwner::Receipt.create!(row.except("id"))
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+    # Doubles with no allowed methods: any forwarded write or remote lookup fails the example.
+    gateway = described_class.new(
+      context: context_for.call("req-carried-data-2"),
+      write_client: instance_double(Timekeeping::EntryWriteClient),
+      read_client: instance_double(Timekeeping::EntryApiClient)
+    )
+    before_counts = timekeeping_row_counts
+    legacy_count = TimesheetEntry.count
+
+    # "In the prepared state, a retry of a committed legacy create with the same key and values is answered from its carried receipt and adds no entry, audit or outbox row"
+    replayed = gateway.create(user:, project:, attributes:)
+
+    expect(replayed.id).to eq(legacy.id)
+    expect(replayed.note).to eq("Carried into prepared")
+    expect(timekeeping_row_counts).to eq(before_counts)
+    expect(TimesheetEntry.count).to eq(legacy_count)
+  end
+
+  it "more tests 13 a prepared-state retry that reuses a carried legacy key with other values is refused as key reused and writes nothing", committed_data: true do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "admin")
+    client_key = "carried-prepared-reuse-data"
+    context_for = lambda do |request_id|
+      Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id:, idempotency_key: client_key)
+    end
+
+    legacy = described_class.new(context: context_for.call("req-carried-reuse-1")).create(
+      user:, project:, attributes: { duration: 30, work_date: Date.current, note: "First values", bill_status: "unbilled" }
+    )
+    receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: legacy.id)
+    committed = TimesheetEntry.instantiate(receipt.entry_attributes)
+    entry_values = Timekeeping::LocalOwner::RESPONSE_FIELDS.index_with do |field|
+      Timekeeping::EntryOutbox.json_value(committed.read_attribute(field))
+    end
+    row = Timekeeping::LegacyCreateReceiptConversion.convert(
+      receipts: [receipt.attributes.except("entry_attributes").symbolize_keys.merge(entry_values:)],
+      captured_at: Time.current
+    )[:rows].first
+    Timekeeping::LocalOwner::Receipt.create!(row.except("id"))
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+    gateway = described_class.new(
+      context: context_for.call("req-carried-reuse-2"),
+      write_client: instance_double(Timekeeping::EntryWriteClient),
+      read_client: instance_double(Timekeeping::EntryApiClient)
+    )
+    before_counts = timekeeping_row_counts
+    legacy_count = TimesheetEntry.count
+
+    # "The same key with different values is refused as key reused and writes nothing; an expired legacy receipt is not matched"
+    expect do
+      gateway.create(user:, project:, attributes: { duration: 45, work_date: Date.current, note: "Other values",
+                                                    bill_status: "unbilled" })
+    end.to raise_error(Timekeeping::EntryWriteClient::Rejected)
+
+    expect(timekeeping_row_counts).to eq(before_counts)
+    expect(TimesheetEntry.count).to eq(legacy_count)
+  end
+
+  it "more tests 14 a prepared-state retry matching a legacy receipt whose carried row is missing is refused and never writes a second entry", committed_data: true do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "admin")
+    client_key = "carried-row-missing-data"
+    attributes = { duration: 30, work_date: Date.current, note: "Committed once", bill_status: "unbilled" }
+    context_for = lambda do |request_id|
+      Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id:, idempotency_key: client_key)
+    end
+
+    described_class.new(context: context_for.call("req-carried-missing-1")).create(user:, project:, attributes:)
+    # The legacy receipt stays live, but no carried row was loaded into the prepared store.
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+    gateway = described_class.new(
+      context: context_for.call("req-carried-missing-2"),
+      write_client: instance_double(Timekeeping::EntryWriteClient),
+      read_client: instance_double(Timekeeping::EntryApiClient)
+    )
+    before_counts = timekeeping_row_counts
+    legacy_count = TimesheetEntry.count
+
+    # "A retry of a write stored under the other owner's receipt is refused or answered, never written a second time"
+    expect { gateway.create(user:, project:, attributes:) }.to raise_error(Timekeeping::EntryWriteClient::Error)
+
+    expect(timekeeping_row_counts).to eq(before_counts)
+    expect(TimesheetEntry.count).to eq(legacy_count)
+  end
+
+  it "more tests 15 a keyed prepared create is stored under the derived key and its retry under a new request id adds no rows", committed_data: true do
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "owner")
+    client_key = "derived-prepared-create-data"
+    attributes = { duration: 30, work_date: Date.current, note: "Derived key", bill_status: "unbilled" }
+    gateway_for = lambda do |request_id|
+      context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id:,
+                                              idempotency_key: client_key)
+      described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient),
+                                    read_client: instance_double(Timekeeping::EntryApiClient))
+    end
+
+    first = gateway_for.call("req-derived-data-1").create(user:, project:, attributes:)
+
+    # "Make `request_key` and `bulk_request_key` derive the key for new local writes with `EntryWriteClient.idempotency_key` / `.bulk_idempotency_key`, seeded by the client key."
+    derived = Timekeeping::EntryWriteClient.idempotency_key(request_id: client_key, operation: "create")
+    stored_keys = Timekeeping::LocalOwner::Receipt.where(company_id: company.id, actor_id: user.id).pluck(:key)
+    expect(stored_keys).to eq([derived])
+
+    after_first = timekeeping_row_counts
+    retried = gateway_for.call("req-derived-data-2").create(user:, project:, attributes:)
+
+    expect(retried.id).to eq(first.id)
+    expect(timekeeping_row_counts).to eq(after_first)
+  end
+
+  it "more tests 16 a raw-key prepared create receipt answers its retry in the prepared state and again after a re-cutover without forwarding or new rows", committed_data: true do
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "owner")
+    client_key = "raw-key-prepared-create-data"
+    attributes = { duration: 30, work_date: Date.current, note: "Raw key receipt", bill_status: "unbilled" }
+    # Doubles with no allowed methods: any forwarded write or remote lookup fails the example.
+    gateway_for = lambda do |request_id|
+      context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id:,
+                                              idempotency_key: client_key)
+      described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient),
+                                    read_client: instance_double(Timekeeping::EntryApiClient))
+    end
+
+    first = gateway_for.call("req-raw-data-1").create(user:, project:, attributes:)
+    # Stands for a receipt the prepared store wrote under the raw client key before this change.
+    Timekeeping::LocalOwner::Receipt.where(company_id: company.id, actor_id: user.id).update_all(key: client_key)
+    stored = timekeeping_row_counts
+    entry_count = TimesheetEntry.count
+
+    # "A prepared-store receipt written before this change under the raw client key still answers its retry with no new rows"
+    prepared_retry = gateway_for.call("req-raw-data-2").create(user:, project:, attributes:)
+    expect(prepared_retry.id).to eq(first.id)
+    expect(timekeeping_row_counts).to eq(stored)
+
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 3)
+
+    # "A retry of a write stored under the other owner's receipt is refused or answered, never written a second time"
+    recut_retry = gateway_for.call("req-raw-data-3").create(user:, project:, attributes:)
+    expect(recut_retry.id).to eq(first.id)
+    expect(timekeeping_row_counts).to eq(stored)
+    expect(TimesheetEntry.count).to eq(entry_count)
+  end
+
+  it "more tests 17 prepared retries across companies a prepared retry by another company's user with the same client key never receives the first company's carried entry", committed_data: true do
+    first_company = create(:company)
+    first_project = create(:project, billable: true, client: create(:client, company: first_company))
+    first_user = create(:user, current_workspace_id: first_company.id).tap do |member|
+      create(:employment, company: first_company, user: member)
+      member.add_role :admin, first_company
+    end
+    second_company = create(:company)
+    second_project = create(:project, billable: true, client: create(:client, company: second_company))
+    second_user = create(:user, current_workspace_id: second_company.id).tap do |member|
+      create(:employment, company: second_company, user: member)
+      member.add_role :admin, second_company
+    end
+    key = "tenant-carried-#{SecureRandom.hex(4)}"
+    attributes = { duration: 30, work_date: Date.current, note: "Tenant carried", bill_status: "unbilled" }
+
+    first_context = Timekeeping::WriteContext.new(company: first_company, actor: first_user, actor_kind: "user",
+                                                  request_id: SecureRandom.uuid, idempotency_key: key)
+    first_entry = described_class.new(context: first_context).create(user: first_user, project: first_project, attributes:)
+    receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: first_entry.id)
+    committed = TimesheetEntry.instantiate(receipt.entry_attributes)
+    entry_values = Timekeeping::LocalOwner::RESPONSE_FIELDS.index_with do |field|
+      Timekeeping::EntryOutbox.json_value(committed.read_attribute(field))
+    end
+    row = Timekeeping::LegacyCreateReceiptConversion.convert(
+      receipts: [receipt.attributes.except("entry_attributes").symbolize_keys.merge(entry_values:)],
+      captured_at: Time.current
+    )[:rows].first
+    Timekeeping::LocalOwner::Receipt.create!(row.except("id"))
+    # A real handoff moves the prepared entry ids past the legacy ones, so a new local entry never reuses one.
+    Timekeeping::Handoff::MonolithStore.new(connection: ActiveRecord::Base.connection)
+      .advance_entry_id_sequence(above: TimesheetEntry.maximum(:id))
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+    first_company_receipts = Timekeeping::LocalOwner::Receipt.where(company_id: first_company.id)
+      .order(:id).pluck(:key, :fingerprint, :body)
+
+    second_context = Timekeeping::WriteContext.new(company: second_company, actor: second_user, actor_kind: "user",
+                                                   request_id: SecureRandom.uuid, idempotency_key: key)
+    # Doubles with no allowed methods: any forwarded write or remote lookup fails the example.
+    gateway = described_class.new(context: second_context, write_client: instance_double(Timekeeping::EntryWriteClient),
+                                  read_client: instance_double(Timekeeping::EntryApiClient))
+
+    entry = gateway.create(user: second_user, project: second_project, attributes:)
+
+    # "Another company's user sending the same key never receives the first company's entry"
+    expect(entry.id).not_to eq(first_entry.id)
+    expect(entry.company_id).to eq(second_company.id)
+    expect(entry.user_id).to eq(second_user.id)
+    expect(Timekeeping::LocalOwner::Receipt.where(company_id: first_company.id).order(:id).pluck(:key, :fingerprint, :body))
+      .to eq(first_company_receipts)
+    # "Make `request_key` and `bulk_request_key` derive the key for new local writes with `EntryWriteClient.idempotency_key` / `.bulk_idempotency_key`, seeded by the client key."
+    stored = Timekeeping::LocalOwner::Receipt.where(company_id: second_company.id, actor_id: second_user.id)
+    expect(stored.pluck(:key)).to eq([Timekeeping::EntryWriteClient.idempotency_key(request_id: key, operation: "create")])
+  end
+
+  it "more tests 18 prepared retries across actors a prepared retry by a colleague in the same company with the same client key never receives the first user's carried entry", committed_data: true do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    first_user, colleague = Array.new(2) do
+      create(:user, current_workspace_id: company.id).tap do |member|
+        create(:employment, company:, user: member)
+        member.add_role :admin, company
+      end
+    end
+    key = "actor-carried-#{SecureRandom.hex(4)}"
+    attributes = { duration: 45, work_date: Date.current, note: "First user's private note", bill_status: "unbilled" }
+
+    first_context = Timekeeping::WriteContext.new(company:, actor: first_user, actor_kind: "user",
+                                                  request_id: SecureRandom.uuid, idempotency_key: key)
+    first_entry = described_class.new(context: first_context).create(user: first_user, project:, attributes:)
+    receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: first_entry.id)
+    committed = TimesheetEntry.instantiate(receipt.entry_attributes)
+    entry_values = Timekeeping::LocalOwner::RESPONSE_FIELDS.index_with do |field|
+      Timekeeping::EntryOutbox.json_value(committed.read_attribute(field))
+    end
+    row = Timekeeping::LegacyCreateReceiptConversion.convert(
+      receipts: [receipt.attributes.except("entry_attributes").symbolize_keys.merge(entry_values:)],
+      captured_at: Time.current
+    )[:rows].first
+    Timekeeping::LocalOwner::Receipt.create!(row.except("id"))
+    # A real handoff moves the prepared entry ids past the legacy ones, so a new local entry never reuses one.
+    Timekeeping::Handoff::MonolithStore.new(connection: ActiveRecord::Base.connection)
+      .advance_entry_id_sequence(above: TimesheetEntry.maximum(:id))
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+
+    colleague_context = Timekeeping::WriteContext.new(company:, actor: colleague, actor_kind: "user",
+                                                      request_id: SecureRandom.uuid, idempotency_key: key)
+    # Doubles with no allowed methods: any forwarded write or remote lookup fails the example.
+    gateway = described_class.new(context: colleague_context, write_client: instance_double(Timekeeping::EntryWriteClient),
+                                  read_client: instance_double(Timekeeping::EntryApiClient))
+
+    entry = gateway.create(user: colleague, project:, attributes:)
+
+    # contracts/timekeeping/idempotency.yml: "a key or operation id from another company or actor never matches"
+    expect(entry.id).not_to eq(first_entry.id)
+    expect(entry.user_id).to eq(colleague.id)
+    expect(entry.company_id).to eq(company.id)
+    # "Make `request_key` and `bulk_request_key` derive the key for new local writes with `EntryWriteClient.idempotency_key` / `.bulk_idempotency_key`, seeded by the client key."
+    stored = Timekeeping::LocalOwner::Receipt.where(company_id: company.id, actor_id: colleague.id)
+    expect(stored.pluck(:key)).to eq([Timekeeping::EntryWriteClient.idempotency_key(request_id: key, operation: "create")])
+  end
+
+  def carried_legacy_create_for_retry(company:, user:, project:, key:, attributes:)
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+      .update_columns(owner: "monolith", monolith_store: "legacy", generation: 1, handoff_step: nil)
+    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: SecureRandom.uuid,
+                                            idempotency_key: key)
+    entry = described_class.new(context:).create(user:, project:, attributes:)
+    receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: entry.id)
+    committed = TimesheetEntry.instantiate(receipt.entry_attributes)
+    entry_values = Timekeeping::LocalOwner::RESPONSE_FIELDS.index_with do |field|
+      Timekeeping::EntryOutbox.json_value(committed.read_attribute(field))
+    end
+    row = Timekeeping::LegacyCreateReceiptConversion.convert(
+      receipts: [receipt.attributes.except("entry_attributes").symbolize_keys.merge(entry_values:)],
+      captured_at: Time.current
+    )[:rows].first
+    Timekeeping::LocalOwner::Receipt.create!(row.except("id"))
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+      .update_columns(owner: "monolith", monolith_store: "prepared", generation: 2)
+    entry
+  end
+
+  def prepared_gateway_for_retry(company:, user:, key:)
+    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: SecureRandom.uuid,
+                                            idempotency_key: key)
+    # Doubles with no allowed methods: any forwarded write or remote lookup fails the example.
+    described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient),
+                                  read_client: instance_double(Timekeeping::EntryApiClient))
+  end
+
+  it "more tests 19 answers a prepared retry of a committed legacy create from its carried receipt and adds no entry, audit, outbox or receipt row", committed_data: true do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "admin", user: create(:user, current_workspace_id: company.id))
+    attributes = { duration: 30, work_date: Date.current, note: "Carried after rollback", bill_status: "unbilled" }
+    key = "carried-prepared-retry-match"
+    legacy = carried_legacy_create_for_retry(company:, user:, project:, key:, attributes:)
+    counts_before = timekeeping_row_counts
+
+    replayed = nil
+    # "In the prepared state, a retry of a committed legacy create with the same key and values is answered from its carried receipt and adds no entry, audit or outbox row"
+    expect do
+      replayed = prepared_gateway_for_retry(company:, user:, key:).create(user:, project:, attributes:)
+    end.not_to change(TimesheetEntry, :count)
+
+    expect(replayed.id).to eq(legacy.id)
+    expect(replayed.note).to eq("Carried after rollback")
+    expect(replayed.company_id).to eq(company.id)
+    expect(timekeeping_row_counts).to eq(counts_before)
+  end
+
+  def carried_legacy_create_for_reuse(company:, user:, project:, key:, attributes:)
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+      .update_columns(owner: "monolith", monolith_store: "legacy", generation: 1, handoff_step: nil)
+    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: SecureRandom.uuid,
+                                            idempotency_key: key)
+    entry = described_class.new(context:).create(user:, project:, attributes:)
+    receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: entry.id)
+    committed = TimesheetEntry.instantiate(receipt.entry_attributes)
+    entry_values = Timekeeping::LocalOwner::RESPONSE_FIELDS.index_with do |field|
+      Timekeeping::EntryOutbox.json_value(committed.read_attribute(field))
+    end
+    row = Timekeeping::LegacyCreateReceiptConversion.convert(
+      receipts: [receipt.attributes.except("entry_attributes").symbolize_keys.merge(entry_values:)],
+      captured_at: Time.current
+    )[:rows].first
+    Timekeeping::LocalOwner::Receipt.create!(row.except("id"))
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+      .update_columns(owner: "monolith", monolith_store: "prepared", generation: 2)
+    entry
+  end
+
+  it "more tests 20 refuses a prepared retry of a carried legacy create sent with other values as key reused and writes nothing", committed_data: true do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "admin", user: create(:user, current_workspace_id: company.id))
+    key = "carried-prepared-retry-reused"
+    carried_legacy_create_for_reuse(company:, user:, project:, key:,
+                                    attributes: { duration: 30, work_date: Date.current, note: "First values",
+                                                  bill_status: "unbilled" })
+    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: SecureRandom.uuid,
+                                            idempotency_key: key)
+    gateway = described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient),
+                                            read_client: instance_double(Timekeeping::EntryApiClient))
+    counts_before = timekeeping_row_counts
+
+    # "The same key with different values is refused as key reused and writes nothing; an expired legacy receipt is not matched"
+    expect do
+      expect do
+        gateway.create(user:, project:,
+                       attributes: { duration: 45, work_date: Date.current, note: "Other values", bill_status: "unbilled" })
+      end.to raise_error(Timekeeping::EntryWriteClient::Rejected)
+    end.not_to change(TimesheetEntry, :count)
+
+    expect(timekeeping_row_counts).to eq(counts_before)
+    expect(Timekeeping::LocalEntry.where(company_id: company.id, note: "Other values")).not_to exist
+  end
+
+  def carried_legacy_create_then_expire(company:, user:, project:, key:, attributes:)
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+      .update_columns(owner: "monolith", monolith_store: "legacy", generation: 1, handoff_step: nil)
+    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: SecureRandom.uuid,
+                                            idempotency_key: key)
+    entry = described_class.new(context:).create(user:, project:, attributes:)
+    receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: entry.id)
+    committed = TimesheetEntry.instantiate(receipt.entry_attributes)
+    entry_values = Timekeeping::LocalOwner::RESPONSE_FIELDS.index_with do |field|
+      Timekeeping::EntryOutbox.json_value(committed.read_attribute(field))
+    end
+    row = Timekeeping::LegacyCreateReceiptConversion.convert(
+      receipts: [receipt.attributes.except("entry_attributes").symbolize_keys.merge(entry_values:)],
+      captured_at: Time.current
+    )[:rows].first
+    Timekeeping::LocalOwner::Receipt.create!(row.except("id"))
+    Timekeeping::LegacyCreateReceipt.where(timesheet_entry_id: entry.id).update_all(expires_at: 1.minute.ago)
+    # A real handoff moves the prepared entry ids past the legacy ones, so a new local entry never reuses one.
+    Timekeeping::Handoff::MonolithStore.new(connection: ActiveRecord::Base.connection)
+      .advance_entry_id_sequence(above: TimesheetEntry.maximum(:id))
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+      .update_columns(owner: "monolith", monolith_store: "prepared", generation: 2)
+    entry
+  end
+
+  it "more tests 21 does not match an expired legacy receipt in the prepared state and stores the new create under the derived key", committed_data: true do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "admin", user: create(:user, current_workspace_id: company.id))
+    attributes = { duration: 30, work_date: Date.current, note: "Expired receipt", bill_status: "unbilled" }
+    key = "carried-prepared-retry-expired"
+    legacy = carried_legacy_create_then_expire(company:, user:, project:, key:, attributes:)
+    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: SecureRandom.uuid,
+                                            idempotency_key: key)
+    gateway = described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient),
+                                            read_client: instance_double(Timekeeping::EntryApiClient))
+    counts_before = timekeeping_row_counts
+
+    # "The same key with different values is refused as key reused and writes nothing; an expired legacy receipt is not matched"
+    created = gateway.create(user:, project:, attributes:)
+
+    expect(created.id).not_to eq(legacy.id)
+    expect(timekeeping_row_counts["entries"] - counts_before["entries"]).to eq(1)
+    derived_key = Timekeeping::EntryWriteClient.idempotency_key(request_id: key, operation: "create")
+    expect(Timekeeping::LocalOwner::Receipt.where(company_id: company.id, actor_id: user.id, key: derived_key).count)
+      .to eq(1)
+  end
+
+  it "more tests 22 refuses a prepared create whose carried legacy receipt matches but whose carried row is missing and writes nothing", committed_data: true do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "admin", user: create(:user, current_workspace_id: company.id))
+    attributes = { duration: 30, work_date: Date.current, note: "Carried row lost", bill_status: "unbilled" }
+    key = "carried-prepared-row-missing"
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+      .update_columns(owner: "monolith", monolith_store: "legacy", generation: 1, handoff_step: nil)
+    legacy_context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user",
+                                                   request_id: SecureRandom.uuid, idempotency_key: key)
+    described_class.new(context: legacy_context).create(user:, project:, attributes:)
+    # The legacy receipt stays; no carried idempotency_records row is seeded for it.
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+      .update_columns(owner: "monolith", monolith_store: "prepared", generation: 2)
+    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: SecureRandom.uuid,
+                                            idempotency_key: key)
+    gateway = described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient),
+                                            read_client: instance_double(Timekeeping::EntryApiClient))
+    counts_before = timekeeping_row_counts
+
+    # "A retry of a write stored under the other owner's receipt is refused or answered, never written a second time"
+    expect do
+      expect { gateway.create(user:, project:, attributes:) }.to raise_error(Timekeeping::EntryWriteClient::Error)
+    end.not_to change(TimesheetEntry, :count)
+
+    expect(timekeeping_row_counts).to eq(counts_before)
+  end
+
+  it "more tests 23 refuses a prepared retry when a receipt under the derived create key holds another fingerprint and writes nothing", committed_data: true do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "admin", user: create(:user, current_workspace_id: company.id))
+    key = "derived-key-other-fingerprint"
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+      .update_columns(owner: "monolith", monolith_store: "prepared", generation: 2, handoff_step: nil)
+    # Stands for a receipt the other owner stored under the derived key with its own fingerprint rule.
+    Timekeeping::LocalOwner::Receipt.create!(
+      company_id: company.id, actor_type: "user", actor_id: user.id, operation: "create ",
+      key: Timekeeping::EntryWriteClient.idempotency_key(request_id: key, operation: "create"),
+      fingerprint: Digest::SHA256.hexdigest("another owner's request body"), status: 201,
+      body: JSON.generate({ "id" => 987_654, "company_id" => company.id, "user_id" => user.id }), created_at: Time.current
+    )
+    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: SecureRandom.uuid,
+                                            idempotency_key: key)
+    gateway = described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient),
+                                            read_client: instance_double(Timekeeping::EntryApiClient))
+    counts_before = timekeeping_row_counts
+
+    # "Keep each owner's fingerprint rule. A cross-owner fingerprint mismatch then answers the existing key-reused refusal instead of writing again."
+    expect do
+      expect do
+        gateway.create(user:, project:,
+                       attributes: { duration: 30, work_date: Date.current, note: "Cross owner", bill_status: "unbilled" })
+      end.to raise_error(Timekeeping::EntryWriteClient::Rejected)
+    end.not_to change(TimesheetEntry, :count)
+
+    expect(timekeeping_row_counts).to eq(counts_before)
+  end
+
+  it "more tests 24 stores a new keyed prepared create under the derived key and replays its retry under a new request id with no new rows", committed_data: true do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "admin", user: create(:user, current_workspace_id: company.id))
+    attributes = { duration: 30, work_date: Date.current, note: "Derived key create", bill_status: "unbilled" }
+    key = "prepared-derived-key-create"
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+      .update_columns(owner: "monolith", monolith_store: "prepared", generation: 2, handoff_step: nil)
+    build_gateway = lambda do
+      context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: SecureRandom.uuid,
+                                              idempotency_key: key)
+      described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient),
+                                    read_client: instance_double(Timekeeping::EntryApiClient))
+    end
+
+    first = build_gateway.call.create(user:, project:, attributes:)
+
+    # "Make `request_key` and `bulk_request_key` derive the key for new local writes with `EntryWriteClient.idempotency_key` / `.bulk_idempotency_key`, seeded by the client key."
+    derived_key = Timekeeping::EntryWriteClient.idempotency_key(request_id: key, operation: "create")
+    receipts = Timekeeping::LocalOwner::Receipt.where(company_id: company.id, actor_id: user.id)
+    expect(receipts.pluck(:key)).to eq([derived_key])
+
+    counts_before = timekeeping_row_counts
+    replayed = build_gateway.call.create(user:, project:, attributes:)
+
+    expect(replayed.id).to eq(first.id)
+    expect(timekeeping_row_counts).to eq(counts_before)
+    expect(Timekeeping::LocalEntry.where(company_id: company.id, note: "Derived key create").count).to eq(1)
+  end
+
+  it "more tests 25 answers a raw-key prepared create receipt in the prepared state and again after a re-cutover without forwarding", committed_data: true do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "admin", user: create(:user, current_workspace_id: company.id))
+    attributes = { duration: 30, work_date: Date.current, note: "Raw key receipt", bill_status: "unbilled" }
+    client_key = "prepared-raw-key-receipt"
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+      .update_columns(owner: "monolith", monolith_store: "prepared", generation: 2, handoff_step: nil)
+    # Doubles with no allowed methods: any forwarded write or remote lookup fails the example.
+    build_gateway = lambda do
+      context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: SecureRandom.uuid,
+                                              idempotency_key: client_key)
+      described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient),
+                                    read_client: instance_double(Timekeeping::EntryApiClient))
+    end
+    first = build_gateway.call.create(user:, project:, attributes:)
+    # Stands for a receipt the prepared store wrote before this change, under the raw client key.
+    Timekeeping::LocalOwner::Receipt.where(company_id: company.id, actor_id: user.id).update_all(key: client_key)
+    counts_before = timekeeping_row_counts
+
+    # "A prepared-store receipt written before this change under the raw client key still answers its retry with no new rows"
+    in_prepared = build_gateway.call.create(user:, project:, attributes:)
+    expect(in_prepared.id).to eq(first.id)
+    expect(timekeeping_row_counts).to eq(counts_before)
+
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 3)
+
+    # "A retry of a write stored under the other owner's receipt is refused or answered, never written a second time"
+    after_recutover = build_gateway.call.create(user:, project:, attributes:)
+    expect(after_recutover.id).to eq(first.id)
+    expect(after_recutover.note).to eq("Raw key receipt")
+    expect(timekeeping_row_counts).to eq(counts_before)
+  end
+
+  it "more tests 26 gives another company's user who sends the same key a new entry of their own and never the first company's carried entry", committed_data: true do
+    first_company = create(:company)
+    first_project = create(:project, billable: true, client: create(:client, company: first_company))
+    first_user = timekeeping_member(first_company, "admin", user: create(:user, current_workspace_id: first_company.id))
+    other_company = create(:company)
+    other_project = create(:project, billable: true, client: create(:client, company: other_company))
+    other_user = timekeeping_member(other_company, "admin", user: create(:user, current_workspace_id: other_company.id))
+    attributes = { duration: 30, work_date: Date.current, note: "Shared key values", bill_status: "unbilled" }
+    key = "carried-shared-key-two-companies"
+
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+      .update_columns(owner: "monolith", monolith_store: "legacy", generation: 1, handoff_step: nil)
+    legacy_context = Timekeeping::WriteContext.new(company: first_company, actor: first_user, actor_kind: "user",
+                                                   request_id: SecureRandom.uuid, idempotency_key: key)
+    legacy = described_class.new(context: legacy_context).create(user: first_user, project: first_project, attributes:)
+    receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: legacy.id)
+    committed = TimesheetEntry.instantiate(receipt.entry_attributes)
+    entry_values = Timekeeping::LocalOwner::RESPONSE_FIELDS.index_with do |field|
+      Timekeeping::EntryOutbox.json_value(committed.read_attribute(field))
+    end
+    row = Timekeeping::LegacyCreateReceiptConversion.convert(
+      receipts: [receipt.attributes.except("entry_attributes").symbolize_keys.merge(entry_values:)],
+      captured_at: Time.current
+    )[:rows].first
+    Timekeeping::LocalOwner::Receipt.create!(row.except("id"))
+    # A real handoff moves the prepared entry ids past the legacy ones, so a new local entry never reuses one.
+    Timekeeping::Handoff::MonolithStore.new(connection: ActiveRecord::Base.connection)
+      .advance_entry_id_sequence(above: TimesheetEntry.maximum(:id))
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+      .update_columns(owner: "monolith", monolith_store: "prepared", generation: 2)
+    first_company_receipts = Timekeeping::LocalOwner::Receipt.where(company_id: first_company.id).pluck(:id, :key, :fingerprint)
+
+    context = Timekeeping::WriteContext.new(company: other_company, actor: other_user, actor_kind: "user",
+                                            request_id: SecureRandom.uuid, idempotency_key: key)
+    gateway = described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient),
+                                            read_client: instance_double(Timekeeping::EntryApiClient))
+
+    # "Another company's user sending the same key never receives the first company's entry"
+    created = gateway.create(user: other_user, project: other_project, attributes:)
+
+    expect(created.id).not_to eq(legacy.id)
+    expect(created.company_id).to eq(other_company.id)
+    expect(created.user_id).to eq(other_user.id)
+    derived_key = Timekeeping::EntryWriteClient.idempotency_key(request_id: key, operation: "create")
+    expect(Timekeeping::LocalOwner::Receipt.where(company_id: other_company.id, actor_id: other_user.id).pluck(:key))
+      .to eq([derived_key])
+    expect(Timekeeping::LocalOwner::Receipt.where(company_id: first_company.id).pluck(:id, :key, :fingerprint))
+      .to eq(first_company_receipts)
+  end
+
+  it "more tests 27 stores a keyed prepared bulk delete under the derived bulk key and replays its retry under a new request id with no new rows" do
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+    entries = Array.new(2) do |index|
+      Timekeeping::LocalEntry.create!(
+        company_id: prepared_company.id, user_id: prepared_user.id, project_id: prepared_project.id,
+        work_date: Date.current, duration: 30.0, note: "bulk derived #{index}", bill_status: "unbilled"
+      )
+    end
+    ids = entries.map(&:id).sort
+    client_key = "k-bulk-derived-#{SecureRandom.hex(4)}"
+    gateway_for = lambda do |request_id|
+      context = Timekeeping::WriteContext.new(company: prepared_company, actor: prepared_user, actor_kind: "user",
+                                              request_id:, idempotency_key: client_key)
+      # Doubles with no allowed methods: any forwarded write or remote lookup fails the example.
+      described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient),
+                                    read_client: instance_double(Timekeeping::EntryApiClient))
+    end
+
+    first = gateway_for.call("req-bulk-derived-1")
+      .bulk_delete(entry_ids: ids.reverse, check: ->(_entries) { nil }, expected_generation: 2)
+
+    # "Make `request_key` and `bulk_request_key` derive the key for new local writes with `EntryWriteClient.idempotency_key` / `.bulk_idempotency_key`, seeded by the client key."
+    stored_keys = Timekeeping::LocalOwner::Receipt
+      .where(company_id: prepared_company.id, actor_id: prepared_user.id, operation: "bulk_delete ").pluck(:key)
+    expect(stored_keys).to eq(
+      [Timekeeping::EntryWriteClient.bulk_idempotency_key(request_id: client_key, operation: "bulk_delete", entry_ids: ids)]
+    )
+    expect(stored_keys).not_to include(client_key)
+    after_first = timekeeping_row_counts
+
+    second = gateway_for.call("req-bulk-derived-2")
+      .bulk_delete(entry_ids: ids, check: ->(_entries) { :refused_on_retry }, expected_generation: 2)
+
+    expect([first.written, second.written]).to eq([true, true])
+    expect(second.refusal).to be_nil
+    expect(timekeeping_row_counts).to eq(after_first)
+  end
+
+  it "more tests 28 refuses a prepared retry of a committed legacy create whose carried row is missing and writes nothing", committed_data: true do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "admin")
+    client_key = "missing-carried-row-key"
+    attributes = { duration: 30, work_date: Date.current, note: "Committed in legacy", bill_status: "unbilled" }
+    legacy_context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user",
+                                                   request_id: SecureRandom.uuid, idempotency_key: client_key)
+    described_class.new(context: legacy_context).create(user:, project:, attributes:)
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+    retry_context = legacy_context.with(request_id: SecureRandom.uuid)
+    gateway = described_class.new(
+      context: retry_context, write_client: instance_double(Timekeeping::EntryWriteClient),
+      read_client: instance_double(Timekeeping::EntryApiClient)
+    )
+    rows_before = timekeeping_row_counts
+    legacy_before = TimesheetEntry.count
+
+    # "A retry of a write stored under the other owner's receipt is refused or answered, never written a second time"
+    # The legacy receipt proves the create committed; with no carried row to answer from, the retry must not write.
+    expect { gateway.create(user:, project:, attributes:) }.to raise_error(Timekeeping::EntryWriteClient::Error)
+    expect(timekeeping_row_counts).to eq(rows_before)
+    expect(TimesheetEntry.count).to eq(legacy_before)
+  end
+
+  it "more tests 29 refuses a prepared retry whose derived-key receipt has another fingerprint without falling through to the raw-key receipt or a write", committed_data: true do
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "admin")
+    client_key = "derived-mismatch-key"
+    attributes = { duration: 30, work_date: Date.current, note: "First prepared create", bill_status: "unbilled" }
+    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user",
+                                            request_id: SecureRandom.uuid, idempotency_key: client_key)
+    described_class.new(context:).create(user:, project:, attributes:)
+    derived_key = Timekeeping::EntryWriteClient.idempotency_key(request_id: client_key, operation: "create")
+    derived = Timekeeping::LocalOwner::Receipt.find_by!(company_id: company.id, actor_id: user.id, key: derived_key)
+    # A matching receipt under the raw key: a lookup that treated the derived-key refusal as a miss would answer from it.
+    Timekeeping::LocalOwner::Receipt.create!(derived.attributes.except("id").merge("key" => client_key))
+    # The derived-key receipt now stands for one the other owner stored with its own fingerprint rule.
+    derived.update_columns(fingerprint: "0" * 64)
+    gateway = described_class.new(
+      context: context.with(request_id: SecureRandom.uuid), write_client: instance_double(Timekeeping::EntryWriteClient),
+      read_client: instance_double(Timekeeping::EntryApiClient)
+    )
+    rows_before = timekeeping_row_counts
+
+    # "A cross-owner fingerprint mismatch then answers the existing key-reused refusal instead of writing again."
+    expect { gateway.create(user:, project:, attributes:) }.to raise_error(Timekeeping::EntryWriteClient::Rejected)
+    expect(timekeeping_row_counts).to eq(rows_before)
+  end
+
+  it "more tests 30 answers or refuses a create retried after a re-cutover from its pre-change raw-key prepared receipt and forwards nothing", committed_data: true do
+    ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+    ownership.update_columns(monolith_store: "prepared", generation: 2)
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "admin")
+    client_key = "recutover-raw-create-key"
+    attributes = { duration: 30, work_date: Date.current, note: "Before the re-cutover", bill_status: "unbilled" }
+    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user",
+                                            request_id: SecureRandom.uuid, idempotency_key: client_key)
+    first = described_class.new(context:).create(user:, project:, attributes:)
+    # Stands for a receipt the prepared store wrote before this change, under the raw client key.
+    Timekeeping::LocalOwner::Receipt.where(company_id: company.id, actor_id: user.id, operation: "create ")
+      .update_all(key: client_key)
+    ownership.update_columns(owner: "timekeeping", generation: 3)
+    retry_gateway = lambda do
+      described_class.new(
+        context: context.with(request_id: SecureRandom.uuid), write_client: instance_double(Timekeeping::EntryWriteClient),
+        read_client: instance_double(Timekeeping::EntryApiClient)
+      )
+    end
+    rows_before = timekeeping_row_counts
+
+    # "A retry of a write stored under the other owner's receipt is refused or answered, never written a second time"
+    replayed = retry_gateway.call.create(user:, project:, attributes:)
+    expect(replayed.id).to eq(first.id)
+    expect do
+      retry_gateway.call.create(user:, project:, attributes: attributes.merge(note: "Other values"))
+    end.to raise_error(Timekeeping::EntryWriteClient::Rejected)
+    expect(timekeeping_row_counts).to eq(rows_before)
+  end
+
+  it "more tests 31 answers a bulk delete retried after a re-cutover from its pre-change raw-key prepared receipt as a bulk result and forwards nothing", committed_data: true do
+    ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+    ownership.update_columns(monolith_store: "prepared", generation: 2)
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "admin")
+    stored = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: user.id, project_id: project.id,
+                                             work_date: Date.current, duration: 30.0, note: "to delete",
+                                             bill_status: "unbilled")
+    client_key = "recutover-raw-bulk-delete-key"
+    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user",
+                                            request_id: SecureRandom.uuid, idempotency_key: client_key)
+    first = described_class.new(context:)
+      .bulk_delete(entry_ids: [stored.id], check: ->(_entries) { }, expected_generation: 2)
+    expect(first.written).to be(true)
+    # Stands for a receipt the prepared store wrote before this change, under the raw client key.
+    Timekeeping::LocalOwner::Receipt.where(company_id: company.id, actor_id: user.id, operation: "bulk_delete ")
+      .update_all(key: client_key)
+    ownership.update_columns(owner: "timekeeping", generation: 3)
+    read_client = instance_double(Timekeeping::EntryApiClient)
+    allow(read_client).to receive(:show_entry)
+      .and_raise(ActiveRecord::RecordNotFound.new("Couldn't find TimesheetEntry", "TimesheetEntry"))
+    gateway = described_class.new(context: context.with(request_id: SecureRandom.uuid),
+                                  write_client: instance_double(Timekeeping::EntryWriteClient), read_client:)
+    rows_before = timekeeping_row_counts
+
+    # "A prepared-store receipt written before this change under the raw client key still answers its retry with no new rows"
+    result = gateway.bulk_delete(entry_ids: [stored.id], check: ->(_entries) { }, expected_generation: 3)
+
+    expect(result.written).to be(true)
+    expect(result.refusal).to be_nil
+    # Timekeeping's lookup no longer finds the deleted entry, so the replayed answer lists none.
+    expect(result.entries).to eq([])
+    expect(timekeeping_row_counts).to eq(rows_before)
+  end
+
+  it "more tests 32 raw-key bulk move receipt across a re-cutover answers a bulk move retried after a re-cutover from its pre-change raw-key prepared receipt as a bulk result and forwards nothing", committed_data: true do
+    company = create(:company)
+    client = create(:client, company:)
+    source = create(:project, billable: true, client:)
+    target = create(:project, billable: true, client:)
+    admin = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    entries = Array.new(2) do
+      Timekeeping::LocalEntry.create!(company_id: company.id, user_id: admin.id, project_id: source.id,
+                                      work_date: Date.current, duration: 30.0, note: "raw bulk move",
+                                      bill_status: "unbilled")
+    end
+    ids = entries.map(&:id)
+    client_key = "raw-bulk-move-key-#{SecureRandom.hex(4)}"
+    ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+    ownership.update_columns(monolith_store: "prepared", generation: 2)
+    # Timekeeping's lookup answers the entries as the move left them; the write client allows no call.
+    read_client = instance_double(Timekeeping::EntryApiClient)
+    allow(read_client).to receive(:show_entry) do |entry_id:, **|
+      timekeeping_show_answer_for(Timekeeping::LocalEntry.find(entry_id))
+    end
+    gateway_for = lambda do
+      context = Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user",
+                                              request_id: SecureRandom.uuid, idempotency_key: client_key)
+      described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient), read_client:)
+    end
+
+    first = gateway_for.call.bulk_move(entry_ids: ids, project: target, check: ->(_entries) { },
+                                       expected_generation: 2)
+    expect(first.written).to be(true)
+    # Stands for a receipt the prepared store wrote under the raw client key before this change.
+    Timekeeping::LocalOwner::Receipt.where(company_id: company.id, actor_id: admin.id)
+      .where("operation LIKE ?", "bulk_move%").update_all(key: client_key)
+    after_first = timekeeping_row_counts
+    timesheet_entries_before = TimesheetEntry.count
+
+    # "A prepared-store receipt written before this change under the raw client key still answers its retry with no new rows"
+    prepared_retry = gateway_for.call.bulk_move(entry_ids: ids, project: target, check: ->(_entries) { },
+                                                expected_generation: 2)
+    expect(prepared_retry.written).to be(true)
+    expect(timekeeping_row_counts).to eq(after_first)
+
+    ownership.update_columns(owner: "timekeeping", generation: 3)
+
+    # "A retry of a write stored under the other owner's receipt is refused or answered, never written a second time"
+    # The write client is a double with no allowed methods, so a forward to Timekeeping fails the example.
+    recut_retry = gateway_for.call.bulk_move(entry_ids: ids, project: target, check: ->(_entries) { },
+                                             expected_generation: 3)
+    expect(recut_retry).to be_a(Timekeeping::Gateway::BulkResult)
+    expect(recut_retry.refusal).to be_nil
+    expect(recut_retry.written).to be(true)
+    # The replayed answer carries the moved entries, as the first answer did.
+    expect(recut_retry.entries.map(&:id)).to match_array(ids)
+    expect(recut_retry.entries.map(&:project_id)).to all(eq(target.id))
+    expect(timekeeping_row_counts).to eq(after_first)
+    expect(TimesheetEntry.count).to eq(timesheet_entries_before)
+    expect(Timekeeping::LocalEntry.where(id: ids).pluck(:project_id)).to all(eq(target.id))
+  end
+
+  # The entry API's show answer for a stored entry, as Timekeeping would send it once it owns the entries.
+  def timekeeping_show_answer_for(entry)
+    Timekeeping::LocalOwner::RESPONSE_FIELDS.index_with do |field|
+      Timekeeping::EntryOutbox.json_value(field == "locked" ? false : entry.read_attribute(field))
+    end
+  end
+
+  def raw_key_retry_gateway(company:, user:, client_key:)
+    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user",
+                                            request_id: SecureRandom.uuid, idempotency_key: client_key)
+    # Doubles with no allowed methods: any forward or remote lookup fails the example.
+    described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient),
+                        read_client: instance_double(Timekeeping::EntryApiClient))
+  end
+
+  it "answers or refuses an update retried after a re-cutover from its pre-change raw-key prepared receipt and forwards nothing",
+     committed_data: true do
+    ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+    ownership.update_columns(monolith_store: "prepared", generation: 2)
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "admin")
+    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: user.id, project_id: project.id,
+                                            work_date: Date.current, duration: 30.0, note: "before",
+                                            bill_status: "unbilled")
+    client_key = "recutover-raw-update-key-#{SecureRandom.hex(4)}"
+    update = lambda do |note|
+      raw_key_retry_gateway(company:, user:, client_key:).update(
+        entry_id: entry.id.to_s, project:, attributes: { note: }, authorize: ->(_entry) { true },
+        expected_generation: ownership.reload.generation
+      )
+    end
+    expect(update.call("after").note).to eq("after")
+    # Stands for a receipt the prepared store wrote before this change, under the raw client key.
+    Timekeeping::LocalOwner::Receipt.where(company_id: company.id, actor_id: user.id, operation: "update #{entry.id}")
+      .update_all(key: client_key)
+    ownership.update_columns(owner: "timekeeping", generation: 3)
+    rows_before = timekeeping_row_counts
+
+    # "A retry of a write stored under the other owner's receipt is refused or answered, never written a second time"
+    replayed = update.call("after")
+    expect([replayed.id, replayed.note]).to eq([entry.id, "after"])
+    expect { update.call("other values") }.to raise_error(Timekeeping::EntryWriteClient::Rejected)
+    expect(timekeeping_row_counts).to eq(rows_before)
+  end
+
+  it "answers a destroy retried after a re-cutover from its pre-change raw-key prepared receipt and forwards nothing",
+     committed_data: true do
+    ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+    ownership.update_columns(monolith_store: "prepared", generation: 2)
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "admin")
+    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: user.id, project_id: project.id,
+                                            work_date: Date.current, duration: 30.0, note: "to discard",
+                                            bill_status: "unbilled")
+    client_key = "recutover-raw-destroy-key-#{SecureRandom.hex(4)}"
+    authorized = []
+    destroy = lambda do
+      raw_key_retry_gateway(company:, user:, client_key:).destroy(
+        entry_id: entry.id.to_s, authorize: ->(found) { authorized << found.id },
+        expected_generation: ownership.reload.generation
+      )
+    end
+    expect(destroy.call).to be(true)
+    # Stands for a receipt the prepared store wrote before this change, under the raw client key.
+    Timekeeping::LocalOwner::Receipt.where(company_id: company.id, actor_id: user.id, operation: "destroy #{entry.id}")
+      .update_all(key: client_key)
+    ownership.update_columns(owner: "timekeeping", generation: 3)
+    rows_before = timekeeping_row_counts
+
+    # "A retry of a write stored under the other owner's receipt is refused or answered, never written a second time"
+    expect(destroy.call).to be(true)
+    expect(authorized).to eq([entry.id, entry.id])
+    expect(timekeeping_row_counts).to eq(rows_before)
+  end
+
+  it "answers a prepared bulk delete retry that named a missing id from the receipt of its first attempt", committed_data: true do
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = timekeeping_member(company, "admin")
+    entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: user.id, project_id: project.id,
+                                            work_date: Date.current, duration: 30.0, note: "to delete",
+                                            bill_status: "unbilled")
+    missing_id = entry.id + 1_000_000
+    client_key = "prepared-bulk-missing-id-key-#{SecureRandom.hex(4)}"
+    bulk_delete = lambda do
+      raw_key_retry_gateway(company:, user:, client_key:)
+        .bulk_delete(entry_ids: [entry.id, missing_id], check: ->(_entries) { }, expected_generation: 2)
+    end
+
+    expect(bulk_delete.call.written).to be(true)
+    rows_after_first = timekeeping_row_counts
+
+    # "A retry of a write stored under the other owner's receipt is refused or answered, never written a second time"
+    retried = bulk_delete.call
+    expect(retried.written).to be(true)
+    expect(retried.refusal).to be_nil
+    expect(timekeeping_row_counts).to eq(rows_after_first)
+  end
+
+  it "answers a partly skipped prepared bulk move retry from its first receipt after the movable entries change", committed_data: true do
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+    company = create(:company)
+    client = create(:client, company:)
+    source = create(:project, billable: true, client:)
+    non_billable_target = create(:project, billable: false, client:)
+    user = timekeeping_member(company, "admin")
+    movable, skipped = %w[non_billable unbilled].map do |bill_status|
+      Timekeeping::LocalEntry.create!(company_id: company.id, user_id: user.id, project_id: source.id,
+                                      work_date: Date.current, duration: 30.0, note: "partial move", bill_status:)
+    end
+    client_key = "prepared-partial-bulk-move-key-#{SecureRandom.hex(4)}"
+    bulk_move = lambda do
+      raw_key_retry_gateway(company:, user:, client_key:)
+        .bulk_move(entry_ids: [movable.id, skipped.id], project: non_billable_target, check: ->(_entries) { },
+                   expected_generation: 2)
+    end
+
+    expect(bulk_move.call.written).to be(true)
+    expect(skipped.reload.project_id).to eq(source.id)
+    # An edit made after the first attempt: the moved entry goes back, and the skipped one becomes movable.
+    movable.update_columns(project_id: source.id)
+    skipped.update_columns(bill_status: "non_billable")
+    rows_after_edit = timekeeping_row_counts
+
+    # "A retry of a write stored under the other owner's receipt is refused or answered, never written a second time"
+    retried = bulk_move.call
+    expect(retried.written).to be(true)
+    expect(timekeeping_row_counts).to eq(rows_after_edit)
+    expect([movable.reload.project_id, skipped.reload.project_id]).to eq([source.id, source.id])
+  end
+
+  it "answers a partial prepared bulk move retried after a re-cutover from its receipt and forwards nothing", committed_data: true do
+    ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+    ownership.update_columns(monolith_store: "prepared", generation: 2)
+    company = create(:company)
+    client = create(:client, company:)
+    source = create(:project, billable: true, client:)
+    target = create(:project, billable: true, client:)
+    user = timekeeping_member(company, "admin")
+    live = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: user.id, project_id: source.id,
+                                           work_date: Date.current, duration: 30.0, note: "partial handoff",
+                                           bill_status: "unbilled")
+    missing_id = live.id + 1_000_000
+    client_key = "partial-bulk-move-recutover-#{SecureRandom.hex(4)}"
+    read_client = instance_double(Timekeeping::EntryApiClient)
+    allow(read_client).to receive(:show_entry) do |entry_id:, **|
+      found = Timekeeping::LocalEntry.find_by(id: entry_id)
+      raise ActiveRecord::RecordNotFound.new("Couldn't find TimesheetEntry", "TimesheetEntry") if found.nil?
+
+      timekeeping_show_answer_for(found)
+    end
+    bulk_move = lambda do
+      context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user",
+                                              request_id: SecureRandom.uuid, idempotency_key: client_key)
+      described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient), read_client:)
+        .bulk_move(entry_ids: [live.id, missing_id], project: target, check: ->(_entries) { },
+                   expected_generation: ownership.reload.generation)
+    end
+    expect(bulk_move.call.written).to be(true)
+    ownership.update_columns(owner: "timekeeping", generation: 3)
+    # An edit made after the first attempt moves the entry back.
+    live.update_columns(project_id: source.id)
+    rows_before = timekeeping_row_counts
+
+    # "A retry of a write stored under the other owner's receipt is refused or answered, never written a second time"
+    retried = bulk_move.call
+    expect(retried.written).to be(true)
+    expect(timekeeping_row_counts).to eq(rows_before)
+    expect(live.reload.project_id).to eq(source.id)
+  end
+
+  it "refuses a partial prepared bulk move whose forwarded receipt a rollback carried in under the sent-ids key",
+     committed_data: true do
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+    company = create(:company)
+    client = create(:client, company:)
+    source = create(:project, billable: true, client:)
+    target = create(:project, billable: true, client:)
+    user = timekeeping_member(company, "admin")
+    live = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: user.id, project_id: source.id,
+                                           work_date: Date.current, duration: 30.0, note: "forwarded move",
+                                           bill_status: "unbilled")
+    missing_id = live.id + 1_000_000
+    client_key = "forwarded-partial-bulk-move-#{SecureRandom.hex(4)}"
+    # Stands for the receipt Timekeeping stored for the forwarded move of the one found entry, carried in by a
+    # rollback: keyed over the ids it sent, and fingerprinted over the body it received.
+    forwarded_body = { "entry_ids" => [live.id], "project_id" => target.id }
+    Timekeeping::LocalOwner::Receipt.create!(
+      company_id: company.id, actor_type: "user", actor_id: user.id, operation: "bulk_move ",
+      key: Timekeeping::EntryWriteClient.bulk_idempotency_key(request_id: client_key, operation: "bulk_move",
+                                                               entry_ids: [live.id]),
+      fingerprint: Digest::SHA256.hexdigest(JSON.generate(forwarded_body)), status: 200,
+      body: JSON.generate({ "results" => [{ "entry_id" => live.id, "result" => "moved" }] }), created_at: Time.current
+    )
+    context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user",
+                                            request_id: SecureRandom.uuid, idempotency_key: client_key)
+    gateway = described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient),
+                                  read_client: instance_double(Timekeeping::EntryApiClient))
+    rows_before = timekeeping_row_counts
+
+    # "A retry of a write stored under the other owner's receipt is refused or answered, never written a second time"
+    expect do
+      gateway.bulk_move(entry_ids: [live.id, missing_id], project: target, check: ->(_entries) { },
+                        expected_generation: 2)
+    end.to raise_error(Timekeeping::EntryWriteClient::Rejected)
+    expect(timekeeping_row_counts).to eq(rows_before)
+    expect(live.reload.project_id).to eq(source.id)
+  end
+
+  # Stands for the receipt Timekeeping stored for a forwarded bulk write of sent_ids, carried in by a rollback:
+  # keyed over the ids it sent, fingerprinted over the body it received, answering each sent id.
+  def carry_forwarded_bulk_receipt(company:, user:, client_key:, operation:, sent_ids:, body:, result:)
+    Timekeeping::LocalOwner::Receipt.create!(
+      company_id: company.id, actor_type: "user", actor_id: user.id, operation: "#{operation} ",
+      key: Timekeeping::EntryWriteClient.bulk_idempotency_key(request_id: client_key, operation: operation.to_s,
+                                                               entry_ids: sent_ids),
+      fingerprint: Digest::SHA256.hexdigest(JSON.generate(body)), status: 200,
+      body: JSON.generate({ "results" => sent_ids.map { |id| { "entry_id" => id, "result" => result } } }),
+      created_at: Time.current
+    )
+  end
+
+  it "refuses a carried partial bulk move retry after a skipped entry becomes movable and leaves the later edits",
+     committed_data: true do
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+    company = create(:company)
+    client = create(:client, company:)
+    source = create(:project, billable: true, client:)
+    target = create(:project, billable: false, client:)
+    user = timekeeping_member(company, "admin")
+    moved = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: user.id, project_id: target.id,
+                                            work_date: Date.current, duration: 30.0, note: "previously moved",
+                                            bill_status: "non_billable")
+    skipped = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: user.id, project_id: source.id,
+                                              work_date: Date.current, duration: 30.0, note: "previously skipped",
+                                              bill_status: "unbilled")
+    client_key = "carried-growing-subset-#{SecureRandom.hex(4)}"
+    carry_forwarded_bulk_receipt(company:, user:, client_key:, operation: :bulk_move, sent_ids: [moved.id],
+                                 body: { "entry_ids" => [moved.id], "project_id" => target.id }, result: "moved")
+    # Later edits: the moved entry goes back, and the skipped one becomes movable.
+    moved.update_columns(project_id: source.id)
+    skipped.update_columns(bill_status: "non_billable")
+    gateway = raw_key_retry_gateway(company:, user:, client_key:)
+    rows_before = timekeeping_row_counts
+
+    # "A retry of a write stored under the other owner's receipt is refused or answered, never written a second time"
+    expect do
+      gateway.bulk_move(entry_ids: [moved.id, skipped.id], project: target, check: ->(_entries) { },
+                        expected_generation: 2)
+    end.to raise_error(Timekeeping::EntryWriteClient::Rejected)
+    expect(timekeeping_row_counts).to eq(rows_before)
+    expect([moved.reload, skipped.reload].map { |entry| [entry.project_id, entry.version] })
+      .to eq([[source.id, moved.version], [source.id, skipped.version]])
+  end
+
+  it "refuses a carried bulk delete retry whose sent entries are gone, even though nothing is found to delete",
+     committed_data: true do
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+    company = create(:company)
+    user = timekeeping_member(company, "admin")
+    deleted_id = 9_400_001
+    missing_id = 9_400_002
+    client_key = "carried-emptied-subset-#{SecureRandom.hex(4)}"
+    carry_forwarded_bulk_receipt(company:, user:, client_key:, operation: :bulk_delete, sent_ids: [deleted_id],
+                                 body: { "entry_ids" => [deleted_id] }, result: "deleted")
+    gateway = raw_key_retry_gateway(company:, user:, client_key:)
+    rows_before = timekeeping_row_counts
+
+    # "A retry of a write stored under the other owner's receipt is refused or answered, never written a second time"
+    expect do
+      gateway.bulk_delete(entry_ids: [deleted_id, missing_id], check: ->(_entries) { }, expected_generation: 2)
+    end.to raise_error(Timekeeping::EntryWriteClient::Rejected)
+    expect(timekeeping_row_counts).to eq(rows_before)
+  end
+
   context "more tests 10" do
     it "a legacy update sent by another user of the company with the same key and body is written, not replayed from the first user's receipt" do
       company = create(:company)
@@ -2574,7 +4055,10 @@ RSpec.describe Timekeeping::Gateway, "prepared branch call shape" do
     expect(kwargs[:actor]).to be_user
     expect(kwargs[:actor].user_id).to eq(admin.id)
     expect(kwargs[:params].keys).to contain_exactly("idempotency_key", "if_match", "entry_id", "body")
-    expect(kwargs[:params]["idempotency_key"]).to eq("k-call-shape-1")
+    # A new prepared write is keyed as a forwarded write would be, seeded by the client's own key.
+    expect(kwargs[:params]["idempotency_key"]).to eq(
+      Timekeeping::EntryWriteClient.idempotency_key(request_id: "k-call-shape-1", operation: "destroy", entry_id: entry.id)
+    )
     # The request's own If-Match wins over the version the lookup read.
     expect(kwargs[:params]["if_match"]).to eq("7")
     expect(kwargs[:params]["entry_id"].to_s).to eq(entry.id.to_s)
@@ -3212,11 +4696,12 @@ RSpec.describe Timekeeping::Gateway do
     forwarded = []
     allow(write_client).to receive(:create_entry) do |**arguments|
       forwarded << arguments
-      { "id" => 9_100_001, "company_id" => second_company.id, "version" => 1, "project_id" => second_project.id,
-        "user_id" => second_user.id, "work_date" => Date.current.iso8601, "duration" => 30.0, "note" => "Same request",
-        "bill_status" => "unbilled", "review_status" => "approved", "source" => "manual", "source_metadata" => {},
-        "agent_id" => nil, "proof_url" => nil, "proof_metadata" => nil, "external_run_id" => nil,
-        "external_session_id" => nil, "locked" => false }
+      row = { "id" => 9_100_001, "company_id" => second_company.id, "version" => 1, "project_id" => second_project.id,
+              "user_id" => second_user.id, "work_date" => Date.current.iso8601, "duration" => 30.0,
+              "note" => "Same request", "bill_status" => "unbilled", "review_status" => "approved", "source" => "manual",
+              "source_metadata" => {}, "agent_id" => nil, "proof_url" => nil, "proof_metadata" => nil,
+              "external_run_id" => nil, "external_session_id" => nil, "locked" => false }
+      Timekeeping::EntryWriteClient::CreateAnswer.new(row:, replayed: false)
     end
     second_context = Timekeeping::WriteContext.new(company: second_company, actor: second_user, actor_kind: "user",
                                                    request_id: "req-forwarded-second", idempotency_key: shared_key)
@@ -3356,13 +4841,22 @@ RSpec.describe Timekeeping::Gateway, "legacy create receipts across the first cu
     let(:attributes) { { duration: 30, work_date: Date.current, note: "Carried retry", bill_status: "unbilled" } }
 
     it "resends the stored body byte for byte under the carried key when the retry matches an unexpired receipt" do
-      entry = carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-match")
+      entry = nil
+      legacy_events = timesheet_entries_created_events do
+        entry = carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-match")
+      end
       receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: entry.id)
       carried_retry_flip!
       sent = carried_retry_stub(company)
 
-      with_forwarded_timekeeping_env { carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-match") }
+      # The stub answers as a fresh create, with no replay header, so only the
+      # carried-receipt path keeps the retry from raising a second event.
+      carried_events = timesheet_entries_created_events do
+        with_forwarded_timekeeping_env { carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-match") }
+      end
 
+      expect(legacy_events.size).to eq(1)
+      expect(carried_events).to be_empty
       expect(sent.size).to eq(1)
       expect(sent.first[:raw_body]).to eq(receipt.forwarded_body)
       expect(sent.first[:key]).to eq(Timekeeping::LegacyCreateReplay.carried_key(actor_kind: "user", key: "carried-retry-match"))
