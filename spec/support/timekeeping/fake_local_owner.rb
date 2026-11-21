@@ -22,5 +22,9 @@ module Timekeeping
     def replay(**)
       nil
     end
+
+    def stored_answer_for(**)
+      nil
+    end
   end
 end

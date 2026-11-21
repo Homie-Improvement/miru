@@ -202,13 +202,15 @@ module Timekeeping
     # may have made the entry one that policy refuses to edit, such as billed.
     # The replayed entry passes the lookup's company, id and scope checks and
     # then authorize_replay, the permission to read back a committed answer.
-    # It defaults to authorize for callers that grant no separate one.
+    # It defaults to authorize for callers that grant no separate one. After a
+    # re-cutover, a receipt the prepared store kept under the raw client key
+    # is replayed the same way (see replay_pre_change_receipt).
     # :reek:LongParameterList
     def update(entry_id:, project:, attributes:, authorize:, authorize_replay: authorize, expected_generation: nil,
                scope: :company)
       perform(expected_generation) do |ownership, owner|
         identity = update_identity(project:, attributes:)
-        replayed = owner == :prepared && replay_local(ownership:, operation: :update, entry_id:, identity:)
+        replayed = replay_committed(ownership:, owner:, operation: :update, entry_id:, identity:)
         next replayed_update(replayed, entry_id:, authorize_replay:, scope:) if replayed
 
         found = find_authorized(ownership:, entry_id:, authorize:, scope:)
@@ -243,10 +245,11 @@ module Timekeeping
     #
     # In the prepared store, a retry with the request's own Idempotency-Key
     # replays this actor's stored answer before the lookup, which no longer
-    # finds the discarded entry.
+    # finds the discarded entry. After a re-cutover, a receipt the prepared
+    # store kept under the raw client key is replayed the same way.
     def destroy(entry_id:, authorize:, expected_generation: nil, scope: :company)
       perform(expected_generation) do |ownership, owner|
-        replayed = owner == :prepared && replay_local(ownership:, operation: :destroy, entry_id:, identity: {})
+        replayed = replay_committed(ownership:, owner:, operation: :destroy, entry_id:, identity: {})
         if replayed
           authorize.call(EntryLookup.replayed(context:, row: replayed, entry_id:, scope:))
           next true
@@ -327,23 +330,33 @@ module Timekeeping
       #
       # In the prepared store, a retry with the request's own Idempotency-Key
       # replays this actor's stored answer before the lookup and the check,
-      # since the first write may have discarded or moved the entries.
+      # since the first write may have discarded or moved the entries. After a
+      # re-cutover, a receipt the prepared store kept under the raw client key
+      # is replayed the same way.
       # :reek:LongParameterList
       def bulk_write(operation:, identity:, entry_ids:, check:, expected_generation:, scope:)
         perform(expected_generation) do |ownership, owner|
-          replayed = owner == :prepared &&
-                     replay_local(ownership:, operation:, identity:,
-                                  keys: bulk_replay_keys(operation, identity.fetch("entry_ids")))
-          entries = bulk_entries(ownership:, entry_ids:, scope:)
+          replayed = replay_committed(ownership:, owner:, operation:, identity:,
+                                      keys: bulk_replay_keys(operation, identity.fetch("entry_ids")))
           if replayed
-            next BulkResult.new(entries:, refusal: nil, written: reported?(replayed, BULK_RESULTS.fetch(operation)))
+            next BulkResult.new(entries: replayed_bulk_entries(ownership:, owner:, entry_ids:, scope:), refusal: nil,
+                                written: reported?(replayed, BULK_RESULTS.fetch(operation)))
           end
 
+          entries = bulk_entries(ownership:, entry_ids:, scope:)
           refusal = check.call(entries)
           next BulkResult.new(entries:, refusal:, written: false) unless refusal.nil?
 
           BulkResult.new(entries:, refusal: nil, written: yield(ownership, owner, entries))
         end
+      end
+
+      # The entries a replayed bulk answer is returned with. The prepared store
+      # reads them locally. A receipt read while Timekeeping owns the entries
+      # was answered from this database alone, so no remote lookup is made
+      # and the answer carries no entries.
+      def replayed_bulk_entries(ownership:, owner:, entry_ids:, scope:)
+        owner == :prepared ? bulk_entries(ownership:, entry_ids:, scope:) : []
       end
 
       # Only a not-found answer drops an id, so a foreign id looks exactly like
@@ -436,8 +449,7 @@ module Timekeeping
         return local_carried_create(ownership:, receipt:) if receipt
 
         draft_user = user || context.actor
-        fields = EntryWriteClient.forwarded_fields(attributes, actor_kind: context.actor_kind, operation: :create)
-        identity = create_identity(user_id: target_user_id, project:, fields:)
+        identity = request_create_identity(project:, attributes:, user_id: target_user_id)
         row = replay_local(ownership:, operation: :create, identity:) || local_write(
           ownership:, operation: :create, identity:, idempotency_key: request_key(:create),
           body: create_body(user: draft_user, project:, attributes:).merge("user_id" => target_user_id)
@@ -541,6 +553,36 @@ module Timekeeping
         nil
       end
 
+      # The stored answer a retry is replayed from before any lookup or write:
+      # the prepared store's receipt while it owns the entries, and a receipt
+      # it wrote before a re-cutover while Timekeeping owns them. The legacy
+      # store keeps receipts for creates only, which legacy_create reads.
+      # :reek:LongParameterList
+      def replay_committed(ownership:, owner:, operation:, identity:, entry_id: nil,
+                           keys: replay_keys(operation, entry_id))
+        case owner
+        when :prepared then replay_local(ownership:, operation:, identity:, entry_id:, keys:)
+        when :timekeeping then replay_pre_change_receipt(operation:, identity:, entry_id:)
+        end
+      end
+
+      # A backstop for receipts the prepared store wrote under the raw client
+      # key before its keys were derived as forwarded ones. A re-cutover
+      # leaves them in this database, while Timekeeping looks a retry up only
+      # under the derived key it is sent and would write it again. The local
+      # owner's generation fence refuses every request while Timekeeping owns
+      # the entries, so this read skips it; it never writes.
+      def replay_pre_change_receipt(operation:, identity:, entry_id: nil)
+        key = context.idempotency_key
+        return if key.nil?
+
+        outcome = local_owner.stored_answer_for(
+          operation:, company_id: context.company.id, actor: local_actor,
+          params: { "idempotency_key" => key, "entry_id" => entry_id }, identity: as_json_value(identity)
+        )
+        local_answer(operation, outcome) unless outcome.nil?
+      end
+
       # The keys a retry of a single-entry write may have been stored under:
       # the key this change derives, then the raw client key that receipts
       # written before it used. A key derived from the request id alone is new
@@ -576,6 +618,13 @@ module Timekeeping
       # default is filled.
       def create_identity(user_id:, project:, fields:)
         { "user_id" => user_id, "project_id" => project.id, "fields" => fields.to_h.stringify_keys }
+      end
+
+      # The identity of a create request, built from the fields its writer may
+      # forward.
+      def request_create_identity(project:, attributes:, user_id:)
+        fields = EntryWriteClient.forwarded_fields(attributes, actor_kind: context.actor_kind, operation: :create)
+        create_identity(user_id:, project:, fields:)
       end
 
       def update_identity(project:, attributes:)
@@ -718,8 +767,14 @@ module Timekeeping
       # otherwise refuse the retry of a create that already committed.
       # :reek:LongParameterList
       def forward_create(ownership:, project:, attributes:, user:, requested_user_id:, resolve_user:)
-        receipt = carried_legacy_create(project:, attributes:, user_id: user ? user.id : requested_user_id)
+        target_user_id = user ? user.id : requested_user_id
+        receipt = carried_legacy_create(project:, attributes:, user_id: target_user_id)
         return forward_carried_create(ownership:, receipt:) if receipt
+
+        stored = replay_pre_change_receipt(
+          operation: :create, identity: request_create_identity(project:, attributes:, user_id: target_user_id)
+        )
+        return hydrate(stored, user_id: stored["user_id"]) if stored
 
         target = user || resolve_user.call
         row = write_client.create_entry(context:, generation: ownership.generation,
@@ -761,8 +816,7 @@ module Timekeeping
 
       # The same request values a prepared create's receipt fingerprints.
       def legacy_create_fingerprint(project:, attributes:, user_id:)
-        fields = EntryWriteClient.forwarded_fields(attributes, actor_kind: context.actor_kind, operation: :create)
-        LegacyCreateReplay.fingerprint(as_json_value(create_identity(user_id:, project:, fields:)))
+        LegacyCreateReplay.fingerprint(as_json_value(request_create_identity(project:, attributes:, user_id:)))
       end
 
       # The legacy model refuses a create already marked billed, so a billed
