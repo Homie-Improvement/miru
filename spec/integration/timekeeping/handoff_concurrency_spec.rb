@@ -25,6 +25,9 @@ RSpec.describe "Timekeeping handoff concurrency", :integrated_runtime, :two_tena
   around do |example|
     WebMock.disable_net_connect!(allow_localhost: true)
     example.run
+  ensure
+    # Back to the suite default (spec/rails_helper.rb), so no later spec may reach localhost.
+    WebMock.disable_net_connect!
   end
 
   # Points the handoff integrations at this example's runtime for the block,
