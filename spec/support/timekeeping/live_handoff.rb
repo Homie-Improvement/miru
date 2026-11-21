@@ -54,10 +54,11 @@ module LiveHandoff
 
   SUCCESS_STATUSES = (200..299)
 
-  # Request headers that sign a monolith request in. web_replay_request drops
-  # every one of them from the recording, so a replay can only authenticate as
-  # the company whose credentials it is given.
-  CREDENTIAL_HEADERS = %w[Authorization X-Auth-Email X-Auth-Token].freeze
+  # Request headers that sign a monolith request in, downcased because header
+  # names are case-insensitive. web_replay_request drops every one of them from
+  # the recording, in any spelling, so a replay can only authenticate as the
+  # company whose credentials it is given.
+  CREDENTIAL_HEADERS = %w[authorization x-auth-email x-auth-token].freeze
 
   # Net::HTTP decompresses a gzip reply on its own; asking for identity keeps
   # the body as the bytes the server wrote.
@@ -193,7 +194,7 @@ module LiveHandoff
   # headers dropped, and X-Auth-Email and X-Auth-Token set to the ones given.
   # Web paths name no company, so company_id is not written into the request.
   def web_replay_request(recorded, company_id:, auth_email:, auth_token:) # rubocop:disable Lint/UnusedMethodArgument
-    headers = recorded.fetch(:headers).except(*CREDENTIAL_HEADERS)
+    headers = recorded.fetch(:headers).reject { |name, _value| CREDENTIAL_HEADERS.include?(name.to_s.downcase) }
                       .merge("X-Auth-Email" => auth_email, "X-Auth-Token" => auth_token)
     TenantGuardCases.frozen_copy(recorded.merge(headers:))
   end

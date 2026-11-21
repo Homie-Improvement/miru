@@ -256,7 +256,7 @@ RSpec.describe TimekeepingIntegrationTags do
     end
   end
 
-  context "more tests 2" do
+  describe "a committed_data tag wrapped onto a second line" do
     it "accepts committed_data: true wrapped onto a second line on a group and on an example, and still flags a wrapped false" do
       wrapped_group = <<~RUBY
         RSpec.describe "relay", :integrated_runtime, :two_tenant_seed,
@@ -288,7 +288,7 @@ RSpec.describe TimekeepingIntegrationTags do
     end
   end
 
-  context "more tests 3" do
+  describe "the live handoff integration specs" do
     it "money guard and handoff sequence specs exist, carry committed_data, never load the handoff fakes, and run on the integrated runtime" do
       paths = %w[money_guard_spec.rb handoff_sequence_spec.rb].map do |name|
         Rails.root.join("spec/integration/timekeeping", name)
@@ -310,7 +310,7 @@ RSpec.describe TimekeepingIntegrationTags do
     end
   end
 
-  context "more tests 4" do
+  describe "the live handoff meta spec" do
     it "the live tenant_counts group in the live handoff meta spec carries integrated_runtime and committed_data and adds no reset of its own" do
       path = Rails.root.join("spec/meta/timekeeping_live_handoff_spec.rb")
       expect(File).to exist(path)

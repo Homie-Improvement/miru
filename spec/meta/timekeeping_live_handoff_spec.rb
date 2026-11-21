@@ -15,7 +15,11 @@ RSpec.describe LiveHandoff do
         "Idempotency-Key" => "replay-key-1",
         "X-Auth-Email" => "owner-a@example.test",
         "X-Auth-Token" => a_token,
-        "Authorization" => a_bearer
+        "Authorization" => a_bearer,
+        # Header names are case-insensitive, so a recording may hold any spelling.
+        "authorization" => a_bearer,
+        "x-auth-TOKEN" => a_token,
+        "X-AUTH-EMAIL" => "owner-a@example.test"
       },
       body: { "project_id" => 11, "timesheet_entry" => { "duration" => 60, "note" => "a note" } }
     }
@@ -34,6 +38,10 @@ RSpec.describe LiveHandoff do
     # The monolith authenticates a Bearer Authorization header before X-Auth, so a
     # leftover recorded header would sign the replay in as company A.
     expect(replay.fetch(:headers)).not_to have_key("Authorization")
+    credential_names = replay.fetch(:headers).keys.select do |name|
+      %w[authorization x-auth-email x-auth-token].include?(name.downcase)
+    end
+    expect(credential_names).to contain_exactly("X-Auth-Email", "X-Auth-Token")
     expect(replay.fetch(:headers).values).not_to include(a_token, a_bearer, "owner-a@example.test")
     expect(recorded).to eq(original)
   end
@@ -194,7 +202,9 @@ end
 
 RSpec.describe LiveHandoff do
   context "live Timekeeping counts for two companies", :integrated_runtime, committed_data: true do
-    it "timekeeping_counts and tenant_counts keep two companies apart in the live Timekeeping database" do
+    # "With rows seeded for both companies, the per-company counts return exact values, and adding an entry, a
+    # version, an audit row or a receipt for one company changes only that company's matching count"
+    it "timekeeping_counts returns exact values per company and moves only company A's matching counts when an entry, a version, an audit row and a receipt are added for A" do
       company_a = 970_001
       company_b = 970_002
       url = ENV.fetch(TimekeepingDatabaseReset::DATABASE_URL_KEY)
@@ -213,39 +223,50 @@ RSpec.describe LiveHandoff do
           "created_at) VALUES ($1, $2, 'user', 1, 'create', '{}', now(), now())", [company_id, entry_id]
         )
       end
-      # Distinguishable seeds: A has one entry at version 2, B has three entries and two audit rows.
+      add_receipt = lambda do |company_id|
+        connection.exec_params(
+          "INSERT INTO idempotency_receipts (company_id, actor_type, actor_id, operation, key, fingerprint, status, " \
+          "body, created_at) VALUES ($1, 'user', 1, 'create', $2, 'live_handoff', 201, '{}', now())",
+          [company_id, SecureRandom.uuid]
+        )
+      end
+      # Distinguishable seeds: A has one entry at version 2 and one receipt; B has three entries, two audit rows
+      # and three receipts, so a query that drops its company filter or adds both companies together fails.
       a_entry = add_entry.call(company_a, 2)
+      add_receipt.call(company_a)
       b_entries = Array.new(3) { add_entry.call(company_b, 1) }
       b_entries.first(2).each { |id| add_audit.call(company_b, id) }
+      3.times { add_receipt.call(company_b) }
 
       a_before = described_class.timekeeping_counts(company_id: company_a)
       b_before = described_class.timekeeping_counts(company_id: company_b)
-      expect(a_before).not_to eq(b_before)
-      expect(a_before.values.sort).to eq([0, 0, 0, 0, 1, 2])
-      expect(b_before.values.sort).to eq([0, 0, 0, 2, 3, 3])
+      expect(a_before).to eq(entries: 1, entry_versions: 2, audit_events: 0, idempotency_receipts: 1,
+                             service_idempotency_receipts: 0, outbox_snapshots: 0)
+      expect(b_before).to eq(entries: 3, entry_versions: 3, audit_events: 2, idempotency_receipts: 3,
+                             service_idempotency_receipts: 0, outbox_snapshots: 0)
       expect(described_class.tenant_counts(company_id: company_a).fetch(:timekeeping)).to eq(a_before)
 
-      changed_by = lambda do |before, after|
-        after.to_h { |key, value| [key, value - before.fetch(key)] }.reject { |_key, delta| delta.zero? }.values.sort
+      writes = {
+        "add an entry" => [-> { add_entry.call(company_a, 1) }, { entries: 1, entry_versions: 1 }],
+        "raise one entry's version" => [
+          -> { connection.exec_params("UPDATE entries SET version = version + 4 WHERE id = $1", [a_entry]) },
+          { entry_versions: 4 }
+        ],
+        "add an audit row" => [-> { add_audit.call(company_a, a_entry) }, { audit_events: 1 }],
+        "add a receipt" => [-> { add_receipt.call(company_a) }, { idempotency_receipts: 1 }]
+      }
+      writes.each do |label, (write, expected_deltas)|
+        before = described_class.timekeeping_counts(company_id: company_a)
+        write.call
+        after = described_class.timekeeping_counts(company_id: company_a)
+        deltas = after.to_h { |key, value| [key, value - before.fetch(key)] }.reject { |_key, delta| delta.zero? }
+        expect(deltas).to eq(expected_deltas), label
+        expect(described_class.timekeeping_counts(company_id: company_b)).to eq(b_before), label
       end
-
-      add_entry.call(company_a, 1)
-      a_after_entry = described_class.timekeeping_counts(company_id: company_a)
-      expect(changed_by.call(a_before, a_after_entry)).to eq([1, 1])
-
-      connection.exec_params("UPDATE entries SET version = version + 4 WHERE id = $1", [a_entry])
-      a_after_version = described_class.timekeeping_counts(company_id: company_a)
-      expect(changed_by.call(a_after_entry, a_after_version)).to eq([4])
-
-      add_audit.call(company_a, a_entry)
-      a_after_audit = described_class.timekeeping_counts(company_id: company_a)
-      expect(changed_by.call(a_after_version, a_after_audit)).to eq([1])
-
-      expect(described_class.timekeeping_counts(company_id: company_b)).to eq(b_before)
     ensure
       if connection
         [company_a, company_b].each do |id|
-          %w[audit_events entries].each do |table|
+          %w[audit_events idempotency_receipts entries].each do |table|
             connection.exec_params("DELETE FROM #{connection.quote_ident(table)} WHERE company_id = $1", [id])
           end
         end
@@ -285,157 +306,6 @@ RSpec.describe LiveHandoff do
     expect(counts_a.values).to all(eq(0))
     expect(counts_b.keys).to match_array(counts_a.keys)
     expect(counts_b.values.sum).to be > 0
-  end
-end
-
-
-RSpec.describe LiveHandoff do
-  # "then adding an entry, raising one entry's version, adding an audit row and adding a receipt for company A changes exactly the matching counts of A and leaves every count of company B unchanged."
-  it "monolith_counts leaves every count of company B unchanged when entries, versions, audits and receipts are added for company A" do
-    company_a = 910_011
-    company_b = 910_012
-    connection = ActiveRecord::Base.connection
-    insert_entry = lambda do |company_id, version|
-      connection.select_value(<<~SQL.squish)
-        INSERT INTO entries (company_id, version, project_id, user_id, work_date, duration, bill_status, created_at, updated_at)
-        VALUES (#{company_id}, #{version}, 1, 1, '2026-01-05', 60, 'unbilled', now(), now())
-        RETURNING id
-      SQL
-    end
-    a_entry = insert_entry.call(company_a, 1)
-    b_entry = insert_entry.call(company_b, 3)
-    insert_entry.call(company_b, 2)
-    connection.execute(<<~SQL.squish)
-      INSERT INTO audits (action, auditable_type, auditable_id, associated_type, associated_id, version, created_at)
-      VALUES ('create', 'TimesheetEntry', #{b_entry}, 'Company', #{company_b}, 1, now());
-      INSERT INTO idempotency_records (company_id, actor_type, actor_id, operation, key, fingerprint, status, body, created_at)
-      VALUES (#{company_b}, 'User', 7, 'create_entry', 'tenant-lens-b-1', 'fp', 201, '{}', now())
-    SQL
-    counts_a_before = described_class.monolith_counts(company_id: company_a)
-    counts_b_before = described_class.monolith_counts(company_id: company_b)
-
-    insert_entry.call(company_a, 1)
-    connection.execute("UPDATE entries SET version = version + 1 WHERE id = #{Integer(a_entry)}")
-    connection.execute(<<~SQL.squish)
-      INSERT INTO audits (action, auditable_type, auditable_id, associated_type, associated_id, version, created_at)
-      VALUES ('update', 'TimesheetEntry', #{a_entry}, 'Company', #{company_a}, 2, now());
-      INSERT INTO idempotency_records (company_id, actor_type, actor_id, operation, key, fingerprint, status, body, created_at)
-      VALUES (#{company_a}, 'User', 7, 'create_entry', 'tenant-lens-a-1', 'fp', 201, '{}', now())
-    SQL
-
-    expect(described_class.monolith_counts(company_id: company_b)).to eq(counts_b_before)
-    expect(described_class.monolith_counts(company_id: company_a)).not_to eq(counts_a_before)
-  end
-end
-
-
-RSpec.describe LiveHandoff do
-  # "`TenantStateDigest.GROUPS` omits the audit tables and `legacy_create_receipts`, so these counts must stand on their own proof"
-  it "monolith_counts does not count a TimesheetEntry audit associated with another company or an audit of another model" do
-    company_a = 910_021
-    company_b = 910_022
-    connection = ActiveRecord::Base.connection
-    before = described_class.monolith_counts(company_id: company_a)
-
-    connection.execute(<<~SQL.squish)
-      INSERT INTO audits (action, auditable_type, auditable_id, associated_type, associated_id, version, created_at)
-      VALUES ('create', 'TimesheetEntry', 424242, 'Company', #{company_b}, 1, now());
-      INSERT INTO audits (action, auditable_type, auditable_id, associated_type, associated_id, version, created_at)
-      VALUES ('create', 'Invoice', 424243, 'Company', #{company_a}, 1, now())
-    SQL
-
-    expect(described_class.monolith_counts(company_id: company_a)).to eq(before)
-
-    connection.execute(<<~SQL.squish)
-      INSERT INTO audits (action, auditable_type, auditable_id, associated_type, associated_id, version, created_at)
-      VALUES ('create', 'TimesheetEntry', 424244, 'Company', #{company_a}, 1, now())
-    SQL
-
-    after = described_class.monolith_counts(company_id: company_a)
-    changed = after.keys.select { |key| after[key] != before[key] }
-    expect(changed.size).to eq(1)
-    expect(after[changed.first] - before[changed.first]).to eq(1)
-  end
-end
-
-
-RSpec.describe LiveHandoff do
-  context "live Timekeeping counts for two companies", :integrated_runtime, committed_data: true do
-    # "With rows seeded for both companies, the per-company counts return exact values, and adding an entry, a
-    # version, an audit row or a receipt for one company changes only that company's matching count"
-    it "timekeeping_counts moves only company A's matching counts when an entry, a version, an audit row and a receipt are added for A" do
-      url = ENV.fetch(TimekeepingDatabaseReset::DATABASE_URL_KEY)
-      TestDatabaseGuard.require_test_database_url!(url)
-      company_a = 9_525_101
-      company_b = 9_525_102
-      connection = TimekeepingDatabaseReset.connect(url, TimekeepingDatabaseReset.database_name(url))
-      add_entry = lambda do |company_id|
-        connection.exec_params(
-          "INSERT INTO entries (company_id, project_id, user_id, work_date, duration, bill_status, created_at, " \
-          "updated_at) VALUES ($1, 1, 1, CURRENT_DATE, 60, 'unbilled', now(), now()) RETURNING id", [company_id]
-        ).getvalue(0, 0).to_i
-      end
-      add_audit = lambda do |company_id, entry_id|
-        connection.exec_params(
-          "INSERT INTO audit_events (company_id, entry_id, actor_type, actor_name, action, after, entry_created_at, " \
-          "created_at) VALUES ($1, $2, 'service', 'live_handoff_spec', 'create', '{}', now(), now())",
-          [company_id, entry_id]
-        )
-      end
-      add_receipt = lambda do |company_id|
-        connection.exec_params(
-          "INSERT INTO idempotency_receipts (company_id, actor_type, actor_id, operation, key, fingerprint, status, " \
-          "body, created_at) VALUES ($1, 'user', 1, 'create', $2, 'live_handoff', 201, '{}', now())",
-          [company_id, SecureRandom.uuid]
-        )
-      end
-
-      # Company B gets more rows than A, so a query that drops its company filter or adds both companies together
-      # cannot return B's counts unchanged.
-      entry_a = add_entry.call(company_a)
-      add_audit.call(company_a, entry_a)
-      add_receipt.call(company_a)
-      3.times do
-        entry_b = add_entry.call(company_b)
-        add_audit.call(company_b, entry_b)
-        add_receipt.call(company_b)
-      end
-      counts = ->(company_id) { described_class.timekeeping_counts(company_id:, env: ENV) }
-      expect(counts.call(company_a)).not_to eq(counts.call(company_b))
-
-      mutations = {
-        "add an entry" => [-> { add_entry.call(company_a) }, 2],
-        "raise one entry's version" => [
-          -> { connection.exec_params("UPDATE entries SET version = version + 1 WHERE id = $1", [entry_a]) }, 1
-        ],
-        "add an audit row" => [-> { add_audit.call(company_a, entry_a) }, 1],
-        "add a receipt" => [-> { add_receipt.call(company_a) }, 1]
-      }
-
-      mutations.each do |label, (mutate, changed_key_count)|
-        before_a = counts.call(company_a)
-        before_b = counts.call(company_b)
-
-        mutate.call
-
-        after_a = counts.call(company_a)
-        changed = after_a.keys.reject { |key| after_a.fetch(key) == before_a.fetch(key) }
-        # An entry moves the entry count and the version sum; each other write moves exactly one count.
-        expect(changed.size).to eq(changed_key_count), label
-        changed.each { |key| expect(after_a.fetch(key)).to eq(before_a.fetch(key) + 1), "#{label} #{key}" }
-        expect(counts.call(company_b)).to eq(before_b), label
-      end
-    ensure
-      if connection
-        %w[audit_events idempotency_receipts entries].each do |table|
-          connection.exec_params(
-            "DELETE FROM #{connection.quote_ident(table)} WHERE company_id = ANY($1::bigint[])",
-            [PG::TextEncoder::Array.new.encode([company_a, company_b])]
-          )
-        end
-        connection.close
-      end
-    end
   end
 end
 
@@ -496,6 +366,10 @@ RSpec.describe "LiveHandoff" do
     bad_inputs.each do |label, rows|
       expect(LiveHandoff.foreign_id_failures(rows, company_ids: [1, 2])).not_to be_empty, label
     end
+    # entry_snapshot_receipts.company_ids may be an empty array, so a row can sit
+    # under company 1 without naming it; the failure names that company.
+    expect(LiveHandoff.foreign_id_failures(bad_inputs.fetch("empty company list"), company_ids: [1, 2]).join("\n"))
+      .to include("company 1")
   end
 end
 
@@ -520,6 +394,12 @@ RSpec.describe "LiveHandoff" do
     expect(verdict.call(422, { errors: "something else" }.to_json, LiveHandoff::MONOLITH_REFUSALS)).to eq(:failed)
     expect(verdict.call(422, "not json", LiveHandoff::MONOLITH_REFUSALS)).to eq(:failed)
     expect(verdict.call(422, "[]", LiveHandoff::TIMEKEEPING_REFUSALS)).to eq(:failed)
+    expect(verdict.call(422, "<html>oops</html>", LiveHandoff::TIMEKEEPING_REFUSALS)).to eq(:failed)
+    # A refusal body with an extra key is not the exact pair the table holds.
+    expect(verdict.call(422, '{"reason":"idempotency_key_reused","entry":{"id":7}}', LiveHandoff::TIMEKEEPING_REFUSALS))
+      .to eq(:failed)
+    # A byte-equal body with an error status is not an answer from the receipt.
+    expect(verdict.call(500, receipt.dup, LiveHandoff::TIMEKEEPING_REFUSALS)).to eq(:failed)
 
     # "404 counts only with the cross-company table."
     not_found = { reason: "not_found" }.to_json
@@ -599,49 +479,6 @@ end
 
 
 RSpec.describe LiveHandoff do
-  it "foreign_id_failures fails a company whose only row lists no company at all" do
-    # "a foreign-id check where the company has no rows of its own fails."
-    # entry_snapshot_receipts.company_ids may be an empty array, so a row can sit
-    # under company 1 without naming it.
-    rows_by_company = {
-      1 => [{ "company_ids" => [] }],
-      2 => [{ "company_id" => 2 }]
-    }
-
-    failures = described_class.foreign_id_failures(rows_by_company, company_ids: [1, 2])
-
-    expect(failures).not_to be_empty
-    expect(failures.join("\n")).to include("1")
-
-    clean = { 1 => [{ "company_ids" => [1] }], 2 => [{ "company_id" => 2 }] }
-    expect(described_class.foreign_id_failures(clean, company_ids: [1, 2])).to eq([])
-  end
-end
-
-
-RSpec.describe LiveHandoff do
-  it "replay_verdict fails a non-JSON body, a refusal body with an extra key and a one-byte-different receipt reply without raising" do
-    stored = '{"notice":"saved","entry":{"id":7,"note":"abc"}}'
-
-    # "a 500 or any other body fails"
-    expect(described_class.replay_verdict(status: 422, body: "<html>oops</html>", expected_body: stored,
-                                          refusals: described_class::TIMEKEEPING_REFUSALS)).to eq(:failed)
-    expect(described_class.replay_verdict(status: 422, body: '{"reason":"idempotency_key_reused","entry":{"id":7}}',
-                                          expected_body: stored,
-                                          refusals: described_class::TIMEKEEPING_REFUSALS)).to eq(:failed)
-    expect(described_class.replay_verdict(status: 200, body: stored.sub("abc", "abd"), expected_body: stored,
-                                          refusals: described_class::TIMEKEEPING_REFUSALS)).to eq(:failed)
-    # A byte-equal body with an error status is not an answer from the receipt.
-    expect(described_class.replay_verdict(status: 500, body: stored, expected_body: stored,
-                                          refusals: described_class::TIMEKEEPING_REFUSALS)).to eq(:failed)
-
-    expect(described_class.replay_verdict(status: 200, body: stored.dup, expected_body: stored,
-                                          refusals: described_class::TIMEKEEPING_REFUSALS)).to eq(:answered_from_receipt)
-  end
-end
-
-
-RSpec.describe LiveHandoff do
   # "restore the integrations in `ensure`, even when a handoff raises."
   it "with_live_handoff_integrations rebuilds from the restored ENV when the handoff block raises" do
     extend LiveHandoff::ExampleHelpers
@@ -689,24 +526,5 @@ RSpec.describe LiveHandoff do
     expect(changed.bytesize).to eq(original.bytesize)
     differing = original.bytes.zip(changed.bytes).count { |left, right| left != right }
     expect(differing).to eq(1)
-  end
-end
-
-
-RSpec.describe LiveHandoff do
-  # "The live `tenant_counts` meta example carries `committed_data` and `:integrated_runtime` and follows the
-  # database reset rule, though it lives under `spec/meta`". The integration tag check reads only
-  # spec/integration/timekeeping, so this example keeps the live groups of this file tagged.
-  it "keeps every live Timekeeping counts group in this file tagged :integrated_runtime and committed_data" do
-    this_file = File.expand_path(__FILE__)
-    live_groups = RSpec.world.example_groups.flat_map(&:descendants).select do |group|
-      group.metadata[:absolute_file_path] == this_file &&
-        group.description == "live Timekeeping counts for two companies"
-    end
-
-    expect(live_groups.size).to eq(2)
-    live_groups.each do |group|
-      expect(group.metadata).to include(integrated_runtime: true, committed_data: true)
-    end
   end
 end
