@@ -606,3 +606,59 @@ RSpec.describe "owned_entry for an id the owning store does not hold", committed
     expect { owned_entry(legacy_id, state: "rollback") }.to raise_error(StandardError)
   end
 end
+
+RSpec.describe "arrange_owned_entries with a billed row", committed_data: true do
+  it "legacy and rollback states arrange a billed row and read it back as billed from the owner and the projection" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    project = create(:project, billable: true, client: create(:client, company:))
+    billed_row = { company:, user:, project:, work_date: Date.current, bill_status: "billed" }
+
+    legacy_id, = arrange_owned_entries([billed_row], state: "legacy")
+    expect(owned_entry(legacy_id, state: "legacy").fetch("bill_status")).to eq("billed")
+
+    rollback_id, = arrange_owned_entries([billed_row], state: "rollback")
+    expect(owned_entry(rollback_id, state: "rollback").fetch("bill_status")).to eq("billed")
+    expect(TimesheetEntry.unscoped.find(rollback_id).bill_status).to eq("billed")
+  end
+
+  it "legacy state still saves a non-billed row with its own bill status" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    project = create(:project, billable: true, client: create(:client, company:))
+
+    unbilled_id, non_billable_id = arrange_owned_entries(
+      [{ company:, user:, project:, bill_status: "unbilled" },
+       { company:, user:, project:, bill_status: "non_billable" }],
+      state: "legacy"
+    )
+
+    expect(owned_entry(unbilled_id, state: "legacy").fetch("bill_status")).to eq("unbilled")
+    expect(owned_entry(non_billable_id, state: "legacy").fetch("bill_status")).to eq("non_billable")
+  end
+end
+
+RSpec.describe "arrange_owned_entries with a billed row against the live Timekeeping app", :without_transaction,
+  committed_data: true do
+  it "live timekeeping state arranges a billed row that the Timekeeping app and the projection hold as billed" do
+    unless ENV["TIMEKEEPING_REGRESSION"] == "1" && ENV["TIMEKEEPING_LIVE"] == "1"
+      skip "Set TIMEKEEPING_REGRESSION=1 and TIMEKEEPING_LIVE=1 to run against the live Timekeeping app"
+    end
+    unless TimekeepingRegressionAdapter.current
+      skip "The live adapter is not running: select the timekeeping owner state and a _test TIMEKEEPING_DATABASE_URL"
+    end
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role(:admin, company)
+    project = create(:project, billable: true, client: create(:client, company:))
+
+    entry_id, = arrange_owned_entries([{ company:, user:, project:, work_date: Date.current, bill_status: "billed" }],
+                                      state: "timekeeping")
+
+    expect(owned_entry(entry_id, state: "timekeeping").fetch("bill_status")).to eq("billed")
+    expect(TimesheetEntry.unscoped.find(entry_id).bill_status).to eq("billed")
+  end
+end
