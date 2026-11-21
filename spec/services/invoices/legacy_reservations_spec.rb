@@ -907,7 +907,9 @@ RSpec.describe Invoices::LegacyReservations do
 
   # Relation#update! saves rows in the order the relation loads them. Rewriting
   # the lower-id entry gives it a new row version stored after the invalid
-  # entry's, so a load with no ORDER BY returns the invalid entry first.
+  # entry's. Index and bitmap scans are turned off so the load is a sequential
+  # scan, which returns rows in storage order: without ORDER BY the invalid
+  # entry loads first on every run.
   it "mark_billed bills the lower-id entry before the invalid one even when the invalid row is stored first and requested first" do
     valid_entry = writer_mark_entry
     invalid_entry = writer_mark_entry(duration: -5)
@@ -916,6 +918,8 @@ RSpec.describe Invoices::LegacyReservations do
     raised = nil
 
     marks, seen_after = writer_marks_in_caller_transaction do
+      ApplicationRecord.connection.execute("SET LOCAL enable_indexscan = off")
+      ApplicationRecord.connection.execute("SET LOCAL enable_bitmapscan = off")
       described_class.new.mark_billed(request)
     rescue ActiveRecord::RecordInvalid => error
       raised = error
@@ -947,7 +951,7 @@ RSpec.describe Invoices::LegacyReservations do
     expect(record_loads).to all(include('ORDER BY "timesheet_entries"."id"'))
   end
 
-  it "mark_billed with several valid entries requested out of id order bills each under the legacy_gateway mark and puts back the caller's mark" do
+  it "mark_billed of two valid entries bills each under the legacy_gateway mark and puts back the caller's mark" do
     first_entry = writer_mark_entry
     second_entry = writer_mark_entry
     request = writer_mark_request([second_entry.id, first_entry.id])
