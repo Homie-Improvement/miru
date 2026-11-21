@@ -9,6 +9,5 @@ module Timekeeping
     RETENTION = LegacyCreateReceipt::RETENTION
 
     scope :expired, -> { where(expires_at: ..Time.current) }
-    scope :unexpired, -> { where.not(expires_at: ..Time.current) }
   end
 end
