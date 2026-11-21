@@ -177,6 +177,35 @@ RSpec.describe Timekeeping::ReferenceFacts, "agents under deletion", committed_d
     expect(described_class.call(company:, project_ids: [])[:agents].pluck(:id))
       .to eq([locked_agent.id, other_agent.id].sort)
   end
+
+  # A detach-entries runs while the agent's destroy holds this lock, and must
+  # still see the agent as the company's own to keep its delete marker.
+  it "lists in owned_agent_ids, without waiting, a requested agent whose row another transaction holds FOR UPDATE" do
+    company = create(:company)
+    locked_agent = create(:agent, company:)
+    foreign_agent = create(:agent, company: create(:company))
+    locked = Queue.new
+    release = Queue.new
+    holder = committed_data_thread do
+      ActiveRecord::Base.transaction do
+        Agent.lock.find(locked_agent.id)
+        locked << true
+        release.pop
+      end
+    end
+
+    begin
+      expect(locked.pop(timeout: 10)).to be(true)
+      facts = Timeout.timeout(5) do
+        described_class.call(company:, project_ids: [], agent_ids: [locked_agent.id, foreign_agent.id])
+      end
+      expect(facts[:owned_agent_ids]).to eq([locked_agent.id])
+      expect(facts[:agents].pluck(:id)).not_to include(locked_agent.id)
+    ensure
+      release << true
+      holder.join(10)
+    end
+  end
 end
 
 RSpec.describe Timekeeping::ReferenceFacts, "role selection" do

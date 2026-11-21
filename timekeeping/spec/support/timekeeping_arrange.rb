@@ -141,7 +141,8 @@ class TimekeepingProviderArrange
 
       company_id = Integer(path[:company_id], 10)
       { status: 200, headers: { "Content-Type" => "application/json" },
-        body: JSON.generate(reference_facts(company_id, requested_project_ids(request))) }
+        body: JSON.generate(reference_facts(company_id, requested_ids(request, "project_ids"),
+                                            requested_ids(request, "agent_ids"))) }
     end
   end
 
@@ -155,19 +156,21 @@ class TimekeepingProviderArrange
       request.headers["Authorization"] == "Bearer #{@service_token}"
     end
 
-    def requested_project_ids(request)
-      URI.decode_www_form(request.uri.query.to_s).to_h.fetch("project_ids", "").split(",").map { |id| Integer(id, 10) }
+    def requested_ids(request, name)
+      URI.decode_www_form(request.uri.query.to_s).to_h.fetch(name, "").split(",").map { |id| Integer(id, 10) }
     end
 
-    def reference_facts(company_id, project_ids)
+    def reference_facts(company_id, project_ids, agent_ids)
       owned, missing = project_ids.partition { |id| @company_projects.fetch(company_id, []).include?(id) }
+      company_agent_ids = @company_agents.fetch(company_id, []).pluck(:id)
       {
         company_id:,
         edit_days: EDIT_DAYS,
         users: @company_users.fetch(company_id, []).map { |id| { id:, role: @users.fetch(id)[:role] } },
         projects: owned.map { |id| { id:, company_id:, billable: true, member_user_ids: [] } },
         missing_project_ids: missing,
-        agents: @company_agents.fetch(company_id, [])
+        agents: @company_agents.fetch(company_id, []),
+        owned_agent_ids: agent_ids.uniq.select { |id| company_agent_ids.include?(id) }.sort
       }
     end
 end
