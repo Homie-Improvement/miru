@@ -45,6 +45,9 @@ RSpec.describe Timekeeping::Handoff::Runner do
     ->(_seconds) { raise interrupted }
   end
 
+  # For an abort whose steps are already complete: a wait would mean a regression, so it fails instead of sleeping.
+  def incomplete_check_no_wait_sleeper = ->(_seconds) { raise "no wait expected once the step completes" }
+
   context "with a legacy source" do
     # A legacy source settles and drains through LegacyOperationsCheck, so the owners carry no integrations.
     let(:owners) do
@@ -87,7 +90,8 @@ RSpec.describe Timekeeping::Handoff::Runner do
 
           # Once the intent resolves, the same abort completes and the outgoing owner reopens exactly once.
           connection.execute("UPDATE invoice_operation_intents SET state = 'committed' WHERE operation_id = '#{operation_id}'")
-          described_class.run(direction: :cutover, abort: true, owners:, report_root:, clock:)
+          described_class.run(direction: :cutover, abort: true, owners:, report_root:, clock:,
+                              sleeper: incomplete_check_no_wait_sleeper)
           expect(incomplete_check_row_state).to eq([2, "monolith", nil])
           expect(incomplete_check_admits).to eq([[:monolith, :admit, 2]])
         ensure
@@ -136,7 +140,8 @@ RSpec.describe Timekeeping::Handoff::Runner do
 
           # Once the operation is gone, the same abort completes and the outgoing owner reopens exactly once.
           connection.execute("DELETE FROM invoice_operations WHERE operation_id = '#{operation_id}'")
-          described_class.run(direction: :cutover, abort: true, owners:, report_root:, clock:)
+          described_class.run(direction: :cutover, abort: true, owners:, report_root:, clock:,
+                              sleeper: incomplete_check_no_wait_sleeper)
           expect(incomplete_check_row_state).to eq([2, "monolith", nil])
           expect(incomplete_check_admits).to eq([[:monolith, :admit, 2]])
         ensure
@@ -198,7 +203,8 @@ RSpec.describe Timekeeping::Handoff::Runner do
 
       # Once settlement completes, the same abort finishes and Timekeeping, the outgoing owner, reopens once.
       switchable_settle.settled = true
-      described_class.run(direction: :rollback, abort: true, owners:, report_root: rollback_root, clock:)
+      described_class.run(direction: :rollback, abort: true, owners:, report_root: rollback_root, clock:,
+                          sleeper: incomplete_check_no_wait_sleeper)
       expect(incomplete_check_row_state).to eq([3, "timekeeping", nil])
       expect(incomplete_check_admits).to eq([[:timekeeping, :admit, 3]])
     end
@@ -260,7 +266,8 @@ RSpec.describe Timekeeping::Handoff::Runner do
 
       # Once the drain completes, the same abort finishes and Timekeeping, the outgoing owner, reopens once.
       stalled_relay.stalled = false
-      described_class.run(direction: :rollback, abort: true, owners:, report_root: rollback_root, clock:)
+      described_class.run(direction: :rollback, abort: true, owners:, report_root: rollback_root, clock:,
+                          sleeper: incomplete_check_no_wait_sleeper)
       expect(incomplete_check_row_state).to eq([3, "timekeeping", nil])
       expect(incomplete_check_admits).to eq([[:timekeeping, :admit, 3]])
     end
