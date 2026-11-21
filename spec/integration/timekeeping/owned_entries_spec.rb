@@ -716,7 +716,7 @@ RSpec.describe "owned_entry in the legacy state", committed_data: true, owner_st
   end
 end
 
-RSpec.describe "arrange_owned_entries" do
+RSpec.describe "arrange_owned_entries", committed_data: true do
   it "owned_entries in the rollback state returns only the given company's prepared entries and never another company's" do
     first_company, second_company = Array.new(2) { create(:company) }
     first_user = create(:user, current_workspace_id: first_company.id)
@@ -740,7 +740,7 @@ RSpec.describe "arrange_owned_entries" do
   end
 end
 
-RSpec.describe "arrange_owned_entries" do
+RSpec.describe "arrange_owned_entries", committed_data: true do
   it "owned_entries in the legacy state keeps one company's entries apart and reads every company only when no company is given" do
     first_company, second_company = Array.new(2) { create(:company) }
     first_user = create(:user, current_workspace_id: first_company.id)
@@ -764,7 +764,7 @@ RSpec.describe "arrange_owned_entries" do
   end
 end
 
-RSpec.describe "arrange_owned_entries" do
+RSpec.describe "arrange_owned_entries", committed_data: true do
   it "owned_entries returns nothing when a company read is filtered by another company's project or user" do
     first_company, second_company = Array.new(2) { create(:company) }
     first_user = create(:user, current_workspace_id: first_company.id)
@@ -787,7 +787,7 @@ RSpec.describe "arrange_owned_entries" do
   end
 end
 
-RSpec.describe "owned_entries" do
+RSpec.describe "owned_entries", committed_data: true do
   # "Replace its `Timekeeping::LocalEntry` and projection counts, which are direct store reads, with a count of the entries the owning store holds for the company."
   it "owned_entries in the rollback state counts the prepared store's entries, not projection-only rows, and scopes by company only when one is given" do
     tenants = Array.new(2) do
@@ -819,7 +819,7 @@ RSpec.describe "owned_entries" do
   end
 end
 
-RSpec.describe "owned_entries" do
+RSpec.describe "owned_entries", committed_data: true do
   # "Adapt only the assertions that read a store directly. The behaviour they pin stays the same."
   # A replaced `.kept` read must not count discarded rows, and a read that counted them must still be able to.
   it "owned_entries in the legacy state leaves discarded entries out unless asked, filters by note and duration together, and rejects an unknown filter" do
