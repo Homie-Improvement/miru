@@ -37,6 +37,17 @@ RSpec.describe Timekeeping::Handoff::Runner do
 
   def incomplete_check_admits = calls.select { |call| call[1] == :admit }
 
+  # Stands in for an operator interrupting an abort that is waiting for an incomplete step.
+  let(:incomplete_check_abort_interrupted) { Class.new(StandardError) }
+
+  def incomplete_check_interrupting_sleeper
+    interrupted = incomplete_check_abort_interrupted
+    ->(_seconds) { raise interrupted }
+  end
+
+  # For an abort whose steps are already complete: a wait would mean a regression, so it fails instead of sleeping.
+  def incomplete_check_no_wait_sleeper = ->(_seconds) { raise "no wait expected once the step completes" }
+
   context "with a legacy source" do
     # A legacy source settles and drains through LegacyOperationsCheck, so the owners carry no integrations.
     let(:owners) do
@@ -69,17 +80,18 @@ RSpec.describe Timekeeping::Handoff::Runner do
           expect(incomplete_check_admits).to be_empty
           expect(Timekeeping::Handoff::ReportDirectory.new(root: report_root, generation: 2).money_before?).to be(false)
 
-          # "Assert that progress does not advance, neither owner is admitted, and abort also refuses to reopen
-          # writes until completion."
+          # An abort waits for the incomplete step; interrupted while waiting, it reopens no writes.
           expect do
-            described_class.run(direction: :cutover, abort: true, owners:, report_root:, clock:)
-          end.to raise_error(Timekeeping::Handoff::Runner::Refused)
+            described_class.run(direction: :cutover, abort: true, owners:, report_root:, clock:,
+                                sleeper: incomplete_check_interrupting_sleeper)
+          end.to raise_error(incomplete_check_abort_interrupted)
           expect(incomplete_check_row_state).to eq(baseline)
           expect(incomplete_check_admits).to be_empty
 
           # Once the intent resolves, the same abort completes and the outgoing owner reopens exactly once.
           connection.execute("UPDATE invoice_operation_intents SET state = 'committed' WHERE operation_id = '#{operation_id}'")
-          described_class.run(direction: :cutover, abort: true, owners:, report_root:, clock:)
+          described_class.run(direction: :cutover, abort: true, owners:, report_root:, clock:,
+                              sleeper: incomplete_check_no_wait_sleeper)
           expect(incomplete_check_row_state).to eq([2, "monolith", nil])
           expect(incomplete_check_admits).to eq([[:monolith, :admit, 2]])
         ensure
@@ -118,17 +130,18 @@ RSpec.describe Timekeeping::Handoff::Runner do
           expect(baseline).to eq([2, "monolith", "settle"])
           expect(incomplete_check_admits).to be_empty
 
-          # "Assert that progress does not advance, neither owner is admitted, and abort also refuses to reopen
-          # writes until completion."
+          # An abort waits for the incomplete step; interrupted while waiting, it reopens no writes.
           expect do
-            described_class.run(direction: :cutover, abort: true, owners:, report_root:, clock:)
-          end.to raise_error(Timekeeping::Handoff::Runner::Refused)
+            described_class.run(direction: :cutover, abort: true, owners:, report_root:, clock:,
+                                sleeper: incomplete_check_interrupting_sleeper)
+          end.to raise_error(incomplete_check_abort_interrupted)
           expect(incomplete_check_row_state).to eq(baseline)
           expect(incomplete_check_admits).to be_empty
 
           # Once the operation is gone, the same abort completes and the outgoing owner reopens exactly once.
           connection.execute("DELETE FROM invoice_operations WHERE operation_id = '#{operation_id}'")
-          described_class.run(direction: :cutover, abort: true, owners:, report_root:, clock:)
+          described_class.run(direction: :cutover, abort: true, owners:, report_root:, clock:,
+                              sleeper: incomplete_check_no_wait_sleeper)
           expect(incomplete_check_row_state).to eq([2, "monolith", nil])
           expect(incomplete_check_admits).to eq([[:monolith, :admit, 2]])
         ensure
@@ -180,17 +193,18 @@ RSpec.describe Timekeeping::Handoff::Runner do
       expect(incomplete_check_admits).to be_empty
       expect(Timekeeping::Handoff::ReportDirectory.new(root: rollback_root, generation: 3).money_before?).to be(false)
 
-      # "Assert that progress does not advance, neither owner is admitted, and abort also refuses to reopen
-      # writes until completion."
+      # An abort waits for the incomplete step; interrupted while waiting, it reopens no writes.
       expect do
-        described_class.run(direction: :rollback, abort: true, owners:, report_root: rollback_root, clock:)
-      end.to raise_error(Timekeeping::Handoff::Runner::Refused)
+        described_class.run(direction: :rollback, abort: true, owners:, report_root: rollback_root, clock:,
+                            sleeper: incomplete_check_interrupting_sleeper)
+      end.to raise_error(incomplete_check_abort_interrupted)
       expect(incomplete_check_row_state).to eq(baseline)
       expect(incomplete_check_admits).to be_empty
 
       # Once settlement completes, the same abort finishes and Timekeeping, the outgoing owner, reopens once.
       switchable_settle.settled = true
-      described_class.run(direction: :rollback, abort: true, owners:, report_root: rollback_root, clock:)
+      described_class.run(direction: :rollback, abort: true, owners:, report_root: rollback_root, clock:,
+                          sleeper: incomplete_check_no_wait_sleeper)
       expect(incomplete_check_row_state).to eq([3, "timekeeping", nil])
       expect(incomplete_check_admits).to eq([[:timekeeping, :admit, 3]])
     end
@@ -242,17 +256,18 @@ RSpec.describe Timekeeping::Handoff::Runner do
       expect(baseline).to eq([3, "timekeeping", "settle"])
       expect(incomplete_check_admits).to be_empty
 
-      # "Assert that progress does not advance, neither owner is admitted, and abort also refuses to reopen
-      # writes until completion."
+      # An abort waits for the incomplete step; interrupted while waiting, it reopens no writes.
       expect do
-        described_class.run(direction: :rollback, abort: true, owners:, report_root: rollback_root, clock:)
-      end.to raise_error(Timekeeping::Handoff::Runner::Refused)
+        described_class.run(direction: :rollback, abort: true, owners:, report_root: rollback_root, clock:,
+                            sleeper: incomplete_check_interrupting_sleeper)
+      end.to raise_error(incomplete_check_abort_interrupted)
       expect(incomplete_check_row_state).to eq(baseline)
       expect(incomplete_check_admits).to be_empty
 
       # Once the drain completes, the same abort finishes and Timekeeping, the outgoing owner, reopens once.
       stalled_relay.stalled = false
-      described_class.run(direction: :rollback, abort: true, owners:, report_root: rollback_root, clock:)
+      described_class.run(direction: :rollback, abort: true, owners:, report_root: rollback_root, clock:,
+                          sleeper: incomplete_check_no_wait_sleeper)
       expect(incomplete_check_row_state).to eq([3, "timekeeping", nil])
       expect(incomplete_check_admits).to eq([[:timekeeping, :admit, 3]])
     end

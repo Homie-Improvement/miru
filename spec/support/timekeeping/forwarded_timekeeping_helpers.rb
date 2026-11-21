@@ -10,25 +10,21 @@ FORWARDED_TIMEKEEPING_BASE_URL = "http://timekeeping.test"
 module TimekeepingForwardingHelpers
   # Puts the ownership row and the fake in owner_state, registers the company,
   # each user with its role and the project on the fake, and routes HTTP for
-  # base_url to it. users maps a user to its role. With no owner_state, it
-  # hands ownership to Timekeeping at generation 2 on both sides; with one, as
-  # in a regression run, the row keeps that state so the run proves the state
-  # it selected.
+  # base_url to it. users maps a user to its role. owner_state defaults to the
+  # state selected for the run, so a regression run proves the state it
+  # selected; with no state selected, the row is put in the timekeeping state,
+  # which gives Timekeeping ownership at generation 2 on both sides.
   #
   # While TimekeepingRegressionAdapter runs, the live app owns the connection:
-  # nothing is registered on the fake and no HTTP is routed to it, so a spec
-  # cannot pass while its requests silently reach the fake.
+  # only the ownership row is written, and the fake is never called, so a spec
+  # cannot pass while its requests or generation silently reach the fake.
   def arrange_forwarded_timekeeping(fake, company:, users:, project:, base_url: FORWARDED_TIMEKEEPING_BASE_URL,
                                     owner_state: TimekeepingOwnerState::SELECTED)
-    if owner_state
-      TimekeepingOwnerState.apply!(owner_state)
-      fake.generation = TimekeepingOwnerState.fetch(owner_state).fetch(:generation)
-    else
-      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
-      fake.generation = 2
-    end
+    state_name = owner_state || "timekeeping"
+    TimekeepingOwnerState.apply!(state_name)
     return if TimekeepingRegressionAdapter.current
 
+    fake.generation = TimekeepingOwnerState.fetch(state_name).fetch(:generation)
     fake.register_company(id: company.id, edit_days: company.timesheet_edit_days)
     users.each { |user, role| fake.register_user(id: user.id, company_id: company.id, role:) }
     fake.register_project(id: project.id, company_id: company.id)
@@ -75,14 +71,17 @@ module TimekeepingForwardingHelpers
     fake.outbox.map { |row| row.fetch("entry").fetch("id") }.uniq.size
   end
 
-  # Moves the generation Timekeeping admits writes at, on the fake and, while
-  # TimekeepingRegressionAdapter runs, in the live admission row. The live
+  # Moves the generation Timekeeping admits writes at: on the fake, or, while
+  # TimekeepingRegressionAdapter runs, in the live admission row only, so the
+  # fake is never called while the live app owns the connection. The live
   # database is reset to the state's generation before every example, so the
   # change ends with the example. After that reset no settle step or held
   # generation is open, so this update matches Timekeeping::Admission.admit!.
   def admit_forwarded_generation(fake, generation)
-    fake.generation = generation
-    return unless TimekeepingRegressionAdapter.current
+    unless TimekeepingRegressionAdapter.current
+      fake.generation = generation
+      return
+    end
 
     with_live_timekeeping_database do |connection|
       result = connection.exec_params("UPDATE admission SET generation = $1 WHERE id = $2",
@@ -110,10 +109,11 @@ module TimekeepingForwardingHelpers
 
   private
 
-    # The adapter refused to start unless this URL names a test database, so
-    # no other database can be read or written here.
+    # The adapter refused to start unless its URL names a test database, so
+    # no other database can be read or written here. The URL is the one the
+    # running adapter checked, not a fresh read of the environment.
     def with_live_timekeeping_database
-      connection = PG.connect(ENV.fetch(TimekeepingRegressionAdapter::DATABASE_URL_KEY))
+      connection = PG.connect(TimekeepingRegressionAdapter.database_url)
       yield connection
     ensure
       connection&.close

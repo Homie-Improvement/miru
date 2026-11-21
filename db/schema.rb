@@ -814,6 +814,21 @@ ActiveRecord::Schema[8.1].define(version: 2026_11_21_120000) do
     t.index ["company_id", "operation_id"], name: "index_legacy_entry_releases_on_company_operation", unique: true
   end
 
+  create_table "legacy_entry_write_receipts", force: :cascade do |t|
+    t.bigint "company_id", null: false
+    t.string "actor_kind", null: false
+    t.bigint "actor_id", null: false
+    t.string "operation", null: false
+    t.string "key", null: false
+    t.string "fingerprint", null: false
+    t.bigint "timesheet_entry_id", null: false
+    t.jsonb "entry_attributes", null: false
+    t.datetime "created_at", null: false
+    t.datetime "expires_at", null: false
+    t.index ["company_id", "actor_kind", "actor_id", "operation", "key"], name: "index_legacy_entry_write_receipts_on_scope_and_key", unique: true
+    t.index ["expires_at"], name: "index_legacy_entry_write_receipts_on_expires_at"
+  end
+
   create_table "mcp_idempotency_records", force: :cascade do |t|
     t.datetime "created_at", null: false
     t.datetime "expires_at", null: false
