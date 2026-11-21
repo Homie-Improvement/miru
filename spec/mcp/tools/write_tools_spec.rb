@@ -13,6 +13,8 @@ RSpec.describe "MCP write tools" do
 
   describe "dry_run safety behavior" do
     it "returns write preview for miru.time.create and sanitizes source metadata" do
+      expect_owner_state!
+
       response = MCP::Miru::Tools::TimeCreateTool.call(
         project_id: 1,
         duration_minutes: 30,
@@ -40,6 +42,8 @@ RSpec.describe "MCP write tools" do
     end
 
     it "returns write preview for miru.time.update" do
+      expect_owner_state!
+
       response = MCP::Miru::Tools::TimeUpdateTool.call(
         id: 10,
         project_id: 2,
@@ -61,6 +65,8 @@ RSpec.describe "MCP write tools" do
     end
 
     it "returns write preview for miru.time.delete" do
+      expect_owner_state!
+
       response = MCP::Miru::Tools::TimeDeleteTool.call(id: 77, dry_run: true, server_context:)
 
       payload = JSON.parse(response.content.first.fetch(:text))
@@ -70,6 +76,8 @@ RSpec.describe "MCP write tools" do
     end
 
     it "returns write preview for miru.expense.create" do
+      expect_owner_state!
+
       response = MCP::Miru::Tools::ExpenseCreateTool.call(
         amount: 19.99,
         date: "2026-04-22",
@@ -86,6 +94,8 @@ RSpec.describe "MCP write tools" do
     end
 
     it "returns write preview for miru.invoice.create" do
+      expect_owner_state!
+
       response = MCP::Miru::Tools::InvoiceCreateTool.call(
         client_id: 42,
         invoice_number: "INV-MCP-001",
@@ -120,6 +130,8 @@ RSpec.describe "MCP write tools" do
     end
 
     it "compacts recipient list for miru.invoice.send" do
+      expect_owner_state!
+
       response = MCP::Miru::Tools::InvoiceSendTool.call(
         id: 123,
         recipients: ["billing@example.com", nil, ""],
@@ -149,6 +161,7 @@ RSpec.describe "MCP write tools" do
     it "uses idempotency store and normalized bearer token for write calls" do
       allow(MCP::Miru::ApiProxy).to receive(:request).and_return(result)
       allow(MCP::Miru::IdempotencyStore).to receive(:fetch).and_call_original
+      expect_owner_state!
 
       response = MCP::Miru::Tools::TimeCreateTool.call(
         project_id: 1,
@@ -169,6 +182,7 @@ RSpec.describe "MCP write tools" do
 
     it "skips idempotency store for dry_run writes" do
       allow(MCP::Miru::IdempotencyStore).to receive(:fetch)
+      expect_owner_state!
 
       MCP::Miru::Tools::TimeDeleteTool.call(
         id: 5,
@@ -182,6 +196,7 @@ RSpec.describe "MCP write tools" do
 
     it "returns stable write error code without leaking exception text" do
       allow(MCP::Miru::IdempotencyStore).to receive(:fetch).and_raise(StandardError, "sensitive upstream detail")
+      expect_owner_state!
 
       response = MCP::Miru::Tools::TimeCreateTool.call(
         project_id: 1,
