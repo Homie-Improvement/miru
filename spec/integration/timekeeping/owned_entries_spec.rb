@@ -1290,3 +1290,61 @@ RSpec.describe "owned_entries against the live Timekeeping app", :without_transa
     expect(entries.first.fetch("locked")).to be(false)
   end
 end
+
+RSpec.describe "arrange_owned_entries with proof metadata", committed_data: true do
+  it "each state keeps a row's proof metadata in the owner and the projection, and defaults it to an empty hash" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    project = create(:project, billable: true, client: create(:client, company:))
+    proof_metadata = { "artifact" => "build-log" }
+    loaded_rows = []
+    store = Object.new
+    store.define_singleton_method(:fence_admission) { nil }
+    store.define_singleton_method(:load_checkpoint) { |checkpoint| loaded_rows.replace(checkpoint.rows.fetch("entries")) }
+    store.define_singleton_method(:advance_entry_id_sequence) { |above:| above + 1 }
+    store.define_singleton_method(:admit) { |generation:| nil }
+    projection_proof = ->(id) { TimesheetEntry.unscoped.find(id).proof_metadata }
+    rows = [{ company:, user:, project:, proof_metadata: }, { company:, user:, project: }]
+
+    legacy_id, legacy_plain_id = arrange_owned_entries(rows, state: "legacy")
+    expect(owned_entry(legacy_id, state: "legacy").fetch("proof_metadata")).to eq(proof_metadata)
+    expect(owned_entry(legacy_plain_id, state: "legacy").fetch("proof_metadata")).to eq({})
+
+    rollback_id, rollback_plain_id = arrange_owned_entries(rows, state: "rollback")
+    expect(owned_entry(rollback_id, state: "rollback").fetch("proof_metadata")).to eq(proof_metadata)
+    expect(owned_entry(rollback_plain_id, state: "rollback").fetch("proof_metadata")).to eq({})
+    expect(projection_proof.call(rollback_id)).to eq(proof_metadata)
+    expect(projection_proof.call(rollback_plain_id)).to eq({})
+
+    timekeeping_id, timekeeping_plain_id = arrange_owned_entries(rows, state: "timekeeping", timekeeping_store: store)
+    loaded = loaded_rows.index_by { |row| row.fetch("id") }
+    expect(loaded.fetch(timekeeping_id).fetch("proof_metadata")).to eq(proof_metadata)
+    expect(loaded.fetch(timekeeping_plain_id).fetch("proof_metadata")).to eq({})
+    expect(projection_proof.call(timekeeping_id)).to eq(proof_metadata)
+    expect(projection_proof.call(timekeeping_plain_id)).to eq({})
+  end
+end
+
+RSpec.describe "arrange_owned_entries with proof metadata against the live Timekeeping app", :without_transaction,
+  committed_data: true do
+  it "live timekeeping state arranges a row whose proof metadata the Timekeeping app and the projection hold" do
+    unless ENV["TIMEKEEPING_REGRESSION"] == "1" && ENV["TIMEKEEPING_LIVE"] == "1"
+      skip "Set TIMEKEEPING_REGRESSION=1 and TIMEKEEPING_LIVE=1 to run against the live Timekeeping app"
+    end
+    unless TimekeepingRegressionAdapter.current
+      skip "The live adapter is not running: select the timekeeping owner state and a _test TIMEKEEPING_DATABASE_URL"
+    end
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role(:admin, company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    proof_metadata = { "artifact" => "build-log" }
+
+    entry_id, = arrange_owned_entries([{ company:, user:, project:, proof_metadata: }], state: "timekeeping")
+
+    expect(owned_entry(entry_id, state: "timekeeping").fetch("proof_metadata")).to eq(proof_metadata)
+    expect(TimesheetEntry.unscoped.find(entry_id).proof_metadata).to eq(proof_metadata)
+  end
+end

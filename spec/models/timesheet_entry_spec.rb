@@ -42,9 +42,26 @@ RSpec.describe TimesheetEntry, type: :model do
   let(:project) { create(:project, client_id: client.id) }
   let(:project2) { create(:project, client_id: client2.id) }
   let(:billable_project) { create(:project, billable: true, client_id: client.id) }
-  let(:timesheet_entry) { create(:timesheet_entry, project:) }
+  # The values the timesheet_entry factory gives, so the entry arranged in the
+  # owning store is the one create(:timesheet_entry, project:) made.
+  let(:entry_row) do
+    { company:, user: create(:user), project:, work_date: Date.current, duration: 480.0, note: "Did that",
+      bill_status: "non_billable" }
+  end
+  let(:timesheet_entry) { arrange_model_entry }
+
+  # Arranges one entry, with changes applied to entry_row, in the store that
+  # owns entries, and returns its timesheet_entries record for the model
+  # operation under test.
+  def arrange_model_entry(**changes)
+    described_class.find(arrange_owned_entries([entry_row.merge(changes)]).first)
+  end
 
   describe "Associations" do
+    # These one-line matchers read no stored entry, so the hook is the last
+    # step before each matcher runs.
+    before { expect_owner_state! }
+
     it { is_expected.to belong_to(:user) }
     it { is_expected.to belong_to(:project) }
     it { is_expected.to belong_to(:agent).optional }
@@ -52,6 +69,10 @@ RSpec.describe TimesheetEntry, type: :model do
   end
 
   describe "Validations" do
+    # Every example here checks a built record and reads no stored entry, so
+    # the hook is the last step before each check.
+    before { expect_owner_state! }
+
     it { is_expected.to validate_presence_of(:duration) }
     it { is_expected.to validate_presence_of(:work_date) }
     it { is_expected.to validate_presence_of(:bill_status) }
@@ -104,6 +125,8 @@ RSpec.describe TimesheetEntry, type: :model do
   end
 
   describe "Callbacks" do
+    before { expect_owner_state! }
+
     it { is_expected.to callback(:ensure_bill_status_is_set).before(:validation) }
     it { is_expected.to callback(:ensure_bill_status_is_not_billed).before(:validation) }
     it { is_expected.to callback(:ensure_billed_status_should_not_be_changed).before(:validation) }
@@ -153,27 +176,38 @@ RSpec.describe TimesheetEntry, type: :model do
   end
 
   describe "Scopes" do
-    before do
-      @timesheet_entry1 = create(:timesheet_entry, project:)
-      @timesheet_entry2 = create(:timesheet_entry, project_id: project2.id)
-      @timesheet_entry3 = create(:timesheet_entry, project_id: project2.id)
+    # Two entries on company's project and two on company2's, each with its own
+    # user as the factory gives, arranged in one call.
+    let!(:scope_entry_ids) do
+      company2_row = entry_row.merge(company: company2, project: project2)
+      arrange_owned_entries(
+        [entry_row, entry_row, company2_row, company2_row].map { |row| row.merge(user: create(:user)) }
+      )
     end
+    let(:timesheet_entry) { described_class.find(scope_entry_ids[0]) }
+    let(:timesheet_entry1) { described_class.find(scope_entry_ids[1]) }
+    let(:timesheet_entry2) { described_class.find(scope_entry_ids[2]) }
+    let(:timesheet_entry3) { described_class.find(scope_entry_ids[3]) }
 
     describe ".in_workspace" do
       it "returns timesheet entries that are associated with project 1" do
-        expect(described_class.in_workspace(company)).to include(timesheet_entry, @timesheet_entry1)
-        expect(described_class.in_workspace(company)).not_to include(@timesheet_entry2, @timesheet_entry3)
+        expect_owner_state!
+        expect(described_class.in_workspace(company)).to include(timesheet_entry, timesheet_entry1)
+        expect(described_class.in_workspace(company)).not_to include(timesheet_entry2, timesheet_entry3)
       end
 
       it "excludes timesheet entries that are associated with project 1" do
-        expect(described_class.in_workspace(company2)).not_to include(timesheet_entry, @timesheet_entry1)
-        expect(described_class.in_workspace(company2)).to include(@timesheet_entry2, @timesheet_entry3)
+        expect_owner_state!
+        expect(described_class.in_workspace(company2)).not_to include(timesheet_entry, timesheet_entry1)
+        expect(described_class.in_workspace(company2)).to include(timesheet_entry2, timesheet_entry3)
       end
     end
   end
 
   describe "#snippet" do
     it "returns proper data" do
+      timesheet_entry
+      expect_owner_state!
       expect(timesheet_entry.snippet).to eq(
         {
           id: timesheet_entry.id,
@@ -199,6 +233,7 @@ RSpec.describe TimesheetEntry, type: :model do
     end
 
     it "declares proof_url as a typed attribute" do
+      expect_owner_state!
       expect(described_class.attribute_types["proof_url"]).to be_a(ActiveModel::Type::String)
     end
   end
@@ -210,6 +245,7 @@ RSpec.describe TimesheetEntry, type: :model do
       agent = create(:agent, company:, user: agent_user)
       entry = build(:timesheet_entry, project: billable_project, user: agent_user, agent:)
 
+      expect_owner_state!
       entry.valid?
 
       expect(entry.review_status).to eq("pending_review")
@@ -218,6 +254,7 @@ RSpec.describe TimesheetEntry, type: :model do
     it "keeps human entries as not required" do
       entry = build(:timesheet_entry, project: billable_project, user: timesheet_entry.user)
 
+      expect_owner_state!
       entry.valid?
 
       expect(entry.review_status).to eq("not_required")
@@ -226,6 +263,8 @@ RSpec.describe TimesheetEntry, type: :model do
 
   describe "proof metadata normalization" do
     it "normalizes values into a bounded top-level hash" do
+      timesheet_entry
+      expect_owner_state!
       timesheet_entry.assign_attributes(
         proof_metadata: {
           artifact: "build-log",
@@ -248,6 +287,8 @@ RSpec.describe TimesheetEntry, type: :model do
 
   describe "source normalization" do
     it "preserves the explicit import source when tool metadata is present" do
+      timesheet_entry
+      expect_owner_state!
       timesheet_entry.assign_attributes(source: "import", source_metadata: { tool: "harvest" })
       timesheet_entry.valid?
 
@@ -255,6 +296,8 @@ RSpec.describe TimesheetEntry, type: :model do
     end
 
     it "normalizes blank and unknown sources to manual" do
+      timesheet_entry
+      expect_owner_state!
       timesheet_entry.assign_attributes(source: "unknown", source_metadata: { tool: "", skill: nil, extra: "ignore-me" })
       timesheet_entry.valid?
 
@@ -264,6 +307,8 @@ RSpec.describe TimesheetEntry, type: :model do
     end
 
     it "builds readable labels for AI-assisted entries" do
+      timesheet_entry
+      expect_owner_state!
       timesheet_entry.assign_attributes(
         source: "automation",
         source_metadata: {
@@ -278,6 +323,8 @@ RSpec.describe TimesheetEntry, type: :model do
     end
 
     it "persists only allowlisted source metadata keys" do
+      timesheet_entry
+      expect_owner_state!
       timesheet_entry.assign_attributes(
         source: "mcp",
         source_metadata: {
@@ -298,7 +345,9 @@ RSpec.describe TimesheetEntry, type: :model do
 
     it "truncates source metadata values to the supported length" do
       long_value = "x" * 140
+      timesheet_entry
 
+      expect_owner_state!
       timesheet_entry.assign_attributes(
         source: "mcp",
         source_metadata: { tool: long_value }
@@ -309,6 +358,7 @@ RSpec.describe TimesheetEntry, type: :model do
     end
 
     it "gives a forwarded write the same source fields a save stores" do
+      expect_owner_state!
       fields = described_class.normalized_source_fields(
         source: "cli", source_metadata: { "tool" => " codex ", mcp_server: "miru", extra: "drop-me", skill: "" }
       )
@@ -336,8 +386,9 @@ RSpec.describe TimesheetEntry, type: :model do
 
   describe "auditing" do
     it "records an audit when tracked attributes change" do
-      entry = create(:timesheet_entry, project:, note: "Initial note", duration: 60)
+      entry = arrange_model_entry(note: "Initial note", duration: 60)
 
+      expect_owner_state!
       expect do
         entry.update!(note: "Updated note", duration: 90)
       end.to change { Audited::Audit.count }.by(1)
@@ -349,8 +400,9 @@ RSpec.describe TimesheetEntry, type: :model do
     end
 
     it "records audits for structured source metadata changes" do
-      entry = create(:timesheet_entry, project:, source_metadata: { "tool" => "codex" })
+      entry = arrange_model_entry(source_metadata: { "tool" => "codex" })
 
+      expect_owner_state!
       expect do
         entry.update!(source_metadata: { "tool" => "claude-code", "mcp_server" => "github" })
       end.to change { Audited::Audit.count }.by(1)
@@ -363,8 +415,9 @@ RSpec.describe TimesheetEntry, type: :model do
     end
 
     it "records audits for proof metadata changes" do
-      entry = create(:timesheet_entry, project:, proof_metadata: { "artifact" => "build-log" })
+      entry = arrange_model_entry(proof_metadata: { "artifact" => "build-log" })
 
+      expect_owner_state!
       expect do
         entry.update!(proof_metadata: { "artifact" => "screenshot", "attempts" => 2 })
       end.to change { Audited::Audit.count }.by(1)
@@ -377,8 +430,9 @@ RSpec.describe TimesheetEntry, type: :model do
     end
 
     it "records an audit when the entry is discarded" do
-      entry = create(:timesheet_entry, project:)
+      entry = arrange_model_entry
 
+      expect_owner_state!
       expect do
         entry.discard!
       end.to change { Audited::Audit.count }.by(1)
@@ -393,6 +447,7 @@ RSpec.describe TimesheetEntry, type: :model do
 
     it "returns an error if project is created with billed status" do
       timesheet_entry = build(:timesheet_entry, bill_status: "billed")
+      expect_owner_state!
       expect(timesheet_entry.valid?).to be_falsey
       expect(timesheet_entry.errors.messages[:timesheet_entry]).to eq([error_message])
     end
@@ -404,6 +459,7 @@ RSpec.describe TimesheetEntry, type: :model do
     context "when the project is non-billable" do
       it "returns an error if project is non billable and user try to create unbilled entry" do
         timesheet_entry = build(:timesheet_entry, bill_status: "unbilled")
+        expect_owner_state!
         expect(timesheet_entry.valid?).to be_falsey
         expect(timesheet_entry.errors.messages[:base]).to include(error_message)
       end
@@ -412,6 +468,7 @@ RSpec.describe TimesheetEntry, type: :model do
     context "when the project is billable" do
       it "does not return an error if the user tries to create an unbilled entry" do
         timesheet_entry = build(:timesheet_entry, bill_status: "unbilled", project: billable_project)
+        expect_owner_state!
         expect(timesheet_entry.valid?).to be_truthy
         expect(timesheet_entry.errors.messages[:base]).not_to include(error_message)
       end
@@ -427,11 +484,13 @@ RSpec.describe TimesheetEntry, type: :model do
       end
 
       let(:admin) { create(:user) }
-      let(:timesheet_entry) { create(:timesheet_entry, project: billable_project) }
 
       context "when time entry is billed" do
+        let(:timesheet_entry) { arrange_model_entry(project: billable_project, bill_status: "billed") }
+
         it "allows owners and admins to edit the billed time entry" do
-          timesheet_entry.update!(bill_status: "billed")
+          timesheet_entry
+          expect_owner_state!
           timesheet_entry.update(bill_status: "unbilled")
 
           expect(timesheet_entry.valid?).to be_truthy
@@ -441,13 +500,12 @@ RSpec.describe TimesheetEntry, type: :model do
       end
 
       context "when time entry is non billable" do
-        before do
-          timesheet_entry.update!(bill_status: "non_billable")
-        end
+        let(:timesheet_entry) { arrange_model_entry(project: billable_project, bill_status: "non_billable") }
 
         it "allows owners and admins to edit the non billable time entry to unbilled" do
           expect(timesheet_entry.bill_status).to eq("non_billable")
 
+          expect_owner_state!
           timesheet_entry.update(bill_status: "unbilled")
 
           expect(timesheet_entry.valid?).to be_truthy
@@ -457,13 +515,12 @@ RSpec.describe TimesheetEntry, type: :model do
       end
 
       context "when time entry is unbilled" do
-        before do
-          timesheet_entry.update!(bill_status: "unbilled")
-        end
+        let(:timesheet_entry) { arrange_model_entry(project: billable_project, bill_status: "unbilled") }
 
         it "allows owners and admins to edit the unbilled time entry to non billable" do
           expect(timesheet_entry.bill_status).to eq("unbilled")
 
+          expect_owner_state!
           timesheet_entry.update(bill_status: "non_billable")
 
           expect(timesheet_entry.valid?).to be_truthy
@@ -481,12 +538,15 @@ RSpec.describe TimesheetEntry, type: :model do
       end
 
       let(:user) { create(:user) }
-      let(:timesheet_entry) { create(:timesheet_entry, project: billable_project) }
+      let(:timesheet_entry) { arrange_model_entry(project: billable_project) }
       let(:error_message) { "You can't bill an entry that has already been billed" }
 
       context "when time entry is billed" do
+        let(:timesheet_entry) { arrange_model_entry(project: billable_project, bill_status: "billed") }
+
         it "does not allow to update billed time entry to employee" do
-          timesheet_entry.update!(bill_status: "billed")
+          timesheet_entry
+          expect_owner_state!
           timesheet_entry.update(bill_status: "unbilled")
 
           expect(timesheet_entry.valid?).to be_falsy
@@ -496,6 +556,8 @@ RSpec.describe TimesheetEntry, type: :model do
 
       context "when time entry is not billed" do
         it "allows employee to change non billed time entries" do
+          timesheet_entry
+          expect_owner_state!
           timesheet_entry.update(bill_status: "unbilled")
 
           expect(timesheet_entry.valid?).to be_truthy
@@ -508,7 +570,7 @@ RSpec.describe TimesheetEntry, type: :model do
   describe "#prevent_edit_if_locked" do
     let(:admin) { create(:user) }
     let(:employee) { create(:user) }
-    let(:timesheet_entry) { create(:timesheet_entry, project: billable_project, locked: true) }
+    let(:timesheet_entry) { arrange_model_entry(project: billable_project, locked: true) }
 
     before do
       admin.add_role(:admin, company)
@@ -522,6 +584,8 @@ RSpec.describe TimesheetEntry, type: :model do
       end
 
       it "does not allow the employee to edit the locked timesheet entry" do
+        timesheet_entry
+        expect_owner_state!
         timesheet_entry.update(duration: 10)
 
         expect(timesheet_entry.errors[:base]).to include("Cannot edit a locked timesheet entry. Please contact admin.")
@@ -534,6 +598,8 @@ RSpec.describe TimesheetEntry, type: :model do
       end
 
       it "allows the admin to edit the locked timesheet entry" do
+        timesheet_entry
+        expect_owner_state!
         timesheet_entry.update(duration: 10)
 
         expect(timesheet_entry.errors[:base]).not_to include(
