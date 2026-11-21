@@ -8,9 +8,9 @@ require "tmpdir"
 
 # Section 12.4 scenarios of docs/architecture/timekeeping-soa.md, run against
 # the live demo runtime (spec/support/timekeeping/integrated_runtime.rb) with
-# real handoffs through Timekeeping::Handoff::Runner.configured_owners. Each
-# example needs TIMEKEEPING_LIVE=1 and TIMEKEEPING_DATABASE_URL; the runtime
-# hook skips it otherwise.
+# real handoffs through Timekeeping::Handoff::Runner.configured_owners. The
+# runtime hook skips each example unless the live flag that hook checks and
+# TIMEKEEPING_DATABASE_URL are set.
 #
 # Ownership is one global row, so every example arranges both seeded
 # companies first, makes each handoff, fence or abort once, and only then
