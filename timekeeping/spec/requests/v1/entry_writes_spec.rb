@@ -336,24 +336,24 @@ RSpec.describe "Entry write routes" do
   end
 
   context "more tests 2" do
-  # "A forwarded create that Timekeeping refuses, or that is replayed from a stored idempotency receipt, raises no event"
-  # The monolith can only skip the event for a replay if Timekeeping says the answer came from its receipt.
-  it "marks a create answered from its stored receipt with Idempotency-Replayed true and the first answer without it" do
-    key = SecureRandom.uuid
+    # "A forwarded create that Timekeeping refuses, or that is replayed from a stored idempotency receipt, raises no event"
+    # The monolith can only skip the event for a replay if Timekeeping says the answer came from its receipt.
+    it "marks a create answered from its stored receipt with Idempotency-Replayed true and the first answer without it" do
+      key = SecureRandom.uuid
 
-    first = send_write(:post, entries_path, employee_token, entry_body, key:)
-    first_status = first.status
-    first_header = first.headers["Idempotency-Replayed"]
-    first_body = first.body
-    after_first = entry_write_counts
+      first = send_write(:post, entries_path, employee_token, entry_body, key:)
+      first_status = first.status
+      first_header = first.headers["Idempotency-Replayed"]
+      first_body = first.body
+      after_first = entry_write_counts
 
-    replay = send_write(:post, entries_path, employee_token, entry_body, key:)
+      replay = send_write(:post, entries_path, employee_token, entry_body, key:)
 
-    expect([first_status, first_header]).to eq([201, nil])
-    expect([replay.status, replay.headers["Idempotency-Replayed"]]).to eq([201, "true"])
-    expect(replay.body).to eq(first_body)
-    expect(entry_write_counts).to eq(after_first)
-  end
+      expect([first_status, first_header]).to eq([201, nil])
+      expect([replay.status, replay.headers["Idempotency-Replayed"]]).to eq([201, "true"])
+      expect(replay.body).to eq(first_body)
+      expect(entry_write_counts).to eq(after_first)
+    end
   end
 
   # The receipt's unique index backs up the key lock; a writer that hits it

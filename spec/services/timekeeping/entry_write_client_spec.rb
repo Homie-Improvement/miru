@@ -45,26 +45,26 @@ RSpec.describe Timekeeping::EntryWriteClient do
   end
 
   context "more tests 2" do
-  it "reports a create answered with Idempotency-Replayed true as replayed and one answered without it as fresh" do
-    row = { "id" => 4242, "company_id" => write_client_company.id, "user_id" => write_client_admin.id }
-    stub_request(:post, write_client_create_url).to_return(
-      { status: 201, body: row.to_json, headers: { "Content-Type" => "application/json" } },
-      { status: 201, body: row.to_json,
-        headers: { "Content-Type" => "application/json", "Idempotency-Replayed" => "true" } }
-    )
-    body = { "project_id" => 1, "work_date" => Date.current.iso8601, "duration" => 30, "note" => "x",
-             "source" => "manual", "source_metadata" => {} }
+    it "reports a create answered with Idempotency-Replayed true as replayed and one answered without it as fresh" do
+      row = { "id" => 4242, "company_id" => write_client_company.id, "user_id" => write_client_admin.id }
+      stub_request(:post, write_client_create_url).to_return(
+        { status: 201, body: row.to_json, headers: { "Content-Type" => "application/json" } },
+        { status: 201, body: row.to_json,
+          headers: { "Content-Type" => "application/json", "Idempotency-Replayed" => "true" } }
+      )
+      body = { "project_id" => 1, "work_date" => Date.current.iso8601, "duration" => 30, "note" => "x",
+               "source" => "manual", "source_metadata" => {} }
 
-    answers = with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
-      client = described_class.new(base_url: write_client_base_url)
-      [client.create_entry(context: write_client_context, generation: 2, body:),
-       client.create_entry(context: write_client_context, generation: 2, body:)]
+      answers = with_timekeeping_env(Timekeeping::UserToken::PRIVATE_KEY_ENV, timekeeping_key_pair.to_pem) do
+        client = described_class.new(base_url: write_client_base_url)
+        [client.create_entry(context: write_client_context, generation: 2, body:),
+         client.create_entry(context: write_client_context, generation: 2, body:)]
+      end
+
+      # "A forwarded create that Timekeeping refuses, or that is replayed from a stored idempotency receipt, raises no event"
+      expect(answers.map(&:replayed)).to eq([false, true])
+      expect(answers.map { |answer| answer.row["id"] }).to eq([4242, 4242])
     end
-
-    # "A forwarded create that Timekeeping refuses, or that is replayed from a stored idempotency receipt, raises no event"
-    expect(answers.map(&:replayed)).to eq([false, true])
-    expect(answers.map { |answer| answer.row["id"] }).to eq([4242, 4242])
-  end
   end
 end
 

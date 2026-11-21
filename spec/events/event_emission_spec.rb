@@ -146,4 +146,21 @@ RSpec.describe "Event emission" do
     expect(payload).to eq(actor: { id: actor.id, type: "User" }, data: { client_id: Client.last.id, company_id: company.id })
     expect(payload.to_json).not_to include("Secret Co")
   end
+
+  context "more tests 2" do
+    it "reports TimesheetEntries::Created through notify_created with the given actor and the entry's data" do
+      project = create(:project, client:)
+      ambient_user = create(:user)
+      request_actor = create(:user)
+      Current.user = ambient_user
+      entry = TimesheetEntry.new(id: 9301, project:, user: request_actor, duration: 45.0, work_date: Date.current)
+
+      event = assert_event_reported("TimesheetEntries::Created") { entry.notify_created(actor: request_actor) }
+
+      expect(event[:payload].to_h).to eq(
+        actor: { id: request_actor.id, type: "User" },
+        data: { timesheet_entry_id: 9301, project_id: project.id, user_id: request_actor.id, duration: 45.0 }
+      )
+    end
+  end
 end
