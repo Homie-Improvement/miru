@@ -25,6 +25,7 @@ RSpec.describe "forwarded Timekeeping setup helpers" do
   # keep all of them, or forwarded imports in the migrated groups stop reaching the fake.
   # What a forwarded import then sends is checked by the importer and job specs, not here.
   it "arrange_forwarded_timekeeping hands ownership to the fake at generation 2 and routes Timekeeping HTTP to it" do
+    stub_const("TimekeepingOwnerState::SELECTED", nil)
     %i[register_company register_user register_project].each do |method|
       allow(arrange_fake).to receive(method).and_call_original
     end
@@ -49,6 +50,7 @@ RSpec.describe "forwarded Timekeeping setup helpers" do
   # Every copied setup this helper replaces set owner "timekeeping" with generation 2 on the ownership row
   # and on the fake, so a generation-bump example that starts from a leftover generation would not bump past it.
   it "resets ownership to timekeeping at generation 2 on both sides even when an earlier step left a later generation" do
+    stub_const("TimekeepingOwnerState::SELECTED", nil)
     TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "monolith", generation: 7)
     arrange_fake.generation = 7
     allow(arrange_fake).to receive(:register_user).and_call_original
@@ -100,6 +102,126 @@ RSpec.describe "forwarded Timekeeping setup helpers" do
     ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
     expect(ownership).to have_attributes(owner: "monolith", monolith_store: "prepared", generation: 3)
     expect(arrange_fake.generation).to eq(3)
+  end
+
+  context "more tests 10" do
+    it "arrange_forwarded_timekeeping with no state selected stores the full timekeeping row, retired legacy table included, over a leftover prepared row" do
+      stub_const("TimekeepingOwnerState::SELECTED", nil)
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+        .update_columns(owner: "monolith", monolith_store: "prepared", generation: 7, legacy_retired_at: nil)
+      arrange_fake.generation = 7
+
+      arrange_forwarded_timekeeping(arrange_fake, company: arrange_company,
+                                                  users: { arrange_paul => "employee" },
+                                                  project: arrange_project)
+
+      # "arrange_forwarded_timekeeping with no state selected leaves the ownership row equal to the timekeeping state, and its existing contract examples still pass"
+      expect_owner_state!("timekeeping")
+      expect(TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).legacy_retired_at).not_to be_nil
+      expect(arrange_fake.generation).to eq(2)
+    end
+  end
+
+  context "more tests 13" do
+    # "arrange_forwarded_timekeeping with no state selected leaves the ownership row equal to the timekeeping state, and its existing contract examples still pass"
+    it "arrange_forwarded_timekeeping with no state selected leaves the whole ownership row equal to the timekeeping state" do
+      stub_const("TimekeepingOwnerState::SELECTED", nil)
+      # Start from a row that differs from the timekeeping state in every compared column,
+      # so a helper that sets only owner and generation leaves monolith_store and the retired flag wrong.
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+        .update_columns(owner: "monolith", monolith_store: "prepared", generation: 7, legacy_retired_at: nil)
+      arrange_fake.generation = 7
+
+      arrange_forwarded_timekeeping(arrange_fake, company: arrange_company,
+                                                  users: { arrange_paul => "employee" },
+                                                  project: arrange_project)
+
+      # "Add an example to spec/contracts/timekeeping/forwarded_timekeeping_helpers_spec.rb proving that with no state selected the row equals the timekeeping state, so `expect_owner_state!("timekeeping")` passes."
+      expect_owner_state!("timekeeping")
+      expect(TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID))
+        .to have_attributes(owner: "timekeeping", monolith_store: "legacy", generation: 2,
+                            legacy_retired_at: TimekeepingOwnerState::LEGACY_RETIRED_AT)
+      expect(arrange_fake.generation).to eq(2)
+    end
+  end
+
+  context "more tests 16" do
+    it "arrange_forwarded_timekeeping with no state selected still registers the fake and resets a leftover row to timekeeping at generation 2 on both sides" do
+      stub_const("TimekeepingOwnerState::SELECTED", nil)
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+        .update_columns(owner: "monolith", monolith_store: "prepared", generation: 7, legacy_retired_at: nil)
+      arrange_fake.generation = 7
+      allow(arrange_fake).to receive(:register_user).and_call_original
+      allow(arrange_fake).to receive(:register_project).and_call_original
+
+      arrange_forwarded_timekeeping(arrange_fake, company: arrange_company,
+                                                  users: { arrange_paul => "employee" },
+                                                  project: arrange_project)
+
+      # "Keep the existing no-state example there passing: owner timekeeping at generation 2 on both sides."
+      expect(TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID))
+        .to have_attributes(owner: "timekeeping", monolith_store: "legacy", generation: 2)
+      expect(arrange_fake.generation).to eq(2)
+      expect(arrange_fake).to have_received(:register_user)
+        .once.with(id: arrange_paul.id, company_id: arrange_company.id, role: "employee")
+      expect(arrange_fake).to have_received(:register_project)
+        .once.with(id: arrange_project.id, company_id: arrange_company.id)
+    end
+  end
+
+  context "more tests 17" do
+    it "arrange_forwarded_timekeeping with no state selected rewrites a leftover rollback-like row into the full timekeeping state" do
+      stub_const("TimekeepingOwnerState::SELECTED", nil)
+      # An earlier step left the row on the prepared store at a later generation with the legacy table not retired,
+      # so a helper that writes only owner and generation leaves a row matching no named state.
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+        .update_columns(owner: "monolith", monolith_store: "prepared", generation: 7, legacy_retired_at: nil)
+      arrange_fake.generation = 7
+
+      arrange_forwarded_timekeeping(arrange_fake, company: arrange_company,
+                                                  users: { arrange_paul => "employee" },
+                                                  project: arrange_project)
+
+      # "arrange_forwarded_timekeeping with no state selected leaves the ownership row equal to the timekeeping state, and its existing contract examples still pass"
+      expect_owner_state!("timekeeping")
+      expect(TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).legacy_retired_at)
+        .to eq(TimekeepingOwnerState::LEGACY_RETIRED_AT)
+      expect(arrange_fake.generation).to eq(2)
+    end
+  end
+
+  context "more tests 18" do
+    it "arrange_forwarded_timekeeping under the live adapter applies the timekeeping state and sends the fake no message at all" do
+      live = double("live adapter instance", base_url: "http://127.0.0.1:4999", private_key: OpenSSL::PKey::RSA.generate(2048))
+      allow(TimekeepingRegressionAdapter).to receive(:current).and_return(live)
+      # A double with no allowed messages fails the example on any call, a generation write included.
+      untouchable_fake = double("FakeTimekeeping that must not be reached")
+
+      # "in the timekeeping state no example in the file reaches FakeTimekeeping, not only the harvest forwarded examples: every Timekeeping call goes through the regression adapter to the real Timekeeping app"
+      arrange_forwarded_timekeeping(untouchable_fake, company: arrange_company,
+                                                      users: { arrange_paul => "employee" },
+                                                      project: arrange_project,
+                                                      owner_state: "timekeeping")
+
+      expect_owner_state!("timekeeping")
+    end
+  end
+
+  context "more tests 19" do
+    it "admit_forwarded_generation under the live adapter moves only the live admission row and sends the fake no message" do
+      live = double("live adapter instance", base_url: "http://127.0.0.1:4999", private_key: OpenSSL::PKey::RSA.generate(2048))
+      allow(TimekeepingRegressionAdapter).to receive(:current).and_return(live)
+      connection = double("live connection", close: nil)
+      allow(connection).to receive(:exec_params).and_return(double(cmd_tuples: 1))
+      allow(PG).to receive(:connect).and_return(connection)
+      untouchable_fake = double("FakeTimekeeping that must not be reached")
+
+      # "in the timekeeping state no example in the file reaches FakeTimekeeping, not only the harvest forwarded examples: every Timekeeping call goes through the regression adapter to the real Timekeeping app"
+      admit_forwarded_generation(untouchable_fake, 3)
+
+      expect(connection).to have_received(:exec_params)
+        .with(a_string_including("UPDATE admission"), [3, TimekeepingDatabaseReset::ADMISSION_ID])
+    end
   end
 end
 
@@ -224,6 +346,32 @@ RSpec.describe "forwarded Timekeeping helpers with the live adapter running" do
       end
     end
   end
+
+  context "more tests 11" do
+    it "arrange_forwarded_timekeeping under the live adapter stores the timekeeping row and sends the fake no message at all" do
+      # A double with no allowed messages fails the example on any call, a generation write included.
+      untouchable_fake = double("FakeTimekeeping that must not be reached")
+
+      arrange_forwarded_timekeeping(untouchable_fake, company: adapter_company, users: { adapter_user => "admin" },
+                                                      project: adapter_project, owner_state: "timekeeping")
+
+      # "in the timekeeping state no example in the file reaches FakeTimekeeping, not only the harvest forwarded examples: every Timekeeping call goes through the regression adapter to the real Timekeeping app"
+      expect_owner_state!("timekeeping")
+    end
+  end
+
+  context "more tests 14" do
+    # "in the timekeeping state no example in the file reaches FakeTimekeeping, not only the harvest forwarded examples: every Timekeeping call goes through the regression adapter to the real Timekeeping app"
+    # A double with no allowed messages fails on any call, a generation write included.
+    it "arrange_forwarded_timekeeping with the live adapter running applies the timekeeping state and sends the fake no message at all" do
+      untouched_fake = double("fake that must not be reached")
+
+      arrange_forwarded_timekeeping(untouched_fake, company: adapter_company, users: { adapter_user => "admin" },
+                                                    project: adapter_project, owner_state: "timekeeping")
+
+      expect_owner_state!("timekeeping")
+    end
+  end
 end
 
 RSpec.describe "forwarded Timekeeping setup helpers in the legacy state" do
@@ -290,6 +438,38 @@ RSpec.describe "forwarded Timekeeping readers with the live adapter running" do
     send_reader_request(Net::HTTP::Post, "http://127.0.0.1:4999/v1/companies/7/reservations", key: "other-path")
 
     expect(forwarded_timekeeping_requests(reader_fake).pluck(:idempotency_key)).to eq(%w[k1 k1 other-path])
+  end
+
+  context "more tests 12" do
+    it "admit_forwarded_generation under the live adapter moves only the live admission row and sends the fake no message at all" do
+      connection = double("live Timekeeping connection", close: nil)
+      allow(connection).to receive(:exec_params).and_return(double(cmd_tuples: 1))
+      allow(PG).to receive(:connect).and_return(connection)
+      # A double with no allowed messages fails the example on any call, a generation write included.
+      untouchable_fake = double("FakeTimekeeping that must not be reached")
+
+      # "in the timekeeping state no example in the file reaches FakeTimekeeping, not only the harvest forwarded examples: every Timekeeping call goes through the regression adapter to the real Timekeeping app"
+      stub_const("ENV", ENV.to_h.merge(TimekeepingRegressionAdapter::DATABASE_URL_KEY => "postgres:///timekeeping_test"))
+      admit_forwarded_generation(untouchable_fake, 3)
+
+      expect(connection).to have_received(:exec_params).with(a_string_including("UPDATE admission"), [3, anything]).once
+    end
+  end
+
+  context "more tests 15" do
+    # "in the timekeeping state no example in the file reaches FakeTimekeeping, not only the harvest forwarded examples: every Timekeeping call goes through the regression adapter to the real Timekeeping app"
+    it "admit_forwarded_generation with the live adapter running moves only the live admission row and sends the fake no message" do
+      untouched_fake = double("fake that must not be reached")
+      update_result = double("update result", cmd_tuples: 1)
+      connection = double("live connection", close: nil)
+      allow(connection).to receive(:exec_params).and_return(update_result)
+      allow(PG).to receive(:connect).and_return(connection)
+
+      admit_forwarded_generation(untouched_fake, 3)
+
+      expect(connection).to have_received(:exec_params)
+        .with("UPDATE admission SET generation = $1 WHERE id = $2", [3, TimekeepingDatabaseReset::ADMISSION_ID])
+    end
   end
 end
 
