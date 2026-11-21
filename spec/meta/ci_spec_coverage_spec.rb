@@ -2,6 +2,7 @@
 
 require "rails_helper"
 require "yaml"
+require Rails.root.join("script/ci/timekeeping_live_specs.rb").to_s
 
 RSpec.describe "CI spec coverage in validations.yml" do
   let(:workflow) { YAML.safe_load_file(Rails.root.join(".github/workflows/validations.yml"), aliases: true) }
@@ -248,17 +249,18 @@ RSpec.describe "CI spec coverage in validations.yml" do
     end
   end
 
-  # The handoff live spec skips itself unless TIMEKEEPING_LIVE is "1", so a job that
-  # names it with the wrong env, a skipped condition or ignored failures still goes green.
+  # The live specs skip themselves unless TIMEKEEPING_LIVE is "1", so a job that runs
+  # them with the wrong env, a skipped condition or ignored failures still goes green.
+  # The live job runs them through the selector script, so the guard finds it by that call.
   describe "guard for the live handoff job" do
-    let(:live_handoff_spec) { "spec/integration/timekeeping/handoff_live_spec.rb" }
+    let(:live_spec_selector) { "script/ci/timekeeping_live_specs.rb" }
     let(:live_handoff_jobs) do
       jobs.values.select { |job| Array(job["steps"]).any? { |step| runs_live_handoff?(step) } }
     end
     let(:live_handoff_step) { live_handoff_jobs.first.fetch("steps").find { |step| runs_live_handoff?(step) } }
 
     def runs_live_handoff?(step)
-      step["run"].to_s.include?(live_handoff_spec)
+      step["run"].to_s.include?(live_spec_selector)
     end
 
     # The handoff spec refuses, and its after hook would otherwise empty, any database
@@ -292,7 +294,7 @@ RSpec.describe "CI spec coverage in validations.yml" do
       candidates = workflow.fetch("jobs").select do |_name, job|
         Array(job["steps"]).any? { |step| runs_live_handoff?(step) }
       end
-      return ["no job runs #{live_handoff_spec}"] if candidates.empty?
+      return ["no job runs #{live_spec_selector}"] if candidates.empty?
 
       problems = candidates.map { |name, job| live_handoff_job_problems(name, job) }
       problems.any?(&:empty?) ? [] : problems.flatten
@@ -300,7 +302,8 @@ RSpec.describe "CI spec coverage in validations.yml" do
 
     it "finds a live handoff job in the real workflow" do
       # "A CI job in .github/workflows/validations.yml sets TIMEKEEPING_LIVE=1 and TIMEKEEPING_DATABASE_URL
-      # and runs spec/integration/timekeeping/handoff_live_spec.rb on every push."
+      # and runs spec/integration/timekeeping/handoff_live_spec.rb on every push." The selector script
+      # now chooses which live specs that job runs.
       expect(live_handoff_problems(workflow)).to be_empty
     end
 
@@ -340,10 +343,10 @@ RSpec.describe "CI spec coverage in validations.yml" do
       expect(live_handoff_problems(workflow)).not_to be_empty
     end
 
-    it "fails when no run step names the live handoff spec" do
-      live_handoff_step["run"] = live_handoff_step.fetch("run").sub(live_handoff_spec, "").strip
+    it "fails when no run step calls the live spec selector" do
+      live_handoff_step["run"] = live_handoff_step.fetch("run").sub(live_spec_selector, "").strip
 
-      expect(live_handoff_problems(workflow)).to eq(["no job runs #{live_handoff_spec}"])
+      expect(live_handoff_problems(workflow)).to eq(["no job runs #{live_spec_selector}"])
     end
 
     it "fails when the live job ignores failures" do
@@ -398,10 +401,19 @@ RSpec.describe "CI spec coverage in validations.yml" do
       expect(live_handoff_problems(workflow)).not_to be_empty
     end
 
-    it "names the live handoff spec in exactly one job, which still runs the live alerts spec" do
-      # Two jobs naming it would boot the live server and reload the seed twice per push.
+    it "calls the live spec selector in exactly one job, whose full set still holds the handoff and alerts specs" do
+      # Two jobs calling it would boot the live server and reload the seed twice per push.
       expect(live_handoff_jobs.size).to eq(1)
-      expect(live_handoff_step.fetch("run")).to match(%r{rspec\b.*spec/integration/timekeeping/alerts_live_spec\.rb})
+      expect(live_handoff_step.fetch("run")).not_to include("${{")
+      # A job that names a live spec directly would also boot the live server and bypass the selector.
+      direct_runs = jobs.flat_map do |name, job|
+        Array(job["steps"]).filter_map { |step| name if step["run"].to_s.include?("spec/integration/timekeeping/") }
+      end
+      expect(direct_runs).to eq([])
+      # Asking the selector itself keeps its live-spec rule in one place.
+      expect(TimekeepingLiveSpecs.live_specs(root: Rails.root.to_s)).to include(
+        "spec/integration/timekeeping/handoff_live_spec.rb", "spec/integration/timekeeping/alerts_live_spec.rb"
+      )
     end
 
     it "gives the live handoff job a read-only token and no secrets" do
@@ -784,6 +796,62 @@ RSpec.describe "CI spec coverage in validations.yml" do
       expect(workflow_text.scan("*full_suite_condition").size).to eq(6)
       expect(workflow_text.scan("'skip ci'").size).to eq(1)
       expect(workflow_text.scan("contains(github.event.head_commit.message, 'skip ci')").size).to eq(1)
+    end
+  end
+
+  context "more tests 2" do
+    it "keeps the timekeeping-alerts-live job id and name and runs its specs through the one selector script" do
+      # "The job id `timekeeping-alerts-live` and its name stay as they are, because branch protection may
+      # require the check by name"
+      live_job = jobs.fetch("timekeeping-alerts-live")
+      expect(live_job.fetch("name")).to eq("Timekeeping alerts against a live service")
+
+      # "The selection rule is in one script with a spec that pins each case above"
+      run_steps = live_job.fetch("steps").filter_map { |step| step["run"] }
+      selector_runs = run_steps.select { |run| run.include?("script/ci/timekeeping_live_specs.rb") }
+      expect(selector_runs.size).to eq(1)
+      expect(selector_runs.first.strip).to eq("ruby script/ci/timekeeping_live_specs.rb")
+      # The workflow names no spec file of its own, so the selection is not copied outside the script.
+      expect(run_steps.join("\n")).not_to include("spec/integration/timekeeping/")
+    end
+  end
+
+  context "more tests 3" do
+    it "keeps the live job's services, environment and setup steps as they were while only the spec step changes" do
+      # "Keep the services, environment and setup steps as they are; only the spec selection changes."
+      live_job = jobs.fetch("timekeeping-alerts-live")
+      steps = live_job.fetch("steps")
+
+      expect(steps.pluck("name")).to eq(
+        [
+          "Checkout code",
+          "Setup Ruby for the monolith",
+          "Install the Timekeeping bundle",
+          "Setup monolith test database",
+          "Run live alert and handoff specs"
+        ]
+      )
+      checkout = steps.first
+      expect(checkout.fetch("uses")).to eq("actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803")
+      expect(checkout).not_to have_key("with")
+      expect(steps[1].fetch("with")).to eq(
+        "ruby-version" => "4.0.1", "bundler-cache" => true, "bundler" => "latest"
+      )
+      expect(steps[2].fetch("with")).to eq(
+        "ruby-version" => "4.0.1", "bundler-cache" => true, "bundler" => "latest", "working-directory" => "timekeeping"
+      )
+      expect(steps[3].fetch("run")).to eq("bundle exec rails db:test:prepare")
+
+      env = live_job.fetch("env")
+      expect(env.except("TIMEKEEPING_DATABASE_URL")).to eq(
+        "RAILS_ENV" => "test", "DB_HOST" => "localhost", "DB_USER" => "root", "DB_PASS" => "password",
+        "CI" => true, "TIMEKEEPING_LIVE" => "1", "SKIP_VITE_TEST_BUILD" => "1"
+      )
+      expect(env.fetch("TIMEKEEPING_DATABASE_URL")).to end_with("@localhost:5432/timekeeping_live_test")
+      expect(live_job.fetch("services").keys).to eq(["postgres"])
+      expect(live_job.dig("services", "postgres", "image")).to eq("postgres:16")
+      expect(live_job.fetch("permissions")).to eq("contents" => "read")
+      expect(live_job.fetch("timeout-minutes")).to eq(30)
     end
   end
 end

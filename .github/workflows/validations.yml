@@ -428,10 +428,15 @@ jobs:
   # server, and the handoff spec empties the Timekeeping tables after its
   # example; the alerts spec writes its own entries, so it relies on none.
   #
-  # The workflow runs on a push to any branch, and this job has no skip-ci
-  # condition, so every branch push runs the live handoff proof. The job id
-  # and name stay as they are because branch protection may require this
-  # check by name.
+  # The workflow runs on a push to any branch, and this job has no condition,
+  # so every push and pull request runs it. script/ci/timekeeping_live_specs.rb
+  # chooses which live specs under spec/integration/timekeeping run: the full
+  # set on a push to a release branch or a manual run, and otherwise only the
+  # live specs the diff adds or edits, or the full set when the diff touches
+  # shared Timekeeping code, db/, the live support files or this workflow.
+  # When it selects none, it prints a line saying so and the job passes.
+  # The job id and name stay as they are because branch protection may
+  # require this check by name.
   timekeeping-alerts-live:
     name: Timekeeping alerts against a live service
     runs-on: ubuntu-24.04
@@ -485,7 +490,7 @@ jobs:
         run: bundle exec rails db:test:prepare
 
       - name: Run live alert and handoff specs
-        run: bundle exec rspec spec/integration/timekeeping/alerts_live_spec.rb spec/integration/timekeeping/handoff_live_spec.rb
+        run: ruby script/ci/timekeeping_live_specs.rb
 
   # Starts the local demo runtime with bin/timekeeping-demo up against the
   # seeded database, and fails if a job from default or any other queue
