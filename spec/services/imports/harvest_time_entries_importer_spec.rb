@@ -450,10 +450,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
     # "With TIMEKEEPING_OWNER_STATE=rollback, spec/services/imports/harvest_time_entries_importer_spec.rb runs with
     # no failing non-forwarded examples, and `bin/timekeeping-demo regression` no longer reports `rollback: failed`."
     it "rollback import of the Harvest file stores the multi-line note once and a reimport adds no entry", owner_state: "rollback" do
-      actor.add_role :admin, company
-
-      described_class.new(data_import).process
-      relay_local_entries_to_projection(company)
+      run_harvest_import(data_import)
 
       expect(data_import.reload).to have_attributes(status: "completed", imported_rows: 11, failed_rows: 0)
       website = company.projects.kept.find_by!(name: "Website")
@@ -466,8 +463,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
 
       reimport = create(:data_import, company:, user: actor, options: {})
       attach_csv(reimport, fixture_path)
-      described_class.new(reimport).process
-      relay_local_entries_to_projection(company)
+      run_harvest_import(reimport)
 
       expect(Timekeeping::LocalEntry.where(company_id: company.id, discarded_at: nil).count).to eq(local_count)
       expect(TimesheetEntry.kept.where(project_id: company.projects.select(:id)).count).to eq(projected_count)
