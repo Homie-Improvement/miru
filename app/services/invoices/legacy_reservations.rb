@@ -73,8 +73,12 @@ module Invoices
       ApplicationRecord.transaction do
         entry_ids = lock_entries(request.company_id, request.entries)
         # Selected again after the wait for the row locks, so an entry
-        # discarded meanwhile is not billed.
-        billed = as_legacy_writer { TimesheetEntry.kept.where(id: entry_ids).update!(bill_status: :billed) }
+        # discarded meanwhile is not billed. update! saves the rows one by one
+        # in load order; ordering by id makes the entries billed before a
+        # validation failure the same on every run, and matches the lock order.
+        billed = as_legacy_writer do
+          TimesheetEntry.kept.where(id: entry_ids).order(:id).update!(bill_status: :billed)
+        end
         outcome("committed", counts: { billed: billed.size })
       end
     end
