@@ -292,13 +292,28 @@ module TimekeepingContract
         # The generation is checked after the receipt, as Timekeeping::EntryWriter
         # does, so a retry of a committed write replays even after the
         # generation has moved.
-        @receipts.answer(company_scope: company_id, actor: ["user", acting["id"]], operation: "#{route} #{params["entry_id"]}",
-                         key: headers["Idempotency-Key"], body:) do
+        evaluated = false
+        answer = @receipts.answer(company_scope: company_id, actor: ["user", acting["id"]],
+                                  operation: "#{route} #{params["entry_id"]}", key: headers["Idempotency-Key"], body:) do
+          evaluated = true
           next Wire.error(@entry_contract, "not_found") if replay_only?(route, headers)
           next Wire.error(@entry_contract, "stale_generation") unless generation_current?(headers["Ownership-Generation"])
 
           entry_route(route, company_id, acting, params, headers, body)
         end
+        replayed?(answer, evaluated:) ? mark_replayed(answer) : answer
+      end
+
+      # Only successful answers are stored, so an answer the block did not
+      # evaluate is a stored receipt when it succeeded, and a reused-key
+      # refusal otherwise.
+      def replayed?(answer, evaluated:)
+        !evaluated && (200..299).cover?(answer.status)
+      end
+
+      # As Timekeeping::V1::EntriesController does (entry_api.yml rules.replayed_answer).
+      def mark_replayed(answer)
+        Response.new(status: answer.status, body: answer.body, headers: { "Idempotency-Replayed" => "true" })
       end
 
       # A replay-only DELETE or bulk delete is answered only from a stored

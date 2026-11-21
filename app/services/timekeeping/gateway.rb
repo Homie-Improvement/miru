@@ -671,9 +671,9 @@ module Timekeeping
         return forward_carried_create(ownership:, receipt:) if receipt
 
         target = user || resolve_user.call
-        row = write_client.create_entry(context:, generation: ownership.generation,
-                                        body: create_body(user: target, project:, attributes:))
-        hydrate(row, user_id: target.id)
+        answer = write_client.create_entry(context:, generation: ownership.generation,
+                                           body: create_body(user: target, project:, attributes:))
+        hydrate(answer.row, user_id: target.id)
       end
 
       # The stored body names the user the first attempt wrote for, so the
@@ -681,8 +681,9 @@ module Timekeeping
       def forward_carried_create(ownership:, receipt:)
         body = JSON.parse(receipt.forwarded_body)
         carried_key = LegacyCreateReplay.carried_key(actor_kind: receipt.actor_kind, key: receipt.key)
-        row = write_client.create_entry(context:, generation: ownership.generation, body:, idempotency_key: carried_key)
-        hydrate(row, user_id: body.fetch("user_id"))
+        answer = write_client.create_entry(context:, generation: ownership.generation, body:,
+                                           idempotency_key: carried_key)
+        hydrate(answer.row, user_id: body.fetch("user_id"))
       end
 
       # The unexpired legacy receipt this request retries, or nil when it
@@ -729,9 +730,9 @@ module Timekeeping
       end
 
       def import_forwarded(ownership:, user:, project:, final:, idempotency_key:)
-        row = write_client.create_entry(context:, generation: ownership.generation,
-                                        body: import_body(user:, project:, final:), idempotency_key:)
-        hydrate(row, user_id: user.id)
+        answer = write_client.create_entry(context:, generation: ownership.generation,
+                                           body: import_body(user:, project:, final:), idempotency_key:)
+        hydrate(answer.row, user_id: user.id)
       end
 
       # The draft is validated with the status the legacy store would create

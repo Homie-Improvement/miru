@@ -139,7 +139,7 @@ module Timekeeping
       def answer_from(receipt, command)
         return WriteOutcome.refusal(:idempotency_key_reused) unless receipt.fingerprint == command.fingerprint
 
-        WriteOutcome.new(status: receipt.status, body: receipt.body)
+        WriteOutcome.new(status: receipt.status, body: receipt.body, replayed: true)
       end
 
       # The one generation Timekeeping admits, read FOR SHARE so a fence waits
