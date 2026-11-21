@@ -91,7 +91,7 @@ RSpec.describe "Entry write routes: bulk move naming only another company's entr
 end
 
 
-RSpec.describe "Entry write routes: bulk delete naming only another company's entries" do
+RSpec.describe "Entry write routes: bulk delete naming only another company's entries, in both directions" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
 
@@ -134,14 +134,7 @@ RSpec.describe "Entry write routes: bulk delete naming only another company's en
     end
     expect(Entry.where(id: entries).pluck(:discarded_at)).to eq([nil, nil])
   end
-end
 
-
-RSpec.describe "Entry write routes: bulk delete naming only another company's entries" do
-  include_context "timekeeping entry writes"
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  # "bulk_move and bulk_delete naming only another company's entries store no receipt and change nothing, pinned by request specs"
   it "answers a bulk delete naming only the other company's entry with not_found in both directions, discards nothing and stores no receipt" do
     arrange = timekeeping_arrange
     first_company = arrange.company

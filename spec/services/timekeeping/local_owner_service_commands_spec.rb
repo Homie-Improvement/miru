@@ -126,7 +126,7 @@ RSpec.describe Timekeeping::LocalOwner, "service command access refusals" do
     end
   end
 
-  context "more tests 2", "service commands carrying only another company's invoice" do
+  context "with a mark-billed carrying only another company's invoice" do
     include LocalOwnerServiceCommandSetup
 
     it "local mark_billed of the other company's invoice bills nothing and stores no receipt for either company, in both directions" do
@@ -162,7 +162,7 @@ RSpec.describe Timekeeping::LocalOwner, "service command access refusals" do
     end
   end
 
-  context "more tests 3", "detach_entries carrying only another company's agent" do
+  context "with a detach_entries carrying only another company's agent" do
     include LocalOwnerServiceCommandSetup
 
     it "local detach_entries naming only the other company's agent detaches nothing and leaves the other company's entries and receipts unchanged, in both directions" do
@@ -193,18 +193,16 @@ RSpec.describe Timekeeping::LocalOwner, "service command access refusals" do
 
         # A request carrying another company's id "returns `404` or no match and changes nothing in either database, in both directions".
         expect([[200, { "detached" => 0 }], [404, { "reason" => "not_found" }]]).to include([outcome.status, outcome.body])
-        # The issue also asks that "detach-entries with zero targets for another company's ids store no receipt".
-        # The accepted plan departs from that for the requester's own receipt: it is the marker that refuses a
-        # racing create naming an agent the monolith deleted, and a foreign agent id cannot be told apart from
-        # an own agent with no entries. The change must disclose that departure; this test asserts only the
-        # owning company's side, which the plan keeps.
+        # Only the owning company's receipts are checked: the requester's detach receipt is still stored
+        # (COMMANDS store_unchanged), because it is the marker that refuses a racing create naming an agent
+        # the monolith deleted, and a foreign agent id cannot be told apart from an own agent with no entries.
         expect(receipts_for.call(owner)).to eq(owner_receipts)
         expect(entries.transform_values { |entry| entry.reload.attributes }).to eq(before)
       end
     end
   end
 
-  context "more tests 4", "service commands that change nothing" do
+  context "with a mark-billed that changes nothing, retried" do
     include LocalOwnerServiceCommandSetup
 
     # "mark-billed and detach-entries with zero targets for another company's ids store no receipt, pinned by request specs"

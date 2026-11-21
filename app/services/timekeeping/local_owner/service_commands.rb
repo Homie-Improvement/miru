@@ -199,7 +199,10 @@ module Timekeeping
           checkpoint.call(:rows_locked)
           change_entries(entries, stored_generation)
           outcome = Outcome.success(200, command.fetch(:count) => entries.size)
-          store_receipt(outcome) if entries.any? || command.fetch(:store_unchanged)
+          if entries.any? || command.fetch(:store_unchanged)
+            store_receipt(outcome)
+            checkpoint.call(:receipt_written)
+          end
           outcome
         end
 
@@ -268,7 +271,6 @@ module Timekeeping
             operation: request.operation_name, key: request.operation_id, fingerprint: request.fingerprint,
             status: outcome.status, body: JSON.generate(outcome.body), created_at: Time.current
           )
-          checkpoint.call(:receipt_written)
         rescue ActiveRecord::RecordNotUnique => error
           raise ReceiptTaken, error.message
         end
