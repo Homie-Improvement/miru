@@ -6,7 +6,7 @@ require "rails_helper"
 # written out in app code; this spec keeps it equal to the contract YAML.
 RSpec.describe Timekeeping::Reasons do
   service_only_reasons = {
-    reference_unavailable: 503, idempotency_key_required: 422, invalid_request: 400,
+    idempotency_key_required: 422, invalid_request: 400,
     handoff_refused: 409, fence_timeout: 503, admission_missing: 409, unpublishable_entry: 409
   }.freeze
 

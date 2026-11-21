@@ -73,6 +73,11 @@ errors:
   forbidden:
     status: 403
     body: { reason: forbidden }
+  # detach_entries only: the monolith could not say whether the requesting
+  # company owns the agent, so nothing is stored and the caller may retry.
+  reference_unavailable:
+    status: 503
+    body: { reason: reference_unavailable }
 
 # How the monolith decides the outcome of a replayed invoice save when prepare
 # answers 200 with a terminal state (section 9.2 step 3 and its section 9.3 row).

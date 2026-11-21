@@ -479,10 +479,11 @@ module TimekeepingContract
         success(respond(200, "results" => results), changed: applied.any?)
       end
 
-      # A successful answer, marked for the receipts when it changed nothing
-      # (idempotency.yml unchanged_stored_operations).
-      def success(response, changed:)
-        changed ? response : IdempotencyReceipts::Unchanged.new(response:)
+      # A successful answer, marked for the receipts when it changed nothing,
+      # with whether its target belongs to the requesting company
+      # (idempotency.yml owned_target_stored_operations).
+      def success(response, changed:, owned_target: false)
+        changed ? response : IdempotencyReceipts::Unchanged.new(response:, owned_target:)
       end
 
       # In token mode an employee's bulk request sees only their own entries,
@@ -790,14 +791,17 @@ module TimekeepingContract
           entries = @entries.values.select do |entry|
             entry["company_id"] == company_id && entry["agent_id"] == agent_id
           end
+          # Read before the agent is deleted below, as Timekeeping reads it
+          # before the detach.
+          owned_agent = @agents[agent_id]&.fetch("company_id") == company_id
           if @policies[:service_command_writes].call(route: "detach_entries")
             entries.each { |entry| write_entry(entry.merge("agent_id" => nil)) }
             # The agent is being deleted, so a create that arrives after the
             # detach, such as one whose caller timed out, answers not_found
             # through the agent_owner rule, as Timekeeping refuses it.
-            @agents.delete(agent_id) if @agents[agent_id]&.fetch("company_id") == company_id
+            @agents.delete(agent_id) if owned_agent
           end
-          success(respond(200, "detached" => entries.size), changed: entries.any?)
+          success(respond(200, "detached" => entries.size), changed: entries.any?, owned_target: owned_agent)
         end
       end
 

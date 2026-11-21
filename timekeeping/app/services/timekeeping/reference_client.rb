@@ -17,7 +17,15 @@ module Timekeeping
     User = Data.define(:id, :role)
     Project = Data.define(:id, :company_id, :billable, :member_user_ids)
     Agent = Data.define(:id, :user_id)
-    Facts = Data.define(:company_id, :edit_days, :users, :projects, :missing_project_ids, :agents) do
+    # owned_agent_ids is nil when the monolith did not send it, which an
+    # older monolith does not. Entry writes never read it, so they keep
+    # working beside such a monolith; owned_agent_ids below refuses instead.
+    Facts = Data.define(:company_id, :edit_days, :users, :projects, :missing_project_ids, :agents,
+                        :owned_agent_ids) do
+      def initialize(owned_agent_ids: nil, **fields)
+        super(owned_agent_ids:, **fields)
+      end
+
       def user_ids
         users.map(&:id)
       end
@@ -55,23 +63,45 @@ module Timekeeping
       raise ArgumentError, "company_id must be an Integer" unless company_id.is_a?(Integer)
       raise ArgumentError, "project_ids must be Integers" unless project_ids.all?(Integer)
 
-      response = get(reference_uri(company_id, project_ids))
-      raise Unavailable, "reference endpoint answered #{response.code}" unless response.is_a?(Net::HTTPSuccess)
+      read_facts(company_id, project_ids:)
+    end
 
-      parse(response.body, company_id)
+    # The requested agent ids that are agents of the company, counting one
+    # whose deletion holds its row lock. A response without owned_agent_ids
+    # raises Unavailable: reading it as "owns none" would let a detach of the
+    # company's own agent skip the marker that refuses later writes naming it.
+    def owned_agent_ids(company_id:, agent_ids:)
+      raise ArgumentError, "company_id must be an Integer" unless company_id.is_a?(Integer)
+      raise ArgumentError, "agent_ids must be Integers" unless agent_ids.all?(Integer)
+
+      owned = read_facts(company_id, project_ids: [], agent_ids:).owned_agent_ids
+      raise Unavailable, "reference response lacks owned_agent_ids" if owned.nil?
+
+      owned
     end
 
     private
 
       attr_reader :base_url, :service_token
 
-      def reference_uri(company_id, project_ids)
+      def read_facts(company_id, project_ids:, agent_ids: [])
+        response = get(reference_uri(company_id, project_ids, agent_ids))
+        raise Unavailable, "reference endpoint answered #{response.code}" unless response.is_a?(Net::HTTPSuccess)
+
+        parse(response.body, company_id)
+      end
+
+      # agent_ids is sent only when asked for, so an entry write's request
+      # stays exactly as it was.
+      def reference_uri(company_id, project_ids, agent_ids)
         raise Unavailable, "MONOLITH_REFERENCE_URL is not set" if base_url.to_s.strip.empty?
 
         uri = URI.parse("#{base_url.chomp("/")}/internal/v1/companies/#{company_id}/reference")
         raise Unavailable, "MONOLITH_REFERENCE_URL is not an http(s) URL" unless uri.is_a?(URI::HTTP) && uri.host
 
-        uri.query = URI.encode_www_form(project_ids: project_ids.join(","))
+        query = { project_ids: project_ids.join(",") }
+        query[:agent_ids] = agent_ids.join(",") if agent_ids.any?
+        uri.query = URI.encode_www_form(query)
         uri
       rescue URI::InvalidURIError
         raise Unavailable, "MONOLITH_REFERENCE_URL is not a valid URL"
@@ -104,7 +134,8 @@ module Timekeeping
                         member_user_ids: project["member_user_ids"])
           end,
           missing_project_ids: facts["missing_project_ids"],
-          agents: facts["agents"].map { |agent| Agent.new(id: agent["id"], user_id: agent["user_id"]) }
+          agents: facts["agents"].map { |agent| Agent.new(id: agent["id"], user_id: agent["user_id"]) },
+          owned_agent_ids: facts["owned_agent_ids"]
         )
       rescue JSON::ParserError
         raise Unavailable, "reference response is not JSON"
@@ -117,7 +148,14 @@ module Timekeeping
           list_of?(facts["users"]) { |user| valid_user?(user) } &&
           list_of?(facts["projects"]) { |project| valid_project?(project, company_id) } &&
           list_of?(facts["missing_project_ids"]) { |id| id.is_a?(Integer) } &&
-          list_of?(facts["agents"]) { |agent| valid_agent?(agent) }
+          list_of?(facts["agents"]) { |agent| valid_agent?(agent) } &&
+          valid_owned_agent_ids?(facts)
+      end
+
+      # Absent is allowed, for a monolith deployed before the field existed;
+      # present, it must be a list of Integers.
+      def valid_owned_agent_ids?(facts)
+        !facts.key?("owned_agent_ids") || list_of?(facts["owned_agent_ids"]) { |id| id.is_a?(Integer) }
       end
 
       def valid_agent?(agent)

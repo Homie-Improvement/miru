@@ -13,13 +13,14 @@ module Timekeeping
     PRIVILEGED_ROLES = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/entry_api.yml"))
       .fetch("privileged_roles").freeze
 
-    def self.call(company:, project_ids:)
-      new(company:, project_ids:).call
+    def self.call(company:, project_ids:, agent_ids: [])
+      new(company:, project_ids:, agent_ids:).call
     end
 
-    def initialize(company:, project_ids:)
+    def initialize(company:, project_ids:, agent_ids: [])
       @company = company
       @requested_project_ids = Array(project_ids).map(&:to_i).uniq
+      @requested_agent_ids = Array(agent_ids).map(&:to_i).uniq
     end
 
     def call
@@ -29,13 +30,26 @@ module Timekeeping
         users: user_ids.map { |id| { id:, role: role_from(held_role_names_by_user_id.fetch(id, [])) } },
         projects: projects.map { |project| project_facts(project) },
         missing_project_ids: requested_project_ids - projects.map(&:id),
-        agents: agents
+        agents: agents,
+        owned_agent_ids: owned_agent_ids
       }
     end
 
     private
 
-      attr_reader :company, :requested_project_ids
+      attr_reader :company, :requested_project_ids, :requested_agent_ids
+
+      # The requested ids that are agents of the company, read without a row
+      # lock. Unlike agents, it lists an agent whose destroy holds its row
+      # lock: a detach-entries of that agent must still count it as the
+      # company's own, so the detach keeps the marker that refuses later
+      # entry writes naming it. Another company's agent is left out exactly
+      # like an id no agent has.
+      def owned_agent_ids
+        return [] if requested_agent_ids.empty?
+
+        company.agents.where(id: requested_agent_ids).order(:id).pluck(:id)
+      end
 
       def project_facts(project)
         {

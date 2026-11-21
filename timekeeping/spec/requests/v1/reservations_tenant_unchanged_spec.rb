@@ -198,11 +198,10 @@ RSpec.describe "Timekeeping detach-entries naming another company's agent" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
 
-  # A detach-entries receipt is also the marker that refuses a later entry write naming the agent being
-  # deleted, and Timekeeping cannot tell another company's agent from an own agent with no entries, so a
-  # detach that changed nothing still stores its receipt (contracts/timekeeping/idempotency.yml
-  # unchanged_stored_operations).
-  it "detaches nothing from the other company and still stores the requester's detach receipt" do
+  # A detach-entries receipt is the marker that refuses a later entry write naming the agent being
+  # deleted, so only a detach of the requesting company's own agent stores it when it changed nothing
+  # (contracts/timekeeping/idempotency.yml owned_target_stored_operations).
+  it "detaches nothing from the other company and stores no detach receipt for either company" do
     arrange = timekeeping_arrange
     company = arrange.company
     other_company = arrange.company
@@ -220,7 +219,208 @@ RSpec.describe "Timekeeping detach-entries naming another company's agent" do
 
     expect([response.status, response.parsed_body]).to eq([200, { "detached" => 0 }])
     expect(Entry.find(foreign_entry).attributes).to eq(entry_before)
-    expect(ServiceIdempotencyReceipt.where(company_id: company).count).to eq(1)
+    expect(ServiceIdempotencyReceipt.where(company_id: company).count).to eq(0)
     expect(ServiceIdempotencyReceipt.where(company_id: other_company).count).to eq(0)
+  end
+
+  context "when the agent belongs to another company" do
+    # "The change still stores a receipt for the requesting company when a detach-entries call names another company's agent and detaches nothing."
+    # The answer and the rows left behind must not tell the caller that the agent id is in use by another company,
+    # so each call is compared with one naming an agent id no company uses, and a resend under the same
+    # operation id must store nothing either.
+    it "answers like an unused agent id and stores no receipt for either company, in both directions and on a resend" do
+      arrange = timekeeping_arrange
+      first = arrange.company
+      second = arrange.company
+      seeded = [first, second].index_with do |company|
+        user = arrange.user(company:, role: "employee")
+        agent = arrange.agent(company:, user:)
+        entry = arrange.entry(company:, user:, project: arrange.project(company:), agent_id: agent)
+        service = arrange.service_identity(company:, name: "agent-destroy", operations: %w[detach_entries])
+        { agent:, entry:, service: }
+      end
+      entries_before = seeded.values.to_h { |seed| [seed.fetch(:entry), Entry.find(seed.fetch(:entry)).attributes] }
+
+      detach = lambda do |company, agent_id, operation_id|
+        post "/v1/companies/#{company}/agents/#{agent_id}/detach-entries",
+             params: { "operation_id" => operation_id, "generation" => arrange.current_generation }.to_json,
+             headers: { "Authorization" => "Bearer #{seeded.fetch(company).fetch(:service)}",
+                        "Content-Type" => "application/json" }
+        [response.status, response.parsed_body]
+      end
+
+      [[first, second], [second, first]].each do |requester, owner|
+        operation_id = SecureRandom.uuid
+        foreign = detach.call(requester, seeded.fetch(owner).fetch(:agent), operation_id)
+        resent = detach.call(requester, seeded.fetch(owner).fetch(:agent), operation_id)
+        unused = detach.call(requester, 990_002, SecureRandom.uuid)
+
+        expect(foreign).to eq([200, { "detached" => 0 }])
+        expect(foreign).to eq(unused)
+        expect(resent).to eq(unused)
+        expect(ServiceIdempotencyReceipt.where(company_id: requester).count).to eq(0)
+        expect(ServiceIdempotencyReceipt.where(company_id: owner).count).to eq(0)
+        expect(ServiceIdempotencyReceipt.count).to eq(0)
+        expect(entries_before.keys.index_with { |id| Entry.find(id).attributes }).to eq(entries_before)
+      end
+    end
+
+    # Ownership is decided for the company the service token is bound to; a company_id the caller writes into the
+    # body must not make another company's agent count as its own.
+    it "ignores a company_id in the detach body, so naming the agent's own company there still stores nothing" do
+      arrange = timekeeping_arrange
+      company = arrange.company
+      other_company = arrange.company
+      other_user = arrange.user(company: other_company, role: "employee")
+      foreign_agent = arrange.agent(company: other_company, user: other_user)
+      foreign_entry = arrange.entry(company: other_company, user: other_user,
+                                    project: arrange.project(company: other_company), agent_id: foreign_agent)
+      service = arrange.service_identity(company:, name: "agent-destroy", operations: %w[detach_entries])
+      entry_before = Entry.find(foreign_entry).attributes
+
+      post "/v1/companies/#{company}/agents/#{foreign_agent}/detach-entries",
+           params: { "operation_id" => SecureRandom.uuid, "generation" => arrange.current_generation,
+                     "company_id" => other_company }.to_json,
+           headers: { "Authorization" => "Bearer #{service}", "Content-Type" => "application/json" }
+
+      expect(response.status).not_to eq(503)
+      expect(Entry.find(foreign_entry).attributes).to eq(entry_before)
+      expect(ServiceIdempotencyReceipt.where(company_id: company).count).to eq(0)
+      expect(ServiceIdempotencyReceipt.where(company_id: other_company).count).to eq(0)
+    end
+  end
+
+  context "when the agent is the company's own and has no entries" do
+    # "That receipt is also the marker that blocks a later entry write naming an agent that is being deleted."
+    it "stores one detach receipt under the requesting company only and replays it without storing a second" do
+      arrange = timekeeping_arrange
+      company = arrange.company
+      other_company = arrange.company
+      own_agent = arrange.agent(company:, user: arrange.user(company:, role: "employee"))
+      service = arrange.service_identity(company:, name: "agent-destroy", operations: %w[detach_entries])
+      operation_id = SecureRandom.uuid
+
+      detach = lambda do
+        post "/v1/companies/#{company}/agents/#{own_agent}/detach-entries",
+             params: { "operation_id" => operation_id, "generation" => arrange.current_generation }.to_json,
+             headers: { "Authorization" => "Bearer #{service}", "Content-Type" => "application/json" }
+        [response.status, response.parsed_body]
+      end
+
+      first = detach.call
+      receipts_after_first = ServiceIdempotencyReceipt.where(company_id: company).count
+      replay = detach.call
+
+      expect(first).to eq([200, { "detached" => 0 }])
+      expect(receipts_after_first).to eq(1)
+      expect(replay).to eq(first)
+      expect(ServiceIdempotencyReceipt.where(company_id: company, operation: "detach_entries #{own_agent}").count).to eq(1)
+      expect(ServiceIdempotencyReceipt.where(company_id: other_company).count).to eq(0)
+      expect(ServiceIdempotencyReceipt.count).to eq(1)
+    end
+  end
+
+  context "when the reference endpoint cannot answer" do
+    # "That receipt is also the marker that blocks a later entry write naming an agent that is being deleted."
+    # A detach must never answer 2xx without that marker when ownership cannot be read, and a detach whose
+    # answer is already stored must still be answered from it, so a caller that lost the first answer can
+    # confirm the detach while the monolith cannot be reached.
+    it "replays a stored own-agent detach unchanged, but refuses a new detach with 503 and stores nothing" do
+      arrange = timekeeping_arrange
+      company = arrange.company
+      own_user = arrange.user(company:, role: "employee")
+      project = arrange.project(company:)
+      own_agent = arrange.agent(company:, user: own_user)
+      second_agent = arrange.agent(company:, user: own_user)
+      detached_entry = arrange.entry(company:, user: own_user, project:, agent_id: own_agent)
+      kept_entry = arrange.entry(company:, user: own_user, project:, agent_id: second_agent)
+      service = arrange.service_identity(company:, name: "agent-destroy", operations: %w[detach_entries])
+      detach = lambda do |agent_id, operation_id|
+        post "/v1/companies/#{company}/agents/#{agent_id}/detach-entries",
+             params: { "operation_id" => operation_id, "generation" => arrange.current_generation }.to_json,
+             headers: { "Authorization" => "Bearer #{service}", "Content-Type" => "application/json" }
+        [response.status, response.parsed_body]
+      end
+      stored_operation = SecureRandom.uuid
+
+      expect(detach.call(own_agent, stored_operation)).to eq([200, { "detached" => 1 }])
+      expect(ServiceIdempotencyReceipt.where(company_id: company).count).to eq(1)
+      detached_after_first = Entry.find(detached_entry).attributes
+      kept_before = Entry.find(kept_entry).attributes
+
+      WebMock.stub_request(:get, TimekeepingProviderArrange::REFERENCE_HOST).to_return(status: 500)
+
+      expect(detach.call(own_agent, stored_operation)).to eq([200, { "detached" => 1 }])
+      expect(Entry.find(detached_entry).attributes).to eq(detached_after_first)
+      expect(Entry.find(detached_entry).agent_id).to be_nil
+      expect(detach.call(second_agent, SecureRandom.uuid)).to eq([503, { "reason" => "reference_unavailable" }])
+      expect(Entry.find(kept_entry).attributes).to eq(kept_before)
+      expect(ServiceIdempotencyReceipt.count).to eq(1)
+    end
+
+    # A reference answer from a monolith that does not yet send owned_agent_ids says nothing about ownership.
+    # Reading it as "not owned" would answer 2xx with no marker for the company's own agent, so the
+    # detach must fail closed instead.
+    it "refuses a detach with 503 and stores no marker when the reference answer carries no owned_agent_ids" do
+      arrange = timekeeping_arrange
+      company = arrange.company
+      own_user = arrange.user(company:, role: "employee")
+      own_agent = arrange.agent(company:, user: own_user)
+      service = arrange.service_identity(company:, name: "agent-destroy", operations: %w[detach_entries])
+      facts_without_ownership = {
+        company_id: company, edit_days: 30, users: [{ id: own_user, role: "employee" }], projects: [],
+        missing_project_ids: [], agents: [{ id: own_agent, user_id: own_user }]
+      }
+      WebMock.stub_request(:get, TimekeepingProviderArrange::REFERENCE_HOST).to_return(
+        status: 200, headers: { "Content-Type" => "application/json" }, body: JSON.generate(facts_without_ownership)
+      )
+
+      post "/v1/companies/#{company}/agents/#{own_agent}/detach-entries",
+           params: { "operation_id" => SecureRandom.uuid, "generation" => arrange.current_generation }.to_json,
+           headers: { "Authorization" => "Bearer #{service}", "Content-Type" => "application/json" }
+
+      expect([response.status, response.parsed_body]).to eq([503, { "reason" => "reference_unavailable" }])
+      expect(ServiceIdempotencyReceipt.where(company_id: company).count).to eq(0)
+    end
+  end
+
+  context "when another company detached the same agent id first" do
+    # "That receipt is also the marker that blocks a later entry write naming an agent that is being deleted."
+    # Ordering: another company's service detaches this agent id first, then the owning company deletes
+    # its agent, which has no entries. The foreign detach must leave nothing, and the owning company's
+    # detach must still leave the marker that refuses a create whose fence was read before the detach.
+    it "keeps the own-agent delete marker, which refuses a create fenced before the detach" do
+      arrange = timekeeping_arrange
+      owner_company = arrange.company
+      other_company = arrange.company
+      owner = arrange.user(company: owner_company, role: "owner")
+      project = arrange.project(company: owner_company)
+      own_agent = arrange.agent(company: owner_company, user: owner)
+      owner_service = arrange.service_identity(company: owner_company, name: "agent-destroy", operations: %w[detach_entries])
+      other_service = arrange.service_identity(company: other_company, name: "agent-destroy", operations: %w[detach_entries])
+      detach = lambda do |company, service|
+        post "/v1/companies/#{company}/agents/#{own_agent}/detach-entries",
+             params: { "operation_id" => SecureRandom.uuid, "generation" => arrange.current_generation }.to_json,
+             headers: { "Authorization" => "Bearer #{service}", "Content-Type" => "application/json" }
+        [response.status, response.parsed_body]
+      end
+      fenced_create = build_entry_command(
+        :create, token: arrange.token_for(owner),
+                 body: { "project_id" => project, "work_date" => "2026-03-02", "duration" => 60.0, "note" => "Late",
+                         "source" => "manual", "source_metadata" => {}, "agent_id" => own_agent }
+      )
+
+      expect(detach.call(other_company, other_service)).to eq([200, { "detached" => 0 }])
+      expect(ServiceIdempotencyReceipt.count).to eq(0)
+
+      expect(detach.call(owner_company, owner_service)).to eq([200, { "detached" => 0 }])
+      expect(ServiceIdempotencyReceipt.where(company_id: owner_company).count).to eq(1)
+      expect(ServiceIdempotencyReceipt.where(company_id: other_company).count).to eq(0)
+
+      outcome = Timekeeping::EntryWriter.new.call(fenced_create)
+
+      expect([outcome.status, JSON.parse(outcome.body)]).to eq([404, { "reason" => "not_found" }])
+      expect(Entry.where(company_id: owner_company).count).to eq(0)
+    end
   end
 end
