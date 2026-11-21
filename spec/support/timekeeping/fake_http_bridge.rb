@@ -20,7 +20,8 @@ module TimekeepingContract
       stub_request(:any, ->(uri) { uri.host == target.host && uri.port == target.port }).to_return do |request|
         body = request.body.to_s.empty? ? nil : JSON.parse(request.body)
         answer = fake.call(request.method.to_s.upcase, request.uri.request_uri, headers: request.headers, body:)
-        { status: answer.status, body: JSON.generate(answer.body), headers: { "Content-Type" => "application/json" } }
+        { status: answer.status, body: JSON.generate(answer.body),
+          headers: { "Content-Type" => "application/json" }.merge(answer.headers.to_h) }
       end
     end
   end

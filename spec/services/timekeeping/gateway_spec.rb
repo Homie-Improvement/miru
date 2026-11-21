@@ -45,6 +45,308 @@ RSpec.describe Timekeeping::Gateway do
     expect([audit.actor_type, audit.actor_id]).to eq(["user", prepared_user.id])
   end
 
+  context "when a forwarded create raises TimesheetEntries::Created" do
+    it "a fresh forwarded create attributes TimesheetEntries::Created to the write context actor, not Current.user, and carries only identifying fields" do
+      company = create(:company)
+      project = create(:project, billable: true, client: create(:client, company:))
+      actor = timekeeping_member(company, "admin")
+      unrelated_user = create(:user)
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+      client_key = "client-key-forwarded-event-actor"
+      row = {
+        "id" => 9_200_001, "company_id" => company.id, "version" => 1, "project_id" => project.id,
+        "user_id" => actor.id, "work_date" => Date.current.iso8601, "duration" => 45.0, "note" => "Private note text",
+        "bill_status" => "unbilled", "review_status" => "approved", "source" => "manual", "source_metadata" => {},
+        "agent_id" => nil, "proof_url" => nil, "proof_metadata" => nil, "external_run_id" => nil,
+        "external_session_id" => nil, "locked" => false
+      }
+      write_client = instance_double(Timekeeping::EntryWriteClient)
+      allow(write_client).to receive(:create_entry)
+        .and_return(Timekeeping::EntryWriteClient::CreateAnswer.new(row:, replayed: false))
+      context = Timekeeping::WriteContext.new(company:, actor:, actor_kind: "user", request_id: "req-event-actor",
+                                              idempotency_key: client_key)
+
+      created_events = timesheet_entries_created_events do
+        # Current names someone else, so an emitter that reads Current instead of the write context is caught.
+        Current.set(user: unrelated_user) do
+          described_class.new(context:, write_client:).create(
+            user: actor, project:,
+            attributes: { duration: 45, work_date: Date.current, note: "Private note text", bill_status: "unbilled" }
+          )
+        end
+      end
+
+      # "A time entry create forwarded to Timekeeping raises exactly one `TimesheetEntries::Created` event, with the same actor and data shape as a create in the legacy state, once Timekeeping answers the create with success"
+      expect(created_events.size).to eq(1)
+      payload = created_events.first[:payload].to_h
+      expect(payload[:actor]).to eq(id: actor.id, type: "User")
+      expect(payload.keys).to contain_exactly(:actor, :data)
+      expect(payload[:data]).to eq(timesheet_entry_id: 9_200_001, project_id: project.id, user_id: actor.id, duration: 45.0)
+      # Events are stored and shown to event viewers across workspaces, so the request's
+      # key and the entry's note must never reach the payload.
+      expect(payload.to_s).not_to include(client_key)
+      expect(payload.to_s).not_to include("Private note text")
+    end
+  end
+
+  context "when Timekeeping answers a forwarded create from its stored receipt" do
+    it "raises no TimesheetEntries::Created for a forwarded create answered from a stored receipt and one with the request actor for a fresh answer" do
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+      context = Timekeeping::WriteContext.new(
+        company: prepared_company, actor: prepared_user, actor_kind: "user", request_id: "req-forwarded-created-event"
+      )
+      row = {
+        "id" => 98_765, "company_id" => prepared_company.id, "version" => 1, "project_id" => prepared_project.id,
+        "user_id" => prepared_user.id, "work_date" => Date.current.iso8601, "duration" => 30.0, "note" => "forwarded",
+        "bill_status" => "unbilled", "review_status" => "not_required", "source" => "manual", "source_metadata" => {},
+        "agent_id" => nil, "proof_url" => nil, "proof_metadata" => nil, "external_run_id" => nil,
+        "external_session_id" => nil, "locked" => false
+      }
+      write_client = instance_double(Timekeeping::EntryWriteClient)
+      allow(write_client).to receive(:create_entry).and_return(
+        Timekeeping::EntryWriteClient::CreateAnswer.new(row:, replayed: true),
+        Timekeeping::EntryWriteClient::CreateAnswer.new(row:, replayed: false)
+      )
+      gateway = described_class.new(context:, write_client:, read_client: instance_double(Timekeeping::EntryApiClient))
+      attributes = { duration: 30, work_date: Date.current, note: "forwarded", bill_status: "unbilled" }
+
+      replayed_events = timesheet_entries_created_events do
+        replayed_entry = gateway.create(user: prepared_user, project: prepared_project, attributes:)
+        expect(replayed_entry.id).to eq(98_765)
+      end
+      fresh_events = timesheet_entries_created_events do
+        gateway.create(user: prepared_user, project: prepared_project, attributes:)
+      end
+
+      # "A forwarded create that Timekeeping refuses, or that is replayed from a stored idempotency receipt, raises no event"
+      expect(replayed_events).to be_empty
+      # "A time entry create forwarded to Timekeeping raises exactly one `TimesheetEntries::Created` event, with the same actor and data shape as a create in the legacy state, once Timekeeping answers the create with success"
+      expect(fresh_events.map { |event| event[:payload].to_h }).to eq([
+        { actor: { id: prepared_user.id, type: "User" },
+          data: { timesheet_entry_id: 98_765, project_id: prepared_project.id, user_id: prepared_user.id, duration: 30.0 } }
+      ])
+    end
+  end
+
+  context "when the prepared store answers a create" do
+    it "raises one TimesheetEntries::Created for a fresh prepared create and none when the local owner answers from its receipt" do
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+      context = Timekeeping::WriteContext.new(
+        company: prepared_company, actor: prepared_user, actor_kind: "user", request_id: "req-prepared-created-event"
+      )
+      body = {
+        "id" => 54_321, "company_id" => prepared_company.id, "version" => 1, "project_id" => prepared_project.id,
+        "user_id" => prepared_user.id, "work_date" => Date.current.iso8601, "duration" => 15.0, "note" => "prepared",
+        "bill_status" => "unbilled", "review_status" => "not_required", "source" => "manual", "source_metadata" => {},
+        "agent_id" => nil, "proof_url" => nil, "proof_metadata" => nil, "external_run_id" => nil,
+        "external_session_id" => nil, "locked" => false
+      }
+      attributes = { duration: 15, work_date: Date.current, note: "prepared", bill_status: "unbilled" }
+      gateway_for = lambda do |replayed|
+        local_owner = Timekeeping::FakeLocalOwner.new(
+          outcome: Timekeeping::LocalOwner::Outcome.new(status: 201, body:, replayed:)
+        )
+        described_class.new(context:, local_owner:, write_client: instance_double(Timekeeping::EntryWriteClient),
+                            read_client: instance_double(Timekeeping::EntryApiClient))
+      end
+
+      fresh_events = timesheet_entries_created_events do
+        gateway_for.call(false).create(user: prepared_user, project: prepared_project, attributes:)
+      end
+      # A concurrent retry that the local owner answers from the receipt the first attempt stored.
+      replayed_entry = nil
+      replayed_events = timesheet_entries_created_events do
+        replayed_entry = gateway_for.call(true).create(user: prepared_user, project: prepared_project, attributes:)
+      end
+
+      # "A create in the legacy and rollback states raises the event exactly as today (one event, from the model)"
+      # In the rollback state no event is raised before this change; the change must disclose that it adds one.
+      expect(fresh_events.map { |event| event[:payload].to_h }).to eq([
+        { actor: { id: prepared_user.id, type: "User" },
+          data: { timesheet_entry_id: 54_321, project_id: prepared_project.id, user_id: prepared_user.id, duration: 15.0 } }
+      ])
+      expect(replayed_entry.id).to eq(54_321)
+      expect(replayed_events).to be_empty
+    end
+  end
+
+  context "when Timekeeping refuses a forwarded create" do
+    it "raises no TimesheetEntries::Created when Timekeeping refuses a forwarded create" do
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+      context = Timekeeping::WriteContext.new(
+        company: prepared_company, actor: prepared_user, actor_kind: "user", request_id: "req-forwarded-refused-event"
+      )
+      attributes = { duration: 30, work_date: Date.current, note: "refused", bill_status: "unbilled" }
+      refusals = [
+        Timekeeping::EntryWriteClient::Rejected.new("refused"),
+        Timekeeping::EntryWriteClient::Forbidden.new("refused"),
+        Timekeeping::EntryWriteClient::Conflict.new("refused"),
+        ActiveRecord::RecordNotFound.new("refused")
+      ]
+
+      events = timesheet_entries_created_events do
+        refusals.each do |refusal|
+          write_client = instance_double(Timekeeping::EntryWriteClient)
+          allow(write_client).to receive(:create_entry).and_raise(refusal)
+          gateway = described_class.new(context:, write_client:, read_client: instance_double(Timekeeping::EntryApiClient))
+
+          expect { gateway.create(user: prepared_user, project: prepared_project, attributes:) }
+            .to raise_error(refusal.class)
+          # The gateway never retries a refused create.
+          expect(write_client).to have_received(:create_entry).once
+        end
+      end
+
+      # "A forwarded create that Timekeeping refuses, or that is replayed from a stored idempotency receipt, raises no event"
+      expect(events).to be_empty
+    end
+  end
+
+  context "when a forwarded answer names another company" do
+    it "a fresh forwarded create answered with another company's entry is refused and raises no TimesheetEntries::Created, while its own company's answer raises one" do
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+      company = create(:company)
+      project = create(:project, billable: true, client: create(:client, company:))
+      user = timekeeping_member(company, "owner")
+      other_company = create(:company)
+      other_project = create(:project, billable: true, client: create(:client, company: other_company))
+      context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: "req-tenant-created")
+      row_for = lambda do |id, row_company, row_project|
+        { "id" => id, "company_id" => row_company.id, "version" => 1, "project_id" => row_project.id,
+          "user_id" => user.id, "work_date" => Date.current.iso8601, "duration" => 30.0, "note" => "Tenant check",
+          "bill_status" => "unbilled", "review_status" => "not_required", "source" => "manual", "source_metadata" => {},
+          "agent_id" => nil, "proof_url" => nil, "proof_metadata" => nil, "external_run_id" => nil,
+          "external_session_id" => nil, "locked" => false }
+      end
+      write_client = instance_double(Timekeeping::EntryWriteClient)
+      allow(write_client).to receive(:create_entry).and_return(
+        Timekeeping::EntryWriteClient::CreateAnswer.new(row: row_for.call(9_516_001, other_company, other_project), replayed: false),
+        Timekeeping::EntryWriteClient::CreateAnswer.new(row: row_for.call(9_516_002, company, project), replayed: false)
+      )
+      attributes = { duration: 30, work_date: Date.current, note: "Tenant check", bill_status: "unbilled" }
+
+      foreign_events = timesheet_entries_created_events do
+        # A forwarded answer outside the request's company is never rendered or announced.
+        expect do
+          described_class.new(context:, write_client:).create(user:, project:, attributes:)
+        end.to raise_error(Timekeeping::EntryWriteClient::Error)
+      end
+      created_events = timesheet_entries_created_events do
+        described_class.new(context:, write_client:).create(user:, project:, attributes:)
+      end
+
+      expect(foreign_events).to be_empty
+      # "A time entry create forwarded to Timekeeping raises exactly one `TimesheetEntries::Created` event, with the same actor and data shape as a create in the legacy state, once Timekeeping answers the create with success"
+      expect(created_events.size).to eq(1)
+      payload = created_events.first[:payload].to_h
+      expect(payload[:data]).to include(timesheet_entry_id: 9_516_002, project_id: project.id, user_id: user.id)
+      expect(payload[:actor]).to eq(id: user.id, type: "User")
+    end
+  end
+
+  context "when a prepared-store answer names another company" do
+    it "a prepared-store create raises TimesheetEntries::Created for its own company's entry and none when the local answer names another company" do
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
+      company = create(:company)
+      project = create(:project, billable: true, client: create(:client, company:))
+      user = timekeeping_member(company, "owner")
+      other_company = create(:company)
+      other_project = create(:project, billable: true, client: create(:client, company: other_company))
+      context = Timekeeping::WriteContext.new(company:, actor: user, actor_kind: "user", request_id: "req-1")
+      row_for = lambda do |id, row_company, row_project|
+        { "id" => id, "company_id" => row_company.id, "version" => 1, "project_id" => row_project.id,
+          "user_id" => user.id, "work_date" => Date.current.iso8601, "duration" => 15.0, "note" => "prepared tenant",
+          "bill_status" => "unbilled", "review_status" => "not_required", "source" => "manual", "source_metadata" => {},
+          "agent_id" => nil, "proof_url" => nil, "proof_metadata" => nil, "external_run_id" => nil,
+          "external_session_id" => nil, "locked" => false }
+      end
+      gateway_for = lambda do |row|
+        local_owner = Timekeeping::FakeLocalOwner.new(outcome: Timekeeping::LocalOwner::Outcome.new(status: 201, body: row))
+        described_class.new(context:, local_owner:, write_client: instance_double(Timekeeping::EntryWriteClient),
+                            read_client: instance_double(Timekeeping::EntryApiClient))
+      end
+      attributes = { duration: 15, work_date: Date.current, note: "prepared tenant", bill_status: "unbilled" }
+
+      foreign_events = timesheet_entries_created_events do
+        expect do
+          gateway_for.call(row_for.call(9_516_101, other_company, other_project)).create(user:, project:, attributes:)
+        end.to raise_error(Timekeeping::EntryWriteClient::Error)
+      end
+      created_events = timesheet_entries_created_events do
+        gateway_for.call(row_for.call(9_516_102, company, project)).create(user:, project:, attributes:)
+      end
+
+      expect(foreign_events).to be_empty
+      # "A create in the legacy and rollback states raises the event exactly as today (one event, from the model)"
+      # The rollback state writes the prepared store, where no event is raised today; the change discloses that.
+      expect(created_events.size).to eq(1)
+      payload = created_events.first[:payload].to_h
+      expect(payload[:data]).to include(timesheet_entry_id: 9_516_102, project_id: project.id, user_id: user.id)
+      expect(payload[:actor]).to eq(id: user.id, type: "User")
+    end
+  end
+
+  context "when the legacy store owns the entries" do
+    it "raises exactly one TimesheetEntries::Created for a legacy-store create through the gateway" do
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "monolith", monolith_store: "legacy")
+      company = create(:company)
+      project = create(:project, billable: true, client: create(:client, company:))
+      admin = timekeeping_member(company, "admin")
+      context = Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id: "req-legacy-once")
+
+      entry = nil
+      events = timesheet_entries_created_events do
+        entry = described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient)).create(
+          user: admin, project:, attributes: { duration: 30, work_date: Date.current, note: "legacy once", bill_status: "unbilled" }
+        )
+      end
+
+      expect(entry).to be_persisted
+      # "A create in the legacy and rollback states raises the event exactly as today (one event, from the model)"
+      expect(events.size).to eq(1)
+      expect(events.first[:payload].to_h[:data]).to include(timesheet_entry_id: entry.id, user_id: admin.id)
+    end
+  end
+
+  context "when a forwarded create's first answer is lost" do
+    it "raises no TimesheetEntries::Created across a lost forwarded create answer and its replayed retry" do
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+      company = create(:company)
+      project = create(:project, billable: true, client: create(:client, company:))
+      member = timekeeping_member(company, "employee")
+      context = Timekeeping::WriteContext.new(company:, actor: member, actor_kind: "user", request_id: "req-lost-answer")
+      row = {
+        "id" => 9102, "company_id" => company.id, "version" => 1, "project_id" => project.id,
+        "user_id" => member.id, "work_date" => Date.current.iso8601, "duration" => 30.0, "note" => "lost answer",
+        "bill_status" => "unbilled", "review_status" => "not_required", "source" => "manual", "source_metadata" => {},
+        "agent_id" => nil, "proof_url" => nil, "proof_metadata" => nil, "external_run_id" => nil,
+        "external_session_id" => nil, "locked" => false
+      }
+      write_client = instance_double(Timekeeping::EntryWriteClient)
+      attempts = 0
+      # The first answer is lost after Timekeeping committed; the retry is served from Timekeeping's receipt.
+      allow(write_client).to receive(:create_entry) do
+        attempts += 1
+        raise Timekeeping::EntryWriteClient::Error, "Timekeeping entry create failed: Net::ReadTimeout" if attempts == 1
+
+        Timekeeping::EntryWriteClient::CreateAnswer.new(row:, replayed: true)
+      end
+      attributes = { duration: 30, work_date: Date.current, note: "lost answer", bill_status: "unbilled" }
+
+      created_events = timesheet_entries_created_events do
+        expect do
+          described_class.new(context:, write_client:).create(user: member, project:, attributes:)
+        end.to raise_error(Timekeeping::EntryWriteClient::Error)
+        described_class.new(context:, write_client:).create(user: member, project:, attributes:)
+      end
+
+      expect(attempts).to eq(2)
+      # "A forwarded create that Timekeeping refuses, or that is replayed from a stored idempotency receipt, raises no event"
+      # So a create whose only fresh answer was lost raises no event at all.
+      expect(created_events).to be_empty
+    end
+  end
+
   it "more tests 10 prepared create from another company's user with a carried key of the first company gets its own entry under the derived key", committed_data: true do
     client_key = "tenant-carried-key-#{SecureRandom.hex(4)}"
     attributes = { duration: 30, work_date: Date.current, note: "First company's private note", bill_status: "unbilled" }
@@ -4394,11 +4696,12 @@ RSpec.describe Timekeeping::Gateway do
     forwarded = []
     allow(write_client).to receive(:create_entry) do |**arguments|
       forwarded << arguments
-      { "id" => 9_100_001, "company_id" => second_company.id, "version" => 1, "project_id" => second_project.id,
-        "user_id" => second_user.id, "work_date" => Date.current.iso8601, "duration" => 30.0, "note" => "Same request",
-        "bill_status" => "unbilled", "review_status" => "approved", "source" => "manual", "source_metadata" => {},
-        "agent_id" => nil, "proof_url" => nil, "proof_metadata" => nil, "external_run_id" => nil,
-        "external_session_id" => nil, "locked" => false }
+      row = { "id" => 9_100_001, "company_id" => second_company.id, "version" => 1, "project_id" => second_project.id,
+              "user_id" => second_user.id, "work_date" => Date.current.iso8601, "duration" => 30.0,
+              "note" => "Same request", "bill_status" => "unbilled", "review_status" => "approved", "source" => "manual",
+              "source_metadata" => {}, "agent_id" => nil, "proof_url" => nil, "proof_metadata" => nil,
+              "external_run_id" => nil, "external_session_id" => nil, "locked" => false }
+      Timekeeping::EntryWriteClient::CreateAnswer.new(row:, replayed: false)
     end
     second_context = Timekeeping::WriteContext.new(company: second_company, actor: second_user, actor_kind: "user",
                                                    request_id: "req-forwarded-second", idempotency_key: shared_key)
@@ -4538,13 +4841,22 @@ RSpec.describe Timekeeping::Gateway, "legacy create receipts across the first cu
     let(:attributes) { { duration: 30, work_date: Date.current, note: "Carried retry", bill_status: "unbilled" } }
 
     it "resends the stored body byte for byte under the carried key when the retry matches an unexpired receipt" do
-      entry = carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-match")
+      entry = nil
+      legacy_events = timesheet_entries_created_events do
+        entry = carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-match")
+      end
       receipt = Timekeeping::LegacyCreateReceipt.find_by!(timesheet_entry_id: entry.id)
       carried_retry_flip!
       sent = carried_retry_stub(company)
 
-      with_forwarded_timekeeping_env { carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-match") }
+      # The stub answers as a fresh create, with no replay header, so only the
+      # carried-receipt path keeps the retry from raising a second event.
+      carried_events = timesheet_entries_created_events do
+        with_forwarded_timekeeping_env { carried_retry_create(company:, user:, project:, attributes:, key: "carried-retry-match") }
+      end
 
+      expect(legacy_events.size).to eq(1)
+      expect(carried_events).to be_empty
       expect(sent.size).to eq(1)
       expect(sent.first[:raw_body]).to eq(receipt.forwarded_body)
       expect(sent.first[:key]).to eq(Timekeeping::LegacyCreateReplay.carried_key(actor_kind: "user", key: "carried-retry-match"))

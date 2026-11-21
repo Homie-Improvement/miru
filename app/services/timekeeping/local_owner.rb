@@ -434,7 +434,7 @@ module Timekeeping
       def answer_from(receipt)
         return Outcome.refusal(:idempotency_key_reused) unless receipt.fingerprint == fingerprint
 
-        Outcome.new(status: receipt.status, body: JSON.parse(receipt.body))
+        Outcome.new(status: receipt.status, body: JSON.parse(receipt.body), replayed: true)
       end
 
       def store_receipt(outcome)
