@@ -51,7 +51,7 @@ class TimesheetEntry < ApplicationRecord
   before_validation :normalize_source_fields
   before_validation :normalize_proof_metadata
   before_save :assign_company_from_project, if: -> { company_id.nil? || will_save_change_to_project_id? }
-  after_create { Rails.event.notify(TimesheetEntries::Created.new(self)) }
+  after_create { notify_created }
 
   validates :duration, :work_date, :bill_status, :review_status, presence: true
   validates :duration, numericality: { less_than_or_equal_to: 6000000, greater_than_or_equal_to: 0.0 }
@@ -155,6 +155,15 @@ class TimesheetEntry < ApplicationRecord
 
   def formatted_work_date
     CompanyDateFormattingService.new(work_date, company:).process
+  end
+
+  # The one place TimesheetEntries::Created is raised. A save in the legacy
+  # store calls it from after_create with the ambient user; a create another
+  # store owns calls it on the record built from that store's answer, with
+  # the actor of the write that made it.
+  def notify_created(actor: Current.user)
+    Rails.event.notify(TimesheetEntries::Created.new(self, actor:))
+    nil
   end
 
   private

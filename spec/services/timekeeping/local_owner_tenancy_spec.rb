@@ -195,6 +195,59 @@ RSpec.describe Timekeeping::LocalOwner, "cross-company references" do
     expect(connection.select_values("SELECT company_id FROM entry_outbox_items").map(&:to_i)).to eq([company_b.id])
   end
 
+  # "a 2xx answer that changed nothing stores no receipt"; "changes nothing in either database, in both directions".
+  it "stores no receipt and changes nothing when a bulk_move or bulk_delete names only the other company's entry, in both directions" do
+    owner_a = timekeeping_member(company_a, "owner")
+    owner_b = timekeeping_member(company_b, "owner")
+    insert_tenancy_entry(93_201, company_a, project_a, owner_a)
+    insert_tenancy_entry(93_202, company_b, project_b, owner_b)
+    entries_before = connection.select_rows("SELECT * FROM entries ORDER BY id")
+    counts_before = timekeeping_row_counts
+    expect(counts_before["entries"]).to eq(2)
+
+    [
+      [company_a, owner_a, project_a, 93_202],
+      [company_b, owner_b, project_b, 93_201]
+    ].each do |company, owner, project, foreign_id|
+      [[:bulk_move, { "project_id" => project.id }], [:bulk_delete, {}]].each do |operation, extra|
+        params = { "idempotency_key" => "unchanged-#{operation}-#{company.id}",
+                   "body" => { "entry_ids" => [foreign_id] }.merge(extra) }
+        # Sent twice with the same key: nothing was stored, so the retry is evaluated again.
+        2.times do
+          outcome = described_class.call(operation:, company_id: company.id, generation:,
+                                         actor: described_class::Actor.user(user_id: owner.id, role: "owner"), params:)
+
+          expect([outcome.status, outcome.body])
+            .to eq([200, { "results" => [{ "entry_id" => foreign_id, "result" => "not_found" }] }])
+        end
+      end
+    end
+
+    expect(timekeeping_row_counts).to eq(counts_before)
+    expect(connection.select_rows("SELECT * FROM entries ORDER BY id")).to eq(entries_before)
+  end
+
+  it "stores one receipt for a bulk_delete that deleted an entry and replays it" do
+    owner_a = timekeeping_member(company_a, "owner")
+    insert_tenancy_entry(93_301, company_a, project_a, owner_a)
+    params = { "idempotency_key" => "changed-bulk-delete", "body" => { "entry_ids" => [93_301] } }
+    delete = lambda do
+      described_class.call(operation: :bulk_delete, company_id: company_a.id, generation:,
+                           actor: described_class::Actor.user(user_id: owner_a.id, role: "owner"), params:)
+    end
+
+    first = delete.call
+    receipts_after_first = described_class::Receipt.count
+    replay = delete.call
+
+    expected = [200, { "results" => [{ "entry_id" => 93_301, "result" => "deleted" }] }]
+    expect([first.status, first.body]).to eq(expected)
+    expect(receipts_after_first).to eq(1)
+    expect([replay.status, replay.body]).to eq(expected)
+    expect(described_class::Receipt.count).to eq(1)
+    expect(connection.select_value("SELECT version FROM entries WHERE id = 93301").to_i).to eq(2)
+  end
+
   it "ignores company, actor and role fields inside params and the body and writes as the keyword company and actor" do
     employee_b = timekeeping_member(company_b, "employee")
     other_b = timekeeping_member(company_b, "owner")

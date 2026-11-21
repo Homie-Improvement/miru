@@ -76,6 +76,18 @@ module Timekeeping
     # instead of discarding the entries it names.
     REPLAY_ONLY_GENERATION = "replay-only"
 
+    # Sent by Timekeeping on an answer served from its stored receipt
+    # (contracts/timekeeping/entry_api.yml rules.replayed_answer).
+    REPLAYED_HEADER = "Idempotency-Replayed"
+    REPLAYED_VALUE = "true"
+
+    # A create's answered entry Hash, and whether Timekeeping served it from
+    # a stored receipt. A replay has the same status and body as the first
+    # answer, so the header is the only way to tell them apart. A Timekeeping
+    # instance that predates the header never sends it, so its replays read as
+    # first answers.
+    CreateAnswer = Data.define(:row, :replayed)
+
     # Timekeeping could not be reached, refused the monolith's own token, or
     # answered something unexpected. A subclass of the read client's error, so
     # it renders as the same retryable 503.
@@ -93,9 +105,18 @@ module Timekeeping
     # a reused Idempotency-Key with a different body. Rendered as 422.
     class Rejected < StandardError; end
 
+    # The Idempotency-Key was already used for a different request. Rendered
+    # as 422 with reason idempotency_key_reused, so a client can tell it from
+    # a malformed write.
+    class KeyReused < Rejected; end
+
     # Errors raised by a 409 answer, by its reason. Any other 409 reason is a
     # conflict too.
     CONFLICT_ERRORS = { "stale_generation" => Gateway::StaleGeneration }.freeze
+
+    # Errors raised by a 422 answer, by its reason. Any other 422 reason is a
+    # rejection.
+    REJECTED_ERRORS = { "idempotency_key_reused" => KeyReused }.freeze
 
     # Errors raised by every other non-2xx status. Any other 4xx is a
     # rejection, and anything else is an unavailable service.
@@ -119,7 +140,8 @@ module Timekeeping
       return ActiveRecord::RecordNotFound.new("Couldn't find TimesheetEntry", "TimesheetEntry") if status == 404
       return CONFLICT_ERRORS.fetch(reason, Conflict).new if status == 409
 
-      error_class = STATUS_ERRORS.fetch(status) { (400..499).cover?(status) ? Rejected : Error }
+      error_class = REJECTED_ERRORS[reason] if status == 422
+      error_class ||= STATUS_ERRORS.fetch(status) { (400..499).cover?(status) ? Rejected : Error }
       error_class.new("Timekeeping entry #{operation} answered #{status}")
     end
 
@@ -174,14 +196,16 @@ module Timekeeping
       number.nil? ? fields : fields.merge("duration" => number)
     end
 
-    # Returns the created entry Hash. idempotency_key replaces the key derived
-    # from the request, for a caller whose retries run under a new request
-    # id, such as an import rerun, and must still be recognised as the same
+    # Returns a CreateAnswer. idempotency_key replaces the key derived from
+    # the request, for a caller whose retries run under a new request id,
+    # such as an import rerun, and must still be recognised as the same
     # create.
     def create_entry(context:, generation:, body:, idempotency_key: nil)
       path = format(ENTRIES_PATH, company_id: context.company.id)
-      forward(Net::HTTP::Post, path, operation: "create", context:, generation:, body:,
-                                     idempotency_key: idempotency_key || request_key(context, "create"))
+      response = send_forward(Net::HTTP::Post, path, operation: "create", context:, generation:, body:,
+                                                     idempotency_key: idempotency_key || request_key(context, "create"))
+      CreateAnswer.new(row: parse_answer(response, operation: "create"),
+                       replayed: response[REPLAYED_HEADER] == REPLAYED_VALUE)
     end
 
     # Returns the updated entry Hash. Only the fields the context's writer may
@@ -271,8 +295,20 @@ module Timekeeping
         self.class.bulk_idempotency_key(request_id: key_seed(context), operation:, entry_ids:)
       end
 
+      # Returns the answered Hash of a successful call.
+      # :reek:LongParameterList
       def forward(request_class, path, operation:, context:, generation:, idempotency_key:, version: nil, body: nil,
                   replay_only: false)
+        response = send_forward(request_class, path, operation:, context:, generation:, idempotency_key:, version:,
+                                                     body:, replay_only:)
+        parse_answer(response, operation:)
+      end
+
+      # Returns the successful Net::HTTPResponse, so a caller can read its
+      # headers as well as its body.
+      # :reek:LongParameterList
+      def send_forward(request_class, path, operation:, context:, generation:, idempotency_key:, version: nil,
+                       body: nil, replay_only: false)
         raise Error, "#{EntryApiClient::BASE_URL_ENV} is not set" if @base_url.blank?
 
         request = request_class.new(URI.join(@base_url, path))
@@ -290,9 +326,14 @@ module Timekeeping
         response = send_request(request)
         raise refusal_for(operation, response) unless response.is_a?(Net::HTTPSuccess)
 
+        response
+      rescue SystemCallError, IOError, Timeout::Error, SocketError, OpenSSL::SSL::SSLError, Net::ProtocolError => error
+        raise Error, "Timekeeping entry #{operation} failed: #{error.class}"
+      end
+
+      def parse_answer(response, operation:)
         JSON.parse(response.body)
-      rescue SystemCallError, IOError, Timeout::Error, SocketError, OpenSSL::SSL::SSLError, Net::ProtocolError,
-             JSON::ParserError => error
+      rescue JSON::ParserError => error
         raise Error, "Timekeeping entry #{operation} failed: #{error.class}"
       end
 

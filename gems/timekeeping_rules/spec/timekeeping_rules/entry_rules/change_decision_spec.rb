@@ -95,7 +95,7 @@ RSpec.describe TimekeepingRules::EntryRules, ".change_decision and .refusing_rul
   describe "background callers skip the user rules" do
     it "allows a background operation on a locked, stale, foreign, unbilled entry" do
       foreign = entry(user_id: 2, locked: true, work_date: today - 30)
-      expect(decide(entry: foreign, caller: "entries.import", role: nil, acting_user_id: nil)).to eq(:ok)
+      expect(decide(entry: foreign, caller: "agents.detach_entries", role: nil, acting_user_id: nil)).to eq(:ok)
     end
   end
 

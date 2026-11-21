@@ -154,6 +154,31 @@ RSpec.describe Timekeeping::LocalOwner, "a committed create" do
     expect(timekeeping_row_counts).to eq(one_row_each)
   end
 
+  it "marks only an answer served from the stored receipt as replayed, on call and on replay" do
+    first = create_as_employee("replayed-flag")
+    second = create_as_employee("replayed-flag")
+    stored = described_class.replay(
+      operation: :create, company_id: company.id, generation: TimekeepingOwnership.current.generation.to_s,
+      actor: described_class::Actor.user(user_id: employee.id, role: "employee"),
+      params: { "idempotency_key" => "replayed-flag",
+                "body" => { "project_id" => project.id, "work_date" => Date.current.iso8601, "duration" => 1.5,
+                            "note" => "planning", "source" => TimesheetEntry::SOURCES.first, "source_metadata" => {} } }
+    )
+
+    expect([first.status, first.replayed]).to eq([201, false])
+    expect([second.status, second.replayed]).to eq([201, true])
+    expect([stored.status, stored.replayed]).to eq([201, true])
+    expect(stored.body).to eq(first.body)
+  end
+
+  it "answers a refusal as not replayed" do
+    expect(create_as_employee("refused-flag", note: "first").status).to eq(201)
+
+    reused = create_as_employee("refused-flag", note: "second")
+
+    expect([reused.status, reused.replayed]).to eq([422, false])
+  end
+
   it "answers idempotency_key_reused to the same key with a different body and keeps the first write" do
     expect(create_as_employee("one-key", note: "first").status).to eq(201)
 
