@@ -234,84 +234,39 @@ RSpec.describe "Internal::V1::Companies::References", type: :request do
         expect(response.parsed_body).to eq("reason" => "invalid_agent_ids")
       end
     end
-  end
-
-  context "more tests 2", type: :request do
-  # "Timekeeping cannot yet tell another company's agent from one of the company's own agents that has no entries."
-  # The ownership fact must tell Timekeeping only about the path company's agents: another company's agent id
-  # is answered exactly like an id no agent has, so the fact cannot be used to probe other companies.
-  it "lists in owned_agent_ids only the path company's requested agents, leaving another company's agent out exactly like an unused id" do
-    own_agent = create(:agent, company: company_a, user: shared_user)
-    foreign_agent = create(:agent, company: company_b, user: b_only_user)
-    unused_agent_id = Agent.maximum(:id).to_i + 1000
-
-    bodies = with_timekeeping_service_token do |token|
-      [[own_agent.id, foreign_agent.id], [own_agent.id, unused_agent_id]].map do |agent_ids|
-        get "/internal/v1/companies/#{company_a.id}/reference",
-            params: { project_ids: "", agent_ids: agent_ids.join(",") },
-            headers: { "Authorization" => "Bearer #{token}" }
-        expect(response).to have_http_status(:ok)
-        response.parsed_body
-      end
-    end
-
-    with_foreign, with_unused = bodies
-    expect(with_foreign["owned_agent_ids"]).to eq([own_agent.id])
-    expect(with_unused["owned_agent_ids"]).to eq([own_agent.id])
-    expect(with_foreign).to eq(with_unused)
-    expect(with_foreign["agents"].pluck("id")).not_to include(foreign_agent.id)
-  end
-  end
-
-  context "more tests 3", type: :request do
-  it "lists only the path company's own agents in owned_agent_ids and answers another company's agent like an unknown id" do
-    own_agent = create(:agent, company: company_a)
-    foreign_agent = create(:agent, company: company_b)
-    unknown_agent_id = Agent.maximum(:id).to_i + 1000
 
     # "Timekeeping cannot yet tell another company's agent from one of the company's own agents that has no entries."
-    # The ownership fact answers for the path's company only, so a foreign id reads exactly like an id no company uses.
-    bodies = with_timekeeping_service_token do |token|
-      [[own_agent.id, foreign_agent.id], [foreign_agent.id], [unknown_agent_id]].map do |agent_ids|
-        get "/internal/v1/companies/#{company_a.id}/reference",
-            params: { project_ids: "", agent_ids: agent_ids.join(",") },
-            headers: { "Authorization" => "Bearer #{token}" }
-        expect(response).to have_http_status(:ok)
-        response.parsed_body
+    # The ownership fact answers for the path's company only, so another company's agent id reads exactly like
+    # an id no agent has, and the fact cannot be used to probe other companies.
+    it "lists only the path company's requested agents in owned_agent_ids and answers another company's agent like an unknown id" do
+      own_agent = create(:agent, company: company_a, user: shared_user)
+      foreign_agent = create(:agent, company: company_b, user: b_only_user)
+      unknown_agent_id = Agent.maximum(:id).to_i + 1000
+      requests = [
+        [own_agent.id, foreign_agent.id, unknown_agent_id], [own_agent.id, foreign_agent.id],
+        [own_agent.id, unknown_agent_id], [foreign_agent.id], [unknown_agent_id], []
+      ]
+
+      bodies = with_timekeeping_service_token do |token|
+        requests.map do |agent_ids|
+          get "/internal/v1/companies/#{company_a.id}/reference",
+              params: { project_ids: "", agent_ids: agent_ids.join(",") },
+              headers: { "Authorization" => "Bearer #{token}" }
+          expect(response).to have_http_status(:ok)
+          response.parsed_body
+        end
       end
+
+      all_kinds, own_and_foreign, own_and_unknown, foreign, unknown, none_requested = bodies
+      expect(contract["response_fields"]).to include("owned_agent_ids")
+      expect(all_kinds["owned_agent_ids"]).to eq([own_agent.id])
+      expect(own_and_foreign["owned_agent_ids"]).to eq([own_agent.id])
+      expect(own_and_foreign).to eq(own_and_unknown)
+      expect(foreign["owned_agent_ids"]).to eq([])
+      expect(foreign).to eq(unknown)
+      expect(none_requested["owned_agent_ids"]).to eq([])
+      expect(foreign["agents"].pluck("id")).not_to include(foreign_agent.id)
     end
-
-    mixed, foreign, unknown = bodies
-    expect(mixed["owned_agent_ids"]).to eq([own_agent.id])
-    expect(foreign["owned_agent_ids"]).to eq([])
-    expect(unknown["owned_agent_ids"]).to eq([])
-    expect(foreign).to eq(unknown)
-    expect(foreign["agents"].pluck("id")).not_to include(foreign_agent.id)
-  end
-  end
-
-  context "more tests 4", type: :request do
-  # "Timekeeping cannot yet tell another company's agent from one of the company's own agents that has no entries."
-  it "lists in owned_agent_ids only the requested agents of the path company, leaving another company's agent out like an unknown id" do
-    own_agent = create(:agent, company: company_a)
-    foreign_agent = create(:agent, company: company_b)
-    unknown_id = Agent.maximum(:id).to_i + 1000
-
-    bodies = with_timekeeping_service_token do |token|
-      [[own_agent.id, foreign_agent.id, unknown_id], []].map do |agent_ids|
-        get "/internal/v1/companies/#{company_a.id}/reference",
-            params: { project_ids: "", agent_ids: agent_ids.join(",") },
-            headers: { "Authorization" => "Bearer #{token}" }
-        expect(response).to have_http_status(:ok)
-        response.parsed_body
-      end
-    end
-
-    requested, none_requested = bodies
-    expect(contract["response_fields"]).to include("owned_agent_ids")
-    expect(requested["owned_agent_ids"]).to eq([own_agent.id])
-    expect(none_requested["owned_agent_ids"]).to eq([])
-  end
   end
 end
 
