@@ -285,7 +285,11 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
           section_9_3_restore_commit!
 
           intent = section_9_3_latest_intent(company, draft)
-          section_9_3_await_abort(name, company, draft, intent) if intent
+          expect(intent&.state).to eq("failed"), "#{name}: the failed save's intent is #{intent&.state.inspect}"
+          if intent
+            state = section_9_3_await_abort(name, company, draft, intent)
+            expect(state).to eq("aborted"), "#{name}: the failed save's operation is #{state.inspect}"
+          end
           after = section_9_3_reservations(company, [entry])
           expect(section_9_3_committed_by(after, entry, draft).size).to eq(1),
             "#{name}: the entry should still be reserved by the committed draft; saw #{after.inspect}"

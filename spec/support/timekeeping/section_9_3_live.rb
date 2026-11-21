@@ -20,7 +20,6 @@ module TimekeepingSection93Live
   class PollTimeout < StandardError; end
 
   HANDOFF_INITIALIZER = "config/initializers/timekeeping_handoff.rb"
-  REPORT_FILE = "reconciliation.json"
   DEFAULT_POLL_SECONDS = 30
   POLL_INTERVAL_SECONDS = 0.1
 
@@ -68,8 +67,9 @@ module TimekeepingSection93Live
     generation = TimekeepingOwnership.uncached do
       TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).pick(:generation)
     end
-    report_path = report_root.join("generation-#{generation}", REPORT_FILE)
-    raise CutoverAborted, "cutover wrote no #{REPORT_FILE} for generation #{generation}" unless report_path.file?
+    report_file = Timekeeping::Handoff::ReportDirectory::RECONCILIATION_FILE
+    report_path = Timekeeping::Handoff::ReportDirectory.new(root: report_root, generation:).path.join(report_file)
+    raise CutoverAborted, "cutover wrote no #{report_file} for generation #{generation}" unless report_path.file?
     raise CutoverAborted, "cutover reconciliation reports abort: true" if JSON.parse(report_path.read).fetch("abort")
 
     generation
