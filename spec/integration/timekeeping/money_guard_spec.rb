@@ -5,8 +5,9 @@ require "rails_helper"
 # Runs the real cutover, rollback and re-cutover against the local demo
 # runtime and proves each seeded company's invoice money is unchanged by them.
 # All three handoffs share one example, because the runtime hooks empty the
-# monolith after every example. It needs TIMEKEEPING_LIVE=1, so the default
-# suite skips it, and a skip is not a pass.
+# monolith after every example. The :integrated_runtime tag skips it unless
+# the live flag is set (spec/support/timekeeping/integrated_runtime.rb), so the
+# default suite skips it, the CI live job does not run it, and a skip is not a pass.
 RSpec.describe "Timekeeping money guard", :integrated_runtime, :two_tenant_seed, committed_data: true,
                                           owner_state: "legacy" do
   # "A test takes the financial snapshot of section 10.4 before and after the first cutover, a rollback and a re-cutover, with no user billing edit between them, and fails on any difference."

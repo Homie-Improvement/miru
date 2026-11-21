@@ -6,8 +6,9 @@ require "securerandom"
 
 # Runs real handoffs against the whole local runtime, so a write accepted by
 # the monolith after a rollback is shown to reach the projection and then to
-# be drained into Timekeeping at re-cutover exactly once. Needs
-# TIMEKEEPING_LIVE=1 and TIMEKEEPING_DATABASE_URL; the default suite skips it.
+# be drained into Timekeeping at re-cutover exactly once. The :integrated_runtime
+# tag skips it unless the live flag is set (spec/support/timekeeping/integrated_runtime.rb),
+# so the default suite skips it, and the CI live job does not run it.
 RSpec.describe "Timekeeping handoff sequence", :integrated_runtime, :two_tenant_seed, committed_data: true, owner_state: "legacy" do
   it "drains a web entry written after rollback into Timekeeping at re-cutover as exactly one row" do
     company_ids = [fork_and_leaf.id, copper_kettle.id]
