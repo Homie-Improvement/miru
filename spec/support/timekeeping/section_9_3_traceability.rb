@@ -12,14 +12,17 @@ module TimekeepingSection93Traceability
   HEADING = "### 9.3 Failure cases"
   COLUMNS = ["Case", "State that survives", "How it is detected and repaired", "Proving test"].freeze
   SEPARATOR = /\A\|(\s*:?-+:?\s*\|)+\z/
-  # The Proving test prefix that marks a row this check covers, and its kind.
-  KINDS = { "Integration:" => :integration, "Concurrency:" => :concurrency }.freeze
+  # Every Proving test prefix the table may use, and the kind it marks. A row
+  # with any other prefix raises, so a mistyped marker cannot drop a row.
+  KINDS = { "Integration:" => :integration, "Concurrency:" => :concurrency, "Contract:" => :contract }.freeze
+  # The kinds this check covers; Contract rows are proved by the contract suite.
+  COVERED_KINDS = %i[integration concurrency].freeze
 
   Row = Data.define(:case_text, :survives, :proving_test, :kind) do
     # Data freezes only the record, so each string is copied and frozen to keep
     # the caller's later edits out of the row.
     def initialize(case_text:, survives:, proving_test:, kind:)
-      raise ArgumentError, "unknown row kind #{kind.inspect}" unless KINDS.value?(kind)
+      raise ArgumentError, "unknown row kind #{kind.inspect}" unless COVERED_KINDS.include?(kind)
 
       super(case_text: case_text.dup.freeze, survives: survives.dup.freeze,
             proving_test: proving_test.dup.freeze, kind:)
@@ -30,16 +33,16 @@ module TimekeepingSection93Traceability
 
   # The covered rows of the section 9.3 table, keyed by their raw Case cell, in
   # table order. Raises ArgumentError when the heading is missing or repeated,
-  # when no table follows it, when a row does not have exactly four cells, or
-  # when a Case repeats.
+  # when no table follows it, when a row does not have exactly four cells,
+  # when a Case repeats, or when a Proving test has no known prefix.
   def rows(markdown)
     table = table_rows(markdown)
     repeated = table.map(&:first).tally.find { |_, count| count > 1 }&.first
     raise ArgumentError, "section 9.3 repeats the Case #{repeated.inspect}" if repeated
 
     table.filter_map do |case_text, survives, _repair, proving_test|
-      kind = KINDS.find { |prefix, _| proving_test.start_with?(prefix) }&.last
-      [case_text, Row.new(case_text:, survives:, proving_test:, kind:)] if kind
+      kind = row_kind(case_text, proving_test)
+      [case_text, Row.new(case_text:, survives:, proving_test:, kind:)] if COVERED_KINDS.include?(kind)
     end.to_h.freeze
   end
 
@@ -78,5 +81,13 @@ module TimekeepingSection93Traceability
   def cells(line)
     line.delete_prefix("|").delete_suffix("|").split("|", -1).map(&:strip)
   end
-  private_class_method :table_rows, :cells
+
+  def row_kind(case_text, proving_test)
+    kind = KINDS.find { |prefix, _| proving_test.start_with?(prefix) }&.last
+    return kind if kind
+
+    raise ArgumentError, "section 9.3 row #{case_text.inspect} has no known Proving test prefix " \
+                         "(#{KINDS.keys.join(', ')}): #{proving_test.inspect}"
+  end
+  private_class_method :table_rows, :cells, :row_kind
 end

@@ -106,6 +106,22 @@ RSpec.describe TimekeepingSection93Traceability do
       expect(rows.fetch("Relay down").kind).to eq(:integration)
     end
 
+    it "rows raises naming the Case when a Proving test prefix is mistyped instead of dropping the row" do
+      control = <<~MARKDOWN
+        ### 9.3 Failure cases
+
+        | Case | State that survives | How it is detected and repaired | Proving test |
+        |---|---|---|---|
+        | Relay down | Outbox rows stay unsent | Relay resumes | Integration: stop the relay |
+        | Draft discarded | Released | Discard | Integration: discard |
+        | Stale generation | No change | 409 | Contract: old generation |
+      MARKDOWN
+      mistyped = control.sub("Integration: discard", "Integraton: discard")
+
+      expect(described_class.rows(control).keys).to eq(["Relay down", "Draft discarded"])
+      expect { described_class.rows(mistyped) }.to raise_error(ArgumentError, /"Draft discarded".*Integraton/)
+    end
+
     it "rows result does not change when the markdown string is mutated afterwards" do
       markdown = +<<~MARKDOWN
         ### 9.3 Failure cases

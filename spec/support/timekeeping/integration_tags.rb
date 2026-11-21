@@ -28,8 +28,8 @@ module TimekeepingIntegrationTags
     before after around prepend_before append_before prepend_after append_after let let! subject subject!
   ].freeze
   # The only example methods whose names count as passing examples: the x
-  # forms, skip and pending never run, and the f forms are focus filters
-  # that should not be committed.
+  # forms, skip and pending never run, and the fit, fspecify, fexample and
+  # focus calls are focus filters that should not be committed.
   COUNTED_EXAMPLE_METHODS = %i[it specify example].freeze
   DISABLED_GROUP_METHODS = %i[xdescribe xcontext].freeze
   # Metadata keys that stop an example, or every example in a group, from
@@ -62,12 +62,21 @@ module TimekeepingIntegrationTags
   end
 
   # The names of the examples in one spec file's source that would run and
-  # pass, in source order. Examples that are skipped, pending, focused, or
-  # under a skipped group are left out, so none of them can count as proof.
+  # pass, in source order. Examples that are skipped, pending, written with
+  # fit, fspecify, fexample or focus, or under a skipped group are left out,
+  # so none of them can count as proof.
   # Raises ArgumentError naming the line of a counted example whose name is
   # not a plain string literal, because its text cannot be read from source.
+  # Also raises on a syntax error: Prism still returns a recovered tree, but
+  # RSpec cannot load the file, so none of its examples would run.
   def example_names(source)
-    example_names_in(Prism.parse(source).value, false).freeze
+    result = Prism.parse(source)
+    unless result.success?
+      error = result.errors.first
+      raise ArgumentError, "the spec source does not parse: line #{error.location.start_line}: #{error.message}"
+    end
+
+    example_names_in(result.value, false).freeze
   end
 
   # disabled is whether a group above node is skipped or pending. It is

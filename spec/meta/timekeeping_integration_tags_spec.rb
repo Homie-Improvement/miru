@@ -506,6 +506,18 @@ RSpec.describe TimekeepingIntegrationTags do
       expect(described_class.example_names(source)).to eq(["Counted control"])
     end
 
+    it "raises naming the parse error line when the source is not valid Ruby" do
+      broken = <<~RUBY
+        RSpec.describe "relay" do
+          it "Relay down" do
+          end
+      RUBY
+      valid = "#{broken}end\n"
+
+      expect(described_class.example_names(valid)).to eq(["Relay down"])
+      expect { described_class.example_names(broken) }.to raise_error(ArgumentError, /does not parse: line \d+/)
+    end
+
     it "raises naming the line of an example that has a block but no name" do
       source = <<~RUBY
         RSpec.describe "relay" do
