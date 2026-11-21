@@ -2774,3 +2774,26 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded client Idempotency-Key
     end
   end
 end
+
+RSpec.describe "Api::V1::TimesheetEntry legacy update project tenant boundary", type: :request do
+  it "keeps the company-scoped project when the entry attributes name another company's project" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    project = create(:project, billable: true, client: create(:client, company:))
+    foreign_project = create(:project, billable: true, client: create(:client, company: create(:company)))
+    entry = create(:timesheet_entry, user:, project:, bill_status: :unbilled)
+    sign_in user
+
+    send_request :patch, api_v1_timesheet_entry_path(entry), params: {
+      project_id: project.id,
+      timesheet_entry: { project_id: foreign_project.id, duration: 30, work_date: Date.current, note: "Nested project",
+                         bill_status: :unbilled }
+    }, headers: auth_headers(user).merge("Idempotency-Key" => "legacy-nested-project-key")
+
+    expect(response).to have_http_status(:ok)
+    expect(entry.reload.project_id).to eq(project.id)
+    expect(entry.note).to eq("Nested project")
+  end
+end

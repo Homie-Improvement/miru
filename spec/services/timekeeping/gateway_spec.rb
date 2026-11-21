@@ -1381,6 +1381,7 @@ RSpec.describe Timekeeping::Gateway do
       context: keyed_context.call("req-retry-delete-2", delete_key), write_client:, read_client:
     )
     discarded_at = TimesheetEntry.find(entry.id).discarded_at
+    expect(discarded_at).to be_present
     # A retry of a committed delete under the same key answers from the legacy receipt, not 404.
     expect(retry_gateway.destroy(entry_id: entry.id, authorize: ->(_entry) { })).to be(true)
     expect(TimesheetEntry.find(entry.id).discarded_at).to eq(discarded_at)
@@ -3502,5 +3503,100 @@ RSpec.describe Timekeeping::Gateway do
     expect(timekeeping_row_counts).to eq(baseline)
     expect(Timekeeping::LocalEntry.where(company_id: company.id).count).to eq(0)
     expect(TimekeepingOwnership.current.attributes).to eq(ownership_before)
+  end
+end
+
+RSpec.describe Timekeeping::Gateway, "legacy update and delete receipts by idempotency key" do
+  let(:receipt_company) { create(:company) }
+  let(:receipt_project) { create(:project, billable: true, client: create(:client, company: receipt_company)) }
+  let(:receipt_admin) do
+    create(:user, current_workspace_id: receipt_company.id).tap do |user|
+      create(:employment, company: receipt_company, user:)
+      user.add_role :admin, receipt_company
+    end
+  end
+  let(:receipt_colleague) do
+    create(:user, current_workspace_id: receipt_company.id).tap do |user|
+      create(:employment, company: receipt_company, user:)
+      user.add_role :employee, receipt_company
+    end
+  end
+
+  def receipt_gateway(request_id, key)
+    described_class.new(context: Timekeeping::WriteContext.new(company: receipt_company, actor: receipt_admin,
+                                                               actor_kind: "user", request_id:, idempotency_key: key))
+  end
+
+  def receipt_audits(entry)
+    Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count
+  end
+
+  # A receipt answers only inside the retry window; past it the same key is a new request.
+  it "runs a legacy update retried after its receipt expired as a new authorized update and prunes the old receipt" do
+    entry = create(:timesheet_entry, user: receipt_admin, project: receipt_project, bill_status: :unbilled)
+    attributes = { duration: 30, work_date: Date.current, note: "Expiring edit", bill_status: "unbilled" }
+    authorized = []
+    update_with = lambda do |request_id|
+      receipt_gateway(request_id, "legacy-update-expiry-key").update(
+        entry_id: entry.id, project: receipt_project, attributes:, authorize: ->(record) { authorized << record.id }
+      )
+    end
+
+    update_with.call("req-update-expiry-1")
+    old_receipt = Timekeeping::LegacyEntryWriteReceipt.find_by!(timesheet_entry_id: entry.id, operation: "update")
+    old_receipt.update_columns(expires_at: 1.second.ago)
+
+    update_with.call("req-update-expiry-2")
+
+    expect(authorized).to eq([entry.id, entry.id])
+    expect(Timekeeping::LegacyEntryWriteReceipt.where(id: old_receipt.id)).not_to exist
+    expect(Timekeeping::LegacyEntryWriteReceipt.where(timesheet_entry_id: entry.id, operation: "update").count).to eq(1)
+  end
+
+  # The refusal rolls back the write's transaction, pruning included, so only the answer is checked here.
+  it "answers not found to a legacy delete retried after its receipt expired" do
+    entry = create(:timesheet_entry, user: receipt_admin, project: receipt_project, bill_status: :unbilled)
+    destroy_with = ->(request_id) { receipt_gateway(request_id, "legacy-delete-expiry-key").destroy(entry_id: entry.id, authorize: ->(_) { }) }
+
+    expect(destroy_with.call("req-delete-expiry-1")).to be(true)
+    discarded_at = TimesheetEntry.find(entry.id).discarded_at
+    expect(discarded_at).to be_present
+    Timekeeping::LegacyEntryWriteReceipt.where(timesheet_entry_id: entry.id).update_all(expires_at: 1.second.ago)
+
+    expect { destroy_with.call("req-delete-expiry-2") }.to raise_error(ActiveRecord::RecordNotFound)
+    expect(TimesheetEntry.find(entry.id).discarded_at).to eq(discarded_at)
+  end
+
+  it "propagates a read refusal on a matching legacy delete receipt and changes nothing" do
+    entry = create(:timesheet_entry, user: receipt_admin, project: receipt_project, bill_status: :unbilled)
+    receipt_gateway("req-delete-refused-1", "legacy-delete-refused-key").destroy(entry_id: entry.id, authorize: ->(_) { })
+    discarded_at = TimesheetEntry.find(entry.id).discarded_at
+    expect(discarded_at).to be_present
+    audits_after_first = receipt_audits(entry)
+    receipts_after_first = Timekeeping::LegacyEntryWriteReceipt.pluck(:id, :expires_at)
+
+    expect do
+      receipt_gateway("req-delete-refused-2", "legacy-delete-refused-key").destroy(
+        entry_id: entry.id, authorize: ->(_) { }, authorize_replay: ->(_) { raise Pundit::NotAuthorizedError }
+      )
+    end.to raise_error(Pundit::NotAuthorizedError)
+
+    expect(TimesheetEntry.find(entry.id).discarded_at).to eq(discarded_at)
+    expect(receipt_audits(entry)).to eq(audits_after_first)
+    expect(Timekeeping::LegacyEntryWriteReceipt.pluck(:id, :expires_at)).to eq(receipts_after_first)
+  end
+
+  # The actor scope only narrows what a caller may target, so a stored colleague entry is never replayed under it.
+  it "answers not found to a legacy delete replayed with the actor scope for a colleague's stored entry" do
+    entry = create(:timesheet_entry, user: receipt_colleague, project: receipt_project, bill_status: :unbilled)
+    receipt_gateway("req-delete-scope-1", "legacy-delete-scope-key").destroy(entry_id: entry.id, authorize: ->(_) { })
+    discarded_at = TimesheetEntry.find(entry.id).discarded_at
+
+    expect do
+      receipt_gateway("req-delete-scope-2", "legacy-delete-scope-key").destroy(
+        entry_id: entry.id, authorize: ->(_) { }, authorize_replay: ->(_) { }, scope: :actor
+      )
+    end.to raise_error(ActiveRecord::RecordNotFound)
+    expect(TimesheetEntry.find(entry.id).discarded_at).to eq(discarded_at)
   end
 end

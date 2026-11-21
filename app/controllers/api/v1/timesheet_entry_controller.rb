@@ -94,7 +94,10 @@ class Api::V1::TimesheetEntryController < Api::V1::ApplicationController
       raise Pundit::NotAuthorizedError
     end
 
+    # The entry's project comes only from the top-level project_id, which
+    # current_project resolves inside the current company. A project_id in
+    # these attributes would be assigned over it unchecked.
     def timesheet_entry_params
-      params.require(:timesheet_entry).permit(:project_id, :duration, :work_date, :note, :bill_status)
+      params.require(:timesheet_entry).permit(:duration, :work_date, :note, :bill_status)
     end
 end
