@@ -40,6 +40,11 @@ module TimekeepingRegressionAdapter
     # The running TimekeepingLiveInstance, or nil when the adapter is not running.
     attr_reader :current
 
+    # The live Timekeeping database URL the running instance was started on,
+    # after start! checked that it names a test database; nil when the
+    # adapter is not running.
+    attr_reader :database_url
+
     # Answers nil, touching nothing, unless env selects a live regression run
     # and owner_state is the timekeeping state. Otherwise answers the started
     # instance, or raises before any process starts when the database URL is

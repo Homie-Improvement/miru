@@ -105,9 +105,18 @@ module Timekeeping
     # a reused Idempotency-Key with a different body. Rendered as 422.
     class Rejected < StandardError; end
 
+    # The Idempotency-Key was already used for a different request. Rendered
+    # as 422 with reason idempotency_key_reused, so a client can tell it from
+    # a malformed write.
+    class KeyReused < Rejected; end
+
     # Errors raised by a 409 answer, by its reason. Any other 409 reason is a
     # conflict too.
     CONFLICT_ERRORS = { "stale_generation" => Gateway::StaleGeneration }.freeze
+
+    # Errors raised by a 422 answer, by its reason. Any other 422 reason is a
+    # rejection.
+    REJECTED_ERRORS = { "idempotency_key_reused" => KeyReused }.freeze
 
     # Errors raised by every other non-2xx status. Any other 4xx is a
     # rejection, and anything else is an unavailable service.
@@ -131,7 +140,8 @@ module Timekeeping
       return ActiveRecord::RecordNotFound.new("Couldn't find TimesheetEntry", "TimesheetEntry") if status == 404
       return CONFLICT_ERRORS.fetch(reason, Conflict).new if status == 409
 
-      error_class = STATUS_ERRORS.fetch(status) { (400..499).cover?(status) ? Rejected : Error }
+      error_class = REJECTED_ERRORS[reason] if status == 422
+      error_class ||= STATUS_ERRORS.fetch(status) { (400..499).cover?(status) ? Rejected : Error }
       error_class.new("Timekeeping entry #{operation} answered #{status}")
     end
 

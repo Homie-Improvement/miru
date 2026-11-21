@@ -15,6 +15,19 @@ retention_hours: 24
 # Only successful answers are stored, so a retry after an error, a 409
 # included, is evaluated again.
 stored_statuses: 2xx
+# A 2xx answer that changed nothing stores no receipt, so a retry of it is
+# evaluated again: nothing was written, so a second evaluation is safe. Such
+# a request, one naming only another company's entries or invoice for
+# example, then leaves no row behind for either company. This rule covers
+# the entry_api writes and the reservations commands; entry snapshot
+# delivery (key_sources.entry_snapshots) still stores every keyed 2xx
+# answer, an all-ignored batch included.
+# The operations listed here are the exception and store their receipt even
+# when they changed nothing. A detach_entries receipt is also the marker that
+# refuses a later entry write naming the agent being deleted, and Timekeeping
+# cannot tell another company's agent from one of the company's own agents
+# that has no entries, so dropping it would let such a write through.
+unchanged_stored_operations: [detach_entries]
 
 key_sources:
   entry_api:

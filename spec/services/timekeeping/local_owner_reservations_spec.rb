@@ -16,7 +16,7 @@ RSpec.describe Timekeeping::LocalOwner, "reservation access refusals" do
       actor.user(user_id: owner.id, role: "owner") => [403, "forbidden"],
       actor.service(name: "invoices", company_id: company.id, operations: ["reservations.commit"]) => [403, "forbidden"],
       actor.service(name: "invoices", company_id: company.id,
-                    operations: ["reservations.commit", "entries.import"]) => [403, "forbidden"],
+                    operations: ["reservations.commit", "invoices.mark_billed"]) => [403, "forbidden"],
       actor.service(name: "invoices", company_id: other_company.id, operations: ["reservations.prepare"]) =>
         [404, "not_found"]
     }
@@ -750,7 +750,7 @@ RSpec.describe Timekeeping::LocalOwner, "reservations: refused callers and store
       described_class::Actor.user(user_id: owner.id, role: "owner") => 403,
       described_class::Actor.service(name: "invoices", company_id: company.id,
                                      operations: ["reservations.commit"]) => 403,
-      described_class::Actor.service(name: "invoices", company_id: company.id, operations: ["entries.import"]) => 403,
+      described_class::Actor.service(name: "invoices", company_id: company.id, operations: ["agents.detach_entries"]) => 403,
       described_class::Actor.service(name: "invoices", company_id: other_company.id,
                                      operations: ["reservations.prepare"]) => 404
     }

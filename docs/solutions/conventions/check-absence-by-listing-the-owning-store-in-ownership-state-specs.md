@@ -31,7 +31,7 @@ The usual fix for positive read-backs is to read the id from the response with `
 
 ## Solution
 
-Use `owned_entries(state:)` from `spec/support/timekeeping/owned_entries.rb`. It returns every entry the owning store holds, in id order, as hashes with the same string keys as `owned_entry`. Filter that list by the fields the old query used, and assert the result is empty:
+Use `owned_entries` from `spec/support/timekeeping/owned_entries.rb`. It returns the entries the owning store holds, in id order, as hashes with the same string keys as `owned_entry`. Since PR #538 its signature is `owned_entries(company: nil, state:, include_discarded: false, **filters)`: discarded entries are left out unless `include_discarded: true`, `company:` limits the read to one company, and keyword filters (`project_id`, `user_id`, `note`, `duration`, `work_date`, `bill_status`, `source`) keep only matching rows; an unknown filter key raises `ArgumentError`. Pass `include_discarded: true` when the query you replace counted discarded rows. Filter by the fields the old query used, and assert the result is empty. The PR #523 form, which selects from the full list, reads:
 
 ```ruby
 owned_for_other_project = owned_entries(state: TimekeepingOwnerState.current).select do |entry|

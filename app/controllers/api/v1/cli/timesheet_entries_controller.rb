@@ -13,10 +13,13 @@ class Api::V1::Cli::TimesheetEntriesController < Api::V1::Cli::BaseController
   end
 
   def update
+    # The project is resolved only for a write, so a retry of a committed
+    # update replays even after the project was archived.
     timesheet_entry = entry_gateway.update(
-      entry_id: params[:id], project:, attributes: update_attributes, authorize: method(:authorize),
+      entry_id: params[:id], requested_project_id: cli_timesheet_entry_params[:project_id],
+      attributes: update_attributes, authorize: method(:authorize),
       authorize_replay: method(:authorize_replayed_entry), scope: :actor
-    )
+    ) { project }
 
     render json: {
       notice: I18n.t("timesheet_entry.update.message"),
@@ -25,16 +28,19 @@ class Api::V1::Cli::TimesheetEntriesController < Api::V1::Cli::BaseController
   end
 
   def destroy
-    entry_gateway.destroy(entry_id: params[:id], authorize: method(:authorize), scope: :actor)
+    entry_gateway.destroy(entry_id: params[:id], authorize: method(:authorize),
+                          authorize_replay: method(:authorize_replayed_entry), scope: :actor)
 
     render json: { notice: I18n.t("timesheet_entry.destroy.message") }, status: 200
   end
 
   private
 
-    # A replayed update returns an edit already committed, so reading it back
-    # needs only show?: the edit policy may refuse the entry the edit made,
-    # such as a billed one.
+    # A replayed update, or a delete replayed by the legacy store, returns a
+    # write already committed, so reading it back needs only show?: the edit
+    # policy may refuse the entry by now, such as one the edit billed or one
+    # past its edit window. The gateway's prepared and Timekeeping delete
+    # replays still check the delete policy instead.
     def authorize_replayed_entry(entry)
       authorize(entry, :show?)
     end
@@ -72,8 +78,15 @@ class Api::V1::Cli::TimesheetEntriesController < Api::V1::Cli::BaseController
         note: cli_timesheet_entry_params[:note],
         bill_status: cli_timesheet_entry_params[:bill_status],
         source: "cli",
-        source_metadata: cli_timesheet_entry_params[:source_metadata]
+        source_metadata:
       }
+    end
+
+    # The gateway's update path normalizes metadata only when it is a plain
+    # Hash, so permitted parameters are converted here. A request without the
+    # key stays nil, which leaves the stored metadata alone on update.
+    def source_metadata
+      cli_timesheet_entry_params[:source_metadata]&.to_h
     end
 
     def update_attributes
@@ -84,7 +97,7 @@ class Api::V1::Cli::TimesheetEntriesController < Api::V1::Cli::BaseController
       }
       attrs[:note] = cli_timesheet_entry_params[:note] if cli_timesheet_entry_params.key?(:note)
       attrs[:bill_status] = cli_timesheet_entry_params[:bill_status] if cli_timesheet_entry_params.key?(:bill_status)
-      attrs[:source_metadata] = cli_timesheet_entry_params[:source_metadata] if cli_timesheet_entry_params.key?(:source_metadata)
+      attrs[:source_metadata] = source_metadata if cli_timesheet_entry_params.key?(:source_metadata)
       attrs
     end
 end

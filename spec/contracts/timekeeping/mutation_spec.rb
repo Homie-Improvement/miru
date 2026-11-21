@@ -116,7 +116,11 @@ RSpec.describe "Timekeeping contract examples against fakes with one rule broken
     ["reserves an entry committed to another active invoice", :reservations,
      { timekeeping: { prepare_table: prepare_table_answering.call(:on_another_invoice, :add_provisional) } }],
     ["reserves an entry held provisionally by another operation", :reservations,
-     { timekeeping: { prepare_table: prepare_table_answering.call(:provisional_elsewhere, :add_provisional) } }]
+     { timekeeping: { prepare_table: prepare_table_answering.call(:provisional_elsewhere, :add_provisional) } }],
+    ["stores a receipt for an answer that changed nothing", :timekeeping_idempotency,
+     { timekeeping: { store_unchanged: ->(**) { true } } }],
+    ["stores no receipt for a detach-entries that detached nothing", :timekeeping_idempotency,
+     { timekeeping: { store_unchanged: ->(**) { false } } }]
   ]
 
   it "passes every group with the unbroken fakes" do
