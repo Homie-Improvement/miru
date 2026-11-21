@@ -3,6 +3,7 @@
 require "rails_helper"
 require "fileutils"
 require "open3"
+require "rbconfig"
 require "stringio"
 require "tmpdir"
 require Rails.root.join("script/ci/timekeeping_live_specs.rb").to_s
@@ -288,6 +289,9 @@ RSpec.describe TimekeepingLiveSpecs do
     expect(described_class.live_spec?(regression_source)).to be(false)
     expect(described_class.live_spec?(ungated_source)).to be(false)
     expect(described_class.live_spec?("")).to be(false)
+    # Naming the regression flag in a comment does not make a spec need it.
+    expect(described_class.live_spec?("#{live_source}# Unlike TIMEKEEPING_REGRESSION proofs, this needs only one flag.\n"))
+      .to be(true)
   end
 
   # Inherited GIT_* variables (GIT_DIR, GIT_WORK_TREE and the like, exported by a git hook)
@@ -344,13 +348,44 @@ RSpec.describe TimekeepingLiveSpecs do
         Dir.chdir(clone) { described_class.changed_paths("origin/main") }
       end
 
-      expect(paths.sort).to eq(
-        %w[
-          spec/integration/timekeeping/alerts_live_spec.rb
-          spec/integration/timekeeping/handoff_live_spec.rb
-          spec/integration/timekeeping/new_live_spec.rb
-        ]
-      )
+      expected_paths = %w[
+        spec/integration/timekeeping/alerts_live_spec.rb
+        spec/integration/timekeeping/handoff_live_spec.rb
+        spec/integration/timekeeping/new_live_spec.rb
+      ]
+      expect(paths.sort).to eq(expected_paths)
+
+      # CI checks out one commit with no base branch; changed_paths must fetch the history it needs.
+      git.call(clone, "push", "-q", "--no-verify", "origin", "feature")
+      shallow = File.join(tmp, "shallow")
+      git.call(tmp, "clone", "-q", "--depth", "1", "--branch", "feature", "file://#{origin}", shallow)
+      expect(git.call(shallow, "rev-parse", "--is-shallow-repository").strip).to eq("true")
+
+      shallow_paths = without_inherited_git_variables_for_live_selector do
+        Dir.chdir(shallow) { described_class.changed_paths("origin/main") }
+      end
+
+      expect(shallow_paths.sort).to eq(expected_paths)
+    end
+  end
+
+  it "exits with rspec's own failing status after handing it the full live set as separate arguments" do
+    Dir.mktmpdir do |fake_bin|
+      args_file = File.join(fake_bin, "args")
+      fake_bundle = File.join(fake_bin, "bundle")
+      File.write(fake_bundle, "#!/bin/sh\nfor arg in \"$@\"; do echo \"$arg\"; done > #{args_file}\nexit 3\n")
+      File.chmod(0o755, fake_bundle)
+      run_env = {
+        "PATH" => [fake_bin, File.dirname(RbConfig.ruby), ENV.fetch("PATH")].join(File::PATH_SEPARATOR),
+        "GITHUB_EVENT_NAME" => "push", "GITHUB_REF_NAME" => "main", "GITHUB_BASE_REF" => ""
+      }
+
+      _output, status = Open3.capture2e(run_env, RbConfig.ruby, "script/ci/timekeeping_live_specs.rb",
+                                        chdir: Rails.root.to_s)
+
+      # A failing live spec must turn the required check red.
+      expect(status.exitstatus).to eq(3)
+      expect(File.readlines(args_file, chomp: true)).to eq(["exec", "rspec", *live])
     end
   end
 

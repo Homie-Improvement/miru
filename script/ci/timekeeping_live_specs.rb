@@ -23,8 +23,9 @@ module TimekeepingLiveSpecs
   LIVE_FLAG = "TIMEKEEPING_LIVE"
   # Matches ENV["TIMEKEEPING_LIVE"] == "1" in either quote style and any spacing.
   LIVE_GATE = /ENV\[\s*(["'])TIMEKEEPING_LIVE\1\s*\]\s*==\s*(["'])1\2/
-  # Specs that also need this flag skip their live examples in this job.
-  REGRESSION_FLAG = "TIMEKEEPING_REGRESSION"
+  # Specs that also read ENV["TIMEKEEPING_REGRESSION"] skip their live examples in this
+  # job, which does not set it. Only a read counts, so a comment naming it changes nothing.
+  REGRESSION_GATE = /ENV\[\s*(["'])TIMEKEEPING_REGRESSION\1\s*\]/
 
   # Each prefix ends in "/" so "lib/timekeeping/" never matches "lib/timekeeping_demo/".
   FULL_SET_PREFIXES = %w[
@@ -75,7 +76,7 @@ module TimekeepingLiveSpecs
   end
 
   def live_spec?(source)
-    source.match?(LIVE_GATE) && !source.include?(REGRESSION_FLAG)
+    source.match?(LIVE_GATE) && !source.match?(REGRESSION_GATE)
   end
 
   # A spec that reads TIMEKEEPING_LIVE through a gate this script does not recognise
@@ -84,7 +85,7 @@ module TimekeepingLiveSpecs
     Dir.glob(LIVE_SPEC_GLOB, base: root).sort.select do |path|
       source = File.read(File.join(root, path))
       next true if live_spec?(source)
-      next false unless source.include?(LIVE_FLAG) && !source.include?(REGRESSION_FLAG)
+      next false unless source.include?(LIVE_FLAG) && !source.match?(REGRESSION_GATE)
 
       raise ConfigError, "#{path} reads #{LIVE_FLAG} without the gate #{LIVE_GATE.source}"
     end
