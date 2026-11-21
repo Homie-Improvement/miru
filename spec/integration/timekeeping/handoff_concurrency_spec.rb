@@ -476,8 +476,9 @@ RSpec.describe "Timekeeping handoff concurrency", :integrated_runtime, :two_tena
         expect(loaded_note).to eq(note)
       ensure
         release&.push(:release)
-        stop_committed_data_threads(entry_holder, rollback)
-        update&.join(concurrency_wait_seconds * 4)
+        # The update thread holds no pooled connection, but it is stopped too, so
+        # no request outlives the example into the integration rebuild.
+        stop_committed_data_threads(entry_holder, rollback, update)
       end
     end
   ensure
