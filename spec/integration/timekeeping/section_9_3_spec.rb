@@ -31,6 +31,17 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
     { "Fork & Leaf Salads" => fork_and_leaf, "Copper Kettle Bakery" => copper_kettle }
   end
 
+  # Runs the block for each company. aggregate_failures collects only failed
+  # expectations, so a poll that times out for one company is recorded as a
+  # failed expectation here; otherwise its error would skip the next company.
+  def section_9_3_each_company
+    section_9_3_companies.each do |name, company|
+      yield name, company
+    rescue TimekeepingSection93Live::PollTimeout => timeout
+      expect(timeout).to be_nil, "#{name}: #{timeout.message}"
+    end
+  end
+
   # The first employee of the company who is a member of one of its billable
   # projects, with that project. Seeded employees can create entries on it.
   def section_9_3_employee_and_project(company)
@@ -186,7 +197,7 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
       section_9_3_cutover!
 
       aggregate_failures do
-        section_9_3_companies.each do |name, company|
+        section_9_3_each_company do |name, company|
           employee, project = section_9_3_employee_and_project(company)
           held = section_9_3_fresh_entry(company:, employee:, project:, note: "Held by the draft")
           added = section_9_3_fresh_entry(company:, employee:, project:, note: "Added by the lost save")
@@ -222,7 +233,7 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
       section_9_3_cutover!
 
       aggregate_failures do
-        section_9_3_companies.each do |name, company|
+        section_9_3_each_company do |name, company|
           employee, project = section_9_3_employee_and_project(company)
           removed = section_9_3_fresh_entry(company:, employee:, project:, note: "Removed by the failed save")
           added = section_9_3_fresh_entry(company:, employee:, project:, note: "Added by the failed save")
@@ -259,7 +270,7 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
       section_9_3_cutover!
 
       aggregate_failures do
-        section_9_3_companies.each do |name, company|
+        section_9_3_each_company do |name, company|
           employee, project = section_9_3_employee_and_project(company)
           entry = section_9_3_fresh_entry(company:, employee:, project:, note: "Held by the saved draft")
           draft = section_9_3_draft_holding(company:, project:, entries: [entry])
@@ -278,6 +289,8 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
           after = section_9_3_reservations(company, [entry])
           expect(section_9_3_committed_by(after, entry, draft).size).to eq(1),
             "#{name}: the entry should still be reserved by the committed draft; saw #{after.inspect}"
+          expect(section_9_3_entry_locked(company:, employee:, entry:)).to be(true),
+            "#{name}: the entry should still show locked: true after the failed save"
           status = section_9_3_employee_edit_status(employee:, project:, entry:)
           expect(status).to be_between(400, 499),
             "#{name}: an employee edit of the still-reserved entry answered #{status}, not a refusal"
@@ -292,7 +305,7 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
       section_9_3_cutover!
 
       aggregate_failures do
-        section_9_3_companies.each do |name, company|
+        section_9_3_each_company do |name, company|
           employee, project = section_9_3_employee_and_project(company)
           entry = section_9_3_fresh_entry(company:, employee:, project:, note: "Held by the discarded invoice")
           old_invoice = section_9_3_non_draft_holding(company:, project:, entries: [entry])
@@ -324,7 +337,7 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
       section_9_3_cutover!
 
       aggregate_failures do
-        section_9_3_companies.each do |name, company|
+        section_9_3_each_company do |name, company|
           employee, project = section_9_3_employee_and_project(company)
           entry = section_9_3_fresh_entry(company:, employee:, project:, note: "Moved to the successor")
           old_invoice = section_9_3_non_draft_holding(company:, project:, entries: [entry])
@@ -351,7 +364,7 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
       section_9_3_cutover!
 
       aggregate_failures do
-        section_9_3_companies.each do |name, company|
+        section_9_3_each_company do |name, company|
           employee, project = section_9_3_employee_and_project(company)
           entry = section_9_3_fresh_entry(company:, employee:, project:, note: "Held by the discarded draft")
           draft = section_9_3_draft_holding(company:, project:, entries: [entry])
@@ -379,7 +392,7 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
       section_9_3_cutover!
 
       aggregate_failures do
-        section_9_3_companies.each do |name, company|
+        section_9_3_each_company do |name, company|
           employee, project = section_9_3_employee_and_project(company)
           entry = section_9_3_fresh_entry(company:, employee:, project:, note: "On the paid invoice")
           invoice = section_9_3_non_draft_holding(company:, project:, entries: [entry])
@@ -411,7 +424,7 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
       section_9_3_cutover!
 
       aggregate_failures do
-        section_9_3_companies.each do |name, company|
+        section_9_3_each_company do |name, company|
           employee, project = section_9_3_employee_and_project(company)
           entry = section_9_3_fresh_entry(company:, employee:, project:, note: "On the deleted invoice")
           invoice = section_9_3_non_draft_holding(company:, project:, entries: [entry])
