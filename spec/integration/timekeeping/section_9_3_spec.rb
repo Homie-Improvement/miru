@@ -86,6 +86,15 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
       .find { |operation| operation.fetch(:operation_id) == operation_id.to_s }&.fetch(:state)
   end
 
+  # Waits until Timekeeping stores the failed save's operation as aborted and
+  # answers that state; the poll raises when the deadline passes first.
+  def section_9_3_await_abort(name, company, invoice, intent)
+    section_9_3_poll_until("#{name}: abort of operation #{intent.operation_id}",
+                           satisfied: ->(observed) { observed == "aborted" }) do
+      section_9_3_operation_state(company, invoice, intent.operation_id)
+    end
+  end
+
   # The employee tries to change the note of an entry they own. Answers the
   # response status.
   def section_9_3_employee_edit_status(employee:, project:, entry:)
@@ -194,10 +203,7 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
           intent = section_9_3_latest_intent(company, draft)
           expect(intent&.state).to eq("failed"), "#{name}: the failed save's intent is #{intent&.state.inspect}"
           if intent
-            state = section_9_3_poll_until("#{name}: abort of operation #{intent.operation_id}",
-                                           satisfied: ->(observed) { observed == "aborted" }) do
-              section_9_3_operation_state(company, draft, intent.operation_id)
-            end
+            state = section_9_3_await_abort(name, company, draft, intent)
             expect(state).to eq("aborted"), "#{name}: the lost save's operation is #{state.inspect}"
           end
           after = section_9_3_reservations(company, [held, added])
@@ -235,10 +241,7 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
           intent = section_9_3_latest_intent(company, draft)
           expect(intent&.state).to eq("failed"), "#{name}: the failed save's intent is #{intent&.state.inspect}"
           if intent
-            state = section_9_3_poll_until("#{name}: abort of operation #{intent.operation_id}",
-                                           satisfied: ->(observed) { observed == "aborted" }) do
-              section_9_3_operation_state(company, draft, intent.operation_id)
-            end
+            state = section_9_3_await_abort(name, company, draft, intent)
             expect(state).to eq("aborted"), "#{name}: the failed save's operation is #{state.inspect}"
           end
           after = section_9_3_reservations(company, [removed, added])
@@ -271,12 +274,7 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
           section_9_3_restore_commit!
 
           intent = section_9_3_latest_intent(company, draft)
-          if intent
-            section_9_3_poll_until("#{name}: abort of operation #{intent.operation_id}",
-                                   satisfied: ->(observed) { observed == "aborted" }) do
-              section_9_3_operation_state(company, draft, intent.operation_id)
-            end
-          end
+          section_9_3_await_abort(name, company, draft, intent) if intent
           after = section_9_3_reservations(company, [entry])
           expect(section_9_3_committed_by(after, entry, draft).size).to eq(1),
             "#{name}: the entry should still be reserved by the committed draft; saw #{after.inspect}"
