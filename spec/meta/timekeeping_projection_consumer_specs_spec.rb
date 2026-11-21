@@ -57,4 +57,21 @@ RSpec.describe "Timekeeping ProjectionConsumer service specs" do
 
     expect(markers.reject { |_case, marker| source.include?(marker) }.keys).to be_empty
   end
+
+  context "more tests 2" do
+    # "A projection snapshot naming an agent id with no agents row is applied with that id, and the consumer comment says so"
+    it "the refuse_foreign_agents! comment says an unknown agent id is applied, not refused by a foreign key" do
+      source_lines = File.readlines(Rails.root.join("app/services/timekeeping/projection_consumer.rb"))
+      method_index = source_lines.index { |line| line.include?("def refuse_foreign_agents!") }
+      expect(method_index).not_to be_nil
+
+      comment = source_lines[0...method_index].reverse
+        .take_while { |line| line.strip.start_with?("#") }
+        .reverse.join
+
+      expect(comment).not_to include("still keeps")
+      expect(comment).not_to match(/foreign key[^.]*refuses/m)
+      expect(comment).to match(/\b(applied|applies|stored|stores)\b/)
+    end
+  end
 end
