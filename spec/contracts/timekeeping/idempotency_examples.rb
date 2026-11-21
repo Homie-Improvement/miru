@@ -77,31 +77,30 @@ RSpec.shared_examples "timekeeping idempotency contract" do |contracts: [:entry_
       end
 
       # "a 2xx answer that changed nothing stores no receipt" (idempotency.yml
-      # unchanged_stored_operations). A replay-only retry answers only from a
-      # stored receipt, so it shows whether one was stored.
+      # unchanged_stored_operations). The same key sent again with a new body
+      # shows whether a receipt was stored: a stored one answers
+      # idempotency_key_reused, and none lets the new body be evaluated. Every
+      # provider answers this way, unlike a replay-only retry, which the local
+      # owner refuses at its generation check before it reads any receipt.
       it "stores no receipt for a bulk delete that changed nothing and keeps the receipt of one that did" do
         foreign_user = timekeeping_arrange.user(company: other_company, role: "employee")
         foreign_entry = timekeeping_arrange.entry(company: other_company, user: foreign_user,
                                                   project: timekeeping_arrange.project(company: other_company))
-        own_entry = timekeeping_arrange.entry(company:, user: employee, project:)
+        # Dated today, so an employee's edit window never refuses the delete.
+        own_entry = timekeeping_arrange.entry(company:, user: employee, project:, work_date: Date.current.iso8601)
         path = timekeeping_path(:entry_api, :bulk_delete, company_id: company)
-        replay_only = { "Idempotency-Replay" => "only", "Ownership-Generation" => "replay-only" }
-        bulk_delete = lambda do |entry_id, key, extra_headers = {}|
-          timekeeping_request("POST", path, headers: user_headers(token, key:).merge(extra_headers),
-                                            body: { "entry_ids" => [entry_id] })
+        bulk_delete = lambda do |entry_id, key|
+          timekeeping_request("POST", path, headers: user_headers(token, key:), body: { "entry_ids" => [entry_id] })
         end
 
-        unchanged_key = new_key
-        unchanged = bulk_delete.call(foreign_entry, unchanged_key)
-        unchanged_replay = bulk_delete.call(foreign_entry, unchanged_key, replay_only)
-        changed_key = new_key
-        changed = bulk_delete.call(own_entry, changed_key)
-        changed_replay = bulk_delete.call(own_entry, changed_key, replay_only)
+        key = new_key
+        unchanged = bulk_delete.call(foreign_entry, key)
+        changed = bulk_delete.call(own_entry, key)
+        # The entry is discarded now, so only the stored receipt can answer "deleted" again.
+        changed_replay = bulk_delete.call(own_entry, key)
 
         expect([unchanged.status, unchanged.body])
           .to eq([200, { "results" => [{ "entry_id" => foreign_entry, "result" => "not_found" }] }])
-        expect([unchanged_replay.status, unchanged_replay.body])
-          .to eq([404, timekeeping_contract_error(:entry_api, "not_found").fetch("body")])
         expect([changed.status, changed.body])
           .to eq([200, { "results" => [{ "entry_id" => own_entry, "result" => "deleted" }] }])
         expect([changed_replay.status, changed_replay.body]).to eq([changed.status, changed.body])
