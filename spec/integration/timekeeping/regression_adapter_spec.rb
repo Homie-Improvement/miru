@@ -251,6 +251,9 @@ RSpec.describe "TimekeepingRegressionAdapter.start! from a stopped adapter", com
       # "set the two env keys; store the instance as `current`"
       expect(started).to be(instance)
       expect(TimekeepingRegressionAdapter.current).to be(instance)
+      # The forwarded helpers open the live database with this URL, so it must
+      # be the one start! checked, not the global ENV value.
+      expect(TimekeepingRegressionAdapter.database_url).to eq(checked_url)
       expect(Array(WebMock::Config.instance.allow)).to eq(["127.0.0.1:#{received[:port]}"])
       expect(ENV.fetch(base_url_env, nil)).to eq("http://127.0.0.1:#{received[:port]}")
       expect(ENV.fetch(key_env, nil)).to eq(key.to_pem)
@@ -272,6 +275,7 @@ RSpec.describe "TimekeepingRegressionAdapter.start! from a stopped adapter", com
     # "An `after(:suite)` hook stops the instance."
     expect(instance).to have_received(:stop)
     expect(TimekeepingRegressionAdapter.current).to be_nil
+    expect(TimekeepingRegressionAdapter.database_url).to be_nil
   end
 end
 

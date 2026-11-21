@@ -87,19 +87,17 @@ RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true do
     expect(entry_event[:context]).to include(source: "harvest_import", data_import_id: data_import.id.to_s)
   end
 
-  # Where the prepared store or Timekeeping owns the entries, the gateway's
-  # per-row write is left out of the count: there the owner reads the company
-  # and project memberships for every row to check the write, which is the
-  # owner's check, not the importer's batching. The live Timekeeping app reads
-  # them through this process's database pool, so its reads would otherwise be
-  # counted here. Where the legacy store owns the entries the whole import is
-  # counted.
+  # Where the prepared store owns the entries, the gateway's per-row write is
+  # left out of the count: that store reads the company and project
+  # memberships for every row to check the write in this process, which is the
+  # owner's check, not the importer's batching. In every other state the whole
+  # import is counted, the gateway's forwarded write included.
   it "avoids per-row project membership and company queries" do
     select_queries = 0
     project_member_queries = 0
     company_queries = 0
     inside_gateway_import = false
-    owner_checks_each_write = Timekeeping::EntryOwner.for(TimekeepingOwnership.current) != :legacy
+    owner_checks_each_write = Timekeeping::EntryOwner.for(TimekeepingOwnership.current) == :prepared
     allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_wrap_original do |original, *args, **kwargs|
       inside_gateway_import = owner_checks_each_write
       original.call(*args, **kwargs)

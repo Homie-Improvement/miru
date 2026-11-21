@@ -337,10 +337,15 @@ RSpec.describe "forwarded Timekeeping readers with the live adapter running" do
     untouchable_fake = double("FakeTimekeeping that must not be reached")
     connection = double("live connection", close: nil)
     allow(connection).to receive(:exec_params).and_return(double("update result", cmd_tuples: 1))
+    checked_url = "postgresql://helpers_user@127.0.0.1/timekeeping_helpers_test"
+    allow(TimekeepingRegressionAdapter).to receive(:database_url).and_return(checked_url)
     allow(PG).to receive(:connect).and_return(connection)
 
     admit_forwarded_generation(untouchable_fake, 3)
 
+    # The helper must open the URL the running adapter checked; PG.connect(nil)
+    # would open the default database instead.
+    expect(PG).to have_received(:connect).with(checked_url).once
     expect(connection).to have_received(:exec_params)
       .with("UPDATE admission SET generation = $1 WHERE id = $2", [3, TimekeepingDatabaseReset::ADMISSION_ID]).once
   end
