@@ -26,9 +26,14 @@ class InvoiceLineItemTimeEntry < ApplicationRecord
 
     # Compares the stored company_id, so an entry with no company never matches,
     # and reports the same not found error a line item gives for a missing id.
+    # No database key checks timesheet_entry_id, so the stored row is read, not
+    # a cached entry object, and key-share locked so it cannot be deleted before
+    # this save commits, as InvoiceLineItem does for its direct entry.
     def timesheet_entry_in_invoice_company
       return if invoice_line_item&.invoice.blank? || timesheet_entry.blank?
-      return if timesheet_entry.company_id == invoice_line_item.invoice.company_id
+
+      stored_entry = TimesheetEntry.where(id: timesheet_entry_id, company_id: invoice_line_item.invoice.company_id)
+      return if stored_entry.lock("FOR KEY SHARE").exists?
 
       errors.add(:timesheet_entry, :not_found)
     end

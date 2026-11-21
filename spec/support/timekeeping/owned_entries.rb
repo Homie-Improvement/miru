@@ -113,11 +113,12 @@ module TimekeepingOwnedEntries
     }.freeze
 
     # Methods of this module, keyed by owner state, that list the owner's
-    # entries, discarded ones included, for one company or for every company.
-    OWNED_ENTRIES_READERS = {
-      "legacy" => :read_legacy_owned_entries,
-      "timekeeping" => :read_timekeeping_owned_entries,
-      "rollback" => :read_prepared_owned_entries
+    # entries in id order, discarded ones included, for one company or for
+    # every company.
+    OWNED_ENTRY_LISTERS = {
+      "legacy" => :list_legacy_owned_entries,
+      "timekeeping" => :list_timekeeping_owned_entries,
+      "rollback" => :list_prepared_owned_entries
     }.freeze
 
     # The entry fields owned_entries can filter on. Any other key raises, so a
@@ -159,9 +160,11 @@ module TimekeepingOwnedEntries
       send(OWNED_ENTRY_READERS.fetch(state), TimekeepingOwnedEntries.integer_id(id))
     end
 
-    # The entries the store that owns them in state holds, as Hashes with
-    # string keys; never the projection in the timekeeping and rollback
-    # states. company limits them to one company; nil reads every company, so
+    # The entries the store that owns them in state holds, in id order, as
+    # Hashes with the same string keys owned_entry returns; never the
+    # projection in the timekeeping and rollback states. This lets a spec show
+    # that the owner holds no entry matching some fields, which a read by id
+    # cannot. company limits them to one company; nil reads every company, so
     # a check on the whole table keeps its reach. Discarded entries are left
     # out unless include_discarded is true. filters keeps the entries whose
     # fields equal the given values. Raises ArgumentError for an unknown state
@@ -172,7 +175,7 @@ module TimekeepingOwnedEntries
       unknown = filters.keys - OWNED_ENTRIES_FILTERS
       raise ArgumentError, "unknown owned entry filters: #{unknown.join(', ')}" if unknown.any?
 
-      send(OWNED_ENTRIES_READERS.fetch(state), company&.id).select do |entry|
+      send(OWNED_ENTRY_LISTERS.fetch(state), company&.id).select do |entry|
         (include_discarded || entry["discarded_at"].nil?) &&
           filters.all? { |field, value| entry[field] == value }
       end
@@ -222,10 +225,16 @@ module TimekeepingOwnedEntries
         Timekeeping::Handoff::TimekeepingStore.new(base_url: live.base_url, token: live.service_token)
       end
 
+      # TimesheetEntry refuses to create a billed row, so a billed entry is
+      # created non-billable and then marked billed without callbacks.
       def create_timesheet_entries(entries, **)
         entries.each do |entry|
-          TimesheetEntry.create!(entry.slice("id", "user_id", "project_id", "work_date", "duration", "note",
-                                             "bill_status", "locked"))
+          attributes = entry.slice("id", "user_id", "project_id", "work_date", "duration", "note", "bill_status",
+                                   "locked")
+          billed = attributes.fetch("bill_status") == "billed"
+          attributes = attributes.merge("bill_status" => "non_billable") if billed
+          record = TimesheetEntry.create!(attributes)
+          record.update_column(:bill_status, "billed") if billed
         end
       end
 
@@ -300,27 +309,9 @@ module TimekeepingOwnedEntries
         TimesheetEntry.unscoped.find(id).attributes
       end
 
-      def read_prepared_owned_entry(id)
-        row = Timekeeping::LocalEntry.with_reserved.find(id)
-        row.attributes.except("reserved").merge("locked" => row.reserved)
-      end
-
-      # Timekeeping, like the prepared store, treats an entry as locked exactly
-      # when a reservation of the same company holds it, so locked is read from
-      # the exported reservations rather than the stored column.
-      def read_timekeeping_owned_entry(id)
-        tables = live_owned_entry_store.export_checkpoint.rows
-        row = tables.fetch("entries").find { |entry| entry.fetch("id") == id } ||
-              raise(ActiveRecord::RecordNotFound, "Timekeeping holds no entry #{id}")
-        reserved = tables.fetch("reservations").any? do |reservation|
-          reservation.fetch("entry_id") == id && reservation.fetch("company_id") == row.fetch("company_id")
-        end
-        row.merge("locked" => reserved)
-      end
-
       # A company is reached through its clients' projects, the scope the
       # project-based reads this replaces used.
-      def read_legacy_owned_entries(company_id)
+      def list_legacy_owned_entries(company_id)
         scope = TimesheetEntry.unscoped.order(:id)
         if company_id
           scope = scope.where(project_id: Project.unscoped.joins(:client).where(clients: { company_id: }).select(:id))
@@ -328,16 +319,43 @@ module TimekeepingOwnedEntries
         scope.map(&:attributes)
       end
 
-      def read_prepared_owned_entries(company_id)
-        scope = Timekeeping::LocalEntry.order(:id)
-        scope = scope.where(company_id:) if company_id
-        scope.map(&:attributes)
+      def read_prepared_owned_entry(id)
+        prepared_entry_fields(Timekeeping::LocalEntry.with_reserved.find(id))
       end
 
-      def read_timekeeping_owned_entries(company_id)
-        entries = live_owned_entry_store.export_checkpoint.rows.fetch("entries")
-        entries = entries.select { |entry| entry.fetch("company_id") == company_id } if company_id
-        entries.sort_by { |entry| entry.fetch("id") }
+      def list_prepared_owned_entries(company_id)
+        scope = Timekeeping::LocalEntry.with_reserved.order(:id)
+        scope = scope.where(company_id:) if company_id
+        scope.map { |row| prepared_entry_fields(row) }
+      end
+
+      def prepared_entry_fields(row)
+        row.attributes.except("reserved").merge("locked" => row.reserved)
+      end
+
+      def read_timekeeping_owned_entry(id)
+        tables = live_owned_entry_store.export_checkpoint.rows
+        row = tables.fetch("entries").find { |entry| entry.fetch("id") == id } ||
+              raise(ActiveRecord::RecordNotFound, "Timekeeping holds no entry #{id}")
+        timekeeping_entry_fields(row, tables.fetch("reservations"))
+      end
+
+      def list_timekeeping_owned_entries(company_id)
+        tables = live_owned_entry_store.export_checkpoint.rows
+        reservations = tables.fetch("reservations")
+        entries = tables.fetch("entries")
+        entries = entries.select { |row| row.fetch("company_id") == company_id } if company_id
+        entries.sort_by { |row| row.fetch("id") }.map { |row| timekeeping_entry_fields(row, reservations) }
+      end
+
+      # Timekeeping, like the prepared store, treats an entry as locked exactly
+      # when a reservation of the same company holds it, so locked is read from
+      # the exported reservations rather than the stored column.
+      def timekeeping_entry_fields(row, reservations)
+        reserved = reservations.any? do |reservation|
+          reservation.fetch("entry_id") == row.fetch("id") && reservation.fetch("company_id") == row.fetch("company_id")
+        end
+        row.merge("locked" => reserved)
       end
   end
 end
