@@ -514,7 +514,7 @@ The relay runs on its own queue, worked by its own dedicated worker. This follow
 
 **Removed from the design.** The monolith's `Projects::Changed`, `ProjectMemberships::Changed` and `Companies::SettingsChanged` events are removed. Nothing consumed them, because authorization reads reference facts synchronously (section 3.4).
 
-**Not the delivery mechanism.** `rails_event_viewer_entries` is not used to deliver anything. `docs/ai/events.md` calls it "best-effort observability, not a mandatory audit trail or delivery queue", and it is pruned after seven days. The existing `Rails.event.notify` calls stay as observability only.
+**Not the delivery mechanism.** `rails_event_viewer_entries` is not used to deliver anything. `docs/ai/events.md` calls it "best-effort observability, not a mandatory audit trail or delivery queue", and it is pruned after seven days. The existing `Rails.event.notify` calls stay as observability only. `TimesheetEntry#notify_created` raises `TimesheetEntries::Created` for a legacy create from `after_create`, and `Timekeeping::Gateway` calls it, with the request's actor, after a forwarded or prepared-store create that was not answered from a stored idempotency receipt; the projection consumer never raises it.
 
 ## 6. Tenant isolation, authorization and identity propagation (proposed)
 
