@@ -57,6 +57,25 @@ RSpec.describe InvoiceLineItemTimeEntry, type: :model do
       expect(link).not_to be_valid
       expect(link.errors[:timesheet_entry]).to include("not found")
     end
+
+    # No database key checks timesheet_entry_id, so a loaded entry object whose
+    # row was deleted elsewhere must not let the link save.
+    it "refuses to save a link whose cached entry was deleted by another instance" do
+      invoice = create(:invoice)
+      project = create(:project, client: invoice.client, billable: true)
+      user = create(:user, current_workspace: invoice.company)
+      invoice_line_item = create(:invoice_line_item, invoice:,
+        timesheet_entry: create(:timesheet_entry, user:, project:, bill_status: "unbilled"))
+      deleted_entry = create(:timesheet_entry, user:, project:, bill_status: "unbilled")
+      link = build(:invoice_line_item_time_entry, invoice_line_item:, timesheet_entry: deleted_entry)
+      expect(link).to be_valid
+
+      TimesheetEntry.find(deleted_entry.id).destroy!
+
+      expect(link.save).to be(false)
+      expect(link.errors[:timesheet_entry]).to eq(["not found"])
+      expect(InvoiceLineItemTimeEntry.where(timesheet_entry_id: deleted_entry.id)).to be_empty
+    end
   end
 end
 

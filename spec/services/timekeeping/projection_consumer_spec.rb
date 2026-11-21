@@ -374,6 +374,13 @@ RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
       [result.status, result.body]
     end
 
+    # The snapshot's own user, so only the company differs and the company check alone must refuse it.
+    def same_user_agent_in_another_company
+      other_company = create(:company)
+      create(:employment, company: other_company, user: rules_user)
+      create(:agent, company: other_company, user: rules_user)
+    end
+
     # "A projection snapshot naming an agent id with no agents row is applied with that id, and the consumer comment says so"
     # The relay retries until it sees 200, so a repeat of the same snapshot must not turn into a refusal.
     it "applies the snapshot, stores that agent id, and ignores a redelivery without adding a second row" do
@@ -390,7 +397,7 @@ RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
 
     # "Foreign-company and other-user agents stay refused."
     it "applies a snapshot naming a deleted agent under its own company and user, while another company's agent is still refused" do
-      foreign_agent = create(:agent)
+      foreign_agent = same_user_agent_in_another_company
 
       expect(rules_deliver(rules_entry(id: 95_101, version: 1, agent_id: missing_agent_id))).to eq(rules_applied)
       expect(rules_row(95_101)).to include("agent_id" => missing_agent_id, "company_id" => rules_company.id,
@@ -414,7 +421,7 @@ RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
 
     # Accepting a missing agent id must not let an existing agent of another company through in the same batch.
     it "still refuses a batch that pairs a deleted agent with another company's agent, and writes neither entry" do
-      foreign_agent = create(:agent)
+      foreign_agent = same_user_agent_in_another_company
 
       expect(deliver_mixed_agent_batch(94_061, 94_062, foreign_agent.id)).to eq(rules_invalid)
       expect(rules_row(94_061)).to be_nil
