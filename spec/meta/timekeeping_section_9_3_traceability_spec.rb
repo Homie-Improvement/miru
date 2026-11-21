@@ -76,11 +76,15 @@ RSpec.describe TimekeepingSection93Traceability do
       markdown << "| Prepare answer lost (timeout or 5xx) | intent `failed` | abort | Integration: drop the answer |\n"
       markdown << "| Refused: `on_another_invoice` | Integration: not here | d | Contract: 409 |\n"
       markdown << "| Two invoices prepare one entry at once | one | lock | Concurrency: parallel |\n"
+      markdown << "| Prepare refused: `provisional_elsewhere` (retry) | none | retry | Integration: refuse |\n"
       markdown << "\nA paragraph ends the table.\n\n#{header}| Elsewhere case | s | d | Integration: other |\n"
 
       rows = described_class.rows(markdown)
 
-      expect(rows.keys).to eq(["Prepare answer lost (timeout or 5xx)", "Two invoices prepare one entry at once"])
+      expect(rows.keys).to eq(["Prepare answer lost (timeout or 5xx)", "Two invoices prepare one entry at once",
+                               "Prepare refused: `provisional_elsewhere` (retry)"])
+      expect(rows.fetch("Prepare refused: `provisional_elsewhere` (retry)").case_text)
+        .to eq("Prepare refused: `provisional_elsewhere` (retry)")
       row = rows.fetch("Prepare answer lost (timeout or 5xx)")
       expect(row.kind).to eq(:integration)
       expect(row.survives).to eq("intent `failed`")
