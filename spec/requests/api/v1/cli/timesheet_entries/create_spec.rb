@@ -14,8 +14,9 @@ RSpec.describe "Api::V1::Cli::TimesheetEntries#create", type: :request do
     user.add_role :employee, company
   end
 
-  it "creates a timesheet entry for the authenticated user" do
+  it "creates a timesheet entry for the authenticated user", committed_data: true do
     create(:project_member, project:, user:)
+    expect_owner_state!
 
     send_request :post, api_v1_cli_timesheet_entries_path, params: {
       timesheet_entry: {
@@ -30,8 +31,9 @@ RSpec.describe "Api::V1::Cli::TimesheetEntries#create", type: :request do
     expect(response).to have_http_status(:ok)
     expect(json_response.dig("entry", "project_id")).to eq(project.id)
     expect(json_response.dig("entry", "duration")).to eq(90.0)
-    expect(TimesheetEntry.last.user_id).to eq(user.id)
-    expect(TimesheetEntry.last.source).to eq("cli")
+    created_entry = owned_entry(json_response.dig("entry", "id"), state: TimekeepingOwnerState.current)
+    expect(created_entry.fetch("user_id")).to eq(user.id)
+    expect(created_entry.fetch("source")).to eq("cli")
   end
 
   describe "event attribution" do
