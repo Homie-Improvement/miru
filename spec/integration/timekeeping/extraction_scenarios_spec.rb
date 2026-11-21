@@ -151,23 +151,23 @@ RSpec.describe "Timekeeping extraction scenarios", type: :request do
           draft = drafts.dig(company, :draft)
           expect(extraction_reserved_ids(company, [x, y, z])).to eq([x.id, y.id, z.id])
 
-          # Removing the direct line would release nothing on its own, because
-          # the grouped line still holds X; adding Z, which the holder draft
-          # keeps, makes Timekeeping refuse the whole save.
+          grouped_line = draft.invoice_line_items.find_by!(timesheet_entry_id: nil)
+          extraction_save_draft(company, draft, [extraction_removed_line(grouped_line)])
+
+          expect(response).to have_http_status(:ok)
+          # The direct line still references X, so only Y is released.
+          expect(extraction_reserved_ids(company, [x, y, z])).to eq([x.id, z.id])
+
+          # Removing the direct line alone would release X; adding Z, which the
+          # holder draft keeps, makes Timekeeping refuse the whole save, so X
+          # must stay reserved and the direct line must stay on the draft.
           direct_line = draft.invoice_line_items.find_by!(timesheet_entry_id: x.id)
           extraction_save_draft(company, draft, [extraction_removed_line(direct_line), extraction_direct_line(z)])
 
           expect(response).to have_http_status(:unprocessable_content)
           expect(json_response["errors"]).to eq("entry is on another invoice")
           expect(InvoiceLineItem.exists?(direct_line.id)).to be(true)
-          expect(extraction_reserved_ids(company, [x, y, z])).to eq([x.id, y.id, z.id])
-
-          grouped_line = draft.invoice_line_items.find_by!(timesheet_entry_id: nil)
-          extraction_save_draft(company, draft, [extraction_removed_line(grouped_line)])
-
-          expect(response).to have_http_status(:ok)
-          # The direct line still references X, so only Y is released.
-          expect(extraction_reserved_ids(company, [x, y])).to eq([x.id])
+          expect(extraction_reserved_ids(company, [x, y, z])).to eq([x.id, z.id])
 
           extraction_save_draft(company, draft, [extraction_removed_line(direct_line)])
 
@@ -260,6 +260,10 @@ RSpec.describe "Timekeeping extraction scenarios", type: :request do
     # AnalyticsController#analytics_timesheet_entries is not in the table: its
     # only caller, user_activity_summary, raises ActiveRecord::ConfigurationError
     # on every request today, because User has no ahoy_events association.
+    # Metrics::DataBuilder appears only through hours_logged: its project_stats
+    # metric, the one branch that runs the bill_status: :billable filters,
+    # raises NoMethodError for every Project today, because Project has no
+    # invoices association, so it returns no output to compare.
     extraction_report_readers = [
       {
         name: "Reports::TimeEntries::ReportService",
