@@ -9,6 +9,13 @@ module Timekeeping
   # failure leaves nothing, so a retry runs as a first attempt. The steps, in
   # order:
   #
+  # Before the transaction, a receipt already stored under the key is
+  # replayed, so a retry of finished work never depends on the monolith. For
+  # a new detach-entries, the monolith is then asked whether the requesting
+  # company owns the agent; an unanswered question refuses the command with
+  # reference_unavailable and stores nothing. No HTTP call runs while a lock
+  # is held.
+  #
   # 1. Lock the receipt key (company, service, operation, operation_id), then
   #    the command's target: the invoice, under the same key a reservation
   #    commit takes, so a commit and a mark-billed of one invoice wait in turn.
@@ -22,9 +29,9 @@ module Timekeeping
   #    under those locks.
   # 5. Write each entry with version + 1, one audit row holding the changed
   #    field before and after, and under the outbox lock one snapshot.
-  # 6. Store the receipt, unless the command changed no entry and is not one
-  #    that stores its receipt regardless (contracts/timekeeping/
-  #    idempotency.yml unchanged_stored_operations). A command that stored
+  # 6. Store the receipt when the command changed an entry, or when it is a
+  #    detach of an agent the requesting company owns (contracts/timekeeping/
+  #    idempotency.yml owned_target_stored_operations). A command that stored
   #    nothing is evaluated again on a retry.
   #
   # checkpoint is called with the name of each step as it finishes, so a spec
@@ -40,8 +47,8 @@ module Timekeeping
     # What each command changes. lock names the target's advisory lock;
     # targets selects the company's entries the command changes; changes is
     # the field it writes on each; count is the answer's key;
-    # store_unchanged says whether a run that changed no entry still stores
-    # its receipt.
+    # owned_target_stored says whether a run that changed no entry still
+    # stores its receipt when the requesting company owns the target.
     COMMANDS = {
       mark_billed: {
         lock: ReservationOperations::INVOICE_LOCK,
@@ -53,7 +60,7 @@ module Timekeeping
         end,
         changes: { "bill_status" => TimekeepingRules::EntryRules::BILLED }.freeze,
         count: "billed",
-        store_unchanged: false
+        owned_target_stored: false
       }.freeze,
       detach_entries: {
         lock: "agent",
@@ -62,16 +69,24 @@ module Timekeeping
         targets: ->(company_id, agent_id) { Entry.where(company_id:, agent_id:) },
         changes: { "agent_id" => nil }.freeze,
         count: "detached",
-        # The receipt is the detach marker agent_detached? reads, and a
-        # detach of the company's own agent with no entries cannot be told
-        # apart from one naming another company's agent, so even a detach
-        # that changed nothing stores it.
-        store_unchanged: true
+        # The receipt is the detach marker agent_detached? reads, so a detach
+        # of the company's own agent stores it even when it detached nothing.
+        # One naming another company's agent, or no agent, stores nothing.
+        owned_target_stored: true
       }.freeze
     }.freeze
 
-    def initialize(checkpoint: ->(_step) { })
+    # Whether the agent is one of the company's agents, as the monolith
+    # answers it. The monolith counts an agent whose deletion holds its row
+    # lock, so the agent being deleted is still owned here. Raises
+    # ReferenceClient::Unavailable when it cannot answer.
+    AGENT_OWNED_BY_REFERENCE = lambda do |company_id, agent_id|
+      ReferenceClient.configured.owned_agent_ids(company_id:, agent_ids: [agent_id]).include?(agent_id)
+    end
+
+    def initialize(checkpoint: ->(_step) { }, agent_owned: AGENT_OWNED_BY_REFERENCE)
       @checkpoint = checkpoint
+      @agent_owned = agent_owned
     end
 
     # Takes the lock a detach-entries command of this agent takes, so an entry
@@ -97,8 +112,9 @@ module Timekeeping
     # either before the deletion began, and so before any such detach, or
     # after a deletion rolled back. An older detach is therefore one whose
     # deletion failed, and it does not refuse writes for the agent that
-    # survived it. Every detach stores its receipt, a zero-entry one included
-    # (COMMANDS store_unchanged), so this marker is never missing.
+    # survived it. Every detach of an agent the company owns stores its
+    # receipt, a zero-entry one included (COMMANDS owned_target_stored), so
+    # this marker is never missing for the company's own agent.
     def self.agent_detached?(company_id, agent_id, after:)
       ServiceIdempotencyReceipt.where(company_id:, operation: operation_name(:detach_entries, agent_id))
         .where("id > ?", after).exists?
@@ -111,7 +127,15 @@ module Timekeeping
     end
 
     def call(request)
-      ApplicationRecord.transaction { run(request) }
+      stored = find_receipt(request)
+      return replay(stored) if stored
+
+      owned_target = target_owned?(request)
+      ApplicationRecord.transaction { run(request, owned_target:) }
+    rescue ReferenceClient::Unavailable
+      # Ownership is unknown, so neither storing nor skipping the marker is
+      # safe; nothing has been written and the caller may retry.
+      WriteOutcome.refusal(:reference_unavailable)
     rescue ActiveRecord::RecordNotUnique
       # A backstop: the receipt-key lock normally stops two writers with one
       # key from both reaching the insert. The failed transaction has rolled
@@ -129,9 +153,16 @@ module Timekeeping
 
     private
 
-      attr_reader :checkpoint
+      attr_reader :checkpoint, :agent_owned
 
-      def run(request)
+      def target_owned?(request)
+        COMMANDS.fetch(request.route).fetch(:owned_target_stored) &&
+          agent_owned.call(request.company_id, request.target_id)
+      end
+
+      # The receipt is looked up again under the locks, so a first attempt
+      # that committed while this one waited is replayed, not repeated.
+      def run(request, owned_target:)
         command = COMMANDS.fetch(request.route)
         WriteSteps.lock_key(request.company_id, ReservationOperations::ACTOR_TYPE, request.actor_name,
                             operation(request), request.operation_id)
@@ -148,7 +179,7 @@ module Timekeeping
         checkpoint.call(:rows_locked)
         change_entries(request, command.fetch(:changes), entries, generation)
         outcome = WriteOutcome.success(200, command.fetch(:count) => entries.size)
-        store_receipt(request, outcome) if entries.any? || command.fetch(:store_unchanged)
+        store_receipt(request, outcome) if entries.any? || owned_target
         outcome
       end
 
