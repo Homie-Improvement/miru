@@ -16,6 +16,7 @@ module ErrorHandler
     rescue_from Timekeeping::EntryWriteClient::Forbidden, with: :render_timekeeping_forbidden
     rescue_from Timekeeping::EntryWriteClient::Conflict, with: :render_entry_version_conflict
     rescue_from Timekeeping::EntryWriteClient::Rejected, with: :render_entry_write_rejected
+    rescue_from Timekeeping::EntryWriteClient::KeyReused, with: :render_idempotency_key_reused
     rescue_from Invoices::OperationErrors::Refused, with: :reservation_refused
   end
 
@@ -124,6 +125,12 @@ module ErrorHandler
 
     def render_entry_write_rejected(_exception)
       render json: { errors: I18n.t("errors.entry_write_rejected") }, status: 422
+    end
+
+    # The key was already used for a different request, so nothing was written.
+    def render_idempotency_key_reused(_exception)
+      render json: { errors: I18n.t("errors.entry_write_rejected"), reason: Timekeeping::Gateway::KEY_REUSED_REASON },
+             status: 422
     end
 
     def invalid_param_value(exception)

@@ -1,9 +1,10 @@
 # frozen_string_literal: true
 
 module Timekeeping
-  # Pure rules for replaying a create in the legacy store by the client's own
-  # Idempotency-Key. The gateway looks up the receipt and carries out the
-  # answer; this module only fingerprints the request and decides.
+  # Pure rules for replaying a create, update or delete in the legacy store by
+  # the client's own Idempotency-Key. The gateway looks up the receipt and
+  # carries out the answer; this module only fingerprints the request and
+  # decides.
   module LegacyCreateReplay
     # Fixed namespace for the version 5 UUIDs used as carried receipt keys.
     # It differs from EntryWriteClient's, so no client-chosen Idempotency-Key
