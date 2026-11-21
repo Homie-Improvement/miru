@@ -78,6 +78,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter do
   # TimesheetEntry's after_create is the only emitter of this event, so it
   # fires only where the legacy store owns the entries.
   it "reports each legacy entry it creates with the import's event context", writes_legacy_store: true do
+    Rails.event.set_context(source: "cli")
     entry_event = assert_event_reported("TimesheetEntries::Created") { run_harvest_import(data_import) }
 
     expect(entry_event[:context]).to include(source: "harvest_import", data_import_id: data_import.id.to_s)
