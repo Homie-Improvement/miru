@@ -112,6 +112,12 @@ module TimekeepingOwnedEntries
       "rollback" => :read_prepared_owned_entry
     }.freeze
 
+    OWNED_ENTRY_LISTERS = {
+      "legacy" => :list_legacy_owned_entries,
+      "timekeeping" => :list_timekeeping_owned_entries,
+      "rollback" => :list_prepared_owned_entries
+    }.freeze
+
     # reservations.invoice_id has no foreign key. A locked fixture only needs a
     # reservation row to exist for its entry, so no invoice is created.
     LOCKED_FIXTURE_INVOICE_ID = 1
@@ -145,6 +151,15 @@ module TimekeepingOwnedEntries
     def owned_entry(id, state: TimekeepingOwnerState.current)
       TimekeepingOwnerState.fetch(state)
       send(OWNED_ENTRY_READERS.fetch(state), TimekeepingOwnedEntries.integer_id(id))
+    end
+
+    # Every entry the store that owns entries in state holds, in id order, as
+    # Hashes with the same string keys owned_entry returns. Lets a spec show
+    # that the owner holds no entry matching some fields, which a read by id
+    # cannot, without falling back to the projection.
+    def owned_entries(state: TimekeepingOwnerState.current)
+      TimekeepingOwnerState.fetch(state)
+      send(OWNED_ENTRY_LISTERS.fetch(state))
     end
 
     private
@@ -191,10 +206,16 @@ module TimekeepingOwnedEntries
         Timekeeping::Handoff::TimekeepingStore.new(base_url: live.base_url, token: live.service_token)
       end
 
+      # TimesheetEntry refuses to create a billed row, so a billed entry is
+      # created non-billable and then marked billed without callbacks.
       def create_timesheet_entries(entries, **)
         entries.each do |entry|
-          TimesheetEntry.create!(entry.slice("id", "user_id", "project_id", "work_date", "duration", "note",
-                                             "bill_status", "locked"))
+          attributes = entry.slice("id", "user_id", "project_id", "work_date", "duration", "note", "bill_status",
+                                   "locked")
+          billed = attributes.fetch("bill_status") == "billed"
+          attributes = attributes.merge("bill_status" => "non_billable") if billed
+          record = TimesheetEntry.create!(attributes)
+          record.update_column(:bill_status, "billed") if billed
         end
       end
 
@@ -269,20 +290,42 @@ module TimekeepingOwnedEntries
         TimesheetEntry.unscoped.find(id).attributes
       end
 
+      def list_legacy_owned_entries
+        TimesheetEntry.unscoped.order(:id).map(&:attributes)
+      end
+
       def read_prepared_owned_entry(id)
-        row = Timekeeping::LocalEntry.with_reserved.find(id)
+        prepared_entry_fields(Timekeeping::LocalEntry.with_reserved.find(id))
+      end
+
+      def list_prepared_owned_entries
+        Timekeeping::LocalEntry.with_reserved.order(:id).map { |row| prepared_entry_fields(row) }
+      end
+
+      def prepared_entry_fields(row)
         row.attributes.except("reserved").merge("locked" => row.reserved)
+      end
+
+      def read_timekeeping_owned_entry(id)
+        tables = live_owned_entry_store.export_checkpoint.rows
+        row = tables.fetch("entries").find { |entry| entry.fetch("id") == id } ||
+              raise(ActiveRecord::RecordNotFound, "Timekeeping holds no entry #{id}")
+        timekeeping_entry_fields(row, tables.fetch("reservations"))
+      end
+
+      def list_timekeeping_owned_entries
+        tables = live_owned_entry_store.export_checkpoint.rows
+        reservations = tables.fetch("reservations")
+        tables.fetch("entries").sort_by { |row| row.fetch("id") }
+              .map { |row| timekeeping_entry_fields(row, reservations) }
       end
 
       # Timekeeping, like the prepared store, treats an entry as locked exactly
       # when a reservation of the same company holds it, so locked is read from
       # the exported reservations rather than the stored column.
-      def read_timekeeping_owned_entry(id)
-        tables = live_owned_entry_store.export_checkpoint.rows
-        row = tables.fetch("entries").find { |entry| entry.fetch("id") == id } ||
-              raise(ActiveRecord::RecordNotFound, "Timekeeping holds no entry #{id}")
-        reserved = tables.fetch("reservations").any? do |reservation|
-          reservation.fetch("entry_id") == id && reservation.fetch("company_id") == row.fetch("company_id")
+      def timekeeping_entry_fields(row, reservations)
+        reserved = reservations.any? do |reservation|
+          reservation.fetch("entry_id") == row.fetch("id") && reservation.fetch("company_id") == row.fetch("company_id")
         end
         row.merge("locked" => reserved)
       end

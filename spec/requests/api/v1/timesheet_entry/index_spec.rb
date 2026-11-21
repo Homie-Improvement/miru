@@ -2,7 +2,9 @@
 
 require "rails_helper"
 
-RSpec.describe "Api::V1::TimesheetEntry#index", type: :request do
+# The live Timekeeping app reads company and project rows on its own database
+# connections, so in the timekeeping state the rows must be committed.
+RSpec.describe "Api::V1::TimesheetEntry#index", type: :request, committed_data: true do
   let(:company) { create(:company) }
   let(:user) { create(:user, current_workspace_id: company.id) }
   let(:other_user) { create(:user, current_workspace_id: company.id) }
@@ -10,14 +12,10 @@ RSpec.describe "Api::V1::TimesheetEntry#index", type: :request do
   let(:project) { create(:project, client:) }
   let(:leave) { create(:leave, company:, year: Date.current.year) }
   let!(:leave_type) { create(:leave_type, leave:, name: "PTO") }
-  let!(:timesheet_entry) do
-    create(
-      :timesheet_entry,
-      user:,
-      project:,
-      work_date: Date.current - 180.days,
-      note: "Old entry still viewable"
-    )
+  let(:old_entry_work_date) { Date.current - 180.days }
+  let(:old_entry_row) do
+    { company:, user:, project:, work_date: old_entry_work_date, duration: 480, note: "Old entry still viewable",
+      bill_status: "non_billable" }
   end
   let!(:timeoff_entry) do
     create(
@@ -38,19 +36,25 @@ RSpec.describe "Api::V1::TimesheetEntry#index", type: :request do
   end
 
   it "returns older entries without raising when proof_url is blank" do
+    old_entry_id, = arrange_owned_entries([old_entry_row])
+    expect_owner_state!
+
     send_request :get, api_v1_timesheet_entry_index_path, params: {
       from: (Date.current - 365.days).iso8601,
       to: Date.current.iso8601
     }, headers: auth_headers(user)
 
     expect(response).to have_http_status(:ok)
-    entry = json_response.dig("entries", timesheet_entry.work_date.iso8601).first
-    expect(entry["id"]).to eq(timesheet_entry.id)
+    entry = json_response.dig("entries", old_entry_work_date.iso8601).first
+    expect(entry["id"]).to eq(old_entry_id)
     expect(entry["proof_url"]).to be_nil
     expect(entry["note"]).to eq("Old entry still viewable")
   end
 
   it "includes timeoff entries and leave metadata in the response" do
+    arrange_owned_entries([old_entry_row])
+    expect_owner_state!
+
     send_request :get, api_v1_timesheet_entry_index_path, params: {
       from: (Date.current - 365.days).iso8601,
       to: Date.current.iso8601,
@@ -80,6 +84,8 @@ RSpec.describe "Api::V1::TimesheetEntry#index", type: :request do
       duration: 480,
       note: "Week navigation PTO"
     )
+    arrange_owned_entries([old_entry_row])
+    expect_owner_state!
 
     send_request :get, api_v1_timesheet_entry_index_path, params: {
       from: target_date.beginning_of_week.strftime("%d-%m-%Y"),
@@ -107,6 +113,8 @@ RSpec.describe "Api::V1::TimesheetEntry#index", type: :request do
       duration: 480,
       note: "Ambiguous range PTO"
     )
+    arrange_owned_entries([old_entry_row])
+    expect_owner_state!
 
     send_request :get, api_v1_timesheet_entry_index_path, params: {
       from: "06-04-2026",
@@ -127,23 +135,17 @@ RSpec.describe "Api::V1::TimesheetEntry#index", type: :request do
     employee_user = create(:user, current_workspace_id: company.id)
     create(:employment, company:, user: employee_user)
     employee_user.add_role :employee, company
-    own_entry = create(
-      :timesheet_entry,
-      user: employee_user,
-      project:,
-      work_date: Date.current - 180.days,
-      note: "Own employee entry"
-    )
-    other_entry = create(
-      :timesheet_entry,
-      user: other_user,
-      project:,
-      work_date: Date.current - 180.days,
-      note: "Other user entry"
-    )
+    _old_entry_id, own_entry_id, other_entry_id = arrange_owned_entries([
+      old_entry_row,
+      { company:, user: employee_user, project:, work_date: old_entry_work_date, duration: 480,
+        note: "Own employee entry", bill_status: "non_billable" },
+      { company:, user: other_user, project:, work_date: old_entry_work_date, duration: 480,
+        note: "Other user entry", bill_status: "non_billable" }
+    ])
 
     sign_out user
     sign_in employee_user
+    expect_owner_state!
 
     send_request :get, api_v1_timesheet_entry_index_path, params: {
       from: (Date.current - 365.days).iso8601,
@@ -153,7 +155,7 @@ RSpec.describe "Api::V1::TimesheetEntry#index", type: :request do
 
     expect(response).to have_http_status(:ok)
     flattened_entries = json_response.fetch("entries").values.flatten
-    expect(flattened_entries.pluck("id")).not_to include(other_entry.id)
-    expect(flattened_entries.pluck("id")).to include(own_entry.id)
+    expect(flattened_entries.pluck("id")).not_to include(other_entry_id)
+    expect(flattened_entries.pluck("id")).to include(own_entry_id)
   end
 end
