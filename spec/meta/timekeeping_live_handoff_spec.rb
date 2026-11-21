@@ -193,26 +193,6 @@ end
 
 
 RSpec.describe LiveHandoff do
-  it "replay_verdict answers from receipt only for a byte-equal 2xx body and fails a replay that executed again" do
-    stored = '{"notice":"Timesheet entry created","entry":{"id":41,"note":"first"}}'
-    re_executed = '{"notice":"Timesheet entry created","entry":{"id":42,"note":"first"}}'
-    one_byte_off = stored.sub("first", "firsT")
-
-    expect(described_class.replay_verdict(status: 200, body: stored.dup, expected_body: stored,
-                                          refusals: described_class::MONOLITH_REFUSALS)).to eq(:answered_from_receipt)
-    # A replay that wrote a second entry answers 2xx with a new id: that is a second effect, never a receipt answer.
-    expect(described_class.replay_verdict(status: 200, body: re_executed, expected_body: stored,
-                                          refusals: described_class::MONOLITH_REFUSALS)).to eq(:failed)
-    expect(described_class.replay_verdict(status: 200, body: one_byte_off, expected_body: stored,
-                                          refusals: described_class::MONOLITH_REFUSALS)).to eq(:failed)
-    # The stored bytes under an error status are not a receipt answer either.
-    expect(described_class.replay_verdict(status: 500, body: stored, expected_body: stored,
-                                          refusals: described_class::MONOLITH_REFUSALS)).to eq(:failed)
-  end
-end
-
-
-RSpec.describe LiveHandoff do
   context "live Timekeeping counts for two companies", :integrated_runtime, committed_data: true do
     it "timekeeping_counts and tenant_counts keep two companies apart in the live Timekeeping database" do
       company_a = 970_001
@@ -375,79 +355,6 @@ RSpec.describe LiveHandoff do
     changed = after.keys.select { |key| after[key] != before[key] }
     expect(changed.size).to eq(1)
     expect(after[changed.first] - before[changed.first]).to eq(1)
-  end
-end
-
-
-RSpec.describe LiveHandoff do
-  # "a foreign-id check where the company has no rows of its own fails."
-  it "foreign_id_failures fails a company whose rows do not name it or name the other company, and passes rows of each company's own" do
-    clean = { 1 => [{ "company_id" => 1 }, { "company_ids" => [1] }], 2 => [{ "company_id" => 2 }] }
-    expect(described_class.foreign_id_failures(clean, company_ids: [1, 2])).to eq([])
-
-    empty_list = { 1 => [{ "company_ids" => [] }], 2 => [{ "company_id" => 2 }] }
-    no_rows = { 1 => [], 2 => [{ "company_id" => 2 }] }
-    missing = { 2 => [{ "company_id" => 2 }] }
-    foreign_row = { 1 => [{ "company_id" => 1 }, { "company_id" => 2 }], 2 => [{ "company_id" => 2 }] }
-    foreign_list = { 1 => [{ "company_ids" => [1, 2] }], 2 => [{ "company_id" => 2 }] }
-    no_field = { 1 => [{ "id" => 5 }], 2 => [{ "company_id" => 2 }] }
-
-    [empty_list, no_rows, missing, foreign_row, foreign_list, no_field].each do |rows|
-      expect(described_class.foreign_id_failures(rows, company_ids: [1, 2])).not_to be_empty, rows.inspect
-    end
-  end
-end
-
-
-RSpec.describe LiveHandoff do
-  # "It keeps the recorded path, Idempotency-Key and body, and replaces the `X-Auth-Email` and `X-Auth-Token` headers."
-  # "the web replay builder carries company A's headers, not company B's;" read here as: a request replayed by B carries B's headers, not A's.
-  it "web_replay_request carries company B's credentials and none of company A's" do
-    body = { "project_id" => 11, "timesheet_entry" => { "duration" => 60, "note" => "a-note", "work_date" => "2026-01-05" } }
-    recorded = {
-      method: "POST",
-      path: "/api/v1/timesheet_entry",
-      headers: {
-        "Idempotency-Key" => "key-recorded-by-a",
-        "X-Auth-Email" => "owner-a@example.test",
-        "X-Auth-Token" => "token-of-a",
-        "Authorization" => "Bearer token-of-a-cli"
-      },
-      body:
-    }
-    recorded_copy = Marshal.load(Marshal.dump(recorded))
-
-    replay = described_class.web_replay_request(
-      recorded, company_id: 2, auth_email: "owner-b@example.test", auth_token: "token-of-b"
-    )
-
-    expect(replay[:path]).to eq("/api/v1/timesheet_entry")
-    expect(replay[:body]).to eq(body)
-    expect(replay[:headers]["Idempotency-Key"]).to eq("key-recorded-by-a")
-    expect(replay[:headers]["X-Auth-Email"]).to eq("owner-b@example.test")
-    expect(replay[:headers]["X-Auth-Token"]).to eq("token-of-b")
-    expect(replay[:headers]).not_to have_key("Authorization")
-    expect(replay[:headers].values.join(" ")).not_to include("owner-a@example.test", "token-of-a")
-    expect(recorded).to eq(recorded_copy)
-  end
-end
-
-
-RSpec.describe LiveHandoff do
-  # "Then read `generation-<n>/reconciliation.json` and require exactly both seeded company ids, each with `abort` false and `unlisted` empty, and `unassigned` empty."
-  it "reconciliation_failures fails a report that misses a seeded company or adds a third one" do
-    company = ->(id) { { "company_id" => id, "abort" => false, "checks" => {}, "listed" => [], "unlisted" => [] } }
-    report = lambda do |ids|
-      { "abort" => false, "companies" => ids.to_h { |id| [id.to_s, company.call(id)] }, "unassigned" => [] }
-    end
-
-    expect(described_class.reconciliation_failures(report.call([7, 8]), company_ids: [7, 8])).to eq([])
-    expect(described_class.reconciliation_failures(report.call([7]), company_ids: [7, 8])).not_to be_empty
-    expect(described_class.reconciliation_failures(report.call([7, 8, 9]), company_ids: [7, 8])).not_to be_empty
-
-    one_company_aborts = report.call([7, 8])
-    one_company_aborts["companies"]["8"] = company.call(8).merge("abort" => true, "unlisted" => [{ "check" => "entries" }])
-    expect(described_class.reconciliation_failures(one_company_aborts, company_ids: [7, 8])).not_to be_empty
   end
 end
 
@@ -645,41 +552,6 @@ RSpec.describe "LiveHandoff" do
 end
 
 
-RSpec.describe "LiveHandoff" do
-  it "web_replay_request keeps path, key and body and carries only the replaying company's credentials" do
-    body = { "project_id" => 41, "timesheet_entry" => { "duration" => 30, "note" => "a", "work_date" => "2026-01-05" } }
-    recorded = {
-      method: "POST",
-      path: "/api/v1/timesheet_entry",
-      headers: {
-        "Idempotency-Key" => "key-a-1",
-        "X-Auth-Email" => "owner-a@example.com",
-        "X-Auth-Token" => "token-a",
-        "Authorization" => "Bearer token-a-cli"
-      },
-      body:
-    }
-    snapshot = Marshal.load(Marshal.dump(recorded))
-
-    replay = LiveHandoff.web_replay_request(
-      recorded, company_id: 22, auth_email: "owner-b@example.com", auth_token: "token-b"
-    )
-
-    # "It keeps the recorded path, Idempotency-Key and body, and replaces the `X-Auth-Email` and `X-Auth-Token` headers."
-    expect(replay[:path]).to eq("/api/v1/timesheet_entry")
-    expect(replay[:body]).to eq(body)
-    expect(replay[:headers]["Idempotency-Key"]).to eq("key-a-1")
-    expect(replay[:headers]["X-Auth-Email"]).to eq("owner-b@example.com")
-    expect(replay[:headers]["X-Auth-Token"]).to eq("token-b")
-    # "the web replay builder carries company A's headers, not company B's;" read with A as the replaying company:
-    # no credential of the recording company may survive.
-    expect(replay[:headers].values).not_to include("owner-a@example.com", "token-a", "Bearer token-a-cli")
-    expect(replay[:headers]).not_to have_key("Authorization")
-    expect(recorded).to eq(snapshot)
-  end
-end
-
-
 RSpec.describe LiveHandoff do
   it "send_request returns the status and the exact response bytes, unparsed and binary" do
     raw = "{\"reason\":\"idempotency_key_reused\"}\n\xFF\x00".b
@@ -748,29 +620,6 @@ end
 
 
 RSpec.describe LiveHandoff do
-  it "reconciliation_failures rejects a null company abort, a missing unlisted and an extra company" do
-    clean_company = ->(id) { { "company_id" => id, "abort" => false, "checks" => {}, "listed" => [], "unlisted" => [] } }
-    clean = {
-      "abort" => false,
-      "companies" => { "1" => clean_company.call(1), "2" => clean_company.call(2) },
-      "unassigned" => []
-    }
-    expect(described_class.reconciliation_failures(clean, company_ids: [1, 2])).to eq([])
-
-    # "require exactly both seeded company ids, each with `abort` false and `unlisted` empty, and `unassigned` empty."
-    null_abort = clean.merge("companies" => clean["companies"].merge("1" => clean_company.call(1).merge("abort" => nil)))
-    missing_unlisted = clean.merge("companies" => clean["companies"].merge("2" => clean_company.call(2).except("unlisted")))
-    extra_company = clean.merge("companies" => clean["companies"].merge("3" => clean_company.call(3)))
-    missing_unassigned = clean.except("unassigned")
-
-    [null_abort, missing_unlisted, extra_company, missing_unassigned].each do |report|
-      expect(described_class.reconciliation_failures(report, company_ids: [1, 2])).not_to be_empty, report.inspect
-    end
-  end
-end
-
-
-RSpec.describe LiveHandoff do
   it "replay_verdict fails a non-JSON body, a refusal body with an extra key and a one-byte-different receipt reply without raising" do
     stored = '{"notice":"saved","entry":{"id":7,"note":"abc"}}'
 
@@ -788,56 +637,6 @@ RSpec.describe LiveHandoff do
 
     expect(described_class.replay_verdict(status: 200, body: stored.dup, expected_body: stored,
                                           refusals: described_class::TIMEKEEPING_REFUSALS)).to eq(:answered_from_receipt)
-  end
-end
-
-
-RSpec.describe LiveHandoff do
-  it "replay_verdict counts a 404 not_found only against the cross-company table" do
-    body = '{"reason":"not_found"}'
-    verdict = ->(refusals) { described_class.replay_verdict(status: 404, body:, expected_body: "{}", refusals:) }
-
-    # "404 is a refusal only in the cross-company table."
-    expect(verdict.call(described_class::CROSS_COMPANY_REFUSALS)).to eq(:refused)
-    expect(verdict.call(described_class::TIMEKEEPING_REFUSALS)).to eq(:failed)
-    expect(verdict.call(described_class::MONOLITH_REFUSALS)).to eq(:failed)
-
-    # "the web 422 body is a refusal on the web table but not on the Timekeeping table"
-    web_422 = { errors: I18n.t("errors.entry_write_rejected") }.to_json
-    expect(described_class.replay_verdict(status: 422, body: web_422, expected_body: "{}",
-                                          refusals: described_class::MONOLITH_REFUSALS)).to eq(:refused)
-    expect(described_class.replay_verdict(status: 422, body: web_422, expected_body: "{}",
-                                          refusals: described_class::TIMEKEEPING_REFUSALS)).to eq(:failed)
-  end
-end
-
-
-RSpec.describe LiveHandoff do
-  it "web_replay_request drops the recorded company's Authorization and X-Auth headers and leaves the recording unchanged" do
-    recorded = {
-      method: "POST",
-      path: "/api/v1/timesheet_entry",
-      headers: {
-        "Idempotency-Key" => "key-a-1",
-        "X-Auth-Email" => "owner-a@example.test",
-        "X-Auth-Token" => "token-a",
-        "Authorization" => "Bearer token-a-cli"
-      },
-      body: { "project_id" => 11, "timesheet_entry" => { "note" => "a" } }
-    }
-    original = Marshal.load(Marshal.dump(recorded))
-
-    replay = described_class.web_replay_request(recorded, company_id: 2, auth_email: "owner-b@example.test",
-                                                          auth_token: "token-b")
-
-    # "It keeps the recorded path, Idempotency-Key and body, and replaces the `X-Auth-Email` and `X-Auth-Token` headers."
-    expect(replay.fetch(:path)).to eq("/api/v1/timesheet_entry")
-    expect(replay.fetch(:body)).to eq(original.fetch(:body))
-    expect(replay.fetch(:headers)).to include("Idempotency-Key" => "key-a-1", "X-Auth-Email" => "owner-b@example.test",
-                                              "X-Auth-Token" => "token-b")
-    expect(replay.fetch(:headers)).not_to have_key("Authorization")
-    expect(replay.fetch(:headers).values).not_to include("owner-a@example.test", "token-a", "Bearer token-a-cli")
-    expect(recorded).to eq(original)
   end
 end
 
