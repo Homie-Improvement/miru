@@ -338,7 +338,9 @@ RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true do
     expect_owner_state!
     expect do
       run_harvest_import(data_import)
-    end.not_to change { [company.clients.count, company.projects.count, owned_entries(include_discarded: true).size] }
+    end.not_to change {
+      [company.clients.count, company.projects.count, TimesheetEntry.count, owned_entries(include_discarded: true).size]
+    }
 
     expect(data_import.reload).to have_attributes(imported_rows: 0, skipped_rows: 1)
   end
@@ -713,7 +715,11 @@ RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true do
       if calls == 1
         # Delivered before the change: the projection refuses an earlier generation's snapshot after it.
         relay_local_entries_to_projection(fold_gen_company)
-        TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).increment!(:generation)
+        ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+        ownership.increment!(:generation)
+        # The live app admits writes at its own generation, so it moves with the
+        # monolith's; this group has no fake, and nothing else reads the argument then.
+        admit_forwarded_generation(nil, ownership.generation) if TimekeepingRegressionAdapter.current
       end
       result
     end
@@ -1221,7 +1227,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true do
 
     expect(rerun_dup_entries("earlier")).to eq(earlier_entries)
     # The projection row itself is still the one match, in every state.
-    expect(TimesheetEntry.where(user: rerun_dup_paul, note: "earlier").count).to eq(1)
+    expect(TimesheetEntry.where(user: rerun_dup_paul, note: "earlier", source: "import").count).to eq(1)
     expect(rerun_dup_entries("second")).to eq(1)
     expect(rerun_dup_entries("third")).to eq(1)
     expect(import.reload).to have_attributes(status: "completed", imported_rows: 1, skipped_rows: 3)
@@ -1278,7 +1284,7 @@ RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true do
       described_class.new(import.reload).process
     end.not_to change { rerun_dup_entries("same work") }
     # The projection row itself is still the one match, in every state.
-    expect(TimesheetEntry.where(user: rerun_dup_paul, note: "same work").count).to eq(1)
+    expect(TimesheetEntry.where(user: rerun_dup_paul, note: "same work", source: "import").count).to eq(1)
     expect(import.reload).to have_attributes(status: "completed", imported_rows: 0, skipped_rows: 2)
   end
 

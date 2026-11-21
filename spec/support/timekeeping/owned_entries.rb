@@ -318,8 +318,8 @@ module TimekeepingOwnedEntries
         row.merge("locked" => reserved)
       end
 
-      # timesheet_entries has no company column, so a company is reached
-      # through its clients' projects.
+      # A company is reached through its clients' projects, the scope the
+      # project-based reads this replaces used.
       def read_legacy_owned_entries(company_id)
         scope = TimesheetEntry.unscoped.order(:id)
         if company_id
