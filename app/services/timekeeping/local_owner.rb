@@ -165,6 +165,22 @@ module Timekeeping
         .stored_answer_without_fence
     end
 
+    # One stored bulk receipt: its key and the entry ids its answer lists.
+    StoredBulkReceipt = Data.define(:key, :entry_ids)
+
+    # Every bulk receipt this store holds for the company, user actor and
+    # bulk operation, whatever its key, so a caller can find one whose key it
+    # can only rebuild from the ids the stored answer lists. It reads only.
+    def self.stored_bulk_receipts(operation:, company_id:, actor:)
+      return [] unless actor.user? && BULK_ROUTES.include?(operation.to_sym)
+
+      Receipt.where(company_id:, actor_type: ACTOR_TYPE, actor_id: actor.user_id, operation: "#{operation} ")
+        .pluck(:key, :body).map do |key, body|
+          entry_ids = Array(JSON.parse(body)["results"]).filter_map { |result| result["entry_id"] }
+          StoredBulkReceipt.new(key:, entry_ids:)
+        end
+    end
+
     # :reek:LongParameterList
     def initialize(operation:, company_id:, generation:, actor:, params:, checkpoint:, identity: nil)
       @operation = operation.to_sym

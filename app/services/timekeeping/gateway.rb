@@ -339,6 +339,7 @@ module Timekeeping
         perform(expected_generation) do |ownership, owner|
           replayed = replay_committed(ownership:, owner:, operation:, identity:,
                                       keys: replay_keys(local_bulk_key(operation, identity)))
+          replayed ||= replay_carried_bulk(ownership:, operation:, identity:) if owner == :prepared
           entries = bulk_entries(ownership:, entry_ids:, scope:)
           if replayed
             next BulkResult.new(entries:, refusal: nil, written: reported?(replayed, BULK_RESULTS.fetch(operation)))
@@ -483,8 +484,7 @@ module Timekeeping
         ids = movable_entry_ids(entries, project).sort
         return false if ids.empty?
 
-        answer = replay_forwarded_bulk(ownership:, operation: :bulk_move, ids:, identity:) ||
-                 local_write(ownership:, operation: :bulk_move, body: { "entry_ids" => ids, "project_id" => project.id },
+        answer = local_write(ownership:, operation: :bulk_move, body: { "entry_ids" => ids, "project_id" => project.id },
                              identity:, idempotency_key: local_bulk_key(:bulk_move, identity))
         reported?(answer, MOVED_RESULT)
       end
@@ -493,8 +493,7 @@ module Timekeeping
         ids = entries.map(&:id).sort
         return false if ids.empty?
 
-        answer = replay_forwarded_bulk(ownership:, operation: :bulk_delete, ids:, identity:) ||
-                 local_write(ownership:, operation: :bulk_delete, body: { "entry_ids" => ids }, identity:,
+        answer = local_write(ownership:, operation: :bulk_delete, body: { "entry_ids" => ids }, identity:,
                              idempotency_key: local_bulk_key(:bulk_delete, identity))
         reported?(answer, DELETED_RESULT)
       end
@@ -507,15 +506,20 @@ module Timekeeping
         bulk_request_key(operation, identity.fetch("entry_ids"))
       end
 
-      # A forwarded bulk write is keyed over the ids it sent, and a rollback
-      # carries its receipt into this store under that key. So before writing
-      # ids, the receipt under the key a forwarded write of them would use is
-      # read too: its fingerprint is Timekeeping's, so a match is refused as a
-      # reused key rather than written a second time.
-      def replay_forwarded_bulk(ownership:, operation:, ids:, identity:)
+      # A forwarded bulk write is keyed over the ids it sent, which were the
+      # ids found or movable at that time, and a rollback carries its receipt
+      # into this store under that key. Those ids cannot be rebuilt from the
+      # entries as they are now, so the receipt is found by its own stored
+      # answer instead: a receipt of this actor and operation whose key is
+      # this request's client key derived over the ids its answer lists. It
+      # is then replayed as any receipt is; its fingerprint is Timekeeping's,
+      # so a retry is refused as a reused key rather than written again.
+      def replay_carried_bulk(ownership:, operation:, identity:)
         return if context.idempotency_key.nil?
 
-        replay_local(ownership:, operation:, identity:, keys: [bulk_request_key(operation, ids)])
+        stored = local_owner.stored_bulk_receipts(operation:, company_id: context.company.id, actor: local_actor)
+        carried = stored.find { |receipt| receipt.key == bulk_request_key(operation, receipt.entry_ids) }
+        replay_local(ownership:, operation:, identity:, keys: [carried.key]) if carried
       end
 
       # The ids of the entries the legacy save would not skip.
