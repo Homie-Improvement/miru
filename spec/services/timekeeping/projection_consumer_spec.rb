@@ -359,6 +359,83 @@ RSpec.describe Timekeeping::ProjectionConsumer, "snapshot rules" do
       expect(rules_row(91_921)).to include("note" => "a  \n  b", "version" => 2)
     end
   end
+
+  # An agent can be deleted while the relay is still behind, so a snapshot can name an agent id with no agents row.
+  # Each example uses an id past every agent row, so it can never name another company's or user's agent.
+  context "when a snapshot names an agent with no agents row" do
+    let(:missing_agent_id) { Agent.maximum(:id).to_i + 1_000 }
+
+    def deliver_mixed_agent_batch(missing_entry_id, other_entry_id, other_agent_id)
+      batch = TimekeepingSnapshots.batch(
+        rules_item(rules_entry(id: missing_entry_id, version: 1, agent_id: missing_agent_id), outbox_position: 1),
+        rules_item(rules_entry(id: other_entry_id, version: 1, agent_id: other_agent_id), outbox_position: 2)
+      )
+      result = described_class.call(batch:, idempotency_key: nil)
+      [result.status, result.body]
+    end
+
+    # The snapshot's own user, so only the company differs and the company check alone must refuse it.
+    def same_user_agent_in_another_company
+      other_company = create(:company)
+      create(:employment, company: other_company, user: rules_user)
+      create(:agent, company: other_company, user: rules_user)
+    end
+
+    # "A projection snapshot naming an agent id with no agents row is applied with that id, and the consumer comment says so"
+    # The relay retries until it sees 200, so a repeat of the same snapshot must not turn into a refusal.
+    it "applies the snapshot, stores that agent id, and ignores a redelivery without adding a second row" do
+      snapshot = rules_entry(id: 94_031, version: 1, agent_id: missing_agent_id)
+
+      expect(rules_deliver(snapshot)).to eq(rules_applied)
+      expect(rules_row(94_031)).to include("agent_id" => missing_agent_id, "version" => 1)
+      expect(Agent.exists?(missing_agent_id)).to be(false)
+
+      expect(rules_deliver(snapshot)).to eq(rules_ignored)
+      rows = ActiveRecord::Base.connection.select_all("SELECT agent_id FROM timesheet_entries WHERE id = 94031").to_a
+      expect(rows).to eq([{ "agent_id" => missing_agent_id }])
+    end
+
+    # "Foreign-company and other-user agents stay refused."
+    it "applies a snapshot naming a deleted agent under its own company and user, while another company's agent is still refused" do
+      foreign_agent = same_user_agent_in_another_company
+
+      expect(rules_deliver(rules_entry(id: 95_101, version: 1, agent_id: missing_agent_id))).to eq(rules_applied)
+      expect(rules_row(95_101)).to include("agent_id" => missing_agent_id, "company_id" => rules_company.id,
+                                           "user_id" => rules_user.id)
+
+      expect(rules_deliver(rules_entry(id: 95_102, version: 1, agent_id: foreign_agent.id))).to eq(rules_invalid)
+      expect(rules_row(95_102)).to be_nil
+    end
+
+    # Accepting a missing agent id must not let an existing agent of another user through in the same batch.
+    it "refuses a whole batch that pairs a deleted agent with another user's agent, and applies the deleted agent alone" do
+      other_users_agent = create(:agent, company: rules_company)
+
+      expect(deliver_mixed_agent_batch(95_111, 95_112, other_users_agent.id)).to eq(rules_invalid)
+      expect(rules_row(95_111)).to be_nil
+      expect(rules_row(95_112)).to be_nil
+
+      expect(rules_deliver(rules_entry(id: 95_111, version: 1, agent_id: missing_agent_id))).to eq(rules_applied)
+      expect(rules_row(95_111)).to include("agent_id" => missing_agent_id)
+    end
+
+    # Accepting a missing agent id must not let an existing agent of another company through in the same batch.
+    it "still refuses a batch that pairs a deleted agent with another company's agent, and writes neither entry" do
+      foreign_agent = same_user_agent_in_another_company
+
+      expect(deliver_mixed_agent_batch(94_061, 94_062, foreign_agent.id)).to eq(rules_invalid)
+      expect(rules_row(94_061)).to be_nil
+      expect(rules_row(94_062)).to be_nil
+    end
+
+    # The update path writes the row a second way, so it is checked apart from the insert.
+    it "applies a later version that moves an entry onto a deleted agent and stores the new agent id" do
+      expect(rules_deliver(rules_entry(id: 94_072, version: 1))).to eq(rules_applied)
+
+      expect(rules_deliver(rules_entry(id: 94_072, version: 2, agent_id: missing_agent_id))).to eq(rules_applied)
+      expect(rules_row(94_072)).to include("agent_id" => missing_agent_id, "version" => 2)
+    end
+  end
 end
 
 RSpec.describe Timekeeping::ProjectionConsumer, "references of applying snapshots" do
