@@ -607,7 +607,7 @@ RSpec.describe "owned_entry for an id the owning store does not hold", committed
   end
 end
 
-RSpec.describe "fixture_reservation_row for a locked fixture" do
+RSpec.describe "fixture_reservation_row for a locked fixture", committed_data: true do
   it "fixture_reservation_row builds the committed active reservation of a locked fixture with no invoice operation" do
     entry = { "id" => 900_901, "company_id" => 77, "locked" => true }
     stamp = Time.current.utc.floor(6)
@@ -804,7 +804,7 @@ RSpec.describe "owned_entry lock state in the rollback state", committed_data: t
   end
 end
 
-RSpec.describe "TimekeepingOwnedEntries.checkpoint_of with reservations" do
+RSpec.describe "TimekeepingOwnedEntries.checkpoint_of with reservations", committed_data: true do
   it "checkpoint_of carries the locked entry's reservation beside its entry and leaves every other table empty" do
     stamp = Time.current.utc.floor(6)
     entry = TimekeepingOwnedEntries.normalize([{ company: 41, user: 42, project: 43, locked: true }])
