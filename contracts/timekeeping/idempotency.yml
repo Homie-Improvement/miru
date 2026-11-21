@@ -22,12 +22,16 @@ stored_statuses: 2xx
 # the entry_api writes and the reservations commands; entry snapshot
 # delivery (key_sources.entry_snapshots) still stores every keyed 2xx
 # answer, an all-ignored batch included.
-# The operations listed here are the exception and store their receipt even
-# when they changed nothing. A detach_entries receipt is also the marker that
-# refuses a later entry write naming the agent being deleted, and Timekeeping
-# cannot tell another company's agent from one of the company's own agents
-# that has no entries, so dropping it would let such a write through.
-unchanged_stored_operations: [detach_entries]
+# The operations listed here store their receipt when they changed nothing
+# only if their target belongs to the requesting company, and a retry then
+# replays it. A detach_entries receipt is also the marker that refuses a later
+# entry write naming the agent being deleted, so a detach of one of the
+# company's own agents stores it even when the agent has no entries.
+# Ownership is read without waiting on, or skipping, the agent's row lock,
+# because the agent's own deletion holds that lock during the detach. A
+# detach naming another company's agent, or an agent no company has, that
+# detached nothing stores no receipt and leaves no row for either company.
+owned_target_stored_operations: [detach_entries]
 
 key_sources:
   entry_api:

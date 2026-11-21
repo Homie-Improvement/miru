@@ -7,12 +7,17 @@ module TimekeepingContract
   # A receipt is stored only for an answer in the contract's stored_statuses
   # class (2xx), so a retry after an error, a 409 included, is evaluated again.
   # A successful answer that changed nothing is stored only for an operation
-  # the contract lists in unchanged_stored_operations; any other is evaluated
-  # again on retry.
+  # the contract lists in owned_target_stored_operations whose target belongs
+  # to the requesting company; any other is evaluated again on retry.
   class IdempotencyReceipts
     # What an answer block returns, in place of the bare response, for a
-    # successful answer that changed nothing.
-    Unchanged = Data.define(:response)
+    # successful answer that changed nothing. owned_target says whether the
+    # command's target belongs to the requesting company.
+    Unchanged = Data.define(:response, :owned_target) do
+      def initialize(response:, owned_target: false)
+        super
+      end
+    end
 
     # Which request facts a receipt is keyed by. The contract scopes it by
     # company, actor, operation and key, so no other caller can match it.
@@ -24,8 +29,8 @@ module TimekeepingContract
     # Whether an answer that changed nothing is stored. An operation is its
     # route name followed by its target, such as "detach_entries 77", and the
     # contract lists route names.
-    STORE_CONTRACT_UNCHANGED = lambda do |operation:, unchanged_stored_operations:|
-      unchanged_stored_operations.include?(operation.split.first)
+    STORE_CONTRACT_UNCHANGED = lambda do |operation:, owned_target:, owned_target_stored_operations:|
+      owned_target && owned_target_stored_operations.include?(operation.split.first)
     end
 
     def initialize(receipt_key: SCOPED_RECEIPT_KEY, reject_reused_key: true, store_answer: STORE_CONTRACT_STATUSES,
@@ -56,7 +61,7 @@ module TimekeepingContract
 
       evaluated = yield
       response = response_of(evaluated)
-      if stored?(operation, response, unchanged: evaluated.is_a?(Unchanged))
+      if stored?(operation, response, evaluated)
         # A private copy, so a caller editing its answer cannot change what a replay returns.
         @receipts[receipt_key] = { fingerprint:, status: response.status, body: Wire.copy(response.body) }
       end
@@ -69,11 +74,12 @@ module TimekeepingContract
         evaluated.is_a?(Unchanged) ? evaluated.response : evaluated
       end
 
-      def stored?(operation, response, unchanged:)
+      def stored?(operation, response, evaluated)
         return false unless @store_answer.call(status: response.status, stored_statuses: @contract.fetch("stored_statuses"))
+        return true unless evaluated.is_a?(Unchanged)
 
-        !unchanged ||
-          @store_unchanged.call(operation:, unchanged_stored_operations: @contract.fetch("unchanged_stored_operations"))
+        @store_unchanged.call(operation:, owned_target: evaluated.owned_target,
+                              owned_target_stored_operations: @contract.fetch("owned_target_stored_operations"))
       end
   end
 end
