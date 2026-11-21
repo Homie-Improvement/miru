@@ -18,7 +18,10 @@ stored_statuses: 2xx
 # A 2xx answer that changed nothing stores no receipt, so a retry of it is
 # evaluated again: nothing was written, so a second evaluation is safe. Such
 # a request, one naming only another company's entries or invoice for
-# example, then leaves no row behind for either company.
+# example, then leaves no row behind for either company. This rule covers
+# the entry_api writes and the reservations commands; entry snapshot
+# delivery (key_sources.entry_snapshots) still stores every keyed 2xx
+# answer, an all-ignored batch included.
 # The operations listed here are the exception and store their receipt even
 # when they changed nothing. A detach_entries receipt is also the marker that
 # refuses a later entry write naming the agent being deleted, and Timekeeping
