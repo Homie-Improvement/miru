@@ -33,10 +33,11 @@ module Timekeeping
     # 5. Write each with version + 1, then, unless a stored row is one the
     #    projection would refuse, one audit row holding the changed field
     #    before and after and one outbox snapshot.
-    # 6. Store the receipt, unless the command changed no entry and is not one
-    #    that stores its receipt regardless (contracts/timekeeping/
-    #    idempotency.yml unchanged_stored_operations). A command that stored
-    #    nothing is evaluated again on a retry.
+    # 6. Store the receipt when an entry changed, or when the command is one
+    #    that stores it for a target the company owns and the company owns
+    #    the target (contracts/timekeeping/idempotency.yml
+    #    owned_target_stored_operations). A command that stored nothing is
+    #    evaluated again on a retry.
     #
     # A refusal decided before step 5 writes nothing. An unpublishable row
     # raises inside the savepoint and is answered after the rollback.
@@ -51,8 +52,9 @@ module Timekeeping
       # What each command changes. target_param names the params key holding
       # its target; lock takes the target's lock; targets selects the
       # company's entries the command changes; changes is the field it
-      # writes on each; count is the answer's key; store_unchanged says
-      # whether a run that changed no entry still stores its receipt.
+      # writes on each; count is the answer's key; owned_target, when present,
+      # answers whether the company owns the target, and a run that changed no
+      # entry stores its receipt only when it does.
       COMMANDS = {
         mark_billed: {
           target_param: "invoice_id",
@@ -69,8 +71,7 @@ module Timekeeping
               .where.not(bill_status: TimekeepingRules::EntryRules::BILLED)
           end,
           changes: { "bill_status" => TimekeepingRules::EntryRules::BILLED }.freeze,
-          count: "billed",
-          store_unchanged: false
+          count: "billed"
         }.freeze,
         detach_entries: {
           target_param: "agent_id",
@@ -80,11 +81,12 @@ module Timekeeping
           targets: ->(company_id, agent_id) { LocalEntry.where(company_id:, agent_id:) },
           changes: { "agent_id" => nil }.freeze,
           count: "detached",
-          # The receipt is the detach marker agent_detached? reads, and a
-          # detach of the company's own agent with no entries cannot be told
-          # apart from one naming another company's agent, so even a detach
-          # that changed nothing stores it.
-          store_unchanged: true
+          # The receipt is the detach marker agent_detached? reads, so a detach
+          # of the company's own agent stores it even when it detached nothing.
+          # One naming another company's agent, or no agent, stores nothing.
+          # A plain read, with no row lock, so it neither waits on the lock
+          # the agent's destroy holds nor skips the agent being deleted.
+          owned_target: ->(company_id, agent_id) { Agent.where(company_id:, id: agent_id).exists? }
         }.freeze
       }.freeze
 
@@ -124,9 +126,10 @@ module Timekeeping
 
       # Whether a detach-entries command of this agent in the company stored
       # its receipt after the marker the write read. An older detach does not
-      # refuse writes for an agent that still exists. Every detach stores its
-      # receipt, a zero-entry one included (COMMANDS store_unchanged), so this
-      # marker is never missing.
+      # refuse writes for an agent that still exists. Every detach of one of
+      # the company's own agents stores its receipt, a zero-entry one included
+      # (COMMANDS owned_target), so this marker is never missing for an agent
+      # being deleted.
       def self.agent_detached?(company_id, agent_id, after:)
         detach_receipts(company_id, agent_id).where("id > ?", after).exists?
       end
@@ -202,14 +205,22 @@ module Timekeeping
         end
 
         # Answers with the count of changed entries. The receipt is stored only
-        # when an entry changed, or for a command that stores it regardless.
+        # when an entry changed, or when the company owns the command's target
+        # and the command stores its receipt for an owned target.
         def finish(entries)
           outcome = Outcome.success(200, command.fetch(:count) => entries.size)
-          if entries.any? || command.fetch(:store_unchanged)
+          if entries.any? || owned_target?
             store_receipt(outcome)
             checkpoint.call(:receipt_written)
           end
           outcome
+        end
+
+        # A command without owned_target never stores a receipt for a run that
+        # changed nothing.
+        def owned_target?
+          owned_target = command[:owned_target]
+          owned_target.present? && owned_target.call(company_id, request.target_id)
         end
 
         # Only the params keys below are read, so a company_id or actor field
