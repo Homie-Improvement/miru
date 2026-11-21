@@ -40,41 +40,6 @@ RSpec.describe "Timekeeping mark-billed naming another company's invoice" do
 end
 
 
-RSpec.describe "Timekeeping mark-billed naming another company's invoice" do
-  include_context "timekeeping entry writes"
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  # "mark-billed and detach-entries with zero targets for another company's ids store no receipt, pinned by request specs"
-  it "stores no receipt and bills nothing for a mark-billed naming another company's invoice, in both directions" do
-    arrange = timekeeping_arrange
-    companies = [arrange.company, arrange.company]
-    invoices = [501, 502]
-    services = companies.map do |company|
-      arrange.service_identity(company:, name: "invoice-boundary", operations: %w[prepare commit abort mark_billed])
-    end
-    billable = companies.zip(invoices).map do |company, invoice_id|
-      arrange.reserved_entry(company:, invoice_id:, state: "committed")
-    end
-    state = -> { [ServiceIdempotencyReceipt.count, Entry.sum(:version), Entry.where(id: billable).order(:id).pluck(:bill_status)] }
-
-    baseline = state.call
-    expect(baseline[2]).to eq(%w[unbilled unbilled])
-
-    [[0, 1], [1, 0]].each do |requester, owner|
-      post "/v1/companies/#{companies[requester]}/invoices/#{invoices[owner]}/mark-billed",
-           params: { "operation_id" => SecureRandom.uuid, "generation" => arrange.current_generation }.to_json,
-           headers: { "Authorization" => "Bearer #{services[requester]}", "Content-Type" => "application/json" }
-
-      # Today the zero-target answer is 200 {"billed" => 0}; a refusal of another company's invoice id as
-      # 404 not_found is also no match, and stores nothing either way.
-      expect([[200, { "billed" => 0 }], [404, { "reason" => "not_found" }]])
-        .to include([response.status, response.parsed_body])
-      expect(state.call).to eq(baseline)
-    end
-  end
-end
-
-
 RSpec.describe "Timekeeping mark-billed retry after a zero-target answer" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
@@ -147,36 +112,6 @@ RSpec.describe "Timekeeping mark-billed naming only another company's invoice" d
     expect(invoices.keys.index_with { |company| ServiceIdempotencyReceipt.where(company_id: company).count })
       .to eq(receipts_before)
     expect(Entry.where(id: entry_ids).order(:id).map(&:attributes)).to eq(entries_before)
-  end
-end
-
-RSpec.describe "Timekeeping mark-billed, another company's invoice id changes nothing" do
-  include_context "timekeeping entry writes"
-
-  # "mark-billed and detach-entries with zero targets for another company's ids store no receipt, pinned by request specs"
-  # Another change may answer this request 404 not_found instead of 200 {"billed" => 0}; either answer
-  # must leave no receipt behind.
-  it "stores no service receipt when company B marks billed an invoice only company A has committed, and bills nothing" do
-    company_a = timekeeping_arrange.company
-    company_b = timekeeping_arrange.company
-    committed_entry = timekeeping_arrange.reserved_entry(company: company_a, invoice_id: 502, state: "committed")
-    service_b = timekeeping_arrange.service_identity(company: company_b, name: "invoice-boundary",
-                                                     operations: %w[prepare commit abort mark_billed detach_entries])
-    expect(timekeeping_arrange.stored_entry(committed_entry).fetch("bill_status")).to eq("unbilled")
-    entry_before = Entry.find(committed_entry).attributes
-    receipts_before = ServiceIdempotencyReceipt.where(company_id: [company_a, company_b]).count
-    counts_before = [AuditEvent.count, OutboxSnapshot.count, Entry.sum(:version)]
-
-    post "/v1/companies/#{company_b}/invoices/502/mark-billed",
-         params: { "operation_id" => SecureRandom.uuid, "generation" => timekeeping_arrange.current_generation }.to_json,
-         headers: { "Authorization" => "Bearer #{service_b}", "Content-Type" => "application/json" }
-
-    expect([[200, { "billed" => 0 }], [404, { "reason" => "not_found" }]])
-      .to include([response.status, JSON.parse(response.body)])
-    # "a 2xx answer that changed nothing stores no receipt"
-    expect(ServiceIdempotencyReceipt.where(company_id: [company_a, company_b]).count).to eq(receipts_before)
-    expect(Entry.find(committed_entry).attributes).to eq(entry_before)
-    expect([AuditEvent.count, OutboxSnapshot.count, Entry.sum(:version)]).to eq(counts_before)
   end
 end
 
@@ -258,43 +193,6 @@ RSpec.describe "Timekeeping mark-billed: another company's invoice" do
   end
 end
 
-
-RSpec.describe "Timekeeping mark-billed: a retry after a first attempt that billed nothing" do
-  include_context "timekeeping entry writes"
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  # "A request that changes nothing stores no receipt, and a retry of it is evaluated again."
-  # The first attempt finds no committed reservation, so it stores nothing; a stored {"billed" => 0}
-  # would be replayed and leave the entry committed later unbilled for good.
-  it "evaluates a mark-billed retry again after a first attempt that billed nothing, bills once, and then replays" do
-    arrange = timekeeping_arrange
-    company = arrange.company
-    service = arrange.service_identity(company:, name: "invoice-boundary",
-                                       operations: %w[prepare commit abort mark_billed detach_entries])
-    operation_id = SecureRandom.uuid
-    mark_billed = lambda do
-      post "/v1/companies/#{company}/invoices/501/mark-billed",
-           params: { "operation_id" => operation_id, "generation" => arrange.current_generation }.to_json,
-           headers: { "Authorization" => "Bearer #{service}", "Content-Type" => "application/json" }
-      [response.status, response.parsed_body]
-    end
-
-    expect(mark_billed.call).to eq([200, { "billed" => 0 }])
-    expect(ServiceIdempotencyReceipt.count).to eq(0)
-
-    billable = arrange.reserved_entry(company:, invoice_id: 501, state: "committed")
-    expect(Entry.find(billable).bill_status).to eq("unbilled")
-
-    expect(mark_billed.call).to eq([200, { "billed" => 1 }])
-    expect(Entry.find(billable).bill_status).to eq("billed")
-    expect(ServiceIdempotencyReceipt.count).to eq(1)
-    version = Entry.find(billable).version
-
-    expect(mark_billed.call).to eq([200, { "billed" => 1 }])
-    expect(ServiceIdempotencyReceipt.count).to eq(1)
-    expect(Entry.find(billable).version).to eq(version)
-  end
-end
 
 RSpec.describe "Timekeeping detach-entries naming another company's agent" do
   include_context "timekeeping entry writes"
