@@ -72,8 +72,15 @@ class Api::V1::Cli::TimesheetEntriesController < Api::V1::Cli::BaseController
         note: cli_timesheet_entry_params[:note],
         bill_status: cli_timesheet_entry_params[:bill_status],
         source: "cli",
-        source_metadata: cli_timesheet_entry_params[:source_metadata]
+        source_metadata:
       }
+    end
+
+    # The gateway's update path normalizes metadata only when it is a plain
+    # Hash, so permitted parameters are converted here. A request without the
+    # key stays nil, which leaves the stored metadata alone on update.
+    def source_metadata
+      cli_timesheet_entry_params[:source_metadata]&.to_h
     end
 
     def update_attributes
@@ -84,7 +91,7 @@ class Api::V1::Cli::TimesheetEntriesController < Api::V1::Cli::BaseController
       }
       attrs[:note] = cli_timesheet_entry_params[:note] if cli_timesheet_entry_params.key?(:note)
       attrs[:bill_status] = cli_timesheet_entry_params[:bill_status] if cli_timesheet_entry_params.key?(:bill_status)
-      attrs[:source_metadata] = cli_timesheet_entry_params[:source_metadata] if cli_timesheet_entry_params.key?(:source_metadata)
+      attrs[:source_metadata] = source_metadata if cli_timesheet_entry_params.key?(:source_metadata)
       attrs
     end
 end
