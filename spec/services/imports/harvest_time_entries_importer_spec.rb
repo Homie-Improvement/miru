@@ -1073,6 +1073,8 @@ RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true do
     expect do
       described_class.new(fresh_dup_import).process
     end.not_to change { owned_entries(user_id: fresh_dup_paul.id, note: "same work", include_discarded: true).size }
+    # The projection row itself is still the one match, in every state.
+    expect(TimesheetEntry.where(user: fresh_dup_paul, note: "same work").count).to eq(1)
     expect(fresh_dup_import.reload).to have_attributes(status: "completed", imported_rows: 0, skipped_rows: 2)
   end
 end
@@ -1218,6 +1220,8 @@ RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true do
     run_harvest_import(import.reload)
 
     expect(rerun_dup_entries("earlier")).to eq(earlier_entries)
+    # The projection row itself is still the one match, in every state.
+    expect(TimesheetEntry.where(user: rerun_dup_paul, note: "earlier").count).to eq(1)
     expect(rerun_dup_entries("second")).to eq(1)
     expect(rerun_dup_entries("third")).to eq(1)
     expect(import.reload).to have_attributes(status: "completed", imported_rows: 1, skipped_rows: 3)
@@ -1273,6 +1277,8 @@ RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true do
     expect do
       described_class.new(import.reload).process
     end.not_to change { rerun_dup_entries("same work") }
+    # The projection row itself is still the one match, in every state.
+    expect(TimesheetEntry.where(user: rerun_dup_paul, note: "same work").count).to eq(1)
     expect(import.reload).to have_attributes(status: "completed", imported_rows: 0, skipped_rows: 2)
   end
 
