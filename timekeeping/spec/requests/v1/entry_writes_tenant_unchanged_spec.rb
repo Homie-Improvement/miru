@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "rails_helper"
+require "webmock/rspec"
 
 RSpec.describe "Entry write routes: bulk delete naming only another company's entries" do
   include_context "timekeeping entry writes"
@@ -49,8 +50,6 @@ RSpec.describe "Entry write routes: bulk delete naming only another company's en
   end
 end
 
-# frozen_string_literal: true
-require "rails_helper"
 
 RSpec.describe "Entry write routes: bulk move naming only another company's entries" do
   include_context "timekeeping entry writes"
@@ -91,8 +90,6 @@ RSpec.describe "Entry write routes: bulk move naming only another company's entr
   end
 end
 
-# frozen_string_literal: true
-require "rails_helper"
 
 RSpec.describe "Entry write routes: bulk delete naming only another company's entries" do
   include_context "timekeeping entry writes"
@@ -139,8 +136,6 @@ RSpec.describe "Entry write routes: bulk delete naming only another company's en
   end
 end
 
-# frozen_string_literal: true
-require "rails_helper"
 
 RSpec.describe "Entry write routes: bulk move naming only another company's entries" do
   include_context "timekeeping entry writes"
@@ -177,8 +172,6 @@ RSpec.describe "Entry write routes: bulk move naming only another company's entr
   end
 end
 
-# frozen_string_literal: true
-require "rails_helper"
 
 RSpec.describe "Entry write routes: bulk move naming only another company's entries" do
   include_context "timekeeping entry writes"
@@ -197,7 +190,7 @@ RSpec.describe "Entry write routes: bulk move naming only another company's entr
     end
     entry_ids = seeded.values.map { |values| values.fetch(:entry) }
     entries_before = Entry.where(id: entry_ids).order(:id).map(&:attributes)
-    receipts_before = [first_company, second_company].to_h { |company| [company, IdempotencyReceipt.where(company_id: company).count] }
+    receipts_before = [first_company, second_company].index_with { |company| IdempotencyReceipt.where(company_id: company).count }
     expect(entries_before.size).to eq(2)
 
     [[first_company, second_company], [second_company, first_company]].each do |requester, owner|
@@ -213,14 +206,12 @@ RSpec.describe "Entry write routes: bulk move naming only another company's entr
     end
 
     # "Each spec shows that no receipt row is written for a request carrying only another company's ids."
-    expect([first_company, second_company].to_h { |company| [company, IdempotencyReceipt.where(company_id: company).count] })
+    expect([first_company, second_company].index_with { |company| IdempotencyReceipt.where(company_id: company).count })
       .to eq(receipts_before)
     expect(Entry.where(id: entry_ids).order(:id).map(&:attributes)).to eq(entries_before)
   end
 end
 
-# frozen_string_literal: true
-require "rails_helper"
 
 RSpec.describe "Entry write routes: bulk delete naming only another company's entries" do
   include_context "timekeeping entry writes"
@@ -238,7 +229,7 @@ RSpec.describe "Entry write routes: bulk delete naming only another company's en
     end
     entry_ids = seeded.values.map { |values| values.fetch(:entry) }
     entries_before = Entry.where(id: entry_ids).order(:id).map(&:attributes)
-    receipts_before = [first_company, second_company].to_h { |company| [company, IdempotencyReceipt.where(company_id: company).count] }
+    receipts_before = [first_company, second_company].index_with { |company| IdempotencyReceipt.where(company_id: company).count }
     expect(entries_before.map { |entry| entry.fetch("discarded_at") }).to eq([nil, nil])
 
     [[first_company, second_company], [second_company, first_company]].each do |requester, owner|
@@ -254,14 +245,12 @@ RSpec.describe "Entry write routes: bulk delete naming only another company's en
     end
 
     # "Each spec shows that no receipt row is written for a request carrying only another company's ids."
-    expect([first_company, second_company].to_h { |company| [company, IdempotencyReceipt.where(company_id: company).count] })
+    expect([first_company, second_company].index_with { |company| IdempotencyReceipt.where(company_id: company).count })
       .to eq(receipts_before)
     expect(Entry.where(id: entry_ids).order(:id).map(&:attributes)).to eq(entries_before)
   end
 end
 
-# frozen_string_literal: true
-require "rails_helper"
 
 RSpec.describe "Entry write routes: replay-only bulk delete after a request naming another company's entry" do
   include_context "timekeeping entry writes"
@@ -292,8 +281,6 @@ RSpec.describe "Entry write routes: replay-only bulk delete after a request nami
     expect(Entry.find(foreign_entry).discarded_at).to be_nil
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "Entry write routes, a bulk move naming only another company's entries" do
   include_context "timekeeping entry writes"
@@ -330,8 +317,6 @@ RSpec.describe "Entry write routes, a bulk move naming only another company's en
   end
 end
 
-require "rails_helper"
-
 RSpec.describe "Entry write routes, a bulk delete naming only another company's entries" do
   include_context "timekeeping entry writes"
 
@@ -367,8 +352,6 @@ RSpec.describe "Entry write routes, a bulk delete naming only another company's 
     expect(stored_entries.call).to eq(entries_before)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "Entry write routes, retrying a bulk delete that changed nothing" do
   include_context "timekeeping entry writes"
@@ -416,8 +399,6 @@ RSpec.describe "Entry write routes, retrying a bulk delete that changed nothing"
   end
 end
 
-# frozen_string_literal: true
-require "rails_helper"
 
 RSpec.describe "Entry write routes: a bulk delete naming only another company's entries" do
   include_context "timekeeping entry writes"
@@ -459,8 +440,6 @@ RSpec.describe "Entry write routes: a bulk delete naming only another company's 
   end
 end
 
-# frozen_string_literal: true
-require "rails_helper"
 
 RSpec.describe "Entry write routes: a key first used by a bulk delete that changed nothing" do
   include_context "timekeeping entry writes"
@@ -504,8 +483,6 @@ RSpec.describe "Entry write routes: a key first used by a bulk delete that chang
   end
 end
 
-# frozen_string_literal: true
-require "rails_helper"
 
 RSpec.describe "Entry write routes: a bulk move naming only another company's entries" do
   include_context "timekeeping entry writes"

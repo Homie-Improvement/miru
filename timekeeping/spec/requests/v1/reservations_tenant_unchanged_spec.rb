@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "rails_helper"
+require "webmock/rspec"
 
 RSpec.describe "Timekeeping mark-billed naming another company's invoice" do
   include_context "timekeeping entry writes"
@@ -38,8 +39,6 @@ RSpec.describe "Timekeeping mark-billed naming another company's invoice" do
   end
 end
 
-# frozen_string_literal: true
-require "rails_helper"
 
 RSpec.describe "Timekeeping mark-billed naming another company's invoice" do
   include_context "timekeeping entry writes"
@@ -75,8 +74,6 @@ RSpec.describe "Timekeeping mark-billed naming another company's invoice" do
   end
 end
 
-# frozen_string_literal: true
-require "rails_helper"
 
 RSpec.describe "Timekeeping mark-billed retry after a zero-target answer" do
   include_context "timekeeping entry writes"
@@ -115,8 +112,6 @@ RSpec.describe "Timekeeping mark-billed retry after a zero-target answer" do
   end
 end
 
-# frozen_string_literal: true
-require "rails_helper"
 
 RSpec.describe "Timekeeping mark-billed naming only another company's invoice" do
   include_context "timekeeping entry writes"
@@ -134,7 +129,7 @@ RSpec.describe "Timekeeping mark-billed naming only another company's invoice" d
     end
     entry_ids = seeded.values.map { |values| values.fetch(:entry) }
     entries_before = Entry.where(id: entry_ids).order(:id).map(&:attributes)
-    receipts_before = invoices.keys.to_h { |company| [company, ServiceIdempotencyReceipt.where(company_id: company).count] }
+    receipts_before = invoices.keys.index_with { |company| ServiceIdempotencyReceipt.where(company_id: company).count }
     expect(entries_before.map { |entry| entry.fetch("bill_status") }).to eq(%w[unbilled unbilled])
 
     [[first_company, second_company], [second_company, first_company]].each do |requester, owner|
@@ -149,13 +144,11 @@ RSpec.describe "Timekeeping mark-billed naming only another company's invoice" d
     end
 
     # "Each spec shows that no receipt row is written for a request carrying only another company's ids."
-    expect(invoices.keys.to_h { |company| [company, ServiceIdempotencyReceipt.where(company_id: company).count] })
+    expect(invoices.keys.index_with { |company| ServiceIdempotencyReceipt.where(company_id: company).count })
       .to eq(receipts_before)
     expect(Entry.where(id: entry_ids).order(:id).map(&:attributes)).to eq(entries_before)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "Timekeeping mark-billed, another company's invoice id changes nothing" do
   include_context "timekeeping entry writes"
@@ -186,8 +179,6 @@ RSpec.describe "Timekeeping mark-billed, another company's invoice id changes no
     expect([AuditEvent.count, OutboxSnapshot.count, Entry.sum(:version)]).to eq(counts_before)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe "Timekeeping mark-billed, retrying an attempt that billed nothing" do
   include_context "timekeeping entry writes"
@@ -225,8 +216,6 @@ RSpec.describe "Timekeeping mark-billed, retrying an attempt that billed nothing
   end
 end
 
-# frozen_string_literal: true
-require "rails_helper"
 
 RSpec.describe "Timekeeping mark-billed: another company's invoice" do
   include_context "timekeeping entry writes"
@@ -269,8 +258,6 @@ RSpec.describe "Timekeeping mark-billed: another company's invoice" do
   end
 end
 
-# frozen_string_literal: true
-require "rails_helper"
 
 RSpec.describe "Timekeeping mark-billed: a retry after a first attempt that billed nothing" do
   include_context "timekeeping entry writes"
