@@ -18,9 +18,9 @@ require_relative "regression_adapter"
 # entry attributes and checkpoint rows. TimekeepingOwnedEntries::Arrange,
 # included into every example, does the writes and reads.
 module TimekeepingOwnedEntries
-  ROW_KEYS = %i[company user project id work_date duration note bill_status locked].freeze
+  ROW_KEYS = %i[company user project id work_date duration note bill_status locked source_metadata].freeze
   REQUIRED_ROW_KEYS = %i[company user project].freeze
-  OPTIONAL_COLUMNS = %w[work_date duration note bill_status locked].freeze
+  OPTIONAL_COLUMNS = %w[work_date duration note bill_status locked source_metadata].freeze
 
   # LocalOwnerArrange's defaults, plus the values the entries table and the
   # checkpoint expect when a row names no note or lock.
@@ -32,6 +32,10 @@ module TimekeepingOwnedEntries
     "version" => 1, "review_status" => "not_required", "source" => "manual", "source_metadata" => {},
     "proof_metadata" => {}
   }.freeze
+
+  # reservations.invoice_id has no foreign key. A locked fixture only needs a
+  # reservation row to exist for its entry, so no invoice is created.
+  LOCKED_FIXTURE_INVOICE_ID = 1
 
   module_function
 
@@ -90,10 +94,28 @@ module TimekeepingOwnedEntries
       .merge(entry)
   end
 
-  # A checkpoint holding entry_rows, with every other table empty.
-  def checkpoint_of(entry_rows)
-    tables = Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }.merge("entries" => entry_rows)
-    Timekeeping::Handoff::Checkpoint.build(tables:)
+  # The reservation that makes entry locked: Timekeeping and the prepared
+  # store treat an entry as locked exactly when a reservation of its company
+  # holds it. The caller draws operation_id, so the row stays a pure value.
+  def fixture_reservation_row(entry, stamp, operation_id:)
+    {
+      "company_id" => entry.fetch("company_id"),
+      "entry_id" => entry.fetch("id"),
+      "invoice_id" => LOCKED_FIXTURE_INVOICE_ID,
+      "operation_id" => operation_id,
+      "state" => "committed",
+      "disposition" => "active",
+      "created_at" => stamp,
+      "invoice_operation_id" => nil
+    }
+  end
+
+  # A checkpoint holding the rows of tables, a Hash of table name to rows,
+  # with every table it does not name empty.
+  def checkpoint_of(tables)
+    Timekeeping::Handoff::Checkpoint.build(
+      tables: Timekeeping::Handoff::Checkpoint::TABLES.keys.index_with { [] }.merge(tables)
+    )
   end
 
   module Arrange
@@ -124,10 +146,6 @@ module TimekeepingOwnedEntries
     # The entry fields owned_entries can filter on. Any other key raises, so a
     # misspelt filter cannot widen a read that is expected to find nothing.
     OWNED_ENTRIES_FILTERS = %w[project_id user_id note duration work_date bill_status source].freeze
-
-    # reservations.invoice_id has no foreign key. A locked fixture only needs a
-    # reservation row to exist for its entry, so no invoice is created.
-    LOCKED_FIXTURE_INVOICE_ID = 1
 
     # Writes rows to the store that owns entries in state and returns their
     # ids in input order. Every check runs before the first write: an unknown
@@ -187,10 +205,11 @@ module TimekeepingOwnedEntries
         @arranged_owned_entry_ids || []
       end
 
-      # The rows loaded into Timekeeping so far in this example. A checkpoint
-      # load replaces whole tables, so every load carries all of them.
-      def timekeeping_owned_entry_rows
-        @timekeeping_owned_entry_rows || []
+      # The entries and reservations loaded into Timekeeping so far in this
+      # example. A checkpoint load replaces whole tables, so every load
+      # carries all of them.
+      def timekeeping_owned_tables
+        @timekeeping_owned_tables || { "entries" => [], "reservations" => [] }
       end
 
       # Gives each entry without an id one drawn from the timesheet_entries
@@ -230,7 +249,7 @@ module TimekeepingOwnedEntries
       def create_timesheet_entries(entries, **)
         entries.each do |entry|
           attributes = entry.slice("id", "user_id", "project_id", "work_date", "duration", "note", "bill_status",
-                                   "locked")
+                                   "locked", "source_metadata")
           billed = attributes.fetch("bill_status") == "billed"
           attributes = attributes.merge("bill_status" => "non_billable") if billed
           record = TimesheetEntry.create!(attributes)
@@ -261,26 +280,39 @@ module TimekeepingOwnedEntries
       # EntryLookup.local_entry reads locked from the reservations table, never
       # the stored column, so a locked entry needs a reservation row.
       def insert_fixture_reservation(entry)
-        values = [entry.fetch("company_id"), entry.fetch("id"), LOCKED_FIXTURE_INVOICE_ID, SecureRandom.uuid]
-        ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, *values]))
-          INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
-          VALUES (?, ?, ?, ?, 'committed', 'active', NOW())
-        SQL
+        row = TimekeepingOwnedEntries.fixture_reservation_row(entry, Time.current.utc, operation_id: SecureRandom.uuid)
+        columns = row.keys.join(", ")
+        placeholders = Array.new(row.size, "?").join(", ")
+        ApplicationRecord.connection.execute(
+          ApplicationRecord.sanitize_sql_array(
+            ["INSERT INTO reservations (#{columns}) VALUES (#{placeholders})", *row.values]
+          )
+        )
       end
 
-      # Loads the union of this example's rows and the new ones. Timekeeping
+      # Loads the union of this example's rows and the new ones, with one
+      # reservation for each locked entry so Timekeeping reads it locked. The
+      # union is kept only after the load succeeds, so a failed batch can be
+      # arranged again without a second reservation for its entry. Timekeeping
       # refuses a load unless admission is fenced, and its load leaves the
       # entries id sequence alone, so the sequence is moved above the highest
       # loaded id before admission is restored at the state's generation.
       def load_timekeeping_entries(entries, state:, store:)
         stamp = Time.current.utc.floor(6)
-        union = timekeeping_owned_entry_rows +
-                entries.map { |entry| TimekeepingOwnedEntries.checkpoint_entry_row(entry, stamp) }
+        entry_rows = entries.map { |entry| TimekeepingOwnedEntries.checkpoint_entry_row(entry, stamp) }
+        reservation_rows = entries.filter_map do |entry|
+          next unless entry.fetch("locked")
+
+          TimekeepingOwnedEntries.fixture_reservation_row(entry, stamp, operation_id: SecureRandom.uuid)
+        end
+        loaded = timekeeping_owned_tables
+        union = { "entries" => loaded.fetch("entries") + entry_rows,
+                  "reservations" => loaded.fetch("reservations") + reservation_rows }
         checkpoint = TimekeepingOwnedEntries.checkpoint_of(union)
         generation = TimekeepingOwnerState.fetch(state).fetch(:admission_generation)
 
-        load_while_fenced(store, checkpoint, highest_id: union.pluck("id").max, generation:)
-        @timekeeping_owned_entry_rows = union
+        load_while_fenced(store, checkpoint, highest_id: union.fetch("entries").pluck("id").max, generation:)
+        @timekeeping_owned_tables = union
       end
 
       def load_while_fenced(store, checkpoint, highest_id:, generation:)

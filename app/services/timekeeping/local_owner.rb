@@ -40,7 +40,10 @@ module Timekeeping
   # 6. Lock the target entries FOR UPDATE, by company, in id order, then check
   #    If-Match and the entry rules on the locked rows.
   # 7. Write the entries with version + 1, one audit row per change, one
-  #    outbox row per change under the outbox lock, and the receipt last.
+  #    outbox row per change under the outbox lock, and the receipt last,
+  #    only when the write changed an entry. A bulk route that changed
+  #    nothing stores none, so a retry of it is evaluated again
+  #    (contracts/timekeeping/idempotency.yml).
   #
   # A refusal at any step writes nothing. checkpoint is called with each name
   # in STEPS as that step finishes, so a spec can fail the transaction at a
@@ -109,7 +112,13 @@ module Timekeeping
 
     # The entries a route changed, the status to answer with, and how to build
     # the answer from the changed rows as committed.
-    Written = Data.define(:status, :changes, :payload)
+    Written = Data.define(:status, :changes, :payload) do
+      # A bulk route whose ids matched no entry it may change answers 200 and
+      # changes nothing; idempotency.yml stores no receipt for that answer.
+      def changed?
+        changes.any?
+      end
+    end
     # One changed entry and its stored values before the change; before is
     # nil for a create.
     Change = Data.define(:entry_id, :before)
@@ -268,8 +277,10 @@ module Timekeeping
         write_outbox(written.changes.map { |change| rows.fetch(change.entry_id) }, stored_generation)
         checkpoint.call(:outbox_written)
         outcome = Outcome.success(written.status, written.payload.call(rows))
-        store_receipt(outcome)
-        checkpoint.call(:receipt_written)
+        if written.changed?
+          store_receipt(outcome)
+          checkpoint.call(:receipt_written)
+        end
         outcome
       end
 

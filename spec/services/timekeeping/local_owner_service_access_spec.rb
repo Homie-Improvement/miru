@@ -46,10 +46,12 @@ RSpec.describe Timekeeping::LocalOwner::ServiceAccess do
 
   # "An actor's operations count only where `TimekeepingRules::EntryRules::BACKGROUND_OPERATIONS` also holds them."
   it "grants nothing for a background name outside the route grants or an unknown name" do
-    import_only = Timekeeping::LocalOwner::Actor.service(name: "importer", company_id: 3, operations: ["entries.import"])
-    unknown = Timekeeping::LocalOwner::Actor.service(name: "invoices", company_id: 3, operations: ["reservations.*", "admin"])
+    mark_billed_only = Timekeeping::LocalOwner::Actor.service(name: "invoices", company_id: 3,
+                                                              operations: ["invoices.mark_billed"])
+    unknown = Timekeeping::LocalOwner::Actor.service(name: "invoices", company_id: 3,
+                                                     operations: ["reservations.*", "admin", "entries.import"])
     %i[prepare commit abort].each do |route|
-      expect(described_class.call(actor: import_only, operation: route, company_id: 3)).to eq(:forbidden)
+      expect(described_class.call(actor: mark_billed_only, operation: route, company_id: 3)).to eq(:forbidden)
       expect(described_class.call(actor: unknown, operation: route, company_id: 3)).to eq(:forbidden)
     end
   end
