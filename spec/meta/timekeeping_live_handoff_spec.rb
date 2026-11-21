@@ -1,4 +1,8 @@
+# frozen_string_literal: true
+
 require "rails_helper"
+require "pg"
+require "securerandom"
 
 RSpec.describe LiveHandoff do
   it "web_replay_request carries only the replaying company's X-Auth credentials and drops the recorded Authorization header" do
@@ -35,7 +39,6 @@ RSpec.describe LiveHandoff do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe LiveHandoff do
   it "timekeeping_counts refuses a database whose name does not end in _test before connecting, without credentials in the error" do
@@ -57,7 +60,6 @@ RSpec.describe LiveHandoff do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe LiveHandoff do
   it "replay_verdict never counts an unauthenticated or forbidden reply as a refusal in any table" do
@@ -80,8 +82,6 @@ RSpec.describe LiveHandoff do
   end
 end
 
-require "rails_helper"
-require "securerandom"
 
 RSpec.describe LiveHandoff do
   it "monolith_counts returns exact per-company values and each write for company A moves only A's matching counts" do
@@ -191,7 +191,6 @@ RSpec.describe LiveHandoff do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe LiveHandoff do
   it "replay_verdict answers from receipt only for a byte-equal 2xx body and fails a replay that executed again" do
@@ -212,7 +211,6 @@ RSpec.describe LiveHandoff do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe LiveHandoff do
   context "live Timekeeping counts for two companies", :integrated_runtime, committed_data: true do
@@ -277,7 +275,6 @@ RSpec.describe LiveHandoff do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe LiveHandoff do
   # "Every query filters by that one company id (or its `company_ids` list); counts of two companies are never added together."
@@ -311,7 +308,6 @@ RSpec.describe LiveHandoff do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe LiveHandoff do
   # "then adding an entry, raising one entry's version, adding an audit row and adding a receipt for company A changes exactly the matching counts of A and leaves every count of company B unchanged."
@@ -352,7 +348,6 @@ RSpec.describe LiveHandoff do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe LiveHandoff do
   # "`TenantStateDigest.GROUPS` omits the audit tables and `legacy_create_receipts`, so these counts must stand on their own proof"
@@ -383,7 +378,6 @@ RSpec.describe LiveHandoff do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe LiveHandoff do
   # "a foreign-id check where the company has no rows of its own fails."
@@ -404,7 +398,6 @@ RSpec.describe LiveHandoff do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe LiveHandoff do
   # "It keeps the recorded path, Idempotency-Key and body, and replaces the `X-Auth-Email` and `X-Auth-Token` headers."
@@ -439,7 +432,6 @@ RSpec.describe LiveHandoff do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe LiveHandoff do
   # "Then read `generation-<n>/reconciliation.json` and require exactly both seeded company ids, each with `abort` false and `unlisted` empty, and `unassigned` empty."
@@ -459,9 +451,6 @@ RSpec.describe LiveHandoff do
   end
 end
 
-require "rails_helper"
-require "pg"
-require "securerandom"
 
 RSpec.describe LiveHandoff do
   context "live Timekeeping counts for two companies", :integrated_runtime, committed_data: true do
@@ -543,7 +532,6 @@ RSpec.describe LiveHandoff do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe "LiveHandoff" do
   it "reconciliation_failures passes a clean two-company report and fails each bad report shape" do
@@ -579,7 +567,6 @@ RSpec.describe "LiveHandoff" do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe "LiveHandoff" do
   it "foreign_id_failures fails a company with no rows of its own, including an empty company list, and passes clean rows" do
@@ -605,7 +592,6 @@ RSpec.describe "LiveHandoff" do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe "LiveHandoff" do
   it "replay_verdict refuses only exact table pairs and answers only byte-equal 2xx bodies" do
@@ -636,7 +622,6 @@ RSpec.describe "LiveHandoff" do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe "LiveHandoff" do
   it "refusal tables hold the exact status and body pairs each route renders" do
@@ -654,12 +639,11 @@ RSpec.describe "LiveHandoff" do
 
     # "404 is a refusal only in the cross-company table."
     expect(LiveHandoff::CROSS_COMPANY_REFUSALS).to include({ status: 404, body: { "reason" => "not_found" } })
-    expect(LiveHandoff::TIMEKEEPING_REFUSALS.map { |refusal| refusal[:status] }).not_to include(404)
-    expect(LiveHandoff::MONOLITH_REFUSALS.map { |refusal| refusal[:status] }).not_to include(404)
+    expect(LiveHandoff::TIMEKEEPING_REFUSALS.pluck(:status)).not_to include(404)
+    expect(LiveHandoff::MONOLITH_REFUSALS.pluck(:status)).not_to include(404)
   end
 end
 
-require "rails_helper"
 
 RSpec.describe "LiveHandoff" do
   it "web_replay_request keeps path, key and body and carries only the replaying company's credentials" do
@@ -695,7 +679,6 @@ RSpec.describe "LiveHandoff" do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe LiveHandoff do
   it "send_request returns the status and the exact response bytes, unparsed and binary" do
@@ -717,7 +700,6 @@ RSpec.describe LiveHandoff do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe LiveHandoff, type: :request do
   it "expected_web_reply equals the body the web controller rendered for a legacy create with an Idempotency-Key" do
@@ -743,7 +725,6 @@ RSpec.describe LiveHandoff, type: :request do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe LiveHandoff do
   it "foreign_id_failures fails a company whose only row lists no company at all" do
@@ -765,7 +746,6 @@ RSpec.describe LiveHandoff do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe LiveHandoff do
   it "reconciliation_failures rejects a null company abort, a missing unlisted and an extra company" do
@@ -789,7 +769,6 @@ RSpec.describe LiveHandoff do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe LiveHandoff do
   it "replay_verdict fails a non-JSON body, a refusal body with an extra key and a one-byte-different receipt reply without raising" do
@@ -812,7 +791,6 @@ RSpec.describe LiveHandoff do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe LiveHandoff do
   it "replay_verdict counts a 404 not_found only against the cross-company table" do
@@ -833,7 +811,6 @@ RSpec.describe LiveHandoff do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe LiveHandoff do
   it "web_replay_request drops the recorded company's Authorization and X-Auth headers and leaves the recording unchanged" do
@@ -864,7 +841,6 @@ RSpec.describe LiveHandoff do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe LiveHandoff do
   # "restore the integrations in `ensure`, even when a handoff raises."
@@ -897,7 +873,6 @@ RSpec.describe LiveHandoff do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe LiveHandoff do
   # The issue's meta case: "the expected web reply differs by one byte when the receipt note changes".
@@ -918,7 +893,6 @@ RSpec.describe LiveHandoff do
   end
 end
 
-require "rails_helper"
 
 RSpec.describe LiveHandoff do
   # "The live `tenant_counts` meta example carries `committed_data` and `:integrated_runtime` and follows the

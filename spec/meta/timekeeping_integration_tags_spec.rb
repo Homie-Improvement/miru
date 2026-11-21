@@ -257,91 +257,90 @@ RSpec.describe TimekeepingIntegrationTags do
   end
 
   context "more tests 2" do
-  it "accepts committed_data: true wrapped onto a second line on a group and on an example, and still flags a wrapped false" do
-    wrapped_group = <<~RUBY
-      RSpec.describe "relay", :integrated_runtime, :two_tenant_seed,
-                     committed_data: true do
-        it "inherits the wrapped tag" do
+    it "accepts committed_data: true wrapped onto a second line on a group and on an example, and still flags a wrapped false" do
+      wrapped_group = <<~RUBY
+        RSpec.describe "relay", :integrated_runtime, :two_tenant_seed,
+                       committed_data: true do
+          it "inherits the wrapped tag" do
+          end
         end
-      end
-    RUBY
-    wrapped_example = <<~RUBY
-      RSpec.describe "relay" do
-        it "carries a wrapped tag",
-           committed_data: true do
+      RUBY
+      wrapped_example = <<~RUBY
+        RSpec.describe "relay" do
+          it "carries a wrapped tag",
+             committed_data: true do
+          end
         end
-      end
-    RUBY
-    wrapped_false = <<~RUBY
-      RSpec.describe "relay", :integrated_runtime,
-                     committed_data: false do
-        it "is untagged" do
+      RUBY
+      wrapped_false = <<~RUBY
+        RSpec.describe "relay", :integrated_runtime,
+                       committed_data: false do
+          it "is untagged" do
+          end
         end
-      end
-    RUBY
+      RUBY
 
-    # "The tag meta spec (spec/meta/timekeeping_integration_tags_spec.rb) must accept `committed_data: true` even when it wraps onto a second line."
-    expect(described_class.violations("wrapped_group_spec.rb", wrapped_group)).to eq([])
-    expect(described_class.violations("wrapped_example_spec.rb", wrapped_example)).to eq([])
-    expect(described_class.violations("wrapped_false_spec.rb", wrapped_false).map { |v| [v.kind, v.line] })
-      .to eq([[:missing_committed_data, 3]])
-  end
+      # "The tag meta spec (spec/meta/timekeeping_integration_tags_spec.rb) must accept `committed_data: true` even when it wraps onto a second line."
+      expect(described_class.violations("wrapped_group_spec.rb", wrapped_group)).to eq([])
+      expect(described_class.violations("wrapped_example_spec.rb", wrapped_example)).to eq([])
+      expect(described_class.violations("wrapped_false_spec.rb", wrapped_false).map { |v| [v.kind, v.line] })
+        .to eq([[:missing_committed_data, 3]])
+    end
   end
 
   context "more tests 3" do
-  it "money guard and handoff sequence specs exist, carry committed_data, never load the handoff fakes, and run on the integrated runtime" do
-    paths = %w[money_guard_spec.rb handoff_sequence_spec.rb].map do |name|
-      Rails.root.join("spec/integration/timekeeping", name)
+    it "money guard and handoff sequence specs exist, carry committed_data, never load the handoff fakes, and run on the integrated runtime" do
+      paths = %w[money_guard_spec.rb handoff_sequence_spec.rb].map do |name|
+        Rails.root.join("spec/integration/timekeeping", name)
+      end
+
+      paths.each do |path|
+        expect(File).to exist(path), path.to_s
+        source = File.read(path)
+
+        # "Every example carries `committed_data` and no example loads spec/support/timekeeping/handoff_fakes.rb"
+        violations = described_class.violations(path.to_s, source)
+        expect(violations).to eq([]), violations.map { |v| "#{v.line} #{v.kind} #{v.detail}" }.join("\n")
+
+        # "Every live example here runs under the teardown queue ledger (`spec/support/timekeeping/queue_ledger.rb`), and the suite fails if a job from a non-dedicated queue ran"
+        # The ledger activates only when IntegratedRuntime.start runs, which the :integrated_runtime tag triggers.
+        expect(source).to include(":integrated_runtime"), path.to_s
+        expect(source).not_to include("TimekeepingLiveInstance"), path.to_s
+      end
     end
-
-    paths.each do |path|
-      expect(File).to exist(path), path.to_s
-      source = File.read(path)
-
-      # "Every example carries `committed_data` and no example loads spec/support/timekeeping/handoff_fakes.rb"
-      violations = described_class.violations(path.to_s, source)
-      expect(violations).to eq([]), violations.map { |v| "#{v.line} #{v.kind} #{v.detail}" }.join("\n")
-
-      # "Every live example here runs under the teardown queue ledger (`spec/support/timekeeping/queue_ledger.rb`), and the suite fails if a job from a non-dedicated queue ran"
-      # The ledger activates only when IntegratedRuntime.start runs, which the :integrated_runtime tag triggers.
-      expect(source).to include(":integrated_runtime"), path.to_s
-      expect(source).not_to include("TimekeepingLiveInstance"), path.to_s
-    end
-  end
   end
 
   context "more tests 4" do
-require "prism"
-  it "the live tenant_counts group in the live handoff meta spec carries integrated_runtime and committed_data and adds no reset of its own" do
-    path = Rails.root.join("spec/meta/timekeeping_live_handoff_spec.rb")
-    expect(File).to exist(path)
-    source = File.read(path)
+    it "the live tenant_counts group in the live handoff meta spec carries integrated_runtime and committed_data and adds no reset of its own" do
+      path = Rails.root.join("spec/meta/timekeeping_live_handoff_spec.rb")
+      expect(File).to exist(path)
+      source = File.read(path)
 
-    calls = []
-    pending_nodes = [Prism.parse(source).value]
-    until pending_nodes.empty?
-      node = pending_nodes.shift
-      calls << node if node.is_a?(Prism::CallNode)
-      pending_nodes.concat(node.compact_child_nodes)
-    end
-    live_groups = calls.select do |call|
-      %i[describe context].include?(call.name) &&
-        call.arguments&.arguments&.any? { |argument| argument.is_a?(Prism::SymbolNode) && argument.unescaped == "integrated_runtime" }
-    end
+      calls = []
+      pending_nodes = [Prism.parse(source).value]
+      until pending_nodes.empty?
+        node = pending_nodes.shift
+        calls << node if node.is_a?(Prism::CallNode)
+        pending_nodes.concat(node.compact_child_nodes)
+      end
+      live_groups = calls.select do |call|
+        %i[describe context].include?(call.name) &&
+          call.arguments&.arguments&.any? { |argument| argument.is_a?(Prism::SymbolNode) && argument.unescaped == "integrated_runtime" }
+      end
 
-    # "The live `tenant_counts` meta example carries `committed_data` and `:integrated_runtime` and follows the database reset rule, though it lives under `spec/meta`"
-    expect(live_groups).not_to be_empty
-    expect(live_groups.map(&:slice).join("\n")).to include("timekeeping_counts").or include("tenant_counts")
-    live_groups.each do |group|
-      expect(described_class.violations(path.to_s, group.slice)).to eq([])
-    end
+      # "The live `tenant_counts` meta example carries `committed_data` and `:integrated_runtime` and follows the database reset rule, though it lives under `spec/meta`"
+      expect(live_groups).not_to be_empty
+      expect(live_groups.map(&:slice).join("\n")).to include("timekeeping_counts").or include("tenant_counts")
+      live_groups.each do |group|
+        expect(described_class.violations(path.to_s, group.slice)).to eq([])
+      end
 
-    # "Every database reset these examples add calls `TestDatabaseCleanup.before_reset!` first or goes through `TimekeepingDatabaseReset.reset!`"
-    # A direct before_reset! outside timekeeping_database_reset.rb fails the reset-site scan, and a reset
-    # while the runtime is live raises, so the file adds none of these.
-    expect(source).not_to include("before_reset!")
-    expect(source).not_to match(/\bTRUNCATE\b/i)
-    expect(source).not_to include("db:prepare")
-  end
+      # "Every database reset these examples add calls `TestDatabaseCleanup.before_reset!` first or goes through `TimekeepingDatabaseReset.reset!`"
+      # A direct before_reset! outside timekeeping_database_reset.rb fails the reset-site scan, and a reset
+      # while the runtime is live raises, so the file adds none of these.
+      expect(source).not_to include("before_reset!")
+      expect(source).not_to match(/\bTRUNCATE\b/i)
+      expect(source).not_to include("db:prepare")
+    end
   end
 end
