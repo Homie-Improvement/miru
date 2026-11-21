@@ -1082,6 +1082,758 @@ RSpec.describe "Api::V1::TimesheetEntry legacy writes through the gateway", type
     expect(json_response["notice"]).to match("Timesheet deleted")
     expect(TimesheetEntry.find(entry.id).discarded_at).to be_present
   end
+
+  context "more tests 10", type: :request do
+  it "legacy update replay answers only the actor who committed it, and a colleague reusing the key is refused by the edit policy" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    admin = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    colleague = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user: colleague)
+    colleague.add_role :admin, company
+    entry = create(:timesheet_entry, user: admin, project:, bill_status: :unbilled, note: "Before")
+    path = api_v1_timesheet_entry_path(entry)
+    request_params = { project_id: project.id,
+                       timesheet_entry: { duration: 30, work_date: Date.current, note: "Billed now", bill_status: :billed } }
+    audits = -> { Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count }
+
+    sign_in admin
+    send_request :patch, path, params: request_params,
+                               headers: auth_headers(admin).merge("Idempotency-Key" => "legacy-actor-scope-key")
+    expect(response).to have_http_status(:ok)
+    first_answer = json_response.deep_dup
+    audits_after_first = audits.call
+
+    # "In the legacy store, a retried time-entry update that carries the same Idempotency-Key as an update this actor already committed answers the stored answer and writes nothing again: the entry is unchanged since the first answer and no second audit row is written, including when the first update made the entry one the edit policy refuses (for example billed)"
+    send_request :patch, path, params: request_params,
+                               headers: auth_headers(admin).merge("Idempotency-Key" => "legacy-actor-scope-key")
+    expect(response).to have_http_status(:ok)
+    expect(json_response).to eq(first_answer)
+
+    # The stored answer belongs to the actor who committed it; another actor sending the same key
+    # is a new request, so the edit policy refuses the now-billed entry.
+    sign_in colleague
+    send_request :patch, path, params: request_params,
+                               headers: auth_headers(colleague).merge("Idempotency-Key" => "legacy-actor-scope-key")
+    expect(response).to have_http_status(:forbidden)
+    expect(audits.call).to eq(audits_after_first)
+    expect(entry.reload.note).to eq("Billed now")
+  end
+  end
+
+  context "more tests 11", type: :request do
+  it "legacy update key reused against another entry answers 422 idempotency_key_reused and leaves that entry unchanged" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    admin = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    first_entry = create(:timesheet_entry, user: admin, project:, bill_status: :unbilled, note: "First")
+    second_entry = create(:timesheet_entry, user: admin, project:, bill_status: :unbilled, note: "Second")
+    request_params = { project_id: project.id,
+                       timesheet_entry: { duration: 30, work_date: Date.current, note: "Edited", bill_status: :unbilled } }
+    headers = auth_headers(admin).merge("Idempotency-Key" => "legacy-cross-entry-key")
+    sign_in admin
+
+    send_request :patch, api_v1_timesheet_entry_path(first_entry), params: request_params, headers: headers
+    expect(response).to have_http_status(:ok)
+
+    # A stored answer for one entry must never stand in for another entry: the key is
+    # refused as reused, so neither the stored copy is shown nor the second entry written.
+    send_request :patch, api_v1_timesheet_entry_path(second_entry), params: request_params, headers: headers
+
+    expect(response).to have_http_status(:unprocessable_content)
+    expect(json_response["reason"]).to eq("idempotency_key_reused")
+    expect(response.body).not_to include(first_entry.id.to_s + ",")
+    expect(second_entry.reload.note).to eq("Second")
+    expect(Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: second_entry.id, action: "update"))
+      .not_to exist
+  end
+  end
+
+  context "more tests 12", type: :request do
+  it "legacy billed update replays under its key while a new key or a changed body under the same key still cannot edit the billed entry" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    admin = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    entry = create(:timesheet_entry, user: admin, project:, bill_status: :unbilled, note: "Before")
+    path = api_v1_timesheet_entry_path(entry)
+    billed_params = { project_id: project.id,
+                      timesheet_entry: { duration: 30, work_date: Date.current, note: "Invoiced", bill_status: :billed } }
+    sign_in admin
+
+    send_request :patch, path, params: billed_params,
+                               headers: auth_headers(admin).merge("Idempotency-Key" => "legacy-billed-bypass-key")
+    expect(response).to have_http_status(:ok)
+    send_request :patch, path, params: billed_params,
+                               headers: auth_headers(admin).merge("Idempotency-Key" => "legacy-billed-bypass-key")
+    expect(response).to have_http_status(:ok)
+
+    changed_params = { project_id: project.id,
+                       timesheet_entry: { duration: 99, work_date: Date.current, note: "Changed after invoicing",
+                                          bill_status: :unbilled } }
+
+    # A known key must not open the billed entry to a different edit: same key, new body is refused as reused.
+    send_request :patch, path, params: changed_params,
+                               headers: auth_headers(admin).merge("Idempotency-Key" => "legacy-billed-bypass-key")
+    expect(response).to have_http_status(:unprocessable_content)
+    expect(json_response["reason"]).to eq("idempotency_key_reused")
+
+    # "A retry with a different key is still a new request"
+    send_request :patch, path, params: changed_params,
+                               headers: auth_headers(admin).merge("Idempotency-Key" => "legacy-billed-new-key")
+    expect(response).to have_http_status(:forbidden)
+
+    entry.reload
+    expect(entry.note).to eq("Invoiced")
+    expect(entry.duration).to eq(30)
+    expect(entry).to be_billed
+  end
+  end
+
+  context "more tests 13", type: :request do
+  it "legacy delete key reused against another company's entry id never answers success and discards nothing" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    admin = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    own_entry = create(:timesheet_entry, user: admin, project:, bill_status: :unbilled)
+    other_company = create(:company)
+    other_project = create(:project, billable: true, client: create(:client, company: other_company))
+    outsider = create(:user, current_workspace_id: other_company.id)
+    create(:employment, company: other_company, user: outsider)
+    foreign_entry = create(:timesheet_entry, user: outsider, project: other_project, bill_status: :unbilled)
+    headers = auth_headers(admin).merge("Idempotency-Key" => "legacy-foreign-delete-key")
+    sign_in admin
+
+    send_request :delete, api_v1_timesheet_entry_path(own_entry), headers: headers
+    expect(response).to be_successful
+
+    # "In the legacy store, a retried delete that carries the same Idempotency-Key as a delete this actor already committed answers success from the stored answer, not 404, and discards nothing else"
+    send_request :delete, api_v1_timesheet_entry_path(own_entry), headers: headers
+    expect(response).to have_http_status(:ok)
+
+    # A stored delete answer is bound to the entry it deleted: the same key sent for another
+    # company's id is refused as reused, never reported as a delete that did not happen.
+    send_request :delete, api_v1_timesheet_entry_path(foreign_entry), headers: headers
+    expect(response).to have_http_status(:unprocessable_content)
+    expect(json_response["reason"]).to eq("idempotency_key_reused")
+    expect(foreign_entry.reload.discarded_at).to be_nil
+  end
+  end
+
+  context "more tests 14", type: :request do
+  # "In the legacy store, a retried time-entry update that carries the same Idempotency-Key as an update this actor already committed answers the stored answer and writes nothing again: the entry is unchanged since the first answer and no second audit row is written, including when the first update made the entry one the edit policy refuses (for example billed)"
+  it "replays a committed legacy update to billed retried with the same Idempotency-Key, leaving the entry and its audit rows unchanged" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    entry = create(:timesheet_entry, user:, project:, bill_status: :unbilled)
+    sign_in user
+    headers = auth_headers(user).merge("Idempotency-Key" => "legacy-update-billed-retry-1")
+    params = { project_id: project.id,
+               timesheet_entry: { duration: 45, work_date: Date.current, note: "Billed edit", bill_status: :billed } }
+    audit_count = -> { Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count }
+
+    send_request :patch, api_v1_timesheet_entry_path(entry), params:, headers: headers
+    expect(response).to have_http_status(:ok)
+    first_response = json_response.deep_dup
+    entry_after_first = entry.reload.attributes
+    audits_after_first = audit_count.call
+
+    send_request :patch, api_v1_timesheet_entry_path(entry), params:, headers: headers
+
+    expect(response).to have_http_status(:ok)
+    expect(json_response).to eq(first_response)
+    expect(entry.reload.attributes).to eq(entry_after_first)
+    expect(entry.bill_status).to eq("billed")
+    expect(audit_count.call).to eq(audits_after_first)
+  end
+  end
+
+  context "more tests 15", type: :request do
+  # "In the legacy store, a retried delete that carries the same Idempotency-Key as a delete this actor already committed answers success from the stored answer, not 404, and discards nothing else"
+  it "replays a committed legacy DELETE retried with the same Idempotency-Key as success and discards nothing else" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    entry = create(:timesheet_entry, user:, project:, bill_status: :unbilled)
+    neighbour = create(:timesheet_entry, user:, project:, bill_status: :unbilled)
+    sign_in user
+    headers = auth_headers(user).merge("Idempotency-Key" => "legacy-delete-retry-1")
+    audit_count = -> { Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count }
+
+    send_request :delete, api_v1_timesheet_entry_path(entry), headers: headers
+    expect(response).to have_http_status(:ok)
+    discarded_at = TimesheetEntry.find(entry.id).discarded_at
+    expect(discarded_at).to be_present
+    audits_after_first = audit_count.call
+
+    send_request :delete, api_v1_timesheet_entry_path(entry), headers: headers
+
+    expect(response).to have_http_status(:ok)
+    expect(json_response["notice"]).to match("Timesheet deleted")
+    expect(TimesheetEntry.find(entry.id).discarded_at).to eq(discarded_at)
+    expect(audit_count.call).to eq(audits_after_first)
+    expect(TimesheetEntry.find(neighbour.id).discarded_at).to be_nil
+  end
+  end
+
+  context "more tests 16", type: :request do
+  # "A retry with a different key is still a new request"
+  it "treats a legacy DELETE retried under a different Idempotency-Key as a new request that answers 404 and writes nothing" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    entry = create(:timesheet_entry, user:, project:, bill_status: :unbilled)
+    sign_in user
+    audit_count = -> { Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count }
+
+    send_request :delete, api_v1_timesheet_entry_path(entry),
+                 headers: auth_headers(user).merge("Idempotency-Key" => "legacy-delete-first-key")
+    expect(response).to have_http_status(:ok)
+    discarded_at = TimesheetEntry.find(entry.id).discarded_at
+    audits_after_first = audit_count.call
+
+    send_request :delete, api_v1_timesheet_entry_path(entry),
+                 headers: auth_headers(user).merge("Idempotency-Key" => "legacy-delete-other-key")
+
+    expect(response).to have_http_status(:not_found)
+    expect(TimesheetEntry.find(entry.id).discarded_at).to eq(discarded_at)
+    expect(audit_count.call).to eq(audits_after_first)
+  end
+  end
+
+  context "more tests 17", type: :request do
+  # "In the legacy store, a retried time-entry update that carries the same Idempotency-Key as an update this actor already committed answers the stored answer and writes nothing again: the entry is unchanged since the first answer and no second audit row is written, including when the first update made the entry one the edit policy refuses (for example billed)"
+  it "replays a committed legacy update retried with the same Idempotency-Key after its project was archived" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    entry = create(:timesheet_entry, user:, project:, bill_status: :unbilled)
+    sign_in user
+    headers = auth_headers(user).merge("Idempotency-Key" => "legacy-update-archived-project-1")
+    params = { project_id: project.id,
+               timesheet_entry: { duration: 30, work_date: Date.current, note: "Before archive", bill_status: :unbilled } }
+    audit_count = -> { Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count }
+
+    send_request :patch, api_v1_timesheet_entry_path(entry), params:, headers: headers
+    expect(response).to have_http_status(:ok)
+    first_response = json_response.deep_dup
+    entry_after_first = entry.reload.attributes
+    audits_after_first = audit_count.call
+
+    project.discard
+
+    send_request :patch, api_v1_timesheet_entry_path(entry), params:, headers: headers
+
+    expect(response).to have_http_status(:ok)
+    expect(json_response).to eq(first_response)
+    expect(entry.reload.attributes).to eq(entry_after_first)
+    expect(audit_count.call).to eq(audits_after_first)
+  end
+  end
+
+  context "more tests 18", type: :request do
+  it "replays a committed legacy update to billed retried with the same Idempotency-Key, writing nothing more" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    entry = create(:timesheet_entry, user:, project:, bill_status: :unbilled, note: "Before")
+    sign_in user
+    path = api_v1_timesheet_entry_path(entry)
+    params = { project_id: project.id,
+               timesheet_entry: { duration: 30, work_date: Date.current, note: "Replay billed", bill_status: :billed } }
+    headers = auth_headers(user).merge("Idempotency-Key" => "legacy-update-billed-1")
+    audits = -> { Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count }
+
+    send_request :patch, path, params:, headers: headers
+    expect(response).to have_http_status(:ok)
+    first_response = json_response.deep_dup
+    entry_after_first = entry.reload.attributes
+    audits_after_first = audits.call
+
+    # "In the legacy store, a retried time-entry update that carries the same Idempotency-Key as an update this actor already committed answers the stored answer and writes nothing again: the entry is unchanged since the first answer and no second audit row is written, including when the first update made the entry one the edit policy refuses (for example billed)"
+    send_request :patch, path, params:, headers: headers
+
+    expect(response).to have_http_status(:ok)
+    expect(json_response).to eq(first_response)
+    expect(entry.reload.attributes).to eq(entry_after_first)
+    expect(entry.bill_status).to eq("billed")
+    expect(audits.call).to eq(audits_after_first)
+  end
+  end
+
+  context "more tests 19", type: :request do
+  it "replays a committed unbilled legacy update retried with the same Idempotency-Key without a second audit row" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    entry = create(:timesheet_entry, user:, project:, bill_status: :unbilled, note: "Before")
+    sign_in user
+    path = api_v1_timesheet_entry_path(entry)
+    params = { project_id: project.id,
+               timesheet_entry: { duration: 45, work_date: Date.current, note: "Replay unbilled", bill_status: :unbilled } }
+    headers = auth_headers(user).merge("Idempotency-Key" => "legacy-update-unbilled-1")
+    audits = -> { Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count }
+    audits_before = audits.call
+
+    send_request :patch, path, params:, headers: headers
+    expect(response).to have_http_status(:ok)
+    first_response = json_response.deep_dup
+    updated_at_after_first = entry.reload.updated_at
+
+    # "A retry ... answers the stored answer and writes nothing again: the entry is unchanged since the first answer and no second audit row is written"
+    send_request :patch, path, params:, headers: headers
+
+    expect(response).to have_http_status(:ok)
+    expect(json_response).to eq(first_response)
+    expect(entry.reload.updated_at).to eq(updated_at_after_first)
+    expect(entry.note).to eq("Replay unbilled")
+    expect(audits.call - audits_before).to eq(1)
+  end
+  end
+
+  context "more tests 20", type: :request do
+  it "answers 403 to a legacy update of a now-billed entry under a different Idempotency-Key and writes nothing" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    entry = create(:timesheet_entry, user:, project:, bill_status: :unbilled, note: "Before")
+    sign_in user
+    path = api_v1_timesheet_entry_path(entry)
+    params = { project_id: project.id,
+               timesheet_entry: { duration: 30, work_date: Date.current, note: "Billed now", bill_status: :billed } }
+    audits = -> { Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count }
+
+    send_request :patch, path, params:, headers: auth_headers(user).merge("Idempotency-Key" => "legacy-billed-key-a")
+    expect(response).to have_http_status(:ok)
+    entry_after_first = entry.reload.attributes
+    audits_after_first = audits.call
+
+    # "A retry with a different key is still a new request"
+    send_request :patch, path, params:, headers: auth_headers(user).merge("Idempotency-Key" => "legacy-billed-key-b")
+
+    expect(response).to have_http_status(:forbidden)
+    expect(entry.reload.attributes).to eq(entry_after_first)
+    expect(audits.call).to eq(audits_after_first)
+  end
+  end
+
+  context "more tests 21", type: :request do
+  it "replays a committed legacy update retried with the same Idempotency-Key after its project was archived" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    entry = create(:timesheet_entry, user:, project:, bill_status: :unbilled, note: "Before")
+    sign_in user
+    path = api_v1_timesheet_entry_path(entry)
+    params = { project_id: project.id,
+               timesheet_entry: { duration: 20, work_date: Date.current, note: "Before archive", bill_status: :unbilled } }
+    headers = auth_headers(user).merge("Idempotency-Key" => "legacy-update-archived-1")
+    audits = -> { Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count }
+
+    send_request :patch, path, params:, headers: headers
+    expect(response).to have_http_status(:ok)
+    first_response = json_response.deep_dup
+    audits_after_first = audits.call
+    project.discard
+
+    # "a retried time-entry update that carries the same Idempotency-Key as an update this actor already committed answers the stored answer and writes nothing again"
+    send_request :patch, path, params:, headers: headers
+
+    expect(response).to have_http_status(:ok)
+    expect(json_response).to eq(first_response)
+    expect(audits.call).to eq(audits_after_first)
+  end
+  end
+
+  context "more tests 22", type: :request do
+  it "writes a legacy update sent twice without an Idempotency-Key twice, as before" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    entry = create(:timesheet_entry, user:, project:, bill_status: :unbilled, note: "Before")
+    sign_in user
+    path = api_v1_timesheet_entry_path(entry)
+    audits = -> { Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count }
+    audits_before = audits.call
+
+    send_request :patch, path, params: { project_id: project.id,
+                                         timesheet_entry: { duration: 20, work_date: Date.current, note: "First" } },
+                 headers: auth_headers(user)
+    expect(response).to have_http_status(:ok)
+    send_request :patch, path, params: { project_id: project.id,
+                                         timesheet_entry: { duration: 25, work_date: Date.current, note: "Second" } },
+                 headers: auth_headers(user)
+
+    expect(response).to have_http_status(:ok)
+    expect(entry.reload.note).to eq("Second")
+    expect(audits.call - audits_before).to eq(2)
+  end
+  end
+
+  context "more tests 23", type: :request do
+  it "replays a legacy DELETE retried with the same Idempotency-Key as success and discards the entry once" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    entry = create(:timesheet_entry, user:, project:, bill_status: :unbilled)
+    other_entry = create(:timesheet_entry, user:, project:, bill_status: :unbilled)
+    sign_in user
+    headers = auth_headers(user).merge("Idempotency-Key" => "legacy-delete-retry-1")
+    audits = -> { Audited::Audit.where(auditable_type: "TimesheetEntry").count }
+
+    send_request :delete, api_v1_timesheet_entry_path(entry), headers: headers
+    expect(response).to have_http_status(:ok)
+    discarded_at = TimesheetEntry.find(entry.id).discarded_at
+    expect(discarded_at).to be_present
+    audits_after_first = audits.call
+
+    # "In the legacy store, a retried delete that carries the same Idempotency-Key as a delete this actor already committed answers success from the stored answer, not 404, and discards nothing else"
+    send_request :delete, api_v1_timesheet_entry_path(entry), headers: headers
+
+    expect(response).to have_http_status(:ok)
+    expect(json_response["notice"]).to match("Timesheet deleted")
+    expect(TimesheetEntry.find(entry.id).discarded_at).to eq(discarded_at)
+    expect(TimesheetEntry.find(other_entry.id).discarded_at).to be_nil
+    expect(audits.call).to eq(audits_after_first)
+  end
+  end
+
+  context "more tests 24", type: :request do
+  it "answers 404 to a legacy DELETE of a discarded entry under a different Idempotency-Key and writes nothing" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    entry = create(:timesheet_entry, user:, project:, bill_status: :unbilled)
+    sign_in user
+    audits = -> { Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count }
+
+    send_request :delete, api_v1_timesheet_entry_path(entry),
+                 headers: auth_headers(user).merge("Idempotency-Key" => "legacy-delete-first-key")
+    expect(response).to have_http_status(:ok)
+    discarded_at = TimesheetEntry.find(entry.id).discarded_at
+    audits_after_first = audits.call
+
+    # "A retry with a different key is still a new request"
+    send_request :delete, api_v1_timesheet_entry_path(entry),
+                 headers: auth_headers(user).merge("Idempotency-Key" => "legacy-delete-other-key")
+
+    expect(response).to have_http_status(:not_found)
+    expect(TimesheetEntry.find(entry.id).discarded_at).to eq(discarded_at)
+    expect(audits.call).to eq(audits_after_first)
+  end
+  end
+
+  context "more tests 25", type: :request do
+  it "replays an employee's legacy DELETE retried with the same Idempotency-Key after the edit window closed" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    employee = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user: employee)
+    employee.add_role :employee, company
+    last_editable_day = company.timesheet_edit_days.days.ago.to_date
+    entry = create(:timesheet_entry, user: employee, project:, bill_status: :unbilled, work_date: last_editable_day)
+    sign_in employee
+    headers = auth_headers(employee).merge("Idempotency-Key" => "legacy-delete-deadline-1")
+
+    send_request :delete, api_v1_timesheet_entry_path(entry), headers: headers
+    expect(response).to have_http_status(:ok)
+    discarded_at = TimesheetEntry.find(entry.id).discarded_at
+
+    # "a retried delete that carries the same Idempotency-Key as a delete this actor already committed answers success from the stored answer, not 404, and discards nothing else"
+    travel_to(1.day.from_now) do
+      send_request :delete, api_v1_timesheet_entry_path(entry), headers: headers
+    end
+
+    expect(response).to have_http_status(:ok)
+    expect(TimesheetEntry.find(entry.id).discarded_at).to eq(discarded_at)
+  end
+  end
+
+  context "more tests 26", type: :request do
+  it "refuses a legacy PATCH that reuses a committed update's Idempotency-Key with a different body and writes nothing" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    entry = create(:timesheet_entry, user:, project:, bill_status: :unbilled)
+    sign_in user
+    headers = auth_headers(user).merge("Idempotency-Key" => "legacy-update-reused-key")
+    path = api_v1_timesheet_entry_path(entry)
+
+    send_request :patch, path, params: {
+      project_id: project.id,
+      timesheet_entry: { duration: 45, work_date: Date.current, note: "First body", bill_status: :unbilled }
+    }, headers: headers
+    expect(response).to have_http_status(:ok)
+    audits_after_first = Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count
+
+    # "In the legacy store, a retried time-entry update that carries the same Idempotency-Key as an update this
+    # actor already committed answers the stored answer and writes nothing again"; a different body under that
+    # key is not that retry, so it must neither replay nor apply.
+    send_request :patch, path, params: {
+      project_id: project.id,
+      timesheet_entry: { duration: 15, work_date: Date.current, note: "Second body", bill_status: :unbilled }
+    }, headers: headers
+
+    expect(response).to have_http_status(:unprocessable_entity)
+    expect(json_response["reason"]).to eq("idempotency_key_reused")
+    entry.reload
+    expect(entry.note).to eq("First body")
+    expect(entry.duration).to eq(45)
+    expect(Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count).to eq(audits_after_first)
+  end
+  end
+
+  context "more tests 27", type: :request do
+  it "never answers a legacy PATCH for another entry with the entry a reused Idempotency-Key first updated" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    first_entry = create(:timesheet_entry, user:, project:, bill_status: :unbilled, note: "First original")
+    other_entry = create(:timesheet_entry, user:, project:, bill_status: :unbilled, note: "Other original")
+    sign_in user
+    headers = auth_headers(user).merge("Idempotency-Key" => "legacy-update-cross-entry-key")
+    params = {
+      project_id: project.id,
+      timesheet_entry: { duration: 45, work_date: Date.current, note: "Same body", bill_status: :unbilled }
+    }
+
+    send_request :patch, api_v1_timesheet_entry_path(first_entry), params:, headers: headers
+    expect(response).to have_http_status(:ok)
+    other_audits = Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: other_entry.id).count
+
+    send_request :patch, api_v1_timesheet_entry_path(other_entry), params:, headers: headers
+
+    # "answers the stored answer and writes nothing again" holds only for a retry of the same update; the stored
+    # answer for one entry must never stand in for a different entry.
+    expect(response).to have_http_status(:unprocessable_entity)
+    expect(json_response["reason"]).to eq("idempotency_key_reused")
+    expect(other_entry.reload.note).to eq("Other original")
+    expect(Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: other_entry.id).count).to eq(other_audits)
+  end
+  end
+
+  context "more tests 28", type: :request do
+  it "refuses a legacy PATCH of an entry made billed when it is sent under a new Idempotency-Key" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    entry = create(:timesheet_entry, user:, project:, bill_status: :unbilled)
+    sign_in user
+    params = {
+      project_id: project.id,
+      timesheet_entry: { duration: 30, work_date: Date.current, note: "Billed now", bill_status: :billed }
+    }
+
+    send_request :patch, api_v1_timesheet_entry_path(entry), params:,
+      headers: auth_headers(user).merge("Idempotency-Key" => "legacy-billed-first-key")
+    expect(response).to have_http_status(:ok)
+    expect(entry.reload).to be_billed
+    audits_after_first = Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count
+
+    # "A retry with a different key is still a new request", so the edit policy still refuses the billed entry.
+    send_request :patch, api_v1_timesheet_entry_path(entry), params: {
+      project_id: project.id,
+      timesheet_entry: { duration: 10, work_date: Date.current, note: "Edit after billing", bill_status: :billed }
+    }, headers: auth_headers(user).merge("Idempotency-Key" => "legacy-billed-second-key")
+
+    expect(response).to have_http_status(:forbidden)
+    expect(entry.reload.note).to eq("Billed now")
+    expect(Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count).to eq(audits_after_first)
+  end
+  end
+
+  context "more tests 29", type: :request do
+  it "replays the first legacy update answer after a later edit and leaves that later edit in place" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    entry = create(:timesheet_entry, user:, project:, bill_status: :unbilled)
+    sign_in user
+    path = api_v1_timesheet_entry_path(entry)
+    retried_params = {
+      project_id: project.id,
+      timesheet_entry: { duration: 45, work_date: Date.current, note: "First edit", bill_status: :unbilled }
+    }
+    retried_headers = auth_headers(user).merge("Idempotency-Key" => "legacy-update-before-later-edit")
+
+    send_request :patch, path, params: retried_params, headers: retried_headers
+    expect(response).to have_http_status(:ok)
+    first_answer = json_response.deep_dup
+
+    send_request :patch, path, params: {
+      project_id: project.id,
+      timesheet_entry: { duration: 20, work_date: Date.current, note: "Later edit", bill_status: :unbilled }
+    }, headers: auth_headers(user).merge("Idempotency-Key" => "legacy-update-later-edit")
+    expect(response).to have_http_status(:ok)
+    audits_after_later_edit = Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count
+
+    # "answers the stored answer and writes nothing again": the late retry must not re-apply its body over the
+    # later edit, and its answer is the first answer, not the live row.
+    send_request :patch, path, params: retried_params, headers: retried_headers
+
+    expect(response).to have_http_status(:ok)
+    expect(json_response).to eq(first_answer)
+    expect(entry.reload.note).to eq("Later edit")
+    expect(Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count)
+      .to eq(audits_after_later_edit)
+  end
+  end
+
+  context "more tests 30", type: :request do
+  it "replays a committed legacy update retried after its project was archived instead of answering 404" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    entry = create(:timesheet_entry, user:, project:, bill_status: :unbilled)
+    sign_in user
+    path = api_v1_timesheet_entry_path(entry)
+    params = {
+      project_id: project.id,
+      timesheet_entry: { duration: 45, work_date: Date.current, note: "Before archive", bill_status: :unbilled }
+    }
+    headers = auth_headers(user).merge("Idempotency-Key" => "legacy-update-archived-project")
+
+    send_request :patch, path, params:, headers: headers
+    expect(response).to have_http_status(:ok)
+    first_answer = json_response.deep_dup
+    audits_after_first = Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count
+
+    project.discard
+
+    # "In the legacy store, a retried time-entry update that carries the same Idempotency-Key as an update this
+    # actor already committed answers the stored answer and writes nothing again"
+    send_request :patch, path, params:, headers: headers
+
+    expect(response).to have_http_status(:ok)
+    expect(json_response).to eq(first_answer)
+    expect(Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count).to eq(audits_after_first)
+  end
+  end
+
+  context "more tests 31", type: :request do
+  it "answers 404 to a legacy DELETE of a discarded entry under a new Idempotency-Key and writes nothing" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role :admin, company
+    entry = create(:timesheet_entry, user:, project:, bill_status: :unbilled)
+    sign_in user
+
+    send_request :delete, api_v1_timesheet_entry_path(entry),
+      headers: auth_headers(user).merge("Idempotency-Key" => "legacy-delete-first-key")
+    expect(response).to have_http_status(:ok)
+    discarded_at = TimesheetEntry.find(entry.id).discarded_at
+    audits_after_first = Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count
+
+    # "A retry with a different key is still a new request": only the key that wrote the delete has a stored answer.
+    send_request :delete, api_v1_timesheet_entry_path(entry),
+      headers: auth_headers(user).merge("Idempotency-Key" => "legacy-delete-other-key")
+
+    expect(response).to have_http_status(:not_found)
+    expect(TimesheetEntry.find(entry.id).discarded_at).to eq(discarded_at)
+    expect(Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count).to eq(audits_after_first)
+  end
+  end
+
+  context "more tests 32", type: :request do
+  it "never replays one actor's legacy DELETE for another actor who sends the same Idempotency-Key" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    first_admin = create(:user, current_workspace_id: company.id)
+    second_admin = create(:user, current_workspace_id: company.id)
+    [first_admin, second_admin].each do |admin|
+      create(:employment, company:, user: admin)
+      admin.add_role :admin, company
+    end
+    entry = create(:timesheet_entry, user: first_admin, project:, bill_status: :unbilled)
+
+    sign_in first_admin
+    send_request :delete, api_v1_timesheet_entry_path(entry),
+      headers: auth_headers(first_admin).merge("Idempotency-Key" => "legacy-delete-shared-key")
+    expect(response).to have_http_status(:ok)
+    sign_out first_admin
+
+    # "a retried delete that carries the same Idempotency-Key as a delete this actor already committed answers
+    # success from the stored answer": the receipt is this actor's, so another actor's request is not its retry.
+    sign_in second_admin
+    send_request :delete, api_v1_timesheet_entry_path(entry),
+      headers: auth_headers(second_admin).merge("Idempotency-Key" => "legacy-delete-shared-key")
+
+    expect(response).to have_http_status(:not_found)
+  end
+  end
+
+  context "more tests 33", type: :request do
+  it "replays an employee's legacy DELETE retried after the edit deadline passed as success" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    employee = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user: employee)
+    employee.add_role :employee, company
+    last_editable_day = company.timesheet_edit_days.days.ago.to_date
+    entry = create(:timesheet_entry, user: employee, project:, bill_status: :unbilled, work_date: last_editable_day)
+    sign_in employee
+    headers = auth_headers(employee).merge("Idempotency-Key" => "legacy-delete-past-deadline")
+
+    send_request :delete, api_v1_timesheet_entry_path(entry), headers: headers
+    expect(response).to have_http_status(:ok)
+    discarded_at = TimesheetEntry.find(entry.id).discarded_at
+    audits_after_first = Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count
+
+    # "In the legacy store, a retried delete that carries the same Idempotency-Key as a delete this actor already
+    # committed answers success from the stored answer, not 404, and discards nothing else"; the edit deadline
+    # passing between the attempts must not turn the committed delete into a refusal.
+    # Just past midnight closes the edit window while the 24-hour receipt is still unexpired.
+    travel_to(Time.current.tomorrow.beginning_of_day + 1.minute) do
+      send_request :delete, api_v1_timesheet_entry_path(entry), headers: headers
+    end
+
+    expect(response).to have_http_status(:ok)
+    expect(TimesheetEntry.find(entry.id).discarded_at).to eq(discarded_at)
+    expect(Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count).to eq(audits_after_first)
+  end
+  end
 end
 
 RSpec.describe "Api::V1::TimesheetEntry gateway handoff refusal on update", type: :request do

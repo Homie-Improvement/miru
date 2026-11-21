@@ -38,23 +38,26 @@ class Api::V1::TimesheetEntryController < Api::V1::ApplicationController
   end
 
   def update
+    # The project is resolved only for a write, so a retry of a committed
+    # update replays even after the project was archived.
     timesheet_entry = entry_gateway.update(
-      entry_id: params[:id], project: current_project, attributes: timesheet_entry_params.to_h,
+      entry_id: params[:id], requested_project_id: params[:project_id], attributes: timesheet_entry_params.to_h,
       authorize: method(:authorize), authorize_replay: method(:authorize_replayed_entry)
-    )
+    ) { current_project }
     render json: { notice: I18n.t("timesheet_entry.update.message"), entry: timesheet_entry.snippet }, status: 200
   end
 
   def destroy
-    entry_gateway.destroy(entry_id: params[:id], authorize: method(:authorize))
+    entry_gateway.destroy(entry_id: params[:id], authorize: method(:authorize),
+                          authorize_replay: method(:authorize_replayed_entry))
     render json: { notice: I18n.t("timesheet_entry.destroy.message") }
   end
 
   private
 
-    # A replayed update returns an edit already committed, so reading it back
-    # needs only show?: the edit policy may refuse the entry the edit made,
-    # such as a billed one.
+    # A replayed update or delete returns a write already committed, so
+    # reading it back needs only show?: the edit policy may refuse the entry
+    # by now, such as one the edit billed or one past its edit window.
     def authorize_replayed_entry(entry)
       authorize(entry, :show?)
     end

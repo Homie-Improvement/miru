@@ -44,6 +44,292 @@ RSpec.describe Timekeeping::Gateway do
     audit = Timekeeping::LocalOwner::AuditRow.find_by(entry_id: entry.id)
     expect([audit.actor_type, audit.actor_id]).to eq(["user", prepared_user.id])
   end
+
+  context "more tests 10" do
+  it "a legacy update sent by another user of the company with the same key and body is written, not replayed from the first user's receipt" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    first_admin, second_admin = Array.new(2) do
+      create(:user, current_workspace_id: company.id).tap do |user|
+        create(:employment, company:, user:)
+        user.add_role :admin, company
+      end
+    end
+    entry = create(:timesheet_entry, user: first_admin, project:, bill_status: :unbilled, note: "Before")
+    attributes = { duration: 30, work_date: Date.current, note: "Shared edit", bill_status: "unbilled" }
+    update_as = lambda do |actor, request_id|
+      context = Timekeeping::WriteContext.new(company:, actor:, actor_kind: "user", request_id:,
+                                              idempotency_key: "tenant-shared-update-key")
+      described_class.new(context:).update(entry_id: entry.id, project:, attributes:, authorize: ->(_entry) {})
+    end
+
+    update_as.call(first_admin, "req-tenant-update-1")
+    # A change made after the first answer, so a replay of the first user's receipt would leave it in place.
+    entry.update_columns(note: "Changed elsewhere")
+
+    # "In the legacy store, a retried time-entry update that carries the same Idempotency-Key as an update this actor already committed answers the stored answer and writes nothing again"
+    # The second user is not "this actor", so the request must be written as a new update.
+    answered = update_as.call(second_admin, "req-tenant-update-2")
+
+    expect(answered.note).to eq("Shared edit")
+    expect(entry.reload.note).to eq("Shared edit")
+    expect(Timekeeping::LegacyEntryWriteReceipt.where(company_id: company.id, operation: "update").pluck(:actor_id))
+      .to contain_exactly(first_admin.id, second_admin.id)
+  end
+  end
+
+  context "more tests 11" do
+  it "the same user's legacy delete key reused in another company discards that company's entry instead of replaying or refusing" do
+    company = create(:company)
+    other_company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    other_project = create(:project, billable: true, client: create(:client, company: other_company))
+    user = create(:user, current_workspace_id: company.id)
+    [company, other_company].each do |member_company|
+      create(:employment, company: member_company, user:)
+      user.add_role :admin, member_company
+    end
+    entry = create(:timesheet_entry, user:, project:, bill_status: :unbilled)
+    other_entry = create(:timesheet_entry, user:, project: other_project, bill_status: :unbilled)
+    destroy_in = lambda do |actor_company, target, request_id|
+      context = Timekeeping::WriteContext.new(company: actor_company, actor: user, actor_kind: "user", request_id:,
+                                              idempotency_key: "tenant-shared-delete-key")
+      described_class.new(context:).destroy(entry_id: target.id, authorize: ->(_entry) {})
+    end
+
+    expect(destroy_in.call(company, entry, "req-tenant-delete-1")).to be(true)
+    expect(destroy_in.call(other_company, other_entry, "req-tenant-delete-2")).to be(true)
+
+    expect(TimesheetEntry.find(entry.id).discarded_at).to be_present
+    expect(TimesheetEntry.find(other_entry.id).discarded_at).to be_present
+    expect(Timekeeping::LegacyEntryWriteReceipt.where(actor_id: user.id, operation: "destroy").pluck(:company_id))
+      .to contain_exactly(company.id, other_company.id)
+  end
+  end
+
+  context "more tests 12" do
+  it "a legacy delete retried from another company with the first company's entry id and key answers not found, never success" do
+    company = create(:company)
+    other_company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    owner, outsider = [company, other_company].map do |member_company|
+      create(:user, current_workspace_id: member_company.id).tap do |user|
+        create(:employment, company: member_company, user:)
+        user.add_role :admin, member_company
+      end
+    end
+    entry = create(:timesheet_entry, user: owner, project:, bill_status: :unbilled)
+    context_for = lambda do |actor_company, actor, request_id|
+      Timekeeping::WriteContext.new(company: actor_company, actor:, actor_kind: "user", request_id:,
+                                    idempotency_key: "tenant-foreign-delete-key")
+    end
+
+    described_class.new(context: context_for.call(company, owner, "req-foreign-delete-1"))
+      .destroy(entry_id: entry.id, authorize: ->(_entry) {})
+    discarded_at = TimesheetEntry.find(entry.id).discarded_at
+
+    # A receipt stored in one company never answers a request made in another.
+    expect do
+      described_class.new(context: context_for.call(other_company, outsider, "req-foreign-delete-2"))
+        .destroy(entry_id: entry.id, authorize: ->(_entry) {})
+    end.to raise_error(ActiveRecord::RecordNotFound)
+
+    expect(TimesheetEntry.find(entry.id).discarded_at).to eq(discarded_at)
+    expect(Timekeeping::LegacyEntryWriteReceipt.where(timesheet_entry_id: entry.id).pluck(:company_id))
+      .to eq([company.id])
+  end
+  end
+
+  context "more tests 13" do
+  it "a legacy update retried from another company with the first company's entry id, key and body answers not found and returns no stored entry" do
+    company = create(:company)
+    other_company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    owner, outsider = [company, other_company].map do |member_company|
+      create(:user, current_workspace_id: member_company.id).tap do |user|
+        create(:employment, company: member_company, user:)
+        user.add_role :admin, member_company
+      end
+    end
+    entry = create(:timesheet_entry, user: owner, project:, bill_status: :unbilled, note: "Before")
+    attributes = { duration: 30, work_date: Date.current, note: "Owner edit", bill_status: "unbilled" }
+    context_for = lambda do |actor_company, actor, request_id|
+      Timekeeping::WriteContext.new(company: actor_company, actor:, actor_kind: "user", request_id:,
+                                    idempotency_key: "tenant-foreign-update-key")
+    end
+
+    described_class.new(context: context_for.call(company, owner, "req-foreign-update-1"))
+      .update(entry_id: entry.id, project:, attributes:, authorize: ->(_entry) {})
+
+    # The outsider names the first company's project too, so only the company in the receipt scope can refuse it.
+    expect do
+      described_class.new(context: context_for.call(other_company, outsider, "req-foreign-update-2"))
+        .update(entry_id: entry.id, project:, attributes:, authorize: ->(_entry) {})
+    end.to raise_error(ActiveRecord::RecordNotFound)
+
+    expect(entry.reload.note).to eq("Owner edit")
+    expect(Timekeeping::LegacyEntryWriteReceipt.where(timesheet_entry_id: entry.id, operation: "update")
+      .pluck(:company_id)).to eq([company.id])
+  end
+  end
+
+  context "more tests 14" do
+  it "gateway replays a committed legacy update retried with the same key from its stored answer without the edit policy" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    admin = create(:user, current_workspace_id: company.id).tap do |user|
+      create(:employment, company:, user:)
+      user.add_role :admin, company
+    end
+    entry = create(:timesheet_entry, user: admin, project:, bill_status: :unbilled, note: "Before")
+    attributes = { duration: 30, work_date: Date.current, note: "Replayed edit", bill_status: "billed" }
+    gateway_for = lambda do |request_id|
+      described_class.new(context: Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id:,
+                                                                 idempotency_key: "legacy-update-service-key"))
+    end
+    audits = -> { Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count }
+
+    first = gateway_for.call("req-legacy-update-1").update(entry_id: entry.id, project:, attributes:,
+                                                           authorize: ->(_entry) {})
+    stored = entry.reload.attributes
+    audits_after_first = audits.call
+
+    # The entry is now billed, so the edit policy would refuse it; a replay must not ask that policy.
+    refusing_policy = ->(_entry) { raise Pundit::NotAuthorizedError }
+    read_back = []
+    # "In the legacy store, a retried time-entry update that carries the same Idempotency-Key as an update this actor already committed answers the stored answer and writes nothing again: the entry is unchanged since the first answer and no second audit row is written, including when the first update made the entry one the edit policy refuses (for example billed)"
+    retried = gateway_for.call("req-legacy-update-2").update(
+      entry_id: entry.id, project:, attributes:, authorize: refusing_policy,
+      authorize_replay: ->(replayed) { read_back << replayed.id }
+    )
+
+    expect(retried.id).to eq(first.id)
+    expect(retried.note).to eq("Replayed edit")
+    expect(retried.bill_status).to eq(first.bill_status)
+    expect(read_back).to eq([entry.id])
+    expect(entry.reload.attributes).to eq(stored)
+    expect(audits.call).to eq(audits_after_first)
+  end
+  end
+
+  context "more tests 15" do
+  it "gateway answers a committed legacy delete retried with the same key as success instead of not found" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    admin = create(:user, current_workspace_id: company.id).tap do |user|
+      create(:employment, company:, user:)
+      user.add_role :admin, company
+    end
+    entry = create(:timesheet_entry, user: admin, project:, bill_status: :unbilled)
+    other = create(:timesheet_entry, user: admin, project:, bill_status: :unbilled)
+    gateway_for = lambda do |request_id|
+      described_class.new(context: Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id:,
+                                                                 idempotency_key: "legacy-delete-service-key"))
+    end
+    audits = -> { Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: [entry.id, other.id]).count }
+
+    expect(gateway_for.call("req-legacy-delete-1").destroy(entry_id: entry.id, authorize: ->(_entry) {})).to be(true)
+    discarded_at = TimesheetEntry.find(entry.id).discarded_at
+    expect(discarded_at).to be_present
+    audits_after_first = audits.call
+
+    # "In the legacy store, a retried delete that carries the same Idempotency-Key as a delete this actor already committed answers success from the stored answer, not 404, and discards nothing else"
+    retried = gateway_for.call("req-legacy-delete-2").destroy(entry_id: entry.id, authorize: ->(_entry) {},
+                                                              authorize_replay: ->(_entry) {})
+
+    expect(retried).to be(true)
+    expect(TimesheetEntry.find(entry.id).discarded_at).to eq(discarded_at)
+    expect(TimesheetEntry.find(other.id).discarded_at).to be_nil
+    expect(audits.call).to eq(audits_after_first)
+  end
+  end
+
+  context "more tests 16" do
+  # "In the legacy store, a retried time-entry update that carries the same Idempotency-Key as an update this actor already committed answers the stored answer and writes nothing again: the entry is unchanged since the first answer and no second audit row is written, including when the first update made the entry one the edit policy refuses (for example billed)"
+  it "replays a committed legacy gateway update to billed under the same key although the edit policy now refuses the entry" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    admin = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    entry = create(:timesheet_entry, user: admin, project:, bill_status: :unbilled, note: "Before")
+    policy = ->(record) { raise Pundit::NotAuthorizedError unless TimesheetEntryPolicy.new(admin, record).update? }
+    read_policy = ->(record) { raise Pundit::NotAuthorizedError unless TimesheetEntryPolicy.new(admin, record).show? }
+    update_with = lambda do |request_id|
+      context = Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id:,
+                                              idempotency_key: "legacy-billed-gateway-key")
+      described_class.new(context:).update(entry_id: entry.id, project:, attributes: { bill_status: "billed" },
+                                           authorize: policy, authorize_replay: read_policy)
+    end
+    audits = -> { Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count }
+
+    first = update_with.call("req-legacy-billed-1")
+    expect(entry.reload.bill_status).to eq("billed")
+    updated_at = entry.updated_at
+    audits_after_first = audits.call
+
+    second = update_with.call("req-legacy-billed-2")
+
+    expect(second.id).to eq(first.id)
+    expect(second.bill_status).to eq("billed")
+    expect(audits.call).to eq(audits_after_first)
+    expect(entry.reload.updated_at).to eq(updated_at)
+  end
+  end
+
+  context "more tests 17" do
+  # "A retry with a different key is still a new request"
+  it "applies a legacy gateway update sent under a different key after a committed update as a new write" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    admin = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    entry = create(:timesheet_entry, user: admin, project:, bill_status: :unbilled, note: "Before")
+    update_with = lambda do |request_id, key, note|
+      context = Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id:,
+                                              idempotency_key: key)
+      described_class.new(context:).update(entry_id: entry.id, project:, attributes: { note: }, authorize: ->(_) {})
+    end
+    audits = -> { Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count }
+
+    update_with.call("req-legacy-newkey-1", "legacy-newkey-first", "First edit")
+    audits_after_first = audits.call
+
+    second = update_with.call("req-legacy-newkey-2", "legacy-newkey-second", "Second edit")
+
+    expect(second.note).to eq("Second edit")
+    expect(entry.reload.note).to eq("Second edit")
+    expect(audits.call).to eq(audits_after_first + 1)
+  end
+  end
+
+  context "more tests 18" do
+  # "In the legacy store, a retried delete that carries the same Idempotency-Key as a delete this actor already committed answers success from the stored answer, not 404, and discards nothing else"
+  # "A retry with a different key is still a new request"
+  it "refuses a legacy gateway destroy of a discarded entry under a different key as not found while the same key replays" do
+    company = create(:company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    admin = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user: admin)
+    admin.add_role :admin, company
+    entry = create(:timesheet_entry, user: admin, project:, bill_status: :unbilled)
+    destroy_with = lambda do |request_id, key|
+      context = Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id:,
+                                              idempotency_key: key)
+      described_class.new(context:).destroy(entry_id: entry.id, authorize: ->(_) {})
+    end
+
+    expect(destroy_with.call("req-legacy-del-1", "legacy-delete-first")).to be(true)
+    discarded_at = TimesheetEntry.unscoped.find(entry.id).discarded_at
+    expect(discarded_at).to be_present
+
+    expect(destroy_with.call("req-legacy-del-2", "legacy-delete-first")).to be(true)
+    expect { destroy_with.call("req-legacy-del-3", "legacy-delete-other") }
+      .to raise_error(ActiveRecord::RecordNotFound)
+    expect(TimesheetEntry.unscoped.find(entry.id).discarded_at).to eq(discarded_at)
+  end
+  end
 end
 
 RSpec.describe Timekeeping::Gateway, committed_data: true do
@@ -1074,7 +1360,7 @@ RSpec.describe Timekeeping::Gateway do
     expect(entry.reload.discarded_at).to be_present
   end
 
-  it "a retried keyed legacy delete of a keyed legacy create still answers not found and sends nothing to Timekeeping" do
+  it "a retried keyed legacy delete of a keyed legacy create replays success and sends nothing to Timekeeping" do
     keyed_context = lambda do |request_id, key|
       Timekeeping::WriteContext.new(company: fallback_company, actor: fallback_admin, actor_kind: "user",
                                     request_id:, idempotency_key: key)
@@ -1094,9 +1380,10 @@ RSpec.describe Timekeeping::Gateway do
     retry_gateway = described_class.new(
       context: keyed_context.call("req-retry-delete-2", delete_key), write_client:, read_client:
     )
-    expect { retry_gateway.destroy(entry_id: entry.id, authorize: ->(_entry) { }) }
-      .to raise_error(ActiveRecord::RecordNotFound)
-    expect(TimesheetEntry.find(entry.id).discarded_at).to be_present
+    discarded_at = TimesheetEntry.find(entry.id).discarded_at
+    # A retry of a committed delete under the same key answers from the legacy receipt, not 404.
+    expect(retry_gateway.destroy(entry_id: entry.id, authorize: ->(_entry) { })).to be(true)
+    expect(TimesheetEntry.find(entry.id).discarded_at).to eq(discarded_at)
     expect(TimesheetEntry.where(project_id: fallback_project.id).count).to eq(1)
   end
 end
