@@ -20,20 +20,6 @@ RSpec.describe "Api::V1::Cli::TimesheetEntries#create TimesheetEntries::Created 
     create(:project_member, project:, user:)
   end
 
-  # Every TimesheetEntries::Created event raised while the block runs.
-  def created_events_during
-    events = []
-    probe = Object.new
-    probe.define_singleton_method(:emit) { |event| events << event if event[:name] == "TimesheetEntries::Created" }
-    Rails.event.subscribe(probe)
-    begin
-      yield
-    ensure
-      Rails.event.unsubscribe(probe)
-    end
-    events
-  end
-
   # committed_data, so a live Timekeeping app in a regression run can read the
   # company, user and project the request names.
   context "when Timekeeping owns the entries", :forwards_to_timekeeping, committed_data: true do
@@ -43,28 +29,11 @@ RSpec.describe "Api::V1::Cli::TimesheetEntries#create TimesheetEntries::Created 
 
     before { arrange_forwarded_timekeeping(fake, company:, users: { user => "employee" }, project:) }
 
-    it "raises exactly one TimesheetEntries::Created when the same forwarded CLI create is sent twice under one Idempotency-Key" do
-      headers = cli_auth_headers(cli_token).merge("Idempotency-Key" => "cli-retry-#{SecureRandom.uuid}")
-      first_id = nil
-      second_id = nil
-
-      events = created_events_during do
-        send_request :post, api_v1_cli_timesheet_entries_path, params: created_event_params, headers: headers
-        first_id = json_response.dig("entry", "id")
-        send_request :post, api_v1_cli_timesheet_entries_path, params: created_event_params, headers: headers
-        second_id = json_response.dig("entry", "id")
-      end
-
-      # "A forwarded create that Timekeeping refuses, or that is replayed from a stored idempotency receipt, raises no event"
-      expect(second_id).to eq(first_id)
-      # "A time entry create forwarded to Timekeeping raises exactly one `TimesheetEntries::Created` event, with the same actor and data shape as a create in the legacy state, once Timekeeping answers the create with success"
-      expect(events.map { |event| event[:payload].to_h.dig(:data, :timesheet_entry_id) }).to eq([first_id])
-    end
-
     it "raises exactly one TimesheetEntries::Created with the CLI user and source when the same forwarded CLI create is sent twice under one Idempotency-Key" do
-      headers = cli_auth_headers(cli_token).merge("Idempotency-Key" => "cli-created-event-retry-1")
+      headers = cli_auth_headers(cli_token).merge("Idempotency-Key" => "cli-created-event-retry-#{SecureRandom.uuid}")
+      first_id = nil
 
-      events = created_events_during do
+      events = timesheet_entries_created_events do
         send_request :post, api_v1_cli_timesheet_entries_path, params: created_event_params, headers: headers
         expect(response).to have_http_status(:ok)
         first_id = json_response.dig("entry", "id")
@@ -81,11 +50,11 @@ RSpec.describe "Api::V1::Cli::TimesheetEntries#create TimesheetEntries::Created 
       payload = event[:payload].to_h
       expect(payload[:actor]).to eq(id: user.id, type: "User")
       expect(payload[:data].keys).to contain_exactly(:timesheet_entry_id, :project_id, :user_id, :duration)
-      expect(payload[:data]).to include(project_id: project.id, user_id: user.id)
+      expect(payload[:data]).to include(timesheet_entry_id: first_id, project_id: project.id, user_id: user.id)
     end
 
     it "raises no further TimesheetEntries::Created when the forwarded entry's snapshot reaches the projection" do
-      created = created_events_during do
+      created = timesheet_entries_created_events do
         send_request :post, api_v1_cli_timesheet_entries_path, params: created_event_params,
                                                                headers: cli_auth_headers(cli_token)
       end
@@ -97,7 +66,7 @@ RSpec.describe "Api::V1::Cli::TimesheetEntries#create TimesheetEntries::Created 
         TimekeepingSnapshots.item(snapshot, generation: TimekeepingOwnership.current.generation)
       )
 
-      delivered = created_events_during do
+      delivered = timesheet_entries_created_events do
         result = Timekeeping::ProjectionConsumer.call(batch:, idempotency_key: "created-event-snapshot-#{entry_id}")
         expect(result.status).to eq(200)
       end
@@ -111,7 +80,7 @@ RSpec.describe "Api::V1::Cli::TimesheetEntries#create TimesheetEntries::Created 
 
   it "raises exactly one TimesheetEntries::Created for a rollback-state CLI create across the create and the relay to the projection", committed_data: true, owner_state: "rollback" do
     expect_owner_state!("rollback")
-    events = created_events_during do
+    events = timesheet_entries_created_events do
       send_request :post, api_v1_cli_timesheet_entries_path, params: created_event_params,
                                                              headers: cli_auth_headers(cli_token)
       expect(response).to have_http_status(:ok)
@@ -132,7 +101,7 @@ RSpec.describe "Api::V1::Cli::TimesheetEntries#create TimesheetEntries::Created 
     first_id = nil
 
     expect_owner_state!("rollback")
-    events = created_events_during do
+    events = timesheet_entries_created_events do
       send_request :post, api_v1_cli_timesheet_entries_path, params: created_event_params, headers: headers
       expect(response).to have_http_status(:ok)
       first_id = json_response.dig("entry", "id")
@@ -165,7 +134,7 @@ RSpec.describe "Api::V1::Cli::TimesheetEntries#create TimesheetEntries::Created 
 
   it "raises exactly one TimesheetEntries::Created with the CLI user and source for a legacy-state CLI create", owner_state: "legacy" do
     expect_owner_state!("legacy")
-    events = created_events_during do
+    events = timesheet_entries_created_events do
       send_request :post, api_v1_cli_timesheet_entries_path, params: created_event_params,
                                                              headers: cli_auth_headers(cli_token)
     end
