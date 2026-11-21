@@ -75,6 +75,36 @@ RSpec.shared_examples "timekeeping idempotency contract" do |contracts: [:entry_
         expect(stale.status).to eq(409)
         expect(retry_answer.status).to eq(201)
       end
+
+      # "a 2xx answer that changed nothing stores no receipt" (idempotency.yml
+      # unchanged_stored_operations). The same key sent again with a new body
+      # shows whether a receipt was stored: a stored one answers
+      # idempotency_key_reused, and none lets the new body be evaluated. Every
+      # provider answers this way, unlike a replay-only retry, which the local
+      # owner refuses at its generation check before it reads any receipt.
+      it "stores no receipt for a bulk delete that changed nothing and keeps the receipt of one that did" do
+        foreign_user = timekeeping_arrange.user(company: other_company, role: "employee")
+        foreign_entry = timekeeping_arrange.entry(company: other_company, user: foreign_user,
+                                                  project: timekeeping_arrange.project(company: other_company))
+        # Dated today, so an employee's edit window never refuses the delete.
+        own_entry = timekeeping_arrange.entry(company:, user: employee, project:, work_date: Date.current.iso8601)
+        path = timekeeping_path(:entry_api, :bulk_delete, company_id: company)
+        bulk_delete = lambda do |entry_id, key|
+          timekeeping_request("POST", path, headers: user_headers(token, key:), body: { "entry_ids" => [entry_id] })
+        end
+
+        key = new_key
+        unchanged = bulk_delete.call(foreign_entry, key)
+        changed = bulk_delete.call(own_entry, key)
+        # The entry is discarded now, so only the stored receipt can answer "deleted" again.
+        changed_replay = bulk_delete.call(own_entry, key)
+
+        expect([unchanged.status, unchanged.body])
+          .to eq([200, { "results" => [{ "entry_id" => foreign_entry, "result" => "not_found" }] }])
+        expect([changed.status, changed.body])
+          .to eq([200, { "results" => [{ "entry_id" => own_entry, "result" => "deleted" }] }])
+        expect([changed_replay.status, changed_replay.body]).to eq([changed.status, changed.body])
+      end
     end
   end
 
@@ -173,6 +203,37 @@ RSpec.shared_examples "timekeeping idempotency contract" do |contracts: [:entry_
           expect([route, first.status, first.body]).to eq([route, 200, expected])
           expect([route, replay.status, replay.body]).to eq([route, 200, expected])
         end
+      end
+
+      # "a 2xx answer that changed nothing stores no receipt", so the same
+      # mark-billed is evaluated again once the invoice has an entry to bill.
+      it "evaluates a mark-billed that billed nothing again under the same operation id" do
+        operation_id = new_key
+        nothing_to_bill = reservation_command(:mark_billed, company, service, { "operation_id" => operation_id }, invoice_id: 502)
+        commit_operation = new_key
+        prepare_with(service, company, 502, [y], commit_operation)
+        reservation_command(:commit, company, service, { "invoice_id" => 502, "operation_id" => commit_operation })
+
+        billed = reservation_command(:mark_billed, company, service, { "operation_id" => operation_id }, invoice_id: 502)
+        replay = reservation_command(:mark_billed, company, service, { "operation_id" => operation_id }, invoice_id: 502)
+
+        expect([nothing_to_bill.status, nothing_to_bill.body]).to eq([200, { "billed" => 0 }])
+        expect([billed.status, billed.body]).to eq([200, { "billed" => 1 }])
+        expect([replay.status, replay.body]).to eq([200, { "billed" => 1 }])
+      end
+
+      # detach_entries is listed in unchanged_stored_operations: its receipt
+      # also refuses later writes naming the agent, so it is kept even when
+      # nothing was detached.
+      it "replays a detach-entries that detached nothing under the same operation id" do
+        operation_id = new_key
+        nothing_to_detach = reservation_command(:detach_entries, company, service, { "operation_id" => operation_id }, agent_id: 77)
+        timekeeping_arrange.entry(company:, user:, project:, agent_id: 77)
+
+        replay = reservation_command(:detach_entries, company, service, { "operation_id" => operation_id }, agent_id: 77)
+
+        expect([nothing_to_detach.status, nothing_to_detach.body]).to eq([200, { "detached" => 0 }])
+        expect([replay.status, replay.body]).to eq([200, { "detached" => 0 }])
       end
 
       it "returns the first commit's answer when the same commit is replayed" do

@@ -255,4 +255,281 @@ RSpec.describe TimekeepingIntegrationTags do
       expect(violations).to be_empty, report
     end
   end
+
+  context "more tests 2" do
+    # "A group written `xdescribe` or `xcontext`, or a group carrying `skip:` or `pending:` metadata, disables every example under it: pass a disabled flag down the walk, the way `walk` already passes the committed_data setting down."
+    it "example_names leaves out examples under xdescribe, xcontext and skip or pending groups at any depth" do
+      source = <<~RUBY
+      RSpec.describe "relay" do
+        it "Kept top" do
+        end
+
+        context "outer" do
+          context "inner" do
+            it "Kept nested" do
+            end
+          end
+        end
+
+        xcontext "off" do
+          it "In xcontext" do
+          end
+        end
+
+        xdescribe "off too" do
+          context "plain" do
+            it "Deep in xdescribe" do
+            end
+          end
+        end
+
+        context "skipped", skip: true do
+          it "In skip group" do
+          end
+        end
+
+        describe "pending group", pending: true do
+          it "In pending group" do
+          end
+        end
+      end
+      RUBY
+
+      names = described_class.example_names(source)
+
+      expect(names).to eq(["Kept top", "Kept nested"])
+      expect(names).to be_frozen
+    end
+  end
+
+  context "more tests 3" do
+    # "It leaves out x-prefixed calls (`xit`, `xspecify`, `xexample`), `skip`, `pending`, and calls carrying `skip:` or `pending:` metadata, because they are not passing examples."
+    it "example_names leaves out xit, skip-tagged, pending, blockless and in-body strings beside a kept example" do
+      source = <<~RUBY
+      RSpec.describe "relay" do
+        before do
+          it "In before" do
+          end
+        end
+
+        xit "A" do
+        end
+
+        it "B", skip: true do
+        end
+
+        pending "C" do
+        end
+
+        it "Relay down"
+
+        specify "Kept" do
+          it "In body" do
+          end
+        end
+      end
+      RUBY
+
+      expect(described_class.example_names(source)).to eq(["Kept"])
+    end
+  end
+
+  context "more tests 4" do
+    # "A name that is not a plain string literal (for example an interpolated `it "#{x} y"`) raises ArgumentError naming its line."
+    it "example_names raises ArgumentError naming the line of an interpolated example name" do
+      source = <<~'RUBY'
+      RSpec.describe "relay" do
+        x = "Relay"
+        it "#{x} y" do
+        end
+      end
+      RUBY
+
+      expect { described_class.example_names(source) }.to raise_error(ArgumentError, /line 3\b/)
+    end
+  end
+
+  context "more tests 5" do
+    # "Keep the existing `violations` behaviour unchanged."
+    it "violations still flags untagged examples that example_names leaves out" do
+      source = <<~RUBY
+      RSpec.describe "relay" do
+        xdescribe "off" do
+          it "inside xdescribe" do
+          end
+        end
+
+        it "blockless"
+
+        it "kept", committed_data: true do
+        end
+      end
+      RUBY
+
+      expect(described_class.example_names(source)).to eq(["kept"])
+
+      violations = described_class.violations("spec/integration/timekeeping/example_spec.rb", source)
+      expect(violations.map { |violation| [violation.kind, violation.line] })
+        .to contain_exactly([:missing_committed_data, 3], [:missing_committed_data, 7])
+    end
+  end
+
+  context "more tests 6" do
+    # "A group written `xdescribe` or `xcontext`, or a group carrying `skip:` or `pending:` metadata, disables every example under it: pass a disabled flag down the walk, the way `walk` already passes the committed_data setting down."
+    it "example_names keeps an xdescribe disabled through two plain inner groups" do
+      source = <<~RUBY
+      RSpec.describe "relay" do
+        xdescribe "off" do
+          context "inner" do
+            describe "deeper" do
+              it "Hidden deep" do
+              end
+            end
+          end
+        end
+
+        RSpec.xdescribe "off through RSpec" do
+          context "inner" do
+            it "Hidden via RSpec receiver" do
+            end
+          end
+        end
+
+        context "on", skip: "later" do
+          context "inner" do
+            it "Hidden under skip" do
+            end
+          end
+        end
+
+        context "control" do
+          it "Visible control" do
+          end
+        end
+      end
+      RUBY
+
+      expect(described_class.example_names(source)).to eq(["Visible control"])
+    end
+  end
+
+  context "more tests 7" do
+    # "An xit, skip, pending or non-literal example name, or an example inside an xdescribe, xcontext or skipped group, never counts as covering a row"
+    it "example_names leaves out a blockless example that RSpec reports as pending" do
+      source = <<~RUBY
+      RSpec.describe "relay" do
+        it "Relay down"
+        specify "Relay down twice"
+
+        it "Relay down implemented" do
+        end
+      end
+      RUBY
+
+      expect(described_class.example_names(source)).to eq(["Relay down implemented"])
+    end
+  end
+
+  context "more tests 8" do
+    # "A name that is not a plain string literal (for example an interpolated `it \"#{x} y\"`) raises ArgumentError naming its line."
+    it "example_names raises naming the line for a concatenated, constant or symbol example name" do
+      concatenated = <<~RUBY
+      RSpec.describe "relay" do
+        it "Relay" " down" do
+        end
+      end
+      RUBY
+      constant = <<~RUBY
+      RSpec.describe "relay" do
+        it "Visible" do
+        end
+
+        it CASE_NAME do
+        end
+      end
+      RUBY
+      symbol = <<~RUBY
+      RSpec.describe "relay" do
+        context "inner" do
+          it :relay_down do
+          end
+        end
+      end
+      RUBY
+
+      expect { described_class.example_names(concatenated) }.to raise_error(ArgumentError, /line 2\b/)
+      expect { described_class.example_names(constant) }.to raise_error(ArgumentError, /line 5\b/)
+      expect { described_class.example_names(symbol) }.to raise_error(ArgumentError, /line 3\b/)
+    end
+  end
+
+  context "more tests 9" do
+    it "example_names result does not change when the source string is mutated afterwards" do
+      source = +<<~RUBY
+      RSpec.describe "relay" do
+        it "Relay down" do
+        end
+      end
+      RUBY
+
+      names = described_class.example_names(source)
+      source.replace("")
+
+      expect(names).to eq(["Relay down"])
+      expect(names).to be_frozen
+      expect(names).to all(be_frozen)
+    end
+  end
+
+  describe ".example_names edge forms" do
+    it "leaves out focused examples and groups marked with a bare :skip or :pending symbol" do
+      source = <<~RUBY
+        RSpec.describe "relay" do
+          fit "D" do
+          end
+
+          context "bare skip", :skip do
+            it "Under bare skip" do
+            end
+          end
+
+          context "bare pending", :pending do
+            it "Under bare pending" do
+            end
+          end
+
+          example "Counted control" do
+          end
+        end
+      RUBY
+
+      expect(described_class.example_names(source)).to eq(["Counted control"])
+    end
+
+    it "raises naming the parse error line when the source is not valid Ruby" do
+      broken = <<~RUBY
+        RSpec.describe "relay" do
+          it "Relay down" do
+          end
+      RUBY
+      valid = "#{broken}end\n"
+
+      expect(described_class.example_names(valid)).to eq(["Relay down"])
+      expect { described_class.example_names(broken) }.to raise_error(ArgumentError, /does not parse: line \d+/)
+    end
+
+    it "raises naming the line of an example that has a block but no name" do
+      source = <<~RUBY
+        RSpec.describe "relay" do
+          it "Named" do
+          end
+
+          it do
+          end
+        end
+      RUBY
+
+      expect { described_class.example_names(source) }.to raise_error(ArgumentError, /line 5\b/)
+    end
+  end
 end
