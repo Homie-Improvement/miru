@@ -256,14 +256,6 @@ RSpec.describe "Timekeeping extraction scenarios", type: :request do
     # positive before cutover. Several readers return fixed keys or zeros even
     # when no entry matches, so the probe proves each one read seeded entries
     # and the comparison cannot pass on empty output.
-    #
-    # AnalyticsController#analytics_timesheet_entries is not in the table: its
-    # only caller, user_activity_summary, raises ActiveRecord::ConfigurationError
-    # on every request today, because User has no ahoy_events association.
-    # Metrics::DataBuilder appears only through hours_logged: its project_stats
-    # metric, the one branch that runs the bill_status: :billable filters,
-    # raises NoMethodError for every Project today, because Project has no
-    # invoices association, so it returns no output to compare.
     extraction_report_readers = [
       {
         name: "Reports::TimeEntries::ReportService",
@@ -391,6 +383,38 @@ RSpec.describe "Timekeeping extraction scenarios", type: :request do
           end)
         end,
         probe: ->(output, _context) { output.fetch("entries").values.sum(&:size) }
+      },
+      {
+        # Only project_stats runs the bill_status: :billable filters section
+        # 1.7 names, and it calls Project#invoices, which Project does not
+        # define. The project is given an empty invoices relation, so the
+        # real method runs every entry query; invoices do not move at cutover.
+        name: "Metrics::DataBuilder project_stats",
+        read: lambda do |context|
+          project = Project.find(extraction_busiest_project_id(context[:company]))
+          project.define_singleton_method(:invoices) { Invoice.none }
+          Metrics::DataBuilder.build(Metric.new(trackable: project, metric_type: "project_stats", period: "all_time"))
+        end,
+        probe: ->(output, _context) { output.fetch("total_entries") }
+      },
+      {
+        # Its only caller, user_activity_summary, fails on every request
+        # because User has no ahoy_events association, so the relation is read
+        # from the controller directly, as the company's owner sees it.
+        name: "AnalyticsController#analytics_timesheet_entries",
+        read: lambda do |context|
+          owner = User.with_role(:owner, context[:company]).order(:id).first!
+          controller = AnalyticsController.new
+          controller.define_singleton_method(:current_user) { owner }
+          entries = controller.send(:analytics_timesheet_entries)
+          travel_to(context[:day]) do
+            {
+              hours_logged_today: entries.where(work_date: Date.current).sum(:duration) / 60.0,
+              entries: entries.order(:id).pluck(:id, :duration, :work_date)
+            }
+          end
+        end,
+        probe: ->(output, _context) { output.fetch("entries").size }
       }
     ].map(&:freeze).freeze
 
@@ -485,9 +509,12 @@ RSpec.describe "Timekeeping extraction scenarios", type: :request do
     FileUtils.rm_rf(report_root) if report_root
   end
 
+  # The flag is set first: a pause the server applied but whose answer was
+  # lost must still be resumed by teardown. Resuming an unpaused relay only
+  # removes a file that is not there.
   def extraction_pause_relay!
-    extraction_relay_hook("pause")
     @extraction_relay_paused = true
+    extraction_relay_hook("pause")
   end
 
   def extraction_resume_relay!
@@ -626,6 +653,12 @@ RSpec.describe "Timekeeping extraction scenarios", type: :request do
       .getvalue(0, 0)
   ensure
     connection&.close
+  end
+
+  # The company's project with the most kept entries, lowest id on a tie.
+  def extraction_busiest_project_id(company)
+    TimesheetEntry.kept.in_workspace(company).group(:project_id)
+      .order(Arel.sql("COUNT(*) DESC"), :project_id).limit(1).pluck(:project_id).first
   end
 
   def extraction_row_counts(checkpoint)
