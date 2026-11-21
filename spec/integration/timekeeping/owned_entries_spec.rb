@@ -606,3 +606,520 @@ RSpec.describe "owned_entry for an id the owning store does not hold", committed
     expect { owned_entry(legacy_id, state: "rollback") }.to raise_error(StandardError)
   end
 end
+
+RSpec.describe "fixture_reservation_row for a locked fixture" do
+  it "fixture_reservation_row builds the committed active reservation of a locked fixture with no invoice operation" do
+    entry = { "id" => 900_901, "company_id" => 77, "locked" => true }
+    stamp = Time.current.utc.floor(6)
+    operation_id = SecureRandom.uuid
+
+    row = TimekeepingOwnedEntries.fixture_reservation_row(entry, stamp, operation_id:)
+
+    # "`Timekeeping::Handoff::Checkpoint::TABLES["reservations"]` already lists these columns."
+    expect(row.keys).to match_array(Timekeeping::Handoff::Checkpoint::TABLES.fetch("reservations"))
+    # The values "that `insert_fixture_reservation` already writes for the rollback state".
+    expect(row).to eq(
+      "company_id" => 77,
+      "entry_id" => 900_901,
+      "invoice_id" => 1,
+      "operation_id" => operation_id,
+      "state" => "committed",
+      "disposition" => "active",
+      "created_at" => stamp,
+      "invoice_operation_id" => nil
+    )
+    expect(TimekeepingOwnedEntries.fixture_reservation_row(entry, stamp, operation_id:)).to eq(row)
+  end
+end
+
+RSpec.describe "arrange_owned_entries timekeeping reservations across calls", committed_data: true do
+  it "arrange_owned_entries in the timekeeping state loads one reservation per locked row and keeps it in a later load" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role(:admin, company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    store = Class.new do
+      attr_reader :checkpoints
+
+      def initialize
+        @checkpoints = []
+      end
+
+      def fence_admission = nil
+
+      def load_checkpoint(checkpoint)
+        @checkpoints << checkpoint.rows
+        checkpoint
+      end
+
+      def advance_entry_id_sequence(above:) = Integer(above) + 1
+
+      def admit(generation:) = generation
+    end.new
+
+    locked_id, open_id = arrange_owned_entries(
+      [{ company:, user:, project:, note: "locked row", locked: true },
+       { company:, user:, project:, note: "open row" }],
+      state: "timekeeping", timekeeping_store: store
+    )
+
+    # "Change the timekeeping writer (`load_timekeeping_entries`) so each locked row also loads one `reservations` row in the same checkpoint."
+    first = store.checkpoints.last
+    reservations = first.fetch("reservations")
+    expect(reservations.pluck("entry_id")).to eq([locked_id])
+    expect(reservations.pluck("entry_id")).not_to include(open_id)
+    reservation = reservations.first
+    expect(reservation.keys).to match_array(Timekeeping::Handoff::Checkpoint::TABLES.fetch("reservations"))
+    expect(reservation.fetch("company_id")).to eq(company.id)
+    expect(reservation.fetch("invoice_id")).to eq(1)
+    expect(reservation.fetch("state")).to eq("committed")
+    expect(reservation.fetch("disposition")).to eq("active")
+    expect(reservation.fetch("invoice_operation_id")).to be_nil
+    expect(reservation.fetch("operation_id")).to be_present
+    locked_entry_row = first.fetch("entries").find { |row| row.fetch("id") == locked_id }
+    expect(reservation.fetch("created_at")).to eq(locked_entry_row.fetch("created_at"))
+
+    second_locked_id, = arrange_owned_entries(
+      [{ company:, user:, project:, note: "second locked", locked: true },
+       { company:, user:, project:, note: "second open" }],
+      state: "timekeeping", timekeeping_store: store
+    )
+
+    # "A checkpoint load replaces whole tables, so a later `arrange_owned_entries` call in the same example must keep earlier reservations."
+    later = store.checkpoints.last.fetch("reservations")
+    expect(later.pluck("entry_id")).to contain_exactly(locked_id, second_locked_id)
+    expect(later.find { |row| row.fetch("entry_id") == locked_id }).to eq(reservation)
+    expect(later.pluck("operation_id").uniq.size).to eq(2)
+  end
+end
+
+RSpec.describe "arrange_owned_entries timekeeping reservations after a failed load", committed_data: true do
+  it "arrange_owned_entries retried after a failed timekeeping load loads exactly one reservation for the locked row" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role(:admin, company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    load_failure = Class.new(StandardError)
+    loaded = []
+    failing = true
+    store = Object.new
+    store.define_singleton_method(:fence_admission) { nil }
+    store.define_singleton_method(:load_checkpoint) do |checkpoint|
+      loaded << checkpoint.rows.fetch("reservations")
+      raise load_failure, "load refused" if failing
+
+      checkpoint
+    end
+    store.define_singleton_method(:advance_entry_id_sequence) { |above:| above + 1 }
+    store.define_singleton_method(:admit) { |generation:| generation }
+    rows = [{ company:, user:, project:, id: 900_931, note: "locked retry", locked: true }]
+
+    expect { arrange_owned_entries(rows, state: "timekeeping", timekeeping_store: store) }
+      .to raise_error(load_failure)
+    failing = false
+    arrange_owned_entries(rows, state: "timekeeping", timekeeping_store: store)
+
+    # A failed load records nothing, so the retry carries one reservation for the entry, not two.
+    expect(loaded.last.pluck("entry_id")).to eq([900_931])
+  end
+end
+
+RSpec.describe "owned_entry locked state against the live Timekeeping app", :without_transaction, committed_data: true do
+  it "live owned_entry in the timekeeping state reads a locked fixture locked, an unlocked one unlocked, and keeps the lock after a second arrange" do
+    unless ENV["TIMEKEEPING_REGRESSION"] == "1" && ENV["TIMEKEEPING_LIVE"] == "1"
+      skip "Set TIMEKEEPING_REGRESSION=1 and TIMEKEEPING_LIVE=1 to run against the live Timekeeping app"
+    end
+    live = TimekeepingRegressionAdapter.current
+    skip "The live adapter is not running: select the timekeeping owner state and a _test TIMEKEEPING_DATABASE_URL" unless live
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role(:admin, company)
+    project = create(:project, billable: true, client: create(:client, company:))
+
+    locked_id, open_id = arrange_owned_entries(
+      [{ company:, user:, project:, note: "live locked", locked: true },
+       { company:, user:, project:, note: "live open" }], state: "timekeeping"
+    )
+
+    # "a locked fixture reads `owned_entry(id, state: "timekeeping")["locked"]` true;"
+    expect(owned_entry(locked_id, state: "timekeeping").fetch("locked")).to be(true)
+    # "an unlocked fixture in the same load reads false;"
+    expect(owned_entry(open_id, state: "timekeeping").fetch("locked")).to be(false)
+
+    later_id = arrange_owned_entries([{ company:, user:, project:, note: "live later" }], state: "timekeeping").first
+
+    # "a second arrange in the same example keeps the first locked entry locked;"
+    expect(owned_entry(locked_id, state: "timekeeping").fetch("locked")).to be(true)
+    expect(owned_entry(later_id, state: "timekeeping").fetch("locked")).to be(false)
+  end
+end
+
+RSpec.describe "owned_entry locked state in the legacy state", committed_data: true, owner_state: "legacy" do
+  it "owned_entry in the legacy state reads a locked fixture locked" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role(:admin, company)
+    project = create(:project, billable: true, client: create(:client, company:))
+
+    locked_id, open_id = arrange_owned_entries(
+      [{ company:, user:, project:, note: "legacy locked", locked: true },
+       { company:, user:, project:, note: "legacy open" }], state: "legacy"
+    )
+
+    # "legacy and rollback locked fixtures still read locked."
+    expect(owned_entry(locked_id, state: "legacy").fetch("locked")).to be(true)
+    expect(owned_entry(open_id, state: "legacy").fetch("locked")).to be(false)
+  end
+end
+
+RSpec.describe "owned_entry locked state in the rollback state", committed_data: true, owner_state: "rollback" do
+  it "owned_entry in the rollback state reads a locked fixture locked and an open one unlocked" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role(:admin, company)
+    project = create(:project, billable: true, client: create(:client, company:))
+
+    locked_id, open_id = arrange_owned_entries(
+      [{ company:, user:, project:, note: "rollback locked", locked: true },
+       { company:, user:, project:, note: "rollback open" }], state: "rollback"
+    )
+
+    # "legacy and rollback locked fixtures still read locked."
+    expect(owned_entry(locked_id, state: "rollback").fetch("locked")).to be(true)
+    expect(owned_entry(open_id, state: "rollback").fetch("locked")).to be(false)
+  end
+end
+
+RSpec.describe "arrange_owned_entries reservations across two companies", committed_data: true do
+  it "arrange_owned_entries in the timekeeping state loads each locked entry's reservation under that entry's own company and none for an open entry" do
+    tenants = Array.new(2) do
+      company = create(:company)
+      user = create(:user, current_workspace_id: company.id)
+      create(:employment, company:, user:)
+      user.add_role(:admin, company)
+      project = create(:project, billable: true, client: create(:client, company:))
+      { company:, user:, project: }
+    end
+    first, second = tenants
+    loaded_reservations = []
+    store = Object.new
+    store.define_singleton_method(:fence_admission) { nil }
+    store.define_singleton_method(:load_checkpoint) do |checkpoint|
+      loaded_reservations << checkpoint.rows.fetch("reservations")
+      checkpoint
+    end
+    store.define_singleton_method(:advance_entry_id_sequence) { |above:| above + 1 }
+    store.define_singleton_method(:admit) { |generation:| generation }
+
+    first_locked_id, second_locked_id, first_open_id = arrange_owned_entries(
+      [first.merge(note: "first company locked", locked: true),
+       second.merge(note: "second company locked", locked: true),
+       first.merge(note: "first company open")],
+      state: "timekeeping", timekeeping_store: store
+    )
+
+    # "Timekeeping treats an entry as locked only when a reservation of the same company holds it."
+    reservations = loaded_reservations.last
+    expect(reservations.map { |row| [row.fetch("company_id"), row.fetch("entry_id")] })
+      .to contain_exactly([first[:company].id, first_locked_id], [second[:company].id, second_locked_id])
+    expect(reservations.pluck("entry_id")).not_to include(first_open_id)
+    expect(reservations).to all(include("invoice_operation_id" => nil, "state" => "committed", "disposition" => "active"))
+  end
+end
+
+RSpec.describe "TimekeepingOwnedEntries.fixture_reservation_row" do
+  it "fixture_reservation_row carries the entry's own company_id and entry_id with the rollback reservation values" do
+    stamp = Time.utc(2024, 5, 6, 7, 8, 9, 123_456)
+    entry = { "id" => 4_711, "company_id" => 42, "user_id" => 3, "project_id" => 5, "locked" => true }
+    operation_id = "0b5e8f1e-2d4c-4c1a-9a57-3f1f1f6f2a10"
+
+    row = TimekeepingOwnedEntries.fixture_reservation_row(entry, stamp, operation_id:)
+
+    expect(row.keys).to match_array(Timekeeping::Handoff::Checkpoint::TABLES.fetch("reservations"))
+    expect(row).to eq(
+      "company_id" => 42, "entry_id" => 4_711, "invoice_id" => 1, "operation_id" => operation_id,
+      "state" => "committed", "disposition" => "active", "created_at" => stamp, "invoice_operation_id" => nil
+    )
+    expect(TimekeepingOwnedEntries.fixture_reservation_row(entry, stamp, operation_id:)).to eq(row)
+  end
+end
+
+RSpec.describe "arrange_owned_entries loading reservations for locked fixtures", committed_data: true do
+  it "timekeeping arrange loads exactly one committed reservation for the locked row and none for the unlocked row" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role(:admin, company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    loaded = []
+    store = Object.new
+    store.define_singleton_method(:fence_admission) { nil }
+    store.define_singleton_method(:load_checkpoint) { |checkpoint| loaded << checkpoint.rows }
+    store.define_singleton_method(:advance_entry_id_sequence) { |above:| above + 1 }
+    store.define_singleton_method(:admit) { |generation:| generation }
+
+    locked_id, open_id = arrange_owned_entries(
+      [{ company:, user:, project:, note: "locked row", locked: true },
+       { company:, user:, project:, note: "open row" }],
+      state: "timekeeping", timekeeping_store: store
+    )
+
+    # "Change the timekeeping writer (`load_timekeeping_entries`) so each locked row also loads one `reservations` row in the same checkpoint."
+    reservations = loaded.last.fetch("reservations")
+    expect(reservations.pluck("entry_id")).to eq([locked_id])
+    expect(reservations.pluck("entry_id")).not_to include(open_id)
+    reservation = reservations.first
+    expect(reservation.keys).to match_array(Timekeeping::Handoff::Checkpoint::TABLES.fetch("reservations"))
+    expect(reservation.fetch("company_id")).to eq(company.id)
+    expect(reservation.fetch("invoice_id")).to eq(1)
+    expect(reservation.fetch("state")).to eq("committed")
+    expect(reservation.fetch("disposition")).to eq("active")
+    expect(reservation.fetch("invoice_operation_id")).to be_nil
+    expect(reservation.fetch("operation_id")).to be_present
+    locked_entry = loaded.last.fetch("entries").find { |entry| entry.fetch("id") == locked_id }
+    # "`created_at` = the load stamp"
+    expect(reservation.fetch("created_at")).to eq(locked_entry.fetch("created_at"))
+  end
+end
+
+RSpec.describe "arrange_owned_entries keeping reservations across calls", committed_data: true do
+  it "a second timekeeping arrange keeps the first batch's reservation exactly once in the reloaded checkpoint" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role(:admin, company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    loaded = []
+    store = Object.new
+    store.define_singleton_method(:fence_admission) { nil }
+    store.define_singleton_method(:load_checkpoint) { |checkpoint| loaded << checkpoint.rows }
+    store.define_singleton_method(:advance_entry_id_sequence) { |above:| above + 1 }
+    store.define_singleton_method(:admit) { |generation:| generation }
+
+    first_id = arrange_owned_entries([{ company:, user:, project:, note: "first locked", locked: true }],
+                                     state: "timekeeping", timekeeping_store: store).first
+    second_id = arrange_owned_entries([{ company:, user:, project:, note: "second open" }],
+                                      state: "timekeeping", timekeeping_store: store).first
+
+    # "A checkpoint load replaces whole tables, so a later `arrange_owned_entries` call in the same example must keep earlier reservations."
+    second_load = loaded.last
+    expect(second_load.fetch("entries").pluck("id")).to contain_exactly(first_id, second_id)
+    expect(second_load.fetch("reservations").pluck("entry_id")).to eq([first_id])
+  end
+end
+
+RSpec.describe "TimekeepingOwnedEntries.fixture_reservation_row" do
+  it "fixture_reservation_row builds the committed active reservation columns for a locked entry" do
+    stamp = Time.utc(2026, 1, 2, 3, 4, 5)
+    entry = { "id" => 4_321, "company_id" => 77, "locked" => true }
+    operation_id = "0f2c6a8e-4b4d-4c1e-9d0a-2f6f1b7e9c11"
+
+    row = TimekeepingOwnedEntries.fixture_reservation_row(entry, stamp, operation_id:)
+
+    expect(row.keys).to match_array(Timekeeping::Handoff::Checkpoint::TABLES.fetch("reservations"))
+    expect(row).to include(
+      "company_id" => 77, "entry_id" => 4_321, "invoice_id" => 1, "operation_id" => operation_id,
+      "state" => "committed", "disposition" => "active", "created_at" => stamp, "invoice_operation_id" => nil
+    )
+    expect(TimekeepingOwnedEntries.fixture_reservation_row(entry, stamp, operation_id:)).to eq(row)
+    expect(entry).to eq({ "id" => 4_321, "company_id" => 77, "locked" => true })
+  end
+end
+
+RSpec.describe "owned_entry lock state against the live Timekeeping app", :without_transaction, committed_data: true do
+  it "live owned_entry reads a locked timekeeping fixture locked and an unlocked one in the same load unlocked" do
+    unless ENV["TIMEKEEPING_REGRESSION"] == "1" && ENV["TIMEKEEPING_LIVE"] == "1"
+      skip "Set TIMEKEEPING_REGRESSION=1 and TIMEKEEPING_LIVE=1 to run against the live Timekeeping app"
+    end
+    live = TimekeepingRegressionAdapter.current
+    skip "The live adapter is not running: select the timekeeping owner state and a _test TIMEKEEPING_DATABASE_URL" unless live
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role(:admin, company)
+    project = create(:project, billable: true, client: create(:client, company:))
+
+    locked_id, open_id = arrange_owned_entries(
+      [{ company:, user:, project:, note: "locked live", locked: true },
+       { company:, user:, project:, note: "open live" }], state: "timekeeping"
+    )
+
+    # "a locked fixture reads `owned_entry(id, state: "timekeeping")["locked"]` true;"
+    expect(owned_entry(locked_id, state: "timekeeping")["locked"]).to be(true)
+    # "an unlocked fixture in the same load reads false;"
+    expect(owned_entry(open_id, state: "timekeeping")["locked"]).to be(false)
+  end
+end
+
+RSpec.describe "owned_entry lock state across two live arrange calls", :without_transaction, committed_data: true do
+  it "live second timekeeping arrange keeps the first locked entry locked" do
+    unless ENV["TIMEKEEPING_REGRESSION"] == "1" && ENV["TIMEKEEPING_LIVE"] == "1"
+      skip "Set TIMEKEEPING_REGRESSION=1 and TIMEKEEPING_LIVE=1 to run against the live Timekeeping app"
+    end
+    live = TimekeepingRegressionAdapter.current
+    skip "The live adapter is not running: select the timekeeping owner state and a _test TIMEKEEPING_DATABASE_URL" unless live
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role(:admin, company)
+    project = create(:project, billable: true, client: create(:client, company:))
+
+    locked_id = arrange_owned_entries([{ company:, user:, project:, note: "first locked", locked: true }],
+                                      state: "timekeeping").first
+    open_id = arrange_owned_entries([{ company:, user:, project:, note: "second open" }], state: "timekeeping").first
+
+    # "a second arrange in the same example keeps the first locked entry locked;"
+    expect(owned_entry(locked_id, state: "timekeeping")["locked"]).to be(true)
+    expect(owned_entry(open_id, state: "timekeeping")["locked"]).to be(false)
+  end
+end
+
+RSpec.describe "owned_entry lock state in the rollback state", committed_data: true, owner_state: "rollback" do
+  it "owned_entry in the rollback state reads a locked fixture locked and its unlocked neighbour unlocked" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role(:admin, company)
+    project = create(:project, billable: true, client: create(:client, company:))
+
+    locked_id, open_id = arrange_owned_entries(
+      [{ company:, user:, project:, note: "rollback locked", locked: true },
+       { company:, user:, project:, note: "rollback open" }], state: "rollback"
+    )
+
+    # "locked fixtures still read locked in the legacy and rollback states"
+    expect(owned_entry(locked_id, state: "rollback")["locked"]).to be(true)
+    expect(owned_entry(open_id, state: "rollback")["locked"]).to be(false)
+    reserved_ids = ActiveRecord::Base.connection.select_values("SELECT entry_id FROM reservations").map(&:to_i)
+    expect(reserved_ids.count(locked_id)).to eq(1)
+    expect(reserved_ids).not_to include(open_id)
+  end
+end
+
+RSpec.describe "TimekeepingOwnedEntries.checkpoint_of with reservations" do
+  it "checkpoint_of carries the locked entry's reservation beside its entry and leaves every other table empty" do
+    stamp = Time.current.utc.floor(6)
+    entry = TimekeepingOwnedEntries.normalize([{ company: 41, user: 42, project: 43, locked: true }])
+      .first.merge("id" => 900_951)
+    entry_row = TimekeepingOwnedEntries.checkpoint_entry_row(entry, stamp)
+    reservation = TimekeepingOwnedEntries.fixture_reservation_row(entry, stamp, operation_id: SecureRandom.uuid)
+
+    # "Change the timekeeping writer (`load_timekeeping_entries`) so each locked row also loads one `reservations` row in the same checkpoint."
+    rows = TimekeepingOwnedEntries.checkpoint_of("entries" => [entry_row], "reservations" => [reservation]).rows
+
+    expect(rows.fetch("entries").pluck("id")).to eq([900_951])
+    expect(rows.fetch("reservations").size).to eq(1)
+    expect(rows.fetch("reservations").first.values_at("company_id", "entry_id", "state", "disposition"))
+      .to eq([41, 900_951, "committed", "active"])
+    expect(rows.fetch("reservations").first.fetch("invoice_operation_id")).to be_nil
+    other_tables = Timekeeping::Handoff::Checkpoint::TABLES.keys - %w[entries reservations]
+    expect(other_tables.map { |table| rows.fetch(table) }).to all(eq([]))
+  end
+end
+
+RSpec.describe "arrange_owned_entries keeping reservations across timekeeping loads", committed_data: true do
+  it "a second timekeeping arrange after a locked batch still loads the first batch's reservation exactly once" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role(:admin, company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    loaded_reservations = []
+    store = Object.new
+    store.define_singleton_method(:fence_admission) { nil }
+    store.define_singleton_method(:load_checkpoint) do |checkpoint|
+      loaded_reservations << checkpoint.rows.fetch("reservations")
+      checkpoint
+    end
+    store.define_singleton_method(:advance_entry_id_sequence) { |above:| above + 1 }
+    store.define_singleton_method(:admit) { |generation:| generation }
+
+    locked_id = arrange_owned_entries([{ company:, user:, project:, note: "first locked", locked: true }],
+                                      state: "timekeeping", timekeeping_store: store).first
+    open_id = arrange_owned_entries([{ company:, user:, project:, note: "second open" }],
+                                    state: "timekeeping", timekeeping_store: store).first
+
+    # "A checkpoint load replaces whole tables, so a later `arrange_owned_entries` call in the same example must keep earlier reservations."
+    second_load = loaded_reservations.last
+    expect(second_load.map { |row| row.fetch("entry_id") }).to eq([locked_id])
+    expect(second_load.first.fetch("company_id")).to eq(company.id)
+    expect(second_load.map { |row| row.fetch("entry_id") }).not_to include(open_id)
+    # The kept reservation is the same row, not a fresh one built again for the earlier entry.
+    expect(second_load.first.fetch("operation_id")).to eq(loaded_reservations.first.first.fetch("operation_id"))
+  end
+end
+
+RSpec.describe "arrange_owned_entries retrying a failed locked timekeeping load", committed_data: true do
+  it "a timekeeping retry after a failed locked load carries one reservation for the locked entry, not two" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role(:admin, company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    load_failure = Class.new(StandardError)
+    failing_load = true
+    loaded_reservations = []
+    store = Object.new
+    store.define_singleton_method(:fence_admission) { nil }
+    store.define_singleton_method(:load_checkpoint) do |checkpoint|
+      raise load_failure, "load refused" if failing_load
+
+      loaded_reservations << checkpoint.rows.fetch("reservations")
+      checkpoint
+    end
+    store.define_singleton_method(:advance_entry_id_sequence) { |above:| above + 1 }
+    store.define_singleton_method(:admit) { |generation:| generation }
+    rows = [{ company:, user:, project:, id: 900_931, note: "locked retry", locked: true }]
+
+    expect { arrange_owned_entries(rows, state: "timekeeping", timekeeping_store: store) }
+      .to raise_error(load_failure, "load refused")
+    failing_load = false
+    arrange_owned_entries(rows, state: "timekeeping", timekeeping_store: store)
+
+    # "Change the timekeeping writer (`load_timekeeping_entries`) so each locked row also loads one `reservations` row in the same checkpoint."
+    # A failed load must record nothing, or the retry would carry a second committed reservation for the same entry.
+    expect(loaded_reservations.size).to eq(1)
+    expect(loaded_reservations.first.map { |row| row.fetch("entry_id") }).to eq([900_931])
+  end
+end
+
+RSpec.describe "arrange_owned_entries reservations for several locked timekeeping rows", committed_data: true do
+  it "two locked rows in one timekeeping arrange each get their own reservation with a distinct random operation_id and no invoice operation" do
+    company = create(:company)
+    user = create(:user, current_workspace_id: company.id)
+    create(:employment, company:, user:)
+    user.add_role(:admin, company)
+    project = create(:project, billable: true, client: create(:client, company:))
+    loaded_reservations = []
+    store = Object.new
+    store.define_singleton_method(:fence_admission) { nil }
+    store.define_singleton_method(:load_checkpoint) do |checkpoint|
+      loaded_reservations << checkpoint.rows.fetch("reservations")
+      checkpoint
+    end
+    store.define_singleton_method(:advance_entry_id_sequence) { |above:| above + 1 }
+    store.define_singleton_method(:admit) { |generation:| generation }
+
+    first_id, open_id, second_id = arrange_owned_entries(
+      [{ company:, user:, project:, note: "locked one", locked: true },
+       { company:, user:, project:, note: "open" },
+       { company:, user:, project:, note: "locked two", locked: true }],
+      state: "timekeeping", timekeeping_store: store
+    )
+
+    reservations = loaded_reservations.last
+    expect(reservations.map { |row| row.fetch("entry_id") }).to contain_exactly(first_id, second_id)
+    expect(reservations.map { |row| row.fetch("entry_id") }).not_to include(open_id)
+    # "a random `operation_id`"
+    operation_ids = reservations.map { |row| row.fetch("operation_id") }
+    expect(operation_ids.uniq.size).to eq(2)
+    # "`invoice_operation_id` nil"
+    expect(reservations.map { |row| row.fetch("invoice_operation_id") }).to all(be_nil)
+    expect(reservations.map(&:keys)).to all(match_array(Timekeeping::Handoff::Checkpoint::TABLES.fetch("reservations")))
+  end
+end
