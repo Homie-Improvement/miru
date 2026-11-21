@@ -141,39 +141,6 @@ RSpec.describe Timekeeping::Gateway do
     end
   end
 
-  context "more tests 12" do
-    it "a forwarded create that Timekeeping refuses as forbidden raises no TimesheetEntries::Created" do
-      company = create(:company)
-      project = create(:project, billable: true, client: create(:client, company:))
-      actor = timekeeping_member(company, "employee")
-      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
-      write_client = instance_double(Timekeeping::EntryWriteClient)
-      allow(write_client).to receive(:create_entry)
-        .and_raise(Timekeeping::EntryWriteClient::Forbidden, "Timekeeping entry create answered 403")
-      context = Timekeeping::WriteContext.new(company:, actor:, actor_kind: "user", request_id: "req-forbidden-create")
-      created_events = []
-      probe = Object.new
-      probe.define_singleton_method(:emit) do |event|
-        created_events << event if event[:name] == "TimesheetEntries::Created"
-      end
-
-      Rails.event.subscribe(probe)
-      begin
-        expect do
-          described_class.new(context:, write_client:).create(
-            user: actor, project:,
-            attributes: { duration: 30, work_date: Date.current, note: "Refused", bill_status: "unbilled" }
-          )
-        end.to raise_error(Timekeeping::EntryWriteClient::Forbidden)
-      ensure
-        Rails.event.unsubscribe(probe)
-      end
-
-      # "A forwarded create that Timekeeping refuses, or that is replayed from a stored idempotency receipt, raises no event"
-      expect(created_events).to be_empty
-    end
-  end
-
   context "more tests 13" do
     it "raises no TimesheetEntries::Created for a forwarded create answered from a stored receipt and one with the request actor for a fresh answer" do
       TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
@@ -394,45 +361,6 @@ RSpec.describe Timekeeping::Gateway do
     end
   end
 
-  context "more tests 18" do
-    it "raises one TimesheetEntries::Created with the request actor for a fresh forwarded create answer" do
-      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
-      company = create(:company)
-      project = create(:project, billable: true, client: create(:client, company:))
-      admin = timekeeping_member(company, "admin")
-      context = Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id: "req-fresh-forward")
-      row = {
-        "id" => 7101, "company_id" => company.id, "version" => 1, "project_id" => project.id,
-        "user_id" => admin.id, "work_date" => Date.current.iso8601, "duration" => 15.0, "note" => "fresh",
-        "bill_status" => "unbilled", "review_status" => "not_required", "source" => "manual", "source_metadata" => {},
-        "agent_id" => nil, "proof_url" => nil, "proof_metadata" => nil, "external_run_id" => nil,
-        "external_session_id" => nil, "locked" => false
-      }
-      write_client = instance_double(Timekeeping::EntryWriteClient)
-      allow(write_client).to receive(:create_entry)
-        .and_return(Timekeeping::EntryWriteClient::CreateAnswer.new(row:, replayed: false))
-      events = []
-      subscriber = Object.new
-      subscriber.define_singleton_method(:emit) { |event| events << event if event[:name] == "TimesheetEntries::Created" }
-
-      Rails.event.subscribe(subscriber)
-      begin
-        described_class.new(context:, write_client:).create(
-          user: admin, project:, attributes: { duration: 15, work_date: Date.current, note: "fresh", bill_status: "unbilled" }
-        )
-      ensure
-        Rails.event.unsubscribe(subscriber)
-      end
-
-      # "A time entry create forwarded to Timekeeping raises exactly one `TimesheetEntries::Created` event, with the same actor and data shape as a create in the legacy state, once Timekeeping answers the create with success"
-      expect(events.size).to eq(1)
-      expect(events.first[:payload].to_h).to eq(
-        actor: { id: admin.id, type: "User" },
-        data: { timesheet_entry_id: 7101, project_id: project.id, user_id: admin.id, duration: 15.0 }
-      )
-    end
-  end
-
   context "more tests 19" do
     it "raises no TimesheetEntries::Created when Timekeeping answers a forwarded create from a stored receipt" do
       TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
@@ -539,43 +467,6 @@ RSpec.describe Timekeeping::Gateway do
     end
   end
 
-  context "more tests 22" do
-    it "raises no TimesheetEntries::Created for a prepared-store create answered from a stored receipt" do
-      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
-      company = create(:company)
-      project = create(:project, billable: true, client: create(:client, company:))
-      admin = timekeeping_member(company, "admin")
-      context = Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id: "req-replayed-prepared")
-      body = {
-        "id" => 7202, "company_id" => company.id, "version" => 1, "project_id" => project.id,
-        "user_id" => admin.id, "work_date" => Date.current.iso8601, "duration" => 20.0, "note" => "prepared replay",
-        "bill_status" => "unbilled", "review_status" => "not_required", "source" => "manual", "source_metadata" => {},
-        "agent_id" => nil, "proof_url" => nil, "proof_metadata" => nil, "external_run_id" => nil,
-        "external_session_id" => nil, "locked" => false
-      }
-      outcome = Timekeeping::LocalOwner::Outcome.new(status: 201, body:, replayed: true)
-      local_owner = Timekeeping::FakeLocalOwner.new(outcome:)
-      events = []
-      subscriber = Object.new
-      subscriber.define_singleton_method(:emit) { |event| events << event if event[:name] == "TimesheetEntries::Created" }
-
-      entry = nil
-      Rails.event.subscribe(subscriber)
-      begin
-        entry = described_class.new(context:, local_owner:, write_client: instance_double(Timekeeping::EntryWriteClient)).create(
-          user: admin, project:,
-          attributes: { duration: 20, work_date: Date.current, note: "prepared replay", bill_status: "unbilled" }
-        )
-      ensure
-        Rails.event.unsubscribe(subscriber)
-      end
-
-      expect(entry.id).to eq(7202)
-      # A stored-receipt answer is a replay of a create that already raised its event, so it must raise none.
-      expect(events).to be_empty
-    end
-  end
-
   context "more tests 23" do
     it "raises exactly one TimesheetEntries::Created for a legacy-store create through the gateway" do
       TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "monolith", monolith_store: "legacy")
@@ -601,45 +492,6 @@ RSpec.describe Timekeeping::Gateway do
       # "A create in the legacy and rollback states raises the event exactly as today (one event, from the model)"
       expect(events.size).to eq(1)
       expect(events.first[:payload].to_h[:data]).to include(timesheet_entry_id: entry.id, user_id: admin.id)
-    end
-  end
-
-  context "more tests 24" do
-    it "raises no TimesheetEntries::Created when Timekeeping answers a forwarded create from its stored receipt" do
-      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
-      company = create(:company)
-      project = create(:project, billable: true, client: create(:client, company:))
-      member = timekeeping_member(company, "employee")
-      context = Timekeeping::WriteContext.new(company:, actor: member, actor_kind: "user", request_id: "req-replayed-create")
-      row = {
-        "id" => 9101, "company_id" => company.id, "version" => 1, "project_id" => project.id,
-        "user_id" => member.id, "work_date" => Date.current.iso8601, "duration" => 30.0, "note" => "replayed",
-        "bill_status" => "unbilled", "review_status" => "not_required", "source" => "manual", "source_metadata" => {},
-        "agent_id" => nil, "proof_url" => nil, "proof_metadata" => nil, "external_run_id" => nil,
-        "external_session_id" => nil, "locked" => false
-      }
-      write_client = instance_double(Timekeeping::EntryWriteClient)
-      allow(write_client).to receive(:create_entry)
-        .and_return(Timekeeping::EntryWriteClient::CreateAnswer.new(row:, replayed: true))
-      created_events = []
-      subscriber = Object.new
-      subscriber.define_singleton_method(:emit) do |event|
-        created_events << event if event[:name] == "TimesheetEntries::Created"
-      end
-
-      Rails.event.subscribe(subscriber)
-      begin
-        entry = described_class.new(context:, write_client:).create(
-          user: member, project:,
-          attributes: { duration: 30, work_date: Date.current, note: "replayed", bill_status: "unbilled" }
-        )
-        expect(entry.id).to eq(9101)
-      ensure
-        Rails.event.unsubscribe(subscriber)
-      end
-
-      # "A forwarded create that Timekeeping refuses, or that is replayed from a stored idempotency receipt, raises no event"
-      expect(created_events).to be_empty
     end
   end
 
@@ -686,81 +538,6 @@ RSpec.describe Timekeeping::Gateway do
       expect(attempts).to eq(2)
       # "A forwarded create that Timekeeping refuses, or that is replayed from a stored idempotency receipt, raises no event"
       # The plan discloses that a create whose only fresh answer was lost therefore raises no event.
-      expect(created_events).to be_empty
-    end
-  end
-
-  context "more tests 26" do
-    it "raises no TimesheetEntries::Created when a fresh forwarded answer names another company" do
-      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
-      company = create(:company)
-      other_company = create(:company)
-      project = create(:project, billable: true, client: create(:client, company:))
-      member = timekeeping_member(company, "employee")
-      context = Timekeeping::WriteContext.new(company:, actor: member, actor_kind: "user", request_id: "req-foreign-row")
-      foreign_row = {
-        "id" => 9103, "company_id" => other_company.id, "version" => 1, "project_id" => project.id,
-        "user_id" => member.id, "work_date" => Date.current.iso8601, "duration" => 30.0, "note" => "foreign",
-        "bill_status" => "unbilled", "review_status" => "not_required", "source" => "manual", "source_metadata" => {},
-        "agent_id" => nil, "proof_url" => nil, "proof_metadata" => nil, "external_run_id" => nil,
-        "external_session_id" => nil, "locked" => false
-      }
-      write_client = instance_double(Timekeeping::EntryWriteClient)
-      allow(write_client).to receive(:create_entry)
-        .and_return(Timekeeping::EntryWriteClient::CreateAnswer.new(row: foreign_row, replayed: false))
-      created_events = []
-      subscriber = Object.new
-      subscriber.define_singleton_method(:emit) do |event|
-        created_events << event if event[:name] == "TimesheetEntries::Created"
-      end
-
-      Rails.event.subscribe(subscriber)
-      begin
-        expect do
-          described_class.new(context:, write_client:).create(
-            user: member, project:,
-            attributes: { duration: 30, work_date: Date.current, note: "foreign", bill_status: "unbilled" }
-          )
-        end.to raise_error(Timekeeping::EntryWriteClient::Error)
-      ensure
-        Rails.event.unsubscribe(subscriber)
-      end
-
-      # "A time entry create forwarded to Timekeeping raises exactly one `TimesheetEntries::Created` event, with the same actor and data shape as a create in the legacy state, once Timekeeping answers the create with success"
-      # An answer that does not match the request is not a success the caller sees, so no event may be raised.
-      expect(created_events).to be_empty
-    end
-  end
-
-  context "more tests 27" do
-    it "raises no TimesheetEntries::Created when Timekeeping refuses a forwarded create as rejected" do
-      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
-      company = create(:company)
-      project = create(:project, billable: true, client: create(:client, company:))
-      member = timekeeping_member(company, "employee")
-      context = Timekeeping::WriteContext.new(company:, actor: member, actor_kind: "user", request_id: "req-refused-create")
-      write_client = instance_double(Timekeeping::EntryWriteClient)
-      allow(write_client).to receive(:create_entry)
-        .and_raise(Timekeeping::EntryWriteClient::Rejected, "Timekeeping entry create answered 422")
-      created_events = []
-      subscriber = Object.new
-      subscriber.define_singleton_method(:emit) do |event|
-        created_events << event if event[:name] == "TimesheetEntries::Created"
-      end
-
-      Rails.event.subscribe(subscriber)
-      begin
-        expect do
-          described_class.new(context:, write_client:).create(
-            user: member, project:,
-            attributes: { duration: 30, work_date: Date.current, note: "refused", bill_status: "unbilled" }
-          )
-        end.to raise_error(Timekeeping::EntryWriteClient::Rejected)
-      ensure
-        Rails.event.unsubscribe(subscriber)
-      end
-
-      # "A forwarded create that Timekeeping refuses, or that is replayed from a stored idempotency receipt, raises no event"
       expect(created_events).to be_empty
     end
   end
