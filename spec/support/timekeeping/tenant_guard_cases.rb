@@ -113,9 +113,15 @@ module TenantGuardCases
     end
 
     # The requester's valid request with only the case's identifier replaced
-    # by the owner's.
+    # by the owner's. A snapshot delivery probe also leads with a newer valid
+    # snapshot of the requester's own entry, so a guard that applied part of
+    # the batch would move that entry's version.
     def probe_request(kase, requester:, owner:)
-      build(kase, swap(kase, request_values(requester), owner))
+      own = request_values(requester)
+      request = build(kase, swap(kase, own, owner))
+      return request unless kase.contract == :entry_snapshots
+
+      with_newer_own_snapshot(request, own)
     end
 
     # The owner's recorded request with only the company and the
@@ -225,11 +231,21 @@ module TenantGuardCases
       # The batch shape comes from TimekeepingSnapshots, so it holds every
       # contract entry field and is not refused before the tenant check.
       def snapshot_batch(values)
+        TimekeepingSnapshots.batch(snapshot_item(values))
+      end
+
+      def snapshot_item(values)
         entry = TimekeepingSnapshots.entry(
           id: values.fetch(:entry_id), company_id: values.fetch(:company_id), version: values.fetch(:entry_version),
           project_id: values.fetch(:project_id), user_id: values.fetch(:user_id)
         )
-        TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation: values.fetch(:generation)))
+        TimekeepingSnapshots.item(entry, generation: values.fetch(:generation))
+      end
+
+      def with_newer_own_snapshot(request, own)
+        newer = snapshot_item(own.merge(entry_version: own.fetch(:entry_version) + 1))
+        body = request.fetch(:body)
+        request.merge(body: body.merge("snapshots" => [newer, *body.fetch("snapshots")]))
       end
 
       def with_snapshot_company(body, company_id)

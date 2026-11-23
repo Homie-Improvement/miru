@@ -333,8 +333,31 @@ RSpec.describe "Timekeeping tenant guard surfaces and cases" do
         %i[reservations mark_billed invoice_id] => [:path, 5],
         %i[reservations mark_billed operation_id] => body_operation,
         %i[reservations detach_entries operation_id] => body_operation,
-        %i[entry_snapshots deliver entry_id] => [:body, "snapshots", 0, "entry", "id"]
+        %i[entry_snapshots deliver entry_id] => [:body, "snapshots", 1, "entry", "id"]
       }
+    end
+
+    # A snapshot delivery probe leads with the requester's newer own snapshot, which its valid request lacks. The
+    # comparison gives the valid request that same leading snapshot, so only the swapped identifier differs; the
+    # leading snapshot itself is checked by its own example.
+    def guard_cases_with_leading_snapshot(valid, probe)
+      valid_snapshots = valid.dig(:body, "snapshots")
+      return valid unless valid_snapshots && probe.dig(:body, "snapshots").size > valid_snapshots.size
+
+      leading = probe.dig(:body, "snapshots").first
+      valid.merge(body: valid.fetch(:body).merge("snapshots" => [leading, *valid_snapshots]))
+    end
+
+    # "It holds a newer valid snapshot of A's own entry first, then a snapshot naming company A with B's entry id."
+    it "builds the snapshot delivery probe as the requester's newer own snapshot followed by the owner's entry id" do
+      kase = guard_cases_find(:entry_snapshots, :deliver, :probe, [:entry_id])
+      snapshots = TenantGuardCases.probe_request(kase, requester: requester_ids, owner: owner_ids)
+                                  .fetch(:body).fetch("snapshots")
+
+      expect(snapshots.size).to eq(2)
+      expect(snapshots.map { |snapshot| snapshot.fetch("generation") }).to eq([requester_ids.fetch(:generation)] * 2)
+      expect(snapshots.first.fetch("entry")).to include("id" => 501, "company_id" => 101, "version" => 4)
+      expect(snapshots.last.fetch("entry")).to include("id" => 1501, "company_id" => 101)
     end
 
     # "Each case swaps in exactly one foreign identifier and keeps the others valid for the requesting company."
@@ -351,8 +374,11 @@ RSpec.describe "Timekeeping tenant guard surfaces and cases" do
 
       probes.each do |kase|
         label = "#{kase.contract} #{kase.route} #{kase.covers.inspect}"
-        valid = guard_cases_request_leaves(TenantGuardCases.valid_request(kase, ids: requester_ids))
-        probe = guard_cases_request_leaves(TenantGuardCases.probe_request(kase, requester: requester_ids, owner: owner_ids))
+        probe_request = TenantGuardCases.probe_request(kase, requester: requester_ids, owner: owner_ids)
+        valid = guard_cases_request_leaves(
+          guard_cases_with_leading_snapshot(TenantGuardCases.valid_request(kase, ids: requester_ids), probe_request)
+        )
+        probe = guard_cases_request_leaves(probe_request)
 
         expect(probe.keys).to match_array(valid.keys), label
         changed = probe.reject { |at, text| valid[at] == text }
