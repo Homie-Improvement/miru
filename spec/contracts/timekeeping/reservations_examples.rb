@@ -280,6 +280,62 @@ RSpec.shared_examples "timekeeping reservations contract" do
     end
   end
 
+  describe "another company's invoice" do
+    let(:foreign_invoice) { timekeeping_arrange.invoice(company: other_company, invoice_id: 601) }
+    # An entry the foreign invoice really holds, so a provider that bills by
+    # invoice id without checking its owner has something to bill.
+    let(:foreign_billable) do
+      timekeeping_arrange.reserved_entry(company: other_company, invoice_id: foreign_invoice, state: "committed")
+    end
+    let(:not_found_error) { timekeeping_contract_error(:reservations, "not_found") }
+
+    def refusal(response)
+      [response.status, response.body]
+    end
+
+    it "refuses a prepare carrying it with not_found and stores no reservation, operation or receipt" do
+      operation_id = new_key
+      before = reservation_state(x)
+      outbox_before = timekeeping_arrange.outbox_size
+      receipts_before = timekeeping_arrange.stored_receipts(company:)
+      refused = [not_found_error.fetch("status"), not_found_error.fetch("body")]
+
+      expect(refusal(prepare(foreign_invoice, [x], operation_id:))).to eq(refused)
+      expect(reservation_state(x)).to eq(before)
+      expect(timekeeping_arrange.entry_locked(x)).to be(false)
+      expect(timekeeping_arrange.outbox_size).to eq(outbox_before)
+      expect(timekeeping_arrange.stored_receipts(company:)).to eq(receipts_before)
+      # A stored operation would be replayed here instead of refused.
+      expect(refusal(prepare(foreign_invoice, [x], operation_id:))).to eq(refused)
+
+      # A stored operation under this key would make this a reused key.
+      own = prepare(invoice_a, [x], operation_id:)
+
+      expect(own.status).to eq(200)
+      expect(own.body.fetch("state")).to eq("prepared")
+    end
+
+    it "refuses a mark-billed carrying it with not_found and bills nothing or stores a receipt" do
+      operation_id = new_key
+      fields_before = entry_fields(foreign_billable)
+      expect(fields_before.dig(foreign_billable, "bill_status")).to eq("unbilled")
+      outbox_before = timekeeping_arrange.outbox_size
+      receipts_before = timekeeping_arrange.stored_receipts(company:)
+      refused = [not_found_error.fetch("status"), not_found_error.fetch("body")]
+      mark_billed = lambda do
+        reservation_command(:mark_billed, company, service, { "operation_id" => operation_id }, invoice_id: foreign_invoice)
+      end
+
+      expect(refusal(mark_billed.call)).to eq(refused)
+      expect(entry_fields(foreign_billable)).to eq(fields_before)
+      expect(timekeeping_arrange.outbox_size).to eq(outbox_before)
+      # Receipts are keyed by target on some providers, so only a count shows
+      # one stored for the refused invoice.
+      expect(timekeeping_arrange.stored_receipts(company:)).to eq(receipts_before)
+      expect(refusal(mark_billed.call)).to eq(refused)
+    end
+  end
+
   describe "who may call the reservation routes" do
     let(:user_token) { timekeeping_arrange.token_for(timekeeping_arrange.user(company:, role: "owner")) }
     let(:service_without_operations) { timekeeping_arrange.service_identity(company:, name: "reporting", operations: []) }

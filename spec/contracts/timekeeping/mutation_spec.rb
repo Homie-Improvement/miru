@@ -124,7 +124,9 @@ RSpec.describe "Timekeeping contract examples against fakes with one rule broken
     ["stores a receipt for a detach-entries naming another company's agent", :timekeeping_idempotency,
      { timekeeping: { store_unchanged: lambda do |operation:, owned_target_stored_operations:, **|
        owned_target_stored_operations.include?(operation.split.first)
-     end } }]
+     end } }],
+    ["accepts another company's invoice", :reservations, { timekeeping: { invoice_owned: ->(**) { true } } }],
+    ["stores a receipt for a refused foreign invoice", :reservations, { timekeeping: { refused_invoice_receipt: true } }]
   ]
 
   it "passes every group with the unbroken fakes" do
