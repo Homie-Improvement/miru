@@ -23,6 +23,9 @@ RSpec.describe Timekeeping::ReservationOperations, "under concurrent requests" d
   let(:project) { timekeeping_arrange.project(company:) }
   let(:entry_id) { timekeeping_arrange.entry(company:, user:, project:) }
 
+  # The races prepare invoices 501 and 502, so the reference lists both as the company's.
+  before { [501, 502].each { |invoice_id| timekeeping_arrange.invoice(company:, invoice_id:) } }
+
   def race_request(route, operation_id:, invoice_id: 501, entry_ids: [])
     Timekeeping::ReservationOperations::Request.new(
       route:, company_id: company, actor_name: "invoice-boundary", invoice_id:, operation_id:,
