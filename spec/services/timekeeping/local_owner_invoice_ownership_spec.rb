@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "foreign invoice id on prepare" do
@@ -23,8 +25,6 @@ RSpec.describe Timekeeping::LocalOwner, "foreign invoice id on prepare" do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "foreign invoice id on a replayed prepare" do
   it "prepare reusing a stored operation_id with another company's invoice id answers 404 not_found instead of a replay" do
     generation = prepare_local_ownership!.generation.to_s
@@ -47,8 +47,6 @@ RSpec.describe Timekeeping::LocalOwner, "foreign invoice id on a replayed prepar
     expect(entry.reload.attributes).to eq(entry_before)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "foreign invoice id on mark_billed" do
   it "mark_billed carrying another company's invoice id answers 404 not_found, bills nothing and stores no receipt, also on retry" do
@@ -76,8 +74,6 @@ RSpec.describe Timekeeping::LocalOwner, "foreign invoice id on mark_billed" do
     expect(timekeeping_row_counts).to eq(baseline)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner, "stale operation rows for a foreign invoice" do
   it "an invoice_operations row the requester already holds for another company's invoice does not admit prepare or mark_billed" do
@@ -113,8 +109,6 @@ RSpec.describe Timekeeping::LocalOwner, "stale operation rows for a foreign invo
   end
 end
 
-require "rails_helper"
-
 RSpec.describe Timekeeping::LocalOwner, "foreign and unknown invoice ids" do
   it "the refusal for another company's invoice id is the same as for an invoice id that does not exist" do
     generation = prepare_local_ownership!.generation.to_s
@@ -139,8 +133,6 @@ RSpec.describe Timekeeping::LocalOwner, "foreign and unknown invoice ids" do
     expect(answers.last).to eq(answers.first)
   end
 end
-
-require "rails_helper"
 
 RSpec.describe Timekeeping::LocalOwner::InvoiceOwnership do
   it "owned? answers false for another company's invoice, for the requester's operation row naming it, and for another company's operation row" do
