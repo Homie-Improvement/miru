@@ -304,7 +304,8 @@ RSpec.describe TimekeepingIntegrationTags do
 
         # "Every live example here runs under the teardown queue ledger (`spec/support/timekeeping/queue_ledger.rb`), and the suite fails if a job from a non-dedicated queue ran"
         # The ledger activates only when IntegratedRuntime.start runs, which the :integrated_runtime tag triggers.
-        expect(source).to include(":integrated_runtime"), path.to_s
+        untagged = described_class.missing_integrated_runtime(path.to_s, source)
+        expect(untagged).to eq([]), untagged.map { |v| "#{v.line} #{v.kind} #{v.detail}" }.join("\n")
         expect(source).not_to include("TimekeepingLiveInstance"), path.to_s
       end
     end
@@ -619,5 +620,223 @@ RSpec.describe TimekeepingIntegrationTags do
 
       expect { described_class.example_names(source) }.to raise_error(ArgumentError, /line 5\b/)
     end
+  end
+
+  context "more tests 10" do
+  # A recovered parse tree could hide untagged examples, so broken Ruby must never count as proof.
+  it "missing_integrated_runtime refuses source that does not parse instead of reporting no violations" do
+    broken = <<~RUBY
+      RSpec.describe "relay", :integrated_runtime do
+        it "runs live" do
+          if
+        end
+    RUBY
+
+    expect { described_class.missing_integrated_runtime("broken_spec.rb", broken) }
+      .to raise_error(ArgumentError, /line \d+/)
+  end
+  end
+
+  context "more tests 11" do
+  # "Every live example here runs under the teardown queue ledger (`spec/support/timekeeping/queue_ledger.rb`), and the suite fails if a job from a non-dedicated queue ran"
+  it "missing_integrated_runtime does not accept the tag from a comment, a string or a symbol description" do
+    source = <<~RUBY
+      # The :integrated_runtime tag turns on the ledger.
+      RSpec.describe "relay" do
+        it "only a comment" do
+        end
+
+        it "names :integrated_runtime in a string" do
+        end
+
+        it :integrated_runtime do
+        end
+
+        it "is really tagged", :integrated_runtime do
+        end
+      end
+    RUBY
+
+    violations = described_class.missing_integrated_runtime("hostile_spec.rb", source)
+
+    expect(violations.map { |v| [v.kind, v.line] })
+      .to eq([[:missing_integrated_runtime, 3], [:missing_integrated_runtime, 6], [:missing_integrated_runtime, 9]])
+  end
+  end
+
+  context "more tests 12" do
+  # "Every live example here runs under the teardown queue ledger (`spec/support/timekeeping/queue_ledger.rb`), and the suite fails if a job from a non-dedicated queue ran"
+  # The ledger turns on only through the :integrated_runtime metadata, so text that merely mentions it must not count.
+  it "missing_integrated_runtime reports examples whose only integrated_runtime is a comment, a string or a symbol description" do
+    source = <<~RUBY
+      # The :integrated_runtime tag is mentioned here only in a comment.
+      RSpec.describe "relay" do
+        it "mentions :integrated_runtime in its name" do
+        end
+
+        it :integrated_runtime do
+        end
+
+        context :integrated_runtime do
+          it "sits under a symbol description" do
+          end
+        end
+      end
+    RUBY
+
+    violations = described_class.missing_integrated_runtime("spec/integration/timekeeping/example_spec.rb", source)
+
+    expect(violations.map { |violation| [violation.kind, violation.line] })
+      .to eq([[:missing_integrated_runtime, 3], [:missing_integrated_runtime, 6], [:missing_integrated_runtime, 10]])
+    expect(violations.map(&:path).uniq).to eq(["spec/integration/timekeeping/example_spec.rb"])
+  end
+  end
+
+  context "more tests 13" do
+  # "Every live example here runs under the teardown queue ledger (`spec/support/timekeeping/queue_ledger.rb`), and the suite fails if a job from a non-dedicated queue ran"
+  it "missing_integrated_runtime reports only the untagged sibling and accepts the tag as metadata on a group, an example or a hash key" do
+    source = <<~RUBY
+      RSpec.describe "relay" do
+        context "live", :integrated_runtime, committed_data: true do
+          it "runs live" do
+          end
+
+          context "nested" do
+            it "inherits the tag" do
+              before { it "not a declaration" }
+            end
+          end
+        end
+
+        context "not live" do
+          it "runs without the runtime" do
+          end
+        end
+
+        it "tags itself", :integrated_runtime do
+        end
+
+        it "tags itself by key", integrated_runtime: true do
+        end
+      end
+    RUBY
+
+    violations = described_class.missing_integrated_runtime("spec/integration/timekeeping/example_spec.rb", source)
+
+    expect(violations.map { |violation| [violation.kind, violation.line] }).to eq([[:missing_integrated_runtime, 14]])
+  end
+  end
+
+  context "more tests 14" do
+  # A recovered parse tree could hide untagged examples, so broken source must never read as "no violations".
+  it "missing_integrated_runtime raises ArgumentError naming the line when the spec source does not parse" do
+    source = <<~RUBY
+      RSpec.describe "relay" do
+        it "is untagged" do
+        end
+        def broken(
+    RUBY
+
+    expect { described_class.missing_integrated_runtime("spec/integration/timekeeping/broken_spec.rb", source) }
+      .to raise_error(ArgumentError, /line \d+/)
+  end
+  end
+
+  context "more tests 15" do
+  # "Every live example here runs under the teardown queue ledger (`spec/support/timekeeping/queue_ledger.rb`), and the suite fails if a job from a non-dedicated queue ran"
+  it "every example in the late replay and other live handoff specs runs under the integrated runtime that activates the queue ledger" do
+    %w[late_replay_spec.rb money_guard_spec.rb handoff_sequence_spec.rb].each do |name|
+      path = Rails.root.join("spec/integration/timekeeping", name)
+      source = File.read(path)
+
+      violations = described_class.missing_integrated_runtime(path.to_s, source)
+
+      expect(violations).to eq([]), violations.map { |v| "#{path}:#{v.line} #{v.kind} #{v.detail}" }.join("\n")
+      expect(TimekeepingIntegrationTags.example_names(source)).not_to be_empty, path.to_s
+    end
+  end
+  end
+
+  context "more tests 16" do
+  # "Every live example here runs under the teardown queue ledger (`spec/support/timekeeping/queue_ledger.rb`), and the suite fails if a job from a non-dedicated queue ran"
+  # RSpec reads the first argument as the description, so none of these turns on the runtime hook that activates the ledger.
+  it "missing_integrated_runtime reports examples whose only integrated_runtime is a symbol description, a comment or a string" do
+    source = <<~RUBY
+      # The :integrated_runtime tag turns on the ledger.
+      RSpec.describe "late replay" do
+        it :integrated_runtime do
+        end
+
+        context :integrated_runtime do
+          it "runs inside a group named by the symbol" do
+          end
+        end
+
+        it "mentions :integrated_runtime only in its name" do
+        end
+
+        context "tagged", :integrated_runtime do
+          it "is tagged" do
+          end
+        end
+      end
+    RUBY
+
+    violations = described_class.missing_integrated_runtime("late_replay_spec.rb", source)
+
+    expect(violations.map { |violation| [violation.kind, violation.line] })
+      .to eq([[:missing_integrated_runtime, 3], [:missing_integrated_runtime, 7], [:missing_integrated_runtime, 11]])
+  end
+  end
+
+  context "more tests 17" do
+  # "Every live example here runs under the teardown queue ledger (`spec/support/timekeeping/queue_ledger.rb`), and the suite fails if a job from a non-dedicated queue ran"
+  # A recovered parse tree could drop an untagged example, so broken source must never read as "no violations".
+  it "missing_integrated_runtime raises on source that does not parse instead of passing a recovered tree" do
+    source = <<~RUBY
+      RSpec.describe "late replay" do
+        context "tagged", :integrated_runtime do
+          it "is tagged" do
+          end
+        end
+
+        it "is untagged" do
+          if (
+        end
+    RUBY
+
+    expect { described_class.missing_integrated_runtime("late_replay_spec.rb", source) }
+      .to raise_error(ArgumentError, /line \d+/)
+  end
+  end
+
+  context "more tests 18" do
+  # "Every live example here runs under the teardown queue ledger (`spec/support/timekeeping/queue_ledger.rb`), and the suite fails if a job from a non-dedicated queue ran"
+  it "missing_integrated_runtime reports an untagged sibling of a tagged group and ignores calls inside example bodies and hooks" do
+    source = <<~RUBY
+      RSpec.describe "late replay" do
+        context "tagged", :integrated_runtime do
+          before do
+            it "is a call in a hook" do
+            end
+          end
+
+          it "is tagged" do
+            it "is a call in a body" do
+            end
+          end
+        end
+
+        context "untagged sibling" do
+          it "runs without the ledger" do
+          end
+        end
+      end
+    RUBY
+
+    violations = described_class.missing_integrated_runtime("late_replay_spec.rb", source)
+
+    expect(violations.map { |violation| [violation.kind, violation.line] }).to eq([[:missing_integrated_runtime, 15]])
+  end
   end
 end
