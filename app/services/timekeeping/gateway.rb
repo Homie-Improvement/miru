@@ -236,15 +236,9 @@ module Timekeeping
         next replayed_update(replayed, entry_id:, authorize_replay:, scope:) if replayed
 
         found = find_authorized(ownership:, entry_id:, authorize:, scope:)
-        entry = found.entry
         case owner
-        when :prepared
-          local_update(ownership:, found:, project: target, attributes:, identity:)
-        when :timekeeping
-          body = normalized_update_attributes(entry, attributes).merge("project_id" => target.id)
-          row = write_client.update_entry(context:, generation: ownership.generation, entry_id: entry.id,
-                                          version: found.version, body:)
-          hydrate(row, user_id: entry.user_id)
+        when :prepared then local_update(ownership:, found:, project: target, attributes:, identity:)
+        when :timekeeping then forward_update(ownership:, found:, project: target, attributes:)
         end
       end
     end
@@ -509,6 +503,15 @@ module Timekeeping
         row = local_write(ownership:, operation: :update, entry_id: entry.id, if_match: context.if_match || found.version,
                           body: update_body(entry, project:, attributes:), identity:,
                           idempotency_key: request_key(:update, entry.id))
+        hydrate(row, user_id: entry.user_id)
+      end
+
+      # Sends the update to Timekeeping at the version the lookup read.
+      def forward_update(ownership:, found:, project:, attributes:)
+        entry = found.entry
+        body = normalized_update_attributes(entry, attributes).merge("project_id" => project.id)
+        row = write_client.update_entry(context:, generation: ownership.generation, entry_id: entry.id,
+                                        version: found.version, body:)
         hydrate(row, user_id: entry.user_id)
       end
 
