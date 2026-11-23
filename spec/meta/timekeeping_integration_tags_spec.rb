@@ -290,7 +290,7 @@ RSpec.describe TimekeepingIntegrationTags do
 
   describe "the live handoff integration specs" do
     it "money guard and handoff sequence specs exist, carry committed_data, never load the handoff fakes, and run on the integrated runtime" do
-      paths = %w[money_guard_spec.rb handoff_sequence_spec.rb].map do |name|
+      paths = %w[money_guard_spec.rb handoff_sequence_spec.rb late_replay_spec.rb].map do |name|
         Rails.root.join("spec/integration/timekeeping", name)
       end
 

@@ -37,11 +37,14 @@ module LiveHandoff
   )
 
   # The monolith web and CLI routes share ErrorHandler
-  # (app/controllers/concerns/error_handler.rb). Its 404 is left out: that body
-  # carries the record's own not-found message, so it is no fixed pair.
+  # (app/controllers/concerns/error_handler.rb). A key reused for other request
+  # values renders the rejected message with its reason. Its 404 is left out:
+  # that body carries the record's own not-found message, so it is no fixed pair.
   MONOLITH_REFUSALS = TenantGuardCases.frozen_copy(
     [
       { status: 422, body: { "errors" => I18n.t("errors.entry_write_rejected") } },
+      { status: 422, body: { "errors" => I18n.t("errors.entry_write_rejected"),
+                             "reason" => Timekeeping::Gateway::KEY_REUSED_REASON } },
       { status: 409, body: { "errors" => I18n.t("errors.stale_generation"), "reason" => "stale_generation" } }
     ]
   )
@@ -53,6 +56,11 @@ module LiveHandoff
   )
 
   SUCCESS_STATUSES = (200..299)
+
+  # RELAY_LOCK_KEY in timekeeping/app/jobs/relay_job.rb, the session lock the
+  # Timekeeping relay holds while it delivers. That class belongs to the
+  # Timekeeping app and cannot be loaded here.
+  TIMEKEEPING_RELAY_LOCK_KEY = 2_026_034_002
 
   # Request headers that sign a monolith request in, downcased because header
   # names are case-insensitive. web_replay_request drops every one of them from
@@ -79,6 +87,7 @@ module LiveHandoff
                             "AND associated_type = 'Company' AND associated_id = $1",
     entry_audits: "SELECT count(*) FROM entry_audits WHERE company_id = $1",
     legacy_create_receipts: "SELECT count(*) FROM legacy_create_receipts WHERE company_id = $1",
+    legacy_entry_write_receipts: "SELECT count(*) FROM legacy_entry_write_receipts WHERE company_id = $1",
     idempotency_records: "SELECT count(*) FROM idempotency_records WHERE company_id = $1",
     entry_snapshot_receipts: "SELECT count(*) FROM entry_snapshot_receipts WHERE $1 = ANY(company_ids)",
     entry_outbox_items: "SELECT count(*) FROM entry_outbox_items WHERE company_id = $1"
@@ -189,6 +198,26 @@ module LiveHandoff
     { notice: I18n.t("timesheet_entry.#{action}.message"), entry: entry.snippet }.to_json
   end
 
+  # The same reply built from an entry row an owner stored in its receipt
+  # (Timekeeping's idempotency_receipts or the prepared store's
+  # idempotency_records), hydrated as the gateway hydrates an owner's answer.
+  # A row the company would not render, such as one of another company, raises.
+  def expected_web_reply_from_row(row, company:, action:)
+    entry = Timekeeping::EntryReader.hydrate([row], company:, user_id: row["user_id"]).first
+    raise ArgumentError, "the stored row is not an entry of company #{company.id}" if entry.nil?
+
+    { notice: I18n.t("timesheet_entry.#{action}.message"), entry: entry.snippet }.to_json
+  end
+
+  # The refusals of company A's replay of company B's web create. The
+  # controller looks the recorded project up inside A's company before any
+  # receipt is read, so A is refused with ErrorHandler's 404 and the
+  # not-found message of that lookup, which the caller reads by running the
+  # same scoped find. Only that exact pair is added to the monolith refusals.
+  def cross_company_web_refusals(not_found_message:)
+    TenantGuardCases.frozen_copy([*MONOLITH_REFUSALS, { status: 404, body: { "errors" => not_found_message } }])
+  end
+
   # The recorded web request sent again with another company's credentials:
   # path, Idempotency-Key and body as recorded, the recording's credential
   # headers dropped, and X-Auth-Email and X-Auth-Token set to the ones given.
@@ -277,16 +306,43 @@ module LiveHandoff
       rebuild.call
     end
 
+    # Holds both relay session locks around the block, so neither the
+    # runtime's monolith relay nor its Timekeeping relay can deliver inside
+    # it and change a count the block compares. The Timekeeping lock is taken
+    # with a blocking call, so a relay run already past its pause check
+    # finishes before the block starts. Yields the Timekeeping database
+    # connection that holds that lock; closing it afterwards releases it.
+    def with_live_relays_held
+      connection = ActiveRecord::Base.connection
+      connection.select_value(live_relay_lock_sql("pg_advisory_lock"))
+      TimekeepingLiveHandoff.with_timekeeping_database do |timekeeping|
+        timekeeping.exec_params("SELECT pg_advisory_lock($1)", [LiveHandoff::TIMEKEEPING_RELAY_LOCK_KEY])
+        yield timekeeping
+      end
+    ensure
+      connection&.select_value(live_relay_lock_sql("pg_advisory_unlock"))
+    end
+
+    # Each company's counts and state digest in both stores, kept per
+    # company so two companies' values are never combined.
+    def live_tenant_states(company_ids)
+      timekeeping_url = ENV.fetch(TimekeepingDatabaseReset::DATABASE_URL_KEY)
+      company_ids.index_with do |id|
+        [LiveHandoff.tenant_counts(company_id: id), TenantStateDigest.take(company_id: id, timekeeping_url:)]
+      end
+    end
+
     # Runs one handoff with the configured owners, asserts the stored
     # ownership row moved to the direction's owner at a higher generation with
     # no step left, and requires a clean reconciliation report for exactly
-    # company_ids. Returns the parsed report.
-    def run_live_handoff(direction, company_ids:)
+    # company_ids. Returns the parsed report. The observer receives the
+    # runner's step events, so a proof can act between steps of a checked run.
+    def run_live_handoff(direction, company_ids:, observer: Timekeeping::Handoff::NullObserver.new)
       owner_before, generation_before, = live_handoff_ownership_row
       report_root = Pathname(Dir.mktmpdir("timekeeping-live-handoff"))
 
       # No owners: argument, so the run uses Runner.configured_owners.
-      Timekeeping::Handoff::Runner.run(direction:, report_root:)
+      Timekeeping::Handoff::Runner.run(direction:, report_root:, observer:)
 
       owner, generation, handoff_step = live_handoff_ownership_row
       expect(owner).to eq(EXPECTED_OWNER.fetch(direction))
@@ -307,6 +363,10 @@ module LiveHandoff
       def rebuild_live_handoff_integrations
         allow(Rails.application.config).to receive(:to_prepare).and_yield
         load Rails.root.join(HANDOFF_INITIALIZER).to_s
+      end
+
+      def live_relay_lock_sql(function)
+        ActiveRecord::Base.sanitize_sql_array(["SELECT #{function}(?)", Timekeeping::RelayJob::RELAY_LOCK_KEY])
       end
 
       def live_handoff_ownership_row
