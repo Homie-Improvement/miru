@@ -7,7 +7,8 @@ require "tmpdir"
 # Shared helpers for the live Timekeeping specs that run real handoffs against
 # the demo runtime (spec/support/timekeeping/integrated_runtime.rb): relay
 # pause and resume, per-run report roots, a setup cutover, a bounded catch-up,
-# readers for money, receipts and queued counts, and a teardown that puts the
+# readers for money, receipts, queued counts and positions and the ownership
+# row, and a teardown that puts the
 # relay, ENV and the handoff integrations back however the example ended.
 #
 # The module functions take what they touch as arguments, so
@@ -181,6 +182,31 @@ module TimekeepingLiveHandoff
     Integer(connection.exec_params(sql, params).getvalue(0, 0))
   end
 
+  # Unsent outbox positions of one company, in order.
+  def queued_positions(connection, company_id:)
+    connection.exec_params(
+      "SELECT outbox_position FROM outbox_snapshots WHERE sent_at IS NULL AND company_id = $1 ORDER BY outbox_position",
+      [Integer(company_id)]
+    ).column_values(0).map { |position| Integer(position) }
+  end
+
+  # receipts: EntrySnapshotReceipt-like objects answering id and response_body.
+  # One receipt covers every company in its batch, so each receipt above the
+  # baseline counts once; summing per company would count it twice.
+  def applied_since(receipts, baseline_id:)
+    receipts.select { |receipt| receipt.id > baseline_id }.each_with_object({ applied: 0, ignored: 0 }) do |receipt, sums|
+      sums[:applied] += Integer(receipt.response_body.fetch("applied"))
+      sums[:ignored] += Integer(receipt.response_body.fetch("ignored"))
+    end
+  end
+
+  # The whole ownership row as JSON text, read through the raw connection so
+  # Active Record's query cache cannot answer with an older row. Comparing the
+  # text shows any column change.
+  def ownership_row_text(connection)
+    connection.exec("SELECT row_to_json(ownership)::text FROM timekeeping_ownership ownership").getvalue(0, 0)
+  end
+
   # Idempotency receipts of one company, user and service receipts together.
   def receipt_count(connection, company_id:)
     Integer(connection.exec_params(<<~SQL.squish, [Integer(company_id)]).getvalue(0, 0))
@@ -283,5 +309,51 @@ RSpec.shared_context "timekeeping live handoff" do
       }
     )
     through
+  end
+
+  # An abort finishes only settle and freeze, so it writes no
+  # reconciliation report. This runs the same checks the reconcile step runs
+  # for a handoff out of Timekeeping: the outgoing owner's state now, and the
+  # copy a resume would load, against the projection, the intents, and each
+  # company's money compared with the money_before file the abort's settle
+  # step stored under report_root. Returns the Reconciliation::Result.
+  def live_handoff_aborted_reconciliation(report_root)
+    handoff = Timekeeping::Handoff
+    generation = TimekeepingOwnership.uncached { TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).generation }
+    store = handoff::TimekeepingStore.new
+    source = store.export_checkpoint
+    loaded = handoff::ReservationLocks.build(source)
+    ActiveRecord::Base.uncached do
+      intents = handoff::RowReader.select_rows(InvoiceOperationsRecord.connection, handoff::Runner::INTENTS_SQL)
+      # The same differences Runner#listed_corrections accepts: the locked
+      # values the copy derives from reservations, and the receipts of
+      # operations the legacy store committed before it was retired.
+      legacy_receipts = handoff::LegacyOperationsCheck.listed_receipts(
+        source_intents: intents, intents:, legacy_retired_at: TimekeepingOwnership.current.legacy_retired_at
+      )
+      listed_corrections = handoff::ReservationLocks.listed_corrections(source:, loaded:)
+                                                   .merge(legacy_receipts) { |_company_id, locks, receipts| locks + receipts }
+      handoff::Reconciliation.run(
+        source:, checkpoint: loaded,
+        projection: handoff::RowReader.select_rows(ActiveRecord::Base.connection, handoff::Runner::PROJECTION_SQL),
+        source_intents: intents, intents:,
+        next_entry_id: live_handoff_next_entry_id,
+        money_before: handoff::ReportDirectory.new(root: report_root, generation:).read_money_before,
+        money_after: Company.order(:id).pluck(:id).index_with { |id| TimekeepingLiveHandoff.money(company_id: id) },
+        listed_corrections:
+      )
+    end
+  end
+
+  # The id Timekeeping's entry sequence hands out next, read without setval or
+  # nextval: TimekeepingStore#advance_entry_id_sequence would raise a sequence
+  # left behind by the abort before Reconciliation could report it.
+  def live_handoff_next_entry_id
+    TimekeepingLiveHandoff.with_timekeeping_database do |connection|
+      sequence = connection.exec("SELECT pg_get_serial_sequence('entries', 'id')").getvalue(0, 0)
+      quoted = connection.quote_ident(sequence.split(".", 2).map { |part| part.delete('"') })
+      Integer(connection.exec("SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END FROM #{quoted}")
+                        .getvalue(0, 0))
+    end
   end
 end
