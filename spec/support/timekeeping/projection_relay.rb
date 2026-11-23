@@ -66,9 +66,13 @@ module TimekeepingProjectionRelay
 
   # Delivers the company's rows when the prepared store owns the entries, or
   # when a live Timekeeping app owns them, and does nothing in any other
-  # state, where writes never reach an outbox this run can drain. Only the
-  # given company's delivery is checked, because one company's refusal is
-  # reported for the company it belongs to.
+  # state, where writes never reach an outbox this run can drain.
+  #
+  # In rollback only the given company's unsent rows are checked, because the
+  # prepared store's relay delivers each company on its own. The live drain
+  # covers every unsent row through the service's highest outbox position,
+  # whatever its company, so another company's refused snapshot also fails
+  # the wait; there the company only picks which consumer answer is reported.
   def relay_local_entries_to_projection(company)
     live = TimekeepingRegressionAdapter.current
     # A live wait's deadline counts from this call, so the time spent reading

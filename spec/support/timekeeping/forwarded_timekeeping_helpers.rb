@@ -128,8 +128,11 @@ end
 module ForwardedTimekeepingRequestLog
   IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
 
+  # Per-thread, so two overlapping unrecorded blocks on different threads
+  # cannot restore each other's setting and leave recording off.
+  PAUSED_KEY = :forwarded_timekeeping_request_log_paused
+
   @requests = []
-  @paused = false
 
   class << self
     def requests
@@ -144,19 +147,20 @@ module ForwardedTimekeepingRequestLog
     # own calls to the live app, such as the drain that delivers snapshots to
     # the projection, are not requests the monolith forwarded, so they must not
     # appear in the exact lists specs check. Recording resumes even when the
-    # block raises.
+    # block raises. WebMock records a request on the thread that sent it, so
+    # only requests this thread sends inside the block are left out.
     def unrecorded
-      paused_before = @paused
-      @paused = true
+      paused_before = Thread.current[PAUSED_KEY]
+      Thread.current[PAUSED_KEY] = true
       yield
     ensure
-      @paused = paused_before
+      Thread.current[PAUSED_KEY] = paused_before
     end
 
     # Records request_signature when it went to the running live app's host
     # and port, whatever its path; requests to any other address are left out.
     def record(request_signature)
-      return if @paused
+      return if Thread.current[PAUSED_KEY]
 
       live = TimekeepingRegressionAdapter.current
       return unless live
