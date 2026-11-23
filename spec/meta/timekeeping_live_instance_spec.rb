@@ -256,7 +256,6 @@ RSpec.describe TimekeepingLiveInstance do
     end
   end
 
-  context "more tests 2" do
   # "The monolith serves invoice facts `{id, company_id}` on the reference endpoint, the pattern of `docs/architecture/timekeeping-soa.md` line 378."
   # Live runs read invoice facts through this stub, so it must answer them as the real endpoint does.
   it "live reference stub forwards invoice_ids and lists only the path company's invoice as {id, company_id}" do
@@ -276,6 +275,5 @@ RSpec.describe TimekeepingLiveInstance do
 
     expect(status).to eq(200)
     expect(facts.fetch("invoices")).to eq([{ "id" => own_invoice.id, "company_id" => company.id }])
-  end
   end
 end
