@@ -323,7 +323,6 @@ RSpec.shared_context "timekeeping live handoff" do
     store = handoff::TimekeepingStore.new
     source = store.export_checkpoint
     loaded = handoff::ReservationLocks.build(source)
-    highest_entry_id = source.rows.fetch("entries").pluck("id").max || 0
     ActiveRecord::Base.uncached do
       intents = handoff::RowReader.select_rows(InvoiceOperationsRecord.connection, handoff::Runner::INTENTS_SQL)
       # The same differences Runner#listed_corrections accepts: the locked
@@ -338,11 +337,23 @@ RSpec.shared_context "timekeeping live handoff" do
         source:, checkpoint: loaded,
         projection: handoff::RowReader.select_rows(ActiveRecord::Base.connection, handoff::Runner::PROJECTION_SQL),
         source_intents: intents, intents:,
-        next_entry_id: store.advance_entry_id_sequence(above: highest_entry_id),
+        next_entry_id: live_handoff_next_entry_id,
         money_before: handoff::ReportDirectory.new(root: report_root, generation:).read_money_before,
         money_after: Company.order(:id).pluck(:id).index_with { |id| TimekeepingLiveHandoff.money(company_id: id) },
         listed_corrections:
       )
+    end
+  end
+
+  # The id Timekeeping's entry sequence hands out next, read without setval or
+  # nextval: TimekeepingStore#advance_entry_id_sequence would raise a sequence
+  # left behind by the abort before Reconciliation could report it.
+  def live_handoff_next_entry_id
+    TimekeepingLiveHandoff.with_timekeeping_database do |connection|
+      sequence = connection.exec("SELECT pg_get_serial_sequence('entries', 'id')").getvalue(0, 0)
+      quoted = connection.quote_ident(sequence.split(".", 2).map { |part| part.delete('"') })
+      Integer(connection.exec("SELECT CASE WHEN is_called THEN last_value + 1 ELSE last_value END FROM #{quoted}")
+                        .getvalue(0, 0))
     end
   end
 end

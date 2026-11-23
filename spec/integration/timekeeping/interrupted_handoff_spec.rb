@@ -36,10 +36,6 @@ RSpec.describe "Timekeeping interrupted handoff", :integrated_runtime, :two_tena
       response = Net::HTTP.start(uri.host, uri.port) { |http| http.request(request) }
       expect(response.code).to eq("200"), "entry create answered #{response.code}"
     end
-    applied = lambda do |receipt|
-      body = receipt.response_body
-      Integer((body.is_a?(String) ? JSON.parse(body) : body).fetch("applied"))
-    end
     state = lambda do
       ActiveRecord::Base.uncached do
         {
@@ -80,8 +76,8 @@ RSpec.describe "Timekeeping interrupted handoff", :integrated_runtime, :two_tena
       live_handoff_resume_relay
       expect(runner.run(direction: :rollback, resume: true, report_root:, sleeper: no_wait)).to be_nil
 
-      new_receipts = ActiveRecord::Base.uncached { EntrySnapshotReceipt.where("id > ?", baseline).order(:id).to_a }
-      expect(new_receipts.sum { |receipt| applied.call(receipt) }).to eq(queued)
+      receipts = ActiveRecord::Base.uncached { EntrySnapshotReceipt.order(:id).to_a }
+      expect(TimekeepingLiveHandoff.applied_since(receipts, baseline_id: baseline)).to eq(applied: queued, ignored: 0)
 
       # Receipt sums cannot show a wrong final row, so the projection is also
       # compared with the outgoing Timekeeping store, company by company.
@@ -308,8 +304,8 @@ RSpec.describe "Timekeeping interrupted handoff, resumed from before_freeze", :i
 
       # "Exactly-once: read the `EntrySnapshotReceipt` rows written after the interrupt. The sum of their `"applied"` counts must equal the queued count."
       receipts = ih_resume_receipts_above(receipt_baseline)
-      expect(receipts.sum { |receipt| receipt.response_body.fetch("applied") }).to eq(queued.size)
-      expect(receipts.sum { |receipt| receipt.response_body.fetch("ignored", 0) }).to eq(0)
+      expect(TimekeepingLiveHandoff.applied_since(receipts, baseline_id: receipt_baseline))
+        .to eq(applied: queued.size, ignored: 0)
       expect(ih_resume_queued_positions(companies)).to eq([])
 
       ownership = ActiveRecord::Base.uncached { TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID) }
@@ -374,6 +370,8 @@ RSpec.describe "Timekeeping interrupted handoff, interrupted at during_checkpoin
       queued = ih_checkpoint_queued(companies)
       expect(queued.size).to eq(entry_ids.size)
       expect(ih_checkpoint_projected_ids(entry_ids)).to eq([])
+      company_ids = companies.map(&:id)
+      money_before = company_ids.index_with { |id| TimekeepingLiveHandoff.money(company_id: id) }
 
       rollback_root = live_handoff_report_root
       interrupt = TimekeepingHandoffHooks::Interrupt.new(at: :during_checkpoint)
@@ -404,7 +402,16 @@ RSpec.describe "Timekeeping interrupted handoff, interrupted at during_checkpoin
 
       expect(Timekeeping::Handoff::Runner.run(direction: :rollback, resume: true, report_root: rollback_root,
                                               sleeper: no_wait)).to be_nil
-      expect(ActiveRecord::Base.uncached { TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).owner }).to eq("monolith")
+      ownership = ActiveRecord::Base.uncached { TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID) }
+      expect(ownership.owner).to eq("monolith")
+
+      # "Reconciliation and money checks pass after each resumed or aborted handoff, on each seeded company"
+      report = JSON.parse(File.read(rollback_root.join("generation-#{ownership.generation}", "reconciliation.json")))
+      expect(LiveHandoff.reconciliation_failures(report, company_ids:)).to eq([])
+      company_ids.each do |id|
+        expect(Timekeeping::FinancialSnapshot.compare(money_before.fetch(id), TimekeepingLiveHandoff.money(company_id: id)))
+          .to eq([]), "money of company #{id} changed"
+      end
     end
   end
 end
