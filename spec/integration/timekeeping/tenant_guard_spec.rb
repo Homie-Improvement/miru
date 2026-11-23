@@ -51,11 +51,6 @@ RSpec.describe "Timekeeping tenant guard", type: :request, committed_data: true 
     %i[update destroy bulk_move bulk_delete prepare commit abort mark_billed detach_entries].freeze
   end
 
-  # The entry API routes that change an existing entry.
-  def tenant_guard_entry_write_routes
-    %i[update destroy bulk_move bulk_delete].freeze
-  end
-
   # The service token operation each reservations route requires.
   def tenant_guard_route_operations
     {
@@ -69,21 +64,34 @@ RSpec.describe "Timekeeping tenant guard", type: :request, committed_data: true 
 
   # Where each owner identifier kind is stored, per contract and route:
   # [database, SQL with $1 the owner's company and $2 the identifier, ids key].
+  # Each row holds the stored row's id and, for a receipt, the answer body it
+  # stores, which a replay under another company must never return.
   def tenant_guard_identifier_lookup(kase, kind)
     case [kase.contract, kase.route, kind]
     in [_, _, :entry_id]
-      [:timekeeping, "SELECT 1 FROM entries WHERE company_id = $1 AND id = $2", :entry_id]
+      [:timekeeping, "SELECT id, NULL AS body FROM entries WHERE company_id = $1 AND id = $2", :entry_id]
     in [_, _, :invoice_id]
-      [:monolith, "SELECT 1 FROM invoices WHERE company_id = $1 AND id = $2", :invoice_id]
+      [:monolith, "SELECT id, NULL AS body FROM invoices WHERE company_id = $1 AND id = $2", :invoice_id]
     in [:reservations, :prepare | :commit | :abort, :operation_id | :idempotency_key]
-      [:timekeeping, "SELECT 1 FROM invoice_operations WHERE company_id = $1 AND operation_id = $2::uuid", :operation_id]
+      [:timekeeping, "SELECT id, NULL AS body FROM invoice_operations WHERE company_id = $1 AND operation_id = $2::uuid",
+       :operation_id]
     in [:reservations, :mark_billed | :detach_entries, :operation_id | :idempotency_key]
-      [:timekeeping, "SELECT 1 FROM service_idempotency_receipts WHERE company_id = $1 AND key = $2", :operation_id]
+      [:timekeeping, "SELECT id, body FROM service_idempotency_receipts WHERE company_id = $1 AND key = $2", :operation_id]
     in [:entry_api, _, :idempotency_key]
-      [:timekeeping, "SELECT 1 FROM idempotency_receipts WHERE company_id = $1 AND key = $2", :idempotency_key]
+      [:timekeeping, "SELECT id, body FROM idempotency_receipts WHERE company_id = $1 AND key = $2", :idempotency_key]
     in [:entry_snapshots, _, :idempotency_key]
-      [:monolith, "SELECT 1 FROM entry_snapshot_receipts WHERE $1 = ANY(company_ids) AND key = $2", :idempotency_key]
+      [:monolith, "SELECT id, response_body AS body FROM entry_snapshot_receipts WHERE $1 = ANY(company_ids) AND key = $2",
+       :idempotency_key]
     end
+  end
+
+  # What an owner's entry write control must leave on its entry, so a route
+  # that answers 2xx while changing nothing cannot pass as the positive
+  # control: the bulk result naming the entry (nil on a single-entry route)
+  # and whether the entry ends discarded. Every write also advances the
+  # entry's version by one (Timekeeping::EntryWriter#apply_change).
+  def tenant_guard_entry_write_effects
+    { update: [nil, false], destroy: [nil, true], bulk_move: ["moved", false], bulk_delete: ["deleted", true] }.freeze
   end
 
   # The owner's own requests a case needs before its identifier exists:
@@ -158,15 +166,40 @@ RSpec.describe "Timekeeping tenant guard", type: :request, committed_data: true 
     owner_own = tenant_guard_own_ids(kase, ids.fetch(:owner), owner, label)
     tenant_guard_run_owner_setup(kase, owner_own, owner, label)
     recorded = tenant_guard_own_request(kase, owner_own, owner, "#{label} owner control") if tenant_guard_owner_first?(kase)
-    tenant_guard_expect_owner_identifiers(kase, ids.fetch(:owner), label)
+    stored = tenant_guard_expect_owner_identifiers(kase, ids.fetch(:owner), label)
     requester_own = tenant_guard_requester_precondition(kase, ids.fetch(:requester), requester, label)
 
     request = tenant_guard_requester_request(kase, recorded, ids, requester)
-    tenant_guard_compare(kase, request, ids, requester:, label:, recorded:)
+    tenant_guard_compare(kase, request, ids, requester:, label:, recorded: recorded&.merge(stored:))
 
     tenant_guard_abort(requester_own, requester, "#{label} requester") if requester_own
-    tenant_guard_own_request(kase, owner_own, owner, "#{label} owner control") if tenant_guard_owner_after?(kase)
+    tenant_guard_owner_control_after(kase, owner_own, owner, label) if tenant_guard_owner_after?(kase)
     tenant_guard_abort(owner_own, owner, "#{label} owner") if kase.contract == :reservations && kase.route == :prepare
+  end
+
+  # The owner's control after a requester-first probe. On an entry write it
+  # must also have changed the owner's entry as the route says.
+  def tenant_guard_owner_control_after(kase, owner_own, owner, label)
+    control = tenant_guard_own_request(kase, owner_own, owner, "#{label} owner control")
+    return unless tenant_guard_entry_write?(kase)
+
+    bulk_result, discarded = tenant_guard_entry_write_effects.fetch(kase.route)
+    entry_id = owner_own.fetch(:entry_ids).first
+    if bulk_result
+      expect(tenant_guard_json(control.fetch(:reply))["results"])
+        .to eq([{ "entry_id" => entry_id, "result" => bulk_result }]), "#{label}: the owner control's bulk result"
+    end
+    stored = tenant_guard_timekeeping_rows(
+      "SELECT version, discarded_at IS NOT NULL AS discarded FROM entries WHERE company_id = $1 AND id = $2",
+      [owner_own.fetch(:company_id), entry_id]
+    )
+    expect(stored).to eq([{ "version" => (owner_own.fetch(:entry_versions).fetch(entry_id) + 1).to_s,
+                            "discarded" => discarded ? "t" : "f" }]),
+                      "#{label}: the owner control left entry #{entry_id} as #{stored.inspect}"
+  end
+
+  def tenant_guard_entry_write?(kase)
+    kase.contract == :entry_api && tenant_guard_entry_write_effects.key?(kase.route)
   end
 
   # The ids a company's own write requests use. The seed's unbilled entries are
@@ -175,7 +208,7 @@ RSpec.describe "Timekeeping tenant guard", type: :request, committed_data: true 
   # the company creates for itself. The foreign identifiers a probe sends stay
   # the seeded ones.
   def tenant_guard_own_ids(kase, party_ids, party, label)
-    return party_ids unless kase.contract == :reservations || tenant_guard_entry_write_routes.include?(kase.route)
+    return party_ids unless kase.contract == :reservations || tenant_guard_entry_write?(kase)
 
     create = TenantGuardCases::ALL.find { |candidate| candidate.contract == :entry_api && candidate.route == :create }
     created = tenant_guard_own_request(create, party_ids.merge(idempotency_key: SecureRandom.uuid), party,
@@ -242,13 +275,15 @@ RSpec.describe "Timekeeping tenant guard", type: :request, committed_data: true 
     tenant_guard_own_route_request(:reservations, :abort, party_ids, party, "#{label} abort")
   end
 
+  # Returns the stored rows found for each identifier kind the case covers.
   def tenant_guard_expect_owner_identifiers(kase, owner_ids, label)
-    (kase.covers - [:none]).each do |kind|
+    (kase.covers - [:none]).to_h do |kind|
       database, sql, key = tenant_guard_identifier_lookup(kase, kind)
       value = key == :entry_id ? owner_ids.fetch(:entry_ids).first : owner_ids.fetch(key)
       params = [owner_ids.fetch(:company_id), value.to_s]
       rows = database == :timekeeping ? tenant_guard_timekeeping_rows(sql, params) : tenant_guard_monolith_rows(sql, params)
       expect(rows).not_to be_empty, "#{label}: the owner's #{kind} #{value} is not stored under the owner's company"
+      [kind, rows]
     end
   end
 
@@ -274,17 +309,22 @@ RSpec.describe "Timekeeping tenant guard", type: :request, committed_data: true 
   end
 
   def tenant_guard_compare(kase, request, ids, requester:, label:, recorded:)
-    company_ids = [ids.fetch(:requester).fetch(:company_id), ids.fetch(:owner).fetch(:company_id)]
     observed_before = tenant_guard_observed(kase, ids)
-    before = tenant_guard_states(company_ids, "#{label} baseline")
-    reply = LiveHandoff.send_request(tenant_guard_base_url(kase), request)
-    unused_reply = tenant_guard_unused_operation_reply(kase, ids, requester)
-    after = tenant_guard_states(company_ids, "#{label} after")
-
-    expect(after).to eq(before), "#{label}: a digest changed"
+    reply = tenant_guard_unchanged(kase, request, ids, label)
     expect(tenant_guard_observed(kase, ids)).to eq(observed_before), "#{label}: the requester's row or a refusal changed"
     tenant_guard_expect_answer(kase, reply, ids.fetch(:owner), label)
+    unused_reply = tenant_guard_unused_operation_reply(kase, ids, requester, label)
     tenant_guard_expect_route_answer(kase, reply, ids, label:, recorded:, unused_reply:)
+  end
+
+  # Sends one request between two sets of all four digests and requires
+  # them equal. Returns the reply.
+  def tenant_guard_unchanged(kase, request, ids, label)
+    company_ids = [ids.fetch(:requester).fetch(:company_id), ids.fetch(:owner).fetch(:company_id)]
+    before = tenant_guard_states(company_ids, "#{label} baseline")
+    reply = LiveHandoff.send_request(tenant_guard_base_url(kase), request)
+    expect(tenant_guard_states(company_ids, "#{label} after")).to eq(before), "#{label}: a digest changed"
+    reply
   end
 
   # Facts the digests leave out but a case still must not change: the
@@ -305,13 +345,13 @@ RSpec.describe "Timekeeping tenant guard", type: :request, committed_data: true 
 
   # For the prepare operation probe, the same request with an operation id no
   # company has used, so the answer to the owner's id is shown to reveal
-  # nothing about whether the owner used it.
-  def tenant_guard_unused_operation_reply(kase, ids, requester)
+  # nothing about whether the owner used it. It must change nothing either.
+  def tenant_guard_unused_operation_reply(kase, ids, requester, label)
     return unless kase.precondition == TenantGuardCases::REQUESTER_OPEN_OPERATION && kase.covers == [:operation_id]
 
     unused_owner = ids.fetch(:owner).merge(operation_id: SecureRandom.uuid)
     probe = TenantGuardCases.probe_request(kase, requester: ids.fetch(:requester), owner: unused_owner)
-    LiveHandoff.send_request(tenant_guard_base_url(kase), tenant_guard_authorized(probe, kase, requester))
+    tenant_guard_unchanged(kase, tenant_guard_authorized(probe, kase, requester), ids, "#{label} unused operation id")
   end
 
   def tenant_guard_expect_answer(kase, reply, owner_ids, label)
@@ -330,7 +370,7 @@ RSpec.describe "Timekeeping tenant guard", type: :request, committed_data: true 
 
   def tenant_guard_expect_route_answer(kase, reply, ids, label:, recorded:, unused_reply:)
     body = tenant_guard_json(reply)
-    tenant_guard_expect_no_owner_receipt(kase, reply, recorded.fetch(:reply), ids, label) if kase.mode == :replay
+    tenant_guard_expect_no_owner_receipt(kase, reply, recorded, ids, label) if kase.mode == :replay
     tenant_guard_expect_entry_list(body, ids, label) if tenant_guard_entry_list?(kase)
     return unless unused_reply
 
@@ -340,26 +380,49 @@ RSpec.describe "Timekeeping tenant guard", type: :request, committed_data: true 
                                                                        "#{label}: an unused operation id answered differently"
   end
 
-  # No id from the owner's stored answer may appear in the requester's answer.
-  # The owner's stored answer must differ from the expected one, or a replay
-  # that returned the owner's receipt would read as the expected answer.
-  def tenant_guard_expect_no_owner_receipt(kase, reply, owner_reply, ids, label)
-    expected, owner_answer = tenant_guard_answers(kase, owner_reply, ids.fetch(:owner))
+  # The requester's answer may carry no id of the owner's answer or of the
+  # stored row behind it (receipt or operation), and neither the owner's
+  # answer nor the stored receipt body, at any depth. The owner's answer must
+  # differ from the expected one, or a replay that returned the owner's
+  # receipt would read as the expected answer.
+  def tenant_guard_expect_no_owner_receipt(kase, reply, recorded, ids, label)
+    owner_body = tenant_guard_json(recorded.fetch(:reply))
+    expected, owner_answer = tenant_guard_answers(kase, recorded.fetch(:reply), ids.fetch(:owner))
     expect(owner_answer).not_to eq(expected), "#{label}: the owner's stored answer equals the expected answer"
-    owner_values = tenant_guard_identifying_values(tenant_guard_json(owner_reply))
-    leaked = owner_values & tenant_guard_identifying_values(tenant_guard_json(reply))
-    expect(leaked).to eq([]), "#{label}: the requester's answer carries the owner's stored ids #{leaked.inspect}"
+
+    stored = recorded.fetch(:stored).fetch(:idempotency_key)
+    owner_ids = tenant_guard_identifying_values(owner_body) + stored.map { |row| row.fetch("id").to_s }
+    owner_bodies = [owner_body, *stored.filter_map { |row| tenant_guard_stored_body(row.fetch("body")) }].reject(&:blank?)
+    answer = tenant_guard_json(reply)
+    leaked = (owner_ids & tenant_guard_identifying_values(answer)) + (owner_bodies & tenant_guard_nested_values(answer))
+    expect(leaked).to eq([]), "#{label}: the requester's answer carries the owner's stored answer #{leaked.inspect}"
   end
 
+  # Values under an id key ("id" or "..._id"), at any depth, as strings.
   def tenant_guard_identifying_values(value)
     case value
     when Hash
       value.flat_map do |key, nested|
-        %w[id entry_id operation_id].include?(key) ? [nested.to_s] : tenant_guard_identifying_values(nested)
+        key == "id" || key.end_with?("_id") ? [nested.to_s] : tenant_guard_identifying_values(nested)
       end
     when Array then value.flat_map { |nested| tenant_guard_identifying_values(nested) }
     else []
     end
+  end
+
+  # The value and every hash or array nested in it.
+  def tenant_guard_nested_values(value)
+    case value
+    when Hash then [value, *value.values.flat_map { |nested| tenant_guard_nested_values(nested) }]
+    when Array then [value, *value.flat_map { |nested| tenant_guard_nested_values(nested) }]
+    else []
+    end
+  end
+
+  # A stored receipt body is JSON text (Timekeeping::WriteOutcome, and jsonb in
+  # entry_snapshot_receipts); an operation row stores no body.
+  def tenant_guard_stored_body(text)
+    text && JSON.parse(text)
   end
 
   # The entry list answers 200 for the requester's own company; it must hold
