@@ -164,13 +164,29 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
   # Prepares the entries for a new draft directly against Timekeeping, the way
   # an invoice save starts, and answers the client and its request.
   def section_9_3_successor_prepare(company:, invoice:, entries:)
-    request = Invoices::ReservationRequest.new(
+    request = section_9_3_reservation_request(company:, invoice:, entries:)
+    client = Timekeeping::ReservationClient.new(http: Timekeeping::ReservationHttp.new)
+    [client, request, client.prepare(request)]
+  end
+
+  # A new active operation for the invoice over the entries, as an invoice
+  # save would build it under the current ownership generation.
+  def section_9_3_reservation_request(company:, invoice:, entries:)
+    Invoices::ReservationRequest.new(
       company_id: company.id, invoice_id: invoice.id, operation_id: SecureRandom.uuid,
       generation: TimekeepingOwnership.current.generation, disposition: Invoices::ReservationDecision::ACTIVE,
       entries: entries.map(&:id)
     )
-    client = Timekeeping::ReservationClient.new(http: Timekeeping::ReservationHttp.new)
-    [client, request, client.prepare(request)]
+  end
+
+  # True when the raw prepare answer is Timekeeping's 409 refusal naming the
+  # entry as provisional_elsewhere.
+  def section_9_3_provisional_elsewhere?(answer, entry)
+    return false unless answer.status == 409 && answer.body.is_a?(Hash) && answer.body["reason"] == "conflict"
+
+    Array(answer.body["conflicts"]).any? do |conflict|
+      conflict["entry_id"] == entry.id && conflict["reason"] == "provisional_elsewhere"
+    end
   end
 
   # The entry as the employee reads it from Timekeeping, whose `locked` is true
@@ -205,6 +221,76 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
     end
   end
 
+  # A reservation adapter that, on a thread carrying a prepare gate, parks at
+  # that gate before it sends the prepare. It is used once per gate.
+  let(:section_9_3_gated_reservations) do
+    Class.new(SimpleDelegator) do
+      def prepare(request)
+        gate = Thread.current.thread_variable_get(:section_9_3_prepare_gate)
+        if gate
+          Thread.current.thread_variable_set(:section_9_3_prepare_gate, nil)
+          gate.reached(ApplicationRecord.connection.select_value("SELECT pg_backend_pid()"))
+        end
+        __getobj__.prepare(request)
+      end
+    end
+  end
+
+  # Saves on a thread with a save checkpoint park after a `prepared` answer;
+  # saves on a thread with a prepare gate park before sending their prepare.
+  def section_9_3_gate_and_park_saves!
+    gated = section_9_3_gated_reservations
+    allow(Invoices::ReservationAdapters).to receive(:for).and_wrap_original do |original, *args, **kwargs|
+      TimekeepingSection93Live::CheckpointedReservations.new(gated.new(original.call(*args, **kwargs)))
+    end
+  end
+
+  # "committed" once the save's thread ended without error; otherwise the
+  # error class, or "still running" when it did not end in time.
+  def section_9_3_save_outcome(thread)
+    thread.join(TimekeepingSection93Live::DEFAULT_POLL_SECONDS) ? "committed" : "still running"
+  rescue StandardError => error
+    error.class.name
+  end
+
+  # Makes the save in this forked child park at the checkpoint just before it
+  # writes the abort outbox row. That write runs inside record_failure's
+  # transaction, after the intent's pending-to-failed update and before
+  # COMMIT, so a kill there leaves the intent pending and no abort row.
+  def section_9_3_park_before_abort_row!(checkpoint)
+    allow_any_instance_of(Invoices::OperationCoordinator).to receive(:insert_outbox_item)
+      .and_wrap_original do |original, request, kind|
+        checkpoint.reached(ApplicationRecord.connection.select_value("SELECT pg_backend_pid()")) if kind == "abort"
+        original.call(request, kind)
+      end
+  end
+
+  # Waits until the killed child's database session is gone, so the server
+  # has rolled back its transaction and released its locks before recovery
+  # runs; otherwise recovery's bounded lock wait could time out on a corpse.
+  def section_9_3_await_session_gone(name, backend_pid)
+    section_9_3_poll_until("#{name}: the killed save's database session ends", satisfied: :!.to_proc) do
+      ActiveRecord::Base.connection.select_value(
+        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = #{Integer(backend_pid)})"
+      )
+    end
+  end
+
+  # The abort outbox rows of one operation, read fresh: their delivery times.
+  def section_9_3_abort_rows(company, intent)
+    InvoiceOperationOutboxItem.uncached do
+      InvoiceOperationOutboxItem.where(company_id: company.id, operation_id: intent.operation_id, kind: "abort")
+        .pluck(:delivered_at)
+    end
+  end
+
+  # Runs the recovery sweep in this process. A pickup age of zero selects the
+  # intent the example just left pending; the default of 60 s would select
+  # nothing, and "recovery changes nothing" would pass for the wrong reason.
+  def section_9_3_recover_now!
+    RecoverInvoiceOperationIntentsJob.perform_now(pickup_age: 0.seconds)
+  end
+
   def section_9_3_bulk_delete(company, invoice)
     owner = company.users.with_role(:owner, company).order(:id).first!
     sign_in owner
@@ -214,6 +300,286 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
   end
 
   before { WebMock.disable_net_connect!(allow_localhost: true) }
+
+  # The entry row is held first, so both prepares are proven to arrive while
+  # the other is still running; without the hold they could run one after
+  # the other and pass even without Timekeeping's entry lock.
+  it "Two invoices prepare one entry at once: exactly one prepare answers 200 and the other 409 " \
+     "provisional_elsewhere, because both wait on the entry row" do
+    section_9_3_live_context do
+      section_9_3_cutover!
+
+      aggregate_failures do
+        section_9_3_each_company do |name, company|
+          employee, project = section_9_3_employee_and_project(company)
+          entry = section_9_3_fresh_entry(company:, employee:, project:, note: "Wanted by two invoices")
+          requests = Array.new(2) do
+            section_9_3_reservation_request(company:, invoice: create(:invoice, company:, client: project.client),
+                                            entries: [entry])
+          end
+          hold = nil
+          prepares = []
+          begin
+            hold = section_9_3_hold_timekeeping_entry(company_id: company.id, entry_id: entry.id)
+            prepares = requests.map { |request| section_9_3_raw_prepare_thread(request) }
+
+            waiters = section_9_3_timekeeping_waiters(hold.pid, count: 2)
+            expect(waiters.size).to eq(2),
+              "#{name}: both prepares should wait on the held entry row; waiting backends #{waiters.inspect}"
+            direct = waiters.map { |pid| section_9_3_timekeeping_blocked_by?(pid, hold.pid) }
+            expect(direct).to include(true),
+              "#{name}: a prepare should wait directly on the entry hold; waiting backends #{waiters.inspect}"
+            waiters.zip(direct).reject(&:last).each do |pid, _|
+              others = waiters - [pid]
+              expect(others.any? { |other| section_9_3_timekeeping_blocked_by?(pid, other) }).to be(true),
+                "#{name}: backend #{pid} should wait behind the other prepare; waiting backends #{waiters.inspect}"
+            end
+
+            hold.release!
+            answers = prepares.map do |thread|
+              thread.join(TimekeepingSection93Live::PREPARE_READ_TIMEOUT_SECONDS)&.value
+            end
+            expect(answers.map { |answer| answer&.status }.sort).to eq([200, 409]),
+              "#{name}: the two prepares answered #{answers.map { |answer| answer&.status }.inspect}"
+            refusal = answers.compact.find { |answer| answer.status == 409 }
+            expect(refusal && section_9_3_provisional_elsewhere?(refusal, entry)).to be(true),
+              "#{name}: the refused prepare should name entry #{entry.id} provisional_elsewhere; saw #{refusal&.body.inspect}"
+            provisional = section_9_3_reservations(company, [entry]).select { |row| row.fetch(:state) == "provisional" }
+            expect(provisional.size).to eq(1),
+              "#{name}: Timekeeping should hold exactly one provisional reservation on the entry; saw #{provisional.inspect}"
+          ensure
+            hold&.release!
+            stop_committed_data_threads(hold&.thread, *prepares)
+          end
+        end
+      end
+    end
+  end
+
+  # The second save adds a zero-cost line, so it leaves the invoice totals and
+  # the invoices row alone and its first wait is the invoice-identity advisory
+  # lock its Flush takes; a wait on the invoices row would satisfy blocked_by?
+  # even without that lock. Once the first save commits, Timekeeping refuses a
+  # new prepare for the invoice until the first commit is delivered, so the
+  # second save's prepare is held until Timekeeping stores that commit.
+  it "Two saves of one invoice start together: the second save waits on the invoice-identity lock, both commit, " \
+     "and each entry has at most one committed reservation" do
+    section_9_3_live_context do
+      section_9_3_cutover!
+
+      aggregate_failures do
+        section_9_3_each_company do |name, company|
+          employee, project = section_9_3_employee_and_project(company)
+          held = section_9_3_fresh_entry(company:, employee:, project:, note: "Held by the draft")
+          first_added = section_9_3_fresh_entry(company:, employee:, project:, note: "Added by the first save")
+          second_added = section_9_3_fresh_entry(company:, employee:, project:, note: "Added by the second save")
+          entries = [held, first_added, second_added]
+          draft = section_9_3_draft_holding(company:, project:, entries: [held])
+          section_9_3_gate_and_park_saves!
+
+          first_parked = TimekeepingSection93Live::ThreadSaveCheckpoint.open
+          second_gate = TimekeepingSection93Live::ThreadSaveCheckpoint.open
+          first_save = second_save = nil
+          begin
+            first_save = committed_data_thread do
+              section_9_3_with_save_checkpoint(first_parked) do
+                Invoice.find(draft.id).update!(invoice_line_items_attributes: [section_9_3_line(first_added)])
+              end
+            end
+            first_pid = first_parked.await_backend_pid("#{name}: the first save")
+
+            second_pids = Queue.new
+            second_save = committed_data_thread(second_pids) do
+              Thread.current.thread_variable_set(:section_9_3_prepare_gate, second_gate)
+              InvoiceLineItem.create!(section_9_3_line(second_added).merge(rate: 0, invoice: Invoice.find(draft.id)))
+            end
+            second_pid = second_pids.pop(timeout: TimekeepingSection93Live::DEFAULT_POLL_SECONDS)
+
+            expect(second_pid && blocked_by?(second_pid, first_pid)).to be(true),
+              "#{name}: the second save should wait on the first save's backend"
+            expect(second_pid && section_9_3_advisory_wait?(second_pid)).to be(true),
+              "#{name}: the second save should wait on the invoice-identity advisory lock"
+
+            first_parked.release!
+            second_gate.await_backend_pid("#{name}: the second save's prepare")
+            section_9_3_poll_until("#{name}: Timekeeping stores the first save's commit",
+                                   satisfied: ->(states) { states == %w[committed committed] }) do
+              section_9_3_timekeeping_operations(company_id: company.id, invoice_id: draft.id)
+                .map { |operation| operation.fetch(:state) }
+            end
+            second_gate.release!
+
+            expect(section_9_3_save_outcome(first_save)).to eq("committed"), "#{name}: the first save should commit"
+            expect(section_9_3_save_outcome(second_save)).to eq("committed"), "#{name}: the second save should commit"
+            reservations = section_9_3_reservations(company, entries)
+            entries.each do |entry|
+              committed = reservations.select do |row|
+                row.fetch(:entry_id) == entry.id && row.fetch(:state) == "committed"
+              end
+              expect(committed.size).to be <= 1,
+                "#{name}: entry #{entry.id} should have at most one committed reservation; saw #{reservations.inspect}"
+              expect(section_9_3_committed_by(reservations, entry, draft).size).to eq(1),
+                "#{name}: entry #{entry.id} should be committed to the invoice; saw #{reservations.inspect}"
+            end
+          ensure
+            first_parked.release!
+            second_gate.release!
+            stop_committed_data_threads(first_save, second_save)
+          end
+        end
+      end
+    end
+  end
+
+  # Every save parks right after Timekeeping answers `prepared` and before
+  # settle, so it holds the invoice-identity advisory lock but no lock on its
+  # intent row: only recovery's own advisory lock can make recovery wait. The
+  # crash is a forked child killed with SIGKILL, because a killed Ruby thread
+  # would still run the rollback callback that records the failure.
+  it "Crash after prepare, before the invoice commits: recovery waits while the save holds the lock and changes " \
+     "nothing; after the save is killed, recovery returns the entries to their state before the save" do
+    section_9_3_live_context do
+      section_9_3_cutover!
+      section_9_3_park_saves_after_prepare!
+
+      section_9_3_with_recovery_queue_paused do
+        aggregate_failures do
+          section_9_3_each_company do |name, company|
+            employee, project = section_9_3_employee_and_project(company)
+
+            parked_entry = section_9_3_fresh_entry(company:, employee:, project:, note: "Added by the parked save")
+            parked_draft = create(:invoice, company:, client: project.client)
+            checkpoint = TimekeepingSection93Live::ThreadSaveCheckpoint.open
+            save = recovery = nil
+            begin
+              save = committed_data_thread do
+                section_9_3_with_save_checkpoint(checkpoint) do
+                  Invoice.find(parked_draft.id).update!(invoice_line_items_attributes: [section_9_3_line(parked_entry)])
+                end
+              end
+              save_pid = checkpoint.await_backend_pid("#{name}: the parked save")
+              intent = section_9_3_latest_intent(company, parked_draft)
+              expect(intent&.state).to eq("pending"), "#{name}: the parked save's intent is #{intent&.state.inspect}"
+              prepared = section_9_3_reservations(company, [parked_entry])
+
+              recovery_pids = Queue.new
+              recovery = committed_data_thread(recovery_pids) { section_9_3_recover_now! }
+              recovery_pid = recovery_pids.pop(timeout: TimekeepingSection93Live::DEFAULT_POLL_SECONDS)
+              expect(recovery_pid && blocked_by?(recovery_pid, save_pid)).to be(true),
+                "#{name}: recovery should wait on the parked save's invoice lock"
+              waiting_intent = section_9_3_latest_intent(company, parked_draft)
+              expect(waiting_intent&.state).to eq("pending"),
+                "#{name}: recovery should not change the intent while the save holds the lock; " \
+                "it is #{waiting_intent&.state.inspect}"
+              waiting_reservations = section_9_3_reservations(company, [parked_entry])
+              expect(waiting_reservations).to eq(prepared),
+                "#{name}: recovery should not change reservations while the save holds the lock; " \
+                "saw #{waiting_reservations.inspect}, prepared #{prepared.inspect}"
+
+              checkpoint.release!
+              expect(section_9_3_save_outcome(save)).to eq("committed"), "#{name}: the parked save should commit"
+              recovery.join(TimekeepingSection93Live::DEFAULT_POLL_SECONDS)
+              settled = section_9_3_latest_intent(company, parked_draft)
+              expect(settled&.state).to eq("committed"),
+                "#{name}: the save should settle its own intent, not recovery; it is #{settled&.state.inspect}"
+            ensure
+              checkpoint.release!
+              stop_committed_data_threads(save, recovery)
+            end
+
+            crashed_entry = section_9_3_fresh_entry(company:, employee:, project:, note: "Added by the killed save")
+            crashed_draft = create(:invoice, company:, client: project.client)
+            before_save = section_9_3_reservations(company, [crashed_entry])
+            child = nil
+            begin
+              child = section_9_3_fork_parked("#{name}: the save to kill") do |fork_checkpoint|
+                section_9_3_with_save_checkpoint(fork_checkpoint) do
+                  Invoice.find(crashed_draft.id).update!(invoice_line_items_attributes: [section_9_3_line(crashed_entry)])
+                end
+              end
+              prepared = section_9_3_reservations(company, [crashed_entry])
+              expect(prepared.map { |row| row.values_at(:state, :invoice_id) }).to eq([["provisional", crashed_draft.id]]),
+                "#{name}: the killed save should have prepared its entry; saw #{prepared.inspect}"
+
+              section_9_3_kill!(child)
+              killed_session = child.backend_pid
+              child = nil
+              section_9_3_await_session_gone(name, killed_session)
+            ensure
+              section_9_3_kill!(child)
+            end
+
+            intent = section_9_3_latest_intent(company, crashed_draft)
+            expect(intent&.state).to eq("pending"), "#{name}: the killed save's intent is #{intent&.state.inspect}"
+            section_9_3_recover_now!
+            recovered = section_9_3_latest_intent(company, crashed_draft)
+            expect(recovered&.state).to eq("failed"), "#{name}: recovery left the intent #{recovered&.state.inspect}"
+            if recovered
+              state = section_9_3_await_abort(name, company, crashed_draft, recovered)
+              expect(state).to eq("aborted"), "#{name}: the killed save's operation is #{state.inspect}"
+            end
+            after = section_9_3_reservations(company, [crashed_entry])
+            expect(after).to eq(before_save),
+              "#{name}: reservations after recovery #{after.inspect} differ from before the save #{before_save.inspect}"
+          end
+        end
+      end
+    end
+  end
+
+  # The child is killed inside record_failure's transaction, after the update
+  # to failed and before COMMIT, so the update is rolled back with it.
+  it "Crash after the intent is set `failed`, before the abort outbox row exists: the intent is still pending, and " \
+     "recovery records failed and delivers the abort" do
+    section_9_3_live_context do
+      section_9_3_cutover!
+
+      section_9_3_with_recovery_queue_paused do
+        aggregate_failures do
+          section_9_3_each_company do |name, company|
+            employee, project = section_9_3_employee_and_project(company)
+            entry = section_9_3_fresh_entry(company:, employee:, project:, note: "Added by the save killed while failing")
+            draft = create(:invoice, company:, client: project.client)
+            before_save = section_9_3_reservations(company, [entry])
+            child = nil
+            begin
+              child = section_9_3_fork_parked("#{name}: the save to kill while it records its failure") do |fork_checkpoint|
+                section_9_3_fail_commit_after_prepare!
+                section_9_3_park_before_abort_row!(fork_checkpoint)
+                Invoice.find(draft.id).update!(invoice_line_items_attributes: [section_9_3_line(entry)])
+              end
+              section_9_3_kill!(child)
+              killed_session = child.backend_pid
+              child = nil
+              section_9_3_await_session_gone(name, killed_session)
+            ensure
+              section_9_3_kill!(child)
+            end
+
+            intent = section_9_3_latest_intent(company, draft)
+            expect(intent&.state).to eq("pending"), "#{name}: the killed save's intent is #{intent&.state.inspect}"
+            next unless intent
+
+            expect(section_9_3_abort_rows(company, intent)).to eq([]),
+              "#{name}: the killed failure transaction should leave no abort outbox row"
+
+            section_9_3_recover_now!
+
+            recovered = section_9_3_latest_intent(company, draft)
+            expect(recovered&.state).to eq("failed"), "#{name}: recovery left the intent #{recovered&.state.inspect}"
+            deliveries = section_9_3_abort_rows(company, intent)
+            expect(deliveries.size).to eq(1), "#{name}: recovery should write one abort outbox row; saw #{deliveries.size}"
+            expect(deliveries.compact.size).to eq(1), "#{name}: recovery should deliver the abort outbox row"
+            state = section_9_3_await_abort(name, company, draft, intent)
+            expect(state).to eq("aborted"), "#{name}: the killed save's operation is #{state.inspect}"
+            after = section_9_3_reservations(company, [entry])
+            expect(after).to eq(before_save),
+              "#{name}: reservations after recovery #{after.inspect} differ from before the save #{before_save.inspect}"
+          end
+        end
+      end
+    end
+  end
 
   it "Prepare answer lost (timeout or 5xx): the save fails, the intent is failed, and after abort each entry's " \
      "reservation equals its state before the save" do
