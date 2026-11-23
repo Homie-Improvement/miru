@@ -129,6 +129,7 @@ module ForwardedTimekeepingRequestLog
   IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
 
   @requests = []
+  @paused = false
 
   class << self
     def requests
@@ -139,9 +140,24 @@ module ForwardedTimekeepingRequestLog
       @requests = []
     end
 
+    # Runs the block without recording, and answers its value. The harness's
+    # own calls to the live app, such as the drain that delivers snapshots to
+    # the projection, are not requests the monolith forwarded, so they must not
+    # appear in the exact lists specs check. Recording resumes even when the
+    # block raises.
+    def unrecorded
+      paused_before = @paused
+      @paused = true
+      yield
+    ensure
+      @paused = paused_before
+    end
+
     # Records request_signature when it went to the running live app's host
     # and port, whatever its path; requests to any other address are left out.
     def record(request_signature)
+      return if @paused
+
       live = TimekeepingRegressionAdapter.current
       return unless live
 
