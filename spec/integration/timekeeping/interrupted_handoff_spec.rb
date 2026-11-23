@@ -44,7 +44,7 @@ RSpec.describe "Timekeeping interrupted handoff", :integrated_runtime, :two_tena
               "SELECT * FROM timesheet_entries WHERE company_id = $1 ORDER BY id", "interrupted", [id]
             ).to_a
           end,
-          receipts: EntrySnapshotReceipt.order(:id).pluck(:id, :response_body),
+          receipts: ActiveRecord::Base.connection.select_rows("SELECT * FROM entry_snapshot_receipts ORDER BY id"),
           outbox: TimekeepingLiveHandoff.with_timekeeping_database do |connection|
             connection.exec("SELECT outbox_position, sent_at FROM outbox_snapshots ORDER BY outbox_position").values
           end,
@@ -389,6 +389,8 @@ RSpec.describe "Timekeeping interrupted handoff, interrupted at during_checkpoin
       end.to raise_error(Timekeeping::Handoff::Runner::Refused)
       expect(at_checkpoint).to eq([])
 
+      # Taken before the relay resumes, so every receipt above it is from this resume's delivery.
+      receipt_baseline = ActiveRecord::Base.uncached { EntrySnapshotReceipt.maximum(:id) || 0 }
       live_handoff_resume_relay
       expect do
         Timekeeping::Handoff::Runner.run(direction: :rollback, resume: true, observer:, report_root: rollback_root,
@@ -399,6 +401,11 @@ RSpec.describe "Timekeeping interrupted handoff, interrupted at during_checkpoin
       expect(at_checkpoint.size).to eq(1)
       expect(at_checkpoint.first.fetch(:queued)).to eq([])
       expect(at_checkpoint.first.fetch(:projected)).to match_array(entry_ids)
+
+      # "Exactly-once: read the `EntrySnapshotReceipt` rows written after the interrupt. The sum of their `"applied"` counts must equal the queued count."
+      receipts = ActiveRecord::Base.uncached { EntrySnapshotReceipt.order(:id).to_a }
+      expect(TimekeepingLiveHandoff.applied_since(receipts, baseline_id: receipt_baseline))
+        .to eq(applied: queued.size, ignored: 0)
 
       expect(Timekeeping::Handoff::Runner.run(direction: :rollback, resume: true, report_root: rollback_root,
                                               sleeper: no_wait)).to be_nil
@@ -846,7 +853,7 @@ RSpec.describe "Timekeeping interrupted handoff: second resume", :integrated_run
     ActiveRecord::Base.uncached do
       {
         projection: connection.select_rows("SELECT * FROM timesheet_entries ORDER BY id"),
-        receipts: connection.select_rows("SELECT id, response_body FROM entry_snapshot_receipts ORDER BY id"),
+        receipts: connection.select_rows("SELECT * FROM entry_snapshot_receipts ORDER BY id"),
         outbox:,
         ownership: TimekeepingLiveHandoff.ownership_row_text(connection.raw_connection),
         money: companies.to_h { |company| [company.id, TimekeepingLiveHandoff.money(company_id: company.id).to_h] }
@@ -911,6 +918,13 @@ RSpec.describe "Timekeeping interrupted handoff: abort from during_checkpoint", 
                                        "work_date" => Date.current.iso8601 } } }
     )
     expect(reply.status).to eq(200), "entry create answered #{reply.status}: #{reply.body}"
+    JSON.parse(reply.body).fetch("entry").fetch("id")
+  end
+
+  def checkpoint_abort_queued(companies)
+    TimekeepingLiveHandoff.with_timekeeping_database do |connection|
+      companies.flat_map { |company| TimekeepingLiveHandoff.queued_positions(connection, company_id: company.id) }
+    end
   end
 
   # Interrupted at during_checkpoint, handoff_step is "freeze", so the abort
@@ -927,19 +941,34 @@ RSpec.describe "Timekeeping interrupted handoff: abort from during_checkpoint", 
       live_handoff_cutover!
       live_handoff_catch_up!
       live_handoff_pause_relay
-      companies.each { |company| 2.times { checkpoint_abort_create_entry(company) } }
+      entry_ids = companies.flat_map { |company| 2.times.map { checkpoint_abort_create_entry(company) } }
+      expect(checkpoint_abort_queued(companies).size).to eq(entry_ids.size)
       money_before = companies.to_h { |company| [company.id, TimekeepingLiveHandoff.money(company_id: company.id)] }
 
       root = live_handoff_report_root
       interrupt = TimekeepingHandoffHooks::Interrupt.new(at: :during_checkpoint)
+      at_checkpoint = []
+      observer = lambda do |event, step:|
+        if event == :during_checkpoint
+          at_checkpoint << {
+            queued: checkpoint_abort_queued(companies),
+            projected: ActiveRecord::Base.uncached { TimesheetEntry.unscoped.where(id: entry_ids).pluck(:id) }
+          }
+        end
+        interrupt.call(event, step:)
+      end
       expect do
-        Timekeeping::Handoff::Runner.run(direction: :rollback, observer: interrupt, report_root: root, sleeper: no_wait)
+        Timekeeping::Handoff::Runner.run(direction: :rollback, observer:, report_root: root, sleeper: no_wait)
       end.to raise_error(Timekeeping::Handoff::Runner::Refused)
       live_handoff_resume_relay
       expect do
-        Timekeeping::Handoff::Runner.run(direction: :rollback, resume: true, observer: interrupt, report_root: root,
+        Timekeeping::Handoff::Runner.run(direction: :rollback, resume: true, observer:, report_root: root,
                                          sleeper: no_wait)
       end.to raise_error(TimekeepingHandoffHooks::Interrupted)
+      # The queue state at the interrupt: drained, with every queued entry in the projection.
+      expect(at_checkpoint.size).to eq(1)
+      expect(at_checkpoint.first.fetch(:queued)).to eq([])
+      expect(at_checkpoint.first.fetch(:projected)).to match_array(entry_ids)
       step = TimekeepingOwnership.uncached { TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).handoff_step }
       expect(step).to eq("freeze")
 
