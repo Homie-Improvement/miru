@@ -129,42 +129,6 @@ RSpec.describe "Timekeeping reservations: another company's invoice id" do
   end
 end
 
-RSpec.describe "Timekeeping reservations: another company's invoice id" do
-  include_context "timekeeping entry writes"
-  include_context "timekeeping entry writes without transactional fixtures"
-
-  # "Timekeeping answers 404 `not_found` for an invoice id the reference does not list for the path company, unless the path company's own `invoice_operations` already hold that `invoice_id` (a hard-deleted invoice keeps its owner in the reservation, lines 440, 589 and 619)."
-  # A reference answer that lists the invoice under another company does not list it for the path company,
-  # so it must never let the prepare write anything.
-  it "never treats an invoice fact naming another company as owned by the path company" do
-    arrange = timekeeping_arrange
-    company = arrange.company
-    other_company = arrange.company
-    user = arrange.user(company:, role: "employee")
-    project = arrange.project(company:)
-    entry_id = arrange.entry(company:, user:, project:)
-    token = arrange.service_identity(company:, name: "invoice-boundary", operations: %w[prepare commit abort mark_billed])
-    crossed_facts = {
-      company_id: company, edit_days: 30, users: [{ id: user, role: "employee" }],
-      projects: [], missing_project_ids: [], agents: [], owned_agent_ids: [],
-      invoices: [{ id: 944, company_id: other_company }]
-    }
-    WebMock.stub_request(:get, TimekeepingProviderArrange::REFERENCE_HOST).to_return(
-      status: 200, headers: { "Content-Type" => "application/json" }, body: JSON.generate(crossed_facts)
-    )
-
-    post "/v1/companies/#{company}/reservations/prepare",
-         params: { "invoice_id" => 944, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                   "entries" => [entry_id], "generation" => arrange.current_generation }.to_json,
-         headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
-
-    expect([[404, { "reason" => "not_found" }], [503, { "reason" => "reference_unavailable" }]])
-      .to include([response.status, response.parsed_body])
-    expect(InvoiceOperation.count).to eq(0)
-    expect(Reservation.count).to eq(0)
-  end
-end
-
 RSpec.describe "Timekeeping prepare naming another company's invoice" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
@@ -814,9 +778,8 @@ RSpec.describe "Timekeeping prepare against a crossed reference answer" do
          headers: { "Authorization" => "Bearer #{service}", "Content-Type" => "application/json" }
 
     # "A foreign invoice id writes nothing in either database."
-    expect(response.status).not_to be_between(200, 299)
-    expect([[404, { "reason" => "not_found" }], [503, { "reason" => "reference_unavailable" }]])
-      .to include([response.status, response.parsed_body])
+    # A crossed answer cannot be trusted to decide ownership either way, so it reads as unavailable.
+    expect([response.status, response.parsed_body]).to eq([503, { "reason" => "reference_unavailable" }])
     expect(counts.call).to eq(before)
     expect(InvoiceOperation.where(company_id: company, invoice_id: 951).count).to eq(0)
   end
