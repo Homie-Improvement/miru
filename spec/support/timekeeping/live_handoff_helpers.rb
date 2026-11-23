@@ -7,7 +7,8 @@ require "tmpdir"
 # Shared helpers for the live Timekeeping specs that run real handoffs against
 # the demo runtime (spec/support/timekeeping/integrated_runtime.rb): relay
 # pause and resume, per-run report roots, a setup cutover, a bounded catch-up,
-# readers for money, receipts and queued counts, and a teardown that puts the
+# readers for money, receipts, queued counts and positions and the ownership
+# row, and a teardown that puts the
 # relay, ENV and the handoff integrations back however the example ended.
 #
 # The module functions take what they touch as arguments, so
@@ -179,6 +180,31 @@ module TimekeepingLiveHandoff
       params << Integer(entry_id)
     end
     Integer(connection.exec_params(sql, params).getvalue(0, 0))
+  end
+
+  # Unsent outbox positions of one company, in order.
+  def queued_positions(connection, company_id:)
+    connection.exec_params(
+      "SELECT outbox_position FROM outbox_snapshots WHERE sent_at IS NULL AND company_id = $1 ORDER BY outbox_position",
+      [Integer(company_id)]
+    ).column_values(0).map { |position| Integer(position) }
+  end
+
+  # receipts: EntrySnapshotReceipt-like objects answering id and response_body.
+  # One receipt covers every company in its batch, so each receipt above the
+  # baseline counts once; summing per company would count it twice.
+  def applied_since(receipts, baseline_id:)
+    receipts.select { |receipt| receipt.id > baseline_id }.each_with_object({ applied: 0, ignored: 0 }) do |receipt, sums|
+      sums[:applied] += Integer(receipt.response_body.fetch("applied"))
+      sums[:ignored] += Integer(receipt.response_body.fetch("ignored"))
+    end
+  end
+
+  # The whole ownership row as JSON text, read through the raw connection so
+  # Active Record's query cache cannot answer with an older row. Comparing the
+  # text shows any column change.
+  def ownership_row_text(connection)
+    connection.exec("SELECT row_to_json(ownership)::text FROM timekeeping_ownership ownership").getvalue(0, 0)
   end
 
   # Idempotency receipts of one company, user and service receipts together.
