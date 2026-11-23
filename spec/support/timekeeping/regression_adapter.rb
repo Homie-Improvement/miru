@@ -9,6 +9,7 @@ require "socket"
 require_relative "owner_state"
 require_relative "live_instance"
 require_relative "timekeeping_database_reset"
+require_relative "live_snapshot_app"
 
 # Points Timekeeping::EntryApiClient at a real Timekeeping app for a
 # regression run in the timekeeping owner state, so the characterization specs
@@ -44,6 +45,10 @@ module TimekeepingRegressionAdapter
     # after start! checked that it names a test database; nil when the
     # adapter is not running.
     attr_reader :database_url
+
+    # The TimekeepingLiveSnapshotApp the running instance's relay delivers
+    # entry snapshots to; nil when the adapter is not running.
+    attr_reader :snapshot_app
 
     # Answers nil, touching nothing, unless env selects a live regression run
     # and owner_state is the timekeeping state. Otherwise answers the started
@@ -88,6 +93,7 @@ module TimekeepingRegressionAdapter
       @current = nil
       @database_url = nil
       @allowed_address = nil
+      @snapshot_app = nil
       instance&.stop
       nil
     end
@@ -112,8 +118,13 @@ module TimekeepingRegressionAdapter
         begin
           WebMock.disable_net_connect!(allow: [address])
           reference_stub = TimekeepingLiveInstance::ReferenceStub.new
-          instance = TimekeepingLiveInstance.start(reference_stub:, admission_generation:, port:, database_url: url)
+          # The service's relay posts entry snapshots here, so rows the live
+          # app stores reach timesheet_entries through the projection consumer.
+          snapshot_app = TimekeepingLiveSnapshotApp.new
+          instance = TimekeepingLiveInstance.start(reference_stub:, admission_generation:, port:, database_url: url,
+                                                   snapshot_app:)
           reference_stub.service_token = instance.service_token
+          snapshot_app.service_token = instance.service_token
           ENV[BASE_URL_ENV] = instance.base_url
           ENV[PRIVATE_KEY_ENV] = instance.private_key.to_pem
         rescue StandardError
@@ -125,6 +136,7 @@ module TimekeepingRegressionAdapter
         end
         @database_url = url
         @allowed_address = address
+        @snapshot_app = snapshot_app
         @current = instance
       end
 
