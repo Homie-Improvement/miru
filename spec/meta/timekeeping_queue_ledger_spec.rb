@@ -862,3 +862,75 @@ RSpec.describe "Timekeeping queue ledger private root probe", :without_transacti
     end
   end
 end
+
+RSpec.describe TimekeepingQueueLedger do
+  it "inline_performs stops collecting when its block ends and returns an empty list when no job ran" do
+    job = Class.new(ApplicationJob) do
+      queue_as :default
+
+      def perform; end
+    end
+    stub_const("QueueLedgerInlineAfterBlockJob", job)
+
+    queues = described_class.inline_performs { nil }
+    QueueLedgerInlineAfterBlockJob.perform_now
+
+    expect(queues).to eq([])
+    expect(described_class.inline_performs { QueueLedgerInlineAfterBlockJob.perform_now }).to eq(["default"])
+  end
+end
+
+RSpec.describe TimekeepingQueueLedger do
+  # "and the suite fails if a job from a non-dedicated queue ran"
+  it "non_dedicated_queues judges queues against DEDICATED_QUEUES per database and accepts the relay job's own queue on the monolith" do
+    monolith = described_class::DEDICATED_QUEUES.fetch("monolith")
+
+    expect(described_class.non_dedicated_queues(monolith, database: "monolith")).to eq([])
+    expect(described_class.non_dedicated_queues([], database: "monolith")).to eq([])
+    expect(described_class.non_dedicated_queues([Timekeeping::RelayJob.new.queue_name], database: "monolith")).to eq([])
+    expect(described_class.non_dedicated_queues(%w[timekeeping_relay default billing_sync], database: "monolith"))
+      .to eq(%w[default billing_sync])
+    expect(described_class.non_dedicated_queues(%w[invoice_operations timekeeping_relay], database: "timekeeping"))
+      .to eq(["invoice_operations"])
+  end
+end
+
+RSpec.describe TimekeepingQueueLedger do
+  # "Every live example here runs under the teardown queue ledger (`spec/support/timekeeping/queue_ledger.rb`), and the suite fails if a job from a non-dedicated queue ran"
+  # perform_now writes no Solid Queue row, so a nested inline job on a non-dedicated queue is visible only to this watcher.
+  it "inline_performs catches a default-queue job run inline from inside a dedicated-queue job and stops watching after the block" do
+    inner_job = Class.new(ApplicationJob) do
+      queue_as :default
+
+      def perform; end
+    end
+    stub_const("QueueLedgerInlineStrayJob", inner_job)
+    outer_job = Class.new(ApplicationJob) do
+      queue_as :timekeeping_relay
+
+      def perform
+        QueueLedgerInlineStrayJob.perform_now
+      end
+    end
+    stub_const("QueueLedgerInlineRelayJob", outer_job)
+
+    queues = described_class.inline_performs { QueueLedgerInlineRelayJob.perform_now }
+
+    expect(queues).to contain_exactly("timekeeping_relay", "default")
+    expect(described_class.non_dedicated_queues(queues, database: "monolith")).to eq(["default"])
+
+    QueueLedgerInlineStrayJob.perform_now
+    expect(described_class.inline_performs { nil }).to eq([])
+  end
+end
+
+RSpec.describe TimekeepingQueueLedger do
+  # "Every live example here runs under the teardown queue ledger (`spec/support/timekeeping/queue_ledger.rb`), and the suite fails if a job from a non-dedicated queue ran"
+  it "non_dedicated_queues judges by the named database, so a queue dedicated only on the monolith is reported for timekeeping" do
+    queues = %w[timekeeping_relay invoice_operations default]
+
+    expect(described_class.non_dedicated_queues(queues, database: "monolith")).to eq(["default"])
+    expect(described_class.non_dedicated_queues(queues, database: "timekeeping")).to eq(%w[invoice_operations default])
+    expect { described_class.non_dedicated_queues(queues, database: "unknown") }.to raise_error(KeyError)
+  end
+end

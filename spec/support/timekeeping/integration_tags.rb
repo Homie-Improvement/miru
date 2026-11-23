@@ -17,6 +17,7 @@ module TimekeepingIntegrationTags
 
   HANDOFF_FAKES_PATH = File.expand_path("handoff_fakes.rb", __dir__)
   TAG = :committed_data
+  RUNTIME_TAG = :integrated_runtime
 
   # RSpec core's group and example methods, aliases included, so an example
   # written with fit or xit is checked like one written with it.
@@ -77,6 +78,64 @@ module TimekeepingIntegrationTags
     end
 
     example_names_in(result.value, false).freeze
+  end
+
+  # Every example in one spec file's source that would run without the
+  # :integrated_runtime tag, in source order. That tag's hooks
+  # (spec/support/timekeeping/integrated_runtime.rb) start the runtime and
+  # activate the teardown queue ledger, so an untagged live example runs
+  # unwatched. Only RSpec metadata counts: a comment, a string, or a symbol
+  # used as the description mentions the tag without setting it.
+  # Raises ArgumentError on a syntax error, because a recovered tree can drop
+  # the very example that lacks the tag.
+  def missing_integrated_runtime(path, source)
+    result = Prism.parse(source)
+    unless result.success?
+      error = result.errors.first
+      raise ArgumentError, "the spec source does not parse: line #{error.location.start_line}: #{error.message}"
+    end
+
+    untagged_examples(result.value, false, false).map do |node|
+      Violation.new(path:, line: node.location.start_line, kind: :missing_integrated_runtime,
+                    detail: "example runs without :integrated_runtime")
+    end.freeze
+  end
+
+  # tagged is whether a group or example above node carries the runtime tag.
+  # runtime is whether node sits inside an example body or a hook, where
+  # group and example methods are calls rather than declarations.
+  def untagged_examples(node, tagged, runtime)
+    found = []
+    if node.is_a?(Prism::CallNode)
+      example = !runtime && example_call?(node)
+      tagged = runtime_tag_setting(node).fetch(:value, tagged) if example || (!runtime && group_call?(node))
+      found << node if example && !tagged
+      runtime ||= example || RUNTIME_BLOCK_METHODS.include?(node.name)
+    end
+    found + node.compact_child_nodes.flat_map { |child| untagged_examples(child, tagged, runtime) }
+  end
+
+  # { value: true | false } when the call's metadata sets the runtime tag, {}
+  # when it does not. RSpec reads the first argument as the description, even
+  # a hash, and only the arguments after it as metadata.
+  # Like tag_setting, any value other than the literal true counts as unset.
+  def runtime_tag_setting(node)
+    (node.arguments&.arguments || []).drop(1).each_with_object({}) do |argument, setting|
+      if argument.is_a?(Prism::SymbolNode)
+        setting[:value] = true if argument.unescaped.to_sym == RUNTIME_TAG
+      elsif hash_node?(argument)
+        argument.elements.each do |element|
+          next unless element.is_a?(Prism::AssocNode) && element.key.is_a?(Prism::SymbolNode) &&
+                      element.key.unescaped.to_sym == RUNTIME_TAG
+
+          setting[:value] = element.value.is_a?(Prism::TrueNode)
+        end
+      end
+    end
+  end
+
+  def hash_node?(node)
+    node.is_a?(Prism::KeywordHashNode) || node.is_a?(Prism::HashNode)
   end
 
   # disabled is whether a group above node is skipped or pending. It is
@@ -246,7 +305,8 @@ module TimekeepingIntegrationTags
       node.compact_child_nodes.flat_map { |child| declared_constants(child, namespace) }
     end
   end
-  private_class_method :example_names_in, :counted_example?, :disabled_group?, :skip_metadata?, :skip_symbol?,
+  private_class_method :untagged_examples, :runtime_tag_setting, :hash_node?,
+                       :example_names_in, :counted_example?, :disabled_group?, :skip_metadata?, :skip_symbol?,
                        :example_name,
                        :walk, :walk_call, :group_call?, :example_call?, :rspec_receiver?, :tag_setting,
                        :tag_key?, :loads_handoff_fakes?, :fake_reference?, :top_level_segments,
