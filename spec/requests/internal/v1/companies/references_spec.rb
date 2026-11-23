@@ -286,8 +286,15 @@ RSpec.describe "Internal::V1::Companies::References", type: :request do
     InvoiceOperationIntent.create!(company_id: company_b.id, invoice_id: foreign_intent_id, operation_id: SecureRandom.uuid,
                                    state: "pending", generation: 1, disposition: "active", desired_entry_ids: [],
                                    created_at: Time.current)
+    # A save that rolled back leaves only a failed intent. Its abort replays prepare, so the failed intent
+    # must still prove ownership or the abort would be refused and retried forever.
+    failed_intent_id = unknown_id + 3
+    InvoiceOperationIntent.create!(company_id: company_a.id, invoice_id: failed_intent_id, operation_id: SecureRandom.uuid,
+                                   state: "failed", generation: 1, disposition: "active", desired_entry_ids: [],
+                                   created_at: Time.current)
 
-    requested = [own_invoice.id, discarded_invoice.id, foreign_invoice.id, unknown_id, intent_only_id, foreign_intent_id]
+    requested = [own_invoice.id, discarded_invoice.id, foreign_invoice.id, unknown_id, intent_only_id, foreign_intent_id,
+                 failed_intent_id]
     bodies = with_timekeeping_service_token do |token|
       [requested, [foreign_invoice.id], [unknown_id], [], [foreign_intent_id]].map do |invoice_ids|
         get "/internal/v1/companies/#{company_a.id}/reference",
@@ -305,7 +312,8 @@ RSpec.describe "Internal::V1::Companies::References", type: :request do
     expect(all_kinds["invoices"]).to match_array([
       { "id" => own_invoice.id, "company_id" => company_a.id },
       { "id" => discarded_invoice.id, "company_id" => company_a.id },
-      { "id" => intent_only_id, "company_id" => company_a.id }
+      { "id" => intent_only_id, "company_id" => company_a.id },
+      { "id" => failed_intent_id, "company_id" => company_a.id }
     ])
     expect(all_kinds["invoices"].pluck("id").count(own_invoice.id)).to eq(1)
     expect(foreign["invoices"]).to eq([])
