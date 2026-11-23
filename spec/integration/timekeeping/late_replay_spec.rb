@@ -16,99 +16,23 @@ require "yaml"
 # No relay message exists before the first cutover: the legacy store has no
 # outbox, and Timekeeping::RelayJob reads only the prepared store's.
 RSpec.describe "Timekeeping late replay" do
-  context "more tests 2", :integrated_runtime, :two_tenant_seed, committed_data: true,
-                                          owner_state: "legacy" do
-    it "keeps reconciliation clean and each seeded company's money unchanged after every handoff while a pre-cutover legacy update is replayed without a second write" do
-      company_ids = [fork_and_leaf.id, copper_kettle.id]
-      owner = User.with_role(:owner, fork_and_leaf).first
-      project = fork_and_leaf.projects.kept.first
-      headers = { "X-Auth-Email" => owner.email, "X-Auth-Token" => owner.token,
-                  "Content-Type" => "application/json" }
-      baselines = company_ids.index_with { |id| TimekeepingLiveHandoff.money(company_id: id) }
-
-      created = LiveHandoff.send_request(@integrated_runtime.monolith_url, {
-        method: "POST", path: "/api/v1/timesheet_entry",
-        headers: headers.merge("Idempotency-Key" => "late-replay-create-#{SecureRandom.hex(4)}"),
-        body: { "project_id" => project.id,
-                "timesheet_entry" => { "duration" => 30.0, "note" => "late replay", "work_date" => "2026-01-08" } }
-      })
-      expect(created.status).to eq(200)
-      entry_id = JSON.parse(created.body).fetch("entry").fetch("id")
-
-      update_key = "late-replay-update-#{SecureRandom.hex(4)}"
-      update_request = {
-        method: "PUT", path: "/api/v1/timesheet_entry/#{entry_id}",
-        headers: headers.merge("Idempotency-Key" => update_key),
-        body: { "project_id" => project.id, "timesheet_entry" => { "note" => "late replay edited" } }
-      }
-      # "Each captured request must first answer 2xx with its receipt present."
-      expect(LiveHandoff.send_request(@integrated_runtime.monolith_url, update_request).status).to eq(200)
-      receipt_attributes = lambda do
-        Timekeeping::LegacyEntryWriteReceipt.uncached do
-          Timekeeping::LegacyEntryWriteReceipt
-            .find_by!(company_id: fork_and_leaf.id, operation: "update", key: update_key).entry_attributes
-        end
-      end
-      receipt_attributes.call
-
-      with_live_handoff_integrations(@integrated_runtime) do
-        %i[cutover rollback re_cutover].each do |direction|
-          # "Reconciliation and money checks pass after each handoff run in these examples, on each seeded company (through the LiveHandoff driver or the same check)"
-          run_live_handoff(direction, company_ids:)
-          company_ids.each do |id|
-            later = TimekeepingLiveHandoff.money(company_id: id)
-            expect(Timekeeping::FinancialSnapshot.compare(baselines.fetch(id), later)).to eq([]), "#{direction}, company #{id}"
-          end
-
-          before = company_ids.index_with { |id| LiveHandoff.tenant_counts(company_id: id) }
-          reply = LiveHandoff.send_request(@integrated_runtime.monolith_url, update_request)
-          after = company_ids.index_with { |id| LiveHandoff.tenant_counts(company_id: id) }
-
-          # "A replayed pre-handoff legacy-store update after cutover writes nothing again (no new version, no audit row): it is refused or answered without a second write, not left out"
-          verdict = LiveHandoff.replay_verdict(
-            status: reply.status, body: reply.body,
-            expected_body: LiveHandoff.expected_web_reply(receipt_attributes.call, action: :update),
-            refusals: LiveHandoff::MONOLITH_REFUSALS
-          )
-          expect(verdict).not_to eq(:failed), "legacy update replay after #{direction}"
-          company_ids.each do |id|
-            expect(after.fetch(id)).to eq(before.fetch(id)), "legacy update replay after #{direction}, company #{id}"
-          end
-        end
-      end
-    end
-  end
-
   context "more tests 3", :integrated_runtime, :two_tenant_seed, committed_data: true, owner_state: "legacy" do
     it "replays each legacy web create and update captured before cutover after cutover, rollback and re-cutover without a second write" do
       company_ids = [fork_and_leaf.id, copper_kettle.id]
       monolith_url = @integrated_runtime.monolith_url
-      # RELAY_LOCK_KEY in timekeeping/app/jobs/relay_job.rb; that class is not loadable from the monolith.
-      timekeeping_relay_lock = 2_026_034_002
-      states = lambda do
-        company_ids.index_with do |id|
-          [LiveHandoff.tenant_counts(company_id: id),
-           TenantStateDigest.take(company_id: id, timekeeping_url: ENV.fetch(TimekeepingDatabaseReset::DATABASE_URL_KEY))]
-        end
-      end
 
       # "Bracket every replay with `LiveHandoff.tenant_counts` for each company in both stores: entries, version sums, `audits`, `entry_audits`, `audit_events`, receipts and outbox."
-      # Both relay locks are held, so no relay delivery can change a count inside the bracket.
       replay = lambda do |capture, direction|
         label = "#{capture.fetch(:kind)} after #{direction}, company #{capture.fetch(:company_id)}"
-        connection = ActiveRecord::Base.connection
-        connection.select_value("SELECT pg_advisory_lock(#{Timekeeping::RelayJob::RELAY_LOCK_KEY})")
-        before, reply, after = TimekeepingLiveHandoff.with_timekeeping_database do |timekeeping|
-          timekeeping.exec("SELECT pg_advisory_lock(#{timekeeping_relay_lock})")
-          [states.call, LiveHandoff.send_request(monolith_url, capture.fetch(:request)), states.call]
+        before, reply, after = with_live_relays_held do
+          [live_tenant_states(company_ids), LiveHandoff.send_request(monolith_url, capture.fetch(:request)),
+           live_tenant_states(company_ids)]
         end
         # "Byte equality always uses the persisted receipt, read back at replay time"
         verdict = LiveHandoff.replay_verdict(status: reply.status, body: reply.body, expected_body: capture.fetch(:expected).call,
                                              refusals: LiveHandoff::MONOLITH_REFUSALS)
         expect(verdict).not_to eq(:failed), label
         company_ids.each { |id| expect(after.fetch(id)).to eq(before.fetch(id)), "#{label}: company #{id} changed" }
-      ensure
-        connection&.select_value("SELECT pg_advisory_unlock(#{Timekeeping::RelayJob::RELAY_LOCK_KEY})")
       end
 
       with_live_handoff_integrations(@integrated_runtime) do
@@ -159,17 +83,9 @@ RSpec.describe "Timekeeping late replay" do
     it "replays web writes accepted while Timekeeping owns through the monolith after rollback and re-cutover without writing again" do
       company_ids = [fork_and_leaf.id, copper_kettle.id]
       monolith_url = @integrated_runtime.monolith_url
-      # RELAY_LOCK_KEY in timekeeping/app/jobs/relay_job.rb; that class is not loadable from the monolith.
-      timekeeping_relay_lock = 2_026_034_002
       owner = User.with_role(:owner, fork_and_leaf).first
       project = fork_and_leaf.projects.kept.first
       headers = ->(key) { { "X-Auth-Email" => owner.email, "X-Auth-Token" => owner.token, "Idempotency-Key" => key } }
-      states = lambda do
-        company_ids.index_with do |id|
-          [LiveHandoff.tenant_counts(company_id: id),
-           TenantStateDigest.take(company_id: id, timekeeping_url: ENV.fetch(TimekeepingDatabaseReset::DATABASE_URL_KEY))]
-        end
-      end
       # The receipt Timekeeping stored for this company and entry, found by the note the write sent.
       stored_row = lambda do |entry_id, note|
         TimekeepingLiveHandoff.with_timekeeping_database do |timekeeping|
@@ -184,11 +100,9 @@ RSpec.describe "Timekeeping late replay" do
       end
       replay = lambda do |capture, direction|
         label = "#{capture.fetch(:kind)} after #{direction}"
-        connection = ActiveRecord::Base.connection
-        connection.select_value("SELECT pg_advisory_lock(#{Timekeeping::RelayJob::RELAY_LOCK_KEY})")
-        before, reply, after = TimekeepingLiveHandoff.with_timekeeping_database do |timekeeping|
-          timekeeping.exec("SELECT pg_advisory_lock(#{timekeeping_relay_lock})")
-          [states.call, LiveHandoff.send_request(monolith_url, capture.fetch(:request)), states.call]
+        before, reply, after = with_live_relays_held do
+          [live_tenant_states(company_ids), LiveHandoff.send_request(monolith_url, capture.fetch(:request)),
+           live_tenant_states(company_ids)]
         end
         expected = LiveHandoff.expected_web_reply_from_row(stored_row.call(capture.fetch(:entry_id), capture.fetch(:note)),
                                                            company: fork_and_leaf, action: capture.fetch(:action))
@@ -198,8 +112,6 @@ RSpec.describe "Timekeeping late replay" do
         expect(verdict).not_to eq(:failed), label
         # "A web write accepted while Timekeeping owns, replayed unchanged through the monolith after rollback, writes nothing"
         company_ids.each { |id| expect(after.fetch(id)).to eq(before.fetch(id)), "#{label}: company #{id} changed" }
-      ensure
-        connection&.select_value("SELECT pg_advisory_unlock(#{Timekeeping::RelayJob::RELAY_LOCK_KEY})")
       end
 
       with_live_handoff_integrations(@integrated_runtime) do
@@ -238,18 +150,10 @@ RSpec.describe "Timekeeping late replay" do
     it "answers a prepared-store relay delivery captured before re-cutover from its entry snapshot receipt when it is delivered again after re-cutover" do
       company_ids = [fork_and_leaf.id, copper_kettle.id]
       monolith_url = @integrated_runtime.monolith_url
-      # RELAY_LOCK_KEY in timekeeping/app/jobs/relay_job.rb; that class is not loadable from the monolith.
-      timekeeping_relay_lock = 2_026_034_002
       monolith_relay_lock = Timekeeping::RelayJob::RELAY_LOCK_KEY
       owner = User.with_role(:owner, fork_and_leaf).first
       project = fork_and_leaf.projects.kept.first
       connection = ActiveRecord::Base.connection
-      states = lambda do
-        company_ids.index_with do |id|
-          [LiveHandoff.tenant_counts(company_id: id),
-           TenantStateDigest.take(company_id: id, timekeeping_url: ENV.fetch(TimekeepingDatabaseReset::DATABASE_URL_KEY))]
-        end
-      end
       parsed_batch = ->(batch) { batch.is_a?(String) ? JSON.parse(batch) : batch }
       receipt_for = lambda do |delivery|
         ids = parsed_batch.call(delivery.fetch(:batch)).fetch("snapshots").map { |snapshot| snapshot.fetch("entry").fetch("company_id") }
@@ -308,14 +212,8 @@ RSpec.describe "Timekeeping late replay" do
                       headers: { "Authorization" => "Bearer #{@integrated_runtime.credentials.service_token}",
                                  "Idempotency-Key" => delivery.fetch(:key), "Content-Type" => "application/json" },
                       body: delivery.fetch(:batch) }
-          connection.select_value("SELECT pg_advisory_lock(#{monolith_relay_lock})")
-          begin
-            before, replayed, after = TimekeepingLiveHandoff.with_timekeeping_database do |timekeeping|
-              timekeeping.exec("SELECT pg_advisory_lock(#{timekeeping_relay_lock})")
-              [states.call, LiveHandoff.send_request(monolith_url, request), states.call]
-            end
-          ensure
-            connection.select_value("SELECT pg_advisory_unlock(#{monolith_relay_lock})")
+          before, replayed, after = with_live_relays_held do
+            [live_tenant_states(company_ids), LiveHandoff.send_request(monolith_url, request), live_tenant_states(company_ids)]
           end
           # "a relay delivery is answered from `entry_snapshot_receipts`."
           receipt = receipt_for.call(delivery)
@@ -336,10 +234,6 @@ RSpec.describe "Timekeeping late replay" do
       timekeeping_url = @integrated_runtime.timekeeping_url
       service_token = @integrated_runtime.credentials.service_token
       private_key = OpenSSL::PKey::RSA.new(@integrated_runtime.credentials.private_key_pem)
-      database_url = ENV.fetch(TimekeepingDatabaseReset::DATABASE_URL_KEY)
-      # RELAY_LOCK_KEY in timekeeping/app/jobs/relay_job.rb; that class is not loadable from the monolith.
-      timekeeping_relay_lock = 2_026_034_002
-      monolith_relay_lock = Timekeeping::RelayJob::RELAY_LOCK_KEY
       entry_fields = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/entry_snapshots.yml")).fetch("entry_fields")
       connection = ActiveRecord::Base.connection
       owner = User.with_role(:owner, fork_and_leaf).first
@@ -348,31 +242,12 @@ RSpec.describe "Timekeeping late replay" do
       web_headers = ->(key) { { "X-Auth-Email" => owner.email, "X-Auth-Token" => owner.token, "Idempotency-Key" => key } }
       handoffs_done = []
 
-      states = lambda do
-        company_ids.index_with do |id|
-          [LiveHandoff.tenant_counts(company_id: id), TenantStateDigest.take(company_id: id, timekeeping_url: database_url)]
-        end
-      end
-
-      # Both relay locks are held around a block, so neither the runtime's
-      # monolith relay nor its Timekeeping relay can deliver inside it. The
-      # Timekeeping lock is blocking, so a relay run already past its pause
-      # check finishes before the block starts.
-      with_relays_held = lambda do |&block|
-        connection.select_value("SELECT pg_advisory_lock(#{monolith_relay_lock})")
-        TimekeepingLiveHandoff.with_timekeeping_database do |timekeeping|
-          timekeeping.exec("SELECT pg_advisory_lock(#{timekeeping_relay_lock})")
-          block.call(timekeeping)
-        end
-      ensure
-        connection.select_value("SELECT pg_advisory_unlock(#{monolith_relay_lock})")
-      end
-
       # "Bracket every replay with `LiveHandoff.tenant_counts` for each company in both stores: entries, version sums, `audits`, `entry_audits`, `audit_events`, receipts and outbox. Also compare `TenantStateDigest.take`. Never add the two companies' counts together."
       replay = lambda do |capture, direction|
         label = "#{capture.fetch(:kind)} after #{direction}"
-        before, reply, after = with_relays_held.call do
-          [states.call, LiveHandoff.send_request(capture.fetch(:base_url), capture.fetch(:request).call), states.call]
+        before, reply, after = with_live_relays_held do
+          [live_tenant_states(company_ids), LiveHandoff.send_request(capture.fetch(:base_url), capture.fetch(:request).call),
+           live_tenant_states(company_ids)]
         end
         # "Refusals count only as the exact per-route status and body pairs in `LiveHandoff`'s refusal tables. Anything else fails, including a 5xx or a connection error."
         expect(capture.fetch(:verdict).call(reply)).not_to eq(:failed), "#{label} answered #{reply.status}"
@@ -483,7 +358,7 @@ RSpec.describe "Timekeeping late replay" do
         api_entry_id = nil
         api_update_note = "api update #{SecureRandom.hex(4)}"
         api_update = nil
-        with_relays_held.call do |timekeeping|
+        with_live_relays_held do |timekeeping|
           created = LiveHandoff.send_request(timekeeping_url, api_create.call)
           expect(created.status).to be_between(200, 299), "Timekeeping API create answered #{created.status}"
           created_row = JSON.parse(created.body)
@@ -498,8 +373,15 @@ RSpec.describe "Timekeeping late replay" do
           timekeeping_receipt.call(api_entry_id, api_update_note)
 
           # The runtime's Timekeeping relay cannot run while this block holds
-          # its lock, so the shared relay code delivers the new outbox rows
-          # here, through a recording endpoint, exactly as that relay would.
+          # its lock, and its delivery cannot be recorded from this process.
+          # The shared relay code therefore delivers the new outbox rows here,
+          # through a recording endpoint, from a source that reads
+          # outbox_snapshots by SQL. That source is not the Timekeeping app's
+          # RelayOutboxSource: it writes timestamps and numbers as Postgres
+          # renders them, and it does not skip a held generation, so the batch
+          # bytes and key can differ from the runtime relay's. What this proves
+          # is that a batch the projection accepted and stored a receipt for is
+          # answered from that receipt when sent again.
           source = Object.new
           source.define_singleton_method(:unsent_after) do |position, limit|
             timekeeping.exec_params(

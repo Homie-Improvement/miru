@@ -57,6 +57,11 @@ module LiveHandoff
 
   SUCCESS_STATUSES = (200..299)
 
+  # RELAY_LOCK_KEY in timekeeping/app/jobs/relay_job.rb, the session lock the
+  # Timekeeping relay holds while it delivers. That class belongs to the
+  # Timekeeping app and cannot be loaded here.
+  TIMEKEEPING_RELAY_LOCK_KEY = 2_026_034_002
+
   # Request headers that sign a monolith request in, downcased because header
   # names are case-insensitive. web_replay_request drops every one of them from
   # the recording, in any spelling, so a replay can only authenticate as the
@@ -301,6 +306,32 @@ module LiveHandoff
       rebuild.call
     end
 
+    # Holds both relay session locks around the block, so neither the
+    # runtime's monolith relay nor its Timekeeping relay can deliver inside
+    # it and change a count the block compares. The Timekeeping lock is taken
+    # with a blocking call, so a relay run already past its pause check
+    # finishes before the block starts. Yields the Timekeeping database
+    # connection that holds that lock; closing it afterwards releases it.
+    def with_live_relays_held
+      connection = ActiveRecord::Base.connection
+      connection.select_value(live_relay_lock_sql("pg_advisory_lock"))
+      TimekeepingLiveHandoff.with_timekeeping_database do |timekeeping|
+        timekeeping.exec_params("SELECT pg_advisory_lock($1)", [LiveHandoff::TIMEKEEPING_RELAY_LOCK_KEY])
+        yield timekeeping
+      end
+    ensure
+      connection&.select_value(live_relay_lock_sql("pg_advisory_unlock"))
+    end
+
+    # Each company's counts and state digest in both stores, kept per
+    # company so two companies' values are never combined.
+    def live_tenant_states(company_ids)
+      timekeeping_url = ENV.fetch(TimekeepingDatabaseReset::DATABASE_URL_KEY)
+      company_ids.index_with do |id|
+        [LiveHandoff.tenant_counts(company_id: id), TenantStateDigest.take(company_id: id, timekeeping_url:)]
+      end
+    end
+
     # Runs one handoff with the configured owners, asserts the stored
     # ownership row moved to the direction's owner at a higher generation with
     # no step left, and requires a clean reconciliation report for exactly
@@ -331,6 +362,10 @@ module LiveHandoff
       def rebuild_live_handoff_integrations
         allow(Rails.application.config).to receive(:to_prepare).and_yield
         load Rails.root.join(HANDOFF_INITIALIZER).to_s
+      end
+
+      def live_relay_lock_sql(function)
+        ActiveRecord::Base.sanitize_sql_array(["SELECT #{function}(?)", Timekeeping::RelayJob::RELAY_LOCK_KEY])
       end
 
       def live_handoff_ownership_row

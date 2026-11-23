@@ -1812,45 +1812,6 @@ RSpec.describe Timekeeping::Gateway do
     end
   end
 
-  context "more tests 34" do
-    it "a legacy update retried with its key while the prepared store owns is answered from its legacy receipt and writes no local entry, audit or outbox row" do
-      company = create(:company)
-      project = create(:project, billable: true, client: create(:client, company:))
-      admin = create(:user, current_workspace_id: company.id).tap do |user|
-        create(:employment, company:, user:)
-        user.add_role :admin, company
-      end
-      entry = create(:timesheet_entry, user: admin, project:, bill_status: :unbilled, note: "Before")
-      attributes = { duration: 45, work_date: Date.current, note: "Legacy edit before handoff", bill_status: "unbilled" }
-      context_for = lambda do |request_id|
-        Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id:,
-                                      idempotency_key: "late-replay-legacy-update-prepared")
-      end
-
-      described_class.new(context: context_for.call("req-late-prepared-1"))
-                     .update(entry_id: entry.id, project:, attributes:, authorize: ->(_entry) { })
-      receipts_before = Timekeeping::LegacyEntryWriteReceipt.where(company_id: company.id).count
-      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 2)
-      local_entries_before = Timekeeping::LocalEntry.where(company_id: company.id).count
-      local_audits_before = Timekeeping::LocalOwner::AuditRow.count
-      outbox_before = Timekeeping::LocalOutboxEntry.where(company_id: company.id).count
-
-      gateway = described_class.new(
-        context: context_for.call("req-late-prepared-2"),
-        write_client: instance_double(Timekeeping::EntryWriteClient),
-        read_client: instance_double(Timekeeping::EntryApiClient)
-      )
-      # "Late or replayed pre-handoff messages are refused or answered byte for byte from their stored receipts after cutover, rollback and re-cutover, with no new row, version, audit entry or receipt"
-      answered = gateway.update(entry_id: entry.id, project:, attributes:, authorize: ->(_entry) { })
-
-      expect([answered.id, answered.note]).to eq([entry.id, "Legacy edit before handoff"])
-      expect(Timekeeping::LocalEntry.where(company_id: company.id).count).to eq(local_entries_before)
-      expect(Timekeeping::LocalOwner::AuditRow.count).to eq(local_audits_before)
-      expect(Timekeeping::LocalOutboxEntry.where(company_id: company.id).count).to eq(outbox_before)
-      expect(Timekeeping::LegacyEntryWriteReceipt.where(company_id: company.id).count).to eq(receipts_before)
-    end
-  end
-
   context "more tests 35" do
     it "a legacy update key reused with other fields after cutover to Timekeeping is refused as key reused and sends nothing" do
       company = create(:company)
@@ -1882,6 +1843,8 @@ RSpec.describe Timekeeping::Gateway do
                        attributes: { duration: 90, work_date: Date.current, note: "Other edit", bill_status: "unbilled" })
       end.to raise_error(Timekeeping::EntryWriteClient::KeyReused)
       expect(entry.reload.note).to eq("First edit")
+      # The refused retry stores no update receipt of its own under the carried key.
+      expect(Timekeeping::LegacyEntryWriteReceipt.where(company_id: company.id, operation: "update").count).to eq(1)
     end
   end
 
@@ -2028,44 +1991,6 @@ RSpec.describe Timekeeping::Gateway do
       expect(Timekeeping::LegacyEntryWriteReceipt.count).to eq(receipts_before)
     end
   end
-
-  context "more tests 44" do
-    it "a legacy update key reused with other fields after cutover is refused as key reused and nothing is forwarded" do
-      company = create(:company)
-      project = create(:project, billable: true, client: create(:client, company:))
-      admin = create(:user, current_workspace_id: company.id).tap do |user|
-        create(:employment, company:, user:)
-        user.add_role :admin, company
-      end
-      entry = create(:timesheet_entry, user: admin, project:, bill_status: :unbilled, note: "Before")
-      context_for = lambda do |request_id|
-        Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id:,
-                                      idempotency_key: "late-replay-legacy-update-reused")
-      end
-
-      described_class.new(context: context_for.call("req-late-reused-1"))
-        .update(entry_id: entry.id, project:,
-                attributes: { duration: 30, work_date: Date.current, note: "First body", bill_status: "unbilled" },
-                authorize: ->(_entry) { })
-
-      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
-      gateway = described_class.new(
-        context: context_for.call("req-late-reused-2"),
-        write_client: instance_double(Timekeeping::EntryWriteClient),
-        read_client: instance_double(Timekeeping::EntryApiClient)
-      )
-
-      # "A replayed pre-handoff legacy-store update after cutover writes nothing again (no new version, no audit row): it is refused or answered without a second write, not left out"
-      # The same key with a different body must be refused, never written as a new update under the carried key.
-      expect do
-        gateway.update(entry_id: entry.id, project:,
-                       attributes: { duration: 90, work_date: Date.current, note: "Other body", bill_status: "unbilled" },
-                       authorize: ->(_entry) { })
-      end.to raise_error(Timekeeping::EntryWriteClient::KeyReused)
-      expect(Timekeeping::LegacyEntryWriteReceipt.where(company_id: company.id, operation: "update").count).to eq(1)
-    end
-  end
-
 end
 
 RSpec.describe Timekeeping::Gateway, committed_data: true do

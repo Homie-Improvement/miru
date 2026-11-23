@@ -124,35 +124,6 @@ RSpec.describe LiveHandoff do
     end
   end
 
-  context "more tests 15" do
-    it "monolith_counts counts legacy_entry_write_receipts per company and a receipt written for company A moves only A's count" do
-      company_a = create(:company).id
-      company_b = create(:company).id
-      write_receipt = lambda do |company_id|
-        now = Time.current
-        Timekeeping::LegacyEntryWriteReceipt.create!(
-          company_id:, actor_kind: "user", actor_id: 1, operation: "update", key: SecureRandom.uuid, fingerprint: "fp",
-          timesheet_entry_id: 1, entry_attributes: {}, created_at: now, expires_at: now + 1.day
-        )
-      end
-      2.times { write_receipt.call(company_a) }
-      write_receipt.call(company_b)
-
-      # "Bracket every replay with `LiveHandoff.tenant_counts` for each company in both stores: entries, version sums, `audits`, `entry_audits`, `audit_events`, receipts and outbox. Also compare `TenantStateDigest.take`. Never add the two companies' counts together."
-      expect(described_class.monolith_counts(company_id: company_a).fetch(:legacy_entry_write_receipts)).to eq(2)
-      expect(described_class.monolith_counts(company_id: company_b).fetch(:legacy_entry_write_receipts)).to eq(1)
-
-      b_before = described_class.monolith_counts(company_id: company_b)
-      a_before = described_class.monolith_counts(company_id: company_a)
-      write_receipt.call(company_a)
-      a_after = described_class.monolith_counts(company_id: company_a)
-
-      expect(a_after.to_h { |key, value| [key, value - a_before.fetch(key)] }.reject { |_key, delta| delta.zero? })
-        .to eq(legacy_entry_write_receipts: 1)
-      expect(described_class.monolith_counts(company_id: company_b)).to eq(b_before)
-    end
-  end
-
   context "more tests 19" do
     it "expected_web_reply_from_row renders the stored owner row's fields, not the live row's, and refuses a row of another company" do
       company = create(:company)
@@ -338,7 +309,8 @@ RSpec.describe LiveHandoff do
       "an entry" => [-> { insert_entry.call(company_a, 1) }, { entries: 1, entry_versions: 1 }],
       "a raised version" => [-> { connection.exec_query("UPDATE entries SET version = version + 1 WHERE id = (SELECT min(id) FROM entries WHERE company_id = $1)", "live_handoff_counts", [company_a]) }, { entry_versions: 1 }],
       "an audit row" => [-> { insert_audit.call(company_a) }, { timesheet_entry_audits: 1 }],
-      "a receipt" => [-> { insert_legacy_receipt.call(company_a) }, { legacy_create_receipts: 1 }]
+      "a receipt" => [-> { insert_legacy_receipt.call(company_a) }, { legacy_create_receipts: 1 }],
+      "a legacy update receipt" => [-> { insert_legacy_entry_write_receipt.call(company_a) }, { legacy_entry_write_receipts: 1 }]
     }
     writes.each do |label, (write, expected_changes)|
       a_before = described_class.monolith_counts(company_id: company_a)
