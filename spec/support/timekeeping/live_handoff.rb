@@ -335,13 +335,14 @@ module LiveHandoff
     # Runs one handoff with the configured owners, asserts the stored
     # ownership row moved to the direction's owner at a higher generation with
     # no step left, and requires a clean reconciliation report for exactly
-    # company_ids. Returns the parsed report.
-    def run_live_handoff(direction, company_ids:)
+    # company_ids. Returns the parsed report. The observer receives the
+    # runner's step events, so a proof can act between steps of a checked run.
+    def run_live_handoff(direction, company_ids:, observer: Timekeeping::Handoff::NullObserver.new)
       owner_before, generation_before, = live_handoff_ownership_row
       report_root = Pathname(Dir.mktmpdir("timekeeping-live-handoff"))
 
       # No owners: argument, so the run uses Runner.configured_owners.
-      Timekeeping::Handoff::Runner.run(direction:, report_root:)
+      Timekeeping::Handoff::Runner.run(direction:, report_root:, observer:)
 
       owner, generation, handoff_step = live_handoff_ownership_row
       expect(owner).to eq(EXPECTED_OWNER.fetch(direction))
