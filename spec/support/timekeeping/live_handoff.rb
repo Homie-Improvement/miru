@@ -37,11 +37,14 @@ module LiveHandoff
   )
 
   # The monolith web and CLI routes share ErrorHandler
-  # (app/controllers/concerns/error_handler.rb). Its 404 is left out: that body
-  # carries the record's own not-found message, so it is no fixed pair.
+  # (app/controllers/concerns/error_handler.rb). A key reused for other request
+  # values renders the rejected message with its reason. Its 404 is left out:
+  # that body carries the record's own not-found message, so it is no fixed pair.
   MONOLITH_REFUSALS = TenantGuardCases.frozen_copy(
     [
       { status: 422, body: { "errors" => I18n.t("errors.entry_write_rejected") } },
+      { status: 422, body: { "errors" => I18n.t("errors.entry_write_rejected"),
+                             "reason" => Timekeeping::Gateway::KEY_REUSED_REASON } },
       { status: 409, body: { "errors" => I18n.t("errors.stale_generation"), "reason" => "stale_generation" } }
     ]
   )
@@ -79,6 +82,7 @@ module LiveHandoff
                             "AND associated_type = 'Company' AND associated_id = $1",
     entry_audits: "SELECT count(*) FROM entry_audits WHERE company_id = $1",
     legacy_create_receipts: "SELECT count(*) FROM legacy_create_receipts WHERE company_id = $1",
+    legacy_entry_write_receipts: "SELECT count(*) FROM legacy_entry_write_receipts WHERE company_id = $1",
     idempotency_records: "SELECT count(*) FROM idempotency_records WHERE company_id = $1",
     entry_snapshot_receipts: "SELECT count(*) FROM entry_snapshot_receipts WHERE $1 = ANY(company_ids)",
     entry_outbox_items: "SELECT count(*) FROM entry_outbox_items WHERE company_id = $1"
@@ -187,6 +191,26 @@ module LiveHandoff
   def expected_web_reply(receipt_entry_attributes, action:)
     entry = TimesheetEntry.instantiate(receipt_entry_attributes).tap(&:readonly!)
     { notice: I18n.t("timesheet_entry.#{action}.message"), entry: entry.snippet }.to_json
+  end
+
+  # The same reply built from an entry row an owner stored in its receipt
+  # (Timekeeping's idempotency_receipts or the prepared store's
+  # idempotency_records), hydrated as the gateway hydrates an owner's answer.
+  # A row the company would not render, such as one of another company, raises.
+  def expected_web_reply_from_row(row, company:, action:)
+    entry = Timekeeping::EntryReader.hydrate([row], company:, user_id: row["user_id"]).first
+    raise ArgumentError, "the stored row is not an entry of company #{company.id}" if entry.nil?
+
+    { notice: I18n.t("timesheet_entry.#{action}.message"), entry: entry.snippet }.to_json
+  end
+
+  # The refusals of company A's replay of company B's web create. The
+  # controller looks the recorded project up inside A's company before any
+  # receipt is read, so A is refused with ErrorHandler's 404 and the
+  # not-found message of that lookup, which the caller reads by running the
+  # same scoped find. Only that exact pair is added to the monolith refusals.
+  def cross_company_web_refusals(not_found_message:)
+    TenantGuardCases.frozen_copy([*MONOLITH_REFUSALS, { status: 404, body: { "errors" => not_found_message } }])
   end
 
   # The recorded web request sent again with another company's credentials:
