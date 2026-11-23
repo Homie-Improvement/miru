@@ -61,11 +61,21 @@ module TimekeepingContract
 
       evaluated = yield
       response = response_of(evaluated)
-      if stored?(operation, response, evaluated)
-        # A private copy, so a caller editing its answer cannot change what a replay returns.
-        @receipts[receipt_key] = { fingerprint:, status: response.status, body: Wire.copy(response.body) }
-      end
+      store(company_scope:, actor:, operation:, key:, body:, response:) if stored?(operation, response, evaluated)
       response
+    end
+
+    # Stores response as the receipt for the request, whatever its status.
+    def store(company_scope:, actor:, operation:, key:, body:, response:)
+      receipt_key = @receipt_key.call(company_scope:, actor:, operation:, key:)
+      # A private copy, so a caller editing its answer cannot change what a replay returns.
+      @receipts[receipt_key] = { company_scope:, fingerprint: JSON.generate(body), status: response.status,
+                                 body: Wire.copy(response.body) }
+    end
+
+    # How many receipts are stored for the company, whatever the receipt key holds.
+    def count(company_scope:)
+      @receipts.values.count { |receipt| receipt.fetch(:company_scope) == company_scope }
     end
 
     private
