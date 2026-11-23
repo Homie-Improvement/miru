@@ -285,11 +285,11 @@ RSpec.describe "TimekeepingRegressionAdapter.start! from a stopped adapter", com
                                 service_token: "adapter-snapshot-token", admission_generation: 2, stop: nil)
       end
       delivered = []
-      allow_any_instance_of(TimekeepingHandoffOutboxRelay::ConsumerEndpoint) # rubocop:disable RSpec/AnyInstance
-        .to receive(:deliver) do |_endpoint, batch, idempotency_key:|
-          delivered << [batch, idempotency_key]
-          TimekeepingRelay::Response.new(status: 200, body: {})
-        end
+      # The snapshot app hands each batch to the projection consumer in this process.
+      allow(Timekeeping::ProjectionConsumer).to receive(:call) do |batch:, idempotency_key:|
+        delivered << [batch, idempotency_key]
+        TimekeepingRelay::Response.new(status: 200, body: {})
+      end
       url = "postgresql://snapshot_user@127.0.0.1/timekeeping_snapshot_adapter_test"
 
       begin

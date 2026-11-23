@@ -2,9 +2,12 @@
 
 require "rails_helper"
 
-RSpec.describe TimekeepingLiveSnapshotApp do
+# The snapshot app hands each batch to Timekeeping::ProjectionConsumer in this
+# process, so these examples stub the consumer's entry point and read what it
+# received.
+RSpec.describe TimekeepingLiveSnapshotApp, committed_data: true do
   it "live snapshot app answers 401 to a missing or wrong bearer token and never hands the batch to the consumer" do
-    expect_any_instance_of(TimekeepingHandoffOutboxRelay::ConsumerEndpoint).not_to receive(:deliver)
+    expect(Timekeeping::ProjectionConsumer).not_to receive(:call)
     app = described_class.new
     app.service_token = "live-service-right-token"
     body = JSON.generate("snapshots" => [{ "entry" => { "company_id" => 1 } }])
@@ -28,7 +31,7 @@ RSpec.describe TimekeepingLiveSnapshotApp do
   end
 
   it "live snapshot app refuses every request before its service token is set, even one sending an empty bearer" do
-    expect_any_instance_of(TimekeepingHandoffOutboxRelay::ConsumerEndpoint).not_to receive(:deliver)
+    expect(Timekeeping::ProjectionConsumer).not_to receive(:call)
     app = described_class.new
     body = JSON.generate("snapshots" => [{ "entry" => { "company_id" => 1 } }])
 
@@ -43,14 +46,13 @@ RSpec.describe TimekeepingLiveSnapshotApp do
     end
   end
 
-  # "start the live instance in TimekeepingRegressionAdapter.launch with a snapshot_app that wraps TimekeepingHandoffOutboxRelay::ConsumerEndpoint."
+  # The live instance's snapshot_app must hand each batch to the projection consumer unchanged.
   it "an authorized snapshot POST reaches ConsumerEndpoint#deliver with its Idempotency-Key and exact decimals and answers the consumer's status" do
     delivered = []
-    allow_any_instance_of(TimekeepingHandoffOutboxRelay::ConsumerEndpoint)
-      .to receive(:deliver) do |_endpoint, batch, idempotency_key:|
-        delivered << [batch, idempotency_key]
-        TimekeepingRelay::Response.new(status: 200, body: { "accepted" => 1 })
-      end
+    allow(Timekeeping::ProjectionConsumer).to receive(:call) do |batch:, idempotency_key:|
+      delivered << [batch, idempotency_key]
+      TimekeepingRelay::Response.new(status: 200, body: { "accepted" => 1 })
+    end
     app = described_class.new
     app.service_token = "live-snapshot-token"
     raw = '{"snapshots":[{"generation":2,"outbox_position":1,"entry":{"company_id":41,"duration":1.123456789012345678}}]}'
@@ -74,8 +76,7 @@ RSpec.describe TimekeepingLiveSnapshotApp do
 
   # The live relay picks outbox rows by position only, so one batch can carry two companies.
   it "a refused batch mixing two companies is answered 409 and kept as the answer for both companies" do
-    allow_any_instance_of(TimekeepingHandoffOutboxRelay::ConsumerEndpoint)
-      .to receive(:deliver)
+    allow(Timekeeping::ProjectionConsumer).to receive(:call)
       .and_return(TimekeepingRelay::Response.new(status: 409, body: { "reason" => "stale_generation" }))
     app = described_class.new
     app.service_token = "live-snapshot-token"
@@ -100,11 +101,10 @@ RSpec.describe TimekeepingLiveSnapshotApp do
   # A drain is retried until delivered, so the consumer's idempotency must see the relay's own key every time.
   it "a relay retry of the same batch reaches the consumer under the same Idempotency-Key both times" do
     keys = []
-    allow_any_instance_of(TimekeepingHandoffOutboxRelay::ConsumerEndpoint)
-      .to receive(:deliver) do |_endpoint, _batch, idempotency_key:|
-        keys << idempotency_key
-        TimekeepingRelay::Response.new(status: 200, body: { "applied" => 1 })
-      end
+    allow(Timekeeping::ProjectionConsumer).to receive(:call) do |idempotency_key:, **|
+      keys << idempotency_key
+      TimekeepingRelay::Response.new(status: 200, body: { "applied" => 1 })
+    end
     app = described_class.new
     app.service_token = "live-snapshot-token"
     batch = { "snapshots" => [{ "generation" => 2, "outbox_position" => 5,
@@ -125,11 +125,10 @@ RSpec.describe TimekeepingLiveSnapshotApp do
 
   it "live snapshot app hands a body that is not JSON to the consumer as nil, so the consumer refuses it" do
     received = []
-    allow_any_instance_of(TimekeepingHandoffOutboxRelay::ConsumerEndpoint)
-      .to receive(:deliver) do |_endpoint, batch, idempotency_key:|
-        received << [batch, idempotency_key]
-        TimekeepingRelay::Response.new(status: 422, body: { "reason" => "invalid_batch" })
-      end
+    allow(Timekeeping::ProjectionConsumer).to receive(:call) do |batch:, idempotency_key:|
+      received << [batch, idempotency_key]
+      TimekeepingRelay::Response.new(status: 422, body: { "reason" => "invalid_batch" })
+    end
     app = described_class.new
     app.service_token = "live-snapshot-token"
     env = Rack::MockRequest.env_for(TimekeepingRelay::HttpEndpoint::DELIVER_PATH,
@@ -144,7 +143,7 @@ RSpec.describe TimekeepingLiveSnapshotApp do
   end
 
   it "live snapshot app answers 404 to an authorized request on any other path and never calls the consumer" do
-    expect_any_instance_of(TimekeepingHandoffOutboxRelay::ConsumerEndpoint).not_to receive(:deliver)
+    expect(Timekeeping::ProjectionConsumer).not_to receive(:call)
     app = described_class.new
     app.service_token = "live-snapshot-token"
     env = Rack::MockRequest.env_for("/internal/v1/other", method: "POST", input: "{}",
