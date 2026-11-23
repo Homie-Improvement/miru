@@ -62,6 +62,9 @@ RSpec.describe LiveHandoff do
                                             expected_body: company_b_reply, refusals:)).to eq(:failed)
       expect(described_class.replay_verdict(status: 500, body: { errors: message }.to_json,
                                             expected_body: company_b_reply, refusals:)).to eq(:failed)
+      # Timekeeping's own not_found body is no refusal on the monolith web route.
+      expect(described_class.replay_verdict(status: 404, body: { reason: "not_found" }.to_json,
+                                            expected_body: company_b_reply, refusals:)).to eq(:failed)
       described_class::MONOLITH_REFUSALS.each do |pair|
         expect(refusals).to include(pair)
       end
@@ -74,29 +77,6 @@ RSpec.describe LiveHandoff do
 
       # The same-company monolith table still counts no 404.
       expect(described_class.replay_verdict(status: 404, body: { errors: message }.to_json, expected_body: company_b_reply,
-                                            refusals: described_class::MONOLITH_REFUSALS)).to eq(:failed)
-    end
-  end
-
-  context "more tests 11" do
-    it "cross_company_web_refusals counts only the exact not-found reply for the replayed project as a cross-company refusal" do
-      message = "Couldn't find Project with 'id'=41"
-      refusals = described_class.cross_company_web_refusals(not_found_message: message)
-      b_receipt = '{"notice":"created","entry":{"id":9}}'
-      verdict = lambda do |status, body|
-        described_class.replay_verdict(status:, body:, expected_body: b_receipt, refusals:)
-      end
-
-      # "Refusals count only as the exact per-route status and body pairs in `LiveHandoff`'s refusal tables. Anything else fails, including a 5xx or a connection error."
-      expect(verdict.call(404, { errors: message }.to_json)).to eq(:refused)
-      expect(verdict.call(404, { errors: "Couldn't find Project with 'id'=42" }.to_json)).to eq(:failed)
-      expect(verdict.call(500, { errors: message }.to_json)).to eq(:failed)
-      # "A must never get B's reply, and neither company's counts may change."
-      # The table holds no success, so B's stored reply is never an accepted answer for A.
-      expect(refusals.pluck(:status)).to all(satisfy { |status| !(200..299).cover?(status) })
-      expect(refusals).to be_frozen
-      # Same-company monolith replays still never count a 404.
-      expect(described_class.replay_verdict(status: 404, body: { errors: message }.to_json, expected_body: b_receipt,
                                             refusals: described_class::MONOLITH_REFUSALS)).to eq(:failed)
     end
   end
@@ -144,28 +124,6 @@ RSpec.describe LiveHandoff do
     end
   end
 
-  context "more tests 14" do
-    it "cross_company_web_refusals counts only the exact not-found pair for the replayed project and never a success or Timekeeping's not_found body" do
-      message = "Couldn't find Project with 'id'=424242"
-      refusals = described_class.cross_company_web_refusals(not_found_message: message)
-      b_stored_reply = { notice: "Timesheet created", entry: { id: 77, note: "company B note" } }.to_json
-
-      expect(refusals).to be_frozen
-      # "Refusals count only as the exact per-route status and body pairs in `LiveHandoff`'s refusal tables. Anything else fails, including a 5xx or a connection error."
-      expect(described_class.replay_verdict(status: 404, body: { errors: message }.to_json, expected_body: b_stored_reply,
-                                            refusals:)).to eq(:refused)
-      expect(described_class.replay_verdict(status: 404, body: { errors: "Couldn't find Project with 'id'=1" }.to_json,
-                                            expected_body: b_stored_reply, refusals:)).to eq(:failed)
-      expect(described_class.replay_verdict(status: 404, body: { reason: "not_found" }.to_json,
-                                            expected_body: b_stored_reply, refusals:)).to eq(:failed)
-      expect(described_class.replay_verdict(status: 500, body: { errors: message }.to_json,
-                                            expected_body: b_stored_reply, refusals:)).to eq(:failed)
-      # "A must never get B's reply, and neither company's counts may change."
-      expect(refusals).not_to include(a_hash_including(status: 200))
-      expect(refusals.map { |pair| pair.fetch(:status) }).to all(satisfy { |status| !(200..299).cover?(status) })
-    end
-  end
-
   context "more tests 15" do
     it "monolith_counts counts legacy_entry_write_receipts per company and a receipt written for company A moves only A's count" do
       company_a = create(:company).id
@@ -192,69 +150,6 @@ RSpec.describe LiveHandoff do
       expect(a_after.to_h { |key, value| [key, value - a_before.fetch(key)] }.reject { |_key, delta| delta.zero? })
         .to eq(legacy_entry_write_receipts: 1)
       expect(described_class.monolith_counts(company_id: company_b)).to eq(b_before)
-    end
-  end
-
-  context "more tests 16" do
-    it "cross_company_web_refusals counts only the exact not-found pair it was built with as a refusal" do
-      message = "Couldn't find Project with 'id'=42"
-      table = described_class.cross_company_web_refusals(not_found_message: message)
-      verdict = lambda do |status, body, refusals|
-        described_class.replay_verdict(status:, body: JSON.generate(body), expected_body: "unused", refusals:)
-      end
-
-      # "Refusals count only as the exact per-route status and body pairs in `LiveHandoff`'s refusal tables. Anything else fails, including a 5xx or a connection error."
-      expect(table).to be_frozen
-      expect(verdict.call(404, { "errors" => message }, table)).to eq(:refused)
-      expect(verdict.call(404, { "errors" => "Couldn't find Project with 'id'=43" }, table)).to eq(:failed)
-      expect(verdict.call(404, { "errors" => message }, described_class::MONOLITH_REFUSALS)).to eq(:failed)
-      expect(verdict.call(500, { "errors" => message }, table)).to eq(:failed)
-      # "Company A replaying company B's key never receives B's answer and changes neither company's counts"
-      expect(verdict.call(200, { "entry" => { "id" => 1 } }, table)).to eq(:failed)
-    end
-  end
-
-  context "more tests 17" do
-    it "MONOLITH_REFUSALS counts the key-reused reply ErrorHandler renders as a refusal and TIMEKEEPING_REFUSALS does not" do
-      body = JSON.generate({ "errors" => I18n.t("errors.entry_write_rejected"), "reason" => "idempotency_key_reused" })
-
-      # "Refusals count only as the exact per-route status and body pairs in `LiveHandoff`'s refusal tables. Anything else fails, including a 5xx or a connection error."
-      expect(described_class.replay_verdict(status: 422, body:, expected_body: "unused",
-                                            refusals: described_class::MONOLITH_REFUSALS)).to eq(:refused)
-      expect(described_class.replay_verdict(status: 422, body:, expected_body: "unused",
-                                            refusals: described_class::TIMEKEEPING_REFUSALS)).to eq(:failed)
-      expect(described_class.replay_verdict(status: 500, body:, expected_body: "unused",
-                                            refusals: described_class::MONOLITH_REFUSALS)).to eq(:failed)
-    end
-  end
-
-  context "more tests 18" do
-    it "monolith_counts counts legacy_entry_write_receipts per company and a receipt for company A moves only A's count" do
-      company_a = create(:company).id
-      company_b = create(:company).id
-      insert_receipt = lambda do |company_id|
-        now = Time.current
-        Timekeeping::LegacyEntryWriteReceipt.create!(
-          company_id:, actor_kind: "user", actor_id: 1, key: SecureRandom.uuid, operation: "update",
-          fingerprint: "fp", timesheet_entry_id: 1, entry_attributes: {}, created_at: now, expires_at: now + 1.day
-        )
-      end
-      insert_receipt.call(company_a)
-      insert_receipt.call(company_a)
-      insert_receipt.call(company_b)
-
-      # "Bracket every replay with `LiveHandoff.tenant_counts` for each company in both stores: entries, version sums, `audits`, `entry_audits`, `audit_events`, receipts and outbox."
-      # "Never add the two companies' counts together."
-      before_a = described_class.monolith_counts(company_id: company_a)
-      before_b = described_class.monolith_counts(company_id: company_b)
-      expect(before_a.fetch(:legacy_entry_write_receipts)).to eq(2)
-      expect(before_b.fetch(:legacy_entry_write_receipts)).to eq(1)
-
-      insert_receipt.call(company_a)
-
-      after_a = described_class.monolith_counts(company_id: company_a)
-      expect(after_a).to eq(before_a.merge(legacy_entry_write_receipts: 3))
-      expect(described_class.monolith_counts(company_id: company_b)).to eq(before_b)
     end
   end
 
