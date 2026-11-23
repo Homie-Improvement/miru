@@ -879,8 +879,6 @@ RSpec.describe TimekeepingQueueLedger do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe TimekeepingQueueLedger do
   # "The inline `Timekeeping::RelayJob.perform_now` run is not shown to be watched by the ledger either."
   # perform_now writes no Solid Queue row, so the inline watcher must see nested inline jobs itself.
@@ -907,8 +905,6 @@ RSpec.describe TimekeepingQueueLedger do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe TimekeepingQueueLedger do
   it "inline_performs stops collecting when its block ends and returns an empty list when no job ran" do
     job = Class.new(ApplicationJob) do
@@ -925,8 +921,6 @@ RSpec.describe TimekeepingQueueLedger do
     expect(described_class.inline_performs { QueueLedgerInlineAfterBlockJob.perform_now }).to eq(["default"])
   end
 end
-
-require "rails_helper"
 
 RSpec.describe TimekeepingQueueLedger do
   # "and the suite fails if a job from a non-dedicated queue ran"

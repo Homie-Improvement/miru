@@ -307,7 +307,8 @@ module TimekeepingIntegrationTags
       node.compact_child_nodes.flat_map { |child| declared_constants(child, namespace) }
     end
   end
-  private_class_method :untagged_examples, :runtime_tag_setting, :hash_node?, :example_names_in, :counted_example?, :disabled_group?, :skip_metadata?, :skip_symbol?,
+  private_class_method :untagged_examples, :runtime_tag_setting, :hash_node?,
+                       :example_names_in, :counted_example?, :disabled_group?, :skip_metadata?, :skip_symbol?,
                        :example_name,
                        :walk, :walk_call, :group_call?, :example_call?, :rspec_receiver?, :tag_setting,
                        :tag_key?, :loads_handoff_fakes?, :fake_reference?, :top_level_segments,
