@@ -3,10 +3,11 @@
 require "rails_helper"
 
 # Runs an import, then delivers the rows it wrote to timesheet_entries through
-# the outbox relay. Where the prepared store owns the entries (rollback), the
-# relay is the only writer of timesheet_entries, and the importer reads that
-# table to skip rows already stored, so a later import must find them
-# delivered. In other states the delivery does nothing.
+# the outbox relay and waits until they are delivered. Where the prepared store
+# owns the entries (rollback), or a live Timekeeping app owns them in a live
+# regression run, the relay is the only writer of timesheet_entries, and the
+# importer reads that table to skip rows already stored, so a later import must
+# find them delivered. In other states the delivery does nothing.
 module HarvestImporterSpecRelay
   def run_harvest_import(import)
     described_class.new(import).process

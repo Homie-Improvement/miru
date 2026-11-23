@@ -42,6 +42,13 @@ module TimekeepingContract
       @timekeeping.add_agent(company_id: company, user_id: user)
     end
 
+    # One of the company's invoices. The fake does not check invoice
+    # ownership, so there is nothing to record; the id is returned so the
+    # shared examples arrange invoices the same way on every provider.
+    def invoice(company:, invoice_id:) # rubocop:disable Lint/UnusedMethodArgument
+      invoice_id
+    end
+
     def entry(company:, user:, project:, **attributes)
       @timekeeping.add_entry(company_id: company, user_id: user, project_id: project, **attributes).fetch("id")
     end

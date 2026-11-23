@@ -9,6 +9,13 @@ module Timekeeping
   # commit together or not at all. Any refusal or failure leaves nothing, so a
   # retry runs as a first attempt. The steps, in order:
   #
+  # Before the transaction, a prepare is checked against the invoice's owner
+  # (Timekeeping::InvoiceOwnership). An invoice that is not the path
+  # company's answers not_found, exactly as an id no company uses does; one
+  # whose owner the monolith cannot say answers reference_unavailable. Either
+  # refusal stores nothing, so a retry is checked again. No HTTP call runs
+  # while a lock is held.
+  #
   # 1. Lock the operation key (company, service, operation_id), then the
   #    company's invoice, so commit and abort of one operation, and prepares
   #    for one invoice, wait in turn.
@@ -68,12 +75,26 @@ module Timekeeping
       abort: { "dropped" => 0 }.freeze
     }.freeze
 
-    def initialize(checkpoint: ->(_step) { })
+    # The routes that name an invoice before any operation for it is stored.
+    # Commit and abort act only on an operation the path company prepared.
+    OWNER_CHECKED_ROUTES = %i[prepare].freeze
+
+    # invoice_owned answers call(company_id:, invoice_id:) with whether the
+    # invoice is the company's, raising ReferenceClient::Unavailable when that
+    # cannot be read.
+    def initialize(checkpoint: ->(_step) { }, invoice_owned: InvoiceOwnership.method(:owned?))
       @checkpoint = checkpoint
+      @invoice_owned = invoice_owned
     end
 
     def call(request)
+      return WriteOutcome.refusal(:not_found) unless invoice_owned?(request)
+
       ApplicationRecord.transaction { run(request) }
+    rescue ReferenceClient::Unavailable
+      # Ownership is unknown, so the prepare is neither applied nor answered
+      # as not_found; nothing has been written and the caller may retry.
+      WriteOutcome.refusal(:reference_unavailable)
     rescue ActiveRecord::RecordNotUnique
       # A backstop: the operation and invoice locks normally stop two writers
       # from both reaching an insert. The failed transaction has rolled back
@@ -95,7 +116,12 @@ module Timekeeping
 
     private
 
-      attr_reader :checkpoint
+      attr_reader :checkpoint, :invoice_owned
+
+      def invoice_owned?(request)
+        !OWNER_CHECKED_ROUTES.include?(request.route) ||
+          invoice_owned.call(company_id: request.company_id, invoice_id: request.invoice_id)
+      end
 
       def run(request)
         WriteSteps.lock_key(request.company_id, ACTOR_TYPE, request.actor_name, request.operation_id)

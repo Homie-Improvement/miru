@@ -14,6 +14,7 @@ RSpec.describe "Reservation conflicted prepare retried through reservation_post"
     free_a = timekeeping_arrange.entry(company:, user:, project:)
     free_b = timekeeping_arrange.entry(company:, user:, project:)
     held = timekeeping_arrange.reserved_entry(company:, invoice_id: 777, state: "committed")
+    timekeeping_arrange.invoice(company:, invoice_id: 501)
     service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: reservation_routes)
     operation_id = SecureRandom.uuid
     body = { "invoice_id" => 501, "operation_id" => operation_id, "disposition" => "active" }
@@ -47,6 +48,7 @@ RSpec.describe "Reservation prepare outbox failure through reservation_post" do
     user = timekeeping_arrange.user(company:, role: "employee")
     entry = timekeeping_arrange.entry(company:, user:, project: timekeeping_arrange.project(company:))
     service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: reservation_routes)
+    timekeeping_arrange.invoice(company:, invoice_id: 501)
     body = { "invoice_id" => 501, "operation_id" => SecureRandom.uuid, "disposition" => "active", "entries" => [entry] }
     before = reservation_row_counts
     expect(before.keys).to eq(%i[reservations operations audit_events outbox_snapshots receipts versions])
@@ -82,6 +84,7 @@ RSpec.describe "Reservation replay after commit through reservation_post" do
     user = timekeeping_arrange.user(company:, role: "employee")
     entry = timekeeping_arrange.entry(company:, user:, project: timekeeping_arrange.project(company:))
     service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: reservation_routes)
+    timekeeping_arrange.invoice(company:, invoice_id: 501)
     finish_body = { "invoice_id" => 501, "operation_id" => SecureRandom.uuid }
     prepare_body = finish_body.merge("disposition" => "active", "entries" => [entry])
 
@@ -132,17 +135,22 @@ RSpec.describe "Reservation operation ids across companies" do
       [response.status, response.parsed_body]
     end
     operation_id = SecureRandom.uuid
-    finish_body = { "invoice_id" => 501, "operation_id" => operation_id }
+    # Each company prepares its own invoice: an invoice id belongs to one company.
+    finish_bodies = { first_company => 501, second_company => 502 }.to_h do |company, invoice_id|
+      [company, { "invoice_id" => timekeeping_arrange.invoice(company:, invoice_id:), "operation_id" => operation_id }]
+    end
+    first_body = finish_bodies.fetch(first_company)
+    second_body = finish_bodies.fetch(second_company)
 
-    expect(command.call(first_company, "prepare", finish_body.merge("disposition" => "active", "entries" => [first_entry])).first).to eq(200)
-    expect(command.call(second_company, "prepare", finish_body.merge("disposition" => "active", "entries" => [second_entry])).first).to eq(200)
+    expect(command.call(first_company, "prepare", first_body.merge("disposition" => "active", "entries" => [first_entry])).first).to eq(200)
+    expect(command.call(second_company, "prepare", second_body.merge("disposition" => "active", "entries" => [second_entry])).first).to eq(200)
 
-    expect(command.call(second_company, "abort", finish_body)).to eq([200, { "dropped" => 1 }])
+    expect(command.call(second_company, "abort", second_body)).to eq([200, { "dropped" => 1 }])
 
     expect(timekeeping_arrange.reservations_for(second_entry)).to eq([])
     expect(timekeeping_arrange.reservations_for(first_entry)).to eq([{ "invoice_id" => 501, "state" => "provisional" }])
     expect(timekeeping_arrange.entry_locked(first_entry)).to be(true)
-    expect(command.call(first_company, "commit", finish_body)).to eq([200, { "reserved" => 1, "released" => 0 }])
+    expect(command.call(first_company, "commit", first_body)).to eq([200, { "reserved" => 1, "released" => 0 }])
     expect(timekeeping_arrange.reservations_for(first_entry)).to eq([{ "invoice_id" => 501, "state" => "committed" }])
   end
 end
@@ -158,6 +166,7 @@ RSpec.describe "Reservation commit that releases an entry" do
     kept = timekeeping_arrange.entry(company:, user:, project:)
     dropped = timekeeping_arrange.entry(company:, user:, project:)
     service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: %w[prepare commit abort])
+    timekeeping_arrange.invoice(company:, invoice_id: 501)
     command = lambda do |route, body|
       process(:post, "/v1/companies/#{company}/reservations/#{route}",
               params: JSON.generate({ "generation" => timekeeping_arrange.current_generation }.merge(body)),

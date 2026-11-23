@@ -9,7 +9,7 @@ routes:
   show:
     method: GET
     path: /internal/v1/companies/{company_id}/reference
-    query: "project_ids=1,2 and agent_ids=3,4 (each a comma-separated list or an array; absent means none)"
+    query: "project_ids=1,2, agent_ids=3,4 and invoice_ids=5,6 (each a comma-separated list or an array; absent means none)"
 
 headers:
   authorization: "Authorization: Bearer <TIMEKEEPING_SERVICE_TOKEN>"
@@ -17,14 +17,16 @@ headers:
 
 max_project_ids: 200
 max_agent_ids: 200
+max_invoice_ids: 200
 
-# owned_agent_ids is additive: a reader that does not ask about agents
-# ignores it. Deploy the monolith before a Timekeeping that reads it, and
-# roll Timekeeping back first.
-response_fields: [company_id, edit_days, users, projects, missing_project_ids, agents, owned_agent_ids]
+# owned_agent_ids and invoices are additive: a reader that does not ask about
+# agents or invoices ignores them. Deploy the monolith before a Timekeeping
+# that reads them, and roll Timekeeping back first.
+response_fields: [company_id, edit_days, users, projects, missing_project_ids, agents, owned_agent_ids, invoices]
 user_fields: [id, role]
 project_fields: [id, company_id, billable, member_user_ids]
 agent_fields: [id, user_id]
+invoice_fields: [id, company_id]
 
 rules:
   service_identity: Only the Timekeeping service token is accepted. A missing or wrong credential, or a user token, gets 401 and no data, whether or not the company exists.
@@ -40,6 +42,13 @@ rules:
     holds its row lock is still listed (agents leaves it out). Another
     company's agent is left out exactly like an id no agent has. With no
     agent_ids the list is empty.
+  owned_invoices: >-
+    invoices lists, as {id, company_id}, the requested invoice_ids that are
+    invoices of the company in the path, discarded ones included, or that the
+    company holds only as an invoice operation intent (a new invoice whose save
+    has not committed yet, or a deleted invoice). Another company's invoice or
+    intent is left out exactly like an id no invoice has. With no invoice_ids
+    the list is empty.
 
 errors:
   unauthorized:
@@ -54,3 +63,6 @@ errors:
   invalid_agent_ids:
     status: 422
     body: { reason: invalid_agent_ids }
+  invalid_invoice_ids:
+    status: 422
+    body: { reason: invalid_invoice_ids }

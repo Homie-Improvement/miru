@@ -17,13 +17,15 @@ module Timekeeping
     User = Data.define(:id, :role)
     Project = Data.define(:id, :company_id, :billable, :member_user_ids)
     Agent = Data.define(:id, :user_id)
-    # owned_agent_ids is nil when the monolith did not send it, which an
-    # older monolith does not. Entry writes never read it, so they keep
-    # working beside such a monolith; owned_agent_ids below refuses instead.
+    Invoice = Data.define(:id, :company_id)
+    # owned_agent_ids and invoices are nil when the monolith did not send
+    # them, which an older monolith does not. Entry writes never read them,
+    # so they keep working beside such a monolith; owned_agent_ids and
+    # owned_invoice_ids below refuse instead.
     Facts = Data.define(:company_id, :edit_days, :users, :projects, :missing_project_ids, :agents,
-                        :owned_agent_ids) do
-      def initialize(owned_agent_ids: nil, **fields)
-        super(owned_agent_ids:, **fields)
+                        :owned_agent_ids, :invoices) do
+      def initialize(owned_agent_ids: nil, invoices: nil, **fields)
+        super(owned_agent_ids:, invoices:, **fields)
       end
 
       def user_ids
@@ -80,20 +82,35 @@ module Timekeeping
       owned
     end
 
+    # The requested invoice ids the monolith lists as the company's, counting
+    # a new invoice whose save has not committed yet. A response without
+    # invoices raises Unavailable: reading it as "owns none" would refuse the
+    # company's own invoice, and reading it as "owns all" would let one
+    # company write against another's.
+    def owned_invoice_ids(company_id:, invoice_ids:)
+      raise ArgumentError, "company_id must be an Integer" unless company_id.is_a?(Integer)
+      raise ArgumentError, "invoice_ids must be Integers" unless invoice_ids.all?(Integer)
+
+      invoices = read_facts(company_id, project_ids: [], invoice_ids:).invoices
+      raise Unavailable, "reference response lacks invoices" if invoices.nil?
+
+      invoices.map(&:id)
+    end
+
     private
 
       attr_reader :base_url, :service_token
 
-      def read_facts(company_id, project_ids:, agent_ids: [])
-        response = get(reference_uri(company_id, project_ids, agent_ids))
+      def read_facts(company_id, project_ids:, agent_ids: [], invoice_ids: [])
+        response = get(reference_uri(company_id, project_ids, agent_ids, invoice_ids))
         raise Unavailable, "reference endpoint answered #{response.code}" unless response.is_a?(Net::HTTPSuccess)
 
         parse(response.body, company_id)
       end
 
-      # agent_ids is sent only when asked for, so an entry write's request
-      # stays exactly as it was.
-      def reference_uri(company_id, project_ids, agent_ids)
+      # agent_ids and invoice_ids are sent only when asked for, so an entry
+      # write's request stays exactly as it was.
+      def reference_uri(company_id, project_ids, agent_ids, invoice_ids)
         raise Unavailable, "MONOLITH_REFERENCE_URL is not set" if base_url.to_s.strip.empty?
 
         uri = URI.parse("#{base_url.chomp("/")}/internal/v1/companies/#{company_id}/reference")
@@ -101,6 +118,7 @@ module Timekeeping
 
         query = { project_ids: project_ids.join(",") }
         query[:agent_ids] = agent_ids.join(",") if agent_ids.any?
+        query[:invoice_ids] = invoice_ids.join(",") if invoice_ids.any?
         uri.query = URI.encode_www_form(query)
         uri
       rescue URI::InvalidURIError
@@ -135,7 +153,8 @@ module Timekeeping
           end,
           missing_project_ids: facts["missing_project_ids"],
           agents: facts["agents"].map { |agent| Agent.new(id: agent["id"], user_id: agent["user_id"]) },
-          owned_agent_ids: facts["owned_agent_ids"]
+          owned_agent_ids: facts["owned_agent_ids"],
+          invoices: facts["invoices"]&.map { |invoice| Invoice.new(id: invoice["id"], company_id: invoice["company_id"]) }
         )
       rescue JSON::ParserError
         raise Unavailable, "reference response is not JSON"
@@ -149,13 +168,25 @@ module Timekeeping
           list_of?(facts["projects"]) { |project| valid_project?(project, company_id) } &&
           list_of?(facts["missing_project_ids"]) { |id| id.is_a?(Integer) } &&
           list_of?(facts["agents"]) { |agent| valid_agent?(agent) } &&
-          valid_owned_agent_ids?(facts)
+          valid_owned_agent_ids?(facts) &&
+          valid_invoices?(facts, company_id)
       end
 
       # Absent is allowed, for a monolith deployed before the field existed;
       # present, it must be a list of Integers.
       def valid_owned_agent_ids?(facts)
         !facts.key?("owned_agent_ids") || list_of?(facts["owned_agent_ids"]) { |id| id.is_a?(Integer) }
+      end
+
+      # Absent is allowed, as for owned_agent_ids; present, every invoice must
+      # belong to the path company, so a crossed answer never grants another
+      # company's invoice.
+      def valid_invoices?(facts, company_id)
+        !facts.key?("invoices") || list_of?(facts["invoices"]) { |invoice| valid_invoice?(invoice, company_id) }
+      end
+
+      def valid_invoice?(invoice, company_id)
+        invoice.is_a?(Hash) && invoice["id"].is_a?(Integer) && invoice["company_id"] == company_id
       end
 
       def valid_agent?(agent)

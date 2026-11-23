@@ -21,6 +21,7 @@ RSpec.describe "Timekeeping reservations tenant isolation: foreign entries at pr
     foreign_entry = timekeeping_arrange.entry(company: other_company, user: foreign_user,
                                               project: timekeeping_arrange.project(company: other_company))
     service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations:)
+    timekeeping_arrange.invoice(company:, invoice_id: 501)
 
     # "not_found covers an entry outside company_id, so a caller cannot probe other tenants" (section 5.3);
     # the issue: "-> 409 { reason: "conflict", ... } (nothing reserved)".
@@ -88,6 +89,7 @@ RSpec.describe "Reservation operation ids per company through reservation_post" 
     other_service = timekeeping_arrange.service_identity(company: other_company, name: "invoice-boundary", operations: reservation_routes)
     user = timekeeping_arrange.user(company:, role: "employee")
     project = timekeeping_arrange.project(company:)
+    timekeeping_arrange.invoice(company:, invoice_id: 501)
 
     { "commit" => { "reserved" => 1, "released" => 0 }, "abort" => { "dropped" => 1 } }.each do |finish, owner_answer|
       entry = timekeeping_arrange.entry(company:, user:, project:)
@@ -119,11 +121,14 @@ end
 RSpec.describe "Timekeeping reservations tenant isolation: invoice ids per company" do
   include_context "timekeeping entry writes"
 
-  it "lets two companies each hold an unresolved operation for the same invoice id" do
+  # An invoice has one owning company, so another company's prepare for it is refused as not_found.
+  # It must not answer unresolved_operation, which would name the owner's open operation id.
+  it "answers another company's prepare for an invoice with an unresolved operation as not_found, not unresolved_operation" do
     client = TimekeepingRackClient.new(Rails.application)
     operations = %w[prepare commit abort mark_billed detach_entries]
     company = timekeeping_arrange.company
     other_company = timekeeping_arrange.company
+    timekeeping_arrange.invoice(company:, invoice_id: 501)
     entry_in = lambda do |company_id|
       user = timekeeping_arrange.user(company: company_id, role: "employee")
       timekeeping_arrange.entry(company: company_id, user:, project: timekeeping_arrange.project(company: company_id))
@@ -139,13 +144,13 @@ RSpec.describe "Timekeeping reservations tenant isolation: invoice ids per compa
     end
 
     first = prepare.call(company, own_entry)
-    # An unresolved operation for invoice 501 in one company must not answer unresolved_operation in another.
     second = prepare.call(other_company, foreign_entry)
 
     expect(first.status).to eq(200)
-    expect(second.status).to eq(200)
-    expect(second.body.fetch("entries")).to eq([{ "entry_id" => foreign_entry, "company_id" => other_company }])
-    expect(timekeeping_arrange.reservations_for(foreign_entry)).to eq([{ "invoice_id" => 501, "state" => "provisional" }])
+    expect([second.status, second.body]).to eq([404, { "reason" => "not_found" }])
+    expect(InvoiceOperation.where(company_id: other_company).count).to eq(0)
+    expect(timekeeping_arrange.reservations_for(foreign_entry)).to eq([])
+    expect(timekeeping_arrange.reservations_for(own_entry)).to eq([{ "invoice_id" => 501, "state" => "provisional" }])
   end
 end
 
@@ -158,7 +163,13 @@ RSpec.describe "Timekeeping reservations tenant isolation: mark-billed per compa
     company = timekeeping_arrange.company
     other_company = timekeeping_arrange.company
     own_entry = timekeeping_arrange.reserved_entry(company:, invoice_id: 501, state: "committed")
-    foreign_entry = timekeeping_arrange.reserved_entry(company: other_company, invoice_id: 501, state: "committed")
+    # A reservation of the same invoice id under another company can only be a row written before
+    # prepare refused foreign invoice ids, so it is seeded directly rather than through the catalogue.
+    foreign_user = timekeeping_arrange.user(company: other_company, role: "employee")
+    foreign_entry = timekeeping_arrange.entry(company: other_company, user: foreign_user,
+                                              project: timekeeping_arrange.project(company: other_company))
+    Reservation.create!(company_id: other_company, entry_id: foreign_entry, invoice_id: 501, state: "committed",
+                        disposition: "active", operation_id: SecureRandom.uuid, created_at: Time.current)
     service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations:)
     foreign_audits = -> { AuditEvent.where(company_id: other_company).count }
     foreign_snapshots = -> { OutboxSnapshot.where(company_id: other_company).count }

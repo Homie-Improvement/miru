@@ -31,6 +31,7 @@ RSpec.describe "Timekeeping mark-billed naming another company's invoice" do
     foreign = mark_billed.call(501)
     missing = mark_billed.call(990_001)
 
+    expect(foreign).to eq([404, { "reason" => "not_found" }])
     expect(foreign).to eq(missing)
     expect(ServiceIdempotencyReceipt.where(company_id: company).count).to eq(0)
     expect(ServiceIdempotencyReceipt.count).to eq(receipts_before)
@@ -50,6 +51,8 @@ RSpec.describe "Timekeeping mark-billed retry after a zero-target answer" do
     arrange = timekeeping_arrange
     company = arrange.company
     service = arrange.service_identity(company:, name: "invoice-boundary", operations: %w[prepare commit abort mark_billed])
+    # The company's own invoice, with no reservation yet, so the first attempt has nothing to bill.
+    arrange.invoice(company:, invoice_id: 501)
     operation_id = SecureRandom.uuid
     mark_billed = lambda do
       post "/v1/companies/#{company}/invoices/501/mark-billed",
@@ -102,10 +105,8 @@ RSpec.describe "Timekeeping mark-billed naming only another company's invoice" d
            params: { "operation_id" => SecureRandom.uuid, "generation" => arrange.current_generation }.to_json,
            headers: { "Authorization" => "Bearer #{seeded.fetch(requester).fetch(:token)}", "Content-Type" => "application/json" }
 
-      # The plan keeps today's 200 {"billed" => 0}; a separate change may refuse another company's
-      # invoice id with 404 not_found instead. Either answer is a "no match".
-      expect([[200, { "billed" => 0 }], [404, { "reason" => "not_found" }]])
-        .to include([response.status, JSON.parse(response.body)])
+      # Another company's invoice id is refused exactly like an invoice id that exists nowhere.
+      expect([response.status, JSON.parse(response.body)]).to eq([404, { "reason" => "not_found" }])
     end
 
     # "Each spec shows that no receipt row is written for a request carrying only another company's ids."
@@ -122,24 +123,26 @@ RSpec.describe "Timekeeping mark-billed, retrying an attempt that billed nothing
   it "evaluates a mark-billed retry again after a first attempt that billed nothing, and bills the entry committed since" do
     company_a = timekeeping_arrange.company
     company_b = timekeeping_arrange.company
-    # Only company B holds invoice 501 when company A first marks it billed.
+    # Company B's invoice 501 holds a committed entry; company A's own invoice 503 holds nothing yet when A
+    # first marks it billed. An invoice has one owning company, so the two companies use different ids.
     foreign_entry = timekeeping_arrange.reserved_entry(company: company_b, invoice_id: 501, state: "committed")
+    timekeeping_arrange.invoice(company: company_a, invoice_id: 503)
     service_a = timekeeping_arrange.service_identity(company: company_a, name: "invoice-boundary",
                                                      operations: %w[prepare commit abort mark_billed detach_entries])
     operation_id = SecureRandom.uuid
     mark_billed = lambda do
-      post "/v1/companies/#{company_a}/invoices/501/mark-billed",
+      post "/v1/companies/#{company_a}/invoices/503/mark-billed",
            params: { "operation_id" => operation_id, "generation" => timekeeping_arrange.current_generation }.to_json,
            headers: { "Authorization" => "Bearer #{service_a}", "Content-Type" => "application/json" }
       [response.status, JSON.parse(response.body)]
     end
 
     first = mark_billed.call
-    expect([[200, { "billed" => 0 }], [404, { "reason" => "not_found" }]]).to include(first)
+    expect(first).to eq([200, { "billed" => 0 }])
     expect(ServiceIdempotencyReceipt.where(company_id: [company_a, company_b]).count).to eq(0)
     expect(timekeeping_arrange.stored_entry(foreign_entry).fetch("bill_status")).to eq("unbilled")
 
-    own_entry = timekeeping_arrange.reserved_entry(company: company_a, invoice_id: 501, state: "committed")
+    own_entry = timekeeping_arrange.reserved_entry(company: company_a, invoice_id: 503, state: "committed")
     retried = mark_billed.call
 
     # A replay of a stored first answer would repeat it and leave the new entry unbilled.
@@ -181,7 +184,7 @@ RSpec.describe "Timekeeping mark-billed: another company's invoice" do
     2.times do |attempt|
       answer = mark_billed.call(company, own_service)
 
-      expect([[200, { "billed" => 0 }], [404, { "reason" => "not_found" }]]).to include(answer), "attempt #{attempt + 1}"
+      expect(answer).to eq([404, { "reason" => "not_found" }]), "attempt #{attempt + 1}"
       expect(counts.call).to eq(before), "attempt #{attempt + 1}"
       expect(Entry.find(foreign_billable).bill_status).to eq("unbilled")
     end

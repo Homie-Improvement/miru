@@ -73,8 +73,9 @@ errors:
   forbidden:
     status: 403
     body: { reason: forbidden }
-  # detach_entries only: the monolith could not say whether the requesting
-  # company owns the agent, so nothing is stored and the caller may retry.
+  # prepare, mark_billed and detach_entries: the monolith could not say
+  # whether the requesting company owns the invoice or the agent, so nothing
+  # is stored and the caller may retry.
   reference_unavailable:
     status: 503
     body: { reason: reference_unavailable }
