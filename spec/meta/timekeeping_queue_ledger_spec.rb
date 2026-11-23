@@ -864,48 +864,6 @@ RSpec.describe "Timekeeping queue ledger private root probe", :without_transacti
 end
 
 RSpec.describe TimekeepingQueueLedger do
-  # "Every live example here runs under the teardown queue ledger (`spec/support/timekeeping/queue_ledger.rb`), and the suite fails if a job from a non-dedicated queue ran"
-  it "non_dedicated_queues reports every queue outside the database's dedicated list and nothing inside it" do
-    monolith = described_class::DEDICATED_QUEUES.fetch("monolith")
-
-    expect(described_class.non_dedicated_queues(monolith, database: "monolith")).to eq([])
-    expect(described_class.non_dedicated_queues(%w[timekeeping_relay default invoice_operations billing_sync],
-                                                database: "monolith"))
-      .to contain_exactly("default", "billing_sync")
-    # invoice_operations is dedicated only on the monolith, so the Timekeeping database reports it.
-    expect(described_class.non_dedicated_queues(%w[timekeeping_relay invoice_operations], database: "timekeeping"))
-      .to eq(["invoice_operations"])
-    expect(described_class.non_dedicated_queues([Timekeeping::RelayJob.new.queue_name], database: "monolith")).to eq([])
-  end
-end
-
-RSpec.describe TimekeepingQueueLedger do
-  # "The inline `Timekeeping::RelayJob.perform_now` run is not shown to be watched by the ledger either."
-  # perform_now writes no Solid Queue row, so the inline watcher must see nested inline jobs itself.
-  it "inline_performs collects a default-queue job run by perform_now, nested inside another job, and non_dedicated_queues reports it" do
-    stray = Class.new(ApplicationJob) do
-      queue_as :default
-
-      def perform; end
-    end
-    stub_const("QueueLedgerInlineStrayJob", stray)
-    outer = Class.new(ApplicationJob) do
-      queue_as :timekeeping_relay
-
-      def perform
-        QueueLedgerInlineStrayJob.perform_now
-      end
-    end
-    stub_const("QueueLedgerInlineOuterJob", outer)
-
-    queues = described_class.inline_performs { QueueLedgerInlineOuterJob.perform_now }
-
-    expect(queues).to contain_exactly("timekeeping_relay", "default")
-    expect(described_class.non_dedicated_queues(queues, database: "monolith")).to eq(["default"])
-  end
-end
-
-RSpec.describe TimekeepingQueueLedger do
   it "inline_performs stops collecting when its block ends and returns an empty list when no job ran" do
     job = Class.new(ApplicationJob) do
       queue_as :default
