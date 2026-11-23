@@ -66,6 +66,7 @@ RSpec.describe "Timekeeping reservation commit: a failed outbox insert" do
     project = arrange.project(company:)
     kept = arrange.entry(company:, user:, project:)
     dropped = arrange.entry(company:, user:, project:)
+    arrange.invoice(company:, invoice_id: 501)
     command = lambda do |route, operation_id, extra = {}|
       post "/v1/companies/#{company}/reservations/#{route}",
            params: { "invoice_id" => 501, "operation_id" => operation_id,

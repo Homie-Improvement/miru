@@ -269,7 +269,6 @@ RSpec.describe "Internal::V1::Companies::References", type: :request do
     end
   end
 
-  context "more tests 2", type: :request do
   # "The monolith serves invoice facts `{id, company_id}` on the reference endpoint, the pattern of `docs/architecture/timekeeping-soa.md` line 378."
   # The facts answer for the path company only, so another company's invoice (or its pending intent) reads exactly
   # like an id no invoice has, and the endpoint cannot be used to probe other companies' invoices.
@@ -301,9 +300,7 @@ RSpec.describe "Internal::V1::Companies::References", type: :request do
     expect(foreign).to eq(unknown)
     expect(foreign_intent["invoices"]).to eq([])
   end
-  end
 
-  context "more tests 3", type: :request do
   # invoice_ids is caller input written into a database query, so a malformed or oversized list is refused
   # before any lookup, and the refusal does not repeat what was sent.
   it "answers invalid_invoice_ids for malformed or too many invoice ids without echoing them" do
@@ -327,9 +324,7 @@ RSpec.describe "Internal::V1::Companies::References", type: :request do
       expect(response.parsed_body).to eq("reason" => "invalid_invoice_ids")
     end
   end
-  end
 
-  context "more tests 4", type: :request do
   # "The monolith serves invoice facts `{id, company_id}` on the reference endpoint"
   # The facts answer for the path company only, so another company's invoice, or another company's in-flight
   # intent for an id, reads exactly like an id no invoice has.
@@ -370,9 +365,7 @@ RSpec.describe "Internal::V1::Companies::References", type: :request do
     expect(foreign).to eq(unknown)
     expect(foreign_intent).to eq(unknown)
   end
-  end
 
-  context "more tests 5", type: :request do
   # "The monolith serves invoice facts `{id, company_id}` on the reference endpoint"
   it "lists the path company's own, discarded and pending-intent invoices as {id, company_id} and leaves another company's invoice out like an unknown id" do
     own_invoice = create(:invoice, company: company_a, client: create(:client, company: company_a))
@@ -414,9 +407,7 @@ RSpec.describe "Internal::V1::Companies::References", type: :request do
     expect(foreign).to eq(unknown)
     expect(none_requested["invoices"]).to eq([])
   end
-  end
 
-  context "more tests 6", type: :request do
   # The invoice id list is caller input on an internal endpoint, so it is bounded and checked like agent_ids.
   it "refuses malformed or too many invoice_ids with 422 invalid_invoice_ids" do
     limit = contract["max_invoice_ids"]
@@ -435,7 +426,6 @@ RSpec.describe "Internal::V1::Companies::References", type: :request do
       expect(response).to have_http_status(:ok)
       expect(response.parsed_body["invoices"]).to eq([])
     end
-  end
   end
 end
 

@@ -18,6 +18,8 @@ RSpec.describe "Timekeeping reservation persistence across companies" do
                             project: arrange.project(company: company_a))
     entry_b = arrange.entry(company: company_b, user: arrange.user(company: company_b, role: "employee"),
                             project: arrange.project(company: company_b))
+    arrange.invoice(company: company_a, invoice_id: 501)
+    arrange.invoice(company: company_b, invoice_id: 502)
     operation_id = SecureRandom.uuid
     send_command = lambda do |company, token, route, body|
       post "/v1/companies/#{company}/reservations/#{route}",
@@ -33,14 +35,14 @@ RSpec.describe "Timekeeping reservation persistence across companies" do
 
     # "Operation ids are unique only within a company."
     other = send_command.call(company_b, service_b, "prepare",
-                              { "invoice_id" => 501, "operation_id" => operation_id, "disposition" => "active", "entries" => [entry_b] })
+                              { "invoice_id" => 502, "operation_id" => operation_id, "disposition" => "active", "entries" => [entry_b] })
 
     expect(other.status).to eq(200)
     expect(other.parsed_body).to eq(
       "operation_id" => operation_id, "state" => "prepared",
       "entries" => [{ "entry_id" => entry_b, "company_id" => company_b }]
     )
-    expect(arrange.reservations_for(entry_b)).to eq([{ "invoice_id" => 501, "state" => "provisional" }])
+    expect(arrange.reservations_for(entry_b)).to eq([{ "invoice_id" => 502, "state" => "provisional" }])
     expect(arrange.reservations_for(entry_a)).to eq([{ "invoice_id" => 501, "state" => "committed" }])
   end
 end
@@ -54,6 +56,7 @@ RSpec.describe "Timekeeping reservation abort persistence" do
     service = arrange.service_identity(company:, name: "invoice-boundary",
                                        operations: %w[prepare commit abort mark_billed detach_entries])
     entry_id = arrange.entry(company:, user: arrange.user(company:, role: "employee"), project: arrange.project(company:))
+    arrange.invoice(company:, invoice_id: 501)
     operation_id = SecureRandom.uuid
     send_command = lambda do |route, body|
       post "/v1/companies/#{company}/reservations/#{route}",
@@ -101,6 +104,7 @@ RSpec.describe "Timekeeping entry locked flag after reservation changes" do
                                        operations: %w[prepare commit abort mark_billed detach_entries])
     owner_token = arrange.token_for(arrange.user(company:, role: "owner"))
     entry_id = arrange.entry(company:, user: arrange.user(company:, role: "employee"), project: arrange.project(company:))
+    arrange.invoice(company:, invoice_id: 501)
     send_command = lambda do |route, body|
       post "/v1/companies/#{company}/reservations/#{route}",
            params: JSON.generate({ "generation" => arrange.current_generation }.merge(body)),

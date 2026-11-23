@@ -14,6 +14,7 @@ RSpec.describe TimekeepingLiveSpecs do
     %w[
       spec/integration/timekeeping/alerts_live_spec.rb
       spec/integration/timekeeping/handoff_live_spec.rb
+      spec/integration/timekeeping/invoice_first_save_live_spec.rb
       spec/integration/timekeeping/live_instance_generation_spec.rb
     ]
   end
@@ -223,7 +224,7 @@ RSpec.describe TimekeepingLiveSpecs do
     expect { base.call("pull_request", "42/merge", nil) }.to raise_error(ArgumentError)
   end
 
-  it "finds exactly the three live specs in the real spec/integration/timekeeping directory" do
+  it "finds exactly the four live specs in the real spec/integration/timekeeping directory" do
     # owned_entries_spec.rb and regression_adapter_spec.rb also need TIMEKEEPING_REGRESSION=1, and
     # local_relay_spec.rb has no live gate, so none of them belongs in the live set.
     expect(described_class.live_specs(root: Rails.root.to_s)).to eq(live)

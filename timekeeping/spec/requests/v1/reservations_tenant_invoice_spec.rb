@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 require "rails_helper"
 require "webmock/rspec"
 
@@ -52,9 +54,6 @@ RSpec.describe "Timekeeping reservations: another company's invoice id" do
   end
 end
 
-require "rails_helper"
-require "webmock/rspec"
-
 RSpec.describe "Timekeeping reservations: another company's invoice id" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
@@ -96,9 +95,6 @@ RSpec.describe "Timekeeping reservations: another company's invoice id" do
   end
 end
 
-require "rails_helper"
-require "webmock/rspec"
-
 RSpec.describe "Timekeeping reservations: another company's invoice id" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
@@ -132,9 +128,6 @@ RSpec.describe "Timekeeping reservations: another company's invoice id" do
     expect(counts.call).to eq(before)
   end
 end
-
-require "rails_helper"
-require "webmock/rspec"
 
 RSpec.describe "Timekeeping reservations: another company's invoice id" do
   include_context "timekeeping entry writes"
@@ -171,10 +164,6 @@ RSpec.describe "Timekeeping reservations: another company's invoice id" do
     expect(Reservation.count).to eq(0)
   end
 end
-
-# frozen_string_literal: true
-require "rails_helper"
-require "webmock/rspec"
 
 RSpec.describe "Timekeeping prepare naming another company's invoice" do
   include_context "timekeeping entry writes"
@@ -234,9 +223,6 @@ RSpec.describe "Timekeeping prepare naming another company's invoice" do
   end
 end
 
-require "rails_helper"
-require "webmock/rspec"
-
 RSpec.describe "Timekeeping mark-billed naming another company's invoice" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
@@ -289,9 +275,6 @@ RSpec.describe "Timekeeping mark-billed naming another company's invoice" do
   end
 end
 
-require "rails_helper"
-require "webmock/rspec"
-
 RSpec.describe "Timekeeping invoice ownership while the reference cannot answer" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
@@ -336,10 +319,6 @@ RSpec.describe "Timekeeping invoice ownership while the reference cannot answer"
     expect(ServiceIdempotencyReceipt.where(company_id: company, key: billing_key).count).to eq(1)
   end
 end
-
-# frozen_string_literal: true
-require "rails_helper"
-require "webmock/rspec"
 
 RSpec.describe "Timekeeping reservation prepare naming another company's invoice" do
   include_context "timekeeping entry writes"
@@ -396,10 +375,6 @@ RSpec.describe "Timekeeping reservation prepare naming another company's invoice
   end
 end
 
-# frozen_string_literal: true
-require "rails_helper"
-require "webmock/rspec"
-
 RSpec.describe "Timekeeping mark-billed of another company's held invoice" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
@@ -446,9 +421,6 @@ RSpec.describe "Timekeeping mark-billed of another company's held invoice" do
     end
   end
 end
-
-require "rails_helper"
-require "webmock/rspec"
 
 RSpec.describe "Timekeeping prepare naming another company's invoice" do
   include_context "timekeeping entry writes"
@@ -498,9 +470,6 @@ RSpec.describe "Timekeeping prepare naming another company's invoice" do
   end
 end
 
-require "rails_helper"
-require "webmock/rspec"
-
 RSpec.describe "Timekeeping mark-billed naming another company's invoice, both directions" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
@@ -543,9 +512,6 @@ RSpec.describe "Timekeeping mark-billed naming another company's invoice, both d
     expect(ServiceIdempotencyReceipt.count).to eq(2)
   end
 end
-
-require "rails_helper"
-require "webmock/rspec"
 
 RSpec.describe "Timekeeping prepare of a hard-deleted invoice" do
   include_context "timekeeping entry writes"
@@ -596,9 +562,6 @@ RSpec.describe "Timekeeping prepare of a hard-deleted invoice" do
   end
 end
 
-require "rails_helper"
-require "webmock/rspec"
-
 RSpec.describe "Timekeeping invoice ownership while the reference is down" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
@@ -630,9 +593,6 @@ RSpec.describe "Timekeeping invoice ownership while the reference is down" do
     expect(counts.call).to eq(before)
   end
 end
-
-require "rails_helper"
-require "webmock/rspec"
 
 RSpec.describe "Timekeeping prepare naming another company's invoice, then its owner" do
   include_context "timekeeping entry writes"
@@ -696,9 +656,6 @@ RSpec.describe "Timekeeping prepare naming another company's invoice, then its o
   end
 end
 
-require "rails_helper"
-require "webmock/rspec"
-
 RSpec.describe "Timekeeping mark-billed naming another company's invoice, then its owner" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
@@ -747,9 +704,6 @@ RSpec.describe "Timekeeping mark-billed naming another company's invoice, then i
   end
 end
 
-require "rails_helper"
-require "webmock/rspec"
-
 RSpec.describe "Timekeeping prepare while the reference endpoint is down" do
   include_context "timekeeping entry writes"
   include_context "timekeeping entry writes without transactional fixtures"
@@ -785,9 +739,6 @@ RSpec.describe "Timekeeping prepare while the reference endpoint is down" do
     expect(InvoiceOperation.where(company_id: company, invoice_id: 911).count).to eq(1)
   end
 end
-
-require "rails_helper"
-require "webmock/rspec"
 
 RSpec.describe "Timekeeping mark-billed of a hard-deleted invoice" do
   include_context "timekeeping entry writes"
@@ -837,9 +788,6 @@ RSpec.describe "Timekeeping mark-billed of a hard-deleted invoice" do
     expect(Entry.find(owner_entry).bill_status).to eq("billed")
   end
 end
-
-require "rails_helper"
-require "webmock/rspec"
 
 RSpec.describe "Timekeeping prepare against a crossed reference answer" do
   include_context "timekeeping entry writes"

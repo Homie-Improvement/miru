@@ -100,6 +100,7 @@ RSpec.describe "Shared reservation request helpers: path company" do
     company = timekeeping_arrange.company
     other_company = timekeeping_arrange.company
     service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: reservation_routes)
+    timekeeping_arrange.invoice(company:, invoice_id: 501)
     body = { "invoice_id" => 501, "operation_id" => SecureRandom.uuid, "disposition" => "active", "entries" => [] }
 
     foreign = reservation_post("prepare", company: other_company, credential: service, body:)
