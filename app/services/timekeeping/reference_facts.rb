@@ -13,14 +13,15 @@ module Timekeeping
     PRIVILEGED_ROLES = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/entry_api.yml"))
       .fetch("privileged_roles").freeze
 
-    def self.call(company:, project_ids:, agent_ids: [])
-      new(company:, project_ids:, agent_ids:).call
+    def self.call(company:, project_ids:, agent_ids: [], invoice_ids: [])
+      new(company:, project_ids:, agent_ids:, invoice_ids:).call
     end
 
-    def initialize(company:, project_ids:, agent_ids: [])
+    def initialize(company:, project_ids:, agent_ids: [], invoice_ids: [])
       @company = company
       @requested_project_ids = Array(project_ids).map(&:to_i).uniq
       @requested_agent_ids = Array(agent_ids).map(&:to_i).uniq
+      @requested_invoice_ids = Array(invoice_ids).map(&:to_i).uniq
     end
 
     def call
@@ -31,13 +32,30 @@ module Timekeeping
         projects: projects.map { |project| project_facts(project) },
         missing_project_ids: requested_project_ids - projects.map(&:id),
         agents: agents,
-        owned_agent_ids: owned_agent_ids
+        owned_agent_ids: owned_agent_ids,
+        invoices: owned_invoice_ids.map { |id| { id:, company_id: company.id } }
       }
     end
 
     private
 
-      attr_reader :company, :requested_project_ids, :requested_agent_ids
+      attr_reader :company, :requested_project_ids, :requested_agent_ids, :requested_invoice_ids
+
+      # The requested ids that are invoices of the company, discarded ones
+      # included, because a discarded invoice still owns its reservations.
+      # An id the company only holds as an invoice_operation_intents row is
+      # listed too: the invoice save commits that intent on its own connection
+      # before it asks Timekeeping to prepare, while the new invoice row is
+      # not yet committed and so not visible to this read. Another company's
+      # invoice or intent is left out exactly like an id no invoice has.
+      def owned_invoice_ids
+        return [] if requested_invoice_ids.empty?
+
+        invoices = company.invoices.where(id: requested_invoice_ids).pluck(:id)
+        intents = InvoiceOperationIntent.where(company_id: company.id, invoice_id: requested_invoice_ids)
+          .distinct.pluck(:invoice_id)
+        (invoices + intents).uniq.sort
+      end
 
       # The requested ids that are agents of the company, read without a row
       # lock. Unlike agents, it lists an agent whose destroy holds its row

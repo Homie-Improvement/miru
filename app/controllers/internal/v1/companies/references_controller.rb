@@ -6,6 +6,7 @@
 class Internal::V1::Companies::ReferencesController < Internal::V1::BaseController
   MAX_PROJECT_IDS = 200
   MAX_AGENT_IDS = 200
+  MAX_INVOICE_IDS = 200
   INTEGER_ID = /\A\d+\z/
 
   def show
@@ -18,8 +19,11 @@ class Internal::V1::Companies::ReferencesController < Internal::V1::BaseControll
     agent_ids = requested_ids(params[:agent_ids], limit: MAX_AGENT_IDS)
     return render_reason(:invalid_agent_ids, status: 422) unless agent_ids
 
+    invoice_ids = requested_ids(params[:invoice_ids], limit: MAX_INVOICE_IDS)
+    return render_reason(:invalid_invoice_ids, status: 422) unless invoice_ids
+
     response.headers["Cache-Control"] = "no-store"
-    render json: Timekeeping::ReferenceFacts.call(company:, project_ids:, agent_ids:)
+    render json: Timekeeping::ReferenceFacts.call(company:, project_ids:, agent_ids:, invoice_ids:)
   end
 
   private

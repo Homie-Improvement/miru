@@ -268,6 +268,175 @@ RSpec.describe "Internal::V1::Companies::References", type: :request do
       expect(foreign["agents"].pluck("id")).not_to include(foreign_agent.id)
     end
   end
+
+  context "more tests 2", type: :request do
+  # "The monolith serves invoice facts `{id, company_id}` on the reference endpoint, the pattern of `docs/architecture/timekeeping-soa.md` line 378."
+  # The facts answer for the path company only, so another company's invoice (or its pending intent) reads exactly
+  # like an id no invoice has, and the endpoint cannot be used to probe other companies' invoices.
+  it "lists only the path company's requested invoices and answers another company's invoice or intent like an unknown id" do
+    own_invoice = create(:invoice, company: company_a, client: create(:client, company: company_a))
+    foreign_invoice = create(:invoice, company: company_b, client: create(:client, company: company_b))
+    foreign_intent_id = Invoice.maximum(:id).to_i + 500
+    InvoiceOperationIntent.create!(company_id: company_b.id, invoice_id: foreign_intent_id,
+                                   operation_id: SecureRandom.uuid, state: "pending", generation: 1,
+                                   disposition: "active", desired_entry_ids: [], created_at: Time.current)
+    unknown_id = Invoice.maximum(:id).to_i + 1000
+    requests = [[own_invoice.id, foreign_invoice.id, unknown_id], [foreign_invoice.id], [unknown_id], [foreign_intent_id]]
+
+    bodies = with_timekeeping_service_token do |token|
+      requests.map do |invoice_ids|
+        get "/internal/v1/companies/#{company_a.id}/reference",
+            params: { project_ids: "", invoice_ids: invoice_ids.join(",") },
+            headers: { "Authorization" => "Bearer #{token}" }
+        expect(response).to have_http_status(:ok)
+        response.parsed_body
+      end
+    end
+
+    mixed, foreign, unknown, foreign_intent = bodies
+    expect(contract["response_fields"]).to include("invoices")
+    expect(mixed.keys).to match_array(contract["response_fields"])
+    expect(mixed["invoices"]).to eq([{ "id" => own_invoice.id, "company_id" => company_a.id }])
+    expect(foreign["invoices"]).to eq([])
+    expect(foreign).to eq(unknown)
+    expect(foreign_intent["invoices"]).to eq([])
+  end
+  end
+
+  context "more tests 3", type: :request do
+  # invoice_ids is caller input written into a database query, so a malformed or oversized list is refused
+  # before any lookup, and the refusal does not repeat what was sent.
+  it "answers invalid_invoice_ids for malformed or too many invoice ids without echoing them" do
+    with_timekeeping_service_token do |token|
+      headers = { "Authorization" => "Bearer #{token}" }
+      get "/internal/v1/companies/#{company_a.id}/reference",
+          params: { project_ids: "", invoice_ids: "7,zz-hostile-invoice" }, headers: headers
+      expect(response).to have_http_status(422)
+      expect(response.parsed_body).to eq("reason" => "invalid_invoice_ids")
+      expect(response.body).not_to include("zz-hostile-invoice")
+
+      get "/internal/v1/companies/#{company_a.id}/reference",
+          params: { project_ids: "", invoice_ids: "-5" }, headers: headers
+      expect(response).to have_http_status(422)
+      expect(response.parsed_body).to eq("reason" => "invalid_invoice_ids")
+
+      get "/internal/v1/companies/#{company_a.id}/reference",
+          params: { project_ids: "", invoice_ids: (1..(contract["max_invoice_ids"] + 1)).to_a.join(",") },
+          headers: headers
+      expect(response).to have_http_status(422)
+      expect(response.parsed_body).to eq("reason" => "invalid_invoice_ids")
+    end
+  end
+  end
+
+  context "more tests 4", type: :request do
+  # "The monolith serves invoice facts `{id, company_id}` on the reference endpoint"
+  # The facts answer for the path company only, so another company's invoice, or another company's in-flight
+  # intent for an id, reads exactly like an id no invoice has.
+  it "R4 lists only the path company's own invoices and pending intents as invoice facts and answers another company's invoice like an unknown id" do
+    own_invoice = create(:invoice, company: company_a, client: create(:client, company: company_a))
+    foreign_invoice = create(:invoice, company: company_b, client: create(:client, company: company_b))
+    unknown_id = Invoice.maximum(:id).to_i + 1000
+    intent_only_id = unknown_id + 1
+    foreign_intent_id = unknown_id + 2
+    InvoiceOperationIntent.create!(company_id: company_a.id, invoice_id: intent_only_id, operation_id: SecureRandom.uuid,
+                                   state: "pending", generation: 1, disposition: "active", desired_entry_ids: [],
+                                   created_at: Time.current)
+    InvoiceOperationIntent.create!(company_id: company_b.id, invoice_id: foreign_intent_id, operation_id: SecureRandom.uuid,
+                                   state: "pending", generation: 1, disposition: "active", desired_entry_ids: [],
+                                   created_at: Time.current)
+    requests = [
+      [own_invoice.id, foreign_invoice.id, intent_only_id, foreign_intent_id],
+      [foreign_invoice.id], [unknown_id], [foreign_intent_id]
+    ]
+
+    bodies = with_timekeeping_service_token do |token|
+      requests.map do |invoice_ids|
+        get "/internal/v1/companies/#{company_a.id}/reference",
+            params: { project_ids: "", invoice_ids: invoice_ids.join(",") },
+            headers: { "Authorization" => "Bearer #{token}" }
+        expect(response).to have_http_status(:ok)
+        response.parsed_body
+      end
+    end
+
+    mixed, foreign, unknown, foreign_intent = bodies
+    expect(mixed["invoices"]).to match_array([
+      { "id" => own_invoice.id, "company_id" => company_a.id },
+      { "id" => intent_only_id, "company_id" => company_a.id }
+    ])
+    expect(mixed["invoices"].pluck("company_id").uniq).to eq([company_a.id])
+    expect(foreign["invoices"]).to eq([])
+    expect(foreign).to eq(unknown)
+    expect(foreign_intent).to eq(unknown)
+  end
+  end
+
+  context "more tests 5", type: :request do
+  # "The monolith serves invoice facts `{id, company_id}` on the reference endpoint"
+  it "lists the path company's own, discarded and pending-intent invoices as {id, company_id} and leaves another company's invoice out like an unknown id" do
+    own_invoice = create(:invoice, company: company_a, client: create(:client, company: company_a))
+    discarded_invoice = create(:invoice, company: company_a, client: create(:client, company: company_a))
+    discarded_invoice.discard
+    foreign_invoice = create(:invoice, company: company_b, client: create(:client, company: company_b))
+    unknown_id = Invoice.maximum(:id).to_i + 1000
+    intent_only_id = unknown_id + 1
+    InvoiceOperationIntent.create!(company_id: company_a.id, invoice_id: intent_only_id, operation_id: SecureRandom.uuid,
+                                   state: "pending", generation: 1, disposition: "active", desired_entry_ids: [],
+                                   created_at: Time.current)
+    foreign_intent_id = unknown_id + 2
+    InvoiceOperationIntent.create!(company_id: company_b.id, invoice_id: foreign_intent_id, operation_id: SecureRandom.uuid,
+                                   state: "pending", generation: 1, disposition: "active", desired_entry_ids: [],
+                                   created_at: Time.current)
+
+    requested = [own_invoice.id, discarded_invoice.id, foreign_invoice.id, unknown_id, intent_only_id, foreign_intent_id]
+    bodies = with_timekeeping_service_token do |token|
+      [requested, [foreign_invoice.id], [unknown_id], []].map do |invoice_ids|
+        get "/internal/v1/companies/#{company_a.id}/reference",
+            params: { project_ids: "", invoice_ids: invoice_ids.join(",") },
+            headers: { "Authorization" => "Bearer #{token}" }
+        expect(response).to have_http_status(:ok)
+        response.parsed_body
+      end
+    end
+    all_kinds, foreign, unknown, none_requested = bodies
+
+    expect(contract["response_fields"]).to include("invoices")
+    expect(contract["invoice_fields"]).to eq(%w[id company_id])
+    expect(all_kinds.keys).to match_array(contract["response_fields"])
+    expect(all_kinds["invoices"]).to match_array([
+      { "id" => own_invoice.id, "company_id" => company_a.id },
+      { "id" => discarded_invoice.id, "company_id" => company_a.id },
+      { "id" => intent_only_id, "company_id" => company_a.id }
+    ])
+    expect(all_kinds["invoices"].pluck("id").count(own_invoice.id)).to eq(1)
+    expect(foreign["invoices"]).to eq([])
+    expect(foreign).to eq(unknown)
+    expect(none_requested["invoices"]).to eq([])
+  end
+  end
+
+  context "more tests 6", type: :request do
+  # The invoice id list is caller input on an internal endpoint, so it is bounded and checked like agent_ids.
+  it "refuses malformed or too many invoice_ids with 422 invalid_invoice_ids" do
+    limit = contract["max_invoice_ids"]
+    expect(limit).to eq(200)
+
+    with_timekeeping_service_token do |token|
+      headers = { "Authorization" => "Bearer #{token}" }
+      ["abc", "1,-2", "1,,2", (1..(limit + 1)).to_a.join(",")].each do |invoice_ids|
+        get "/internal/v1/companies/#{company_a.id}/reference", params: { project_ids: "", invoice_ids: }, headers: headers
+        expect(response).to have_http_status(422)
+        expect(response.parsed_body).to eq("reason" => "invalid_invoice_ids")
+      end
+
+      get "/internal/v1/companies/#{company_a.id}/reference",
+          params: { project_ids: "", invoice_ids: (1..limit).to_a.join(",") }, headers: headers
+      expect(response).to have_http_status(:ok)
+      expect(response.parsed_body["invoices"]).to eq([])
+    end
+  end
+  end
 end
 
 # Generated by Descant: acceptance tests below.
