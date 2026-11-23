@@ -62,10 +62,23 @@ module TenantGuardCases
   # stores no receipt (ServiceCommands#run).
   DETACH_NO_MATCH = { status: 200, reason: nil, detached: 0 }.freeze
 
-  # Before the prepare operation probe, the requester prepares its own invoice
-  # under its own new operation id, so that invoice holds an open operation.
+  # Before these probes the requester prepares its own invoice under the
+  # operation id its own request names, so that invoice holds an open
+  # operation. The prepare operation probe then meets that open operation for
+  # any unused id; the commit and abort invoice probes find their own
+  # operation, so only the invoice check can turn them away.
   REQUESTER_OPEN_OPERATION = :requester_open_operation
-  PRECONDITIONS = { %i[reservations prepare operation_id] => REQUESTER_OPEN_OPERATION }.freeze
+  PRECONDITIONS = {
+    %i[reservations prepare operation_id] => REQUESTER_OPEN_OPERATION,
+    %i[reservations commit invoice_id] => REQUESTER_OPEN_OPERATION,
+    %i[reservations abort invoice_id] => REQUESTER_OPEN_OPERATION
+  }.freeze
+
+  # The outbox positions of a snapshot delivery: every request's own item sits
+  # at the later one, and a probe's leading snapshot of the requester's own
+  # entry at the earlier one, so the consumer reads that snapshot first.
+  LEADING_SNAPSHOT_POSITION = 1
+  SNAPSHOT_POSITION = 2
 
   # entry_api rules.replay_only: these headers make a DELETE or bulk delete
   # answer only from a stored receipt, so a key probe can never discard an entry.
@@ -80,7 +93,8 @@ module TenantGuardCases
   # requester miss for the wrong reason. Every other identifier case (replays,
   # reads and snapshot delivery) runs the owner first, so the owner's row or
   # receipt is shown to exist. No-identifier cases send only the requester's
-  # request, so the requester runs first.
+  # request, so the requester runs first, except the entry list: it is a read,
+  # so the owner lists its own entries first.
   ROWS = [
     [:entry_api, :create, :replay, %i[idempotency_key], :owner, NOT_FOUND, {}],
     [:entry_api, :update, :probe, %i[entry_id], :requester, NOT_FOUND, {}],
@@ -88,7 +102,7 @@ module TenantGuardCases
     [:entry_api, :destroy, :probe, %i[entry_id], :requester, NOT_FOUND, {}],
     [:entry_api, :destroy, :probe, %i[idempotency_key], :requester, NOT_FOUND, REPLAY_ONLY_HEADERS],
     [:entry_api, :show, :probe, %i[entry_id], :owner, NOT_FOUND, {}],
-    [:entry_api, :index, :probe, %i[none], :requester, OK, {}],
+    [:entry_api, :index, :probe, %i[none], :owner, OK, {}],
     [:entry_api, :bulk_move, :probe, %i[entry_id], :requester, BULK_ENTRY_NOT_FOUND, {}],
     # B's body names B's project, which EntryWriter refuses before the bulk writer runs.
     [:entry_api, :bulk_move, :replay, %i[idempotency_key], :owner, NOT_FOUND, {}],
@@ -252,19 +266,20 @@ module TenantGuardCases
       # The batch shape comes from TimekeepingSnapshots, so it holds every
       # contract entry field and is not refused before the tenant check.
       def snapshot_batch(values)
-        TimekeepingSnapshots.batch(snapshot_item(values))
+        TimekeepingSnapshots.batch(snapshot_item(values, outbox_position: SNAPSHOT_POSITION))
       end
 
-      def snapshot_item(values)
+      def snapshot_item(values, outbox_position:)
         entry = TimekeepingSnapshots.entry(
           id: values.fetch(:entry_id), company_id: values.fetch(:company_id), version: values.fetch(:entry_version),
           project_id: values.fetch(:project_id), user_id: values.fetch(:user_id)
         )
-        TimekeepingSnapshots.item(entry, generation: values.fetch(:generation))
+        TimekeepingSnapshots.item(entry, generation: values.fetch(:generation), outbox_position:)
       end
 
       def with_newer_own_snapshot(request, own)
-        newer = snapshot_item(own.merge(entry_version: own.fetch(:entry_version) + 1))
+        newer = snapshot_item(own.merge(entry_version: own.fetch(:entry_version) + 1),
+                              outbox_position: LEADING_SNAPSHOT_POSITION)
         body = request.fetch(:body)
         request.merge(body: body.merge("snapshots" => [newer, *body.fetch("snapshots")]))
       end

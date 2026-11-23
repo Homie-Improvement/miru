@@ -184,11 +184,9 @@ RSpec.describe "Timekeeping tenant guard", type: :request, committed_data: true 
     party_ids.merge(entry_ids: [entry.fetch("id")], entry_versions: { entry.fetch("id") => entry.fetch("version") })
   end
 
-  # Reads, replays and snapshot delivery show the owner's row or receipt
-  # first; the entry list has no identifier but still lists the owner's own
-  # entries first.
+  # Reads, replays and snapshot delivery show the owner's row or receipt first.
   def tenant_guard_owner_first?(kase)
-    kase.mode == :replay || (kase.first == :owner && kase.covers != [:none]) || tenant_guard_entry_list?(kase)
+    kase.mode == :replay || kase.first == :owner
   end
 
   def tenant_guard_owner_after?(kase)
@@ -205,6 +203,21 @@ RSpec.describe "Timekeeping tenant guard", type: :request, committed_data: true 
       tenant_guard_own_route_request(kase.contract, route, operation == :case ? owner_ids : setup_ids, owner,
                                      "#{label} owner setup #{route}")
     end
+    tenant_guard_agent_entry(owner_ids, owner, label) if kase.route == :detach_entries
+  end
+
+  # Gives the owner's agent an entry, so the owner's detach detaches one and
+  # its stored answer differs from the requester's no-match answer: a replay
+  # leaking that receipt across companies would then fail the case. The
+  # entry belongs to the agent's own user, as entry_api.yml rules.agent_owner
+  # requires.
+  def tenant_guard_agent_entry(owner_ids, owner, label)
+    agent = owner.fetch(:agent)
+    create = TenantGuardCases::ALL.find { |candidate| candidate.contract == :entry_api && candidate.route == :create }
+    request = TenantGuardCases.valid_request(create, ids: owner_ids.merge(idempotency_key: SecureRandom.uuid))
+    request = request.merge(body: request.fetch(:body).merge("user_id" => agent.user_id, "agent_id" => agent.id))
+    reply = LiveHandoff.send_request(tenant_guard_base_url(create), tenant_guard_authorized(request, create, owner))
+    expect(reply.status).to be_between(200, 299), "#{label}: the owner's agent entry answered #{reply.status}"
   end
 
   # A company's own valid request for the case, which must succeed. Returns
@@ -294,7 +307,7 @@ RSpec.describe "Timekeeping tenant guard", type: :request, committed_data: true 
   # company has used, so the answer to the owner's id is shown to reveal
   # nothing about whether the owner used it.
   def tenant_guard_unused_operation_reply(kase, ids, requester)
-    return unless kase.precondition == TenantGuardCases::REQUESTER_OPEN_OPERATION
+    return unless kase.precondition == TenantGuardCases::REQUESTER_OPEN_OPERATION && kase.covers == [:operation_id]
 
     unused_owner = ids.fetch(:owner).merge(operation_id: SecureRandom.uuid)
     probe = TenantGuardCases.probe_request(kase, requester: ids.fetch(:requester), owner: unused_owner)
@@ -302,18 +315,22 @@ RSpec.describe "Timekeeping tenant guard", type: :request, committed_data: true 
   end
 
   def tenant_guard_expect_answer(kase, reply, owner_ids, label)
-    expected = TenantGuardCases.expected_answer(kase, owner: owner_ids)
-    body = tenant_guard_json(reply)
-    extra = JSON.parse(JSON.generate(expected.except(:status, :reason)))
+    expected, actual = tenant_guard_answers(kase, reply, owner_ids)
+    expect(actual).to eq(expected), "#{label}: answered #{reply.status} #{tenant_guard_json(reply).inspect}"
+  end
 
-    expect(reply.status).to eq(expected.fetch(:status)), "#{label}: answered #{reply.status} #{body.inspect}"
-    expect(body["reason"]).to eq(expected.fetch(:reason)), "#{label}: answered #{body.inspect}"
-    expect(body.slice(*extra.keys)).to eq(extra), "#{label}: answered #{body.inspect}"
+  # The case's expected answer and the reply's, each as status, reason and
+  # the expected answer's other fields (bulk results, conflicts, a count).
+  def tenant_guard_answers(kase, reply, owner_ids)
+    expected = TenantGuardCases.expected_answer(kase, owner: owner_ids)
+    extra = JSON.parse(JSON.generate(expected.except(:status, :reason)))
+    body = tenant_guard_json(reply)
+    [[expected.fetch(:status), expected.fetch(:reason), extra], [reply.status, body["reason"], body.slice(*extra.keys)]]
   end
 
   def tenant_guard_expect_route_answer(kase, reply, ids, label:, recorded:, unused_reply:)
     body = tenant_guard_json(reply)
-    tenant_guard_expect_no_owner_receipt(reply, recorded.fetch(:reply), label) if kase.mode == :replay
+    tenant_guard_expect_no_owner_receipt(kase, reply, recorded.fetch(:reply), ids, label) if kase.mode == :replay
     tenant_guard_expect_entry_list(body, ids, label) if tenant_guard_entry_list?(kase)
     return unless unused_reply
 
@@ -324,7 +341,11 @@ RSpec.describe "Timekeeping tenant guard", type: :request, committed_data: true 
   end
 
   # No id from the owner's stored answer may appear in the requester's answer.
-  def tenant_guard_expect_no_owner_receipt(reply, owner_reply, label)
+  # The owner's stored answer must differ from the expected one, or a replay
+  # that returned the owner's receipt would read as the expected answer.
+  def tenant_guard_expect_no_owner_receipt(kase, reply, owner_reply, ids, label)
+    expected, owner_answer = tenant_guard_answers(kase, owner_reply, ids.fetch(:owner))
+    expect(owner_answer).not_to eq(expected), "#{label}: the owner's stored answer equals the expected answer"
     owner_values = tenant_guard_identifying_values(tenant_guard_json(owner_reply))
     leaked = owner_values & tenant_guard_identifying_values(tenant_guard_json(reply))
     expect(leaked).to eq([]), "#{label}: the requester's answer carries the owner's stored ids #{leaked.inspect}"

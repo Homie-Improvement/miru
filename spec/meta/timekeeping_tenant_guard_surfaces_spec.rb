@@ -280,7 +280,11 @@ RSpec.describe "Timekeeping tenant guard surfaces and cases" do
       expect(prepare.expected).to eq(status: 409, reason: "unresolved_operation")
       expect(detach.expected).to eq(status: 200, reason: nil, detached: 0)
       expect(TenantGuardCases::ALL.map(&:precondition).tally)
-        .to eq(TenantGuardCases::REQUESTER_OPEN_OPERATION => 1, none: TenantGuardCases::ALL.size - 1)
+        .to eq(TenantGuardCases::REQUESTER_OPEN_OPERATION => 3, none: TenantGuardCases::ALL.size - 3)
+      %i[commit abort].each do |route|
+        expect(guard_cases_find(:reservations, route, :probe, [:invoice_id]).precondition)
+          .to eq(TenantGuardCases::REQUESTER_OPEN_OPERATION), route.to_s
+      end
       # A probe sending the owner's operation id with the requester's own invoice or agent would be a new command.
       %i[mark_billed detach_entries].each do |route|
         expect(guard_cases_find(:reservations, route, :probe, [:operation_id])).to be_nil, route.to_s
@@ -371,6 +375,15 @@ RSpec.describe "Timekeeping tenant guard surfaces and cases" do
       expect(snapshots.map { |snapshot| snapshot.fetch("generation") }).to eq([requester_ids.fetch(:generation)] * 2)
       expect(snapshots.first.fetch("entry")).to include("id" => 501, "company_id" => 101, "version" => 4)
       expect(snapshots.last.fetch("entry")).to include("id" => 1501, "company_id" => 101)
+    end
+
+    it "orders the snapshot delivery probe so the consumer reads the requester's newer own snapshot first" do
+      kase = guard_cases_find(:entry_snapshots, :deliver, :probe, [:entry_id])
+      # The owner's entry at a version below the requester's, as a freshly loaded seed holds it.
+      owner = owner_ids.merge(entry_versions: { 1501 => 1, 1502 => 1 })
+      batch = TenantGuardCases.probe_request(kase, requester: requester_ids, owner:).fetch(:body)
+
+      expect(Timekeeping::SnapshotBatch.parse(batch).map { |item| item.row.fetch("id") }).to eq([501, 1501])
     end
 
     # "Each case swaps in exactly one foreign identifier and keeps the others valid for the requesting company."
