@@ -737,4 +737,31 @@ RSpec.describe TimekeepingIntegrationTags do
       expect(violations.map { |violation| [violation.kind, violation.line] }).to eq([[:missing_integrated_runtime, 15]])
     end
   end
+
+  context "a lone hash argument" do
+    # RSpec reads a lone hash as the description, so it sets no metadata and the runtime hooks never run.
+    it "missing_integrated_runtime reports examples whose only integrated_runtime is a lone hash on the group or the example" do
+      source = <<~RUBY
+      RSpec.describe "late replay" do
+        context({ integrated_runtime: true }) do
+          it "sits under a braced hash description" do
+          end
+        end
+
+        context(integrated_runtime: true) do
+          it "sits under a keyword hash description" do
+          end
+        end
+
+        it(integrated_runtime: true) do
+        end
+      end
+      RUBY
+
+      violations = described_class.missing_integrated_runtime("late_replay_spec.rb", source)
+
+      expect(violations.map { |violation| [violation.kind, violation.line] })
+        .to eq([[:missing_integrated_runtime, 3], [:missing_integrated_runtime, 8], [:missing_integrated_runtime, 12]])
+    end
+  end
 end

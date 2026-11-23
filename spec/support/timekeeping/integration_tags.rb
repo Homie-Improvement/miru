@@ -116,13 +116,11 @@ module TimekeepingIntegrationTags
   end
 
   # { value: true | false } when the call's metadata sets the runtime tag, {}
-  # when it does not. RSpec reads the first argument as the description and
-  # only the arguments after it as metadata, unless the first is a hash.
+  # when it does not. RSpec reads the first argument as the description, even
+  # a hash, and only the arguments after it as metadata.
   # Like tag_setting, any value other than the literal true counts as unset.
   def runtime_tag_setting(node)
-    arguments = node.arguments&.arguments || []
-    metadata = hash_node?(arguments.first) ? arguments : arguments.drop(1)
-    metadata.each_with_object({}) do |argument, setting|
+    (node.arguments&.arguments || []).drop(1).each_with_object({}) do |argument, setting|
       if argument.is_a?(Prism::SymbolNode)
         setting[:value] = true if argument.unescaped.to_sym == RUNTIME_TAG
       elsif hash_node?(argument)
