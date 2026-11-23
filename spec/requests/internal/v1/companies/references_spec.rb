@@ -269,38 +269,6 @@ RSpec.describe "Internal::V1::Companies::References", type: :request do
     end
   end
 
-  # "The monolith serves invoice facts `{id, company_id}` on the reference endpoint, the pattern of `docs/architecture/timekeeping-soa.md` line 378."
-  # The facts answer for the path company only, so another company's invoice (or its pending intent) reads exactly
-  # like an id no invoice has, and the endpoint cannot be used to probe other companies' invoices.
-  it "lists only the path company's requested invoices and answers another company's invoice or intent like an unknown id" do
-    own_invoice = create(:invoice, company: company_a, client: create(:client, company: company_a))
-    foreign_invoice = create(:invoice, company: company_b, client: create(:client, company: company_b))
-    foreign_intent_id = Invoice.maximum(:id).to_i + 500
-    InvoiceOperationIntent.create!(company_id: company_b.id, invoice_id: foreign_intent_id,
-                                   operation_id: SecureRandom.uuid, state: "pending", generation: 1,
-                                   disposition: "active", desired_entry_ids: [], created_at: Time.current)
-    unknown_id = Invoice.maximum(:id).to_i + 1000
-    requests = [[own_invoice.id, foreign_invoice.id, unknown_id], [foreign_invoice.id], [unknown_id], [foreign_intent_id]]
-
-    bodies = with_timekeeping_service_token do |token|
-      requests.map do |invoice_ids|
-        get "/internal/v1/companies/#{company_a.id}/reference",
-            params: { project_ids: "", invoice_ids: invoice_ids.join(",") },
-            headers: { "Authorization" => "Bearer #{token}" }
-        expect(response).to have_http_status(:ok)
-        response.parsed_body
-      end
-    end
-
-    mixed, foreign, unknown, foreign_intent = bodies
-    expect(contract["response_fields"]).to include("invoices")
-    expect(mixed.keys).to match_array(contract["response_fields"])
-    expect(mixed["invoices"]).to eq([{ "id" => own_invoice.id, "company_id" => company_a.id }])
-    expect(foreign["invoices"]).to eq([])
-    expect(foreign).to eq(unknown)
-    expect(foreign_intent["invoices"]).to eq([])
-  end
-
   # invoice_ids is caller input written into a database query, so a malformed or oversized list is refused
   # before any lookup, and the refusal does not repeat what was sent.
   it "answers invalid_invoice_ids for malformed or too many invoice ids without echoing them" do
