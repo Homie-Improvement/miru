@@ -67,17 +67,27 @@ RSpec.describe "Timekeeping alternating writers", :integrated_runtime, :two_tena
       accept_alternating_edits(2)
       expect_alternating_stage("after edits following cutover", store: :timekeeping, outbox_required: true)
 
+      # A handoff's drain step does not wait for a relay pass that the
+      # runtime's own relay job is already running, so each handoff after
+      # edits starts once the projection holds them, as an operator would.
+      @alternating_writers.each_value { |writer| wait_for_alternating_values(writer, places: %i[projection]) }
       run_alternating_handoff(:rollback, company_ids:, baselines:)
       expect_alternating_stage("after rollback", store: :prepared, outbox_required: false)
       accept_alternating_edits(2)
       expect_alternating_stage("after edits following rollback", store: :prepared, outbox_required: true)
 
+      @alternating_writers.each_value { |writer| wait_for_alternating_values(writer, places: %i[projection]) }
       run_alternating_handoff(:re_cutover, company_ids:, baselines:)
       expect_alternating_stage("after re-cutover", store: :timekeeping, outbox_required: false)
       accept_alternating_edits(2)
       expect_alternating_stage("after edits following re-cutover", store: :timekeeping, outbox_required: true)
 
-      @alternating_writers.each_value { |writer| wait_for_alternating_final_values(writer) }
+      @alternating_writers.each_value do |writer|
+        wait_for_alternating_values(writer, places: %i[timekeeping projection])
+      end
+      # The relay may still have been delivering the last edits during the
+      # previous scan, so the scan runs again once both stores hold them.
+      expect_alternating_stage("after the final values arrived", store: :timekeeping, outbox_required: true)
     end
   ensure
     @alternating_timekeeping&.close
@@ -110,7 +120,8 @@ RSpec.describe "Timekeeping alternating writers", :integrated_runtime, :two_tena
           pause[:replies] << { edit:, reply:, audit_counts: alternating_audit_counts(edit) }
         end
       end
-      pause[:tenant_failures] = alternating_tenant_failures("during the pause", outbox_required: false)
+      pause[:tenant_failures] = alternating_tenant_failures("during the pause", store: :legacy,
+                                                                                 outbox_required: false)
     rescue StandardError => e
       pause[:error] = "#{e.class}: #{e.message}"
     end
@@ -206,7 +217,7 @@ RSpec.describe "Timekeeping alternating writers", :integrated_runtime, :two_tena
 
   def expect_alternating_stage(stage, store:, outbox_required:)
     expect(alternating_audit_failures(stage, store:)).to eq([])
-    expect(alternating_tenant_failures(stage, outbox_required:)).to eq([])
+    expect(alternating_tenant_failures(stage, store:, outbox_required:)).to eq([])
   end
 
   # Every accepted edit so far must have exactly one audit row in the store
@@ -258,13 +269,16 @@ RSpec.describe "Timekeeping alternating writers", :integrated_runtime, :two_tena
   end
 
   # Rows, audit entries and outbox messages tied to each company's own entry
-  # or notes, read from both stores. Each row must name its own company only,
-  # and rows and audit entries must exist, so an empty query cannot pass.
-  # Outbox messages are required only once the current owner has written for
-  # the entry: the legacy store keeps no outbox, and a handoff alone writes
-  # none. entry_snapshot_receipts is left out because one receipt names every
-  # company of a relay batch.
-  def alternating_tenant_failures(stage, outbox_required:)
+  # or notes, read from both databases and judged per database. Every row
+  # found in either database must name its own company only. The company's
+  # own rows must exist in the database of the store that owns the entries
+  # now, so neither an empty query nor rows kept in the other database can
+  # pass. Outbox messages are required only once the current owner has
+  # written for the entry, so a stage right after a handoff does not depend
+  # on whether that handoff wrote correction snapshots; the legacy store
+  # keeps no outbox. entry_snapshot_receipts is left out because one receipt
+  # names every company of a relay batch.
+  def alternating_tenant_failures(stage, store:, outbox_required:)
     surfaces = { rows: {}, audit_entries: {}, outbox_messages: {} }
     @alternating_writers.each_value do |writer|
       company_id = writer[:company_id]
@@ -275,11 +289,17 @@ RSpec.describe "Timekeeping alternating writers", :integrated_runtime, :two_tena
     end
 
     company_ids = @alternating_writers.keys
+    # The legacy and prepared stores both live in the monolith's database.
+    owner_database = store == :timekeeping ? :timekeeping : :monolith
     surfaces.flat_map do |surface, rows_by_company|
       own_rows_required = surface != :outbox_messages || outbox_required
-      checked_ids = own_rows_required ? company_ids : company_ids.select { |id| rows_by_company.fetch(id).any? }
-      LiveHandoff.foreign_id_failures(rows_by_company, company_ids: checked_ids)
-                 .map { |failure| "#{stage}: #{surface}: #{failure}" }
+      %i[monolith timekeeping].flat_map do |database|
+        rows = rows_by_company.transform_values { |by_database| by_database.fetch(database) }
+        required = own_rows_required && database == owner_database
+        checked_ids = required ? company_ids : company_ids.select { |id| rows.fetch(id).any? }
+        LiveHandoff.foreign_id_failures(rows, company_ids: checked_ids)
+                   .map { |failure| "#{stage}: #{surface} in #{database}: #{failure}" }
+      end
     end
   end
 
@@ -322,6 +342,7 @@ RSpec.describe "Timekeeping alternating writers", :integrated_runtime, :two_tena
     }
   end
 
+  # { monolith: rows, timekeeping: rows }, each row { "company_id" => id }.
   def alternating_tenant_rows(queries, binds)
     monolith = ActiveRecord::Base.uncached do
       queries.fetch(:monolith).flat_map do |sql|
@@ -331,38 +352,48 @@ RSpec.describe "Timekeeping alternating writers", :integrated_runtime, :two_tena
     timekeeping = queries.fetch(:timekeeping).flat_map do |sql|
       @alternating_timekeeping.exec_params(sql, binds).column_values(0)
     end
-    (monolith + timekeeping).map { |company_id| { "company_id" => company_id&.to_i } }
+    { monolith:, timekeeping: }.transform_values do |company_ids|
+      company_ids.map { |company_id| { "company_id" => company_id&.to_i } }
+    end
   end
 
   # The projection is filled by the runtime's relay on its own schedule, so
-  # both stores are read until they hold the last accepted values.
-  def wait_for_alternating_final_values(writer)
+  # the named places are read until they hold the last accepted values:
+  # :timekeeping is Timekeeping's entries, :projection the monolith's
+  # timesheet_entries.
+  def wait_for_alternating_values(writer, places:)
     company_id = writer[:company_id]
     entry_id = writer[:entry_id]
     last = @alternating_accepted.fetch(company_id).last
     expected = { "duration" => last[:duration], "note" => last[:note] }
     started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     loop do
-      observed = {
-        timekeeping: alternating_values(@alternating_timekeeping.exec_params(
-          "SELECT duration, note FROM entries WHERE id = $1 AND company_id = $2", [entry_id, company_id]
-        ).first),
-        projection: alternating_values(ActiveRecord::Base.uncached do
-          ActiveRecord::Base.connection.select_one(
-            "SELECT duration, note FROM timesheet_entries WHERE id = $1 AND company_id = $2",
-            "alternating writers", [entry_id, company_id]
-          )
-        end)
-      }
+      observed = places.index_with { |place| alternating_place_values(place, entry_id:, company_id:) }
       return if observed.values.all?(expected)
 
       waited = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
       if waited > 60
-        raise "company #{company_id} entry #{entry_id} did not reach #{expected} in Timekeeping and the projection " \
-              "within 60 s; saw #{observed}"
+        raise "company #{company_id} entry #{entry_id} did not reach #{expected} in #{places} within 60 s; " \
+              "saw #{observed}"
       end
 
       sleep 1
+    end
+  end
+
+  def alternating_place_values(place, entry_id:, company_id:)
+    case place
+    when :timekeeping
+      alternating_values(@alternating_timekeeping.exec_params(
+        "SELECT duration, note FROM entries WHERE id = $1 AND company_id = $2", [entry_id, company_id]
+      ).first)
+    when :projection
+      alternating_values(ActiveRecord::Base.uncached do
+        ActiveRecord::Base.connection.select_one(
+          "SELECT duration, note FROM timesheet_entries WHERE id = $1 AND company_id = $2",
+          "alternating writers", [entry_id, company_id]
+        )
+      end)
     end
   end
 
