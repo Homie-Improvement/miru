@@ -333,6 +333,7 @@ RSpec.shared_examples "timekeeping reservations contract" do
       # one stored for the refused invoice.
       expect(timekeeping_arrange.stored_receipts(company:)).to eq(receipts_before)
       expect(refusal(mark_billed.call)).to eq(refused)
+      expect(timekeeping_arrange.stored_receipts(company:)).to eq(receipts_before)
     end
   end
 

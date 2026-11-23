@@ -157,4 +157,19 @@ RSpec.describe Timekeeping::LocalOwner::InvoiceOwnership do
     # The other company's own row still counts for it, so the false above comes from the company scope.
     expect(described_class.owned?(company_id: other_company.id, invoice_id: rowless_id)).to be(true)
   end
+
+  it "owned? answers false when another company holds an intent for an id with no invoice row, despite the requester's operation row" do
+    company = create(:company)
+    other_company = create(:company)
+    in_flight_id = 900_000_021
+    InvoiceOperationIntent.create!(company_id: other_company.id, invoice_id: in_flight_id, operation_id: SecureRandom.uuid,
+                                   state: "pending", generation: 1)
+    Timekeeping::LocalOwner::ReservationOperations::InvoiceOperation.create!(
+      company_id: company.id, invoice_id: in_flight_id, operation_id: SecureRandom.uuid, actor_name: "invoices",
+      state: "committed", desired_entry_ids: [], disposition: "active", generation: 1, created_at: Time.current
+    )
+
+    expect(described_class.owned?(company_id: company.id, invoice_id: in_flight_id)).to be(false)
+    expect(described_class.owned?(company_id: other_company.id, invoice_id: in_flight_id)).to be(true)
+  end
 end
