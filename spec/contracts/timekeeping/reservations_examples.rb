@@ -14,8 +14,10 @@ RSpec.shared_examples "timekeeping reservations contract" do
   let(:other_company) { timekeeping_arrange.company }
   let(:service) { timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: reservation_operations) }
   let(:conflict_error) { timekeeping_contract_error(:reservations, "conflict") }
-  let(:invoice_a) { 501 }
-  let(:invoice_b) { 502 }
+  # Both invoices are the path company's, so a provider that checks invoice
+  # ownership serves every example below.
+  let(:invoice_a) { timekeeping_arrange.invoice(company:, invoice_id: 501) }
+  let(:invoice_b) { timekeeping_arrange.invoice(company:, invoice_id: 502) }
   let(:user) { timekeeping_arrange.user(company:, role: "employee") }
   let(:project) { timekeeping_arrange.project(company:) }
   let(:x) { timekeeping_arrange.entry(company:, user:, project:) }

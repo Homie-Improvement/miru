@@ -2,9 +2,9 @@
 
 # The timekeeping_arrange the shared contract examples call, for the real
 # provider. Entries and reservations are seeded through the models, and the
-# admitted generation through Timekeeping::Admission. Users, projects and
-# agents live in the monolith, so they are kept in an in-memory catalogue that a WebMock
-# stub of the reference endpoint serves.
+# admitted generation through Timekeeping::Admission. Users, projects, agents
+# and invoices live in the monolith, so they are kept in an in-memory catalogue
+# that a WebMock stub of the reference endpoint serves.
 # Tokens are RS256, signed with a key generated once per run.
 class TimekeepingProviderArrange
   REFERENCE_URL = "http://reference.test"
@@ -27,6 +27,7 @@ class TimekeepingProviderArrange
     @company_users = {}
     @company_projects = {}
     @company_agents = {}
+    @invoice_owners = {}
     @service_credentials = []
     @current_generation = 1
   end
@@ -89,6 +90,17 @@ class TimekeepingProviderArrange
     agent_id
   end
 
+  # Records invoice_id as one of the company's invoices, so the reference
+  # stub lists it for that company and no other. The monolith gives every
+  # invoice one owner, so arranging one id for a second company raises.
+  def invoice(company:, invoice_id:)
+    owner = @invoice_owners.fetch(invoice_id, company)
+    raise ArgumentError, "invoice #{invoice_id} is already arranged for company #{owner}" unless owner == company
+
+    @invoice_owners[invoice_id] = company
+    invoice_id
+  end
+
   def entry(company:, user:, project:, **attributes)
     Entry.create!({
       company_id: company, user_id: user, project_id: project, work_date: "2026-03-02", duration: 90.0,
@@ -97,6 +109,7 @@ class TimekeepingProviderArrange
   end
 
   def reserved_entry(company:, invoice_id:, state: "committed", disposition: "active", **attributes)
+    invoice(company:, invoice_id:)
     entry_id = entry(company:, user: user(company:, role: "employee"), project: project(company:), **attributes)
     Reservation.create!(company_id: company, entry_id:, invoice_id:, state:, disposition:,
                         operation_id: SecureRandom.uuid, created_at: Time.current)
@@ -142,7 +155,8 @@ class TimekeepingProviderArrange
       company_id = Integer(path[:company_id], 10)
       { status: 200, headers: { "Content-Type" => "application/json" },
         body: JSON.generate(reference_facts(company_id, requested_ids(request, "project_ids"),
-                                            requested_ids(request, "agent_ids"))) }
+                                            requested_ids(request, "agent_ids"),
+                                            requested_ids(request, "invoice_ids"))) }
     end
   end
 
@@ -160,7 +174,7 @@ class TimekeepingProviderArrange
       URI.decode_www_form(request.uri.query.to_s).to_h.fetch(name, "").split(",").map { |id| Integer(id, 10) }
     end
 
-    def reference_facts(company_id, project_ids, agent_ids)
+    def reference_facts(company_id, project_ids, agent_ids, invoice_ids)
       owned, missing = project_ids.partition { |id| @company_projects.fetch(company_id, []).include?(id) }
       company_agent_ids = @company_agents.fetch(company_id, []).pluck(:id)
       {
@@ -170,7 +184,9 @@ class TimekeepingProviderArrange
         projects: owned.map { |id| { id:, company_id:, billable: true, member_user_ids: [] } },
         missing_project_ids: missing,
         agents: @company_agents.fetch(company_id, []),
-        owned_agent_ids: agent_ids.uniq.select { |id| company_agent_ids.include?(id) }.sort
+        owned_agent_ids: agent_ids.uniq.select { |id| company_agent_ids.include?(id) }.sort,
+        invoices: invoice_ids.uniq.select { |id| @invoice_owners[id] == company_id }.sort
+          .map { |id| { id:, company_id: } }
       }
     end
 end

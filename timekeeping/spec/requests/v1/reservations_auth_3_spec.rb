@@ -17,6 +17,7 @@ RSpec.describe "Reservation route access through reservation_post" do
     billable = timekeeping_arrange.reserved_entry(company:, invoice_id: 501, state: "committed")
     agent_entry = timekeeping_arrange.entry(company:, user: employee, project:, agent_id: 77)
     owner = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: reservation_routes)
+    [502, 503].each { |invoice_id| timekeeping_arrange.invoice(company:, invoice_id:) }
     operation_id = SecureRandom.uuid
     expect(reservation_post("prepare", company:, credential: owner,
                             body: { "invoice_id" => 503, "operation_id" => operation_id, "disposition" => "active",

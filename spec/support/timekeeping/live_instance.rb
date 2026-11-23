@@ -35,10 +35,11 @@ class TimekeepingLiveInstance
       return respond(404, reason: "not_found") unless path
 
       project_ids = request.params.fetch("project_ids", "").to_s.split(",")
+      invoice_ids = request.params.fetch("invoice_ids", "").to_s.split(",")
       # Served on the stub server's own threads, which must hand their
       # database connection back after each request.
       facts = ActiveRecord::Base.connection_pool.with_connection do
-        Timekeeping::ReferenceFacts.call(company: Company.find(Integer(path[:company_id], 10)), project_ids:)
+        Timekeeping::ReferenceFacts.call(company: Company.find(Integer(path[:company_id], 10)), project_ids:, invoice_ids:)
       end
       respond(200, facts)
     end

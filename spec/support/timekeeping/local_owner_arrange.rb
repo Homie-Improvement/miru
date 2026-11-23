@@ -183,6 +183,14 @@ module TimekeepingContract
       FactoryBot.build(:agent, company_id: company, user_id: user).tap { |agent| agent.save!(validate: false) }.id
     end
 
+    # One of the company's invoices. LocalOwner does not check invoice
+    # ownership against the reservations it stores, so there is nothing to
+    # record; the id is returned so the shared examples arrange invoices the
+    # same way on every provider.
+    def invoice(company:, invoice_id:) # rubocop:disable Lint/UnusedMethodArgument
+      invoice_id
+    end
+
     def entry(company:, user:, project:, **attributes)
       Timekeeping::LocalEntry.create!(
         ENTRY_DEFAULTS.merge(attributes.transform_keys(&:to_s), "company_id" => company, "user_id" => user,

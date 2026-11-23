@@ -10,11 +10,14 @@ module Timekeeping
   # order:
   #
   # Before the transaction, a receipt already stored under the key is
-  # replayed, so a retry of finished work never depends on the monolith. For
-  # a new detach-entries, the monolith is then asked whether the requesting
-  # company owns the agent; an unanswered question refuses the command with
-  # reference_unavailable and stores nothing. No HTTP call runs while a lock
-  # is held.
+  # replayed, so a retry of finished work never depends on the monolith. A
+  # new mark-billed is then checked against the invoice's owner
+  # (Timekeeping::InvoiceOwnership): an invoice that is not the requesting
+  # company's answers not_found, exactly as an id no company uses does, and
+  # stores nothing. For a new detach-entries, the monolith is asked whether
+  # the requesting company owns the agent. An unanswered question on either
+  # refuses the command with reference_unavailable and stores nothing. No
+  # HTTP call runs while a lock is held.
   #
   # 1. Lock the receipt key (company, service, operation, operation_id), then
   #    the command's target: the invoice, under the same key a reservation
@@ -47,8 +50,10 @@ module Timekeeping
     # What each command changes. lock names the target's advisory lock;
     # targets selects the company's entries the command changes; changes is
     # the field it writes on each; count is the answer's key;
-    # owned_target_stored says whether a run that changed no entry still
-    # stores its receipt when the requesting company owns the target.
+    # refuse_unowned_invoice says whether a target invoice the requesting
+    # company does not own answers not_found before anything runs;
+    # owned_target_stored says whether a run that changed no entry still stores its receipt when the
+    # requesting company owns the target.
     COMMANDS = {
       mark_billed: {
         lock: ReservationOperations::INVOICE_LOCK,
@@ -60,6 +65,7 @@ module Timekeeping
         end,
         changes: { "bill_status" => TimekeepingRules::EntryRules::BILLED }.freeze,
         count: "billed",
+        refuse_unowned_invoice: true,
         owned_target_stored: false
       }.freeze,
       detach_entries: {
@@ -69,6 +75,10 @@ module Timekeeping
         targets: ->(company_id, agent_id) { Entry.where(company_id:, agent_id:) },
         changes: { "agent_id" => nil }.freeze,
         count: "detached",
+        # Another company's agent detaches nothing, so it answers like an
+        # agent with no entries rather than not_found; detach ownership is
+        # agent_owned below.
+        refuse_unowned_invoice: false,
         # The receipt is the detach marker agent_detached? reads, so a detach
         # of the company's own agent stores it even when it detached nothing.
         # One naming another company's agent, or no agent, stores nothing.
@@ -84,9 +94,14 @@ module Timekeeping
       ReferenceClient.configured.owned_agent_ids(company_id:, agent_ids: [agent_id]).include?(agent_id)
     end
 
-    def initialize(checkpoint: ->(_step) { }, agent_owned: AGENT_OWNED_BY_REFERENCE)
+    # invoice_owned answers call(company_id:, invoice_id:) with whether the
+    # invoice is the company's, raising ReferenceClient::Unavailable when that
+    # cannot be read.
+    def initialize(checkpoint: ->(_step) { }, agent_owned: AGENT_OWNED_BY_REFERENCE,
+                   invoice_owned: InvoiceOwnership.method(:owned?))
       @checkpoint = checkpoint
       @agent_owned = agent_owned
+      @invoice_owned = invoice_owned
     end
 
     # Takes the lock a detach-entries command of this agent takes, so an entry
@@ -129,6 +144,7 @@ module Timekeeping
     def call(request)
       stored = find_receipt(request)
       return replay(stored) if stored
+      return WriteOutcome.refusal(:not_found) unless target_admitted?(request)
 
       owned_target = target_owned?(request)
       ApplicationRecord.transaction { run(request, owned_target:) }
@@ -153,7 +169,12 @@ module Timekeeping
 
     private
 
-      attr_reader :checkpoint, :agent_owned
+      attr_reader :checkpoint, :agent_owned, :invoice_owned
+
+      def target_admitted?(request)
+        !COMMANDS.fetch(request.route).fetch(:refuse_unowned_invoice) ||
+          invoice_owned.call(company_id: request.company_id, invoice_id: request.target_id)
+      end
 
       def target_owned?(request)
         COMMANDS.fetch(request.route).fetch(:owned_target_stored) &&

@@ -11,6 +11,9 @@ RSpec.describe "Timekeeping reservation prepare: operation ids per company" do
     routes = %w[prepare commit abort mark_billed detach_entries]
     company = timekeeping_arrange.company
     other_company = timekeeping_arrange.company
+    # An invoice has one owning company, so each company prepares its own invoice under the shared operation id.
+    own_invoice = timekeeping_arrange.invoice(company:, invoice_id: 501)
+    foreign_invoice = timekeeping_arrange.invoice(company: other_company, invoice_id: 502)
     entry_id = timekeeping_arrange.entry(company:, user: timekeeping_arrange.user(company:, role: "employee"),
                                          project: timekeeping_arrange.project(company:))
     foreign_entry_id = timekeeping_arrange.entry(company: other_company,
@@ -26,18 +29,20 @@ RSpec.describe "Timekeeping reservation prepare: operation ids per company" do
     end
 
     send_command.call("/v1/companies/#{company}/reservations/prepare", own_service,
-                      { "invoice_id" => 501, "operation_id" => operation_id, "disposition" => "active", "entries" => [entry_id] })
+                      { "invoice_id" => own_invoice, "operation_id" => operation_id, "disposition" => "active",
+                        "entries" => [entry_id] })
     send_command.call("/v1/companies/#{company}/reservations/commit", own_service,
-                      { "invoice_id" => 501, "operation_id" => operation_id })
+                      { "invoice_id" => own_invoice, "operation_id" => operation_id })
 
     # "Operation ids are unique only within a company."
     foreign = send_command.call("/v1/companies/#{other_company}/reservations/prepare", foreign_service,
-                                { "invoice_id" => 501, "operation_id" => operation_id, "disposition" => "active",
+                                { "invoice_id" => foreign_invoice, "operation_id" => operation_id, "disposition" => "active",
                                   "entries" => [foreign_entry_id] })
 
     expect(foreign).to eq([200, { "operation_id" => operation_id, "state" => "prepared",
                                   "entries" => [{ "entry_id" => foreign_entry_id, "company_id" => other_company }] }])
-    expect(timekeeping_arrange.reservations_for(foreign_entry_id)).to eq([{ "invoice_id" => 501, "state" => "provisional" }])
-    expect(timekeeping_arrange.reservations_for(entry_id)).to eq([{ "invoice_id" => 501, "state" => "committed" }])
+    expect(timekeeping_arrange.reservations_for(foreign_entry_id))
+      .to eq([{ "invoice_id" => foreign_invoice, "state" => "provisional" }])
+    expect(timekeeping_arrange.reservations_for(entry_id)).to eq([{ "invoice_id" => own_invoice, "state" => "committed" }])
   end
 end
