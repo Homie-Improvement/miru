@@ -83,6 +83,20 @@ RSpec.describe "Timekeeping interrupted handoff", :integrated_runtime, :two_tena
       new_receipts = ActiveRecord::Base.uncached { EntrySnapshotReceipt.where("id > ?", baseline).order(:id).to_a }
       expect(new_receipts.sum { |receipt| applied.call(receipt) }).to eq(queued)
 
+      # Receipt sums cannot show a wrong final row, so the projection is also
+      # compared with the outgoing Timekeeping store, company by company.
+      entry_columns = "id, note, duration::float8::text, work_date::text, project_id, user_id"
+      company_ids.each do |id|
+        outgoing = TimekeepingLiveHandoff.with_timekeeping_database do |connection|
+          connection.exec_params("SELECT #{entry_columns} FROM entries WHERE company_id = $1 ORDER BY id", [id]).values
+        end
+        projected = ActiveRecord::Base.connection.raw_connection.exec_params(
+          "SELECT #{entry_columns} FROM timesheet_entries WHERE company_id = $1 AND id = ANY($2::bigint[]) ORDER BY id",
+          [id, PG::TextEncoder::Array.new.encode(outgoing.map(&:first))]
+        ).values
+        expect(projected).to eq(outgoing), "projection rows of company #{id} differ from the outgoing store"
+      end
+
       generation = TimekeepingOwnership.uncached do
         TimekeepingOwnership.where(id: TimekeepingOwnership::SINGLETON_ID).pick(:generation)
       end
@@ -857,16 +871,11 @@ RSpec.describe "Timekeeping interrupted handoff: second resume", :integrated_run
       Timekeeping::Handoff::Runner.run(direction: :rollback, resume: true, report_root: root, sleeper: no_wait)
       before_second = second_resume_state(companies)
 
-      second_outcome =
-        begin
-          Timekeeping::Handoff::Runner.run(direction: :rollback, resume: true, report_root: root, sleeper: no_wait)
-          :returned
-        rescue Timekeeping::Handoff::Runner::Refused
-          :refused
-        end
+      # Once flipped, Steps.decide_idle answers readmit, so the second resume only re-sends admit and returns nil.
+      expect(Timekeeping::Handoff::Runner.run(direction: :rollback, resume: true, report_root: root, sleeper: no_wait))
+        .to be_nil
 
       # "A second resume changes nothing": compare projection rows, receipts, outbox positions, the ownership row and money, byte for byte, before and after the second resume.
-      expect(%i[returned refused]).to include(second_outcome)
       after_second = second_resume_state(companies)
       before_second.each_key do |part|
         expect(after_second.fetch(part)).to eq(before_second.fetch(part)), "#{part} changed on the second resume"
