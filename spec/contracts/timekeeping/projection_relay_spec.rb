@@ -158,9 +158,7 @@ RSpec.describe TimekeepingProjectionRelay do
       expect(store).to have_received(:drain).with(through: 5).at_least(:once)
     end
   end
-end
 
-RSpec.describe TimekeepingProjectionRelay do
   it "deliver_live_snapshots! names only the waiting company and never reports another company's consumer answer as its own" do
     waiting_company_id = 9_558_201
     other_company_id = 9_558_202
@@ -184,48 +182,7 @@ RSpec.describe TimekeepingProjectionRelay do
       expect(error.message).not_to include("other_company_private_refusal")
     }
   end
-end
 
-RSpec.describe TimekeepingProjectionRelay do
-  # "Have run_harvest_import wait for that delivery and verify it in the timekeeping state, the same way it runs the relay in rollback."
-  it "deliver_live_snapshots! keeps draining through the highest outbox position until the drain answers true" do
-    drains = []
-    answers = [false, true]
-    store = double("live store", highest_outbox_position: 17)
-    allow(store).to receive(:drain) do |through:|
-      drains << through
-      answers.shift
-    end
-    snapshot_answers = double("snapshot answers", answer_for: nil)
-    now = 0.0
-
-    result = TimekeepingProjectionRelay.deliver_live_snapshots!(store:, answers: snapshot_answers, company_id: 71,
-                                                                deadline_seconds: 30, clock: -> { now += 0.1 })
-
-    expect(result).to be_nil
-    expect(drains).to eq([17, 17])
-  end
-end
-
-RSpec.describe TimekeepingProjectionRelay do
-  # "Have run_harvest_import wait for that delivery and verify it in the timekeeping state, the same way it runs the relay in rollback."
-  it "deliver_live_snapshots! raises Undelivered with the company and the consumer's refusal when the drain never finishes" do
-    store = double("live store", highest_outbox_position: 9)
-    allow(store).to receive(:drain).and_return(false)
-    refusal = TimekeepingRelay::Response.new(status: 409, body: { "reason" => "stale_generation" })
-    snapshot_answers = double("snapshot answers")
-    allow(snapshot_answers).to receive(:answer_for).with(72).and_return(refusal)
-    now = 0.0
-
-    expect do
-      TimekeepingProjectionRelay.deliver_live_snapshots!(store:, answers: snapshot_answers, company_id: 72,
-                                                         deadline_seconds: 30, clock: -> { now += 20.0 })
-    end.to raise_error(TimekeepingProjectionRelay::Undelivered, /company 72.*409.*stale_generation/m)
-    expect(store).to have_received(:drain).with(through: 9).at_least(:once)
-  end
-end
-
-RSpec.describe TimekeepingProjectionRelay do
   # "Have run_harvest_import wait for that delivery and verify it in the timekeeping state, the same way it runs the relay in rollback."
   it "relay_local_entries_to_projection drains the live outbox in the timekeeping state while the live adapter runs", owner_state: "timekeeping" do
     TimekeepingOwnerState.apply!("timekeeping")
@@ -244,10 +201,7 @@ RSpec.describe TimekeepingProjectionRelay do
     # The rollback relay of the monolith's own prepared outbox does not run in the timekeeping state.
     expect(Timekeeping::RelayJob).not_to have_received(:perform_now)
   end
-end
 
-RSpec.describe TimekeepingProjectionRelay do
-  # "Have run_harvest_import wait for that delivery and verify it in the timekeeping state, the same way it runs the relay in rollback."
   it "relay_local_entries_to_projection raises Undelivered with the consumer's refusal when the live outbox never drains in the timekeeping state" do
     TimekeepingOwnerState.apply!("timekeeping")
     company = create(:company)
@@ -266,9 +220,7 @@ RSpec.describe TimekeepingProjectionRelay do
     # The rollback relay is not what verifies the timekeeping state.
     expect(Timekeeping::RelayJob).not_to have_received(:perform_now)
   end
-end
 
-RSpec.describe TimekeepingProjectionRelay do
   # Drain answers false while another run holds the relay lock, so one false must not fail the delivery.
   it "deliver_live_snapshots! retries a drain refused while another run holds the relay lock and returns once it drains" do
     drained_through = []
@@ -286,24 +238,5 @@ RSpec.describe TimekeepingProjectionRelay do
 
     expect(result).to be_nil
     expect(drained_through).to eq([17, 17])
-  end
-end
-
-RSpec.describe TimekeepingProjectionRelay do
-  # A refused batch must fail with the consumer's answer, never read later as a duplicate row.
-  # Issue: "Have run_harvest_import wait for that delivery and verify it in the timekeeping state, the same way it runs the relay in rollback."
-  it "deliver_live_snapshots! raises Undelivered with the company and the consumer refusal when the drain never finishes before the deadline" do
-    store = Object.new
-    store.define_singleton_method(:highest_outbox_position) { 9 }
-    store.define_singleton_method(:drain) { |through:| false }
-    refusal = TimekeepingRelay::Response.new(status: 409, body: { "reason" => "stale_generation" })
-    answers = Object.new
-    answers.define_singleton_method(:answer_for) { |company_id| company_id == 7501 ? refusal : nil }
-    now = 0.0
-    clock = -> { now += 10.0 }
-
-    expect do
-      TimekeepingProjectionRelay.deliver_live_snapshots!(store:, answers:, company_id: 7501, deadline_seconds: 30, clock:)
-    end.to raise_error(TimekeepingProjectionRelay::Undelivered, /7501.*409.*stale_generation/m)
   end
 end
