@@ -11,8 +11,13 @@ module Timekeeping
     # of ReservationOperations.
     #
     # ServiceAccess decides first, before any lock or read, so a refused
-    # caller never sees a stored answer. Then everything runs in one
-    # savepoint, in this order:
+    # caller never sees a stored answer. A mark-billed whose invoice is not
+    # the path company's (InvoiceOwnership) is then refused as not_found, also
+    # before any lock or replay, so it writes nothing and stores no receipt.
+    # The service replays a stored receipt before this check; a receipt is
+    # only ever stored for an owned invoice, and an invoice's owner never
+    # changes, so the two orders give the same answers. Then everything runs
+    # in one savepoint, in this order:
     #
     # 1. Lock the operation key (company, service name, operation_id), the
     #    key ReservationOperations takes, so one key used for two targets
@@ -52,9 +57,11 @@ module Timekeeping
       # What each command changes. target_param names the params key holding
       # its target; lock takes the target's lock; targets selects the
       # company's entries the command changes; changes is the field it
-      # writes on each; count is the answer's key; owned_target, when present,
-      # answers whether the company owns the target, and a run that changed no
-      # entry stores its receipt only when it does.
+      # writes on each; count is the answer's key; refuse_unowned_invoice
+      # refuses a target invoice the company does not own as not_found before
+      # anything runs; owned_target, when present, answers whether the company
+      # owns the target, and a run that changed no entry stores its receipt
+      # only when it does.
       COMMANDS = {
         mark_billed: {
           target_param: "invoice_id",
@@ -71,7 +78,8 @@ module Timekeeping
               .where.not(bill_status: TimekeepingRules::EntryRules::BILLED)
           end,
           changes: { "bill_status" => TimekeepingRules::EntryRules::BILLED }.freeze,
-          count: "billed"
+          count: "billed",
+          refuse_unowned_invoice: true
         }.freeze,
         detach_entries: {
           target_param: "agent_id",
@@ -81,6 +89,7 @@ module Timekeeping
           targets: ->(company_id, agent_id) { LocalEntry.where(company_id:, agent_id:) },
           changes: { "agent_id" => nil }.freeze,
           count: "detached",
+          refuse_unowned_invoice: false,
           # The receipt is the detach marker agent_detached? reads, so a detach
           # of the company's own agent stores it even when it detached nothing.
           # One naming another company's agent, or no agent, stores nothing.
@@ -157,6 +166,7 @@ module Timekeeping
 
         @request = build_request
         return Outcome.refusal(:invalid_request) unless request
+        return Outcome.refusal(:not_found) unless target_admitted?
 
         attempt
       rescue ReceiptTaken
@@ -173,6 +183,11 @@ module Timekeeping
 
         def command
           COMMANDS.fetch(route)
+        end
+
+        def target_admitted?
+          !command.fetch(:refuse_unowned_invoice) ||
+            InvoiceOwnership.owned?(company_id:, invoice_id: request.target_id)
         end
 
         # Each attempt runs in its own savepoint, so a refusal raised after a

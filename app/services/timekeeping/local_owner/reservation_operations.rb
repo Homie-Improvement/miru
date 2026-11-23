@@ -12,7 +12,10 @@ module Timekeeping
     # with the same TimekeepingRules::ReservationDecision.
     #
     # ServiceAccess decides first, before any lock or read, so a refused
-    # caller never sees a stored answer. Then everything runs in one
+    # caller never sees a stored answer. A prepare whose invoice is not the
+    # path company's (InvoiceOwnership) is then refused as not_found, also
+    # before any lock or replay, so a stored operation under the same key
+    # never answers for another company's invoice. Then everything runs in one
     # savepoint, in this order:
     #
     # 1. Lock the operation key (company, service name, operation_id), then
@@ -59,6 +62,10 @@ module Timekeeping
 
       ROUTES = { prepare: :prepare, commit: :commit, abort: :abort_operation }.freeze
 
+      # The routes that name an invoice before any operation for it is stored.
+      # Commit and abort act only on an operation the path company prepared.
+      OWNER_CHECKED_ROUTES = %i[prepare].freeze
+
       # What commit and abort answer for an operation that is already
       # terminal: the first of them won, so this one changes nothing.
       TERMINAL_ANSWERS = {
@@ -72,7 +79,8 @@ module Timekeeping
       Request = Data.define(:route, :company_id, :actor_name, :invoice_id, :operation_id, :disposition, :entry_ids)
 
       # The two tables have no model the monolith shares. ServiceCommands
-      # reads Reservation too, to find an invoice's committed entries.
+      # reads Reservation too, to find an invoice's committed entries, and
+      # InvoiceOwnership reads InvoiceOperation for a deleted invoice's owner.
       class Reservation < ApplicationRecord
         self.table_name = "reservations"
       end
@@ -81,7 +89,7 @@ module Timekeeping
         self.table_name = "invoice_operations"
       end
 
-      private_constant :Request, :InvoiceOperation
+      private_constant :Request
 
       # :reek:LongParameterList
       def initialize(operation:, company_id:, generation:, actor:, params:, checkpoint:)
@@ -101,6 +109,7 @@ module Timekeeping
 
         @request = build_request
         return Outcome.refusal(:invalid_request) unless request
+        return Outcome.refusal(:not_found) unless invoice_owned?
 
         attempt
       rescue ReceiptTaken
@@ -114,6 +123,10 @@ module Timekeeping
       private
 
         attr_reader :route, :company_id, :generation, :actor, :params, :checkpoint, :request
+
+        def invoice_owned?
+          !OWNER_CHECKED_ROUTES.include?(route) || InvoiceOwnership.owned?(company_id:, invoice_id: request.invoice_id)
+        end
 
         # Each attempt runs in its own savepoint, so a refusal raised after a
         # write, or a NOWAIT read that found the row locked, rolls back every

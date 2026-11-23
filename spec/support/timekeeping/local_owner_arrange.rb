@@ -183,11 +183,17 @@ module TimekeepingContract
       FactoryBot.build(:agent, company_id: company, user_id: user).tap { |agent| agent.save!(validate: false) }.id
     end
 
-    # One of the company's invoices. LocalOwner does not check invoice
-    # ownership against the reservations it stores, so there is nothing to
-    # record; the id is returned so the shared examples arrange invoices the
-    # same way on every provider.
-    def invoice(company:, invoice_id:) # rubocop:disable Lint/UnusedMethodArgument
+    # One of the company's invoices, as a real invoices row with the given id,
+    # because LocalOwner refuses an invoice id the company does not own. The
+    # monolith gives every invoice one owner, so arranging one id for a second
+    # company raises; arranging it again for the same company is a no-op.
+    def invoice(company:, invoice_id:)
+      owner = Invoice.where(id: invoice_id).pick(:company_id)
+      raise ArgumentError, "invoice #{invoice_id} is already arranged for company #{owner}" if owner && owner != company
+      return invoice_id if owner
+
+      FactoryBot.create(:invoice, id: invoice_id, company_id: company, client: FactoryBot.create(:client, company_id: company))
+      advance_invoice_ids(above: invoice_id)
       invoice_id
     end
 
@@ -202,6 +208,7 @@ module TimekeepingContract
     # reservations table, so an example can set a state such as a provisional
     # hold on another operation without running prepare and commit.
     def reserved_entry(company:, invoice_id:, state: "committed", disposition: "active", **attributes)
+      invoice(company:, invoice_id:)
       entry_id = entry(company:, user: user(company:, role: "employee"), project: project(company:), **attributes)
       ApplicationRecord.connection.execute(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, company, entry_id, invoice_id, SecureRandom.uuid, state, disposition]))
         INSERT INTO reservations (company_id, entry_id, invoice_id, operation_id, state, disposition, created_at)
@@ -240,11 +247,32 @@ module TimekeepingContract
       Timekeeping::LocalOutboxEntry.count
     end
 
+    # How many idempotency receipts the company holds, so an example can show
+    # a refused command stored none.
+    def stored_receipts(company:)
+      Timekeeping::LocalOwner::Receipt.where(company_id: company).count
+    end
+
     # The unsent outbox rows in position order, each with its snapshot.
     def published_snapshots
       Timekeeping::LocalOutboxEntry.where(sent_at: nil).order(:outbox_position).map do |row|
         { "generation" => row.generation, "outbox_position" => row.outbox_position, "entry" => row.payload }
       end
     end
+
+    private
+
+      # An insert that names its id does not move the invoices sequence, so a
+      # later invoice created without an id could collide with an arranged
+      # one. The sequence only moves forward, because another spec may have
+      # pushed it higher already.
+      def advance_invoice_ids(above:)
+        connection = ApplicationRecord.connection
+        sequence = connection.select_value("SELECT pg_get_serial_sequence('invoices', 'id')")
+        last_value = connection.select_value("SELECT last_value FROM #{sequence}").to_i
+        connection.select_value(
+          ApplicationRecord.sanitize_sql_array(["SELECT setval(?, ?, true)", sequence, [last_value, above].max])
+        )
+      end
   end
 end

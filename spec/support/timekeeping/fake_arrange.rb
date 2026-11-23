@@ -42,10 +42,10 @@ module TimekeepingContract
       @timekeeping.add_agent(company_id: company, user_id: user)
     end
 
-    # One of the company's invoices. The fake does not check invoice
-    # ownership, so there is nothing to record; the id is returned so the
-    # shared examples arrange invoices the same way on every provider.
-    def invoice(company:, invoice_id:) # rubocop:disable Lint/UnusedMethodArgument
+    # Records invoice_id as one of the company's invoices, so the fake refuses
+    # it for any other company. Arranging one id for a second company raises.
+    def invoice(company:, invoice_id:)
+      @timekeeping.add_invoice(company_id: company, invoice_id:)
       invoice_id
     end
 
@@ -56,6 +56,7 @@ module TimekeepingContract
     # An entry that already holds a reservation, without calling the
     # reservation routes, so the entry examples run on their own.
     def reserved_entry(company:, invoice_id:, state: "committed", disposition: "active", **attributes)
+      invoice(company:, invoice_id:)
       entry_id = entry(company:, user: user(company:, role: "employee"), project: project(company:), **attributes)
       @timekeeping.add_reservation(entry_id:, invoice_id:, state:, disposition:)
       entry_id
@@ -89,6 +90,12 @@ module TimekeepingContract
     # show a request wrote none.
     def outbox_size
       @timekeeping.outbox.size
+    end
+
+    # How many idempotency receipts the provider holds for the company, so an
+    # example can show a refused command stored none.
+    def stored_receipts(company:)
+      @timekeeping.stored_receipts(company_id: company)
     end
 
     def entry_locked(entry_id)

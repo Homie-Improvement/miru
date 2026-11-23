@@ -131,6 +131,12 @@ class TimekeepingProviderArrange
     OutboxSnapshot.count
   end
 
+  # How many idempotency receipts the company's service callers have stored,
+  # so an example can show a refused command stored none.
+  def stored_receipts(company:)
+    ServiceIdempotencyReceipt.where(company_id: company).count
+  end
+
   def reservations_for(entry_id)
     Reservation.where(entry_id:).order(:created_at, :invoice_id).pluck(:invoice_id, :state).map do |invoice_id, state|
       { "invoice_id" => invoice_id, "state" => state }

@@ -98,6 +98,14 @@ module TimekeepingContract
       # it counts: always.
       service_command_writes: ->(route:) { true },
       replay_terminal_prepare: true,
+      # Whether prepare and mark_billed accept an invoice for the path company.
+      # owner is the company the invoice was arranged for, or nil when nobody
+      # arranged it: token-mode specs send invoice ids they never arrange, so
+      # only an invoice arranged for another company is refused.
+      invoice_owned: ->(owner:, company_id:) { owner.nil? || owner == company_id },
+      # Whether a mark_billed refused for another company's invoice still
+      # stores its answer as a receipt: never.
+      refused_invoice_receipt: false,
       # The section 7.2 prepare decision table the fake answers from.
       prepare_table: ReservationRules::PREPARE_TABLE,
       snapshot_entry: ->(entry, credentials:) { entry },
@@ -142,6 +150,7 @@ module TimekeepingContract
       @entries = {}
       @reservations = []
       @operations = {}
+      @invoice_owners = {}
       @outbox = []
       @companies = {}
       @requests = []
@@ -228,8 +237,22 @@ module TimekeepingContract
       refresh_locked([entry_id])
     end
 
+    # Records the company as the invoice's owner. The monolith gives every
+    # invoice one owner, so recording one id for a second company raises.
+    def add_invoice(company_id:, invoice_id:)
+      owner = @invoice_owners.fetch(invoice_id, company_id)
+      raise ArgumentError, "invoice #{invoice_id} is already arranged for company #{owner}" unless owner == company_id
+
+      @invoice_owners[invoice_id] = company_id
+    end
+
     def generation=(generation)
       @generation = Integer(generation)
+    end
+
+    # How many idempotency receipts the fake holds for the company.
+    def stored_receipts(company_id:)
+      @receipts.count(company_scope: company_id)
     end
 
     def entry_locked?(entry_id)
@@ -622,7 +645,11 @@ module TimekeepingContract
         @operations[@policies[:operation_key].call(company_id:, actor:, operation_id:)]
       end
 
+      # Checked before the stored operation is read, as Timekeeping checks
+      # ownership before any replay, so a foreign invoice id is never replayed.
       def prepare(company_id, actor, body)
+        return Wire.error(@reservation_contract, "not_found") unless invoice_owned?(company_id, body["invoice_id"])
+
         existing = operation(company_id, actor, body["operation_id"])
         if existing
           return Wire.error(@idempotency_contract, "key_reused") unless existing[:request] == body
@@ -770,6 +797,8 @@ module TimekeepingContract
 
       def mark_billed(company_id, actor, params, body)
         invoice_id = integer(params["invoice_id"])
+        return refused_invoice(company_id, actor, invoice_id, body) unless invoice_owned?(company_id, invoice_id)
+
         @receipts.answer(company_scope: company_id, actor:, operation: "mark_billed #{invoice_id}", key: body["operation_id"],
                          body:) do
           held = @reservations.select do |reservation|
@@ -782,6 +811,21 @@ module TimekeepingContract
           end
           success(respond(200, "billed" => entries.size), changed: entries.any?)
         end
+      end
+
+      def invoice_owned?(company_id, invoice_id)
+        @policies[:invoice_owned].call(owner: @invoice_owners[integer(invoice_id)], company_id:)
+      end
+
+      # The not_found answer for a mark_billed of another company's invoice,
+      # which stores no receipt unless the refused_invoice_receipt policy says so.
+      def refused_invoice(company_id, actor, invoice_id, body)
+        refusal = Wire.error(@reservation_contract, "not_found")
+        if @policies[:refused_invoice_receipt]
+          @receipts.store(company_scope: company_id, actor:, operation: "mark_billed #{invoice_id}",
+                          key: body["operation_id"], body:, response: refusal)
+        end
+        refusal
       end
 
       def detach_entries(company_id, actor, params, body)

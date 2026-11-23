@@ -41,20 +41,9 @@ module Timekeeping
 
       attr_reader :company, :requested_project_ids, :requested_agent_ids, :requested_invoice_ids
 
-      # The requested ids that are invoices of the company, discarded ones
-      # included, because a discarded invoice still owns its reservations.
-      # An id the company only holds as an invoice_operation_intents row is
-      # listed too: the invoice save commits that intent on its own connection
-      # before it asks Timekeeping to prepare, while the new invoice row is
-      # not yet committed and so not visible to this read. Another company's
-      # invoice or intent is left out exactly like an id no invoice has.
+      # The requested ids the company owns, by the rule OwnedInvoices states.
       def owned_invoice_ids
-        return [] if requested_invoice_ids.empty?
-
-        invoices = company.invoices.where(id: requested_invoice_ids).pluck(:id)
-        intents = InvoiceOperationIntent.where(company_id: company.id, invoice_id: requested_invoice_ids)
-          .distinct.pluck(:invoice_id)
-        (invoices + intents).uniq.sort
+        OwnedInvoices.ids(company_id: company.id, invoice_ids: requested_invoice_ids)
       end
 
       # The requested ids that are agents of the company, read without a row
