@@ -33,7 +33,7 @@ The obvious fix is to relay once, after a successful `process`. That leaves two 
 
 ## Solution
 
-Use `relay_local_entries_to_projection(company)` from `spec/support/timekeeping/projection_relay.rb`. It runs the real relay and consumer only when the prepared store owns entries. In any other state it does nothing. Call it before each point where the example next reads the projection:
+Use `relay_local_entries_to_projection(company)` from `spec/support/timekeeping/projection_relay.rb`. When the prepared store owns entries, it runs the real relay and consumer. In the timekeeping state, while `TimekeepingRegressionAdapter` runs a live app, it drains the live app's outbox through the adapter's snapshot app into the same consumer. In any other state it does nothing. Call it before each point where the example next reads the projection:
 
 1. After a successful import. The importer spec wraps this as `run_harvest_import`.
 2. Inside a stub that raises the generation or starts a handoff: after `original.call` and before the change.
