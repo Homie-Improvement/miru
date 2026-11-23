@@ -310,4 +310,39 @@ RSpec.shared_context "timekeeping live handoff" do
     )
     through
   end
+
+  # An abort finishes only settle and freeze, so it writes no
+  # reconciliation report. This runs the same checks the reconcile step runs
+  # for a handoff out of Timekeeping: the outgoing owner's state now, and the
+  # copy a resume would load, against the projection, the intents, and each
+  # company's money compared with the money_before file the abort's settle
+  # step stored under report_root. Returns the Reconciliation::Result.
+  def live_handoff_aborted_reconciliation(report_root)
+    handoff = Timekeeping::Handoff
+    generation = TimekeepingOwnership.uncached { TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).generation }
+    store = handoff::TimekeepingStore.new
+    source = store.export_checkpoint
+    loaded = handoff::ReservationLocks.build(source)
+    highest_entry_id = source.rows.fetch("entries").pluck("id").max || 0
+    ActiveRecord::Base.uncached do
+      intents = handoff::RowReader.select_rows(InvoiceOperationsRecord.connection, handoff::Runner::INTENTS_SQL)
+      # The same differences Runner#listed_corrections accepts: the locked
+      # values the copy derives from reservations, and the receipts of
+      # operations the legacy store committed before it was retired.
+      legacy_receipts = handoff::LegacyOperationsCheck.listed_receipts(
+        source_intents: intents, intents:, legacy_retired_at: TimekeepingOwnership.current.legacy_retired_at
+      )
+      listed_corrections = handoff::ReservationLocks.listed_corrections(source:, loaded:)
+                                                   .merge(legacy_receipts) { |_company_id, locks, receipts| locks + receipts }
+      handoff::Reconciliation.run(
+        source:, checkpoint: loaded,
+        projection: handoff::RowReader.select_rows(ActiveRecord::Base.connection, handoff::Runner::PROJECTION_SQL),
+        source_intents: intents, intents:,
+        next_entry_id: store.advance_entry_id_sequence(above: highest_entry_id),
+        money_before: handoff::ReportDirectory.new(root: report_root, generation:).read_money_before,
+        money_after: Company.order(:id).pluck(:id).index_with { |id| TimekeepingLiveHandoff.money(company_id: id) },
+        listed_corrections:
+      )
+    end
+  end
 end
