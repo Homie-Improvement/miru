@@ -194,7 +194,7 @@ RSpec.describe "Timekeeping tenant guard surfaces and cases" do
         .not_to include(%i[entry_api create idempotency_key])
     end
 
-    it "R8 REPLAY_PAIRS holds exactly the key pairs of create, update, bulk_move, prepare, mark_billed, detach_entries and deliver" do
+    it "R8 REPLAY_PAIRS holds the seven key pairs and the mark_billed and detach_entries operation ids" do
       expect(TenantGuardSurfaces::REPLAY_PAIRS).to contain_exactly(
         %i[entry_api create idempotency_key],
         %i[entry_api update idempotency_key],
@@ -202,7 +202,9 @@ RSpec.describe "Timekeeping tenant guard surfaces and cases" do
         %i[reservations prepare idempotency_key],
         %i[reservations mark_billed idempotency_key],
         %i[reservations detach_entries idempotency_key],
-        %i[entry_snapshots deliver idempotency_key]
+        %i[entry_snapshots deliver idempotency_key],
+        %i[reservations mark_billed operation_id],
+        %i[reservations detach_entries operation_id]
       )
       expect(TenantGuardSurfaces::REPLAY_PAIRS).to be_frozen
       expect(TenantGuardSurfaces::REPLAY_PAIRS).to all(be_frozen)
@@ -259,16 +261,33 @@ RSpec.describe "Timekeeping tenant guard surfaces and cases" do
       end
     end
 
-    it "the bulk_move replay and the prepare, mark_billed and detach_entries operation probes expect 404 not_found" do
+    it "the bulk_move and mark_billed replays expect 404 not_found" do
       cases = [
         guard_cases_find(:entry_api, :bulk_move, :replay, [:idempotency_key]),
-        guard_cases_find(:reservations, :prepare, :probe, [:operation_id]),
-        guard_cases_find(:reservations, :mark_billed, :probe, [:operation_id]),
-        guard_cases_find(:reservations, :detach_entries, :probe, [:operation_id])
+        guard_cases_find(:reservations, :mark_billed, :replay, %i[operation_id idempotency_key])
       ]
 
       cases.each do |kase|
         expect(kase.expected).to eq(status: 404, reason: "not_found")
+      end
+    end
+
+    it "covers the owner's operation id only with cases the requester's own state turns away" do
+      prepare = guard_cases_find(:reservations, :prepare, :probe, [:operation_id])
+      detach = guard_cases_find(:reservations, :detach_entries, :replay, %i[operation_id idempotency_key])
+
+      expect(prepare.precondition).to eq(TenantGuardCases::REQUESTER_OPEN_OPERATION)
+      expect(prepare.expected).to eq(status: 409, reason: "unresolved_operation")
+      expect(detach.expected).to eq(status: 200, reason: nil, detached: 0)
+      expect(TenantGuardCases::ALL.map(&:precondition).tally)
+        .to eq(TenantGuardCases::REQUESTER_OPEN_OPERATION => 3, none: TenantGuardCases::ALL.size - 3)
+      %i[commit abort].each do |route|
+        expect(guard_cases_find(:reservations, route, :probe, [:invoice_id]).precondition)
+          .to eq(TenantGuardCases::REQUESTER_OPEN_OPERATION), route.to_s
+      end
+      # A probe sending the owner's operation id with the requester's own invoice or agent would be a new command.
+      %i[mark_billed detach_entries].each do |route|
+        expect(guard_cases_find(:reservations, route, :probe, [:operation_id])).to be_nil, route.to_s
       end
     end
   end
@@ -331,10 +350,40 @@ RSpec.describe "Timekeeping tenant guard surfaces and cases" do
         %i[reservations abort operation_id] => body_operation,
         %i[reservations abort idempotency_key] => body_operation,
         %i[reservations mark_billed invoice_id] => [:path, 5],
-        %i[reservations mark_billed operation_id] => body_operation,
-        %i[reservations detach_entries operation_id] => body_operation,
-        %i[entry_snapshots deliver entry_id] => [:body, "snapshots", 0, "entry", "id"]
+        %i[entry_snapshots deliver entry_id] => [:body, "snapshots", 1, "entry", "id"]
       }
+    end
+
+    # A snapshot delivery probe leads with the requester's newer own snapshot, which its valid request lacks. The
+    # comparison gives the valid request that same leading snapshot, so only the swapped identifier differs; the
+    # leading snapshot itself is checked by its own example.
+    def guard_cases_with_leading_snapshot(valid, probe)
+      valid_snapshots = valid.dig(:body, "snapshots")
+      return valid unless valid_snapshots && probe.dig(:body, "snapshots").size > valid_snapshots.size
+
+      leading = probe.dig(:body, "snapshots").first
+      valid.merge(body: valid.fetch(:body).merge("snapshots" => [leading, *valid_snapshots]))
+    end
+
+    # "It holds a newer valid snapshot of A's own entry first, then a snapshot naming company A with B's entry id."
+    it "builds the snapshot delivery probe as the requester's newer own snapshot followed by the owner's entry id" do
+      kase = guard_cases_find(:entry_snapshots, :deliver, :probe, [:entry_id])
+      snapshots = TenantGuardCases.probe_request(kase, requester: requester_ids, owner: owner_ids)
+                                  .fetch(:body).fetch("snapshots")
+
+      expect(snapshots.size).to eq(2)
+      expect(snapshots.map { |snapshot| snapshot.fetch("generation") }).to eq([requester_ids.fetch(:generation)] * 2)
+      expect(snapshots.first.fetch("entry")).to include("id" => 501, "company_id" => 101, "version" => 4)
+      expect(snapshots.last.fetch("entry")).to include("id" => 1501, "company_id" => 101)
+    end
+
+    it "orders the snapshot delivery probe so the consumer reads the requester's newer own snapshot first" do
+      kase = guard_cases_find(:entry_snapshots, :deliver, :probe, [:entry_id])
+      # The owner's entry at a version below the requester's, as a freshly loaded seed holds it.
+      owner = owner_ids.merge(entry_versions: { 1501 => 1, 1502 => 1 })
+      batch = TenantGuardCases.probe_request(kase, requester: requester_ids, owner:).fetch(:body)
+
+      expect(Timekeeping::SnapshotBatch.parse(batch).map { |item| item.row.fetch("id") }).to eq([501, 1501])
     end
 
     # "Each case swaps in exactly one foreign identifier and keeps the others valid for the requesting company."
@@ -351,8 +400,11 @@ RSpec.describe "Timekeeping tenant guard surfaces and cases" do
 
       probes.each do |kase|
         label = "#{kase.contract} #{kase.route} #{kase.covers.inspect}"
-        valid = guard_cases_request_leaves(TenantGuardCases.valid_request(kase, ids: requester_ids))
-        probe = guard_cases_request_leaves(TenantGuardCases.probe_request(kase, requester: requester_ids, owner: owner_ids))
+        probe_request = TenantGuardCases.probe_request(kase, requester: requester_ids, owner: owner_ids)
+        valid = guard_cases_request_leaves(
+          guard_cases_with_leading_snapshot(TenantGuardCases.valid_request(kase, ids: requester_ids), probe_request)
+        )
+        probe = guard_cases_request_leaves(probe_request)
 
         expect(probe.keys).to match_array(valid.keys), label
         changed = probe.reject { |at, text| valid[at] == text }

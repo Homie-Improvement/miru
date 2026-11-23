@@ -10,16 +10,27 @@
 # the company and the credential replaced; it is used where the owner's key with
 # an otherwise valid body would be a new, valid write, because another
 # company's key never matches (idempotency.yml).
+#
+# Operation ids are stored per company, so another company's operation id is
+# an unused key to the requester, never a refusal. A case carrying one must
+# therefore be one the requester's own state already turns away: the prepare
+# probe runs while the requester holds an open operation on its own invoice,
+# so any unused operation id answers unresolved_operation; the mark_billed
+# and detach_entries replays name the owner's invoice or agent, which the
+# requester does not own.
 module TenantGuardCases
-  # expected holds status and reason, plus results (bulk) or conflicts
-  # (prepare) where the answer names the swapped entry. FOREIGN_ENTRY stands for
-  # that entry until expected_answer resolves it against the owner's ids.
-  Case = Data.define(:contract, :route, :mode, :covers, :credential, :first, :expected, :headers) do
-    def initialize(covers:, expected:, headers:, **fields)
+  # expected holds status and reason, plus results (bulk), conflicts (prepare)
+  # or a count (detach) where the answer carries more than a reason.
+  # FOREIGN_ENTRY stands for the swapped entry until expected_answer resolves it
+  # against the owner's ids. precondition names state the requester sets up
+  # for itself before the case runs (see PRECONDITIONS).
+  Case = Data.define(:contract, :route, :mode, :covers, :credential, :first, :expected, :headers, :precondition) do
+    def initialize(covers:, expected:, headers:, precondition: :none, **fields)
       super(
         covers: TenantGuardCases.frozen_copy(covers),
         expected: TenantGuardCases.frozen_copy(expected),
         headers: TenantGuardCases.frozen_copy(headers),
+        precondition:,
         **fields
       )
     end
@@ -44,6 +55,30 @@ module TenantGuardCases
   }.freeze
   STALE_GENERATION = { status: 409, reason: "stale_generation" }.freeze
   UNAUTHORIZED = { status: 401, reason: "unauthorized" }.freeze
+  # reservations.yml errors.unresolved_operation: the body also names the
+  # requester's own open operation.
+  UNRESOLVED_OPERATION = { status: 409, reason: "unresolved_operation" }.freeze
+  # A detach of an agent the requester does not own detaches nothing and
+  # stores no receipt (ServiceCommands#run).
+  DETACH_NO_MATCH = { status: 200, reason: nil, detached: 0 }.freeze
+
+  # Before these probes the requester prepares its own invoice under the
+  # operation id its own request names, so that invoice holds an open
+  # operation. The prepare operation probe then meets that open operation for
+  # any unused id; the commit and abort invoice probes find their own
+  # operation, so only the invoice check can turn them away.
+  REQUESTER_OPEN_OPERATION = :requester_open_operation
+  PRECONDITIONS = {
+    %i[reservations prepare operation_id] => REQUESTER_OPEN_OPERATION,
+    %i[reservations commit invoice_id] => REQUESTER_OPEN_OPERATION,
+    %i[reservations abort invoice_id] => REQUESTER_OPEN_OPERATION
+  }.freeze
+
+  # The outbox positions of a snapshot delivery: every request's own item sits
+  # at the later one, and a probe's leading snapshot of the requester's own
+  # entry at the earlier one, so the consumer reads that snapshot first.
+  LEADING_SNAPSHOT_POSITION = 1
+  SNAPSHOT_POSITION = 2
 
   # entry_api rules.replay_only: these headers make a DELETE or bulk delete
   # answer only from a stored receipt, so a key probe can never discard an entry.
@@ -58,7 +93,8 @@ module TenantGuardCases
   # requester miss for the wrong reason. Every other identifier case (replays,
   # reads and snapshot delivery) runs the owner first, so the owner's row or
   # receipt is shown to exist. No-identifier cases send only the requester's
-  # request, so the requester runs first.
+  # request, so the requester runs first, except the entry list: it is a read,
+  # so the owner lists its own entries first.
   ROWS = [
     [:entry_api, :create, :replay, %i[idempotency_key], :owner, NOT_FOUND, {}],
     [:entry_api, :update, :probe, %i[entry_id], :requester, NOT_FOUND, {}],
@@ -66,7 +102,7 @@ module TenantGuardCases
     [:entry_api, :destroy, :probe, %i[entry_id], :requester, NOT_FOUND, {}],
     [:entry_api, :destroy, :probe, %i[idempotency_key], :requester, NOT_FOUND, REPLAY_ONLY_HEADERS],
     [:entry_api, :show, :probe, %i[entry_id], :owner, NOT_FOUND, {}],
-    [:entry_api, :index, :probe, %i[none], :requester, OK, {}],
+    [:entry_api, :index, :probe, %i[none], :owner, OK, {}],
     [:entry_api, :bulk_move, :probe, %i[entry_id], :requester, BULK_ENTRY_NOT_FOUND, {}],
     # B's body names B's project, which EntryWriter refuses before the bulk writer runs.
     [:entry_api, :bulk_move, :replay, %i[idempotency_key], :owner, NOT_FOUND, {}],
@@ -74,7 +110,7 @@ module TenantGuardCases
     [:entry_api, :bulk_delete, :probe, %i[idempotency_key], :requester, NOT_FOUND, REPLAY_ONLY_HEADERS],
     [:reservations, :prepare, :probe, %i[invoice_id], :requester, NOT_FOUND, {}],
     [:reservations, :prepare, :probe, %i[entry_id], :requester, PREPARE_ENTRY_CONFLICT, {}],
-    [:reservations, :prepare, :probe, %i[operation_id], :requester, NOT_FOUND, {}],
+    [:reservations, :prepare, :probe, %i[operation_id], :requester, UNRESOLVED_OPERATION, {}],
     [:reservations, :prepare, :replay, %i[idempotency_key], :owner, NOT_FOUND, {}],
     [:reservations, :commit, :probe, %i[invoice_id], :requester, NOT_FOUND, {}],
     # The body operation_id is the reservations key, so one swap covers both kinds.
@@ -82,10 +118,9 @@ module TenantGuardCases
     [:reservations, :abort, :probe, %i[invoice_id], :requester, NOT_FOUND, {}],
     [:reservations, :abort, :probe, %i[operation_id idempotency_key], :requester, NOT_FOUND, {}],
     [:reservations, :mark_billed, :probe, %i[invoice_id], :requester, NOT_FOUND, {}],
-    [:reservations, :mark_billed, :probe, %i[operation_id], :requester, NOT_FOUND, {}],
-    [:reservations, :mark_billed, :replay, %i[idempotency_key], :owner, NOT_FOUND, {}],
-    [:reservations, :detach_entries, :probe, %i[operation_id], :requester, NOT_FOUND, {}],
-    [:reservations, :detach_entries, :replay, %i[idempotency_key], :owner, NOT_FOUND, {}],
+    # These replays carry the owner's operation id, which is also its key.
+    [:reservations, :mark_billed, :replay, %i[operation_id idempotency_key], :owner, NOT_FOUND, {}],
+    [:reservations, :detach_entries, :replay, %i[operation_id idempotency_key], :owner, DETACH_NO_MATCH, {}],
     [:entry_snapshots, :deliver, :probe, %i[entry_id], :owner, STALE_GENERATION, {}],
     [:entry_snapshots, :deliver, :replay, %i[idempotency_key], :owner, STALE_GENERATION, {}],
     [:reference, :show, :probe, %i[none], :requester, OK, {}],
@@ -113,9 +148,15 @@ module TenantGuardCases
     end
 
     # The requester's valid request with only the case's identifier replaced
-    # by the owner's.
+    # by the owner's. A snapshot delivery probe also leads with a newer valid
+    # snapshot of the requester's own entry, so a guard that applied part of
+    # the batch would move that entry's version.
     def probe_request(kase, requester:, owner:)
-      build(kase, swap(kase, request_values(requester), owner))
+      own = request_values(requester)
+      request = build(kase, swap(kase, own, owner))
+      return request unless kase.contract == :entry_snapshots
+
+      with_newer_own_snapshot(request, own)
     end
 
     # The owner's recorded request with only the company and the
@@ -225,11 +266,22 @@ module TenantGuardCases
       # The batch shape comes from TimekeepingSnapshots, so it holds every
       # contract entry field and is not refused before the tenant check.
       def snapshot_batch(values)
+        TimekeepingSnapshots.batch(snapshot_item(values, outbox_position: SNAPSHOT_POSITION))
+      end
+
+      def snapshot_item(values, outbox_position:)
         entry = TimekeepingSnapshots.entry(
           id: values.fetch(:entry_id), company_id: values.fetch(:company_id), version: values.fetch(:entry_version),
           project_id: values.fetch(:project_id), user_id: values.fetch(:user_id)
         )
-        TimekeepingSnapshots.batch(TimekeepingSnapshots.item(entry, generation: values.fetch(:generation)))
+        TimekeepingSnapshots.item(entry, generation: values.fetch(:generation), outbox_position:)
+      end
+
+      def with_newer_own_snapshot(request, own)
+        newer = snapshot_item(own.merge(entry_version: own.fetch(:entry_version) + 1),
+                              outbox_position: LEADING_SNAPSHOT_POSITION)
+        body = request.fetch(:body)
+        request.merge(body: body.merge("snapshots" => [newer, *body.fetch("snapshots")]))
       end
 
       def with_snapshot_company(body, company_id)
@@ -253,6 +305,8 @@ module TenantGuardCases
 
   # Built after frozen_copy is defined, because Case#initialize calls it.
   ALL = ROWS.map do |contract, route, mode, covers, first, expected, headers|
-    Case.new(contract:, route:, mode:, covers:, credential: CREDENTIALS.fetch(contract), first:, expected:, headers:)
+    precondition = PRECONDITIONS.fetch([contract, route, *covers], :none)
+    Case.new(contract:, route:, mode:, covers:, credential: CREDENTIALS.fetch(contract), first:, expected:, headers:,
+             precondition:)
   end.freeze
 end
