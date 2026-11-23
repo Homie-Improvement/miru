@@ -33,7 +33,11 @@ RSpec.describe Timekeeping::ServiceCommands do
     other_invoice = timekeeping_arrange.reserved_entry(company:, invoice_id: 502)
     discarded = timekeeping_arrange.reserved_entry(company:, invoice_id: 501, discarded_at: Time.current)
     already = timekeeping_arrange.reserved_entry(company:, invoice_id: 501, bill_status: "billed")
-    foreign = timekeeping_arrange.reserved_entry(company: other_company, invoice_id: 501)
+    # Seeded directly: an invoice has one owner, so the catalogue refuses 501 for a second company, but the
+    # selection must still ignore another company's rows that name the same id.
+    foreign = plain_entry(other_company)
+    Reservation.create!(company_id: other_company, entry_id: foreign, invoice_id: 501, state: "committed",
+                        disposition: "active", operation_id: SecureRandom.uuid, created_at: Time.current)
     versions = Entry.where(id: [already, foreign]).order(:id).pluck(:version)
 
     expect(service_command(:mark_billed, target_id: 501)).to eq([200, { "billed" => 1 }])
@@ -248,6 +252,50 @@ RSpec.describe Timekeeping::ServiceCommands do
       expect(ServiceIdempotencyReceipt.where(company_id: other_company).count).to eq(0)
       expect(described_class.agent_detached?(company, 92, after: fence)).to be(true)
       expect(described_class.agent_detached?(other_company, 92, after: fence)).to be(false)
+    end
+  end
+
+  context "when mark-billed names an invoice the company may not own" do
+    def mark_billed_with(invoice_owned, operation_id: SecureRandom.uuid)
+      request = described_class::Request.new(route: :mark_billed, company_id: company, actor_name: "invoice-boundary",
+                                             target_id: 501, operation_id:,
+                                             generation: timekeeping_arrange.current_generation)
+      outcome = described_class.new(invoice_owned:).call(request)
+      [outcome.status, JSON.parse(outcome.body)]
+    end
+
+    it "answers not_found and writes nothing when the invoice is not the company's" do
+      billable = timekeeping_arrange.reserved_entry(company:, invoice_id: 501)
+      before = command_row_counts
+
+      expect(mark_billed_with(->(company_id:, invoice_id:) { false })).to eq([404, { "reason" => "not_found" }])
+      expect(command_row_counts).to eq(before)
+      expect(Entry.find(billable).bill_status).to eq("unbilled")
+    end
+
+    it "answers reference_unavailable and writes nothing when the invoice's owner cannot be read" do
+      billable = timekeeping_arrange.reserved_entry(company:, invoice_id: 501)
+      before = command_row_counts
+      unreadable = ->(company_id:, invoice_id:) { raise Timekeeping::ReferenceClient::Unavailable, "down" }
+
+      expect(mark_billed_with(unreadable)).to eq([503, { "reason" => "reference_unavailable" }])
+      expect(command_row_counts).to eq(before)
+      expect(Entry.find(billable).bill_status).to eq("unbilled")
+    end
+
+    it "replays a stored receipt without asking who owns the invoice" do
+      timekeeping_arrange.reserved_entry(company:, invoice_id: 501)
+      operation_id = SecureRandom.uuid
+      first = mark_billed_with(->(company_id:, invoice_id:) { true }, operation_id:)
+      asked = []
+      recording = lambda do |company_id:, invoice_id:|
+        asked << [company_id, invoice_id]
+        false
+      end
+
+      expect(mark_billed_with(recording, operation_id:)).to eq(first)
+      expect(first).to eq([200, { "billed" => 1 }])
+      expect(asked).to eq([])
     end
   end
 end

@@ -6,7 +6,7 @@ module Timekeeping
   # contracts/timekeeping/entry_api.yml, idempotency.yml and reservations.yml
   # are written out here; spec/services/timekeeping/reasons_spec.rb compares
   # them with the YAML. reservations.yml lists reference_unavailable for
-  # detach-entries; entry writes answer it too. idempotency_key_required and
+  # prepare, mark-billed and detach-entries; entry writes answer it too. idempotency_key_required and
   # invalid_request (a write body that is not JSON or holds a value of the
   # wrong shape) are this service's own answers, not yet listed in the
   # contract. So are the

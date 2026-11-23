@@ -115,6 +115,10 @@ RSpec.shared_examples "timekeeping idempotency contract" do |contracts: [:entry_
       let(:x) { timekeeping_arrange.entry(company:, user:, project:) }
       let(:y) { timekeeping_arrange.entry(company:, user:, project:) }
 
+      # A provider that asks the monolith who owns an invoice refuses an id
+      # nobody arranged, so the invoices these examples name are the company's.
+      before { [501, 502].each { |invoice_id| timekeeping_arrange.invoice(company:, invoice_id:) } }
+
       def prepare_with(credential, company_id, invoice_id, entries, operation_id)
         reservation_command(:prepare, company_id, credential,
                             { "invoice_id" => invoice_id, "operation_id" => operation_id, "disposition" => "active", "entries" => entries })
@@ -176,7 +180,9 @@ RSpec.shared_examples "timekeeping idempotency contract" do |contracts: [:entry_
         foreign_user = timekeeping_arrange.user(company: other_company, role: "employee")
         foreign_entry = timekeeping_arrange.entry(company: other_company, user: foreign_user, project: timekeeping_arrange.project(company: other_company))
 
-        other_company_answer = prepare_with(foreign_service, other_company, 501, [foreign_entry], operation_id)
+        foreign_invoice = timekeeping_arrange.invoice(company: other_company, invoice_id: 601)
+
+        other_company_answer = prepare_with(foreign_service, other_company, foreign_invoice, [foreign_entry], operation_id)
 
         expect(other_company_answer.status).to eq(200)
         expect(other_company_answer.body.fetch("entries")).to eq([{ "entry_id" => foreign_entry, "company_id" => other_company }])

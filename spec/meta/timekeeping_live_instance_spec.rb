@@ -255,4 +255,25 @@ RSpec.describe TimekeepingLiveInstance do
       expect(Process).not_to have_received(:spawn)
     end
   end
+
+  # "The monolith serves invoice facts `{id, company_id}` on the reference endpoint, the pattern of `docs/architecture/timekeeping-soa.md` line 378."
+  # Live runs read invoice facts through this stub, so it must answer them as the real endpoint does.
+  it "live reference stub forwards invoice_ids and lists only the path company's invoice as {id, company_id}" do
+    company = create(:company)
+    other_company = create(:company)
+    own_invoice = create(:invoice, company:, client: create(:client, company:))
+    foreign_invoice = create(:invoice, company: other_company, client: create(:client, company: other_company))
+    reference = described_class::ReferenceStub.new
+    reference.service_token = "live-stub-invoice-token"
+    env = Rack::MockRequest.env_for(
+      "/internal/v1/companies/#{company.id}/reference?project_ids=&invoice_ids=#{own_invoice.id},#{foreign_invoice.id}",
+      "HTTP_AUTHORIZATION" => "Bearer live-stub-invoice-token"
+    )
+
+    status, _headers, body = reference.call(env)
+    facts = JSON.parse(body.join)
+
+    expect(status).to eq(200)
+    expect(facts.fetch("invoices")).to eq([{ "id" => own_invoice.id, "company_id" => company.id }])
+  end
 end

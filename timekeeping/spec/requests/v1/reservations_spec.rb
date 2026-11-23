@@ -15,6 +15,7 @@ RSpec.describe "Reservation locks seen through the entry API" do
     entry_id = timekeeping_arrange.entry(company:, user: owner, project: timekeeping_arrange.project(company:))
     service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary",
                                                    operations: %w[prepare commit abort mark_billed detach_entries])
+    timekeeping_arrange.invoice(company:, invoice_id: 501)
     operation_id = SecureRandom.uuid
     send_command = lambda do |route, extra = {}|
       body = { "invoice_id" => 501, "operation_id" => operation_id, "generation" => timekeeping_arrange.current_generation }
@@ -149,6 +150,7 @@ RSpec.describe "Arranged reservation service identities" do
     company = timekeeping_arrange.company
     other_company = timekeeping_arrange.company
     service = timekeeping_arrange.service_identity(company:, name: "invoice-boundary", operations: %w[prepare])
+    timekeeping_arrange.invoice(company:, invoice_id: 501)
     headers = { "Content-Type" => "application/json", "Authorization" => "Bearer #{service}" }
     request_body = lambda do |extra = {}|
       JSON.generate({ "invoice_id" => 501, "operation_id" => SecureRandom.uuid,
