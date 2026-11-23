@@ -206,7 +206,9 @@ module Timekeeping
     # then authorize_replay, the permission to read back a committed answer.
     # It defaults to authorize for callers that grant no separate one. After a
     # re-cutover, a receipt the prepared store kept is replayed the same way
-    # (see replay_prepared_receipt).
+    # (see replay_prepared_receipt). On every owner after the legacy store, a
+    # retry of an update the legacy store committed is answered first from
+    # that store's own receipt (see carried_legacy_update).
     #
     # The target project is given one of two ways: project, a record the
     # caller already resolved inside the context's company, or
@@ -218,11 +220,15 @@ module Timekeeping
     def update(entry_id:, attributes:, authorize:, project: nil, requested_project_id: nil,
                authorize_replay: authorize, expected_generation: nil, scope: :company, &resolve_project)
       resolve_target = -> { project || resolve_project.call }
+      project_id = project ? project.id : requested_project_id
       perform(expected_generation) do |ownership, owner|
         if owner == :legacy
-          next legacy_update(ownership:, entry_id:, attributes:, authorize:, authorize_replay:, scope:,
-                             project_id: project ? project.id : requested_project_id, resolve_project: resolve_target)
+          next legacy_update(ownership:, entry_id:, attributes:, authorize:, authorize_replay:, scope:, project_id:,
+                             resolve_project: resolve_target)
         end
+
+        carried = carried_legacy_update(entry_id:, project_id:, attributes:, authorize_replay:, scope:)
+        next carried if carried
 
         target = resolve_target.call
         identity = update_identity(project: target, attributes:)
@@ -612,7 +618,8 @@ module Timekeeping
       # The stored answer a retry is replayed from before any lookup or write:
       # the prepared store's receipt while it owns the entries, and a receipt
       # it wrote before a re-cutover while Timekeeping owns them. The legacy
-      # store's receipts are read by legacy_create and legacy_entry_write.
+      # store's receipts are read by legacy_create, legacy_entry_write,
+      # carried_legacy_create and carried_legacy_update.
       # :reek:LongParameterList
       def replay_committed(ownership:, owner:, operation:, identity:, entry_id: nil,
                            keys: replay_keys(request_key(operation, entry_id)))
@@ -811,10 +818,7 @@ module Timekeeping
       # :reek:LongParameterList
       def legacy_update(ownership:, entry_id:, attributes:, authorize:, authorize_replay:, scope:, project_id:,
                         resolve_project:)
-        fingerprint = legacy_entry_write_fingerprint(
-          "entry_id" => ENTRY_ID_TYPE.cast(entry_id), "project_id" => ENTRY_ID_TYPE.cast(project_id),
-          "fields" => EntryWriteClient.forwarded_fields(attributes, actor_kind: context.actor_kind, operation: :update)
-        )
+        fingerprint = legacy_update_fingerprint(entry_id:, project_id:, attributes:)
         legacy_entry_write(operation: :update, entry_id:, fingerprint:, authorize_replay:, scope:) do
           project = resolve_project.call
           find_authorized(ownership:, entry_id:, authorize:, scope:).entry.tap do |entry|
@@ -855,7 +859,45 @@ module Timekeeping
         # do not outlive the retry window.
         LegacyEntryWriteReceipt.expired.delete_all
         receipt = LegacyEntryWriteReceipt.find_by(receipt_scope)
+        replayed = replay_legacy_entry_write(receipt, operation:, entry_id:, fingerprint:, authorize_replay:, scope:)
+        return replayed if replayed
 
+        yield.tap do |entry|
+          now = Time.current
+          LegacyEntryWriteReceipt.create!(**receipt_scope, fingerprint:, timesheet_entry_id: entry.id,
+                                                           entry_attributes: entry.attributes_for_database,
+                                                           created_at: now,
+                                                           expires_at: now + LegacyEntryWriteReceipt::RETENTION)
+        end
+      end
+
+      # A legacy-store update committed before a handoff left its receipt in
+      # this database, but the handoff carries only create receipts, so the
+      # new owner never sees it and would apply the retry as a second edit.
+      # The retry is therefore answered from that receipt here, before any
+      # lookup or forward. Any receipt still stored answers, whatever its
+      # expires_at: rows are pruned only by legacy_entry_write, which no
+      # longer runs once the legacy store has handed off. Returns the replayed
+      # entry, or nil when the request sent no key of its own or none was
+      # stored for it. This read never writes.
+      # :reek:LongParameterList
+      def carried_legacy_update(entry_id:, project_id:, attributes:, authorize_replay:, scope:)
+        key = context.idempotency_key
+        return if key.nil?
+
+        receipt = LegacyEntryWriteReceipt.find_by(legacy_create_scope(key).merge(operation: "update"))
+        replay_legacy_entry_write(receipt, operation: :update, entry_id:, authorize_replay:, scope:,
+                                           fingerprint: legacy_update_fingerprint(entry_id:, project_id:, attributes:))
+      end
+
+      # The answer a stored legacy update or delete receipt gives a retry: a
+      # read-only copy of the entry as the first attempt committed it, held
+      # to the lookup's company, id and scope checks and then to
+      # authorize_replay. A key reused for another entry or other request
+      # values is refused. Returns nil when no receipt was stored, so the
+      # caller writes.
+      # :reek:LongParameterList
+      def replay_legacy_entry_write(receipt, operation:, entry_id:, fingerprint:, authorize_replay:, scope:)
         case LegacyCreateReplay.decision(stored_fingerprint: receipt&.fingerprint, fingerprint:)
         when :replay
           TimesheetEntry.instantiate(receipt.entry_attributes).tap(&:readonly!).tap do |entry|
@@ -864,15 +906,14 @@ module Timekeeping
           end
         when :key_reused
           raise EntryWriteClient.refusal_error(operation:, status: 422, reason: KEY_REUSED_REASON)
-        when :write
-          yield.tap do |entry|
-            now = Time.current
-            LegacyEntryWriteReceipt.create!(**receipt_scope, fingerprint:, timesheet_entry_id: entry.id,
-                                                             entry_attributes: entry.attributes_for_database,
-                                                             created_at: now,
-                                                             expires_at: now + LegacyEntryWriteReceipt::RETENTION)
-          end
         end
+      end
+
+      def legacy_update_fingerprint(entry_id:, project_id:, attributes:)
+        legacy_entry_write_fingerprint(
+          "entry_id" => ENTRY_ID_TYPE.cast(entry_id), "project_id" => ENTRY_ID_TYPE.cast(project_id),
+          "fields" => EntryWriteClient.forwarded_fields(attributes, actor_kind: context.actor_kind, operation: :update)
+        )
       end
 
       def legacy_entry_write_fingerprint(identity)
