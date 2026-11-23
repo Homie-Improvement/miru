@@ -299,188 +299,188 @@ RSpec.describe Timekeeping::LocalOwner, "service command access refusals" do
   end
 
   context "more tests 4", "mark_billed with another company's invoice id" do
-  include LocalOwnerServiceCommandSetup
+    include LocalOwnerServiceCommandSetup
 
-  it "mark_billed carrying another company's invoice id answers 404 not_found, bills nothing, stores no receipt, and a retry with the same operation_id is refused again" do
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    other_company = create(:company)
-    foreign_invoice_id = create(:invoice, company: other_company, client: create(:client, company: other_company)).id
-    foreign_entry = service_command_company_entry(other_company, role: "employee", work_date: "2026-03-02", duration: 60.0)
-    reserve_service_command_entry(foreign_entry, foreign_invoice_id, state: "committed")
-    foreign_before = foreign_entry.reload.attributes
-    actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
-                                           operations: ["invoices.mark_billed"])
-    operation_id = SecureRandom.uuid
-    baseline = timekeeping_row_counts
+    it "mark_billed carrying another company's invoice id answers 404 not_found, bills nothing, stores no receipt, and a retry with the same operation_id is refused again" do
+      generation = prepare_local_ownership!.generation.to_s
+      company = create(:company)
+      other_company = create(:company)
+      foreign_invoice_id = create(:invoice, company: other_company, client: create(:client, company: other_company)).id
+      foreign_entry = service_command_company_entry(other_company, role: "employee", work_date: "2026-03-02", duration: 60.0)
+      reserve_service_command_entry(foreign_entry, foreign_invoice_id, state: "committed")
+      foreign_before = foreign_entry.reload.attributes
+      actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
+                                             operations: ["invoices.mark_billed"])
+      operation_id = SecureRandom.uuid
+      baseline = timekeeping_row_counts
 
-    # "A shared contract example that sends a prepare and a mark-billed carrying another company's invoice id gets 404 not_found and no writes on all three providers, LocalOwner included."
-    2.times do
-      steps = []
+      # "A shared contract example that sends a prepare and a mark-billed carrying another company's invoice id gets 404 not_found and no writes on all three providers, LocalOwner included."
+      2.times do
+        steps = []
+        outcome = described_class.call(operation: :mark_billed, company_id: company.id, generation:, actor:,
+                                       params: { "invoice_id" => foreign_invoice_id, "operation_id" => operation_id },
+                                       checkpoint: ->(step) { steps << step })
+
+        expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
+        expect(steps).to be_empty
+        expect(timekeeping_row_counts).to eq(baseline)
+        expect(foreign_entry.reload.attributes).to eq(foreign_before)
+      end
+    end
+  end
+
+  context "more tests 5", "mark_billed with stale rows naming another company's invoice" do
+    include LocalOwnerServiceCommandSetup
+
+    it "mark_billed refuses another company's invoice and leaves the requester's entry unbilled even when the requester holds an operation row and a committed reservation under that invoice id" do
+      generation = prepare_local_ownership!.generation.to_s
+      company = create(:company)
+      other_company = create(:company)
+      foreign_invoice_id = create(:invoice, company: other_company, client: create(:client, company: other_company)).id
+      own_entry = service_command_company_entry(company, role: "employee", work_date: "2026-03-02", duration: 60.0)
+      reserve_service_command_entry(own_entry, foreign_invoice_id, state: "committed")
+      described_class::ReservationOperations::InvoiceOperation.create!(
+        company_id: company.id, invoice_id: foreign_invoice_id, operation_id: SecureRandom.uuid, actor_name: "invoice-boundary",
+        state: "committed", desired_entry_ids: [own_entry.id], disposition: "active", generation: generation.to_i,
+        created_at: Time.current
+      )
+      own_before = own_entry.reload.attributes
+      actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
+                                             operations: ["invoices.mark_billed"])
+      baseline = timekeeping_row_counts
+
       outcome = described_class.call(operation: :mark_billed, company_id: company.id, generation:, actor:,
-                                     params: { "invoice_id" => foreign_invoice_id, "operation_id" => operation_id },
-                                     checkpoint: ->(step) { steps << step })
+                                     params: { "invoice_id" => foreign_invoice_id, "operation_id" => SecureRandom.uuid })
 
       expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
-      expect(steps).to be_empty
+      expect(own_entry.reload.attributes).to eq(own_before)
+      expect(timekeeping_row_counts).to eq(baseline)
+    end
+  end
+
+  context "more tests 6", "service command access refusals" do
+    it "mark_billed carrying another company's invoice id answers 404 not_found, bills the requester's entry committed under that id nowhere and stores no receipt, in both directions" do
+      generation = prepare_local_ownership!.generation.to_s
+      first = create(:company)
+      second = create(:company)
+      invoices = [first, second].index_with do |company|
+        create(:invoice, company:, client: create(:client, company:)).id
+      end
+      # Each company holds an entry committed under the OTHER company's invoice id, so a provider
+      # that ignores invoice ownership has something of the requester's own to bill.
+      entries = [[first, second], [second, first]].to_h do |requester, owner|
+        entry = service_command_company_entry(requester, role: "employee", work_date: "2026-03-02", duration: 60.0)
+        reserve_service_command_entry(entry, invoices.fetch(owner), state: "committed")
+        [requester, entry]
+      end
+      before = entries.transform_values { |entry| entry.reload.attributes }
+      expect(before.values.map { |attributes| attributes.fetch("bill_status") }).to eq(%w[unbilled unbilled])
+      baseline = timekeeping_row_counts
+
+      [[first, second], [second, first]].each do |requester, owner|
+        actor = described_class::Actor.service(name: "invoice-boundary", company_id: requester.id,
+                                               operations: ["invoices.mark_billed"])
+        operation_id = SecureRandom.uuid
+        mark_billed = lambda do
+          described_class.call(operation: :mark_billed, company_id: requester.id, generation:, actor:,
+                               params: { "invoice_id" => invoices.fetch(owner), "operation_id" => operation_id })
+        end
+
+        # "A shared contract example that sends a prepare and a mark-billed carrying another company's invoice id gets 404 not_found and no writes on all three providers, LocalOwner included."
+        expect([mark_billed.call].map { |outcome| [outcome.status, outcome.body] }).to eq([[404, { "reason" => "not_found" }]])
+        retried = mark_billed.call
+        expect([retried.status, retried.body]).to eq([404, { "reason" => "not_found" }])
+        expect(timekeeping_row_counts).to eq(baseline)
+      end
+      expect(entries.transform_values { |entry| entry.reload.attributes }).to eq(before)
+    end
+  end
+
+  context "more tests 7", "mark_billed refuses a foreign invoice id" do
+    include LocalOwnerServiceCommandSetup
+
+    it "mark_billed carrying another company's invoice id answers exactly 404 not_found, stores no receipt, and a retry is still 404" do
+      generation = prepare_local_ownership!.generation.to_s
+      company = create(:company)
+      other_company = create(:company)
+      foreign_invoice_id = create(:invoice, company: other_company, client: create(:client, company: other_company)).id
+      foreign_entry = service_command_company_entry(other_company, role: "employee", work_date: "2026-03-02", duration: 60.0)
+      reserve_service_command_entry(foreign_entry, foreign_invoice_id, state: "committed")
+      foreign_before = foreign_entry.reload.attributes
+      baseline = timekeeping_row_counts
+      actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id, operations: ["invoices.mark_billed"])
+      params = { "invoice_id" => foreign_invoice_id, "operation_id" => SecureRandom.uuid }
+
+      # "A shared contract example that sends a prepare and a mark-billed carrying another company's invoice id gets 404 not_found and no writes on all three providers, LocalOwner included."
+      first = described_class.call(operation: :mark_billed, company_id: company.id, generation:, actor:, params:)
+      retried = described_class.call(operation: :mark_billed, company_id: company.id, generation:, actor:, params:)
+
+      expect([first.status, first.body]).to eq([404, { "reason" => "not_found" }])
+      expect([retried.status, retried.body]).to eq([404, { "reason" => "not_found" }])
       expect(timekeeping_row_counts).to eq(baseline)
       expect(foreign_entry.reload.attributes).to eq(foreign_before)
     end
   end
-  end
-
-  context "more tests 5", "mark_billed with stale rows naming another company's invoice" do
-  include LocalOwnerServiceCommandSetup
-
-  it "mark_billed refuses another company's invoice and leaves the requester's entry unbilled even when the requester holds an operation row and a committed reservation under that invoice id" do
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    other_company = create(:company)
-    foreign_invoice_id = create(:invoice, company: other_company, client: create(:client, company: other_company)).id
-    own_entry = service_command_company_entry(company, role: "employee", work_date: "2026-03-02", duration: 60.0)
-    reserve_service_command_entry(own_entry, foreign_invoice_id, state: "committed")
-    described_class::ReservationOperations::InvoiceOperation.create!(
-      company_id: company.id, invoice_id: foreign_invoice_id, operation_id: SecureRandom.uuid, actor_name: "invoice-boundary",
-      state: "committed", desired_entry_ids: [own_entry.id], disposition: "active", generation: generation.to_i,
-      created_at: Time.current
-    )
-    own_before = own_entry.reload.attributes
-    actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
-                                           operations: ["invoices.mark_billed"])
-    baseline = timekeeping_row_counts
-
-    outcome = described_class.call(operation: :mark_billed, company_id: company.id, generation:, actor:,
-                                   params: { "invoice_id" => foreign_invoice_id, "operation_id" => SecureRandom.uuid })
-
-    expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
-    expect(own_entry.reload.attributes).to eq(own_before)
-    expect(timekeeping_row_counts).to eq(baseline)
-  end
-  end
-
-  context "more tests 6", "service command access refusals" do
-  it "mark_billed carrying another company's invoice id answers 404 not_found, bills the requester's entry committed under that id nowhere and stores no receipt, in both directions" do
-    generation = prepare_local_ownership!.generation.to_s
-    first = create(:company)
-    second = create(:company)
-    invoices = [first, second].to_h do |company|
-      [company, create(:invoice, company:, client: create(:client, company:)).id]
-    end
-    # Each company holds an entry committed under the OTHER company's invoice id, so a provider
-    # that ignores invoice ownership has something of the requester's own to bill.
-    entries = [[first, second], [second, first]].to_h do |requester, owner|
-      entry = service_command_company_entry(requester, role: "employee", work_date: "2026-03-02", duration: 60.0)
-      reserve_service_command_entry(entry, invoices.fetch(owner), state: "committed")
-      [requester, entry]
-    end
-    before = entries.transform_values { |entry| entry.reload.attributes }
-    expect(before.values.map { |attributes| attributes.fetch("bill_status") }).to eq(%w[unbilled unbilled])
-    baseline = timekeeping_row_counts
-
-    [[first, second], [second, first]].each do |requester, owner|
-      actor = described_class::Actor.service(name: "invoice-boundary", company_id: requester.id,
-                                             operations: ["invoices.mark_billed"])
-      operation_id = SecureRandom.uuid
-      mark_billed = lambda do
-        described_class.call(operation: :mark_billed, company_id: requester.id, generation:, actor:,
-                             params: { "invoice_id" => invoices.fetch(owner), "operation_id" => operation_id })
-      end
-
-      # "A shared contract example that sends a prepare and a mark-billed carrying another company's invoice id gets 404 not_found and no writes on all three providers, LocalOwner included."
-      expect([mark_billed.call].map { |outcome| [outcome.status, outcome.body] }).to eq([[404, { "reason" => "not_found" }]])
-      retried = mark_billed.call
-      expect([retried.status, retried.body]).to eq([404, { "reason" => "not_found" }])
-      expect(timekeeping_row_counts).to eq(baseline)
-    end
-    expect(entries.transform_values { |entry| entry.reload.attributes }).to eq(before)
-  end
-  end
-
-  context "more tests 7", "mark_billed refuses a foreign invoice id" do
-  include LocalOwnerServiceCommandSetup
-
-  it "mark_billed carrying another company's invoice id answers exactly 404 not_found, stores no receipt, and a retry is still 404" do
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    other_company = create(:company)
-    foreign_invoice_id = create(:invoice, company: other_company, client: create(:client, company: other_company)).id
-    foreign_entry = service_command_company_entry(other_company, role: "employee", work_date: "2026-03-02", duration: 60.0)
-    reserve_service_command_entry(foreign_entry, foreign_invoice_id, state: "committed")
-    foreign_before = foreign_entry.reload.attributes
-    baseline = timekeeping_row_counts
-    actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id, operations: ["invoices.mark_billed"])
-    params = { "invoice_id" => foreign_invoice_id, "operation_id" => SecureRandom.uuid }
-
-    # "A shared contract example that sends a prepare and a mark-billed carrying another company's invoice id gets 404 not_found and no writes on all three providers, LocalOwner included."
-    first = described_class.call(operation: :mark_billed, company_id: company.id, generation:, actor:, params:)
-    retried = described_class.call(operation: :mark_billed, company_id: company.id, generation:, actor:, params:)
-
-    expect([first.status, first.body]).to eq([404, { "reason" => "not_found" }])
-    expect([retried.status, retried.body]).to eq([404, { "reason" => "not_found" }])
-    expect(timekeeping_row_counts).to eq(baseline)
-    expect(foreign_entry.reload.attributes).to eq(foreign_before)
-  end
-  end
 
   context "more tests 8", "mark_billed with a legacy operation row for a foreign invoice" do
-  include LocalOwnerServiceCommandSetup
+    include LocalOwnerServiceCommandSetup
 
-  it "mark_billed does not bill the requester's entry committed under another company's invoice, even with a legacy operation row naming it" do
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    other_company = create(:company)
-    foreign_invoice_id = create(:invoice, company: other_company, client: create(:client, company: other_company)).id
-    own_entry = service_command_company_entry(company, role: "employee", work_date: "2026-03-02", duration: 60.0)
-    reserve_service_command_entry(own_entry, foreign_invoice_id, state: "committed")
-    operation_rows = Class.new(ApplicationRecord) { self.table_name = "invoice_operations" }
-    operation_rows.create!(company_id: company.id, invoice_id: foreign_invoice_id, operation_id: SecureRandom.uuid,
-                           actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [own_entry.id],
-                           disposition: "active", generation: generation.to_i, created_at: Time.current)
-    baseline = timekeeping_row_counts
-    actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id, operations: ["invoices.mark_billed"])
+    it "mark_billed does not bill the requester's entry committed under another company's invoice, even with a legacy operation row naming it" do
+      generation = prepare_local_ownership!.generation.to_s
+      company = create(:company)
+      other_company = create(:company)
+      foreign_invoice_id = create(:invoice, company: other_company, client: create(:client, company: other_company)).id
+      own_entry = service_command_company_entry(company, role: "employee", work_date: "2026-03-02", duration: 60.0)
+      reserve_service_command_entry(own_entry, foreign_invoice_id, state: "committed")
+      operation_rows = Class.new(ApplicationRecord) { self.table_name = "invoice_operations" }
+      operation_rows.create!(company_id: company.id, invoice_id: foreign_invoice_id, operation_id: SecureRandom.uuid,
+                             actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [own_entry.id],
+                             disposition: "active", generation: generation.to_i, created_at: Time.current)
+      baseline = timekeeping_row_counts
+      actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id, operations: ["invoices.mark_billed"])
 
-    outcome = described_class.call(operation: :mark_billed, company_id: company.id, generation:, actor:,
-                                   params: { "invoice_id" => foreign_invoice_id, "operation_id" => SecureRandom.uuid })
+      outcome = described_class.call(operation: :mark_billed, company_id: company.id, generation:, actor:,
+                                     params: { "invoice_id" => foreign_invoice_id, "operation_id" => SecureRandom.uuid })
 
-    expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
-    expect(own_entry.reload.bill_status).to eq("unbilled")
-    expect(timekeeping_row_counts).to eq(baseline)
-  end
+      expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
+      expect(own_entry.reload.bill_status).to eq("unbilled")
+      expect(timekeeping_row_counts).to eq(baseline)
+    end
   end
 
   context "more tests 9", "service command access refusals" do
-  include LocalOwnerServiceCommandSetup
+    include LocalOwnerServiceCommandSetup
 
-  it "mark_billed of another company's invoice delivered twice under one key answers not_found both times and bills nothing, even with a stale requester operation row for that id" do
-    generation = prepare_local_ownership!.generation.to_s
-    company = create(:company)
-    other_company = create(:company)
-    foreign_invoice_id = create(:invoice, company: other_company, client: create(:client, company: other_company)).id
-    # The requester's own entry committed under the foreign id, and an operation row naming it,
-    # as a prepare that ran before ownership was checked would have left them.
-    own_entry = service_command_company_entry(company, role: "employee", work_date: "2026-03-02", duration: 60.0)
-    reserve_service_command_entry(own_entry, foreign_invoice_id, state: "committed")
-    Timekeeping::LocalOwner::ReservationOperations::InvoiceOperation.create!(
-      company_id: company.id, invoice_id: foreign_invoice_id, operation_id: SecureRandom.uuid, actor_name: "invoice-boundary",
-      state: "committed", desired_entry_ids: [own_entry.id], disposition: "active", generation: generation.to_i,
-      created_at: Time.current
-    )
-    expect(own_entry.reload.bill_status).to eq("unbilled")
-    baseline = timekeeping_row_counts
-    actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
-                                           operations: ["invoices.mark_billed"])
-    params = { "invoice_id" => foreign_invoice_id, "operation_id" => SecureRandom.uuid }
+    it "mark_billed of another company's invoice delivered twice under one key answers not_found both times and bills nothing, even with a stale requester operation row for that id" do
+      generation = prepare_local_ownership!.generation.to_s
+      company = create(:company)
+      other_company = create(:company)
+      foreign_invoice_id = create(:invoice, company: other_company, client: create(:client, company: other_company)).id
+      # The requester's own entry committed under the foreign id, and an operation row naming it,
+      # as a prepare that ran before ownership was checked would have left them.
+      own_entry = service_command_company_entry(company, role: "employee", work_date: "2026-03-02", duration: 60.0)
+      reserve_service_command_entry(own_entry, foreign_invoice_id, state: "committed")
+      Timekeeping::LocalOwner::ReservationOperations::InvoiceOperation.create!(
+        company_id: company.id, invoice_id: foreign_invoice_id, operation_id: SecureRandom.uuid, actor_name: "invoice-boundary",
+        state: "committed", desired_entry_ids: [own_entry.id], disposition: "active", generation: generation.to_i,
+        created_at: Time.current
+      )
+      expect(own_entry.reload.bill_status).to eq("unbilled")
+      baseline = timekeeping_row_counts
+      actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
+                                             operations: ["invoices.mark_billed"])
+      params = { "invoice_id" => foreign_invoice_id, "operation_id" => SecureRandom.uuid }
 
-    answers = Array.new(2) do
-      outcome = described_class.call(operation: :mark_billed, company_id: company.id, generation:, actor:, params:)
-      [outcome.status, outcome.body]
+      answers = Array.new(2) do
+        outcome = described_class.call(operation: :mark_billed, company_id: company.id, generation:, actor:, params:)
+        [outcome.status, outcome.body]
+      end
+
+      # "A shared contract example that sends a prepare and a mark-billed carrying another company's invoice id gets 404 not_found and no writes on all three providers, LocalOwner included."
+      expect(answers).to eq([[404, { "reason" => "not_found" }]] * 2)
+      expect(timekeeping_row_counts).to eq(baseline)
+      expect(own_entry.reload.bill_status).to eq("unbilled")
     end
-
-    # "A shared contract example that sends a prepare and a mark-billed carrying another company's invoice id gets 404 not_found and no writes on all three providers, LocalOwner included."
-    expect(answers).to eq([[404, { "reason" => "not_found" }]] * 2)
-    expect(timekeeping_row_counts).to eq(baseline)
-    expect(own_entry.reload.bill_status).to eq("unbilled")
-  end
   end
 end
 
