@@ -273,6 +273,70 @@ RSpec.describe "TimekeepingRegressionAdapter.start! from a stopped adapter", com
     expect(instance).to have_received(:stop)
     expect(TimekeepingRegressionAdapter.current).to be_nil
   end
+
+  context "with the snapshot app the live relay delivers to", committed_data: true do
+    # "In a live timekeeping regression run, TimekeepingRegressionAdapter.launch starts the live instance with a snapshot_app wrapping TimekeepingHandoffOutboxRelay::ConsumerEndpoint, run_harvest_import waits for that delivery, and the 9 reimport examples pass with their owned_entries counts and duplicate expectations unchanged."
+    it "start! passes a TimekeepingLiveSnapshotApp holding the instance's service token as snapshot_app and stop! forgets it" do
+      saved = [base_url_env, key_env].index_with { |name| ENV.fetch(name, nil) }
+      received = nil
+      allow(TimekeepingLiveInstance).to receive(:start) do |**keywords|
+        received = keywords
+        double("live instance", base_url: "http://127.0.0.1:#{keywords[:port]}", private_key: OpenSSL::PKey::RSA.generate(2048),
+                                service_token: "adapter-snapshot-token", admission_generation: 2, stop: nil)
+      end
+      delivered = []
+      # The snapshot app hands each batch to the projection consumer in this process.
+      allow(Timekeeping::ProjectionConsumer).to receive(:call) do |batch:, idempotency_key:|
+        delivered << [batch, idempotency_key]
+        TimekeepingRelay::Response.new(status: 200, body: {})
+      end
+      url = "postgresql://snapshot_user@127.0.0.1/timekeeping_snapshot_adapter_test"
+
+      begin
+        TimekeepingRegressionAdapter.start!(env: live_flags.merge("TIMEKEEPING_DATABASE_URL" => url), owner_state: "timekeeping")
+
+        app = received.fetch(:snapshot_app)
+        expect(app).to be_a(TimekeepingLiveSnapshotApp)
+        expect(TimekeepingRegressionAdapter.snapshot_app).to be(app)
+        response = Rack::MockRequest.new(app).post(
+          TimekeepingRelay::HttpEndpoint::DELIVER_PATH,
+          input: '{"snapshots":[{"generation":2,"outbox_position":1,"entry":{"company_id":61}}]}',
+          "HTTP_AUTHORIZATION" => "Bearer adapter-snapshot-token", "HTTP_IDEMPOTENCY_KEY" => "adapter-key"
+        )
+        expect(response.status).to eq(200)
+        expect(delivered.map(&:last)).to eq(["adapter-key"])
+      ensure
+        TimekeepingRegressionAdapter.stop!
+        saved.each { |name, value| value.nil? ? ENV.delete(name) : ENV[name] = value }
+      end
+      expect(TimekeepingRegressionAdapter.snapshot_app).to be_nil
+    end
+
+    it "a start that fails after the instance began stops the instance and leaves no snapshot app" do
+      url = "postgresql://snapshot_fail_user@127.0.0.1/timekeeping_snapshot_fail_test"
+      instance = instance_double(TimekeepingLiveInstance, base_url: "http://127.0.0.1:4994",
+                                                          service_token: "live-service-snapshotfail",
+                                                          private_key: OpenSSL::PKey::RSA.generate(2048), stop: nil)
+      received = nil
+      allow(TimekeepingLiveInstance).to receive(:start) do |**keywords|
+        received = keywords
+        instance
+      end
+      allow_any_instance_of(TimekeepingLiveSnapshotApp) # rubocop:disable RSpec/AnyInstance
+        .to receive(:service_token=).and_raise(RuntimeError, "could not set the snapshot token")
+
+      with_timekeeping_env(base_url_env => "http://outer-before.test", key_env => "outer-before-key") do
+        expect { TimekeepingRegressionAdapter.start!(env: live_flags.merge("TIMEKEEPING_DATABASE_URL" => url), owner_state: "timekeeping") }
+          .to raise_error(TimekeepingRegressionAdapter::BootError)
+        expect_outer_client_env_kept
+      end
+
+      expect(received.fetch(:snapshot_app)).to be_a(TimekeepingLiveSnapshotApp)
+      expect(instance).to have_received(:stop)
+      expect(TimekeepingRegressionAdapter.snapshot_app).to be_nil
+      expect(TimekeepingRegressionAdapter.current).to be_nil
+    end
+  end
 end
 
 # "Live-gated (skip with a stated reason without the flags and a \_test URL): two consecutive examples both reach
