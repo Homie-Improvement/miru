@@ -110,53 +110,53 @@ RSpec.describe TimekeepingProjectionRelay do
   end
 
   context "more tests 10" do
-  it "deliver_live_snapshots! retries a drain that answered false and returns once every snapshot through the highest outbox position is delivered" do
-    store_class = Class.new do
-      attr_reader :drained_through
+    it "deliver_live_snapshots! retries a drain that answered false and returns once every snapshot through the highest outbox position is delivered" do
+      store_class = Class.new do
+        attr_reader :drained_through
 
-      def initialize
-        @drained_through = []
-        @answers = [false, true]
-      end
+        def initialize
+          @drained_through = []
+          @answers = [false, true]
+        end
 
-      def highest_outbox_position
-        17
-      end
+        def highest_outbox_position
+          17
+        end
 
-      def drain(through:)
-        @drained_through << through
-        @answers.shift
+        def drain(through:)
+          @drained_through << through
+          @answers.shift
+        end
       end
+      store = store_class.new
+      answers = double("answers", answer_for: nil)
+      ticks = (0..100).to_a
+      clock = -> { ticks.shift }
+
+      # A drain that answers false (another run holds the relay lock) is retried, not treated as delivered or failed.
+      result = described_class.deliver_live_snapshots!(store:, answers:, company_id: 42, deadline_seconds: 30, clock:)
+
+      expect(result).to be_nil
+      expect(store.drained_through).to eq([17, 17])
     end
-    store = store_class.new
-    answers = double("answers", answer_for: nil)
-    ticks = (0..100).to_a
-    clock = -> { ticks.shift }
-
-    # A drain that answers false (another run holds the relay lock) is retried, not treated as delivered or failed.
-    result = described_class.deliver_live_snapshots!(store:, answers:, company_id: 42, deadline_seconds: 30, clock:)
-
-    expect(result).to be_nil
-    expect(store.drained_through).to eq([17, 17])
-  end
   end
 
   context "more tests 11" do
-  it "deliver_live_snapshots! raises Undelivered with the consumer's refusal when the drain never finishes before the deadline" do
-    store = double("store", highest_outbox_position: 5)
-    allow(store).to receive(:drain).with(through: 5).and_return(false)
-    refusal = TimekeepingRelay::Response.new(status: 409, body: { "reason" => "stale_generation" })
-    answers = double("answers")
-    allow(answers).to receive(:answer_for).with(42).and_return(refusal)
-    now = 0.0
-    clock = -> { now += 10.0 }
+    it "deliver_live_snapshots! raises Undelivered with the consumer's refusal when the drain never finishes before the deadline" do
+      store = double("store", highest_outbox_position: 5)
+      allow(store).to receive(:drain).with(through: 5).and_return(false)
+      refusal = TimekeepingRelay::Response.new(status: 409, body: { "reason" => "stale_generation" })
+      answers = double("answers")
+      allow(answers).to receive(:answer_for).with(42).and_return(refusal)
+      now = 0.0
+      clock = -> { now += 10.0 }
 
-    # An undelivered snapshot must fail loudly, never read as delivered, so a reimport cannot silently store a duplicate.
-    expect do
-      described_class.deliver_live_snapshots!(store:, answers:, company_id: 42, deadline_seconds: 30, clock:)
-    end.to raise_error(TimekeepingProjectionRelay::Undelivered, /company 42.*409.*stale_generation/m)
-    expect(store).to have_received(:drain).with(through: 5).at_least(:once)
-  end
+      # An undelivered snapshot must fail loudly, never read as delivered, so a reimport cannot silently store a duplicate.
+      expect do
+        described_class.deliver_live_snapshots!(store:, answers:, company_id: 42, deadline_seconds: 30, clock:)
+      end.to raise_error(TimekeepingProjectionRelay::Undelivered, /company 42.*409.*stale_generation/m)
+      expect(store).to have_received(:drain).with(through: 5).at_least(:once)
+    end
   end
 end
 
@@ -246,8 +246,6 @@ RSpec.describe TimekeepingProjectionRelay do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe TimekeepingProjectionRelay do
   # "Have run_harvest_import wait for that delivery and verify it in the timekeeping state, the same way it runs the relay in rollback."
   it "relay_local_entries_to_projection raises Undelivered with the consumer's refusal when the live outbox never drains in the timekeeping state" do
@@ -270,8 +268,6 @@ RSpec.describe TimekeepingProjectionRelay do
   end
 end
 
-require "rails_helper"
-
 RSpec.describe TimekeepingProjectionRelay do
   # Drain answers false while another run holds the relay lock, so one false must not fail the delivery.
   it "deliver_live_snapshots! retries a drain refused while another run holds the relay lock and returns once it drains" do
@@ -292,8 +288,6 @@ RSpec.describe TimekeepingProjectionRelay do
     expect(drained_through).to eq([17, 17])
   end
 end
-
-require "rails_helper"
 
 RSpec.describe TimekeepingProjectionRelay do
   # A refused batch must fail with the consumer's answer, never read later as a duplicate row.

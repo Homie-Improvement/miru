@@ -130,52 +130,52 @@ RSpec.describe "forwarded Timekeeping setup helpers" do
   end
 
   context "more tests 2" do
-  # "leave every owned_entries count and duplicate expectation unchanged."
-  it "a drain POST to the live app inside ForwardedTimekeepingRequestLog.unrecorded is not counted as a forwarded create" do
-    allow(TimekeepingRegressionAdapter).to receive(:current)
-      .and_return(double("live instance", base_url: "http://127.0.0.1:4782"))
-    drain = WebMock::RequestSignature.new(:post, "http://127.0.0.1:4782/internal/v1/handoff/drain", body: '{"through":3}')
-    create = WebMock::RequestSignature.new(:post, "http://127.0.0.1:4782/v1/companies/1/entries", body: '{"note":"x"}')
-    ForwardedTimekeepingRequestLog.clear
+    # "leave every owned_entries count and duplicate expectation unchanged."
+    it "a drain POST to the live app inside ForwardedTimekeepingRequestLog.unrecorded is not counted as a forwarded create" do
+      allow(TimekeepingRegressionAdapter).to receive(:current)
+        .and_return(double("live instance", base_url: "http://127.0.0.1:4782"))
+      drain = WebMock::RequestSignature.new(:post, "http://127.0.0.1:4782/internal/v1/handoff/drain", body: '{"through":3}')
+      create = WebMock::RequestSignature.new(:post, "http://127.0.0.1:4782/v1/companies/1/entries", body: '{"note":"x"}')
+      ForwardedTimekeepingRequestLog.clear
 
-    value = ForwardedTimekeepingRequestLog.unrecorded do
-      ForwardedTimekeepingRequestLog.record(drain)
-      :drained
+      value = ForwardedTimekeepingRequestLog.unrecorded do
+        ForwardedTimekeepingRequestLog.record(drain)
+        :drained
+      end
+      ForwardedTimekeepingRequestLog.record(create)
+
+      expect(value).to eq(:drained)
+      expect(forwarded_create_requests(nil).size).to eq(1)
+      expect(forwarded_create_requests(nil).first.fetch(:body)).to eq("note" => "x")
+    ensure
+      ForwardedTimekeepingRequestLog.clear
     end
-    ForwardedTimekeepingRequestLog.record(create)
-
-    expect(value).to eq(:drained)
-    expect(forwarded_create_requests(nil).size).to eq(1)
-    expect(forwarded_create_requests(nil).first.fetch(:body)).to eq("note" => "x")
-  ensure
-    ForwardedTimekeepingRequestLog.clear
-  end
   end
 
   context "more tests 3" do
-  # A drain that fails inside the block must not leave the log switched off, or later
-  # forwarded creates would go missing from the exact-list checks.
-  it "ForwardedTimekeepingRequestLog records requests to the live app again after an unrecorded block raised" do
-    live = instance_double(TimekeepingLiveInstance, base_url: "http://127.0.0.1:45991")
-    allow(TimekeepingRegressionAdapter).to receive(:current).and_return(live)
-    drain = WebMock::RequestSignature.new(:post, "http://127.0.0.1:45991/internal/v1/handoff/drain",
-                                          body: JSON.generate("through" => 3))
-    create = WebMock::RequestSignature.new(:post, "http://127.0.0.1:45991/v1/companies/1/entries",
-                                           body: JSON.generate("note" => "after"))
-    ForwardedTimekeepingRequestLog.clear
+    # A drain that fails inside the block must not leave the log switched off, or later
+    # forwarded creates would go missing from the exact-list checks.
+    it "ForwardedTimekeepingRequestLog records requests to the live app again after an unrecorded block raised" do
+      live = instance_double(TimekeepingLiveInstance, base_url: "http://127.0.0.1:45991")
+      allow(TimekeepingRegressionAdapter).to receive(:current).and_return(live)
+      drain = WebMock::RequestSignature.new(:post, "http://127.0.0.1:45991/internal/v1/handoff/drain",
+                                            body: JSON.generate("through" => 3))
+      create = WebMock::RequestSignature.new(:post, "http://127.0.0.1:45991/v1/companies/1/entries",
+                                             body: JSON.generate("note" => "after"))
+      ForwardedTimekeepingRequestLog.clear
 
-    expect do
-      ForwardedTimekeepingRequestLog.unrecorded do
-        ForwardedTimekeepingRequestLog.record(drain)
-        raise IOError, "drain failed"
-      end
-    end.to raise_error(IOError)
-    ForwardedTimekeepingRequestLog.record(create)
+      expect do
+        ForwardedTimekeepingRequestLog.unrecorded do
+          ForwardedTimekeepingRequestLog.record(drain)
+          raise IOError, "drain failed"
+        end
+      end.to raise_error(IOError)
+      ForwardedTimekeepingRequestLog.record(create)
 
-    expect(ForwardedTimekeepingRequestLog.requests.map { |request| request.fetch(:body) }).to eq([{ "note" => "after" }])
-  ensure
-    ForwardedTimekeepingRequestLog.clear
-  end
+      expect(ForwardedTimekeepingRequestLog.requests.map { |request| request.fetch(:body) }).to eq([{ "note" => "after" }])
+    ensure
+      ForwardedTimekeepingRequestLog.clear
+    end
   end
 end
 
