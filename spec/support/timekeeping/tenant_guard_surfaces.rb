@@ -78,7 +78,11 @@ module TenantGuardSurfaces
   # no key source raises, so a missing key source cannot drop key pairs.
   KEYLESS_CONTRACTS = %i[handoff].freeze
 
-  # The pairs a replay counts toward. Every other pair needs a probe.
+  # The pairs a replay counts toward. Every other pair needs a probe. The
+  # mark_billed and detach_entries operation ids are their keys, and a probe
+  # sending the owner's operation id with the requester's own invoice or
+  # agent would be a new, valid command for the requester, so their replays
+  # cover the operation id too.
   REPLAY_PAIRS = [
     %i[entry_api create idempotency_key],
     %i[entry_api update idempotency_key],
@@ -86,7 +90,9 @@ module TenantGuardSurfaces
     %i[reservations prepare idempotency_key],
     %i[reservations mark_billed idempotency_key],
     %i[reservations detach_entries idempotency_key],
-    %i[entry_snapshots deliver idempotency_key]
+    %i[entry_snapshots deliver idempotency_key],
+    %i[reservations mark_billed operation_id],
+    %i[reservations detach_entries operation_id]
   ].map(&:freeze).freeze
 
   PATH_PARAM_PATTERN = /\{(\w+)\}/

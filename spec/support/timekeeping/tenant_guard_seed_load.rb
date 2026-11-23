@@ -28,9 +28,12 @@ module TenantGuardSeedLoad
   # runtime: the IntegratedRuntime of the example (timekeeping_url and
   # credentials.service_token are read). timekeeping_database_url: the
   # Timekeeping database, read directly to check the admission generation.
-  # Returns the loaded checkpoint.
+  # captured_at stamps the exported reservations; it is cut to microseconds,
+  # as the handoff runner cuts it, because Postgres stores no finer time and
+  # Timekeeping refuses a load whose rows read back differently. Returns the
+  # loaded checkpoint.
   def load!(runtime:, timekeeping_database_url: ENV.fetch(TimekeepingDatabaseReset::DATABASE_URL_KEY),
-            captured_at: Time.current.utc)
+            captured_at: Time.current.utc.floor(6))
     generation = admission_generation
     checkpoint = export_checkpoint(generation:, captured_at:)
     store = Timekeeping::Handoff::TimekeepingStore.new(
@@ -46,12 +49,18 @@ module TenantGuardSeedLoad
   end
 
   # LegacySource#export opens its own repeatable-read transaction, so this
-  # must not run inside a transaction the caller already opened.
+  # must not run inside a transaction the caller already opened. Timekeeping
+  # refuses legacy entries at version 0, so the export goes through the same
+  # LegacyLoadVersions copy the handoff runner loads on a first cutover;
+  # Timekeeping holds nothing after its reset, so no stored versions apply.
   def export_checkpoint(generation:, captured_at:)
-    Timekeeping::Handoff::LegacySource.new(
+    exported = Timekeeping::Handoff::LegacySource.new(
       connection: ActiveRecord::Base.connection,
       recorded_disposition: YAML.load_file(Timekeeping::SeedDispositionRecorder::DEFAULT_PATH)
-    ).export(generation:, captured_at:).fetch(:checkpoint)
+    ).export(generation:, captured_at:)
+    Timekeeping::Handoff::LegacyLoadVersions.build(
+      source: exported.fetch(:checkpoint), corrections: exported.fetch(:corrections), stored: nil
+    )
   end
 
   # The load leaves the entries id sequence alone, so it is moved above the

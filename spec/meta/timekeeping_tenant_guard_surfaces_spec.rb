@@ -194,7 +194,7 @@ RSpec.describe "Timekeeping tenant guard surfaces and cases" do
         .not_to include(%i[entry_api create idempotency_key])
     end
 
-    it "R8 REPLAY_PAIRS holds exactly the key pairs of create, update, bulk_move, prepare, mark_billed, detach_entries and deliver" do
+    it "R8 REPLAY_PAIRS holds the seven key pairs and the mark_billed and detach_entries operation ids" do
       expect(TenantGuardSurfaces::REPLAY_PAIRS).to contain_exactly(
         %i[entry_api create idempotency_key],
         %i[entry_api update idempotency_key],
@@ -202,7 +202,9 @@ RSpec.describe "Timekeeping tenant guard surfaces and cases" do
         %i[reservations prepare idempotency_key],
         %i[reservations mark_billed idempotency_key],
         %i[reservations detach_entries idempotency_key],
-        %i[entry_snapshots deliver idempotency_key]
+        %i[entry_snapshots deliver idempotency_key],
+        %i[reservations mark_billed operation_id],
+        %i[reservations detach_entries operation_id]
       )
       expect(TenantGuardSurfaces::REPLAY_PAIRS).to be_frozen
       expect(TenantGuardSurfaces::REPLAY_PAIRS).to all(be_frozen)
@@ -259,16 +261,29 @@ RSpec.describe "Timekeeping tenant guard surfaces and cases" do
       end
     end
 
-    it "the bulk_move replay and the prepare, mark_billed and detach_entries operation probes expect 404 not_found" do
+    it "the bulk_move and mark_billed replays expect 404 not_found" do
       cases = [
         guard_cases_find(:entry_api, :bulk_move, :replay, [:idempotency_key]),
-        guard_cases_find(:reservations, :prepare, :probe, [:operation_id]),
-        guard_cases_find(:reservations, :mark_billed, :probe, [:operation_id]),
-        guard_cases_find(:reservations, :detach_entries, :probe, [:operation_id])
+        guard_cases_find(:reservations, :mark_billed, :replay, %i[operation_id idempotency_key])
       ]
 
       cases.each do |kase|
         expect(kase.expected).to eq(status: 404, reason: "not_found")
+      end
+    end
+
+    it "covers the owner's operation id only with cases the requester's own state turns away" do
+      prepare = guard_cases_find(:reservations, :prepare, :probe, [:operation_id])
+      detach = guard_cases_find(:reservations, :detach_entries, :replay, %i[operation_id idempotency_key])
+
+      expect(prepare.precondition).to eq(TenantGuardCases::REQUESTER_OPEN_OPERATION)
+      expect(prepare.expected).to eq(status: 409, reason: "unresolved_operation")
+      expect(detach.expected).to eq(status: 200, reason: nil, detached: 0)
+      expect(TenantGuardCases::ALL.map(&:precondition).tally)
+        .to eq(TenantGuardCases::REQUESTER_OPEN_OPERATION => 1, none: TenantGuardCases::ALL.size - 1)
+      # A probe sending the owner's operation id with the requester's own invoice or agent would be a new command.
+      %i[mark_billed detach_entries].each do |route|
+        expect(guard_cases_find(:reservations, route, :probe, [:operation_id])).to be_nil, route.to_s
       end
     end
   end
@@ -331,8 +346,6 @@ RSpec.describe "Timekeeping tenant guard surfaces and cases" do
         %i[reservations abort operation_id] => body_operation,
         %i[reservations abort idempotency_key] => body_operation,
         %i[reservations mark_billed invoice_id] => [:path, 5],
-        %i[reservations mark_billed operation_id] => body_operation,
-        %i[reservations detach_entries operation_id] => body_operation,
         %i[entry_snapshots deliver entry_id] => [:body, "snapshots", 1, "entry", "id"]
       }
     end
