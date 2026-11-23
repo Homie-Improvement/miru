@@ -89,6 +89,24 @@ module TimekeepingQueueLedger
     FileUtils.rm_f(temp_path) if temp_path
   end
 
+  # The queues among those given that the database's workers may not run, in
+  # the order given. Raises KeyError for a database the ledger does not know.
+  def non_dedicated_queues(queues, database:)
+    dedicated = DEDICATED_QUEUES.fetch(database)
+    queues.reject { |queue| dedicated.include?(queue) }
+  end
+
+  # The queue of every job performed in this process while the block runs,
+  # in the order they started. A job run with perform_now writes no Solid
+  # Queue row, so the collectors never see it, nor any job it runs inline in
+  # turn; Active Job's perform notification fires for each of them.
+  def inline_performs(&)
+    queues = []
+    record = ->(*, payload) { queues << payload.fetch(:job).queue_name }
+    ActiveSupport::Notifications.subscribed(record, "perform_start.active_job", &)
+    queues.freeze
+  end
+
   def control_failure(control, ran_ids)
     status = ran_ids.include?(control.active_job_id) ? "ran" : control.status
     return if status == UNRUN

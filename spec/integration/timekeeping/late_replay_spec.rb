@@ -14,6 +14,13 @@ require "yaml"
 # live flag is set (spec/support/timekeeping/integrated_runtime.rb), so the
 # default suite skips it, and a skip is not a pass.
 #
+# The same tag turns on the queue ledger
+# (spec/support/timekeeping/queue_ledger.rb), so a job any runtime worker runs
+# from a non-dedicated queue fails the suite at teardown. The ledger reads only
+# Solid Queue rows and cannot see the inline Timekeeping::RelayJob run, so that
+# run is wrapped in TimekeepingQueueLedger.inline_performs and every job it
+# performs must be on a dedicated monolith queue.
+#
 # No relay message exists before the first cutover: the legacy store has no
 # outbox, and Timekeeping::RelayJob reads only the prepared store's.
 RSpec.describe "Timekeeping late replay" do
@@ -364,7 +371,8 @@ RSpec.describe "Timekeeping late replay" do
           with_timekeeping_env(Timekeeping::LocalSnapshotEndpoint::PROJECTION_URL_ENV => monolith_url) do
             allow(Timekeeping::LocalSnapshotEndpoint).to receive(:configured) { prepared_recorder.call(configured.call) }
             # The job takes the same session lock again on this connection, which Postgres allows.
-            Timekeeping::RelayJob.perform_now
+            relay_queues = TimekeepingQueueLedger.inline_performs { Timekeeping::RelayJob.perform_now }
+            expect(TimekeepingQueueLedger.non_dedicated_queues(relay_queues, database: "monolith")).to eq([])
           end
           RSpec::Mocks.space.proxy_for(Timekeeping::LocalSnapshotEndpoint).reset
         ensure
