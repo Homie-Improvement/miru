@@ -36,6 +36,291 @@ RSpec.describe Timekeeping::LocalOwner, "reservation access refusals" do
       expect(entry.reload.attributes).to eq(entry_before)
     end
   end
+
+  context "more tests 10", "prepare with another company's invoice id" do
+  it "a prepare carrying another company's invoice id answers 404 not_found before any lock, writes nothing, and a retry with the same operation_id is refused again" do
+    generation = prepare_local_ownership!.generation.to_s
+    seeded_invoice_entry => { company:, entry: }
+    seeded_invoice_entry => { invoice: foreign_invoice }
+    actor = described_class::Actor.service(name: "invoices", company_id: company.id, operations: ["reservations.prepare"])
+    operation_id = SecureRandom.uuid
+    baseline = timekeeping_row_counts
+    entry_before = entry.reload.attributes
+
+    # "A shared contract example that sends a prepare and a mark-billed carrying another company's invoice id gets 404 not_found and no writes on all three providers, LocalOwner included."
+    2.times do
+      steps = []
+      outcome = reservation_call(:prepare, company:, generation:, actor:, invoice: foreign_invoice, operation_id:,
+                                           entry_ids: [entry.id], checkpoint: ->(step) { steps << step })
+
+      expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
+      expect(steps).to be_empty
+      expect(timekeeping_row_counts).to eq(baseline)
+      expect(entry.reload.attributes).to eq(entry_before)
+    end
+  end
+  end
+
+  context "more tests 11", "prepare replay with another company's invoice id" do
+  it "a prepare reusing the operation_id of the company's own stored prepare with another company's invoice id answers 404 not_found, not a replay or a reused key" do
+    generation = prepare_local_ownership!.generation.to_s
+    seeded_invoice_entry => { company:, invoice:, entry: }
+    seeded_invoice_entry => { invoice: foreign_invoice }
+    actor = described_class::Actor.service(name: "invoices", company_id: company.id, operations: ["reservations.prepare"])
+    operation_id = SecureRandom.uuid
+    own = reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id:, entry_ids: [entry.id])
+    expect(own.status).to eq(200)
+    baseline = timekeeping_row_counts
+    entry_before = entry.reload.attributes
+
+    # The owner check runs before the stored answer is read, so a stored operation under this key never answers for a foreign invoice.
+    outcome = reservation_call(:prepare, company:, generation:, actor:, invoice: foreign_invoice, operation_id:,
+                                         entry_ids: [entry.id])
+
+    expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
+    expect(timekeeping_row_counts).to eq(baseline)
+    expect(entry.reload.attributes).to eq(entry_before)
+  end
+  end
+
+  context "more tests 12", "prepare with a stale operation row naming another company's invoice" do
+  it "a prepare is refused for another company's invoice even when the requester's own invoice_operations row already names that invoice id" do
+    generation = prepare_local_ownership!.generation.to_s
+    seeded_invoice_entry => { company:, entry: }
+    seeded_invoice_entry => { invoice: foreign_invoice }
+    # A row an earlier, unchecked prepare could have stored under the requester for the foreign invoice.
+    described_class::ReservationOperations::InvoiceOperation.create!(
+      company_id: company.id, invoice_id: foreign_invoice.id, operation_id: SecureRandom.uuid, actor_name: "invoices",
+      state: "aborted", desired_entry_ids: [], disposition: "active", generation: generation.to_i, created_at: Time.current
+    )
+    actor = described_class::Actor.service(name: "invoices", company_id: company.id, operations: ["reservations.prepare"])
+    baseline = timekeeping_row_counts
+    entry_before = entry.reload.attributes
+
+    outcome = reservation_call(:prepare, company:, generation:, actor:, invoice: foreign_invoice,
+                                         operation_id: SecureRandom.uuid, entry_ids: [entry.id])
+
+    expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
+    expect(timekeeping_row_counts).to eq(baseline)
+    expect(entry.reload.attributes).to eq(entry_before)
+  end
+  end
+
+  context "more tests 13", "prepare for invoices owned without a committed invoice row" do
+  it "a prepare for an invoice id the company holds only as a failed intent, or only in its own invoice_operations with no invoice row anywhere, is still accepted" do
+    generation = prepare_local_ownership!.generation.to_s
+    seeded_invoice_entry => { company:, owner:, project: }
+    actor = described_class::Actor.service(name: "invoices", company_id: company.id, operations: ["reservations.prepare"])
+    intent_only_id = Invoice.maximum(:id).to_i + 9001
+    deleted_invoice_id = intent_only_id + 1
+    InvoiceOperationIntent.create!(company_id: company.id, invoice_id: intent_only_id, operation_id: SecureRandom.uuid,
+                                   state: "failed", generation: 1)
+    described_class::ReservationOperations::InvoiceOperation.create!(
+      company_id: company.id, invoice_id: deleted_invoice_id, operation_id: SecureRandom.uuid, actor_name: "invoices",
+      state: "aborted", desired_entry_ids: [], disposition: "active", generation: generation.to_i, created_at: Time.current
+    )
+
+    [intent_only_id, deleted_invoice_id].each do |invoice_id|
+      entry = Timekeeping::LocalEntry.create!(company_id: company.id, user_id: owner.id, project_id: project.id,
+                                              work_date: Date.current, duration: 30.0, note: "n", bill_status: "unbilled")
+      outcome = described_class.call(
+        operation: :prepare, company_id: company.id, generation:, actor:,
+        params: { "invoice_id" => invoice_id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
+                  "entry_ids" => [entry.id] }
+      )
+
+      expect([invoice_id, outcome.status, outcome.body["state"]]).to eq([invoice_id, 200, "prepared"])
+    end
+  end
+  end
+
+  context "more tests 14", "reservation access refusals" do
+  it "prepare carrying another company's invoice id answers 404 not_found before any lock and writes nothing, in both directions" do
+    generation = prepare_local_ownership!.generation.to_s
+    first = seeded_invoice_entry
+    second = seeded_invoice_entry
+    baseline = timekeeping_row_counts
+    entries_before = [first, second].map { |seed| seed.entry.reload.attributes }
+
+    [[first, second], [second, first]].each do |requester, owner|
+      steps = []
+      actor = described_class::Actor.service(name: "invoices", company_id: requester.company.id,
+                                             operations: ["reservations.prepare"])
+      outcome = reservation_call(:prepare, company: requester.company, generation:, actor:, invoice: owner.invoice,
+                                           operation_id: SecureRandom.uuid, entry_ids: [requester.entry.id],
+                                           checkpoint: ->(step) { steps << step })
+
+      # "Make the monolith's LocalOwner (`app/services/timekeeping/local_owner/reservation_operations.rb`, `service_commands.rb`) refuse foreign invoice ids, and add a shared-contract example for it across all three providers."
+      expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
+      expect(steps).not_to include(:operation_key_locked)
+      expect(timekeeping_row_counts).to eq(baseline)
+    end
+    expect([first, second].map { |seed| seed.entry.reload.attributes }).to eq(entries_before)
+  end
+  end
+
+  context "more tests 15", "reservation access refusals" do
+  it "prepare reusing the requester's own stored operation_id with another company's invoice id answers 404 not_found, not a replay or key reuse" do
+    generation = prepare_local_ownership!.generation.to_s
+    requester = seeded_invoice_entry
+    owner = seeded_invoice_entry
+    actor = described_class::Actor.service(name: "invoices", company_id: requester.company.id,
+                                           operations: ["reservations.prepare"])
+    operation_id = SecureRandom.uuid
+    own = reservation_call(:prepare, company: requester.company, generation:, actor:, invoice: requester.invoice,
+                                     operation_id:, entry_ids: [requester.entry.id])
+    expect(own.status).to eq(200)
+    baseline = timekeeping_row_counts
+    owner_entry_before = owner.entry.reload.attributes
+
+    foreign = reservation_call(:prepare, company: requester.company, generation:, actor:, invoice: owner.invoice,
+                                         operation_id:, entry_ids: [requester.entry.id])
+
+    # "Make the monolith's LocalOwner (`app/services/timekeeping/local_owner/reservation_operations.rb`, `service_commands.rb`) refuse foreign invoice ids, and add a shared-contract example for it across all three providers."
+    expect([foreign.status, foreign.body]).to eq([404, { "reason" => "not_found" }])
+    expect(timekeeping_row_counts).to eq(baseline)
+    expect(owner.entry.reload.attributes).to eq(owner_entry_before)
+  end
+  end
+
+  context "more tests 16", "reservation access refusals" do
+  it "prepare is refused when the requester's own invoice_operations row names an invoice another company holds" do
+    generation = prepare_local_ownership!.generation.to_s
+    requester = seeded_invoice_entry
+    owner = seeded_invoice_entry
+    # A row stored before invoice ownership was checked: the requester's company with another company's invoice id.
+    Timekeeping::LocalOwner::ReservationOperations::InvoiceOperation.create!(
+      company_id: requester.company.id, invoice_id: owner.invoice.id, operation_id: SecureRandom.uuid,
+      actor_name: "invoices", state: "committed", desired_entry_ids: [], disposition: "active",
+      generation: generation.to_i, created_at: Time.current
+    )
+    actor = described_class::Actor.service(name: "invoices", company_id: requester.company.id,
+                                           operations: ["reservations.prepare"])
+    baseline = timekeeping_row_counts
+
+    outcome = reservation_call(:prepare, company: requester.company, generation:, actor:, invoice: owner.invoice,
+                                         operation_id: SecureRandom.uuid, entry_ids: [requester.entry.id])
+
+    # "Make the monolith's LocalOwner (`app/services/timekeeping/local_owner/reservation_operations.rb`, `service_commands.rb`) refuse foreign invoice ids, and add a shared-contract example for it across all three providers."
+    expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
+    expect(timekeeping_row_counts).to eq(baseline)
+    expect(requester.entry.reload.attributes.fetch("version")).to eq(requester.entry.version)
+  end
+  end
+
+  context "more tests 17", "prepare refuses a foreign invoice id" do
+  it "prepare carrying another company's invoice id answers 404 not_found before any lock and writes nothing" do
+    generation = prepare_local_ownership!.generation.to_s
+    seeded_invoice_entry => { company:, entry: }
+    seeded_invoice_entry => { invoice: foreign_invoice }
+    actor = described_class::Actor.service(name: "invoices", company_id: company.id, operations: ["reservations.prepare"])
+    baseline = timekeeping_row_counts
+    entry_before = entry.reload.attributes
+    steps = []
+
+    # "A shared contract example that sends a prepare and a mark-billed carrying another company's invoice id gets 404 not_found and no writes on all three providers, LocalOwner included."
+    outcome = reservation_call(:prepare, company:, generation:, actor:, invoice: foreign_invoice,
+                                         operation_id: SecureRandom.uuid, entry_ids: [entry.id],
+                                         checkpoint: ->(step) { steps << step })
+
+    expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
+    expect(steps).to be_empty
+    expect(timekeeping_row_counts).to eq(baseline)
+    expect(entry.reload.attributes).to eq(entry_before)
+  end
+  end
+
+  context "more tests 18", "prepare checks the invoice owner before replay" do
+  it "prepare reusing the requester's stored operation_id with a foreign invoice id answers 404, not a replay or key reuse" do
+    generation = prepare_local_ownership!.generation.to_s
+    seeded_invoice_entry => { company:, invoice:, entry: }
+    seeded_invoice_entry => { invoice: foreign_invoice }
+    actor = described_class::Actor.service(name: "invoices", company_id: company.id, operations: ["reservations.prepare"])
+    operation_id = SecureRandom.uuid
+    own = reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id:, entry_ids: [entry.id])
+    expect(own.status).to eq(200)
+    baseline = timekeeping_row_counts
+    entry_before = entry.reload.attributes
+
+    foreign = reservation_call(:prepare, company:, generation:, actor:, invoice: foreign_invoice, operation_id:,
+                                         entry_ids: [entry.id])
+
+    expect([foreign.status, foreign.body]).to eq([404, { "reason" => "not_found" }])
+    expect(timekeeping_row_counts).to eq(baseline)
+    expect(entry.reload.attributes).to eq(entry_before)
+  end
+  end
+
+  context "more tests 19", "prepare with a legacy operation row for a foreign invoice" do
+  it "prepare is refused for another company's invoice even when the requester already holds an invoice_operations row naming it" do
+    generation = prepare_local_ownership!.generation.to_s
+    seeded_invoice_entry => { company:, entry: }
+    seeded_invoice_entry => { invoice: foreign_invoice }
+    operation_rows = Class.new(ApplicationRecord) { self.table_name = "invoice_operations" }
+    # A row an earlier, unchecked prepare could have stored for the requester under the foreign id.
+    operation_rows.create!(company_id: company.id, invoice_id: foreign_invoice.id, operation_id: SecureRandom.uuid,
+                           actor_name: "invoices", state: "committed", desired_entry_ids: [],
+                           disposition: "active", generation: generation.to_i, created_at: Time.current)
+    actor = described_class::Actor.service(name: "invoices", company_id: company.id, operations: ["reservations.prepare"])
+    baseline = timekeeping_row_counts
+
+    outcome = reservation_call(:prepare, company:, generation:, actor:, invoice: foreign_invoice,
+                                         operation_id: SecureRandom.uuid, entry_ids: [entry.id])
+
+    expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
+    expect(timekeeping_row_counts).to eq(baseline)
+  end
+  end
+
+  context "more tests 20", "reservation access refusals" do
+  it "prepare reusing the operation_id of the requester's own stored prepare with another company's invoice id answers not_found before any replay and writes nothing" do
+    generation = prepare_local_ownership!.generation.to_s
+    seeded_invoice_entry => { company:, invoice:, entry: }
+    foreign_invoice = seeded_invoice_entry.invoice
+    actor = described_class::Actor.service(name: "invoices", company_id: company.id, operations: ["reservations.prepare"])
+    operation_id = SecureRandom.uuid
+
+    own = reservation_call(:prepare, company:, generation:, actor:, invoice:, operation_id:, entry_ids: [entry.id])
+    expect(own.status).to eq(200)
+    baseline = timekeeping_row_counts
+    entry_before = entry.reload.attributes
+
+    # The stored operation under this key names the requester's own invoice. A provider that
+    # replays before it checks ownership answers key reuse or the stored answer instead.
+    replayed = reservation_call(:prepare, company:, generation:, actor:, invoice: foreign_invoice, operation_id:,
+                                          entry_ids: [entry.id])
+
+    # "A shared contract example that sends a prepare and a mark-billed carrying another company's invoice id gets 404 not_found and no writes on all three providers, LocalOwner included."
+    expect([replayed.status, replayed.body]).to eq([404, { "reason" => "not_found" }])
+    expect(timekeeping_row_counts).to eq(baseline)
+    expect(entry.reload.attributes).to eq(entry_before)
+  end
+  end
+
+  context "more tests 21", "reservation access refusals" do
+  it "prepare carrying another company's invoice id is refused even when the requester already holds an invoice_operations row for that id" do
+    generation = prepare_local_ownership!.generation.to_s
+    seeded_invoice_entry => { company:, entry: }
+    foreign_invoice = seeded_invoice_entry.invoice
+    # A row left by a prepare that ran before ownership was checked: it names the requester's
+    # company with another company's real invoice, so it is no proof of ownership.
+    Timekeeping::LocalOwner::ReservationOperations::InvoiceOperation.create!(
+      company_id: company.id, invoice_id: foreign_invoice.id, operation_id: SecureRandom.uuid, actor_name: "invoices",
+      state: "aborted", desired_entry_ids: [], disposition: "active", generation: generation.to_i, created_at: Time.current
+    )
+    actor = described_class::Actor.service(name: "invoices", company_id: company.id, operations: ["reservations.prepare"])
+    baseline = timekeeping_row_counts
+    entry_before = entry.reload.attributes
+
+    outcome = reservation_call(:prepare, company:, generation:, actor:, invoice: foreign_invoice,
+                                         operation_id: SecureRandom.uuid, entry_ids: [entry.id])
+
+    # "A shared contract example that sends a prepare and a mark-billed carrying another company's invoice id gets 404 not_found and no writes on all three providers, LocalOwner included."
+    expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
+    expect(timekeeping_row_counts).to eq(baseline)
+    expect(entry.reload.attributes).to eq(entry_before)
+  end
+  end
 end
 
 RSpec.describe Timekeeping::LocalOwner, "refused callers and stored answers" do
