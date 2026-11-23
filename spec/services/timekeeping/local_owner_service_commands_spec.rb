@@ -154,8 +154,7 @@ RSpec.describe Timekeeping::LocalOwner, "service command access refusals" do
         )
 
         # A request carrying another company's invoice id "returns `404` or no match and changes nothing in either database, in both directions".
-        expect([[200, { "billed" => 0 }], [404, { "reason" => "not_found" }]]).to include([outcome.status, outcome.body])
-        # "a 2xx answer that changed nothing stores no receipt"
+        expect([outcome.status, outcome.body]).to eq([404, { "reason" => "not_found" }])
         expect(timekeeping_row_counts).to eq(baseline)
         expect(entries.map { |entry| entry.reload.attributes }).to eq(before)
       end
@@ -224,18 +223,19 @@ RSpec.describe Timekeeping::LocalOwner, "service command access refusals" do
       end
 
       first = mark_billed.call
-      expect([[200, { "billed" => 0 }], [404, { "reason" => "not_found" }]]).to include([first.status, first.body])
-      # "a 2xx answer that changed nothing stores no receipt"
+      expect([first.status, first.body]).to eq([404, { "reason" => "not_found" }])
       expect(timekeeping_row_counts).to eq(baseline)
       expect(foreign_entry.reload.attributes).to eq(foreign_before)
 
-      # The requesting company now commits its own entry under the same invoice id.
+      # The requesting company now holds a committed reservation of its own entry under the
+      # other company's invoice id. The invoice is still the other company's, so the retry is
+      # evaluated again and refused rather than billing that entry.
       own_entry = service_command_company_entry(company, role: "employee", work_date: "2026-03-02", duration: 30.0)
       reserve_service_command_entry(own_entry, foreign_invoice_id, state: "committed")
       retried = mark_billed.call
 
-      expect([retried.status, retried.body]).to eq([200, { "billed" => 1 }])
-      expect(own_entry.reload.bill_status).to eq("billed")
+      expect([retried.status, retried.body]).to eq([404, { "reason" => "not_found" }])
+      expect(own_entry.reload.bill_status).to eq("unbilled")
       expect(foreign_entry.reload.attributes).to eq(foreign_before)
     end
   end
@@ -569,7 +569,8 @@ RSpec.describe Timekeeping::LocalOwner, "mark_billed tenant boundary" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
     other_company = create(:company)
-    invoice_number = 501
+    # The invoice is the caller's own; the other company's reservation names the same id directly.
+    invoice_number = create(:invoice, company:, client: create(:client, company:)).id
     own_entry, foreign_entry = [company, other_company].map do |owning_company|
       entry = service_command_company_entry(owning_company, role: "employee", work_date: "2026-03-02", duration: 60.0)
       reserve_service_command_entry(entry, invoice_number, state: "committed")
@@ -580,7 +581,7 @@ RSpec.describe Timekeeping::LocalOwner, "mark_billed tenant boundary" do
 
     # "mark_billed bills only the entries the invoice holds by committed reservation, writing version, audit, outbox and receipt in one transaction"
     # "Every local query filters by `company_id`." Invoice numbers repeat across companies, so the
-    # other company's committed reservation for 501 must not bill its entry.
+    # other company's committed reservation for the same id must not bill its entry.
     outcome = described_class.call(operation: :mark_billed, company_id: company.id, generation:, actor:,
                                    params: { "invoice_id" => invoice_number, "operation_id" => SecureRandom.uuid })
 
@@ -602,12 +603,13 @@ RSpec.describe Timekeeping::LocalOwner, "service commands refuse another company
     project = create(:project, client: create(:client, company:))
     agent_entry = service_command_entry(company, user: member, project:, work_date: "2026-03-02", duration: 60.0, agent_id: 77)
     billable = service_command_entry(company, user: member, project:, work_date: "2026-03-02", duration: 60.0)
-    reserve_service_command_entry(billable, 501, state: "committed")
+    invoice_id = create(:invoice, company:, client: project.client).id
+    reserve_service_command_entry(billable, invoice_id, state: "committed")
     operations = %w[invoices.mark_billed agents.detach_entries]
     own_service = described_class::Actor.service(name: "invoice-boundary", company_id: company.id, operations:)
     foreign_service = described_class::Actor.service(name: "invoice-boundary", company_id: other_company.id, operations:)
     commands = {
-      mark_billed: { "invoice_id" => 501, "operation_id" => SecureRandom.uuid },
+      mark_billed: { "invoice_id" => invoice_id, "operation_id" => SecureRandom.uuid },
       detach_entries: { "agent_id" => 77, "operation_id" => SecureRandom.uuid }
     }
     # The caller's own company stores a receipt under each operation_id first, so a foreign
@@ -847,16 +849,20 @@ RSpec.describe Timekeeping::LocalOwner, "service command receipts per service an
       described_class::Receipt.where(key: operation_id, actor_type: "service").pluck(:company_id, :actor_name)
     end
 
-    # mark_billed: both companies hold a committed reservation for the same invoice number.
-    invoice_id = 501
+    # mark_billed: each company holds a committed reservation for an invoice of its own, and both
+    # are billed under one operation_id.
+    invoice_ids = [company, other_company].to_h do |owning|
+      [owning.id, create(:invoice, company: owning, client: create(:client, company: owning)).id]
+    end
     own_billable, foreign_billable = [company, other_company].map do |owning|
       entry = service_command_company_entry(owning, role: "employee", work_date: "2026-03-02", duration: 60.0)
-      reserve_service_command_entry(entry, invoice_id, state: "committed")
+      reserve_service_command_entry(entry, invoice_ids.fetch(owning.id), state: "committed")
       entry
     end
-    bill_params = { "invoice_id" => invoice_id, "operation_id" => SecureRandom.uuid }
+    bill_operation_id = SecureRandom.uuid
     bill = lambda do |caller, company_id|
-      described_class.call(operation: :mark_billed, company_id:, generation:, actor: caller, params: bill_params)
+      described_class.call(operation: :mark_billed, company_id:, generation:, actor: caller,
+                           params: { "invoice_id" => invoice_ids.fetch(company_id), "operation_id" => bill_operation_id })
     end
     invoice_service = actor.service(name: "invoice-boundary", company_id: company.id, operations: ["invoices.mark_billed"])
     foreign_invoice_service = actor.service(name: "invoice-boundary", company_id: other_company.id, operations: ["invoices.mark_billed"])
@@ -881,7 +887,7 @@ RSpec.describe Timekeeping::LocalOwner, "service command receipts per service an
     foreign_bill = bill.call(foreign_invoice_service, other_company.id)
     expect([foreign_bill.status, foreign_bill.body]).to eq([200, { "billed" => 1 }])
     expect([own_billable, foreign_billable].map { |entry| entry.reload.bill_status }).to eq(%w[billed billed])
-    expect(receipt_owners.call(bill_params["operation_id"]))
+    expect(receipt_owners.call(bill_operation_id))
       .to contain_exactly([company.id, "invoice-boundary"], [other_company.id, "invoice-boundary"])
 
     # detach_entries: two entries with agent 77 and one with agent 78 in the first company, one with
@@ -951,7 +957,8 @@ RSpec.describe Timekeeping::LocalOwner, "service commands on an unpublishable en
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
     entry = service_command_company_entry(company, role: "owner", work_date: "2026-03-02", duration: 60.0, agent_id: 77)
-    reserve_service_command_entry(entry, 501, state: "committed")
+    invoice_id = create(:invoice, company:, client: create(:client, company:)).id
+    reserve_service_command_entry(entry, invoice_id, state: "committed")
     # A source outside the snapshot contract's list is a stored value the projection refuses.
     entry.update_columns(source: "legacy")
     before = entry.reload.attributes
@@ -959,7 +966,7 @@ RSpec.describe Timekeeping::LocalOwner, "service commands on an unpublishable en
     actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
                                            operations: %w[invoices.mark_billed agents.detach_entries])
 
-    { mark_billed: { "invoice_id" => 501 }, detach_entries: { "agent_id" => 77 } }.each do |operation, target|
+    { mark_billed: { "invoice_id" => invoice_id }, detach_entries: { "agent_id" => 77 } }.each do |operation, target|
       outcome = described_class.call(operation:, company_id: company.id, generation:, actor:,
                                      params: target.merge("operation_id" => SecureRandom.uuid))
 
@@ -980,7 +987,8 @@ RSpec.describe Timekeeping::LocalOwner, "service commands with an ownership upda
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
     entry = service_command_company_entry(company, role: "owner", work_date: "2026-03-02", duration: 60.0, agent_id: 77)
-    reserve_service_command_entry(entry, 501, state: "committed")
+    invoice_id = create(:invoice, company:, client: create(:client, company:)).id
+    reserve_service_command_entry(entry, invoice_id, state: "committed")
     before = entry.reload.attributes
     baseline = timekeeping_row_counts
     actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
@@ -1007,7 +1015,7 @@ RSpec.describe Timekeeping::LocalOwner, "service commands with an ownership upda
       await_service_command_worker(updater) { updater_pids.first }
 
       expect(blocked_by?(updater_pids.first, holder_pids.first)).to be(true)
-      { mark_billed: { "invoice_id" => 501 }, detach_entries: { "agent_id" => 77 } }.each do |operation, target|
+      { mark_billed: { "invoice_id" => invoice_id }, detach_entries: { "agent_id" => 77 } }.each do |operation, target|
         # statement_timeout, not lock_timeout: a blocking read then fails with a cancelled query
         # instead of the lock_not_available error a NOWAIT read raises.
         ApplicationRecord.transaction do
@@ -1169,14 +1177,15 @@ RSpec.describe Timekeeping::LocalOwner, "stored service command receipts" do
   it "stores each command's receipt as a service receipt with the target-qualified operation and its SHA256 fingerprint" do
     generation = prepare_local_ownership!.generation.to_s
     company = create(:company)
-    # A mark-billed that bills nothing stores no receipt, so invoice 501 holds one entry to bill.
+    # A mark-billed that bills nothing stores no receipt, so the company's invoice holds one entry to bill.
     billable = service_command_company_entry(company, role: "employee", work_date: "2026-03-02", duration: 60.0)
-    reserve_service_command_entry(billable, 501, state: "committed")
+    invoice_id = create(:invoice, company:, client: create(:client, company:)).id
+    reserve_service_command_entry(billable, invoice_id, state: "committed")
     # A detach that detaches nothing stores its receipt only for the company's own agent.
     create(:agent, company:, id: 77)
     actor = described_class::Actor.service(name: "invoice-boundary", company_id: company.id,
                                            operations: %w[invoices.mark_billed agents.detach_entries])
-    commands = { mark_billed: ["invoice_id", 501, "mark_billed 501"], detach_entries: ["agent_id", 77, "detach_entries 77"] }
+    commands = { mark_billed: ["invoice_id", invoice_id, "mark_billed #{invoice_id}"], detach_entries: ["agent_id", 77, "detach_entries 77"] }
 
     commands.each do |operation, (target_param, target_id, operation_name)|
       operation_id = SecureRandom.uuid
