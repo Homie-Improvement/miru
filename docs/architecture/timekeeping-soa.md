@@ -480,7 +480,7 @@ POST /v1/companies/{company_id}/agents/{agent_id}/detach-entries
   -> 200 { detached: <count> }
 ```
 
-- **mark-billed** replaces `Invoice#update_timesheet_entry_status!`. It sets `bill_status: billed` on the kept entries that the invoice holds by committed reservation. Today that method runs only from the uncalled mailer path (L5), and the migration does not call it more often.
+- **mark-billed** replaces `Invoice#update_timesheet_entry_status!`. It sets `bill_status: billed` on the kept entries that the invoice holds by committed reservation. Today that method runs only from the uncalled mailer path (L5), and the migration does not call it more often. A retry whose answer is stored is replayed first. A new mark-billed, like a prepare, then checks that the invoice is the path company's (its own `invoice_operations` hold it, or the invoice facts of section 3.4 list it). Another company's invoice answers `404 not_found`, the same as an unknown id, and stores nothing; when the read fails, Timekeeping answers `503 reference_unavailable`.
 - **detach-entries** is agent destroy. It nulls `agent_id` on that company's entries for the agent and writes an audit row for each entry. A retry whose answer is stored is replayed first. A new detach then reads whether the company owns the agent (section 3.4); when that read fails, Timekeeping answers `503 reference_unavailable` and stores nothing.
 
 ### 5.4 The entry snapshot stream
