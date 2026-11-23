@@ -308,6 +308,23 @@ RSpec.describe TimekeepingIntegrationTags do
         expect(source).not_to include("TimekeepingLiveInstance"), path.to_s
       end
     end
+
+    it "the interrupted handoff spec exists, carries committed_data and the legacy owner state, never loads the handoff fakes, and runs on the integrated runtime" do
+      path = Rails.root.join("spec/integration/timekeeping/interrupted_handoff_spec.rb")
+      expect(File).to exist(path)
+      source = File.read(path)
+
+      violations = described_class.violations(path.to_s, source)
+      expect(violations).to eq([]), violations.map { |v| "#{v.line} #{v.kind} #{v.detail}" }.join("\n")
+
+      expect(source).to include(":integrated_runtime", ":two_tenant_seed", 'owner_state: "legacy"')
+      expect(source).not_to include("TimekeepingLiveInstance")
+      expect(source).not_to include("handoff_fakes")
+      # The spec adds no database reset of its own and never sleeps.
+      expect(source).not_to include("before_reset!")
+      expect(source).not_to match(/\bTRUNCATE\b/i)
+      expect(source).not_to match(/\bsleep\(/)
+    end
   end
 
   describe "the live handoff meta spec" do

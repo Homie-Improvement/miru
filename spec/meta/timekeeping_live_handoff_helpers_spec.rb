@@ -218,6 +218,150 @@ RSpec.describe TimekeepingLiveHandoff do
     it "lists unsent positions at or below through in order" do
       expect(described_class.unsent_outbox_positions(live_handoff_connection, through: 3)).to eq([2, 3])
     end
+
+    it "lists the unsent positions of only the given company, in order" do
+      live_handoff_connection.exec("INSERT INTO outbox_snapshots VALUES (0, 13, 1, NULL)")
+
+      expect(described_class.queued_positions(live_handoff_connection, company_id: 1)).to eq([0, 2, 3])
+      expect(described_class.queued_positions(live_handoff_connection, company_id: 2)).to eq([4])
+    end
+  end
+
+  describe ".relay_batches" do
+    # One outbox row as PostgreSQL returns it in text form: bigint, float,
+    # boolean, date and timestamp columns as text, jsonb as its stored text.
+    def live_handoff_stored_row(outbox_position:, metadata_text:)
+      {
+        "id" => "11", "project_id" => "3", "user_id" => "4", "agent_id" => nil, "work_date" => "2026-03-02",
+        "duration" => "90.5", "note" => "Queued", "bill_status" => "unbilled", "review_status" => "pending",
+        "locked" => "f", "source" => "manual", "source_metadata" => metadata_text, "external_run_id" => nil,
+        "external_session_id" => nil, "proof_url" => nil, "proof_metadata" => "{}", "discarded_at" => nil,
+        "created_at" => "2026-03-02 09:00:00.123456", "updated_at" => "2026-03-02 09:30:00.5",
+        "company_id" => "1", "version" => "2", "generation" => "3", "outbox_position" => outbox_position.to_s
+      }
+    end
+
+    # The same row as Timekeeping::RelayOutboxSource#relay_row offers it to the relay.
+    def live_handoff_relay_row(outbox_position:, metadata:)
+      {
+        "generation" => 3, "outbox_position" => outbox_position,
+        "entry" => {
+          "id" => 11, "project_id" => 3, "user_id" => 4, "agent_id" => nil, "work_date" => Date.new(2026, 3, 2),
+          "duration" => 90.5, "note" => "Queued", "bill_status" => "unbilled", "review_status" => "pending",
+          "locked" => false, "source" => "manual", "source_metadata" => metadata, "external_run_id" => nil,
+          "external_session_id" => nil, "proof_url" => nil, "proof_metadata" => {}, "discarded_at" => nil,
+          "created_at" => "2026-03-02T09:00:00.123456Z", "updated_at" => "2026-03-02T09:30:00.500000Z",
+          "company_id" => 1, "version" => 2
+        }
+      }
+    end
+
+    # Runs the real relay over the relay-shaped rows and records what it posts.
+    def live_handoff_relay_posts(rows)
+      posts = []
+      source = Object.new
+      source.define_singleton_method(:unsent_after) do |position, limit|
+        rows.select { |row| row.fetch("outbox_position") > position }.first(limit)
+      end
+      source.define_singleton_method(:mark_sent) { |_positions| nil }
+      endpoint = Object.new
+      endpoint.define_singleton_method(:deliver) do |batch, idempotency_key:|
+        posts << [TimekeepingRelay::BatchJson.generate(batch), idempotency_key]
+        TimekeepingRelay::Response.new(status: 200, body: { "applied" => batch.fetch("snapshots").size, "ignored" => 0 })
+      end
+      TimekeepingRelay::Relay.new(source:, endpoint:).deliver(limit: described_class::RELAY_BATCH_SIZE)
+      posts
+    end
+
+    it "rebuilds the body and Idempotency-Key the relay posts, keeping a fine decimal exact" do
+      metadata_text = '{"rate": 0.1000000000000000055511151231257827}'
+      stored = [live_handoff_stored_row(outbox_position: 7, metadata_text:),
+                live_handoff_stored_row(outbox_position: 8, metadata_text:)]
+      offered = [7, 8].map do |position|
+        live_handoff_relay_row(outbox_position: position,
+                               metadata: { "rate" => BigDecimal("0.1000000000000000055511151231257827") })
+      end
+
+      batches = described_class.relay_batches(stored)
+
+      expect(batches.map { |batch| [batch.body, batch.idempotency_key] }).to eq(live_handoff_relay_posts(offered))
+      expect(batches.first.body).to include('"created_at":"2026-03-02T09:00:00.123456Z"')
+      expect(batches.first.body).to include('"rate":0.1000000000000000055511151231257827')
+    end
+
+    it "splits rows into batches of the relay's batch size" do
+      stored = (1..(described_class::RELAY_BATCH_SIZE + 1)).map do |position|
+        live_handoff_stored_row(outbox_position: position, metadata_text: "{}")
+      end
+
+      expect(described_class.relay_batches(stored).map { |batch| JSON.parse(batch.body).fetch("snapshots").size })
+        .to eq([described_class::RELAY_BATCH_SIZE, 1])
+    end
+  end
+
+  describe ".ownership_row_text" do
+    it "reads the ownership table's row as row_to_json text past the query cache" do
+      TimekeepingOwnership.ensure_initial!
+      table = TimekeepingOwnership.table_name
+
+      ActiveRecord::Base.cache do
+        before = described_class.ownership_row_text
+        expect(JSON.parse(before)).to include("id" => TimekeepingOwnership::SINGLETON_ID)
+        ActiveRecord::Base.connection.raw_connection.exec(
+          "UPDATE #{table} SET changed_by = 'live handoff helpers spec' WHERE id = #{TimekeepingOwnership::SINGLETON_ID}"
+        )
+
+        expect(JSON.parse(described_class.ownership_row_text)).to include("changed_by" => "live handoff helpers spec")
+      end
+    end
+  end
+
+  describe "entry snapshot receipt readers" do
+    def live_handoff_receipt(key:, applied:, company_ids: [1, 2])
+      EntrySnapshotReceipt.create!(actor: "timekeeping", company_ids:, key:, request_digest: "digest-#{key}",
+                                   response_status: 200, response_body: { "applied" => applied, "ignored" => 0 },
+                                   created_at: Time.current, expires_at: 1.day.from_now)
+    end
+
+    it "sums applied once for each receipt written after the baseline, whatever companies it covers" do
+      live_handoff_receipt(key: "before", applied: 5)
+      baseline = described_class.snapshot_receipt_baseline
+      first = live_handoff_receipt(key: "first", applied: 3)
+      second = live_handoff_receipt(key: "second", applied: 2, company_ids: [1])
+
+      expect(described_class.snapshot_receipts_after(baseline))
+        .to eq([described_class::SnapshotReceipt.new(id: first.id, key: "first", applied: 3),
+                described_class::SnapshotReceipt.new(id: second.id, key: "second", applied: 2)])
+      expect(described_class.applied_after(baseline)).to eq(5)
+    end
+
+    # The runtime writes receipts through its own connections, which do not
+    # clear this process's query cache; a raw insert does the same here.
+    it "reads the baseline and the receipts past the query cache" do
+      ActiveRecord::Base.cache do
+        baseline = described_class.snapshot_receipt_baseline
+        expect(described_class.snapshot_receipts_after(baseline)).to eq([])
+        ActiveRecord::Base.connection.raw_connection.exec(<<~SQL)
+          INSERT INTO entry_snapshot_receipts (actor, company_ids, key, request_digest, response_status, response_body,
+                                               created_at, expires_at)
+          VALUES ('timekeeping', '{1}', 'raw', 'digest-raw', 200, '{"applied": 4, "ignored": 0}', now(),
+                  now() + interval '1 day')
+        SQL
+
+        expect(described_class.snapshot_receipt_baseline).to be > baseline
+        expect(described_class.applied_after(baseline)).to eq(4)
+      end
+    end
+  end
+
+  describe ".tenant_digest" do
+    it "passes the Timekeeping database URL, not the runtime's HTTP address" do
+      allow(TenantStateDigest).to receive(:take).and_return(:digest)
+      env = { TimekeepingDatabaseReset::DATABASE_URL_KEY => "postgres://db/timekeeping_test" }
+
+      expect(described_class.tenant_digest(company_id: 4, env:)).to eq(:digest)
+      expect(TenantStateDigest).to have_received(:take).with(company_id: 4, timekeeping_url: "postgres://db/timekeeping_test")
+    end
   end
 
   describe ".money" do

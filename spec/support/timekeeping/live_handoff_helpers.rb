@@ -7,7 +7,8 @@ require "tmpdir"
 # Shared helpers for the live Timekeeping specs that run real handoffs against
 # the demo runtime (spec/support/timekeeping/integrated_runtime.rb): relay
 # pause and resume, per-run report roots, a setup cutover, a bounded catch-up,
-# readers for money, receipts and queued counts, and a teardown that puts the
+# readers for money, receipts, queued snapshots, ownership and projection
+# state, a rebuild of the batches the relay posted, and a teardown that puts the
 # relay, ENV and the handoff integrations back however the example ended.
 #
 # The module functions take what they touch as arguments, so
@@ -193,6 +194,169 @@ module TimekeepingLiveHandoff
   # own connections, which do not clear this process's query cache.
   def money(company_id:)
     ActiveRecord::Base.uncached { Timekeeping::FinancialSnapshot.take(company_id:) }
+  end
+
+  # Unsent outbox positions of one company, in order.
+  def queued_positions(connection, company_id:)
+    connection.exec_params(
+      "SELECT outbox_position FROM outbox_snapshots WHERE sent_at IS NULL AND company_id = $1 ORDER BY outbox_position",
+      [Integer(company_id)]
+    ).column_values(0).map { |position| Integer(position) }
+  end
+
+  # Every outbox row of one company as the database's own row_to_json text,
+  # sent_at included, in position order.
+  def outbox_rows_text(connection, company_id:)
+    connection.exec_params(
+      "SELECT row_to_json(t)::text FROM outbox_snapshots t WHERE company_id = $1 ORDER BY outbox_position",
+      [Integer(company_id)]
+    ).column_values(0)
+  end
+
+  # Timekeeping's admission row as row_to_json text.
+  def admission_text(connection)
+    connection.exec("SELECT row_to_json(t)::text FROM admission t ORDER BY id").column_values(0)
+  end
+
+  # The ownership row as row_to_json text, read past the query cache because
+  # the runner and the runtime write it through other connections.
+  def ownership_row_text
+    connection = ActiveRecord::Base.connection
+    ActiveRecord::Base.uncached do
+      connection.select_value(
+        "SELECT row_to_json(t)::text FROM #{connection.quote_table_name(TimekeepingOwnership.table_name)} t " \
+        "WHERE id = #{Integer(TimekeepingOwnership::SINGLETON_ID)}"
+      )
+    end
+  end
+
+  # One company's projection rows as row_to_json text, in id order, uncached.
+  def projection_rows_text(company_id:)
+    connection = ActiveRecord::Base.connection
+    ActiveRecord::Base.uncached do
+      connection.select_values(
+        "SELECT row_to_json(t)::text FROM timesheet_entries t WHERE company_id = $1 ORDER BY id",
+        "TimekeepingLiveHandoff", [Integer(company_id)]
+      )
+    end
+  end
+
+  # Every entry snapshot receipt as row_to_json text, in id order, uncached.
+  def snapshot_receipts_text
+    ActiveRecord::Base.uncached do
+      ActiveRecord::Base.connection.select_values(
+        "SELECT row_to_json(t)::text FROM #{EntrySnapshotReceipt.quoted_table_name} t ORDER BY id"
+      )
+    end
+  end
+
+  # The highest entry snapshot receipt id now, 0 when there is none. Take it
+  # before the run that delivers the measured snapshots.
+  def snapshot_receipt_baseline
+    ActiveRecord::Base.uncached { EntrySnapshotReceipt.maximum(:id) || 0 }
+  end
+
+  SnapshotReceipt = Data.define(:id, :key, :applied)
+
+  # The receipts written after baseline_id, in id order. One receipt covers
+  # every company in its batch, so each one is listed once.
+  def snapshot_receipts_after(baseline_id)
+    ActiveRecord::Base.uncached do
+      EntrySnapshotReceipt.where(id: (Integer(baseline_id) + 1)..).order(:id).map do |receipt|
+        SnapshotReceipt.new(id: receipt.id, key: receipt.key, applied: Integer(receipt.response_body.fetch("applied")))
+      end
+    end
+  end
+
+  # The sum of applied over the receipts written after baseline_id. A snapshot
+  # applied twice, or skipped, moves this sum away from the queued count.
+  def applied_after(baseline_id)
+    snapshot_receipts_after(baseline_id).sum(&:applied)
+  end
+
+  # Everything "a second resume changes nothing" compares, as text or plain
+  # values, for the given companies. timekeeping_connection reads Timekeeping's
+  # outbox and admission.
+  def state_snapshot(timekeeping_connection, company_ids:)
+    {
+      ownership: ownership_row_text,
+      admission: admission_text(timekeeping_connection),
+      receipts: snapshot_receipts_text,
+      companies: company_ids.to_h do |company_id|
+        [company_id, { projection: projection_rows_text(company_id:),
+                       outbox: outbox_rows_text(timekeeping_connection, company_id:),
+                       money: money(company_id:) }]
+      end
+    }
+  end
+
+  # TenantStateDigest.take for one company, given the Timekeeping database
+  # URL from env, never the runtime's HTTP address.
+  def tenant_digest(company_id:, env: ENV)
+    TenantStateDigest.take(company_id:, timekeeping_url: env.fetch(TimekeepingDatabaseReset::DATABASE_URL_KEY))
+  end
+
+  # The most rows one relay POST carries: RelayJob::BATCH_SIZE in
+  # timekeeping/app/jobs/relay_job.rb, which this process does not load.
+  RELAY_BATCH_SIZE = 100
+  # outbox_snapshots columns the relay sends as Integers, Floats, booleans,
+  # ISO 8601 times or exact JSON; every other entry field is sent as stored
+  # text (work_date as its ISO date text, which JSON writes as a Date is).
+  RELAY_INTEGER_FIELDS = %w[id project_id user_id agent_id company_id version].freeze
+  RELAY_FLOAT_FIELDS = %w[duration].freeze
+  RELAY_BOOLEAN_FIELDS = %w[locked].freeze
+  RELAY_TIME_FIELDS = %w[discarded_at created_at updated_at].freeze
+  RELAY_JSON_FIELDS = %w[source_metadata proof_metadata].freeze
+  RELAY_STORED_TRUE = "t"
+
+  RelayBatch = Data.define(:body, :idempotency_key)
+
+  # The outbox rows at the given positions, each column as the database's
+  # text, in position order.
+  def outbox_relay_rows(connection, positions:)
+    columns = (Timekeeping::SnapshotBatch::ENTRY_FIELDS + %w[generation outbox_position])
+              .map { |column| connection.quote_ident(column) }.join(", ")
+    result = connection.exec_params(
+      "SELECT #{columns} FROM outbox_snapshots WHERE outbox_position = ANY($1::bigint[]) ORDER BY outbox_position",
+      [PG::TextEncoder::Array.new.encode(positions.map { |position| Integer(position) })]
+    )
+    result.to_a
+  end
+
+  # The batches the relay posts for these rows, built as
+  # Timekeeping::RelayOutboxSource#relay_row and TimekeepingRelay::Relay
+  # build them, so the body and Idempotency-Key match a delivery the
+  # projection already answered.
+  def relay_batches(rows)
+    rows.each_slice(RELAY_BATCH_SIZE).map do |slice|
+      batch = TimekeepingRelay::BatchJson.canonical(
+        "schema_version" => TimekeepingRelay::Relay::SCHEMA_VERSION,
+        "snapshots" => slice.map { |row| relay_snapshot(row) }
+      )
+      RelayBatch.new(body: TimekeepingRelay::BatchJson.generate(batch),
+                     idempotency_key: TimekeepingRelay::IdempotencyKey.for(batch))
+    end
+  end
+
+  def relay_snapshot(row)
+    {
+      "generation" => Integer(row.fetch("generation")),
+      "outbox_position" => Integer(row.fetch("outbox_position")),
+      "entry" => Timekeeping::SnapshotBatch::ENTRY_FIELDS.to_h { |field| [field, relay_value(field, row.fetch(field))] }
+    }
+  end
+
+  def relay_value(field, text)
+    return nil if text.nil?
+
+    case field
+    when *RELAY_INTEGER_FIELDS then Integer(text)
+    when *RELAY_FLOAT_FIELDS then Float(text)
+    when *RELAY_BOOLEAN_FIELDS then text == RELAY_STORED_TRUE
+    when *RELAY_TIME_FIELDS then Time.find_zone!("UTC").parse(text).utc.iso8601(6)
+    when *RELAY_JSON_FIELDS then JSON.parse(text, decimal_class: BigDecimal)
+    else text
+    end
   end
 end
 
