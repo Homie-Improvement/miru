@@ -676,29 +676,48 @@ RSpec.describe "Timekeeping interrupted handoff: abort ordering", :integrated_ru
     end || raise("#{company.name} has no seeded owner or admin with an API token")
   end
 
-  def abort_ordering_create_entry(company)
-    project = Project.kept.joins(:client).where(clients: { company_id: company.id }, billable: true).order(:id).first!
+  def abort_ordering_write(company, method:, path:, body:)
     user = abort_ordering_admin(company)
-    uri = URI.join(@integrated_runtime.monolith_url, "/api/v1/timesheet_entry")
-    request = Net::HTTP::Post.new(uri)
-    request["X-Auth-Email"] = user.email
-    request["X-Auth-Token"] = user.token
-    request["Accept"] = "application/json"
-    request["Content-Type"] = "application/json"
-    request.body = JSON.generate(
-      project_id: project.id,
-      timesheet_entry: { duration: 60, work_date: Date.current.iso8601, note: "Interrupted", bill_status: "unbilled" }
-    )
-    response = Net::HTTP.start(uri.host, uri.port) { |http| http.request(request) }
-    expect(response.code).to eq("200"), "entry create answered #{response.code}: #{response.body}"
-    Integer(JSON.parse(response.body).dig("entry", "id"))
+    headers = { "X-Auth-Email" => user.email, "X-Auth-Token" => user.token,
+                "Idempotency-Key" => "abort-ordering-#{SecureRandom.hex(8)}" }
+    reply = LiveHandoff.send_request(@integrated_runtime.monolith_url, { method:, path:, headers:, body: })
+    expect(reply.status).to eq(200), "#{method} #{path} answered #{reply.status}: #{reply.body}"
+    JSON.parse(reply.body)
   end
 
-  def abort_ordering_projected_ids(ids)
+  def abort_ordering_create_entry(company, project:, note:)
+    created = abort_ordering_write(company, method: "POST", path: "/api/v1/timesheet_entry",
+                                            body: { "project_id" => project.id,
+                                                    "timesheet_entry" => { "duration" => 60.0, "note" => note,
+                                                                           "bill_status" => "unbilled",
+                                                                           "work_date" => Date.current.iso8601 } })
+    Integer(created.dig("entry", "id"))
+  end
+
+  # Queues, for one company, two versions of one entry plus single writes of
+  # two other entries, so a projection holding only the first version of the
+  # edited entry can be told apart from one holding every latest version.
+  # Returns { edited:, others: } entry ids.
+  def abort_ordering_queue_writes(company)
+    project = Project.kept.joins(:client).where(clients: { company_id: company.id }, billable: true).order(:id).first!
+    edited = abort_ordering_create_entry(company, project:, note: "abort ordering #{company.id} v1")
+    abort_ordering_write(company, method: "PUT", path: "/api/v1/timesheet_entry/#{edited}",
+                                  body: { "project_id" => project.id,
+                                          "timesheet_entry" => { "duration" => 45.0, "note" => "abort ordering #{company.id} v2" } })
+    others = %w[other-b other-c].map do |label|
+      abort_ordering_create_entry(company, project:, note: "abort ordering #{company.id} #{label}")
+    end
+    { edited:, others: }
+  end
+
+  # The projection's version and note of each given entry, read uncached
+  # because runtime processes write these rows outside this connection.
+  def abort_ordering_projected_snapshots(ids)
+    encoded_ids = PG::TextEncoder::Array.new.encode(ids.map { |id| Integer(id) })
     ActiveRecord::Base.uncached do
-      ActiveRecord::Base.connection.select_values(
-        "SELECT id FROM timesheet_entries WHERE id = ANY($1::bigint[])", "abort ordering", ["{#{ids.join(',')}}"]
-      ).map { |id| Integer(id) }
+      ActiveRecord::Base.connection.select_rows(
+        "SELECT id, version, note FROM timesheet_entries WHERE id = ANY($1::bigint[])", "abort ordering", [encoded_ids]
+      ).to_h { |id, version, note| [Integer(id), { version: Integer(version), note: }] }
     end
   end
 
@@ -711,8 +730,27 @@ RSpec.describe "Timekeeping interrupted handoff: abort ordering", :integrated_ru
       live_handoff_cutover!
       live_handoff_catch_up!
       live_handoff_pause_relay
-      queued_ids = [fork_and_leaf, copper_kettle].flat_map { |company| 2.times.map { abort_ordering_create_entry(company) } }
-      expect(abort_ordering_projected_ids(queued_ids)).to be_empty
+      companies = [fork_and_leaf, copper_kettle]
+      queued = companies.to_h { |company| [company.id, abort_ordering_queue_writes(company)] }
+      queued_ids = queued.values.flat_map { |entries| [entries.fetch(:edited), *entries.fetch(:others)] }
+
+      # Taken from the outgoing store before the rollback, never from the
+      # projection the admit record is compared with.
+      expected_at_admit = TimekeepingLiveHandoff.with_timekeeping_database do |connection|
+        queued.each do |company_id, entries|
+          expect(TimekeepingLiveHandoff.queued_count(connection, company_id:, entry_id: entries.fetch(:edited))).to eq(2)
+          entries.fetch(:others).each do |entry_id|
+            expect(TimekeepingLiveHandoff.queued_count(connection, company_id:, entry_id:)).to eq(1)
+          end
+        end
+        TimekeepingLiveHandoff.latest_queued_snapshots(connection, entry_ids: queued_ids)
+      end
+      expect(expected_at_admit.keys).to match_array(queued_ids)
+      queued.each_value do |entries|
+        expect(expected_at_admit.fetch(entries.fetch(:edited))[:note]).to end_with(" v2")
+      end
+      projected_before = abort_ordering_projected_snapshots(queued_ids)
+      expect(projected_before.select { |id, snapshot| expected_at_admit.fetch(id) == snapshot }).to be_empty
 
       root = live_handoff_report_root
       expect do
@@ -726,7 +764,7 @@ RSpec.describe "Timekeeping interrupted handoff: abort ordering", :integrated_ru
       projected_at_admit = []
       # A lambda, because the admit method below runs on the delegator, which
       # cannot call this example group's helpers.
-      record_projection = -> { projected_at_admit << abort_ordering_projected_ids(queued_ids) }
+      record_projection = -> { projected_at_admit << abort_ordering_projected_snapshots(queued_ids) }
       configured = Timekeeping::Handoff::Runner.configured_owners
       timekeeping = configured.fetch("timekeeping")
       recording_admission = Class.new(SimpleDelegator) do
@@ -749,7 +787,10 @@ RSpec.describe "Timekeeping interrupted handoff: abort ordering", :integrated_ru
       # "every queued position at or below P is in the projection before the outgoing owner admits writes"
       expect(polls).to be >= 2
       expect(projected_at_admit.size).to eq(1)
-      expect(projected_at_admit.first).to match_array(queued_ids)
+      expect(projected_at_admit.first.keys).to match_array(queued_ids)
+      # Ids alone would pass with only the edited entry's first version
+      # applied; the version and note show the latest queued one arrived.
+      expect(projected_at_admit.first).to eq(expected_at_admit)
       reconciliation = live_handoff_aborted_reconciliation(root)
       expect(reconciliation.abort?).to be(false), reconciliation.to_h.inspect
     end
