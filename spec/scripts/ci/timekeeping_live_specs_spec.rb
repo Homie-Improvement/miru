@@ -415,83 +415,10 @@ RSpec.describe TimekeepingLiveSpecs do
     end
   end
 
-  context "more tests 2" do
-    # "No non-dedicated queue job runs during these suites, shown by the teardown queue ledger"
-    # The ledger's verdict only runs in the live CI job, so these suites must be selected there.
-    it "the real live set holds the four gated live specs plus the interrupted-handoff spec and no other integrated-runtime file" do
-      expected = (live + ["spec/integration/timekeeping/interrupted_handoff_spec.rb"]).sort
-
-      selected = described_class.live_specs(root: Rails.root.to_s)
-
-      expect(selected).to eq(expected)
-      expect(selected).not_to include(
-        "spec/integration/timekeeping/money_guard_spec.rb",
-        "spec/integration/timekeeping/late_replay_spec.rb",
-        "spec/integration/timekeeping/handoff_sequence_spec.rb"
-      )
-    end
-  end
-
-  context "more tests 3" do
-    # "No non-dedicated queue job runs during these suites, shown by the teardown queue ledger"
-    it "on a pull request that edits only the interrupted-handoff spec, the live job runs rspec once with exactly that file" do
-      interrupted = "spec/integration/timekeeping/interrupted_handoff_spec.rb"
-      real_live_specs = described_class.live_specs(root: Rails.root.to_s)
-
-      status, out, _err, rspec_calls = run_timekeeping_live_selector(
-        env: pull_request_env, changed_paths: ->(_base) { [interrupted] }, live_specs: real_live_specs
-      )
-
-      expect(status).to eq(0)
-      expect(rspec_calls).to eq([[interrupted]])
-      expect(out).not_to include(TimekeepingLiveSpecs::NO_SPEC_MESSAGE)
-    end
-  end
-
-  context "more tests 4" do
-    it "live_specs lists the interrupted-handoff spec only when that file exists under the given root" do
-      Dir.mktmpdir do |root|
-        dir = File.join(root, "spec/integration/timekeeping")
-        FileUtils.mkdir_p(dir)
-        File.write(File.join(dir, "plain_spec.rb"), "it { expect(1).to eq(1) }\n")
-        # A file carrying the tag but not named by the selector stays out of the live set.
-        File.write(File.join(dir, "other_runtime_spec.rb"), "RSpec.describe \"other\", :integrated_runtime do\nend\n")
-
-        expect(described_class.live_specs(root:)).to eq([])
-
-        File.write(File.join(dir, "interrupted_handoff_spec.rb"),
-                   "RSpec.describe \"interrupted\", :integrated_runtime do\nend\n")
-
-        expect(described_class.live_specs(root:)).to eq(["spec/integration/timekeeping/interrupted_handoff_spec.rb"])
-      end
-    end
-  end
-
-  context "more tests 5" do
-    it "live_specs adds the interrupted-handoff suites to the four gated live specs and no other integrated-runtime file" do
-      # "No non-dedicated queue job runs during these suites, shown by the teardown queue ledger"
-      # The ledger's verdict only runs in the live CI job, so these suites must be in the set it runs.
-      selected = described_class.live_specs(root: Rails.root.to_s)
-
-      expect(selected).to eq(
-        %w[
-          spec/integration/timekeeping/alerts_live_spec.rb
-          spec/integration/timekeeping/handoff_live_spec.rb
-          spec/integration/timekeeping/interrupted_handoff_spec.rb
-          spec/integration/timekeeping/invoice_first_save_live_spec.rb
-          spec/integration/timekeeping/live_instance_generation_spec.rb
-        ]
-      )
-      expect(selected.count("spec/integration/timekeeping/interrupted_handoff_spec.rb")).to eq(1)
-      expect(selected).not_to include(
-        "spec/integration/timekeeping/money_guard_spec.rb", "spec/integration/timekeeping/late_replay_spec.rb"
-      )
-    end
-  end
-
-  context "more tests 6" do
+  # "No non-dedicated queue job runs during these suites, shown by the teardown queue ledger"
+  # The ledger's teardown verdict only runs on the interrupted-handoff suites if the live job selects them.
+  context "the interrupted-handoff spec" do
     it "a pull request that edits only the interrupted-handoff spec runs exactly that file in the live job" do
-      # "No non-dedicated queue job runs during these suites, shown by the teardown queue ledger"
       interrupted = "spec/integration/timekeeping/interrupted_handoff_spec.rb"
       env = { "GITHUB_EVENT_NAME" => "pull_request", "GITHUB_REF_NAME" => "597/merge", "GITHUB_BASE_REF" => "main" }
       out = StringIO.new
@@ -509,12 +436,8 @@ RSpec.describe TimekeepingLiveSpecs do
       expect(rspec_calls).to eq([[interrupted]])
       expect(out.string).not_to include("No live Timekeeping spec was selected")
     end
-  end
 
-  context "more tests 7" do
-    # "No non-dedicated queue job runs during these suites, shown by the teardown queue ledger"
-    # The ledger's teardown verdict only runs on these suites if the live job selects them. The sibling
-    # integrated suite stays out, because selecting every integrated suite is separate work.
+    # The sibling integrated suite stays out, because selecting every integrated suite is separate work.
     it "a pull request that edits the interrupted handoff spec and a sibling integrated suite runs only the interrupted handoff spec live" do
       changed = %w[
         spec/integration/timekeeping/money_guard_spec.rb
@@ -529,10 +452,7 @@ RSpec.describe TimekeepingLiveSpecs do
       expect(status).to eq(0), err
       expect(rspec_calls).to eq([["spec/integration/timekeeping/interrupted_handoff_spec.rb"]])
     end
-  end
 
-  context "more tests 8" do
-    # "No non-dedicated queue job runs during these suites, shown by the teardown queue ledger"
     # A deleted or renamed file must not be handed to rspec, and the integrated-runtime tag alone selects nothing.
     it "live_specs lists the interrupted handoff spec only while it exists and never a differently named integrated suite" do
       Dir.mktmpdir do |root|
