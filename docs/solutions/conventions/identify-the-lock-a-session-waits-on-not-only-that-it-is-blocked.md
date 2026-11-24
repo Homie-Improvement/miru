@@ -61,4 +61,58 @@ A lock-discrimination spec is only worth having if removing the lock turns it re
 - PR #596, `spec/support/timekeeping/section_9_3_live.rb`: adds `OPERATION_LOCK_SQL`, which decodes the advisory key from `classid`, `objid` and `objsubid = 1`. It also adds `section_9_3_operation_lock?`, whose comment says `blocked_by?` alone cannot tell this wait from a wait on a row lock.
 - The same file adds `TIMEKEEPING_WAITERS_SQL`, a recursive query whose comment says the second waiter waits on the first waiter, not on the holder. It adds `ENTRY_LOCK_QUERY` and `section_9_3_timekeeping_waiting_on_entry_lock?` to reject waits from a later statement such as the reservation INSERT.
 - `spec/integration/timekeeping/section_9_3_spec.rb` in PR #596: the two-saves example repoints two different existing lines, keeping rate and quantity. It asserts both `blocked_by?(second_pid, first_pid)` and `section_9_3_operation_lock?(..., granted: false)`. The two-prepares example asserts `entry_lock_waiters` equals `waiters`, with a comment about the foreign-key wait.
-- The author ran the `ENTRY_LOCK_QUERY` pattern against both statements. It matched the entry-locking SELECT and did not match the reservation INSERT. The PR body records that with both save-path `OperationLock.acquire!` calls removed, the saves example failed `blocked_by?` and the lock check.
+- The author ran the `ENTRY_LOCK_QUERY` pattern against both statements. It matched the entry-locking SELECT and did not match the reservation INSERT.
+
+## Removal record
+
+Each run below removed one mechanism in the working tree, ran the examples that depend on it, and restored the file. No removal was committed. On the restored tree every example listed passed. Live runs used `TIMEKEEPING_LIVE=1` with the environment of the `timekeeping-runtime-live` CI job. The section 9.3 examples ran for both seeded companies, "Fork & Leaf Salads" and "Copper Kettle Bakery", and both failed on every run.
+
+**Search.** `grep -rlF '<pattern>' spec timekeeping/spec` for each of `blocked_by?(`, `OperationLock`, `hold_at: :rows_locked`, `BillingFence` and `settle`. Most `BillingFence` hits are refusal specs, and most `settle` hits are the unrelated payment `Invoice#settle!`. The `blocked_by?(` hits, which are the examples that prove a wait, were:
+
+- `spec/db/committed_data_mode_spec.rb`
+- `spec/integration/timekeeping/handoff_concurrency_spec.rb`
+- `spec/integration/timekeeping/section_9_3_spec.rb`
+- `spec/jobs/recover_invoice_operation_intents_job_spec.rb`
+- `spec/lib/timekeeping/handoff/monolith_admission_spec.rb`
+- `spec/models/timekeeping_ownership_concurrency_spec.rb`
+- `spec/services/invoices/operation_lock_spec.rb`
+- `spec/services/invoices/prepared_reservations_concurrency_spec.rb`
+- `spec/services/timekeeping/billing_fence_concurrency_spec.rb`
+- `spec/services/timekeeping/gateway_agent_race_spec.rb`
+- `spec/services/timekeeping/gateway_fence_concurrency_spec.rb`
+- `spec/services/timekeeping/gateway_spec.rb`
+- `spec/services/timekeeping/local_owner_agent_race_spec.rb`
+- `spec/services/timekeeping/local_owner_concurrency_spec.rb`
+- `spec/services/timekeeping/local_owner_reservations_spec.rb`
+- `spec/services/timekeeping/local_owner_service_commands_spec.rb`
+- `spec/services/timekeeping/projection_consumer_spec.rb`
+- `timekeeping/spec/services/timekeeping/entry_writer_race_spec.rb`
+- `timekeeping/spec/services/timekeeping/reservation_operations_race_spec.rb`
+
+**Save-path invoice-identity lock.** Removed both `Invoices::OperationLock.acquire!` calls on the save path: `Flush#call` in `app/services/invoices/reservation_boundary.rb` and `lock_current_generation!` in `app/services/invoices/operation_coordinator.rb`. Removing only one leaves the save serialized by the other.
+
+- "Two saves of one invoice start together" (`-e 'Two saves of one invoice start together'`): 1 example, 1 failure. For each company it failed on "the second save should wait on the first save", "the second save should wait on the invoice-identity lock", "both saves should commit; their intents are [\"committed\", \"failed\"]", "the invoice should carry both saves' entries" and "the invoice should hold exactly its new entries committed".
+- `spec/services/invoices/operation_lock_spec.rb` stayed green. It calls `OperationLock.acquire!` directly, so it does not depend on the save-path call sites.
+
+**Timekeeping entry lock.** Removed `.lock("FOR UPDATE")` from `lock_entries` in `timekeeping/app/services/timekeeping/reservation_operations.rb`. The monolith copies of `lock_entries` were left alone, because the live example runs after cutover against the Timekeeping server.
+
+- "Two invoices prepare one entry at once": 1 example, 1 failure. For each company it failed on "both prepares should wait in Timekeeping's entry-locking SELECT ... FOR UPDATE; waiting sessions [845, 924], of which in that SELECT []" (the prepares waited in the reservation INSERT's foreign-key check instead), "the two prepares answered [200]" and "the refused prepare should name provisional_elsewhere; saw {}".
+- `timekeeping/spec/services/timekeeping/reservation_operations_race_spec.rb`: 8 examples, 5 failures. Lines 86 and 257 failed with "the second request never waited on the first one's lock". Lines 160, 192 and 221 failed with "the other writer never waited on the held operation's lock".
+
+**Recovery lock.** Removed `Invoices::OperationLock.acquire!` from `RecoverInvoiceOperationIntentsJob#resolve` in `app/jobs/recover_invoice_operation_intents_job.rb`.
+
+- "Crash after prepare, before the invoice commits": 1 example, 1 failure. For each company it failed on "recovery should wait on the paused save's lock", "recovery beside a live save should change nothing; before {...}, after {...}" and "the released save should commit". The `blocked_by?` check alone was enough here: with the lock gone, recovery did not wait at all and failed the live save's intent.
+- `spec/jobs/recover_invoice_operation_intents_job_spec.rb`: 15 examples, 4 failures. Lines 250 and 382 failed with `Expected "failed" to eq "pending".`. Line 288 failed with `Expected false to equal true.` on `expect(waited).to be(true)`. Line 333 failed with `Invoices::OperationErrors::IntentNotPending`, raised by the released save because recovery had already failed its intent.
+
+**Billing fence.** Removed `.lock("FOR SHARE")` from `Timekeeping::BillingFence.admit!` in `app/services/timekeeping/billing_fence.rb`.
+
+- `spec/services/timekeeping/billing_fence_concurrency_spec.rb`: line 9 failed with "the handoff update never waited on the billing transaction's lock", and line 44 failed with "the billing transaction never waited on the handoff update's lock".
+- `spec/lib/timekeeping/handoff/monolith_admission_spec.rb`: line 340 failed with `Expected false to equal true.` on `expect(blocked_by?(fence_pid, late_pid, within: 3)).to be(true)`.
+- `spec/models/timekeeping_ownership_concurrency_spec.rb` and `spec/services/timekeeping/gateway_fence_concurrency_spec.rb` stayed green. They prove other locks on the ownership row, not the billing fence's share lock.
+
+**Handoff settling phase.** Removed `settle_integration.settle!(generation: @generation)` from `Runner#settle` in `lib/timekeeping/handoff/runner.rb`.
+
+- `spec/integration/timekeeping/handoff_concurrency_spec.rb`, "makes step 1 of a rollback wait for an invoice save paused after prepare, and settles the save before the freeze": 1 example, 1 failure, "Fork & Leaf Salads: at the freeze the in-flight operation was not settled (The settle step did not finish; resume or abort the handoff)". That example has no `aggregate_failures`, so the first company's failure stopped the loop. A rerun with the company list narrowed to Copper Kettle Bakery, then restored, failed with the same message for "Copper Kettle Bakery". Select this example with `-e`: selecting it by line number picked the neighbouring example.
+- No section 9.3 example depends on the billing fence or the settling phase.
+
+**Not yet run with their mechanism removed.** These hits prove waits on other mechanisms. `spec/db/committed_data_mode_spec.rb` tests `blocked_by?` itself. `spec/services/invoices/prepared_reservations_concurrency_spec.rb` and the `local_owner_*` specs depend on the monolith copies of `lock_entries` and the local-owner locks. `gateway_agent_race_spec.rb`, `gateway_spec.rb`, `projection_consumer_spec.rb` and `timekeeping/spec/services/timekeeping/entry_writer_race_spec.rb` depend on the Timekeeping write and agent locks and the fence generation. In `handoff_concurrency_spec.rb`, the billing-refusal example and the example where step 1's fence waits on a Timekeeping entry update depend on the handoff's step-1 fence.
