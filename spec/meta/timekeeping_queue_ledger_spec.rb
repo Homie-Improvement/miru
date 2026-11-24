@@ -934,3 +934,136 @@ RSpec.describe TimekeepingQueueLedger do
     expect { described_class.non_dedicated_queues(queues, database: "unknown") }.to raise_error(KeyError)
   end
 end
+
+RSpec.describe TimekeepingQueueLedger, :without_transaction do
+  # "No non-dedicated queue job runs during these suites, shown by the teardown queue ledger"
+  # A job run with perform_now writes no Solid Queue row, so only the around hook can catch it.
+  it "an inline_jobs_on_dedicated_queues example that runs a default-queue job inline fails, even when it skips afterwards, while an invoice_operations job passes" do
+    probe = Rails.root.join("spec/fixtures/timekeeping_harness/inline_dedicated_queue_probe.rb")
+    expect(probe).to exist
+    expect(probe.basename.to_s).not_to end_with("_spec.rb")
+    database_url = ENV["DATABASE_URL"].presence ||
+                   "postgresql:///#{ActiveRecord::Base.connection_db_config.database}"
+
+    results = %w[default skip_after_default dedicated].to_h do |scenario|
+      Dir.mktmpdir("inline-queue-probe") do |dir|
+        stdout, stderr, status = Open3.capture3(
+          { "INLINE_QUEUE_PROBE" => scenario, described_class::PATH_KEY => File.join(dir, "queue_ledger.json"),
+            "DATABASE_URL" => database_url },
+          "bundle", "exec", "rspec", probe.to_s, chdir: Rails.root.to_s
+        )
+        [scenario, [status.success?, "#{stdout}\n#{stderr}"]]
+      end
+    end
+
+    expect(results.fetch("default").first).to be(false), results.fetch("default").last
+    expect(results.fetch("default").last).to include("default")
+    expect(results.fetch("skip_after_default").first).to be(false), results.fetch("skip_after_default").last
+    expect(results.fetch("skip_after_default").last).to include("default")
+    expect(results.fetch("dedicated").first).to be(true), results.fetch("dedicated").last
+    expect(results.fetch("dedicated").last).to match(/1 example, 0 failures/)
+  end
+end
+
+RSpec.describe TimekeepingQueueLedger do
+  # "No non-dedicated queue job runs during these suites, shown by the teardown queue ledger"
+  # A job run with perform_now writes no Solid Queue row, so if the hook ignored skipped examples,
+  # a job that ran before the skip would pass unseen by both the hook and the teardown ledger.
+  it "the inline queue hook fails a tagged example that runs a default-queue job inline and then skips" do
+    stray_job = Class.new(ApplicationJob) do
+      queue_as :default
+
+      def perform; end
+    end
+    stub_const("InlineHookSkipStrayDefaultJob", stray_job)
+
+    inner = RSpec::Core::ExampleGroup.describe("inline hook job before skip", :inline_jobs_on_dedicated_queues) do
+      it "runs a default-queue job and then skips" do
+        InlineHookSkipStrayDefaultJob.perform_now
+        skip "skipped after the job already ran"
+      end
+    end
+    passed = inner.run(RSpec::Core::NullReporter)
+    RSpec.world.example_groups.delete(inner)
+
+    expect(passed).to be(false)
+    exception = inner.examples.first.execution_result.exception
+    expect(exception).not_to be_nil
+    expect(exception.message).to include("default")
+  end
+end
+
+RSpec.describe TimekeepingQueueLedger do
+  # "No non-dedicated queue job runs during these suites, shown by the teardown queue ledger"
+  # The queue check must not replace an example's own error, which is the failure a reader needs to see.
+  it "the inline queue hook keeps an example's own failure and fails a clean example that ran a default-queue job" do
+    stray_job = Class.new(ApplicationJob) do
+      queue_as :default
+
+      def perform; end
+    end
+    stub_const("InlineHookOwnFailureStrayJob", stray_job)
+
+    inner = RSpec::Core::ExampleGroup.describe("inline hook own failure", :inline_jobs_on_dedicated_queues) do
+      it "runs a default-queue job and then fails on its own" do
+        InlineHookOwnFailureStrayJob.perform_now
+        raise "the example's own failure"
+      end
+
+      it "runs a default-queue job and otherwise passes" do
+        InlineHookOwnFailureStrayJob.perform_now
+      end
+    end
+    passed = inner.run(RSpec::Core::NullReporter)
+    RSpec.world.example_groups.delete(inner)
+
+    expect(passed).to be(false)
+    own_failure, clean = inner.examples.map { |example| example.execution_result.exception }
+    expect(own_failure.message).to include("the example's own failure")
+    expect(clean).not_to be_nil
+    expect(clean.message).to include("default")
+  end
+end
+
+RSpec.describe TimekeepingQueueLedger do
+  # "No non-dedicated queue job runs during these suites, shown by the teardown queue ledger"
+  # The handoff runner performs Timekeeping::RelayJob inline; a non-dedicated job that relay job runs in
+  # turn is hidden one level down and must still fail the example.
+  it "the inline queue hook fails a default-queue job nested inside an inline relay job and passes the relay job alone" do
+    stray_job = Class.new(ApplicationJob) do
+      queue_as :default
+
+      def perform; end
+    end
+    stub_const("InlineHookNestedStrayJob", stray_job)
+    nesting_relay_job = Class.new(ApplicationJob) do
+      queue_as :timekeeping_relay
+
+      def perform
+        InlineHookNestedStrayJob.perform_now
+      end
+    end
+    stub_const("InlineHookNestingRelayJob", nesting_relay_job)
+    plain_relay_job = Class.new(ApplicationJob) do
+      queue_as :timekeeping_relay
+
+      def perform; end
+    end
+    stub_const("InlineHookPlainRelayJob", plain_relay_job)
+
+    nested = RSpec::Core::ExampleGroup.describe("inline hook nested job", :inline_jobs_on_dedicated_queues) do
+      it("runs a relay job that runs a default-queue job") { InlineHookNestingRelayJob.perform_now }
+    end
+    alone = RSpec::Core::ExampleGroup.describe("inline hook relay alone", :inline_jobs_on_dedicated_queues) do
+      it("runs only a relay job") { InlineHookPlainRelayJob.perform_now }
+    end
+    nested_passed = nested.run(RSpec::Core::NullReporter)
+    alone_passed = alone.run(RSpec::Core::NullReporter)
+    RSpec.world.example_groups.delete(nested)
+    RSpec.world.example_groups.delete(alone)
+
+    expect(nested_passed).to be(false)
+    expect(nested.examples.first.execution_result.exception.message).to include("default")
+    expect(alone_passed).to be(true)
+  end
+end
