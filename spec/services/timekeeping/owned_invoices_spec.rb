@@ -48,4 +48,38 @@ RSpec.describe Timekeeping::OwnedInvoices do
       expect(described_class.ids(company_id: company.id, invoice_ids: [])).to eq([])
     end
   end
+
+  context "more tests 2" do
+    it "held_by_others lists, sorted and once each, only the requested ids another company holds as an invoice or an intent row" do
+      company = create(:company)
+      other_company = create(:company)
+      own_invoice = create(:invoice, company:, client: create(:client, company:)).id
+      foreign_client = create(:client, company: other_company)
+      foreign_invoice = create(:invoice, company: other_company, client: foreign_client).id
+      foreign_discarded = create(:invoice, company: other_company, client: foreign_client)
+        .tap { |invoice| invoice.update_columns(discarded_at: Time.current) }.id
+      base = Invoice.maximum(:id).to_i + 1_000
+      own_intent, foreign_intent, unrequested_foreign_intent, unknown = (1..4).map { |offset| base + offset }
+      InvoiceOperationIntent.create!(company_id: company.id, invoice_id: own_intent, operation_id: SecureRandom.uuid,
+                                     state: "pending", generation: 1)
+      # Two intents for one id must still list that id once.
+      2.times do
+        InvoiceOperationIntent.create!(company_id: other_company.id, invoice_id: foreign_intent,
+                                       operation_id: SecureRandom.uuid, state: "pending", generation: 1)
+      end
+      InvoiceOperationIntent.create!(company_id: other_company.id, invoice_id: unrequested_foreign_intent,
+                                     operation_id: SecureRandom.uuid, state: "pending", generation: 1)
+
+      # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
+      held = described_class.held_by_others(
+        company_id: company.id,
+        invoice_ids: [foreign_intent, unknown, own_invoice, foreign_discarded, own_intent, foreign_invoice, foreign_intent]
+      )
+
+      expect(held).to eq([foreign_invoice, foreign_discarded, foreign_intent].sort)
+      expect(described_class.held_by_others(company_id: other_company.id, invoice_ids: [own_invoice, own_intent, unknown]))
+        .to eq([own_invoice, own_intent].sort)
+      expect(described_class.held_by_others(company_id: company.id, invoice_ids: [])).to eq([])
+    end
+  end
 end

@@ -54,430 +54,430 @@ RSpec.describe "Timekeeping reservations: another company's invoice id" do
   end
 
   context "more tests 10" do
-  # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
-  it "refuses a prepare naming another company's invoice like an unknown id even when the requester's own invoice_operations row names that id" do
-    arrange = timekeeping_arrange
-    requester = arrange.company
-    owner = arrange.company
-    arrange.invoice(company: owner, invoice_id: 841)
-    # A row an older, unchecked prepare could have stored: the requester's company, the other company's invoice.
-    InvoiceOperation.create!(company_id: requester, invoice_id: 841, operation_id: SecureRandom.uuid,
-                             actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
-                             disposition: "active", generation: 1, created_at: Time.current)
-    entry_id = arrange.entry(company: requester, user: arrange.user(company: requester, role: "employee"),
-                             project: arrange.project(company: requester))
-    token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[prepare])
-    prepare = lambda do |invoice_id|
-      post "/v1/companies/#{requester}/reservations/prepare",
-           params: { "invoice_id" => invoice_id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                     "entries" => [entry_id], "generation" => arrange.current_generation }.to_json,
-           headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
-      [response.status, response.parsed_body]
+    # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
+    it "refuses a prepare naming another company's invoice like an unknown id even when the requester's own invoice_operations row names that id" do
+      arrange = timekeeping_arrange
+      requester = arrange.company
+      owner = arrange.company
+      arrange.invoice(company: owner, invoice_id: 841)
+      # A row an older, unchecked prepare could have stored: the requester's company, the other company's invoice.
+      InvoiceOperation.create!(company_id: requester, invoice_id: 841, operation_id: SecureRandom.uuid,
+                               actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
+                               disposition: "active", generation: 1, created_at: Time.current)
+      entry_id = arrange.entry(company: requester, user: arrange.user(company: requester, role: "employee"),
+                               project: arrange.project(company: requester))
+      token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[prepare])
+      prepare = lambda do |invoice_id|
+        post "/v1/companies/#{requester}/reservations/prepare",
+             params: { "invoice_id" => invoice_id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
+                       "entries" => [entry_id], "generation" => arrange.current_generation }.to_json,
+             headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
+        [response.status, response.parsed_body]
+      end
+      operations_before = InvoiceOperation.count
+      reservations_before = Reservation.count
+
+      foreign = prepare.call(841)
+      unknown = prepare.call(990_841)
+
+      # The refusal must not let the requester tell "another company has it" from "nobody has it".
+      expect(foreign).to eq([404, { "reason" => "not_found" }])
+      expect(foreign).to eq(unknown)
+      expect(InvoiceOperation.count).to eq(operations_before)
+      expect(Reservation.count).to eq(reservations_before)
+      expect(Reservation.where(entry_id:).count).to eq(0)
     end
-    operations_before = InvoiceOperation.count
-    reservations_before = Reservation.count
-
-    foreign = prepare.call(841)
-    unknown = prepare.call(990_841)
-
-    # The refusal must not let the requester tell "another company has it" from "nobody has it".
-    expect(foreign).to eq([404, { "reason" => "not_found" }])
-    expect(foreign).to eq(unknown)
-    expect(InvoiceOperation.count).to eq(operations_before)
-    expect(Reservation.count).to eq(reservations_before)
-    expect(Reservation.where(entry_id:).count).to eq(0)
-  end
   end
 
   context "more tests 11" do
-  # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
-  it "refuses mark-billed of another company's invoice even when the requester's own invoice_operations row and reservation name that id, and bills nothing" do
-    arrange = timekeeping_arrange
-    requester = arrange.company
-    owner = arrange.company
-    arrange.invoice(company: owner, invoice_id: 842)
-    operation_id = SecureRandom.uuid
-    InvoiceOperation.create!(company_id: requester, invoice_id: 842, operation_id:,
-                             actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
-                             disposition: "active", generation: 1, created_at: Time.current)
-    entry_id = arrange.entry(company: requester, user: arrange.user(company: requester, role: "employee"),
-                             project: arrange.project(company: requester))
-    # A committed reservation under the foreign id, so a provider that skipped the owner check would bill it.
-    Reservation.create!(company_id: requester, entry_id:, invoice_id: 842, state: "committed", disposition: "active",
-                        operation_id:, created_at: Time.current)
-    token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[mark_billed])
-    mark_billed = lambda do |invoice_id|
-      post "/v1/companies/#{requester}/invoices/#{invoice_id}/mark-billed",
-           params: { "generation" => arrange.current_generation, "operation_id" => SecureRandom.uuid }.to_json,
-           headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
-      [response.status, response.parsed_body]
+    # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
+    it "refuses mark-billed of another company's invoice even when the requester's own invoice_operations row and reservation name that id, and bills nothing" do
+      arrange = timekeeping_arrange
+      requester = arrange.company
+      owner = arrange.company
+      arrange.invoice(company: owner, invoice_id: 842)
+      operation_id = SecureRandom.uuid
+      InvoiceOperation.create!(company_id: requester, invoice_id: 842, operation_id:,
+                               actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
+                               disposition: "active", generation: 1, created_at: Time.current)
+      entry_id = arrange.entry(company: requester, user: arrange.user(company: requester, role: "employee"),
+                               project: arrange.project(company: requester))
+      # A committed reservation under the foreign id, so a provider that skipped the owner check would bill it.
+      Reservation.create!(company_id: requester, entry_id:, invoice_id: 842, state: "committed", disposition: "active",
+                          operation_id:, created_at: Time.current)
+      token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[mark_billed])
+      mark_billed = lambda do |invoice_id|
+        post "/v1/companies/#{requester}/invoices/#{invoice_id}/mark-billed",
+             params: { "generation" => arrange.current_generation, "operation_id" => SecureRandom.uuid }.to_json,
+             headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
+        [response.status, response.parsed_body]
+      end
+      receipts_before = ServiceIdempotencyReceipt.where(company_id: requester).count
+
+      foreign = mark_billed.call(842)
+      unknown = mark_billed.call(990_842)
+
+      expect(foreign).to eq([404, { "reason" => "not_found" }])
+      expect(foreign).to eq(unknown)
+      expect(ServiceIdempotencyReceipt.where(company_id: requester).count).to eq(receipts_before)
+      expect(arrange.stored_entry(entry_id).fetch("bill_status")).to eq("unbilled")
     end
-    receipts_before = ServiceIdempotencyReceipt.where(company_id: requester).count
-
-    foreign = mark_billed.call(842)
-    unknown = mark_billed.call(990_842)
-
-    expect(foreign).to eq([404, { "reason" => "not_found" }])
-    expect(foreign).to eq(unknown)
-    expect(ServiceIdempotencyReceipt.where(company_id: requester).count).to eq(receipts_before)
-    expect(arrange.stored_entry(entry_id).fetch("bill_status")).to eq("unbilled")
-  end
   end
 
   context "more tests 12" do
-  # The own row must never decide on its own: a reference answer without foreign_invoice_ids cannot rule out
-  # another company holding the id, so the request fails closed instead of admitting it.
-  it "answers 503 and writes nothing when the reference answer says nothing about other holders, even with the requester's own invoice_operations row" do
-    arrange = timekeeping_arrange
-    requester = arrange.company
-    InvoiceOperation.create!(company_id: requester, invoice_id: 843, operation_id: SecureRandom.uuid,
-                             actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
-                             disposition: "active", generation: 1, created_at: Time.current)
-    entry_id = arrange.entry(company: requester, user: arrange.user(company: requester, role: "employee"),
-                             project: arrange.project(company: requester))
-    token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[prepare])
-    WebMock.stub_request(:get, TimekeepingProviderArrange::REFERENCE_HOST).to_return(
-      status: 200, headers: { "Content-Type" => "application/json" },
-      body: JSON.generate(company_id: requester, edit_days: 30, users: [], projects: [], missing_project_ids: [],
-                          agents: [], owned_agent_ids: [], invoices: [])
-    )
-    counts = -> { [InvoiceOperation.count, Reservation.count, ServiceIdempotencyReceipt.count] }
-    before = counts.call
+    # The own row must never decide on its own: a reference answer without foreign_invoice_ids cannot rule out
+    # another company holding the id, so the request fails closed instead of admitting it.
+    it "answers 503 and writes nothing when the reference answer says nothing about other holders, even with the requester's own invoice_operations row" do
+      arrange = timekeeping_arrange
+      requester = arrange.company
+      InvoiceOperation.create!(company_id: requester, invoice_id: 843, operation_id: SecureRandom.uuid,
+                               actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
+                               disposition: "active", generation: 1, created_at: Time.current)
+      entry_id = arrange.entry(company: requester, user: arrange.user(company: requester, role: "employee"),
+                               project: arrange.project(company: requester))
+      token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[prepare])
+      WebMock.stub_request(:get, TimekeepingProviderArrange::REFERENCE_HOST).to_return(
+        status: 200, headers: { "Content-Type" => "application/json" },
+        body: JSON.generate(company_id: requester, edit_days: 30, users: [], projects: [], missing_project_ids: [],
+                            agents: [], owned_agent_ids: [], invoices: [])
+      )
+      counts = -> { [InvoiceOperation.count, Reservation.count, ServiceIdempotencyReceipt.count] }
+      before = counts.call
 
-    post "/v1/companies/#{requester}/reservations/prepare",
-         params: { "invoice_id" => 843, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                   "entries" => [entry_id], "generation" => arrange.current_generation }.to_json,
-         headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
+      post "/v1/companies/#{requester}/reservations/prepare",
+           params: { "invoice_id" => 843, "operation_id" => SecureRandom.uuid, "disposition" => "active",
+                     "entries" => [entry_id], "generation" => arrange.current_generation }.to_json,
+           headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
 
-    expect([response.status, response.parsed_body]).to eq([503, { "reason" => "reference_unavailable" }])
-    expect(counts.call).to eq(before)
-  end
+      expect([response.status, response.parsed_body]).to eq([503, { "reason" => "reference_unavailable" }])
+      expect(counts.call).to eq(before)
+    end
   end
 
   context "more tests 13" do
-  # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
-  it "refuses a prepare of another company's invoice despite the requester's own invoice_operations row, writes nothing, and refuses the same operation_id again on retry" do
-    arrange = timekeeping_arrange
-    requester = arrange.company
-    owner = arrange.company
-    arrange.invoice(company: owner, invoice_id: 5921)
-    entry_id = arrange.entry(company: requester, user: arrange.user(company: requester, role: "employee"),
-                             project: arrange.project(company: requester))
-    token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[prepare])
-    # An operation row an unchecked prepare once stored under the requester's company for the foreign id.
-    InvoiceOperation.create!(company_id: requester, invoice_id: 5921, operation_id: SecureRandom.uuid,
-                             actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
-                             disposition: "active", generation: 1, created_at: Time.current)
-    prepare = lambda do |invoice_id, operation_id|
-      post "/v1/companies/#{requester}/reservations/prepare",
-           params: { "invoice_id" => invoice_id, "operation_id" => operation_id, "disposition" => "active",
-                     "entries" => [entry_id], "generation" => arrange.current_generation }.to_json,
-           headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
-      [response.status, response.parsed_body]
+    # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
+    it "refuses a prepare of another company's invoice despite the requester's own invoice_operations row, writes nothing, and refuses the same operation_id again on retry" do
+      arrange = timekeeping_arrange
+      requester = arrange.company
+      owner = arrange.company
+      arrange.invoice(company: owner, invoice_id: 5921)
+      entry_id = arrange.entry(company: requester, user: arrange.user(company: requester, role: "employee"),
+                               project: arrange.project(company: requester))
+      token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[prepare])
+      # An operation row an unchecked prepare once stored under the requester's company for the foreign id.
+      InvoiceOperation.create!(company_id: requester, invoice_id: 5921, operation_id: SecureRandom.uuid,
+                               actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
+                               disposition: "active", generation: 1, created_at: Time.current)
+      prepare = lambda do |invoice_id, operation_id|
+        post "/v1/companies/#{requester}/reservations/prepare",
+             params: { "invoice_id" => invoice_id, "operation_id" => operation_id, "disposition" => "active",
+                       "entries" => [entry_id], "generation" => arrange.current_generation }.to_json,
+             headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
+        [response.status, response.parsed_body]
+      end
+      operations_before = InvoiceOperation.where(company_id: requester).count
+      reservations_before = Reservation.count
+      entry_before = Entry.find(entry_id).attributes
+      operation_id = SecureRandom.uuid
+
+      foreign = prepare.call(5921, operation_id)
+      retried = prepare.call(5921, operation_id)
+      unknown = prepare.call(990_592, SecureRandom.uuid)
+
+      expect(foreign).to eq([404, { "reason" => "not_found" }])
+      expect(retried).to eq(foreign)
+      expect(foreign).to eq(unknown)
+      expect(InvoiceOperation.where(company_id: requester).count).to eq(operations_before)
+      expect(InvoiceOperation.where(operation_id:).count).to eq(0)
+      expect(Reservation.count).to eq(reservations_before)
+      expect(ServiceIdempotencyReceipt.where(company_id: requester).count).to eq(0)
+      expect(Entry.find(entry_id).attributes).to eq(entry_before)
     end
-    operations_before = InvoiceOperation.where(company_id: requester).count
-    reservations_before = Reservation.count
-    entry_before = Entry.find(entry_id).attributes
-    operation_id = SecureRandom.uuid
-
-    foreign = prepare.call(5921, operation_id)
-    retried = prepare.call(5921, operation_id)
-    unknown = prepare.call(990_592, SecureRandom.uuid)
-
-    expect(foreign).to eq([404, { "reason" => "not_found" }])
-    expect(retried).to eq(foreign)
-    expect(foreign).to eq(unknown)
-    expect(InvoiceOperation.where(company_id: requester).count).to eq(operations_before)
-    expect(InvoiceOperation.where(operation_id:).count).to eq(0)
-    expect(Reservation.count).to eq(reservations_before)
-    expect(ServiceIdempotencyReceipt.where(company_id: requester).count).to eq(0)
-    expect(Entry.find(entry_id).attributes).to eq(entry_before)
-  end
   end
 
   context "more tests 14" do
-  # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
-  it "refuses a mark-billed of an id another company holds only as an intent despite the requester's own invoice_operations row, bills nothing and stores no receipt, also on retry" do
-    arrange = timekeeping_arrange
-    requester = arrange.company
-    # The requester's entry holds a committed reservation under the id, so a provider that skipped the
-    # owner check would bill it.
-    billable = arrange.reserved_entry(company: requester, invoice_id: 5922, state: "committed")
-    InvoiceOperation.create!(company_id: requester, invoice_id: 5922, operation_id: SecureRandom.uuid,
-                             actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
-                             disposition: "active", generation: 1, created_at: Time.current)
-    token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[mark_billed])
-    # The monolith reports the id as held by another company (an in-flight intent with no invoice row yet):
-    # it is not the requester's, and it is listed among the requested ids another company holds.
-    WebMock.stub_request(:get, TimekeepingProviderArrange::REFERENCE_HOST).to_return do |request|
-      company_id = Integer(request.uri.path[%r{/companies/(\d+)/reference}, 1], 10)
-      { status: 200, headers: { "Content-Type" => "application/json" },
-        body: JSON.generate(company_id:, edit_days: 30, users: [], projects: [], missing_project_ids: [],
-                            agents: [], owned_agent_ids: [], invoices: [], foreign_invoice_ids: [5922]) }
-    end
-    mark_billed = lambda do |invoice_id, operation_id|
-      post "/v1/companies/#{requester}/invoices/#{invoice_id}/mark-billed",
-           params: { "operation_id" => operation_id, "generation" => arrange.current_generation }.to_json,
-           headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
-      [response.status, response.parsed_body]
-    end
-    reservations_before = Reservation.where(company_id: requester).pluck(:invoice_id, :state, :disposition)
-    operation_id = SecureRandom.uuid
+    # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
+    it "refuses a mark-billed of an id another company holds only as an intent despite the requester's own invoice_operations row, bills nothing and stores no receipt, also on retry" do
+      arrange = timekeeping_arrange
+      requester = arrange.company
+      # The requester's entry holds a committed reservation under the id, so a provider that skipped the
+      # owner check would bill it.
+      billable = arrange.reserved_entry(company: requester, invoice_id: 5922, state: "committed")
+      InvoiceOperation.create!(company_id: requester, invoice_id: 5922, operation_id: SecureRandom.uuid,
+                               actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
+                               disposition: "active", generation: 1, created_at: Time.current)
+      token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[mark_billed])
+      # The monolith reports the id as held by another company (an in-flight intent with no invoice row yet):
+      # it is not the requester's, and it is listed among the requested ids another company holds.
+      WebMock.stub_request(:get, TimekeepingProviderArrange::REFERENCE_HOST).to_return do |request|
+        company_id = Integer(request.uri.path[%r{/companies/(\d+)/reference}, 1], 10)
+        { status: 200, headers: { "Content-Type" => "application/json" },
+          body: JSON.generate(company_id:, edit_days: 30, users: [], projects: [], missing_project_ids: [],
+                              agents: [], owned_agent_ids: [], invoices: [], foreign_invoice_ids: [5922]) }
+      end
+      mark_billed = lambda do |invoice_id, operation_id|
+        post "/v1/companies/#{requester}/invoices/#{invoice_id}/mark-billed",
+             params: { "operation_id" => operation_id, "generation" => arrange.current_generation }.to_json,
+             headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
+        [response.status, response.parsed_body]
+      end
+      reservations_before = Reservation.where(company_id: requester).pluck(:invoice_id, :state, :disposition)
+      operation_id = SecureRandom.uuid
 
-    first = mark_billed.call(5922, operation_id)
-    retried = mark_billed.call(5922, operation_id)
+      first = mark_billed.call(5922, operation_id)
+      retried = mark_billed.call(5922, operation_id)
 
-    expect(first).to eq([404, { "reason" => "not_found" }])
-    expect(retried).to eq(first)
-    expect(arrange.stored_entry(billable).fetch("bill_status")).to eq("unbilled")
-    expect(ServiceIdempotencyReceipt.where(company_id: requester).count).to eq(0)
-    expect(Reservation.where(company_id: requester).pluck(:invoice_id, :state, :disposition)).to eq(reservations_before)
-  end
+      expect(first).to eq([404, { "reason" => "not_found" }])
+      expect(retried).to eq(first)
+      expect(arrange.stored_entry(billable).fetch("bill_status")).to eq("unbilled")
+      expect(ServiceIdempotencyReceipt.where(company_id: requester).count).to eq(0)
+      expect(Reservation.where(company_id: requester).pluck(:invoice_id, :state, :disposition)).to eq(reservations_before)
+    end
   end
 
   context "more tests 15" do
-  # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
-  # A reference answer that does not say whether another company holds the id cannot rule that case out, so the
-  # own row must not decide: the request is refused as unavailable and nothing is stored.
-  it "answers 503 and writes nothing on a prepare backed only by the requester's own invoice_operations row when the reference answer lacks foreign_invoice_ids" do
-    arrange = timekeeping_arrange
-    requester = arrange.company
-    entry_id = arrange.entry(company: requester, user: arrange.user(company: requester, role: "employee"),
-                             project: arrange.project(company: requester))
-    token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[prepare])
-    InvoiceOperation.create!(company_id: requester, invoice_id: 5923, operation_id: SecureRandom.uuid,
-                             actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
-                             disposition: "active", generation: 1, created_at: Time.current)
-    WebMock.stub_request(:get, TimekeepingProviderArrange::REFERENCE_HOST).to_return do |request|
-      company_id = Integer(request.uri.path[%r{/companies/(\d+)/reference}, 1], 10)
-      { status: 200, headers: { "Content-Type" => "application/json" },
-        body: JSON.generate(company_id:, edit_days: 30, users: [], projects: [], missing_project_ids: [],
-                            agents: [], owned_agent_ids: [], invoices: []) }
+    # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
+    # A reference answer that does not say whether another company holds the id cannot rule that case out, so the
+    # own row must not decide: the request is refused as unavailable and nothing is stored.
+    it "answers 503 and writes nothing on a prepare backed only by the requester's own invoice_operations row when the reference answer lacks foreign_invoice_ids" do
+      arrange = timekeeping_arrange
+      requester = arrange.company
+      entry_id = arrange.entry(company: requester, user: arrange.user(company: requester, role: "employee"),
+                               project: arrange.project(company: requester))
+      token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[prepare])
+      InvoiceOperation.create!(company_id: requester, invoice_id: 5923, operation_id: SecureRandom.uuid,
+                               actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
+                               disposition: "active", generation: 1, created_at: Time.current)
+      WebMock.stub_request(:get, TimekeepingProviderArrange::REFERENCE_HOST).to_return do |request|
+        company_id = Integer(request.uri.path[%r{/companies/(\d+)/reference}, 1], 10)
+        { status: 200, headers: { "Content-Type" => "application/json" },
+          body: JSON.generate(company_id:, edit_days: 30, users: [], projects: [], missing_project_ids: [],
+                              agents: [], owned_agent_ids: [], invoices: []) }
+      end
+      counts = -> { [InvoiceOperation.count, Reservation.count, ServiceIdempotencyReceipt.count, Entry.sum(:version)] }
+      before = counts.call
+      operation_id = SecureRandom.uuid
+
+      post "/v1/companies/#{requester}/reservations/prepare",
+           params: { "invoice_id" => 5923, "operation_id" => operation_id, "disposition" => "active",
+                     "entries" => [entry_id], "generation" => arrange.current_generation }.to_json,
+           headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
+
+      expect([response.status, response.parsed_body]).to eq([503, { "reason" => "reference_unavailable" }])
+      expect(counts.call).to eq(before)
+      expect(InvoiceOperation.where(operation_id:).count).to eq(0)
     end
-    counts = -> { [InvoiceOperation.count, Reservation.count, ServiceIdempotencyReceipt.count, Entry.sum(:version)] }
-    before = counts.call
-    operation_id = SecureRandom.uuid
-
-    post "/v1/companies/#{requester}/reservations/prepare",
-         params: { "invoice_id" => 5923, "operation_id" => operation_id, "disposition" => "active",
-                   "entries" => [entry_id], "generation" => arrange.current_generation }.to_json,
-         headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
-
-    expect([response.status, response.parsed_body]).to eq([503, { "reason" => "reference_unavailable" }])
-    expect(counts.call).to eq(before)
-    expect(InvoiceOperation.where(operation_id:).count).to eq(0)
-  end
   end
 
   context "more tests 16" do
-  # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
-  it "refuses a prepare naming another company's invoice like an unknown id even when the requester's own invoice_operations row names it, and writes nothing" do
-    arrange = timekeeping_arrange
-    requester = arrange.company
-    owner = arrange.company
-    arrange.invoice(company: owner, invoice_id: 883)
-    # A row an unchecked prepare once stored: the requester's company with the owner's invoice id.
-    InvoiceOperation.create!(company_id: requester, invoice_id: 883, operation_id: SecureRandom.uuid,
-                             actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
-                             disposition: "active", generation: 1, created_at: Time.current)
-    entry_id = arrange.entry(company: requester, user: arrange.user(company: requester, role: "employee"),
-                             project: arrange.project(company: requester))
-    token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[prepare])
-    prepare = lambda do |invoice_id|
-      post "/v1/companies/#{requester}/reservations/prepare",
-           params: { "invoice_id" => invoice_id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                     "entries" => [entry_id], "generation" => arrange.current_generation }.to_json,
-           headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
-      [response.status, response.parsed_body]
+    # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
+    it "refuses a prepare naming another company's invoice like an unknown id even when the requester's own invoice_operations row names it, and writes nothing" do
+      arrange = timekeeping_arrange
+      requester = arrange.company
+      owner = arrange.company
+      arrange.invoice(company: owner, invoice_id: 883)
+      # A row an unchecked prepare once stored: the requester's company with the owner's invoice id.
+      InvoiceOperation.create!(company_id: requester, invoice_id: 883, operation_id: SecureRandom.uuid,
+                               actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
+                               disposition: "active", generation: 1, created_at: Time.current)
+      entry_id = arrange.entry(company: requester, user: arrange.user(company: requester, role: "employee"),
+                               project: arrange.project(company: requester))
+      token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[prepare])
+      prepare = lambda do |invoice_id|
+        post "/v1/companies/#{requester}/reservations/prepare",
+             params: { "invoice_id" => invoice_id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
+                       "entries" => [entry_id], "generation" => arrange.current_generation }.to_json,
+             headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
+        [response.status, response.parsed_body]
+      end
+      counts = -> { [InvoiceOperation.count, Reservation.count, ServiceIdempotencyReceipt.count, Entry.sum(:version)] }
+      before = counts.call
+
+      foreign = prepare.call(883)
+      unknown = prepare.call(990_883)
+
+      expect(foreign).to eq([404, { "reason" => "not_found" }])
+      expect(foreign).to eq(unknown)
+      expect(counts.call).to eq(before)
+      expect(Reservation.where(company_id: requester, invoice_id: 883).count).to eq(0)
     end
-    counts = -> { [InvoiceOperation.count, Reservation.count, ServiceIdempotencyReceipt.count, Entry.sum(:version)] }
-    before = counts.call
-
-    foreign = prepare.call(883)
-    unknown = prepare.call(990_883)
-
-    expect(foreign).to eq([404, { "reason" => "not_found" }])
-    expect(foreign).to eq(unknown)
-    expect(counts.call).to eq(before)
-    expect(Reservation.where(company_id: requester, invoice_id: 883).count).to eq(0)
-  end
   end
 
   context "more tests 17" do
-  # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
-  it "refuses a mark-billed naming another company's invoice even when the requester holds its own invoice_operations row and a committed reservation under that id, and bills nothing" do
-    arrange = timekeeping_arrange
-    requester = arrange.company
-    owner = arrange.company
-    arrange.invoice(company: owner, invoice_id: 884)
-    InvoiceOperation.create!(company_id: requester, invoice_id: 884, operation_id: SecureRandom.uuid,
-                             actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
-                             disposition: "active", generation: 1, created_at: Time.current)
-    entry_id = arrange.entry(company: requester, user: arrange.user(company: requester, role: "employee"),
-                             project: arrange.project(company: requester))
-    # The requester's own entry is reserved under the owner's invoice id, so a missing owner check would bill it.
-    Reservation.create!(company_id: requester, entry_id:, invoice_id: 884, state: "committed", disposition: "active",
-                        operation_id: SecureRandom.uuid, created_at: Time.current)
-    token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[mark_billed])
-    mark_billed = lambda do |invoice_id|
-      post "/v1/companies/#{requester}/invoices/#{invoice_id}/mark-billed",
-           params: { "operation_id" => SecureRandom.uuid, "generation" => arrange.current_generation }.to_json,
-           headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
-      [response.status, response.parsed_body]
+    # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
+    it "refuses a mark-billed naming another company's invoice even when the requester holds its own invoice_operations row and a committed reservation under that id, and bills nothing" do
+      arrange = timekeeping_arrange
+      requester = arrange.company
+      owner = arrange.company
+      arrange.invoice(company: owner, invoice_id: 884)
+      InvoiceOperation.create!(company_id: requester, invoice_id: 884, operation_id: SecureRandom.uuid,
+                               actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
+                               disposition: "active", generation: 1, created_at: Time.current)
+      entry_id = arrange.entry(company: requester, user: arrange.user(company: requester, role: "employee"),
+                               project: arrange.project(company: requester))
+      # The requester's own entry is reserved under the owner's invoice id, so a missing owner check would bill it.
+      Reservation.create!(company_id: requester, entry_id:, invoice_id: 884, state: "committed", disposition: "active",
+                          operation_id: SecureRandom.uuid, created_at: Time.current)
+      token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[mark_billed])
+      mark_billed = lambda do |invoice_id|
+        post "/v1/companies/#{requester}/invoices/#{invoice_id}/mark-billed",
+             params: { "operation_id" => SecureRandom.uuid, "generation" => arrange.current_generation }.to_json,
+             headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
+        [response.status, response.parsed_body]
+      end
+      receipts_before = ServiceIdempotencyReceipt.count
+
+      foreign = mark_billed.call(884)
+      unknown = mark_billed.call(990_884)
+
+      expect(foreign).to eq([404, { "reason" => "not_found" }])
+      expect(foreign).to eq(unknown)
+      expect(ServiceIdempotencyReceipt.count).to eq(receipts_before)
+      expect(arrange.stored_entry(entry_id).fetch("bill_status")).to eq("unbilled")
     end
-    receipts_before = ServiceIdempotencyReceipt.count
-
-    foreign = mark_billed.call(884)
-    unknown = mark_billed.call(990_884)
-
-    expect(foreign).to eq([404, { "reason" => "not_found" }])
-    expect(foreign).to eq(unknown)
-    expect(ServiceIdempotencyReceipt.count).to eq(receipts_before)
-    expect(arrange.stored_entry(entry_id).fetch("bill_status")).to eq("unbilled")
-  end
   end
 
   context "more tests 18" do
-  # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
-  it "refuses a prepare naming an id another company holds only as an intent like an unknown id even when the requester's own invoice_operations row names it, and writes nothing" do
-    arrange = timekeeping_arrange
-    company = arrange.company
-    entry_id = arrange.entry(company:, user: arrange.user(company:, role: "employee"), project: arrange.project(company:))
-    service = arrange.service_identity(company:, name: "invoice-boundary", operations: %w[prepare])
-    intent_only_id = 981
-    unknown_id = 990_981
-    # An operation row stored before ownership was checked, naming the foreign id under the requester's company.
-    InvoiceOperation.create!(company_id: company, invoice_id: intent_only_id, operation_id: SecureRandom.uuid,
-                             actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
-                             disposition: "active", generation: 1, created_at: Time.current)
-    # The monolith has no invoice row for the id yet; another company's intent holds it, so the reference
-    # reports it in foreign_invoice_ids and lists it in nobody's invoices.
-    WebMock.stub_request(:get, TimekeepingProviderArrange::REFERENCE_HOST).to_return do |request|
-      requested = URI.decode_www_form(request.uri.query.to_s).to_h.fetch("invoice_ids", "").split(",").map(&:to_i)
-      { status: 200, headers: { "Content-Type" => "application/json" },
-        body: JSON.generate(company_id: company, edit_days: 30, users: [], projects: [], missing_project_ids: [],
-                            agents: [], owned_agent_ids: [], invoices: [],
-                            foreign_invoice_ids: requested & [intent_only_id]) }
-    end
-    prepare = lambda do |invoice_id|
-      post "/v1/companies/#{company}/reservations/prepare",
-           params: JSON.generate("generation" => arrange.current_generation, "invoice_id" => invoice_id,
-                                 "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                                 "entries" => [entry_id]),
-           headers: { "Authorization" => "Bearer #{service}", "Content-Type" => "application/json" }
-      [response.status, response.parsed_body]
-    end
-    counts = -> { [InvoiceOperation.count, Reservation.count, ServiceIdempotencyReceipt.count, Entry.sum(:version)] }
-    before = counts.call
+    # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
+    it "refuses a prepare naming an id another company holds only as an intent like an unknown id even when the requester's own invoice_operations row names it, and writes nothing" do
+      arrange = timekeeping_arrange
+      company = arrange.company
+      entry_id = arrange.entry(company:, user: arrange.user(company:, role: "employee"), project: arrange.project(company:))
+      service = arrange.service_identity(company:, name: "invoice-boundary", operations: %w[prepare])
+      intent_only_id = 981
+      unknown_id = 990_981
+      # An operation row stored before ownership was checked, naming the foreign id under the requester's company.
+      InvoiceOperation.create!(company_id: company, invoice_id: intent_only_id, operation_id: SecureRandom.uuid,
+                               actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
+                               disposition: "active", generation: 1, created_at: Time.current)
+      # The monolith has no invoice row for the id yet; another company's intent holds it, so the reference
+      # reports it in foreign_invoice_ids and lists it in nobody's invoices.
+      WebMock.stub_request(:get, TimekeepingProviderArrange::REFERENCE_HOST).to_return do |request|
+        requested = URI.decode_www_form(request.uri.query.to_s).to_h.fetch("invoice_ids", "").split(",").map(&:to_i)
+        { status: 200, headers: { "Content-Type" => "application/json" },
+          body: JSON.generate(company_id: company, edit_days: 30, users: [], projects: [], missing_project_ids: [],
+                              agents: [], owned_agent_ids: [], invoices: [],
+                              foreign_invoice_ids: requested & [intent_only_id]) }
+      end
+      prepare = lambda do |invoice_id|
+        post "/v1/companies/#{company}/reservations/prepare",
+             params: JSON.generate("generation" => arrange.current_generation, "invoice_id" => invoice_id,
+                                   "operation_id" => SecureRandom.uuid, "disposition" => "active",
+                                   "entries" => [entry_id]),
+             headers: { "Authorization" => "Bearer #{service}", "Content-Type" => "application/json" }
+        [response.status, response.parsed_body]
+      end
+      counts = -> { [InvoiceOperation.count, Reservation.count, ServiceIdempotencyReceipt.count, Entry.sum(:version)] }
+      before = counts.call
 
-    foreign = prepare.call(intent_only_id)
-    unknown = prepare.call(unknown_id)
+      foreign = prepare.call(intent_only_id)
+      unknown = prepare.call(unknown_id)
 
-    expect(foreign).to eq([404, { "reason" => "not_found" }])
-    expect(foreign).to eq(unknown)
-    expect(counts.call).to eq(before)
-    expect(Reservation.where(company_id: company, invoice_id: intent_only_id).count).to eq(0)
-  end
+      expect(foreign).to eq([404, { "reason" => "not_found" }])
+      expect(foreign).to eq(unknown)
+      expect(counts.call).to eq(before)
+      expect(Reservation.where(company_id: company, invoice_id: intent_only_id).count).to eq(0)
+    end
   end
 
   context "more tests 19" do
-  it "refuses a prepare of another company's invoice like an unknown id even when the requester's own invoice_operations row names it, and writes nothing" do
-    arrange = timekeeping_arrange
-    requester = arrange.company
-    owner = arrange.company
-    arrange.invoice(company: owner, invoice_id: 791)
-    entry = arrange.entry(company: requester, user: arrange.user(company: requester, role: "employee"),
-                          project: arrange.project(company: requester))
-    token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[prepare])
-    # A row an unchecked prepare stored under the requester for the owner's invoice id.
-    InvoiceOperation.create!(company_id: requester, invoice_id: 791, operation_id: SecureRandom.uuid,
-                             actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
-                             disposition: "active", generation: 1, created_at: Time.current)
-    prepare = lambda do |invoice_id|
-      post "/v1/companies/#{requester}/reservations/prepare",
-           params: { "invoice_id" => invoice_id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                     "entries" => [entry], "generation" => arrange.current_generation }.to_json,
-           headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
-      [response.status, response.parsed_body]
+    it "refuses a prepare of another company's invoice like an unknown id even when the requester's own invoice_operations row names it, and writes nothing" do
+      arrange = timekeeping_arrange
+      requester = arrange.company
+      owner = arrange.company
+      arrange.invoice(company: owner, invoice_id: 791)
+      entry = arrange.entry(company: requester, user: arrange.user(company: requester, role: "employee"),
+                            project: arrange.project(company: requester))
+      token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[prepare])
+      # A row an unchecked prepare stored under the requester for the owner's invoice id.
+      InvoiceOperation.create!(company_id: requester, invoice_id: 791, operation_id: SecureRandom.uuid,
+                               actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
+                               disposition: "active", generation: 1, created_at: Time.current)
+      prepare = lambda do |invoice_id|
+        post "/v1/companies/#{requester}/reservations/prepare",
+             params: { "invoice_id" => invoice_id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
+                       "entries" => [entry], "generation" => arrange.current_generation }.to_json,
+             headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
+        [response.status, response.parsed_body]
+      end
+      counts = -> { [InvoiceOperation.count, Reservation.count, ServiceIdempotencyReceipt.count, Entry.sum(:version)] }
+      before = counts.call
+
+      foreign = prepare.call(791)
+      unknown = prepare.call(990_791)
+
+      expect(foreign).to eq([404, { "reason" => "not_found" }])
+      expect(foreign).to eq(unknown)
+      expect(counts.call).to eq(before)
     end
-    counts = -> { [InvoiceOperation.count, Reservation.count, ServiceIdempotencyReceipt.count, Entry.sum(:version)] }
-    before = counts.call
-
-    foreign = prepare.call(791)
-    unknown = prepare.call(990_791)
-
-    expect(foreign).to eq([404, { "reason" => "not_found" }])
-    expect(foreign).to eq(unknown)
-    expect(counts.call).to eq(before)
-  end
   end
 
   context "more tests 20" do
-  it "refuses a mark-billed of another company's invoice like an unknown id even when the requester's own invoice_operations row names it, and bills nothing" do
-    arrange = timekeeping_arrange
-    requester = arrange.company
-    owner = arrange.company
-    arrange.invoice(company: owner, invoice_id: 792)
-    entry = arrange.entry(company: requester, user: arrange.user(company: requester, role: "employee"),
-                          project: arrange.project(company: requester))
-    token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[mark_billed])
-    operation_id = SecureRandom.uuid
-    # Rows an unchecked prepare left: the requester's own operation and a committed reservation of its entry
-    # under the owner's invoice id, so a provider that trusted them would bill the entry.
-    InvoiceOperation.create!(company_id: requester, invoice_id: 792, operation_id:,
-                             actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [entry],
-                             disposition: "active", generation: 1, created_at: Time.current)
-    Reservation.create!(company_id: requester, entry_id: entry, invoice_id: 792, state: "committed",
-                        disposition: "active", operation_id:, created_at: Time.current)
-    mark_billed = lambda do |invoice_id|
-      post "/v1/companies/#{requester}/invoices/#{invoice_id}/mark-billed",
-           params: { "operation_id" => SecureRandom.uuid, "generation" => arrange.current_generation }.to_json,
-           headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
-      [response.status, response.parsed_body]
+    it "refuses a mark-billed of another company's invoice like an unknown id even when the requester's own invoice_operations row names it, and bills nothing" do
+      arrange = timekeeping_arrange
+      requester = arrange.company
+      owner = arrange.company
+      arrange.invoice(company: owner, invoice_id: 792)
+      entry = arrange.entry(company: requester, user: arrange.user(company: requester, role: "employee"),
+                            project: arrange.project(company: requester))
+      token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[mark_billed])
+      operation_id = SecureRandom.uuid
+      # Rows an unchecked prepare left: the requester's own operation and a committed reservation of its entry
+      # under the owner's invoice id, so a provider that trusted them would bill the entry.
+      InvoiceOperation.create!(company_id: requester, invoice_id: 792, operation_id:,
+                               actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [entry],
+                               disposition: "active", generation: 1, created_at: Time.current)
+      Reservation.create!(company_id: requester, entry_id: entry, invoice_id: 792, state: "committed",
+                          disposition: "active", operation_id:, created_at: Time.current)
+      mark_billed = lambda do |invoice_id|
+        post "/v1/companies/#{requester}/invoices/#{invoice_id}/mark-billed",
+             params: { "operation_id" => SecureRandom.uuid, "generation" => arrange.current_generation }.to_json,
+             headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
+        [response.status, response.parsed_body]
+      end
+      receipts_before = ServiceIdempotencyReceipt.count
+
+      foreign = mark_billed.call(792)
+      unknown = mark_billed.call(990_792)
+
+      expect(foreign).to eq([404, { "reason" => "not_found" }])
+      expect(foreign).to eq(unknown)
+      expect(ServiceIdempotencyReceipt.count).to eq(receipts_before)
+      expect(arrange.stored_entry(entry).fetch("bill_status")).to eq("unbilled")
     end
-    receipts_before = ServiceIdempotencyReceipt.count
-
-    foreign = mark_billed.call(792)
-    unknown = mark_billed.call(990_792)
-
-    expect(foreign).to eq([404, { "reason" => "not_found" }])
-    expect(foreign).to eq(unknown)
-    expect(ServiceIdempotencyReceipt.count).to eq(receipts_before)
-    expect(arrange.stored_entry(entry).fetch("bill_status")).to eq("unbilled")
-  end
   end
 
   context "more tests 21" do
-  # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
-  it "refuses a prepare for another company's invoice like an unknown id even when a stale own invoice_operations row names it, writing nothing" do
-    arrange = timekeeping_arrange
-    requester = arrange.company
-    owner = arrange.company
-    arrange.invoice(company: owner, invoice_id: 891)
-    entry_id = arrange.entry(company: requester, user: arrange.user(company: requester, role: "employee"),
-                             project: arrange.project(company: requester))
-    token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[prepare])
-    # A row an unchecked prepare stored earlier, naming the requester and the owner's invoice.
-    InvoiceOperation.create!(company_id: requester, invoice_id: 891, operation_id: SecureRandom.uuid,
-                             actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
-                             disposition: "active", generation: 1, created_at: Time.current)
-    prepare = lambda do |invoice_id|
-      post "/v1/companies/#{requester}/reservations/prepare",
-           params: { "invoice_id" => invoice_id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                     "entries" => [entry_id], "generation" => arrange.current_generation }.to_json,
-           headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
-      [response.status, response.parsed_body]
+    # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
+    it "refuses a prepare for another company's invoice like an unknown id even when a stale own invoice_operations row names it, writing nothing" do
+      arrange = timekeeping_arrange
+      requester = arrange.company
+      owner = arrange.company
+      arrange.invoice(company: owner, invoice_id: 891)
+      entry_id = arrange.entry(company: requester, user: arrange.user(company: requester, role: "employee"),
+                               project: arrange.project(company: requester))
+      token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[prepare])
+      # A row an unchecked prepare stored earlier, naming the requester and the owner's invoice.
+      InvoiceOperation.create!(company_id: requester, invoice_id: 891, operation_id: SecureRandom.uuid,
+                               actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
+                               disposition: "active", generation: 1, created_at: Time.current)
+      prepare = lambda do |invoice_id|
+        post "/v1/companies/#{requester}/reservations/prepare",
+             params: { "invoice_id" => invoice_id, "operation_id" => SecureRandom.uuid, "disposition" => "active",
+                       "entries" => [entry_id], "generation" => arrange.current_generation }.to_json,
+             headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
+        [response.status, response.parsed_body]
+      end
+      counts = -> { [InvoiceOperation.count, Reservation.count, ServiceIdempotencyReceipt.count, Entry.sum(:version)] }
+      before = counts.call
+
+      foreign = prepare.call(891)
+      unknown = prepare.call(990_891)
+
+      expect(foreign).to eq([404, { "reason" => "not_found" }])
+      expect(foreign).to eq(unknown)
+      expect(counts.call).to eq(before)
     end
-    counts = -> { [InvoiceOperation.count, Reservation.count, ServiceIdempotencyReceipt.count, Entry.sum(:version)] }
-    before = counts.call
-
-    foreign = prepare.call(891)
-    unknown = prepare.call(990_891)
-
-    expect(foreign).to eq([404, { "reason" => "not_found" }])
-    expect(foreign).to eq(unknown)
-    expect(counts.call).to eq(before)
-  end
   end
 end
 
