@@ -224,4 +224,22 @@ RSpec.describe TimekeepingSection93Traceability do
       end
     end
   end
+
+  describe "the real section_9_3_spec.rb" do
+    # It parses the files only, so it runs without the demo runtime; without
+    # TIMEKEEPING_LIVE=1 it proves the examples are named, not that they pass.
+    it "covers every Integration and Concurrency row of the real document, with TIMEKEEPING_LIVE unset" do
+      source = Rails.root.join("spec/integration/timekeeping/section_9_3_spec.rb").read
+      saved = ENV.fetch("TIMEKEEPING_LIVE", nil)
+      ENV.delete("TIMEKEEPING_LIVE")
+      begin
+        rows = described_class.rows(real_document)
+
+        expect(rows).not_to be_empty
+        expect(described_class.missing(rows, TimekeepingIntegrationTags.example_names(source))).to eq([])
+      ensure
+        saved.nil? ? ENV.delete("TIMEKEEPING_LIVE") : ENV["TIMEKEEPING_LIVE"] = saved
+      end
+    end
+  end
 end

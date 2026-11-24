@@ -3,6 +3,7 @@
 require "fileutils"
 require "io/wait"
 require "json"
+require "net/http"
 require "pathname"
 require "pg"
 require "tmpdir"
@@ -20,6 +21,7 @@ module TimekeepingSection93Live
   class TimekeepingReadError < StandardError; end
   class PollTimeout < StandardError; end
   class CrashChildFailed < StandardError; end
+  class WorkerRestartFailed < StandardError; end
 
   HANDOFF_INITIALIZER = "config/initializers/timekeeping_handoff.rb"
   DEFAULT_POLL_SECONDS = 30
@@ -30,6 +32,27 @@ module TimekeepingSection93Live
   # seen while the waiter is still waiting.
   LOCK_OBSERVE_SECONDS = 3
   CRASH_CHECKPOINT_SECONDS = 30
+  # How long the Solid Queue supervisor gets to start a new worker after its
+  # forked worker was killed.
+  WORKER_RESTART_SECONDS = 60
+  # How long to wait for the invoice worker's recovery sweeps. Its recurring
+  # task runs once a minute (config/solid_queue_timekeeping_demo_invoice_operations.yml),
+  # so the default poll deadline can end before the next sweep is due; this
+  # one leaves room for two sweeps.
+  RECOVERY_SWEEP_SECONDS = 150
+  # Above Timekeeping::ReferenceClient::TIMEOUT_SECONDS, so a write whose
+  # reference read times out is answered by Timekeeping, not cut off here.
+  ENTRY_WRITE_READ_SECONDS = 10
+  ENTRIES_ROUTE = "/v1/companies/%<company_id>d/entries"
+
+  WORKER_ROWS_SQL = "SELECT pid, metadata FROM solid_queue_processes WHERE kind = 'Worker' ORDER BY id"
+  # Where each queue worker registers itself: the Timekeeping relay worker in
+  # the Timekeeping database, the monolith's workers in the monolith's. Both
+  # apps run a worker on a queue named timekeeping_relay.
+  WORKER_ROW_READERS = {
+    monolith: :section_9_3_monolith_worker_rows,
+    timekeeping: :section_9_3_timekeeping_worker_rows
+  }.freeze
 
   ENTRY_HOLD_SQL = "SELECT id FROM entries WHERE company_id = $1 AND id = $2 FOR UPDATE"
 
@@ -42,10 +65,10 @@ module TimekeepingSection93Live
     )
   SQL
 
-  # Sessions on the Timekeeping database waiting on the holder, directly or
-  # behind another waiter. Two sessions that wait for one locked row queue:
-  # the second waits on the first waiter, not on the holder.
-  TIMEKEEPING_WAITERS_SQL = <<~SQL.squish
+  # Sessions on the named database waiting on the holder, directly or behind
+  # another waiter. Two sessions that wait for one locked row queue: the
+  # second waits on the first waiter, not on the holder.
+  WAITERS_SQL = <<~SQL.squish
     WITH RECURSIVE waiting(pid) AS (
       SELECT pid FROM pg_stat_activity
       WHERE datname = $1 AND $2 = ANY(pg_blocking_pids(pid))
@@ -189,18 +212,97 @@ module TimekeepingSection93Live
   end
 
   # The backend pids of Timekeeping server sessions waiting on holding_pid's
-  # locks, directly or queued behind another such session, in pid order, once
-  # at least count of them wait; whatever was last
-  # seen, possibly fewer, when the given seconds pass first. The test cannot
-  # learn these pids any other way: the Timekeeping server opens them.
+  # locks, as section_9_3_waiters answers them. The test cannot learn these
+  # pids any other way: the Timekeeping server opens them.
   def section_9_3_timekeeping_waiters(holding_pid, count:, within: LOCK_OBSERVE_SECONDS)
-    params = [section_9_3_timekeeping_database_name, Integer(holding_pid)]
+    section_9_3_waiters(section_9_3_timekeeping_database_name, holding_pid, count:, within:)
+  end
+
+  # The backend pids of monolith database sessions waiting on holding_pid's
+  # locks, such as the monolith server's answer to a reference request.
+  def section_9_3_monolith_waiters(holding_pid, count:, within: LOCK_OBSERVE_SECONDS)
+    section_9_3_waiters(ActiveRecord::Base.connection_db_config.database, holding_pid, count:, within:)
+  end
+
+  # The backend pids of sessions on database_name waiting on holding_pid's
+  # locks, directly or queued behind another such session, in pid order, once
+  # at least count of them wait; whatever was last seen, possibly fewer, when
+  # the given seconds pass first.
+  def section_9_3_waiters(database_name, holding_pid, count:, within: LOCK_OBSERVE_SECONDS)
+    params = [database_name, Integer(holding_pid)]
     waiters = []
     section_9_3_observe_server(within) do |observer|
-      waiters = observer.exec_params(TIMEKEEPING_WAITERS_SQL, params).column_values(0).map { |pid| Integer(pid) }
+      waiters = observer.exec_params(WAITERS_SQL, params).column_values(0).map { |pid| Integer(pid) }
       waiters.size >= count
     end
     waiters
+  end
+
+  # Kills the one live Solid Queue worker serving queue, as registered in the
+  # given database (:monolith or :timekeeping), and waits until its
+  # supervisor has started a replacement. Answers [killed_pid, new_pid].
+  #
+  # Only the worker's own pid gets SIGKILL, never its process group: the demo
+  # supervisor makes each of its children a group leader, so a group kill
+  # would end the Solid Queue supervisor and the whole runtime with it. The
+  # killed worker's row can outlive it, so a worker counts as live only while
+  # its pid exists, and the replacement is a live row with another pid.
+  def section_9_3_restart_queue_worker!(queue:, database:)
+    live_pids = section_9_3_live_worker_pids(queue, database)
+    unless live_pids.one?
+      raise WorkerRestartFailed,
+            "expected one live #{queue} worker in the #{database} database, found #{live_pids.size}"
+    end
+
+    killed_pid = live_pids.first
+    section_9_3_kill_worker(killed_pid)
+    observed = section_9_3_poll_until(
+      "a new #{queue} worker in the #{database} database (the row needs harness work if none appears)",
+      within: WORKER_RESTART_SECONDS,
+      satisfied: ->(seen) { !seen[:killed_alive] && seen[:live_pids].any? }
+    ) do
+      { killed_alive: section_9_3_process_alive?(killed_pid),
+        live_pids: section_9_3_live_worker_pids(queue, database) - [killed_pid] }
+    end
+    [killed_pid, observed[:live_pids].first]
+  end
+
+  # Holds Timekeeping's relay with its test hook for the block, so outbox rows
+  # written meanwhile stay unsent. The relay is resumed and the pause file
+  # under timekeeping/tmp removed however the block ends; a failed resume is
+  # raised only when the block itself finished, so it never hides the block's
+  # own error.
+  def section_9_3_with_paused_relay(&block)
+    resume = lambda do
+      TimekeepingLiveHandoff.resume_relay(post: method(:section_9_3_service_post),
+                                          pause_file: TimekeepingLiveHandoff.pause_file)
+    end
+    TimekeepingLiveHandoff.run_with_teardown(steps: { resume_relay: resume }, failures: []) do
+      TimekeepingLiveHandoff.pause_relay(post: method(:section_9_3_service_post))
+      block.call
+    end
+  end
+
+  # POSTs to a Timekeeping route with the runtime's service token.
+  def section_9_3_service_post(route)
+    runtime = @integrated_runtime
+    TimekeepingLiveHandoff.service_post(timekeeping_url: runtime.timekeeping_url,
+                                        service_token: runtime.credentials.service_token, route:)
+  end
+
+  # Sends an entry create straight to Timekeeping, the way the monolith
+  # forwards one, and answers the Net::HTTPResponse. The monolith answers
+  # every Timekeeping 5xx with its own body, so only this direct request
+  # shows the refusal reason Timekeeping gave.
+  def section_9_3_post_timekeeping_entry(company_id:, token:, generation:, body:)
+    uri = URI.join(@integrated_runtime.timekeeping_url, format(ENTRIES_ROUTE, company_id: Integer(company_id)))
+    request = Net::HTTP::Post.new(uri)
+    request["Authorization"] = "Bearer #{token}"
+    request["Content-Type"] = "application/json"
+    request["Ownership-Generation"] = generation.to_s
+    request["Idempotency-Key"] = SecureRandom.uuid
+    request.body = JSON.generate(body)
+    Net::HTTP.start(uri.host, uri.port, read_timeout: ENTRY_WRITE_READ_SECONDS) { |http| http.request(request) }
   end
 
   # True when the Timekeeping session pid is running the entry-locking
@@ -301,6 +403,58 @@ module TimekeepingSection93Live
       return Integer(report) if report&.match?(/\A\d+\z/)
 
       raise CrashChildFailed, "crash child #{report || 'exited'} before its checkpoint"
+    end
+
+    # A worker that ended before the signal reached it was not killed, so a
+    # replacement started after it would prove nothing about recovery from a
+    # kill: that case fails the restart instead of being polled past.
+    def section_9_3_kill_worker(pid)
+      Process.kill(:KILL, Integer(pid))
+    rescue Errno::ESRCH
+      raise WorkerRestartFailed, "worker #{pid} ended before SIGKILL reached it, so no kill was delivered", cause: nil
+    end
+
+    # True while a process with this pid exists, including one owned by another
+    # user (EPERM).
+    def section_9_3_process_alive?(pid)
+      Process.kill(0, Integer(pid))
+      true
+    rescue Errno::ESRCH
+      false
+    rescue Errno::EPERM
+      true
+    end
+
+    # Pids of the registered workers in database whose queues include queue
+    # and whose process still exists, in registration order.
+    def section_9_3_live_worker_pids(queue, database)
+      reader = WORKER_ROW_READERS.fetch(database) do
+        raise ArgumentError, "unknown worker database #{database.inspect}; expected one of #{WORKER_ROW_READERS.keys}"
+      end
+      send(reader).filter_map do |pid, metadata|
+        pid if section_9_3_worker_queues(metadata).include?(queue) && section_9_3_process_alive?(pid)
+      end
+    end
+
+    # [pid, metadata] of every Worker row in the monolith's Solid Queue tables.
+    def section_9_3_monolith_worker_rows
+      SolidQueue::Process.uncached do
+        SolidQueue::Process.where(kind: "Worker").order(:id).pluck(:pid, :metadata)
+      end
+    end
+
+    # [pid, metadata] of every Worker row in the Timekeeping database.
+    def section_9_3_timekeeping_worker_rows
+      section_9_3_with_timekeeping_connection("read queue workers") do |connection|
+        connection.exec(WORKER_ROWS_SQL).values.map { |pid, metadata| [Integer(pid), metadata] }
+      end
+    end
+
+    # A worker's metadata holds its queues as one comma-separated string or a
+    # list of them, stored as JSON text or already decoded.
+    def section_9_3_worker_queues(metadata)
+      decoded = metadata.is_a?(String) ? JSON.parse(metadata) : metadata.to_h
+      Array(decoded["queues"]).flat_map { |queues| queues.to_s.split(",") }.map(&:strip)
     end
 
     def section_9_3_reap_crash_child(child)

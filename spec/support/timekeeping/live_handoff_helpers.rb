@@ -59,6 +59,15 @@ module TimekeepingLiveHandoff
     FileUtils.rm_f(pause_file)
   end
 
+  # Sends one POST to a Timekeeping route with the service bearer token and
+  # answers the Net::HTTPResponse.
+  def service_post(timekeeping_url:, service_token:, route:)
+    uri = URI.join(timekeeping_url, route)
+    request = Net::HTTP::Post.new(uri)
+    request["Authorization"] = "Bearer #{service_token}"
+    Net::HTTP.start(uri.host, uri.port) { |http| http.request(request) }
+  end
+
   def require_hook_answer!(route, response)
     return nil if response.code == HOOK_ANSWERED
 
@@ -264,10 +273,8 @@ RSpec.shared_context "timekeeping live handoff" do
   end
 
   def live_handoff_service_post(route)
-    uri = URI.join(@integrated_runtime.timekeeping_url, route)
-    request = Net::HTTP::Post.new(uri)
-    request["Authorization"] = "Bearer #{@integrated_runtime.credentials.service_token}"
-    Net::HTTP.start(uri.host, uri.port) { |http| http.request(request) }
+    TimekeepingLiveHandoff.service_post(timekeeping_url: @integrated_runtime.timekeeping_url,
+                                        service_token: @integrated_runtime.credentials.service_token, route:)
   end
 
   # Removed by the with_live_handoff teardown.
