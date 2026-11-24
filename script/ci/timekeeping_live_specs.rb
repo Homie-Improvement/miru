@@ -26,6 +26,13 @@ module TimekeepingLiveSpecs
   # Specs that also read ENV["TIMEKEEPING_REGRESSION"] skip their live examples in this
   # job, which does not set it. Only a read counts, so a comment naming it changes nothing.
   REGRESSION_GATE = /ENV\[\s*(["'])TIMEKEEPING_REGRESSION\1\s*\]/
+  # Live specs gated by the :integrated_runtime tag, whose skip lives in
+  # spec/support/timekeeping/integrated_runtime.rb rather than in the file, so
+  # LIVE_GATE cannot find them. The tag alone selects nothing: other suites
+  # carrying it are not part of the live job's set.
+  INTEGRATED_RUNTIME_LIVE_SPECS = %w[
+    spec/integration/timekeeping/interrupted_handoff_spec.rb
+  ].freeze
 
   # Each prefix ends in "/" so "lib/timekeeping/" never matches "lib/timekeeping_demo/".
   FULL_SET_PREFIXES = %w[
@@ -81,14 +88,18 @@ module TimekeepingLiveSpecs
 
   # A spec that reads TIMEKEEPING_LIVE through a gate this script does not recognise
   # raises ConfigError: leaving it out would let the check pass with that spec unrun.
+  # A named integrated-runtime spec is listed only while it exists, so a deleted
+  # or renamed file is never handed to rspec.
   def live_specs(root: Dir.pwd)
-    Dir.glob(LIVE_SPEC_GLOB, base: root).sort.select do |path|
+    gated = Dir.glob(LIVE_SPEC_GLOB, base: root).select do |path|
       source = File.read(File.join(root, path))
       next true if live_spec?(source)
       next false unless source.include?(LIVE_FLAG) && !source.match?(REGRESSION_GATE)
 
       raise ConfigError, "#{path} reads #{LIVE_FLAG} without the gate #{LIVE_GATE.source}"
     end
+    integrated = INTEGRATED_RUNTIME_LIVE_SPECS.select { |path| File.file?(File.join(root, path)) }
+    (gated | integrated).sort
   end
 
   # The pull_request branches are the release branches: their pushes run the full set.
