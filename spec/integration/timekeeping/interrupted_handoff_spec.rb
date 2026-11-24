@@ -799,8 +799,9 @@ RSpec.describe "Timekeeping interrupted handoff: abort ordering", :integrated_ru
       queued.each_value do |entries|
         expect(expected_at_admit.fetch(entries.fetch(:edited))[:note]).to end_with(" v2")
       end
-      projected_before = abort_ordering_projected_snapshots(queued_ids)
-      expect(projected_before.select { |id, snapshot| expected_at_admit.fetch(id) == snapshot }).to be_empty
+      # The relay pause held, so whatever the projection shows at admission
+      # came from the abort's drain.
+      expect(abort_ordering_projected_snapshots(queued_ids)).to be_empty
 
       root = live_handoff_report_root
       expect do
