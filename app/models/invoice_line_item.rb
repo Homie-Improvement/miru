@@ -173,8 +173,8 @@ class InvoiceLineItem < ApplicationRecord
     end
 
     # A line moved to another invoice changes the entries of both.
-    def register_reservation_change(added_entries = [])
-      Invoices::ReservationBoundary.register(invoice, added_entries:) if invoice
+    def register_reservation_change(added_references = [])
+      Invoices::ReservationBoundary.register(invoice, added_references:) if invoice
       return unless will_save_change_to_invoice_id? && invoice_id_in_database
 
       previous_invoice = Invoice.find_by(id: invoice_id_in_database)
@@ -186,14 +186,17 @@ class InvoiceLineItem < ApplicationRecord
     # references, so the boundary checks each one at commit. New links register
     # their own entry when they are saved.
     def register_reservation_change_on_save
-      added_entries = []
-      if new_record? || will_save_change_to_timesheet_entry_id? || will_save_change_to_invoice_id?
-        added_entries << timesheet_entry_id
+      added_references = []
+      if timesheet_entry_id &&
+         (new_record? || will_save_change_to_timesheet_entry_id? || will_save_change_to_invoice_id?)
+        added_references << [self, timesheet_entry_id]
       end
       if persisted? && will_save_change_to_invoice_id?
-        added_entries.concat(InvoiceLineItemTimeEntry.where(invoice_line_item_id: id).pluck(:timesheet_entry_id))
+        InvoiceLineItemTimeEntry.where(invoice_line_item_id: id).find_each do |link|
+          added_references << [link, link.timesheet_entry_id]
+        end
       end
-      register_reservation_change(added_entries.compact)
+      register_reservation_change(added_references)
     end
 
     def capture_previous_invoice_id

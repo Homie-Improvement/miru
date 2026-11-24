@@ -27,9 +27,9 @@ class InvoiceLineItemTimeEntry < ApplicationRecord
     # so the invoice it leaves registers too, before the move is written. A
     # new, retargeted or moved link is a new reference for the invoice it now
     # belongs to, so the boundary checks its entry at commit.
-    def register_reservation_change(added_entries = [])
+    def register_reservation_change(added_references = [])
       invoice = invoice_line_item&.invoice
-      Invoices::ReservationBoundary.register(invoice, added_entries:) if invoice
+      Invoices::ReservationBoundary.register(invoice, added_references:) if invoice
       return unless will_save_change_to_invoice_line_item_id? && invoice_line_item_id_in_database
 
       previous_invoice = InvoiceLineItem.find_by(id: invoice_line_item_id_in_database)&.invoice
@@ -39,7 +39,7 @@ class InvoiceLineItemTimeEntry < ApplicationRecord
     def register_reservation_change_on_save
       changed_reference = new_record? || will_save_change_to_timesheet_entry_id? ||
         will_save_change_to_invoice_line_item_id?
-      register_reservation_change(changed_reference && timesheet_entry_id ? [timesheet_entry_id] : [])
+      register_reservation_change(changed_reference && timesheet_entry_id ? [[self, timesheet_entry_id]] : [])
     end
 
     # Compares the stored company_id, so an entry with no company never matches,

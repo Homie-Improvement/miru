@@ -809,6 +809,34 @@ RSpec.describe Invoices::ReservationBoundary, "checking the entries a save adds"
       expect(adapter.prepared).to be_empty
     end
 
+    it "under the timekeeping owner keeps an invoice edit whose #{kind} foreign reference a savepoint rolled back" do
+      foreign_id = added_check_foreign_entry.id
+      draft = create(:invoice, company: added_check_company, client: added_check_client)
+      InvoiceLineItem.insert_all!([{ invoice_id: draft.id, name: "Old", date: Date.current, rate: 100, quantity: 60,
+                                     timesheet_entry_id: foreign_id, created_at: Time.current, updated_at: Time.current }])
+      rows_before = InvoiceLineItem.where(invoice_id: draft.id).order(:id).map(&:attributes)
+      added_check_take_timekeeping_ownership
+
+      Invoice.transaction do
+        Invoice.find(draft.id).update!(reference: "kept")
+        Invoice.transaction(requires_new: true) do
+          temporary = InvoiceLineItem.new(invoice: Invoice.find(draft.id), name: "Canceled", date: Date.current,
+                                          rate: 100, quantity: 60)
+          if kind == :direct
+            temporary.timesheet_entry_id = foreign_id
+          else
+            temporary.linked_timesheet_entry_ids = [foreign_id]
+          end
+          temporary.save!
+          raise ActiveRecord::Rollback
+        end
+      end
+
+      expect(draft.reload.reference).to eq("kept")
+      expect(InvoiceLineItem.where(invoice_id: draft.id).order(:id).map(&:attributes)).to eq(rows_before)
+      expect(InvoiceLineItemTimeEntry.where(timesheet_entry_id: foreign_id)).to be_empty
+    end
+
     it "under the timekeeping owner refuses a #{kind} replacement of an older foreign line and restores the old line" do
       foreign_id = added_check_foreign_entry.id
       draft = create(:invoice, company: added_check_company, client: added_check_client)
