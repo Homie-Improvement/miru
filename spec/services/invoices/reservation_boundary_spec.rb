@@ -635,3 +635,400 @@ RSpec.describe Invoices::ReservationBoundary, "mark_billed with an undeliverable
     expect(adapter).not_to have_received(:mark_billed)
   end
 end
+
+RSpec.describe Invoices::ReservationBoundary, "checking the entries a save adds" do
+  let(:added_check_company) { create(:company) }
+  let(:added_check_client) { create(:client, company: added_check_company) }
+  let(:added_check_project) { create(:project, client: added_check_client, billable: true) }
+  let(:added_check_user) { create(:user, current_workspace_id: added_check_company.id) }
+  let(:added_check_other_company) { create(:company) }
+  let(:added_check_other_client) { create(:client, company: added_check_other_company) }
+  let(:added_check_foreign_entry) do
+    project = create(:project, client: added_check_other_client, billable: true)
+    create(:timesheet_entry, user: create(:user, current_workspace_id: added_check_other_company.id), project:,
+      bill_status: "unbilled")
+  end
+
+  # Records every reservation call and answers each one as accepted, standing
+  # in for the Timekeeping service.
+  let(:added_check_adapter_class) do
+    Class.new do
+      attr_reader :prepared
+
+      def initialize
+        @prepared = []
+      end
+
+      def prepare(request)
+        @prepared << request
+        outcome("prepared")
+      end
+
+      def commit(_request) = outcome("committed")
+      def abort(_request) = outcome("aborted")
+
+      private
+
+        def outcome(state)
+          Invoices::ReservationOutcome.new(state:, conflicts: [], counts: {})
+        end
+    end
+  end
+
+  def added_check_line(invoice, entry_id)
+    InvoiceLineItem.new(invoice:, name: "Work", date: Date.current, rate: 100, quantity: 60, timesheet_entry_id: entry_id)
+  end
+
+  def added_check_take_timekeeping_ownership
+    TimekeepingOwnership.current.update!(owner: "timekeeping", handoff_step: nil)
+  end
+
+  # Line validation runs before the ownership row is locked and, while
+  # Timekeeping owns entries, leaves existence and company to this check, so
+  # these saves skip validation to reach it alone.
+  def added_check_expect_not_found(line, entry_id)
+    expect { line.save(validate: false) }.to raise_error(Invoices::OperationErrors::Refused) { |refusal|
+      expect(refusal.outcome.conflicts).to eq([{ entry_id:, reason: "not_found" }])
+    }
+    expect(InvoiceLineItem.where(timesheet_entry_id: entry_id)).to be_empty
+  end
+
+  it "under the timekeeping owner refuses another company's entry added to a discarded draft as not found" do
+    foreign_id = added_check_foreign_entry.id
+    draft = create(:invoice, company: added_check_company, client: added_check_client)
+    draft.discard!
+    added_check_take_timekeeping_ownership
+
+    added_check_expect_not_found(added_check_line(Invoice.find(draft.id), foreign_id), foreign_id)
+  end
+
+  it "under the timekeeping owner refuses another company's entry added to a discarded sent invoice as not found" do
+    foreign_id = added_check_foreign_entry.id
+    sent = create(:invoice, company: added_check_company, client: added_check_client, status: :sent)
+    sent.discard!
+    added_check_take_timekeeping_ownership
+
+    added_check_expect_not_found(added_check_line(Invoice.find(sent.id), foreign_id), foreign_id)
+  end
+
+  it "under the timekeeping owner refuses another company's entry added to a live sent invoice as not found" do
+    foreign_id = added_check_foreign_entry.id
+    sent = create(:invoice, company: added_check_company, client: added_check_client, status: :sent)
+    added_check_take_timekeeping_ownership
+
+    added_check_expect_not_found(added_check_line(Invoice.find(sent.id), foreign_id), foreign_id)
+  end
+
+  it "refuses at flush a foreign line validated under the timekeeping owner and saved after a rollback" do
+    foreign_id = added_check_foreign_entry.id
+    draft = create(:invoice, company: added_check_company, client: added_check_client)
+    added_check_take_timekeeping_ownership
+    line = added_check_line(Invoice.find(draft.id), foreign_id)
+    line.valid?
+
+    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared")
+
+    added_check_expect_not_found(line, foreign_id)
+  end
+
+  it "under the timekeeping owner sends an unprojected entry to prepare and holds it, without another company's lines" do
+    other_invoice = create(:invoice, company: added_check_other_company, client: added_check_other_client)
+    create(:invoice_line_item, invoice: other_invoice, timesheet_entry: added_check_foreign_entry, rate: 100, quantity: 60)
+    draft = create(:invoice, company: added_check_company, client: added_check_client)
+    unprojected_id = TimesheetEntry.maximum(:id).to_i + 1_000
+    adapter = added_check_adapter_class.new
+    allow(Invoices::ReservationAdapters).to receive(:for).and_return(adapter)
+    added_check_take_timekeeping_ownership
+
+    expect(added_check_line(Invoice.find(draft.id), unprojected_id).save(validate: false)).to be(true)
+
+    expect(adapter.prepared.map(&:entries)).to eq([[unprojected_id]])
+    expect(adapter.prepared.map(&:company_id)).to eq([added_check_company.id])
+    expect(InvoiceEntryHolding.find_by!(company_id: added_check_company.id, invoice_id: draft.id).entry_ids)
+      .to eq([unprojected_id])
+  end
+
+  it "under the legacy owner still saves an invoice that already carries another company's line" do
+    foreign_entry = added_check_foreign_entry
+    own_entry = create(:timesheet_entry, user: added_check_user, project: added_check_project, bill_status: "unbilled")
+    draft = create(:invoice, company: added_check_company, client: added_check_client)
+    # A row written before validation refused foreign ids: insert_all runs no callback or validation.
+    InvoiceLineItem.insert_all!([{ invoice_id: draft.id, name: "Old", date: Date.current, rate: 100, quantity: 60,
+                                   timesheet_entry_id: foreign_entry.id, created_at: Time.current, updated_at: Time.current }])
+
+    added_check_line(Invoice.find(draft.id), own_entry.id).save!
+
+    expect(own_entry.reload.locked).to be(true)
+    expect(foreign_entry.reload.locked).to be(false)
+  end
+
+  it "under the timekeeping owner still saves an invoice that already carries another company's or a no-company line" do
+    foreign_id = added_check_foreign_entry.id
+    no_company_entry = create(:timesheet_entry, user: added_check_user, project: added_check_project,
+      bill_status: "unbilled")
+    no_company_entry.update_column(:company_id, nil)
+    draft = create(:invoice, company: added_check_company, client: added_check_client)
+    # Rows written before validation refused such ids: insert_all runs no callback or validation.
+    InvoiceLineItem.insert_all!([foreign_id, no_company_entry.id].map do |entry_id|
+      { invoice_id: draft.id, name: "Old", date: Date.current, rate: 100, quantity: 60,
+        timesheet_entry_id: entry_id, created_at: Time.current, updated_at: Time.current }
+    end)
+    unprojected_id = TimesheetEntry.maximum(:id).to_i + 1_000
+    adapter = added_check_adapter_class.new
+    allow(Invoices::ReservationAdapters).to receive(:for).and_return(adapter)
+    added_check_take_timekeeping_ownership
+
+    expect(added_check_line(Invoice.find(draft.id), unprojected_id).save(validate: false)).to be(true)
+
+    expect(adapter.prepared.map(&:entries)).to eq([[unprojected_id]])
+  end
+
+  [:direct, :linked].each do |kind|
+    it "under the timekeeping owner refuses a new #{kind} reference to a foreign id an older line already names" do
+      foreign_id = added_check_foreign_entry.id
+      draft = create(:invoice, company: added_check_company, client: added_check_client)
+      # A row written before validation refused foreign ids: insert_all runs no callback or validation.
+      InvoiceLineItem.insert_all!([{ invoice_id: draft.id, name: "Old", date: Date.current, rate: 100, quantity: 60,
+                                     timesheet_entry_id: foreign_id, created_at: Time.current, updated_at: Time.current }])
+      adapter = added_check_adapter_class.new
+      allow(Invoices::ReservationAdapters).to receive(:for).and_return(adapter)
+      added_check_take_timekeeping_ownership
+      line = InvoiceLineItem.new(invoice: Invoice.find(draft.id), name: "New", date: Date.current, rate: 100,
+                                 quantity: 60)
+      if kind == :direct
+        line.timesheet_entry_id = foreign_id
+      else
+        line.linked_timesheet_entry_ids = [foreign_id]
+      end
+
+      expect { line.save! }.to raise_error(Invoices::OperationErrors::Refused) { |refusal|
+        expect(refusal.outcome.conflicts).to eq([{ entry_id: foreign_id, reason: "not_found" }])
+      }
+      expect(InvoiceLineItem.where(invoice_id: draft.id).pluck(:name)).to eq(["Old"])
+      expect(InvoiceLineItemTimeEntry.where(timesheet_entry_id: foreign_id)).to be_empty
+      expect(adapter.prepared).to be_empty
+    end
+
+    it "under the timekeeping owner keeps an invoice edit whose #{kind} foreign reference a savepoint rolled back" do
+      foreign_id = added_check_foreign_entry.id
+      draft = create(:invoice, company: added_check_company, client: added_check_client)
+      InvoiceLineItem.insert_all!([{ invoice_id: draft.id, name: "Old", date: Date.current, rate: 100, quantity: 60,
+                                     timesheet_entry_id: foreign_id, created_at: Time.current, updated_at: Time.current }])
+      rows_before = InvoiceLineItem.where(invoice_id: draft.id).order(:id).map(&:attributes)
+      added_check_take_timekeeping_ownership
+
+      Invoice.transaction do
+        Invoice.find(draft.id).update!(reference: "kept")
+        Invoice.transaction(requires_new: true) do
+          temporary = InvoiceLineItem.new(invoice: Invoice.find(draft.id), name: "Canceled", date: Date.current,
+                                          rate: 100, quantity: 60)
+          if kind == :direct
+            temporary.timesheet_entry_id = foreign_id
+          else
+            temporary.linked_timesheet_entry_ids = [foreign_id]
+          end
+          temporary.save!
+          raise ActiveRecord::Rollback
+        end
+      end
+
+      expect(draft.reload.reference).to eq("kept")
+      expect(InvoiceLineItem.where(invoice_id: draft.id).order(:id).map(&:attributes)).to eq(rows_before)
+      expect(InvoiceLineItemTimeEntry.where(timesheet_entry_id: foreign_id)).to be_empty
+    end
+
+    it "under the timekeeping owner keeps an invoice edit after a rolled-back savepoint changed an older #{kind} " \
+       "foreign reference away and back" do
+      foreign_id = added_check_foreign_entry.id
+      own_entry = create(:timesheet_entry, user: added_check_user, project: added_check_project,
+        bill_status: "unbilled")
+      draft = create(:invoice, company: added_check_company, client: added_check_client)
+      InvoiceLineItem.insert_all!([{ invoice_id: draft.id, name: "Old", date: Date.current, rate: 100, quantity: 60,
+                                     timesheet_entry_id: kind == :direct ? foreign_id : nil,
+                                     created_at: Time.current, updated_at: Time.current }])
+      old_line = InvoiceLineItem.find_by!(invoice_id: draft.id)
+      if kind == :linked
+        InvoiceLineItemTimeEntry.insert_all!([{ invoice_line_item_id: old_line.id, timesheet_entry_id: foreign_id,
+                                                created_at: Time.current, updated_at: Time.current }])
+      end
+      reference = kind == :direct ? old_line : InvoiceLineItemTimeEntry.find_by!(invoice_line_item_id: old_line.id)
+      rows_before = [InvoiceLineItem, InvoiceLineItemTimeEntry].map { |model| model.order(:id).map(&:attributes) }
+      added_check_take_timekeeping_ownership
+
+      Invoice.transaction do
+        Invoice.find(draft.id).update!(reference: "kept")
+        Invoice.transaction(requires_new: true) do
+          changed = reference.class.find(reference.id)
+          changed.update!(timesheet_entry_id: own_entry.id)
+          changed.update!(timesheet_entry_id: foreign_id)
+          raise ActiveRecord::Rollback
+        end
+      end
+
+      expect(draft.reload.reference).to eq("kept")
+      expect([InvoiceLineItem, InvoiceLineItemTimeEntry].map { |model| model.order(:id).map(&:attributes) })
+        .to eq(rows_before)
+    end
+
+    it "under the timekeeping owner refuses a #{kind} replacement of an older foreign line and restores the old line" do
+      foreign_id = added_check_foreign_entry.id
+      draft = create(:invoice, company: added_check_company, client: added_check_client)
+      InvoiceLineItem.insert_all!([{ invoice_id: draft.id, name: "Old", date: Date.current, rate: 100, quantity: 60,
+                                     timesheet_entry_id: foreign_id, created_at: Time.current, updated_at: Time.current }])
+      rows_before = InvoiceLineItem.where(invoice_id: draft.id).order(:id).map(&:attributes)
+      adapter = added_check_adapter_class.new
+      allow(Invoices::ReservationAdapters).to receive(:for).and_return(adapter)
+      added_check_take_timekeeping_ownership
+      replacement = InvoiceLineItem.new(invoice: Invoice.find(draft.id), name: "Replacement", date: Date.current,
+                                        rate: 100, quantity: 60)
+      if kind == :direct
+        replacement.timesheet_entry_id = foreign_id
+      else
+        replacement.linked_timesheet_entry_ids = [foreign_id]
+      end
+
+      expect {
+        Invoice.transaction do
+          InvoiceLineItem.find(rows_before.first.fetch("id")).destroy!
+          replacement.save!
+        end
+      }.to raise_error(Invoices::OperationErrors::Refused) { |refusal|
+        expect(refusal.outcome.conflicts).to eq([{ entry_id: foreign_id, reason: "not_found" }])
+      }
+      expect(InvoiceLineItem.where(invoice_id: draft.id).order(:id).map(&:attributes)).to eq(rows_before)
+      expect(InvoiceLineItemTimeEntry.where(timesheet_entry_id: foreign_id)).to be_empty
+      expect(adapter.prepared).to be_empty
+    end
+  end
+
+  it "under the timekeeping owner refuses retargeting an own line to a foreign id an older line names" do
+    foreign_id = added_check_foreign_entry.id
+    own_entry = create(:timesheet_entry, user: added_check_user, project: added_check_project, bill_status: "unbilled")
+    draft = create(:invoice, company: added_check_company, client: added_check_client)
+    InvoiceLineItem.insert_all!([{ invoice_id: draft.id, name: "Old", date: Date.current, rate: 100, quantity: 60,
+                                   timesheet_entry_id: foreign_id, created_at: Time.current, updated_at: Time.current }])
+    own_line = added_check_line(Invoice.find(draft.id), own_entry.id)
+    own_line.save!
+    adapter = added_check_adapter_class.new
+    allow(Invoices::ReservationAdapters).to receive(:for).and_return(adapter)
+    added_check_take_timekeeping_ownership
+
+    line = InvoiceLineItem.find(own_line.id)
+    line.timesheet_entry_id = foreign_id
+    expect { line.save! }.to raise_error(Invoices::OperationErrors::Refused)
+    expect(own_line.reload.timesheet_entry_id).to eq(own_entry.id)
+  end
+
+  it "under the timekeeping owner refuses a no-company projected entry added to a draft as not found" do
+    no_company_entry = create(:timesheet_entry, user: added_check_user, project: added_check_project,
+      bill_status: "unbilled")
+    no_company_entry.update_column(:company_id, nil)
+    draft = create(:invoice, company: added_check_company, client: added_check_client)
+    adapter = added_check_adapter_class.new
+    allow(Invoices::ReservationAdapters).to receive(:for).and_return(adapter)
+    added_check_take_timekeeping_ownership
+
+    added_check_expect_not_found(added_check_line(Invoice.find(draft.id), no_company_entry.id), no_company_entry.id)
+    expect(adapter.prepared).to be_empty
+  end
+
+  # Writes a line on each invoice with insert_all, which runs no callback or
+  # validation, so the source line can carry an older foreign reference:
+  # directly for :direct, through a link for :linked and :line_with_links.
+  def added_check_move_setup(kind, foreign_id)
+    source = create(:invoice, company: added_check_company, client: added_check_client)
+    destination = create(:invoice, company: added_check_company, client: added_check_client)
+    now = Time.current
+    InvoiceLineItem.insert_all!([[source, "Old", kind == :direct ? foreign_id : nil], [destination, "Destination", nil]]
+      .map do |invoice, name, entry_id|
+        { invoice_id: invoice.id, name:, date: Date.current, rate: 100, quantity: 60, timesheet_entry_id: entry_id,
+          created_at: now, updated_at: now }
+      end)
+    old_line = InvoiceLineItem.find_by!(invoice_id: source.id)
+    unless kind == :direct
+      InvoiceLineItemTimeEntry.insert_all!([{ invoice_line_item_id: old_line.id, timesheet_entry_id: foreign_id,
+                                              created_at: now, updated_at: now }])
+    end
+    { source:, destination:, old_line:, destination_line: InvoiceLineItem.find_by!(invoice_id: destination.id) }
+  end
+
+  def added_check_all_reference_rows
+    [InvoiceLineItem, InvoiceLineItemTimeEntry].map { |model| model.order(:id).map(&:attributes) }
+  end
+
+  [:direct, :linked, :line_with_links].each do |kind|
+    it "under the timekeeping owner keeps an invoice edit after a rolled-back savepoint moved an older #{kind} " \
+       "foreign reference to another invoice and back" do
+      foreign_id = added_check_foreign_entry.id
+      setup = added_check_move_setup(kind, foreign_id)
+      reference, attribute, outward, inward =
+        if kind == :linked
+          [InvoiceLineItemTimeEntry.find_by!(invoice_line_item_id: setup[:old_line].id), :invoice_line_item_id,
+           setup[:destination_line].id, setup[:old_line].id]
+        else
+          [setup[:old_line], :invoice_id, setup[:destination].id, setup[:source].id]
+        end
+      rows_before = added_check_all_reference_rows
+      added_check_take_timekeeping_ownership
+
+      Invoice.transaction do
+        Invoice.find(setup[:source].id).update!(reference: "kept")
+        Invoice.transaction(requires_new: true) do
+          moved = reference.class.find(reference.id)
+          moved.update!(attribute => outward)
+          moved.update!(attribute => inward)
+          raise ActiveRecord::Rollback
+        end
+      end
+
+      expect(setup[:source].reload.reference).to eq("kept")
+      expect(added_check_all_reference_rows).to eq(rows_before)
+    end
+
+    it "under the timekeeping owner refuses moving an older #{kind} foreign reference to another invoice" do
+      foreign_id = added_check_foreign_entry.id
+      setup = added_check_move_setup(kind, foreign_id)
+      rows_before = added_check_all_reference_rows
+      added_check_take_timekeeping_ownership
+
+      expect {
+        if kind == :linked
+          InvoiceLineItemTimeEntry.find_by!(invoice_line_item_id: setup[:old_line].id)
+            .update!(invoice_line_item_id: setup[:destination_line].id)
+        else
+          InvoiceLineItem.find(setup[:old_line].id).update!(invoice_id: setup[:destination].id)
+        end
+      }.to raise_error(Invoices::OperationErrors::Refused) { |refusal|
+        expect(refusal.outcome.conflicts).to eq([{ entry_id: foreign_id, reason: "not_found" }])
+      }
+      expect(added_check_all_reference_rows).to eq(rows_before)
+    end
+  end
+
+  [:foreign, :no_company].each do |kind|
+    it "under the timekeeping owner refuses moving an older #{kind} link to another line of the same invoice" do
+      entry = added_check_foreign_entry
+      entry.update_column(:company_id, nil) if kind == :no_company
+      draft = create(:invoice, company: added_check_company, client: added_check_client)
+      now = Time.current
+      InvoiceLineItem.insert_all!(["Old", "Destination"].map do |name|
+        { invoice_id: draft.id, name:, date: Date.current, rate: 100, quantity: 60, timesheet_entry_id: nil,
+          created_at: now, updated_at: now }
+      end)
+      old_line = InvoiceLineItem.find_by!(invoice_id: draft.id, name: "Old")
+      destination_line = InvoiceLineItem.find_by!(invoice_id: draft.id, name: "Destination")
+      InvoiceLineItemTimeEntry.insert_all!([{ invoice_line_item_id: old_line.id, timesheet_entry_id: entry.id,
+                                              created_at: now, updated_at: now }])
+      rows_before = added_check_all_reference_rows
+      added_check_take_timekeeping_ownership
+
+      expect {
+        InvoiceLineItemTimeEntry.find_by!(invoice_line_item_id: old_line.id)
+          .update!(invoice_line_item_id: destination_line.id)
+      }.to raise_error(Invoices::OperationErrors::Refused) { |refusal|
+        expect(refusal.outcome.conflicts).to eq([{ entry_id: entry.id, reason: "not_found" }])
+      }
+      expect(added_check_all_reference_rows).to eq(rows_before)
+    end
+  end
+end

@@ -11,7 +11,7 @@ class InvoiceLineItem < ApplicationRecord
   # Registered before the links are replaced and before the dependent join
   # rows are destroyed, so the reservation boundary captures the entries the
   # invoice referenced before this change.
-  before_save :register_reservation_change
+  before_save :register_reservation_change_on_save
   before_destroy :register_reservation_change, prepend: true
   before_save :link_pending_linked_timesheet_entries
   before_update :capture_previous_invoice_id, if: :will_save_change_to_invoice_id?
@@ -21,9 +21,13 @@ class InvoiceLineItem < ApplicationRecord
   validates :name, :date, :rate, :quantity, presence: true
   validates :rate, numericality: { greater_than_or_equal_to: 0 }
   validates :quantity, numericality: { greater_than_or_equal_to: 0 }
-  # Manual lines keep a NULL timesheet_entry_id.
-  validate :timesheet_entry_found_in_invoice_company, unless: -> { timesheet_entry_id.nil? }
-  validate :linked_timesheet_entries_found_in_invoice_company
+  # Manual lines keep a NULL timesheet_entry_id. Once Timekeeping owns the
+  # entries, the projection lags, so these checks would refuse an entry the
+  # relay has not delivered yet; the reservation boundary checks every added
+  # entry at commit instead, against Timekeeping's prepare answer.
+  validate :timesheet_entry_found_in_invoice_company,
+    if: -> { !timesheet_entry_id.nil? && entries_checked_by_projection? }
+  validate :linked_timesheet_entries_found_in_invoice_company, if: :entries_checked_by_projection?
 
   def self.total_cost_of_all_line_items
     (self.sum("quantity * rate") / 60.0).round(3)
@@ -69,6 +73,13 @@ class InvoiceLineItem < ApplicationRecord
     @pending_linked_timesheet_entry_ids = Array(ids).reject(&:blank?).map { |id| id_type.cast(id) }.uniq
   end
 
+  # The linked entry ids as the link rows store them. The through reader joins
+  # timesheet_entries, which leaves out an entry the relay has not projected
+  # yet, so an editor resubmitting the ids it was shown would drop that link.
+  def linked_entry_ids_on_rows
+    invoice_line_item_time_entries.map(&:timesheet_entry_id)
+  end
+
   # Nested invoice saves validate and save only children that report a change.
   # Pending linked ids change no column, so they are counted here.
   def changed_for_autosave?
@@ -101,6 +112,7 @@ class InvoiceLineItem < ApplicationRecord
     # validation refuse the save rather than leave the old links in place.
     def link_pending_linked_timesheet_entries
       return unless pending_linked_timesheet_entry_ids?
+      return link_pending_linked_timesheet_entry_ids unless entries_checked_by_projection?
 
       entries = pending_linked_entries_in_invoice_company
       if entries.nil?
@@ -110,6 +122,26 @@ class InvoiceLineItem < ApplicationRecord
 
       self.linked_timesheet_entries = entries
       @pending_linked_timesheet_entry_ids = nil
+    end
+
+    # Links the pending ids by id, because the projection may not hold their
+    # rows yet. Links to ids no longer named are destroyed now; new ones are
+    # saved with this line. The reservation boundary refuses the save at
+    # commit when any new id is not the invoice company's entry.
+    def link_pending_linked_timesheet_entry_ids
+      requested_ids = @pending_linked_timesheet_entry_ids
+      kept_links, dropped_links = invoice_line_item_time_entries.partition do |link|
+        requested_ids.include?(link.timesheet_entry_id)
+      end
+      invoice_line_item_time_entries.destroy(*dropped_links) if dropped_links.any?
+      (requested_ids - kept_links.map(&:timesheet_entry_id)).each do |entry_id|
+        invoice_line_item_time_entries.build(timesheet_entry_id: entry_id)
+      end
+      @pending_linked_timesheet_entry_ids = nil
+    end
+
+    def entries_checked_by_projection?
+      Invoices::EntryReferenceCheck.for(TimekeepingOwnership.current) == :projection
     end
 
     # Missing ids, other companies' ids and entries with no company get the same
@@ -141,12 +173,26 @@ class InvoiceLineItem < ApplicationRecord
     end
 
     # A line moved to another invoice changes the entries of both.
-    def register_reservation_change
-      Invoices::ReservationBoundary.register(invoice) if invoice
+    def register_reservation_change(changed_references = [])
+      Invoices::ReservationBoundary.register(invoice, changed_references:) if invoice
       return unless will_save_change_to_invoice_id? && invoice_id_in_database
 
       previous_invoice = Invoice.find_by(id: invoice_id_in_database)
       Invoices::ReservationBoundary.register(previous_invoice) if previous_invoice
+    end
+
+    # A new line, a changed direct entry or a move to another invoice changes
+    # where the line names its entry, and a move also changes where its stored
+    # links name theirs, so the boundary checks those rows at commit. New links
+    # are passed when they are saved themselves.
+    def register_reservation_change_on_save
+      changed_references = []
+      changed_references << self if new_record? || will_save_change_to_timesheet_entry_id? ||
+        will_save_change_to_invoice_id?
+      if persisted? && will_save_change_to_invoice_id?
+        changed_references.concat(InvoiceLineItemTimeEntry.where(invoice_line_item_id: id).to_a)
+      end
+      register_reservation_change(changed_references)
     end
 
     def capture_previous_invoice_id

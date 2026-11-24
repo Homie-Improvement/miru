@@ -16,20 +16,6 @@ RSpec.describe "Timekeeping relay paused", :integrated_runtime, :two_tenant_seed
                committed_data: true, owner_state: "legacy" do
   include_context "timekeeping live handoff"
 
-  # The draft invoice save reads the projection through
-  # InvoiceLineItem#timesheet_entry_found_in_invoice_company, and the database
-  # refuses a line item whose entry is not in timesheet_entries. Both hold
-  # until the follow-up invoice change lands, so that part is pending, and
-  # RSpec fails the example once it passes.
-  def relay_paused_ac5_pending_reason
-    "AC5 waits on the follow-up invoice change: the draft invoice save answers 422 " \
-      "\"Invoice line items timesheet entry not found\" because the projection-backed " \
-      "validation InvoiceLineItem#timesheet_entry_found_in_invoice_company reads " \
-      "timesheet_entries, and the keys invoice_line_items -> timesheet_entries and " \
-      "invoice_line_item_time_entries -> timesheet_entries refuse the row before the " \
-      "relay delivers it"
-  end
-
   before { WebMock.disable_net_connect!(allow_localhost: true) }
 
   # An owner or admin of the company who can sign requests with the legacy
@@ -155,8 +141,6 @@ RSpec.describe "Timekeeping relay paused", :integrated_runtime, :two_tenant_seed
           # the projection lags.
           relay_paused_expect_queued_only(company:, entry_id:)
           expect(relay_paused_listed_entry_ids(user: admin)).to include(entry_id)
-
-          pending relay_paused_ac5_pending_reason
 
           response = relay_paused_request(
             :post, "/api/v1/invoices", user: admin,
