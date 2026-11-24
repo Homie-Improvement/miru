@@ -317,8 +317,12 @@ RSpec.describe "Internal::V1::Companies::References", type: :request do
     ])
     expect(all_kinds["invoices"].pluck("id").count(own_invoice.id)).to eq(1)
     expect(foreign["invoices"]).to eq([])
-    expect(foreign).to eq(unknown)
-    expect(foreign_intent).to eq(unknown)
+    # Only foreign_invoice_ids tells another company's id from an unknown one, and only as a bare id.
+    expect(foreign.except("foreign_invoice_ids")).to eq(unknown.except("foreign_invoice_ids"))
+    expect(foreign_intent.except("foreign_invoice_ids")).to eq(unknown.except("foreign_invoice_ids"))
+    expect(foreign["foreign_invoice_ids"]).to eq([foreign_invoice.id])
+    expect(foreign_intent["foreign_invoice_ids"]).to eq([foreign_intent_id])
+    expect(unknown["foreign_invoice_ids"]).to eq([])
     expect(none_requested["invoices"]).to eq([])
   end
 
@@ -341,6 +345,47 @@ RSpec.describe "Internal::V1::Companies::References", type: :request do
           params: { project_ids: "", invoice_ids: (1..limit).to_a.join(",") }, headers: headers
       expect(response).to have_http_status(:ok)
       expect(response.parsed_body["invoices"]).to eq([])
+    end
+  end
+
+  context "more tests 4", type: :request do
+    it "lists in foreign_invoice_ids exactly the requested ids another company holds as an invoice or an intent, and nothing else" do
+      own_invoice = create(:invoice, company: company_a, client: create(:client, company: company_a))
+      foreign_invoice = create(:invoice, company: company_b, client: create(:client, company: company_b))
+      foreign_discarded = create(:invoice, company: company_b, client: create(:client, company: company_b))
+      foreign_discarded.discard
+      unrequested_foreign_invoice = create(:invoice, company: company_b, client: create(:client, company: company_b))
+      unknown_id = Invoice.maximum(:id).to_i + 1000
+      foreign_intent_id = unknown_id + 1
+      InvoiceOperationIntent.create!(company_id: company_b.id, invoice_id: foreign_intent_id, operation_id: SecureRandom.uuid,
+                                     state: "pending", generation: 1, disposition: "active", desired_entry_ids: [],
+                                     created_at: Time.current)
+      requested = [own_invoice.id, foreign_invoice.id, foreign_invoice.id, foreign_discarded.id, unknown_id, foreign_intent_id]
+
+      bodies = with_timekeeping_service_token do |token|
+        [[company_a, requested], [company_a, [unknown_id]], [company_a, []], [company_b, requested]]
+          .map do |company, invoice_ids|
+            get "/internal/v1/companies/#{company.id}/reference",
+                params: { project_ids: "", invoice_ids: invoice_ids.join(",") },
+                headers: { "Authorization" => "Bearer #{token}" }
+            expect(response).to have_http_status(:ok)
+            response.parsed_body
+          end
+      end
+      all_kinds, unknown_only, none_requested, as_company_b = bodies
+
+      expect(contract["response_fields"]).to include("foreign_invoice_ids")
+      expect(all_kinds.keys).to match_array(contract["response_fields"])
+      expect(all_kinds["foreign_invoice_ids"]).to eq([foreign_invoice.id, foreign_discarded.id, foreign_intent_id].sort)
+      expect(all_kinds["foreign_invoice_ids"].count(foreign_invoice.id)).to eq(1)
+      expect(all_kinds["foreign_invoice_ids"]).not_to include(unrequested_foreign_invoice.id)
+      # Each company's own invoices are reported as held by another company only to that other company.
+      expect(as_company_b["foreign_invoice_ids"]).to eq([own_invoice.id])
+      # Only ids are reported: the other company is never named.
+      expect(all_kinds.to_json).not_to include("\"company_id\":#{company_b.id}")
+      expect(all_kinds["invoices"]).to eq([{ "id" => own_invoice.id, "company_id" => company_a.id }])
+      expect(unknown_only["foreign_invoice_ids"]).to eq([])
+      expect(none_requested["foreign_invoice_ids"]).to eq([])
     end
   end
 end

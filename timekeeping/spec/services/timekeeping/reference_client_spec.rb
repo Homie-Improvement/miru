@@ -210,13 +210,49 @@ RSpec.describe Timekeeping::ReferenceClient do
       end
     end
   end
+
+  context "more tests 4" do
+    it "invoice_holders returns the owned and foreign invoice ids from one reference request" do
+      body = facts_body.merge("invoices" => [{ "id" => 41, "company_id" => 5 }], "foreign_invoice_ids" => [42])
+      stub = stub_request(:get, reference_url).with(query: hash_including("invoice_ids" => "41,42,99"))
+        .to_return(status: 200, body: body.to_json)
+
+      holders = client.invoice_holders(company_id: 5, invoice_ids: [41, 42, 99])
+
+      expect(holders).to eq(described_class::InvoiceHolders.new(owned_ids: [41], foreign_ids: [42]))
+      expect(stub).to have_been_requested.once
+    end
+  end
+
+  context "more tests 5" do
+    it "invoice_holders raises Unavailable when foreign_invoice_ids or invoices is missing or malformed" do
+      owned = { "invoices" => [{ "id" => 41, "company_id" => 5 }] }
+      bodies = [
+        facts_body.merge(owned),
+        facts_body.merge(owned).merge("foreign_invoice_ids" => nil),
+        facts_body.merge(owned).merge("foreign_invoice_ids" => ["42"]),
+        facts_body.merge(owned).merge("foreign_invoice_ids" => 42),
+        facts_body.merge("foreign_invoice_ids" => [42])
+      ]
+
+      bodies.each do |body|
+        WebMock.reset!
+        stub_request(:get, reference_url).with(query: hash_including("invoice_ids" => "41,42"))
+          .to_return(status: 200, body: body.to_json)
+
+        expect { client.invoice_holders(company_id: 5, invoice_ids: [41, 42]) }
+          .to raise_error(described_class::Unavailable), "accepted #{body.inspect}"
+      end
+    end
+  end
 end
 
 RSpec.describe Timekeeping::ReferenceClient, "invoice ownership" do
   let(:invoice_client) { described_class.new(base_url: "http://monolith.test", service_token: "invoice-spec-token") }
   let(:invoice_reference_url) { "http://monolith.test/internal/v1/companies/5/reference" }
   let(:invoice_facts_body) do
-    { "company_id" => 5, "edit_days" => 7, "users" => [], "projects" => [], "missing_project_ids" => [], "agents" => [] }
+    { "company_id" => 5, "edit_days" => 7, "users" => [], "projects" => [], "missing_project_ids" => [], "agents" => [],
+      "foreign_invoice_ids" => [] }
   end
 
   def stub_invoice_reference(body, status: 200)
@@ -236,14 +272,14 @@ RSpec.describe Timekeeping::ReferenceClient, "invoice ownership" do
             headers: { "Authorization" => "Bearer invoice-spec-token" })
       .to_return(status: 200, body: invoice_facts_body.merge("invoices" => [{ "id" => 41, "company_id" => 5 }]).to_json)
 
-    expect(invoice_client.owned_invoice_ids(company_id: 5, invoice_ids: [41, 99])).to eq([41])
+    expect(invoice_client.invoice_holders(company_id: 5, invoice_ids: [41, 99]).owned_ids).to eq([41])
     expect(stub).to have_been_requested.once
   end
 
   it "raises Unavailable when an invoice fact names another company, rather than granting that invoice" do
     stub_invoice_reference(invoice_facts_body.merge("invoices" => [{ "id" => 41, "company_id" => 6 }]))
 
-    expect { invoice_client.owned_invoice_ids(company_id: 5, invoice_ids: [41, 99]) }
+    expect { invoice_client.invoice_holders(company_id: 5, invoice_ids: [41, 99]) }
       .to raise_error(described_class::Unavailable)
   end
 
@@ -260,7 +296,7 @@ RSpec.describe Timekeeping::ReferenceClient, "invoice ownership" do
       WebMock.reset!
       stub_invoice_reference(answer.fetch(:body), status: answer.fetch(:status, 200))
 
-      expect { invoice_client.owned_invoice_ids(company_id: 5, invoice_ids: [41, 99]) }
+      expect { invoice_client.invoice_holders(company_id: 5, invoice_ids: [41, 99]) }
         .to raise_error(described_class::Unavailable), "accepted #{answer.inspect}"
     end
   end
@@ -274,8 +310,8 @@ RSpec.describe Timekeeping::ReferenceClient, "invoice ownership" do
   end
 
   it "refuses invoice ids that are not Integers before building a request URL" do
-    expect { invoice_client.owned_invoice_ids(company_id: 5, invoice_ids: ["1&x=2"]) }.to raise_error(ArgumentError)
-    expect { invoice_client.owned_invoice_ids(company_id: "5", invoice_ids: [41]) }.to raise_error(ArgumentError)
+    expect { invoice_client.invoice_holders(company_id: 5, invoice_ids: ["1&x=2"]) }.to raise_error(ArgumentError)
+    expect { invoice_client.invoice_holders(company_id: "5", invoice_ids: [41]) }.to raise_error(ArgumentError)
     expect(a_request(:any, /.*/)).not_to have_been_made
   end
 end
