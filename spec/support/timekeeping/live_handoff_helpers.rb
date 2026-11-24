@@ -199,6 +199,19 @@ module TimekeepingLiveHandoff
     ).column_values(0).map { |position| Integer(position) }
   end
 
+  # The newest unsent snapshot of each given entry, as
+  # { entry_id => { version:, note: } }. An entry with several queued versions
+  # appears once, at its highest version; an entry with nothing unsent is
+  # absent.
+  def latest_queued_snapshots(connection, entry_ids:)
+    ids = PG::TextEncoder::Array.new.encode(entry_ids.map { |id| Integer(id) })
+    connection.exec_params(
+      "SELECT DISTINCT ON (id) id, version, note FROM outbox_snapshots " \
+      "WHERE sent_at IS NULL AND id = ANY($1::bigint[]) ORDER BY id, version DESC",
+      [ids]
+    ).to_h { |row| [Integer(row.fetch("id")), { version: Integer(row.fetch("version")), note: row.fetch("note") }] }
+  end
+
   # receipts: EntrySnapshotReceipt-like objects answering id and response_body.
   # One receipt covers every company in its batch, so each receipt above the
   # baseline counts once; summing per company would count it twice.
