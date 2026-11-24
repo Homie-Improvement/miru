@@ -263,11 +263,15 @@ module Timekeeping
     # The legacy store does the same from its own receipt, and authorizes the
     # replayed entry with authorize_replay, the permission to read back a
     # committed answer: the delete policy may refuse the entry by now, for
-    # example once its edit window has closed. It defaults to authorize.
+    # example once its edit window has closed. It defaults to authorize. On
+    # every owner after the legacy store, a retry of a delete the legacy store
+    # committed is answered first from that store's own receipt, held to the
+    # same checks (see carried_legacy_destroy).
     # :reek:LongParameterList
     def destroy(entry_id:, authorize:, authorize_replay: authorize, expected_generation: nil, scope: :company)
       perform(expected_generation) do |ownership, owner|
         next legacy_destroy(ownership:, entry_id:, authorize:, authorize_replay:, scope:) if owner == :legacy
+        next true if carried_legacy_destroy(entry_id:, authorize_replay:, scope:)
 
         replayed = replay_committed(ownership:, owner:, operation: :destroy, entry_id:, identity: {})
         if replayed
@@ -283,18 +287,7 @@ module Timekeeping
 
           raise
         end
-        entry = found.entry
-        EntryLookup.check_target(entry, context:, entry_id:, scope:)
-        authorize.call(entry)
-        case owner
-        when :prepared
-          local_write(ownership:, operation: :destroy, entry_id: entry.id, if_match: context.if_match || found.version,
-                      body: {}, identity: {}, idempotency_key: request_key(:destroy, entry.id))
-        when :timekeeping
-          write_client.destroy_entry(context:, generation: ownership.generation, entry_id: entry.id,
-                                     version: found.version)
-        end
-        true
+        destroy_found(ownership:, owner:, found:, entry_id:, authorize:, scope:)
       end
     end
 
@@ -622,7 +615,7 @@ module Timekeeping
       # the prepared store's receipt while it owns the entries, and a receipt
       # it wrote before a re-cutover while Timekeeping owns them. The legacy
       # store's receipts are read by legacy_create, legacy_entry_write,
-      # carried_legacy_create and carried_legacy_update.
+      # carried_legacy_create, carried_legacy_update and carried_legacy_destroy.
       # :reek:LongParameterList
       def replay_committed(ownership:, owner:, operation:, identity:, entry_id: nil,
                            keys: replay_keys(request_key(operation, entry_id)))
@@ -831,9 +824,27 @@ module Timekeeping
         end
       end
 
+      # Deletes the entry the owner's lookup found, in the store that owns it,
+      # once it passes the lookup's company, id and scope checks and the
+      # delete policy. Returns true.
+      def destroy_found(ownership:, owner:, found:, entry_id:, authorize:, scope:)
+        entry = found.entry
+        EntryLookup.check_target(entry, context:, entry_id:, scope:)
+        authorize.call(entry)
+        case owner
+        when :prepared
+          local_write(ownership:, operation: :destroy, entry_id: entry.id, if_match: context.if_match || found.version,
+                      body: {}, identity: {}, idempotency_key: request_key(:destroy, entry.id))
+        when :timekeeping
+          write_client.destroy_entry(context:, generation: ownership.generation, entry_id: entry.id,
+                                     version: found.version)
+        end
+        true
+      end
+
       # :reek:LongParameterList
       def legacy_destroy(ownership:, entry_id:, authorize:, authorize_replay:, scope:)
-        fingerprint = legacy_entry_write_fingerprint("entry_id" => ENTRY_ID_TYPE.cast(entry_id))
+        fingerprint = legacy_destroy_fingerprint(entry_id)
         legacy_entry_write(operation: :destroy, entry_id:, fingerprint:, authorize_replay:, scope:) do
           find_authorized(ownership:, entry_id:, authorize:, scope:).entry.tap(&:discard!)
         end
@@ -893,6 +904,21 @@ module Timekeeping
                                            fingerprint: legacy_update_fingerprint(entry_id:, project_id:, attributes:))
       end
 
+      # The same as carried_legacy_update, for a legacy-store delete committed
+      # before a handoff. The new owner no longer finds the discarded entry
+      # and holds no receipt for it, so without this the retry would be
+      # forwarded or replayed there and answered not found. Returns the
+      # replayed entry, or nil when the request sent no key of its own or none
+      # was stored for it. This read never writes.
+      def carried_legacy_destroy(entry_id:, authorize_replay:, scope:)
+        key = context.idempotency_key
+        return if key.nil?
+
+        receipt = LegacyEntryWriteReceipt.find_by(legacy_create_scope(key).merge(operation: "destroy"))
+        replay_legacy_entry_write(receipt, operation: :destroy, entry_id:, authorize_replay:, scope:,
+                                           fingerprint: legacy_destroy_fingerprint(entry_id))
+      end
+
       # The answer a stored legacy update or delete receipt gives a retry: a
       # read-only copy of the entry as the first attempt committed it, held
       # to the lookup's company, id and scope checks and then to
@@ -910,6 +936,10 @@ module Timekeeping
         when :key_reused
           raise EntryWriteClient.refusal_error(operation:, status: 422, reason: KEY_REUSED_REASON)
         end
+      end
+
+      def legacy_destroy_fingerprint(entry_id)
+        legacy_entry_write_fingerprint("entry_id" => ENTRY_ID_TYPE.cast(entry_id))
       end
 
       def legacy_update_fingerprint(entry_id:, project_id:, attributes:)

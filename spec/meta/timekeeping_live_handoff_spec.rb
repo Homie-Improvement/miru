@@ -150,6 +150,23 @@ RSpec.describe LiveHandoff do
         .to raise_error(StandardError)
     end
   end
+
+  context "more tests 2" do
+    it "expected_web_destroy_reply is the destroy notice alone and only a byte-equal 2xx reply counts as answered" do
+      expected = described_class.expected_web_destroy_reply
+
+      expect(JSON.parse(expected)).to eq({ "notice" => I18n.t("timesheet_entry.destroy.message") })
+      expect(described_class.replay_verdict(status: 200, body: expected, expected_body: expected, refusals: []))
+        .to eq(:answered_from_receipt)
+      # A refused retry is not an answer from the receipt, so the destroy capture's empty refusal list fails it.
+      key_reused = { "errors" => I18n.t("errors.entry_write_rejected"),
+                     "reason" => Timekeeping::Gateway::KEY_REUSED_REASON }.to_json
+      expect(described_class.replay_verdict(status: 422, body: key_reused, expected_body: expected, refusals: []))
+        .to eq(:failed)
+      expect(described_class.replay_verdict(status: 404, body: { errors: "not found" }.to_json, expected_body: expected,
+                                            refusals: [])).to eq(:failed)
+    end
+  end
 end
 
 

@@ -1991,6 +1991,395 @@ RSpec.describe Timekeeping::Gateway do
       expect(Timekeeping::LegacyEntryWriteReceipt.count).to eq(receipts_before)
     end
   end
+
+  context "more tests 40" do
+    context "carried legacy destroy company isolation after rollback" do
+      it "after rollback a legacy destroy receipt answers only its own company and another company's same key is not found" do
+        entry = create(:timesheet_entry, user: prepared_user, project: prepared_project, bill_status: :unbilled)
+        key = "carried-legacy-destroy-shared-key"
+        intruder_company = create(:company)
+        intruder = create(:user, current_workspace_id: intruder_company.id).tap do |user|
+          create(:employment, company: intruder_company, user:)
+          user.add_role :owner, intruder_company
+        end
+        gateway_for = lambda do |company, actor, request_id|
+          context = Timekeeping::WriteContext.new(company:, actor:, actor_kind: "user", request_id:, idempotency_key: key)
+          described_class.new(context:, write_client: instance_double(Timekeeping::EntryWriteClient),
+                                        read_client: instance_double(Timekeeping::EntryApiClient))
+        end
+
+        expect(described_class.new(context: Timekeeping::WriteContext.new(
+          company: prepared_company, actor: prepared_user, actor_kind: "user",
+          request_id: "req-carried-del-iso-1", idempotency_key: key
+        )).destroy(entry_id: entry.id, authorize: ->(_) { })).to be(true)
+        discarded_at = TimesheetEntry.unscoped.find(entry.id).discarded_at
+        receipts_before = Timekeeping::LegacyEntryWriteReceipt.pluck(:id, :company_id, :fingerprint)
+        intruder_audits = -> { Audited::Audit.where(associated_type: "Company", associated_id: intruder_company.id).count }
+        intruder_audits_before = intruder_audits.call
+        TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 3)
+        counts_before = timekeeping_row_counts
+
+        # "A legacy-store destroy retried after cutover, rollback or re-cutover is answered from its LegacyEntryWriteReceipt with no forwarded or local second write, and a live late-replay example shows this."
+        expect(gateway_for.call(prepared_company, prepared_user, "req-carried-del-iso-2")
+                 .destroy(entry_id: entry.id, authorize: ->(_) { }, authorize_replay: ->(_) { })).to be(true)
+
+        # Another company sending the same key and entry id must never be answered from this company's receipt.
+        expect do
+          gateway_for.call(intruder_company, intruder, "req-carried-del-iso-3")
+                     .destroy(entry_id: entry.id, authorize: ->(_) { }, authorize_replay: ->(_) { })
+        end.to raise_error(ActiveRecord::RecordNotFound)
+
+        expect(TimesheetEntry.unscoped.find(entry.id).discarded_at).to eq(discarded_at)
+        expect(Timekeeping::LegacyEntryWriteReceipt.pluck(:id, :company_id, :fingerprint)).to eq(receipts_before)
+        expect(Timekeeping::LegacyEntryWriteReceipt.where(company_id: intruder_company.id)).not_to exist
+        expect(intruder_audits.call).to eq(intruder_audits_before)
+        expect(timekeeping_row_counts).to eq(counts_before)
+      end
+    end
+  end
+
+  context "more tests 41" do
+    it "answers a legacy destroy retried after cutover, rollback and re-cutover from its stored receipt with no forwarded or local second write" do
+      entry = create(:timesheet_entry, user: prepared_user, project: prepared_project, bill_status: :unbilled)
+      bystander = create(:timesheet_entry, user: prepared_user, project: prepared_project, bill_status: :unbilled)
+      key = "late-replay-legacy-destroy-handoffs"
+      context_for = lambda do |request_id|
+        Timekeeping::WriteContext.new(company: prepared_company, actor: prepared_user, actor_kind: "user",
+                                      request_id:, idempotency_key: key)
+      end
+      expect(described_class.new(context: context_for.call("req-late-destroy-0"))
+                            .destroy(entry_id: entry.id, authorize: ->(_) { })).to be(true)
+      expect(Timekeeping::LegacyEntryWriteReceipt.where(timesheet_entry_id: entry.id, operation: "destroy").count).to eq(1)
+
+      discarded_at = TimesheetEntry.unscoped.find(entry.id).discarded_at
+      expect(discarded_at).to be_present
+      audits = -> { Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: [entry.id, bystander.id]).count }
+      receipts = -> { Timekeeping::LegacyEntryWriteReceipt.order(:id).pluck(:id, :operation, :fingerprint, :expires_at) }
+      audits_before = audits.call
+      receipts_before = receipts.call
+      entries_before = TimesheetEntry.unscoped.count
+      ownership = TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+
+      handoffs = {
+        "cutover" => { owner: "timekeeping", generation: 2 },
+        "rollback" => { owner: "monolith", monolith_store: "prepared", generation: 3 },
+        "re-cutover" => { owner: "timekeeping", generation: 4 }
+      }
+      handoffs.each_with_index do |(handoff, columns), index|
+        ownership.update_columns(**columns)
+        counts_before = timekeeping_row_counts
+        # Doubles with no allowed methods: a forwarded DELETE or a remote lookup fails the example.
+        gateway = described_class.new(
+          context: context_for.call("req-late-destroy-#{index + 1}"),
+          write_client: instance_double(Timekeeping::EntryWriteClient),
+          read_client: instance_double(Timekeeping::EntryApiClient)
+        )
+
+        # "A legacy-store destroy retried after cutover, rollback or re-cutover is answered from its LegacyEntryWriteReceipt with no forwarded or local second write, and a live late-replay example shows this."
+        expect(gateway.destroy(entry_id: entry.id, authorize: ->(_) { }, authorize_replay: ->(_) { })).to be(true), handoff
+        # Without its own authorize_replay, the retry is read back with authorize.
+        expect(gateway.destroy(entry_id: entry.id, authorize: ->(_) { })).to be(true), handoff
+        expect(timekeeping_row_counts).to eq(counts_before), handoff
+        expect(TimesheetEntry.unscoped.count).to eq(entries_before), handoff
+        expect(TimesheetEntry.unscoped.find(entry.id).discarded_at).to eq(discarded_at), handoff
+        expect(TimesheetEntry.unscoped.find(bystander.id).discarded_at).to be_nil, handoff
+        expect(audits.call).to eq(audits_before), handoff
+        expect(receipts.call).to eq(receipts_before), handoff
+      end
+    end
+  end
+
+  context "more tests 42" do
+    it "a legacy destroy receipt past its expiry date still answers the retry after cutover and is kept" do
+      entry = create(:timesheet_entry, user: prepared_user, project: prepared_project, bill_status: :unbilled)
+      context_for = lambda do |request_id|
+        Timekeeping::WriteContext.new(company: prepared_company, actor: prepared_user, actor_kind: "user",
+                                      request_id:, idempotency_key: "late-replay-legacy-destroy-expired")
+      end
+      described_class.new(context: context_for.call("req-late-destroy-expired-1"))
+                     .destroy(entry_id: entry.id, authorize: ->(_) { })
+      Timekeeping::LegacyEntryWriteReceipt.where(timesheet_entry_id: entry.id, operation: "destroy")
+                                          .update_all(expires_at: 1.second.ago)
+      receipts_before = Timekeeping::LegacyEntryWriteReceipt.order(:id).pluck(:id, :fingerprint, :expires_at)
+      expect(receipts_before.size).to eq(1)
+      discarded_at = TimesheetEntry.unscoped.find(entry.id).discarded_at
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+      counts_before = timekeeping_row_counts
+
+      gateway = described_class.new(
+        context: context_for.call("req-late-destroy-expired-2"),
+        write_client: instance_double(Timekeeping::EntryWriteClient),
+        read_client: instance_double(Timekeeping::EntryApiClient)
+      )
+      read_back = []
+
+      # "A legacy-store destroy retried after cutover, rollback or re-cutover is answered from its LegacyEntryWriteReceipt with no forwarded or local second write, and a live late-replay example shows this."
+      # The delete policy is not consulted: the committed delete is read back with authorize_replay.
+      expect(gateway.destroy(entry_id: entry.id, authorize: ->(_) { raise Pundit::NotAuthorizedError },
+                             authorize_replay: ->(replayed) { read_back << replayed.id })).to be(true)
+      expect(read_back).to eq([entry.id])
+      expect(Timekeeping::LegacyEntryWriteReceipt.order(:id).pluck(:id, :fingerprint, :expires_at)).to eq(receipts_before)
+      expect(TimesheetEntry.unscoped.find(entry.id).discarded_at).to eq(discarded_at)
+      expect(timekeeping_row_counts).to eq(counts_before)
+    end
+  end
+
+  context "more tests 43" do
+    it "a legacy destroy key reused for another entry after cutover is refused as key reused and discards nothing" do
+      entry = create(:timesheet_entry, user: prepared_user, project: prepared_project, bill_status: :unbilled)
+      other = create(:timesheet_entry, user: prepared_user, project: prepared_project, bill_status: :unbilled)
+      context_for = lambda do |request_id|
+        Timekeeping::WriteContext.new(company: prepared_company, actor: prepared_user, actor_kind: "user",
+                                      request_id:, idempotency_key: "late-replay-legacy-destroy-reused")
+      end
+      described_class.new(context: context_for.call("req-late-destroy-reused-1"))
+                     .destroy(entry_id: entry.id, authorize: ->(_) { })
+      receipts_before = Timekeeping::LegacyEntryWriteReceipt.order(:id).pluck(:id, :operation, :fingerprint)
+      audits_before = Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: other.id).count
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+      counts_before = timekeeping_row_counts
+
+      # Doubles with no allowed methods: a forwarded DELETE of the other entry fails the example.
+      gateway = described_class.new(
+        context: context_for.call("req-late-destroy-reused-2"),
+        write_client: instance_double(Timekeeping::EntryWriteClient),
+        read_client: instance_double(Timekeeping::EntryApiClient)
+      )
+
+      expect { gateway.destroy(entry_id: other.id, authorize: ->(_) { }, authorize_replay: ->(_) { }) }
+        .to raise_error(Timekeeping::EntryWriteClient::KeyReused)
+      # The refusal does not depend on a separate authorize_replay being given.
+      expect { gateway.destroy(entry_id: other.id, authorize: ->(_) { }) }
+        .to raise_error(Timekeeping::EntryWriteClient::KeyReused)
+      expect(TimesheetEntry.unscoped.find(other.id).discarded_at).to be_nil
+      expect(Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: other.id).count).to eq(audits_before)
+      expect(Timekeeping::LegacyEntryWriteReceipt.order(:id).pluck(:id, :operation, :fingerprint)).to eq(receipts_before)
+      expect(timekeeping_row_counts).to eq(counts_before)
+    end
+  end
+
+  context "more tests 45" do
+    context "carried legacy destroy under the actor scope" do
+      it "after cutover a carried legacy destroy retried under the actor scope for another user's entry answers not found and forwards nothing" do
+        company = create(:company)
+        project = create(:project, billable: true, client: create(:client, company:))
+        admin = create(:user, current_workspace_id: company.id).tap do |user|
+          create(:employment, company:, user:)
+          user.add_role :admin, company
+        end
+        member = create(:user, current_workspace_id: company.id).tap do |user|
+          create(:employment, company:, user:)
+          user.add_role :employee, company
+        end
+        member_entry = create(:timesheet_entry, user: member, project:, bill_status: :unbilled)
+        key = "carried-legacy-destroy-actor-scope-key"
+        context_for = lambda do |request_id|
+          Timekeeping::WriteContext.new(company:, actor: admin, actor_kind: "user", request_id:, idempotency_key: key)
+        end
+
+        # The admin deletes the member's entry in the legacy store under the company scope.
+        expect(described_class.new(context: context_for.call("req-actor-destroy-1"))
+                              .destroy(entry_id: member_entry.id, authorize: ->(_entry) { })).to be(true)
+        discarded_at = TimesheetEntry.unscoped.find(member_entry.id).discarded_at
+        receipts_before = Timekeeping::LegacyEntryWriteReceipt.where(company_id: company.id).pluck(:id, :fingerprint)
+
+        TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+        counts_before = timekeeping_row_counts
+
+        # The receipt matches this actor and key, but under the actor scope the stored entry
+        # belongs to another user, so the retry must get the same not-found answer as a missing
+        # entry, with no forwarded DELETE or remote lookup (the doubles allow no methods).
+        gateway = described_class.new(
+          context: context_for.call("req-actor-destroy-2"),
+          write_client: instance_double(Timekeeping::EntryWriteClient),
+          read_client: instance_double(Timekeeping::EntryApiClient)
+        )
+        expect do
+          gateway.destroy(entry_id: member_entry.id, authorize: ->(_entry) { }, authorize_replay: ->(_entry) { },
+                          scope: :actor)
+        end.to raise_error(ActiveRecord::RecordNotFound)
+
+        expect(TimesheetEntry.unscoped.find(member_entry.id).discarded_at).to eq(discarded_at)
+        expect(Timekeeping::LegacyEntryWriteReceipt.where(company_id: company.id).pluck(:id, :fingerprint))
+          .to match_array(receipts_before)
+        expect(timekeeping_row_counts).to eq(counts_before)
+      end
+    end
+  end
+
+  context "more tests 47" do
+    it "answers a legacy destroy retried in the prepared store after rollback from its stored receipt with no local write" do
+      entry = create(:timesheet_entry, user: prepared_user, project: prepared_project, bill_status: :unbilled)
+      key = "carried-legacy-destroy-rollback"
+      context_for = lambda do |request_id|
+        Timekeeping::WriteContext.new(company: prepared_company, actor: prepared_user, actor_kind: "user",
+                                      request_id:, idempotency_key: key)
+      end
+
+      described_class.new(context: context_for.call("req-carried-rollback-1"))
+                     .destroy(entry_id: entry.id, authorize: ->(_) { })
+      discarded_at = TimesheetEntry.unscoped.find(entry.id).discarded_at
+      audits_before = Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count
+      receipts_before = Timekeeping::LegacyEntryWriteReceipt.pluck(:id, :fingerprint)
+
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 3)
+      counts_before = timekeeping_row_counts
+
+      retried = described_class.new(
+        context: context_for.call("req-carried-rollback-2"), write_client: instance_double(Timekeeping::EntryWriteClient),
+        read_client: instance_double(Timekeeping::EntryApiClient)
+      ).destroy(entry_id: entry.id, authorize: ->(_) { }, authorize_replay: ->(_) { })
+
+      # "A legacy-store destroy retried after cutover, rollback or re-cutover is answered from its LegacyEntryWriteReceipt with no forwarded or local second write, and a live late-replay example shows this."
+      expect(retried).to be(true)
+      expect(timekeeping_row_counts).to eq(counts_before)
+      expect(TimesheetEntry.unscoped.find(entry.id).discarded_at).to eq(discarded_at)
+      expect(Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count).to eq(audits_before)
+      expect(Timekeeping::LegacyEntryWriteReceipt.pluck(:id, :fingerprint)).to eq(receipts_before)
+    end
+  end
+
+  context "more tests 53" do
+    it "an expired legacy destroy receipt still answers the retry after rollback and is not pruned" do
+      entry = create(:timesheet_entry, user: prepared_user, project: prepared_project, bill_status: :unbilled)
+      key = "late-replay-legacy-destroy-expired"
+      context_for = lambda do |request_id|
+        Timekeeping::WriteContext.new(company: prepared_company, actor: prepared_user, actor_kind: "user",
+                                      request_id:, idempotency_key: key)
+      end
+
+      described_class.new(context: context_for.call("req-destroy-expired-1")).destroy(entry_id: entry.id, authorize: ->(_) { })
+      Timekeeping::LegacyEntryWriteReceipt.where(timesheet_entry_id: entry.id, operation: "destroy")
+                                          .update_all(expires_at: 1.second.ago)
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 3)
+      counts_before = timekeeping_row_counts
+
+      gateway = described_class.new(
+        context: context_for.call("req-destroy-expired-2"), write_client: instance_double(Timekeeping::EntryWriteClient),
+        read_client: instance_double(Timekeeping::EntryApiClient)
+      )
+
+      # "A legacy-store destroy retried after cutover, rollback or re-cutover is answered from its LegacyEntryWriteReceipt with no forwarded or local second write, and a live late-replay example shows this."
+      # Nothing prunes receipts after the handoff, so an expired one is still the only record that the delete committed.
+      expect(gateway.destroy(entry_id: entry.id, authorize: ->(_) { })).to be(true)
+      expect(timekeeping_row_counts).to eq(counts_before)
+      expect(Timekeeping::LegacyEntryWriteReceipt.where(timesheet_entry_id: entry.id, operation: "destroy").count).to eq(1)
+    end
+  end
+
+  context "more tests 54" do
+    it "a carried legacy destroy is held to authorize_replay, not the delete policy, and a refusing authorize_replay confirms nothing" do
+      entry = create(:timesheet_entry, user: prepared_user, project: prepared_project, bill_status: :unbilled)
+      key = "late-replay-legacy-destroy-policy"
+      context_for = lambda do |request_id|
+        Timekeeping::WriteContext.new(company: prepared_company, actor: prepared_user, actor_kind: "user",
+                                      request_id:, idempotency_key: key)
+      end
+      gateway_for = lambda do |request_id|
+        described_class.new(context: context_for.call(request_id), write_client: instance_double(Timekeeping::EntryWriteClient),
+                            read_client: instance_double(Timekeeping::EntryApiClient))
+      end
+      refuse = ->(_entry) { raise Pundit::NotAuthorizedError }
+
+      described_class.new(context: context_for.call("req-destroy-policy-1")).destroy(entry_id: entry.id, authorize: ->(_) { })
+      discarded_at = TimesheetEntry.unscoped.find(entry.id).discarded_at
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+      counts_before = timekeeping_row_counts
+      replay_checked = []
+      refuse_after_check = lambda do |replayed|
+        replay_checked << replayed.id
+        raise Pundit::NotAuthorizedError
+      end
+
+      # "A legacy-store destroy retried after cutover, rollback or re-cutover is answered from its LegacyEntryWriteReceipt with no forwarded or local second write, and a live late-replay example shows this."
+      # The delete policy may refuse the entry by now; the committed delete is read back with authorize_replay.
+      expect(gateway_for.call("req-destroy-policy-2").destroy(entry_id: entry.id, authorize: refuse,
+                                                              authorize_replay: ->(_) { })).to be(true)
+      # A caller authorize_replay refuses gets no confirmation of the delete.
+      expect do
+        gateway_for.call("req-destroy-policy-3").destroy(entry_id: entry.id, authorize: ->(_) { },
+                                                         authorize_replay: refuse_after_check)
+      end.to raise_error(Pundit::NotAuthorizedError)
+      expect(replay_checked).to eq([entry.id])
+      expect(TimesheetEntry.unscoped.find(entry.id).discarded_at).to eq(discarded_at)
+      expect(timekeeping_row_counts).to eq(counts_before)
+    end
+  end
+
+  context "carried legacy destroy receipt scoping and order" do
+    let(:carried_scoping_key) { "carried-legacy-destroy-scoping" }
+    let(:carried_scoping_entry) do
+      create(:timesheet_entry, user: prepared_user, project: prepared_project, bill_status: :unbilled)
+    end
+
+    def carried_scoping_context(request_id, actor: prepared_user, key: carried_scoping_key)
+      Timekeeping::WriteContext.new(company: prepared_company, actor:, actor_kind: "user", request_id:,
+                                    idempotency_key: key)
+    end
+
+    # Doubles with no allowed methods: a lookup, a forwarded call or a prepared-store replay fails the example.
+    def carried_scoping_gateway(context)
+      described_class.new(context:, local_owner: class_double(Timekeeping::LocalOwner),
+                                    write_client: instance_double(Timekeeping::EntryWriteClient),
+                                    read_client: instance_double(Timekeeping::EntryApiClient))
+    end
+
+    it "answers a legacy destroy from its receipt before the prepared store's own receipts are read" do
+      expect(described_class.new(context: carried_scoping_context("req-scoping-order-1"))
+                            .destroy(entry_id: carried_scoping_entry.id, authorize: ->(_) { })).to be(true)
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(monolith_store: "prepared", generation: 3)
+
+      # The legacy receipt answers first, so the prepared store's replay is never called.
+      expect(carried_scoping_gateway(carried_scoping_context("req-scoping-order-2"))
+               .destroy(entry_id: carried_scoping_entry.id, authorize: ->(_) { }, authorize_replay: ->(_) { }))
+        .to be(true)
+    end
+
+    it "never answers a destroy from a legacy update receipt, or an update from a legacy destroy receipt" do
+      attributes = { duration: 30, work_date: Date.current, note: "Edited before cutover", bill_status: "unbilled" }
+      described_class.new(context: carried_scoping_context("req-scoping-op-1"))
+                     .update(entry_id: carried_scoping_entry.id, project: prepared_project, attributes:,
+                             authorize: ->(_) { })
+      other = create(:timesheet_entry, user: prepared_user, project: prepared_project, bill_status: :unbilled)
+      destroy_key = "carried-legacy-destroy-scoping-op"
+      described_class.new(context: carried_scoping_context("req-scoping-op-2", key: destroy_key))
+                     .destroy(entry_id: other.id, authorize: ->(_) { })
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+
+      # Each retry finds no receipt of its own operation, so it goes on to the owner and reaches a double that allows nothing.
+      expect do
+        carried_scoping_gateway(carried_scoping_context("req-scoping-op-3"))
+          .destroy(entry_id: carried_scoping_entry.id, authorize: ->(_) { }, authorize_replay: ->(_) { })
+      end.to raise_error(RSpec::Mocks::MockExpectationError)
+      expect do
+        carried_scoping_gateway(carried_scoping_context("req-scoping-op-4", key: destroy_key))
+          .update(entry_id: other.id, project: prepared_project, attributes:, authorize: ->(_) { })
+      end.to raise_error(RSpec::Mocks::MockExpectationError)
+      expect(carried_scoping_entry.reload.discarded_at).to be_nil
+    end
+
+    it "does not answer a destroy retried without its own key, or by another actor with the same key, from the receipt" do
+      other_actor = create(:user, current_workspace_id: prepared_company.id).tap do |user|
+        create(:employment, company: prepared_company, user:)
+        user.add_role :admin, prepared_company
+      end
+      described_class.new(context: carried_scoping_context("req-scoping-actor-1"))
+                     .destroy(entry_id: carried_scoping_entry.id, authorize: ->(_) { })
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(owner: "timekeeping", generation: 2)
+      receipts_before = Timekeeping::LegacyEntryWriteReceipt.order(:id).pluck(:id, :fingerprint)
+
+      # Neither retry matches the stored receipt, so each goes on to the owner and reaches a double that allows nothing.
+      expect do
+        carried_scoping_gateway(carried_scoping_context("req-scoping-actor-2", key: nil))
+          .destroy(entry_id: carried_scoping_entry.id, authorize: ->(_) { }, authorize_replay: ->(_) { })
+      end.to raise_error(RSpec::Mocks::MockExpectationError)
+      expect do
+        carried_scoping_gateway(carried_scoping_context("req-scoping-actor-3", actor: other_actor))
+          .destroy(entry_id: carried_scoping_entry.id, authorize: ->(_) { }, authorize_replay: ->(_) { })
+      end.to raise_error(RSpec::Mocks::MockExpectationError)
+      expect(Timekeeping::LegacyEntryWriteReceipt.order(:id).pluck(:id, :fingerprint)).to eq(receipts_before)
+    end
+  end
 end
 
 RSpec.describe Timekeeping::Gateway, committed_data: true do
