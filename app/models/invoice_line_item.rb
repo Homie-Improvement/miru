@@ -173,31 +173,26 @@ class InvoiceLineItem < ApplicationRecord
     end
 
     # A line moved to another invoice changes the entries of both.
-    def register_reservation_change(added_references = [])
-      Invoices::ReservationBoundary.register(invoice, added_references:) if invoice
+    def register_reservation_change(changed_references = [])
+      Invoices::ReservationBoundary.register(invoice, changed_references:) if invoice
       return unless will_save_change_to_invoice_id? && invoice_id_in_database
 
       previous_invoice = Invoice.find_by(id: invoice_id_in_database)
       Invoices::ReservationBoundary.register(previous_invoice) if previous_invoice
     end
 
-    # A new or retargeted direct entry is a new reference, and a line moved to
-    # another invoice brings its direct entry and its stored links there as new
-    # references, so the boundary checks each one at commit. New links register
-    # their own entry when they are saved.
+    # A new line, a changed direct entry or a move to another invoice changes
+    # where the line names its entry, and a move also changes where its stored
+    # links name theirs, so the boundary checks those rows at commit. New links
+    # are passed when they are saved themselves.
     def register_reservation_change_on_save
-      added_references = []
-      if timesheet_entry_id &&
-         (new_record? || will_save_change_to_timesheet_entry_id? || will_save_change_to_invoice_id?)
-        stored = [timesheet_entry_id_in_database, invoice_id_in_database] if persisted?
-        added_references << [self, timesheet_entry_id, stored]
-      end
+      changed_references = []
+      changed_references << self if new_record? || will_save_change_to_timesheet_entry_id? ||
+        will_save_change_to_invoice_id?
       if persisted? && will_save_change_to_invoice_id?
-        InvoiceLineItemTimeEntry.where(invoice_line_item_id: id).find_each do |link|
-          added_references << [link, link.timesheet_entry_id, [link.timesheet_entry_id, invoice_id_in_database]]
-        end
+        changed_references.concat(InvoiceLineItemTimeEntry.where(invoice_line_item_id: id).to_a)
       end
-      register_reservation_change(added_references)
+      register_reservation_change(changed_references)
     end
 
     def capture_previous_invoice_id
