@@ -37,13 +37,29 @@ module InvoiceEntryReferenceExpectations
       record.errors.to_hash
     when :prepare_response
       refusal = nil
+      rows_before = invoice_entry_reference_rows
+      stored_before = record.persisted? ? record.class.find(record.id).attributes : nil
       expect { record.save(validate: via != :save_without_validation) }
         .to raise_error(Invoices::OperationErrors::Refused) { |error| refusal = error }
+      # The refusal rolls the whole save back: no invoice, line or link row
+      # changes, and a stored record keeps its stored references.
+      expect(invoice_entry_reference_rows).to eq(rows_before)
+      expect(record.class.find(record.id).attributes).to eq(stored_before) if stored_before
       reasons = refusal.outcome.conflicts.map { |conflict| conflict.fetch(:reason) }.uniq
       expect(reasons).to eq([NOT_FOUND_REASON])
       reasons
     end
   end
+
+  private
+
+    # Every invoice, line and link row as stored, so a refused save can be
+    # shown to have written nothing.
+    def invoice_entry_reference_rows
+      [Invoice, InvoiceLineItem, InvoiceLineItemTimeEntry].to_h do |model|
+        [model.name, model.order(:id).map(&:attributes)]
+      end
+    end
 end
 
 RSpec.configure do |config|

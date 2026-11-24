@@ -783,6 +783,33 @@ RSpec.describe Invoices::ReservationBoundary, "checking the entries a save adds"
     expect(adapter.prepared.map(&:entries)).to eq([[unprojected_id]])
   end
 
+  [:direct, :linked].each do |kind|
+    it "under the timekeeping owner refuses a new #{kind} reference to a foreign id an older line already names" do
+      foreign_id = added_check_foreign_entry.id
+      draft = create(:invoice, company: added_check_company, client: added_check_client)
+      # A row written before validation refused foreign ids: insert_all runs no callback or validation.
+      InvoiceLineItem.insert_all!([{ invoice_id: draft.id, name: "Old", date: Date.current, rate: 100, quantity: 60,
+                                     timesheet_entry_id: foreign_id, created_at: Time.current, updated_at: Time.current }])
+      adapter = added_check_adapter_class.new
+      allow(Invoices::ReservationAdapters).to receive(:for).and_return(adapter)
+      added_check_take_timekeeping_ownership
+      line = InvoiceLineItem.new(invoice: Invoice.find(draft.id), name: "New", date: Date.current, rate: 100,
+                                 quantity: 60)
+      if kind == :direct
+        line.timesheet_entry_id = foreign_id
+      else
+        line.linked_timesheet_entry_ids = [foreign_id]
+      end
+
+      expect { line.save! }.to raise_error(Invoices::OperationErrors::Refused) { |refusal|
+        expect(refusal.outcome.conflicts).to eq([{ entry_id: foreign_id, reason: "not_found" }])
+      }
+      expect(InvoiceLineItem.where(invoice_id: draft.id).pluck(:name)).to eq(["Old"])
+      expect(InvoiceLineItemTimeEntry.where(timesheet_entry_id: foreign_id)).to be_empty
+      expect(adapter.prepared).to be_empty
+    end
+  end
+
   it "under the timekeeping owner refuses a no-company projected entry added to a draft as not found" do
     no_company_entry = create(:timesheet_entry, user: added_check_user, project: added_check_project,
       bill_status: "unbilled")

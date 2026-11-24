@@ -120,13 +120,15 @@ module Invoices
     module CompanyEntries
       module_function
 
-      # Every entry id the invoice's direct and grouped lines name now, read
-      # from the line rows alone. The invoice id pins the company.
+      # Every entry reference the invoice's direct and grouped lines hold now,
+      # read from the line rows alone, one id per reference, sorted. An id
+      # named twice appears twice, so a new reference to an id an older row
+      # already names still counts as added. The invoice id pins the company.
       def referenced(invoice_id)
         direct = InvoiceLineItem.where(invoice_id:).where.not(timesheet_entry_id: nil).pluck(:timesheet_entry_id)
         grouped = InvoiceLineItemTimeEntry.joins(:invoice_line_item)
           .where(invoice_line_items: { invoice_id: }).pluck(:timesheet_entry_id)
-        ReservationRequest.canonical_entries(direct + grouped)
+        (direct + grouped).sort.freeze
       end
 
       # The entry ids an invoice's lines reference now that it can hold.
@@ -330,9 +332,12 @@ module Invoices
           @holding || { entries: @captured, disposition: ACTIVE }
         end
 
-        # The ids this transaction added to the invoice's lines.
+        # The ids this transaction added a reference to: each id the lines now
+        # name more often than at registration, including one an older row
+        # already named.
         def added_entries
-          @referenced - registration.referenced_entries
+          before = registration.referenced_entries.tally
+          @referenced.tally.filter_map { |entry_id, count| entry_id if count > before.fetch(entry_id, 0) }
         end
 
         # Added ids the invoice cannot hold, as CompanyEntries.within decides

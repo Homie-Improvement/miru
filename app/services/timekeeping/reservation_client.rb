@@ -122,14 +122,16 @@ module Timekeeping
     end
 
     # The not_found conflicts for a prepare answer: every requested entry the
-    # answer does not list under the request's company, then every listed
-    # entry the request did not name. Empty when the answer confirms exactly
-    # the requested entries.
+    # answer does not list under the request's company, every entry it lists
+    # under any other company (even beside an item naming the right one), then
+    # every listed entry the request did not name. Empty when the answer
+    # confirms exactly the requested entries.
     def self.company_mismatches(request, entries)
-      confirmed = entries.filter_map { |entry| entry[:entry_id] if entry[:company_id] == request.company_id }
-      unconfirmed = request.entries - confirmed
+      confirmed, contradicted = entries.partition { |entry| entry[:company_id] == request.company_id }
+      unconfirmed = request.entries - confirmed.pluck(:entry_id)
       unrequested = entries.pluck(:entry_id) - request.entries
-      (unconfirmed + unrequested).uniq.map { |entry_id| { entry_id:, reason: NOT_FOUND_REASON } }
+      (unconfirmed + contradicted.pluck(:entry_id) + unrequested).uniq
+        .map { |entry_id| { entry_id:, reason: NOT_FOUND_REASON } }
     end
 
     # http: answers call(method, path, headers:, body:) with an object that

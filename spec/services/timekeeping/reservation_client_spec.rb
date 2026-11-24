@@ -884,9 +884,11 @@ RSpec.describe Timekeeping::ReservationClient, "answers outside the mapping tabl
       "a 401" => [401, { "reason" => "unauthorized" }],
       "a 403" => [403, { "reason" => "forbidden" }],
       "a 404" => [404, { "reason" => "not_found" }],
-      "an unknown status carrying a known state" => [418, { "state" => "prepared" }],
+      "an unknown status carrying a known state" => [418, { "state" => "prepared",
+                                                             "entries" => [{ "entry_id" => 7, "company_id" => 41 }] }],
       "an unknown status with an empty body" => [418, {}],
-      "a 503 carrying a known state" => [503, { "state" => "prepared" }],
+      "a 503 carrying a known state" => [503, { "state" => "prepared",
+                                                 "entries" => [{ "entry_id" => 7, "company_id" => 41 }] }],
       "a 503" => [503, { "reason" => "unavailable" }],
       "a 409 conflict with an empty conflicts list" => [409, { "reason" => "conflict", "conflicts" => [] }],
       "a 409 conflict whose item has no entry_id" => [409, { "reason" => "conflict",
@@ -901,6 +903,32 @@ RSpec.describe Timekeeping::ReservationClient, "answers outside the mapping tabl
         expect(outcome.reason).to be_nil
         expect(outcome.conflicts).to eq([])
       end
+    end
+
+    it "a 200 carrying the same known state and entries is prepared, so the status alone makes the probes above retryable" do
+      answer = [200, { "state" => "prepared", "entries" => [{ "entry_id" => 7, "company_id" => 41 }] }]
+
+      expect(client_answering(answer).prepare(table_request(operation_id)).state).to eq("prepared")
+    end
+
+    it "a 200 listing a requested entry under both the request's company and another is refused for that entry" do
+      answer = [200, { "state" => "prepared", "entries" => [{ "entry_id" => 7, "company_id" => 41 },
+                                                            { "entry_id" => 7, "company_id" => 42 }] }]
+
+      outcome = client_answering(answer).prepare(table_request(operation_id))
+
+      expect(outcome.state).to eq("refused")
+      expect(outcome.conflicts).to eq([{ entry_id: 7, reason: "not_found" }])
+    end
+
+    it "a 200 listing every requested entry plus an unrequested one under the request's company is refused for the extra" do
+      answer = [200, { "state" => "prepared", "entries" => [{ "entry_id" => 7, "company_id" => 41 },
+                                                            { "entry_id" => 8, "company_id" => 41 }] }]
+
+      outcome = client_answering(answer).prepare(table_request(operation_id))
+
+      expect(outcome.state).to eq("refused")
+      expect(outcome.conflicts).to eq([{ entry_id: 8, reason: "not_found" }])
     end
 
     # The well-formed row still maps as stated, so the rows above are not retryable only by default.
