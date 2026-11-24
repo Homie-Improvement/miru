@@ -620,7 +620,7 @@ Each operation is idempotent by its stable `operation_id`. A prepare that arrive
 - A **bulk invoice delete** is a hard destroy today (section 1.4). It goes through the same boundary:
   - A destroyed draft releases its reservations, as a line-item destroy on a draft does today (L4).
   - A destroyed non-draft keeps them as a known owner, like a discarded non-draft. Its invoice and line-item rows are gone, so the reservation itself carries the owner: the tenant, the stable invoice identity, and the disposition (`retained`, and passable to a successor). There is no invoice snapshot and no replacement chain.
-  - A failed delete, for example an invoice with payments, leaves the prior state as it was: its operation aborts. A successful delete keeps the edit lock and allows the same provisional successor transition as above.
+  - A failed delete, for example an invoice with payments, leaves the prior state as it was: no intent is recorded and no operation is sent. A successful delete keeps the edit lock and allows the same provisional successor transition as above.
 
 ```mermaid
 stateDiagram-v2
@@ -784,7 +784,7 @@ While the prepared monolith owns the data after a rollback, it runs the same ste
 | Successor prepares an entry held by a discarded or destroyed non-draft, then aborts | The old `retained` committed reservation, unchanged | Abort drops only the successor's provisional reservation | Integration: discard non-draft A holding X; B prepares X (200); B aborts; X still reserved by A and still locked against edits |
 | Successor commits an entry held `retained` | Reservation by the successor only | Commit drops the retained reservation on that entry | Integration: as above, but B commits; X reserved by B only |
 | Draft discarded | Reservations released at commit | Discard sends an empty desired set; the `update_invoice_number` save sends nothing (deliberate fix, section 2.3) | Integration: a draft holds X; discard it; X shows `locked: false` and an employee can edit it |
-| Hard delete of a non-draft fails (payments) | Invoice, line items and reservations as before | The destroy rolls back; the intent is recorded `failed` and the operation aborts | Integration: bulk-delete a non-draft with a payment; 422; its entries' reservations unchanged |
+| Hard delete of a non-draft fails (payments) | Invoice, line items and reservations as before | The savepoint rolls the destroy back before the commit-time flush, which finds the invoice unchanged; no intent is recorded and no operation is sent | Integration: bulk-delete a non-draft with a payment; 422; its entries' reservations unchanged |
 | Hard delete of a non-draft succeeds | Reservations `retained`, carrying tenant, invoice identity and disposition; the operation ledger kept | The commit sets `disposition: 'retained'`; nothing references the deleted rows | Integration: bulk-delete a non-draft holding X; X still locked against edits; a new invoice can prepare and commit X |
 | Stale ownership generation | No change | `409 stale_generation`; the save fails with a retryable error and is retried against the current owner | Contract: prepare with an old generation; 409; nothing reserved |
 | Reference facts unavailable | No change | Write refused with `503 reference_unavailable`; client or job retries | Integration: monolith reference endpoint down; entry write refused; nothing written |
