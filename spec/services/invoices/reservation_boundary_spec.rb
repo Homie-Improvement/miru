@@ -761,4 +761,38 @@ RSpec.describe Invoices::ReservationBoundary, "checking the entries a save adds"
     expect(own_entry.reload.locked).to be(true)
     expect(foreign_entry.reload.locked).to be(false)
   end
+
+  it "under the timekeeping owner still saves an invoice that already carries another company's or a no-company line" do
+    foreign_id = added_check_foreign_entry.id
+    no_company_entry = create(:timesheet_entry, user: added_check_user, project: added_check_project,
+      bill_status: "unbilled")
+    no_company_entry.update_column(:company_id, nil)
+    draft = create(:invoice, company: added_check_company, client: added_check_client)
+    # Rows written before validation refused such ids: insert_all runs no callback or validation.
+    InvoiceLineItem.insert_all!([foreign_id, no_company_entry.id].map do |entry_id|
+      { invoice_id: draft.id, name: "Old", date: Date.current, rate: 100, quantity: 60,
+        timesheet_entry_id: entry_id, created_at: Time.current, updated_at: Time.current }
+    end)
+    unprojected_id = TimesheetEntry.maximum(:id).to_i + 1_000
+    adapter = added_check_adapter_class.new
+    allow(Invoices::ReservationAdapters).to receive(:for).and_return(adapter)
+    added_check_take_timekeeping_ownership
+
+    expect(added_check_line(Invoice.find(draft.id), unprojected_id).save(validate: false)).to be(true)
+
+    expect(adapter.prepared.map(&:entries)).to eq([[unprojected_id]])
+  end
+
+  it "under the timekeeping owner refuses a no-company projected entry added to a draft as not found" do
+    no_company_entry = create(:timesheet_entry, user: added_check_user, project: added_check_project,
+      bill_status: "unbilled")
+    no_company_entry.update_column(:company_id, nil)
+    draft = create(:invoice, company: added_check_company, client: added_check_client)
+    adapter = added_check_adapter_class.new
+    allow(Invoices::ReservationAdapters).to receive(:for).and_return(adapter)
+    added_check_take_timekeeping_ownership
+
+    added_check_expect_not_found(added_check_line(Invoice.find(draft.id), no_company_entry.id), no_company_entry.id)
+    expect(adapter.prepared).to be_empty
+  end
 end

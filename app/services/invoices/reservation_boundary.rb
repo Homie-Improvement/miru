@@ -114,7 +114,8 @@ module Invoices
     # company's timesheet_entries rows do not hold is dropped, so rows
     # written before validation refused such ids do not fail a save. Where
     # Timekeeping owns them (:prepare_response), those rows lag behind the
-    # relay, so every id the invoice's own lines name is kept and
+    # relay, so only an id they place under another company, or under no
+    # company, is dropped; an id they do not hold yet is kept, and
     # Timekeeping's prepare answer decides whether it is the company's.
     module CompanyEntries
       module_function
@@ -138,7 +139,8 @@ module Invoices
         when :projection
           ReservationRequest.canonical_entries(TimesheetEntry.where(company_id:, id: entry_ids).pluck(:id))
         when :prepare_response
-          ReservationRequest.canonical_entries(entry_ids)
+          misplaced = TimesheetEntry.where(id: entry_ids).where("company_id IS DISTINCT FROM ?", company_id).pluck(:id)
+          ReservationRequest.canonical_entries(entry_ids - misplaced)
         else
           raise ArgumentError, "unknown entry reference source #{source.inspect}"
         end
@@ -333,12 +335,12 @@ module Invoices
           @referenced - registration.referenced_entries
         end
 
-        # Added ids the invoice cannot hold. Under the projection source these
-        # are ids the company's timesheet_entries rows do not hold: line
+        # Added ids the invoice cannot hold, as CompanyEntries.within decides
+        # for the owner read here. Under the projection source line
         # validation normally refuses them first, but it runs before the
         # ownership row is locked, so an owner change after it is caught
-        # here. Under the prepare_response source every id can be held until
-        # Timekeeping answers, so this is always empty.
+        # here. Under the prepare_response source these are ids the
+        # projection already places under another company or none.
         def unholdable_entries
           added_entries - @lines
         end

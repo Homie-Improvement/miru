@@ -99,6 +99,10 @@ RSpec.describe "Api::V1::Invoices#create entry check under the timekeeping owner
     line_ids = invoice.invoice_line_items.pluck(:id)
     expect(InvoiceLineItemTimeEntry.where(invoice_line_item_id: line_ids).pluck(:timesheet_entry_id)).to eq([entry_id])
     expect(linked_fake.reservations_for(entry_id)).to eq([{ "invoice_id" => invoice.id, "state" => "committed" }])
+    # The editor resubmits the ids it is shown, so the unprojected link must be listed, or an edit would drop it.
+    expect(JSON.parse(response.body)["invoiceLineItems"].pluck("linkedTimesheetEntryIds")).to eq([[entry_id]])
+    send_request :get, api_v1_invoice_path(invoice), headers: auth_headers(linked_admin)
+    expect(JSON.parse(response.body)["invoiceLineItems"].pluck("linkedTimesheetEntryIds")).to eq([[entry_id]])
   end
 end
 
@@ -148,19 +152,28 @@ RSpec.describe "Api::V1::Invoices#create entry check under the timekeeping owner
     foreign_id = TimesheetEntry.maximum(:id).to_i + 700
     refusing_fake.add_entry(company_id: foreign_company.id, user_id: foreign_user.id, project_id: foreign_project.id,
                             id: foreign_id)
+    # A projected row with no company, and an id nothing holds: both must answer exactly like the foreign entry.
+    no_company_entry = create(:timesheet_entry, user: refusing_admin,
+      project: create(:project, client: refusing_client, billable: true), bill_status: :unbilled)
+    no_company_entry.update_column(:company_id, nil)
+    missing_id = foreign_id + 1
 
     results = nil
     expect do
       results = [
         post_refusing_invoice(timesheet_entry_id: foreign_id),
         post_refusing_invoice(timesheet_entry_id: foreign_id),
-        post_refusing_invoice(linked_timesheet_entry_ids: [foreign_id])
+        post_refusing_invoice(linked_timesheet_entry_ids: [foreign_id]),
+        post_refusing_invoice(timesheet_entry_id: missing_id),
+        post_refusing_invoice(linked_timesheet_entry_ids: [missing_id]),
+        post_refusing_invoice(timesheet_entry_id: no_company_entry.id),
+        post_refusing_invoice(linked_timesheet_entry_ids: [no_company_entry.id])
       ]
     end.to not_change(Invoice, :count)
       .and not_change(InvoiceLineItem, :count)
       .and not_change(InvoiceLineItemTimeEntry, :count)
 
-    expect(results.map(&:first)).to eq([422, 422, 422])
+    expect(results.map(&:first)).to all(eq(422))
     expect(results.uniq.size).to eq(1)
     expect(JSON.parse(results.first.last)["errors"]).to include("not found")
     expect(results.first.last).not_to include(foreign_id.to_s)

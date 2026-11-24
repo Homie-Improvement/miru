@@ -73,6 +73,13 @@ class InvoiceLineItem < ApplicationRecord
     @pending_linked_timesheet_entry_ids = Array(ids).reject(&:blank?).map { |id| id_type.cast(id) }.uniq
   end
 
+  # The linked entry ids as the link rows store them. The through reader joins
+  # timesheet_entries, which leaves out an entry the relay has not projected
+  # yet, so an editor resubmitting the ids it was shown would drop that link.
+  def linked_entry_ids_on_rows
+    invoice_line_item_time_entries.map(&:timesheet_entry_id)
+  end
+
   # Nested invoice saves validate and save only children that report a change.
   # Pending linked ids change no column, so they are counted here.
   def changed_for_autosave?

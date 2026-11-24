@@ -135,8 +135,11 @@ RSpec.describe InvoiceLineItem, type: :model do
         line = build(:invoice_line_item, invoice:, timesheet_entry: nil)
         line.linked_timesheet_entry_ids = [same_company_entry.id, entry.id]
 
+        # Validation alone must refuse, so the save's own link check cannot hide a missing validation.
+        expect(expect_entry_reference_refused(line, attribute: :linked_timesheet_entries)).to eq(missing_refusal)
         expect(expect_entry_reference_refused(line, attribute: :linked_timesheet_entries, via: :save))
           .to eq(missing_refusal)
+        expect(line.linked_timesheet_entries).to be_empty
         expect(InvoiceLineItemTimeEntry.where(timesheet_entry_id: [same_company_entry.id, entry.id])).to be_empty
       end
 
