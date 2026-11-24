@@ -18,14 +18,17 @@ module Timekeeping
     Project = Data.define(:id, :company_id, :billable, :member_user_ids)
     Agent = Data.define(:id, :user_id)
     Invoice = Data.define(:id, :company_id)
-    # owned_agent_ids and invoices are nil when the monolith did not send
-    # them, which an older monolith does not. Entry writes never read them,
-    # so they keep working beside such a monolith; owned_agent_ids and
-    # owned_invoice_ids below refuse instead.
+    # Of the requested invoice ids, those the path company holds and those
+    # another company holds, read from one reference answer.
+    InvoiceHolders = Data.define(:owned_ids, :foreign_ids)
+    # owned_agent_ids, invoices and foreign_invoice_ids are nil when the
+    # monolith did not send them, which an older monolith does not. Entry
+    # writes never read them, so they keep working beside such a monolith;
+    # owned_agent_ids and invoice_holders below refuse instead.
     Facts = Data.define(:company_id, :edit_days, :users, :projects, :missing_project_ids, :agents,
-                        :owned_agent_ids, :invoices) do
-      def initialize(owned_agent_ids: nil, invoices: nil, **fields)
-        super(owned_agent_ids:, invoices:, **fields)
+                        :owned_agent_ids, :invoices, :foreign_invoice_ids) do
+      def initialize(owned_agent_ids: nil, invoices: nil, foreign_invoice_ids: nil, **fields)
+        super(owned_agent_ids:, invoices:, foreign_invoice_ids:, **fields)
       end
 
       def user_ids
@@ -82,19 +85,21 @@ module Timekeeping
       owned
     end
 
-    # The requested invoice ids the monolith lists as the company's, counting
-    # a new invoice whose save has not committed yet. A response without
-    # invoices raises Unavailable: reading it as "owns none" would refuse the
-    # company's own invoice, and reading it as "owns all" would let one
-    # company write against another's.
-    def owned_invoice_ids(company_id:, invoice_ids:)
+    # The requested invoice ids the company holds, counting a new invoice
+    # whose save has not committed yet, and those another company holds, from
+    # one request so both lists describe the same moment. A response without
+    # either list raises Unavailable: reading missing invoices as "owns none"
+    # would refuse the company's own invoice, and without foreign ids an own
+    # invoice_operations row could admit another company's invoice.
+    def invoice_holders(company_id:, invoice_ids:)
       raise ArgumentError, "company_id must be an Integer" unless company_id.is_a?(Integer)
       raise ArgumentError, "invoice_ids must be Integers" unless invoice_ids.all?(Integer)
 
-      invoices = read_facts(company_id, project_ids: [], invoice_ids:).invoices
-      raise Unavailable, "reference response lacks invoices" if invoices.nil?
+      facts = read_facts(company_id, project_ids: [], invoice_ids:)
+      raise Unavailable, "reference response lacks invoices" if facts.invoices.nil?
+      raise Unavailable, "reference response lacks foreign_invoice_ids" if facts.foreign_invoice_ids.nil?
 
-      invoices.map(&:id)
+      InvoiceHolders.new(owned_ids: facts.invoices.map(&:id), foreign_ids: facts.foreign_invoice_ids)
     end
 
     private
@@ -154,7 +159,8 @@ module Timekeeping
           missing_project_ids: facts["missing_project_ids"],
           agents: facts["agents"].map { |agent| Agent.new(id: agent["id"], user_id: agent["user_id"]) },
           owned_agent_ids: facts["owned_agent_ids"],
-          invoices: facts["invoices"]&.map { |invoice| Invoice.new(id: invoice["id"], company_id: invoice["company_id"]) }
+          invoices: facts["invoices"]&.map { |invoice| Invoice.new(id: invoice["id"], company_id: invoice["company_id"]) },
+          foreign_invoice_ids: facts["foreign_invoice_ids"]
         )
       rescue JSON::ParserError
         raise Unavailable, "reference response is not JSON"
@@ -168,14 +174,15 @@ module Timekeeping
           list_of?(facts["projects"]) { |project| valid_project?(project, company_id) } &&
           list_of?(facts["missing_project_ids"]) { |id| id.is_a?(Integer) } &&
           list_of?(facts["agents"]) { |agent| valid_agent?(agent) } &&
-          valid_owned_agent_ids?(facts) &&
-          valid_invoices?(facts, company_id)
+          valid_id_list?(facts, "owned_agent_ids") &&
+          valid_invoices?(facts, company_id) &&
+          valid_id_list?(facts, "foreign_invoice_ids")
       end
 
       # Absent is allowed, for a monolith deployed before the field existed;
       # present, it must be a list of Integers.
-      def valid_owned_agent_ids?(facts)
-        !facts.key?("owned_agent_ids") || list_of?(facts["owned_agent_ids"]) { |id| id.is_a?(Integer) }
+      def valid_id_list?(facts, field)
+        !facts.key?(field) || list_of?(facts[field]) { |id| id.is_a?(Integer) }
       end
 
       # Absent is allowed, as for owned_agent_ids; present, every invoice must

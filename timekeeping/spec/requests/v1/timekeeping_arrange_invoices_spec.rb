@@ -10,7 +10,7 @@ RSpec.describe "TimekeepingProviderArrange invoice catalogue" do
   include_context "timekeeping entry writes"
 
   def owned_invoice_ids(company, invoice_ids)
-    Timekeeping::ReferenceClient.configured.owned_invoice_ids(company_id: company, invoice_ids:)
+    Timekeeping::ReferenceClient.configured.invoice_holders(company_id: company, invoice_ids:).owned_ids
   end
 
   it "refuses to arrange one invoice id for a second company" do

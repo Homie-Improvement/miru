@@ -192,7 +192,8 @@ class TimekeepingProviderArrange
         agents: @company_agents.fetch(company_id, []),
         owned_agent_ids: agent_ids.uniq.select { |id| company_agent_ids.include?(id) }.sort,
         invoices: invoice_ids.uniq.select { |id| @invoice_owners[id] == company_id }.sort
-          .map { |id| { id:, company_id: } }
+          .map { |id| { id:, company_id: } },
+        foreign_invoice_ids: invoice_ids.uniq.select { |id| @invoice_owners.fetch(id, company_id) != company_id }.sort
       }
     end
 end

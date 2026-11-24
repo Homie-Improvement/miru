@@ -53,7 +53,9 @@ The check runs in `call`, before any lock or replay, and refuses with the same `
 
 Adding a check does not fix the rows the code wrote before the check existed. Any rule that trusts state the old code wrote must first rule out that state being the bug's own output. Here the cost of getting it wrong is a hole between tenants that the new check seems to close but does not.
 
-The PR body states that the Timekeeping service still uses the plain fallback. So the local owner is now stricter than the service in this one case. Do not "align" the local owner by copying the service's rule; the service is the one that should gain the guard.
+When PR #590 merged, the Timekeeping service still used the plain fallback, so the local owner was stricter than the service in this one case. The fix was not to "align" the local owner by copying the service's rule; the service was the one that had to gain the guard. It has since gained it: `Timekeeping::InvoiceOwnership.owned?` reads the reference endpoint's `invoices` and `foreign_invoice_ids` before its own `invoice_operations` rows (see serve-requested-foreign-ids-as-bare-ids-when-a-remote-owner-check-keeps-an-own-row-fallback.md).
+
+Steps 2 and 3 above now live in one shared rule, `Timekeeping::OwnedInvoices.held_by_others`. The local owner calls it in place of the two inline queries shown, and the reference endpoint serves the same rule to the service.
 
 Each guard line needs its own test. In review, someone found that deleting the intent line left every spec green, so the author added a test for it.
 
@@ -63,4 +65,4 @@ Each guard line needs its own test. In review, someone found that deleting the i
 - `spec/services/timekeeping/local_owner_invoice_ownership_spec.rb` holds the cases. The requester's own `invoice_operations` row that names another company's invoice does not admit prepare or mark_billed (404, row counts unchanged). Another company's intent on an id with no invoice row, plus the requester's operation row, gives `owned?` false for the requester and true for the other company.
 - `spec/services/timekeeping/local_owner_reservations_spec.rb` (context "more tests 13") shows the fallback still admits an id that only the company's own operation row holds, with no invoice row anywhere.
 - The author ran `local_owner_invoice_ownership_spec.rb` with the intent line deleted and got 7 examples, 1 failure. With the line present, the spec passed.
-- The PR body records the deviation: the local owner refuses an id whose invoice row belongs to another company even when the requester has an old operation row for it, while the service still admits that case.
+- The PR #590 body records the deviation at that time: the local owner refused an id whose invoice row belongs to another company even when the requester had an old operation row for it, while the service still admitted that case. PR #616 closed that gap in the service.
