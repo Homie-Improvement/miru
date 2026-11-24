@@ -48,12 +48,13 @@ RSpec.describe Invoices::PreparedReservations, "with competing writers", committ
   end
 
   # True when the waiter is blocked by the paused writer. Reads the block's
-  # result from the test's own connection while both are still running, and
-  # releases the paused writer whatever happens, so a failed check cannot
-  # leave it holding locks.
+  # result, given the waiter's pid, from the test's own connection while both
+  # are still running, and releases the paused writer whatever happens, so a
+  # failed check cannot leave it holding locks.
   def blocked_while_held
-    blocked = blocked_by?(waiter_pids.pop(timeout: 5), holder_pids.pop(timeout: 5))
-    [blocked, yield]
+    waiter_pid = waiter_pids.pop(timeout: 5)
+    blocked = blocked_by?(waiter_pid, holder_pids.pop(timeout: 5))
+    [blocked, yield(waiter_pid)]
   ensure
     release << true
   end
@@ -229,9 +230,10 @@ RSpec.describe Invoices::PreparedReservations, "with competing writers", committ
   end
 
   # Rollback control: it shows the waiter wins once the first writer rolls
-  # back. It does not prove the entry lock on its own, because without that
-  # lock the waiter would block on the one-provisional-per-entry index and
-  # still succeed.
+  # back. Without the entry lock the waiter would still block, on the
+  # one-provisional-per-entry index at its reservation INSERT, and still
+  # succeed, so the example also checks the statement the waiter is blocked
+  # in is the entry-locking SELECT ... FOR UPDATE.
   it "a prepare waiting behind a rolled-back prepare of the same entry wins with exactly one version bump and snapshot" do
     entry = prepared_spec_entry(company)
     first_invoice = prepared_spec_invoice(company)
@@ -243,9 +245,15 @@ RSpec.describe Invoices::PreparedReservations, "with competing writers", committ
 
     @holder = hold_writer(roll_back: true) { adapter.prepare(first_request) }
     @waiter = start_waiter { adapter.prepare(second_request) }
-    blocked, reservations_while_held = blocked_while_held { prepared_spec_reservations(company) }
+    blocked, (waiting_statement, reservations_while_held) = blocked_while_held do |waiter_pid|
+      [committed_data_session_statement(waiter_pid), prepared_spec_reservations(company)]
+    end
 
     expect(blocked).to be(true), "the second prepare never waited on the first prepare"
+    expect(waiting_statement).to match(TimekeepingSection93Live::ENTRY_LOCK_QUERY),
+                                 "the second prepare should wait in the entry lock " \
+                                 "(.lock(ROW_LOCK) in Invoices::PreparedReservations#lock_entries); " \
+                                 "it waited in #{waiting_statement.inspect}"
     expect(reservations_while_held).to eq([])
     expect(@holder.join(5)&.value&.state).to eq("prepared")
     expect(@waiter.join(5)&.value&.state).to eq("prepared")
