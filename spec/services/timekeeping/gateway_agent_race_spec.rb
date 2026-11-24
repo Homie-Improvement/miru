@@ -69,7 +69,9 @@ RSpec.describe Timekeeping::Gateway, committed_data: true do
                                      "FOR UPDATE) in Timekeeping::Gateway#detach_agent_entries; it waited in " \
                                      "#{waiting_statement.inspect}"
         created = creator.join(10).value
-        destroyer.join(10)
+        # join re-raises an error the destroy ended with, so a failed destroy
+        # fails here; the cleanup in ensure drops worker errors.
+        expect(destroyer.join(10)).to be(destroyer), "the agent destroy did not finish within 10 seconds"
       end
     end
 

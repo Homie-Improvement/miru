@@ -136,7 +136,7 @@ Each run below removed one mechanism in the working tree, ran the examples that 
 
 - `-e 'keeps v3 when a v2 delivery'`: 1 example, 0 failures, on each of 4 runs. It stays listed under **Not yet run** below, with the reason.
 
-**Timekeeping receipt-key lock.** Removed `WriteSteps.lock_key(...)` from `Timekeeping::EntryWriter#lock_receipt_key` in `timekeeping/app/services/timekeeping/entry_writer.rb`. The other `lock_key` callers, in `ServiceCommands` and `ReservationOperations`, were left alone, because entry writes do not reach them.
+**Timekeeping receipt-key lock.** Removed `WriteSteps.lock_key(...)` from `Timekeeping::EntryWriter#lock_receipt_key` in `timekeeping/app/services/timekeeping/entry_writer.rb`. The other `lock_key` calls were left alone. `ServiceCommands#run` and `ReservationOperations` take their own locks, which entry writes do not reach. `ServiceCommands.lock_agent`, which `EntryWriter#names_detached_agent?` calls, is the agent lock, a different mechanism with its own run under **Timekeeping agent lock** below.
 
 - `timekeeping/spec/services/timekeeping/entry_writer_race_spec.rb`: 10 examples, 3 failures. "answers two identical PATCHes with one key ...", "answers two identical DELETEs with one key ..." and "answers two creates with one key and different bodies ..." each failed with "the second request never waited on the first one's lock".
 
