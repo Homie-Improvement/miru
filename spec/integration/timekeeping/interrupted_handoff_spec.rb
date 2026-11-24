@@ -473,8 +473,35 @@ RSpec.describe "Timekeeping interrupted handoff, aborted while paused", :integra
     JSON.parse(reply.body).fetch("entry").fetch("id")
   end
 
+  def ih_abort_update(company, entry_id, note:)
+    project = company.projects.kept.order(:id).first
+    reply = ih_abort_send(company, method: "PUT", path: "/api/v1/timesheet_entry/#{entry_id}",
+                                   body: { "project_id" => project.id,
+                                           "timesheet_entry" => { "duration" => 45.0, "note" => note } })
+    expect(reply.status).to eq(200), "entry update answered #{reply.status}: #{reply.body}"
+  end
+
+  # Queues, for one company, two versions of one entry plus single writes of
+  # two other entries. Returns { edited:, others: } entry ids.
+  def ih_abort_queue_writes(company)
+    edited = ih_abort_create(company, note: "ih abort #{company.id} v1")
+    ih_abort_update(company, edited, note: "ih abort #{company.id} v2")
+    others = %w[other-b other-c].map { |label| ih_abort_create(company, note: "ih abort #{company.id} #{label}") }
+    { edited:, others: }
+  end
+
   def ih_abort_projected_ids(entry_ids)
     ActiveRecord::Base.uncached { TimesheetEntry.unscoped.where(id: entry_ids).pluck(:id) }
+  end
+
+  # The projection's version and note of each given entry, as
+  # { entry_id => { version:, note: } }, read uncached because runtime
+  # processes write these rows outside this connection.
+  def ih_abort_projected_snapshots(entry_ids)
+    ActiveRecord::Base.uncached do
+      TimesheetEntry.unscoped.where(id: entry_ids).pluck(:id, :version, :note)
+                    .to_h { |id, version, note| [id, { version:, note: }] }
+    end
   end
 
   def ih_abort_row_text
@@ -489,7 +516,26 @@ RSpec.describe "Timekeeping interrupted handoff, aborted while paused", :integra
       live_handoff_cutover!
       live_handoff_catch_up!
       live_handoff_pause_relay
-      entry_ids = companies.map { |company| ih_abort_create(company, note: "ih abort queued") }
+      queued = companies.to_h { |company| [company.id, ih_abort_queue_writes(company)] }
+      entry_ids = queued.values.flat_map { |entries| [entries.fetch(:edited), *entries.fetch(:others)] }
+
+      # Taken from the outgoing store before the rollback, never from the
+      # projection the admit record is compared with.
+      expected_at_admit = TimekeepingLiveHandoff.with_timekeeping_database do |connection|
+        queued.each do |company_id, entries|
+          expect(TimekeepingLiveHandoff.queued_count(connection, company_id:, entry_id: entries.fetch(:edited))).to eq(2)
+          entries.fetch(:others).each do |entry_id|
+            expect(TimekeepingLiveHandoff.queued_count(connection, company_id:, entry_id:)).to eq(1)
+          end
+        end
+        TimekeepingLiveHandoff.latest_queued_snapshots(connection, entry_ids:)
+      end
+      expect(expected_at_admit.keys).to match_array(entry_ids)
+      queued.each_value do |entries|
+        expect(expected_at_admit.fetch(entries.fetch(:edited))[:note]).to end_with(" v2")
+      end
+      projected_before = ih_abort_projected_snapshots(entry_ids)
+      expect(projected_before.select { |id, snapshot| expected_at_admit.fetch(id) == snapshot }).to be_empty
       money_before = companies.to_h { |company| [company.id, TimekeepingLiveHandoff.money(company_id: company.id)] }
       rollback_root = live_handoff_report_root
 
@@ -508,7 +554,8 @@ RSpec.describe "Timekeeping interrupted handoff, aborted while paused", :integra
       owners = Timekeeping::Handoff::Runner.configured_owners
       outgoing = owners.fetch("timekeeping")
       owners["timekeeping"] = outgoing.with(
-        admission: ih_abort_recording_admission(outgoing.admission, -> { projected_at_admit << ih_abort_projected_ids(entry_ids) })
+        admission: ih_abort_recording_admission(outgoing.admission,
+                                                -> { projected_at_admit << ih_abort_projected_snapshots(entry_ids) })
       )
       poll_cap = 10
       paused_sleeper = lambda do |_seconds|
@@ -538,7 +585,10 @@ RSpec.describe "Timekeeping interrupted handoff, aborted while paused", :integra
 
       # "every queued position at or below P is in the projection before the outgoing owner admits writes"
       expect(projected_at_admit.size).to eq(1)
-      expect(projected_at_admit.first).to match_array(entry_ids)
+      expect(projected_at_admit.first.keys).to match_array(entry_ids)
+      # Ids alone would pass with only the edited entry's first version
+      # applied; the version and note show the latest queued one arrived.
+      expect(projected_at_admit.first).to eq(expected_at_admit)
 
       ownership = ActiveRecord::Base.uncached { TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID) }
       expect(ownership.owner).to eq("timekeeping")
