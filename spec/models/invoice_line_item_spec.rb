@@ -47,16 +47,14 @@ RSpec.describe InvoiceLineItem, type: :model do
         line_item = build(:invoice_line_item, timesheet_entry: nil)
         line_item.timesheet_entry_id = TimesheetEntry.maximum(:id).to_i + 1_000
 
-        expect(line_item).not_to be_valid
-        expect(line_item.errors[:timesheet_entry]).to include("not found")
+        expect_entry_reference_refused(line_item, attribute: :timesheet_entry)
       end
 
       it "is invalid when timesheet_entry_id is 0, which names no entry" do
         line_item = build(:invoice_line_item, timesheet_entry: nil)
         line_item.timesheet_entry_id = 0
 
-        expect(line_item).not_to be_valid
-        expect(line_item.errors[:timesheet_entry]).to include("not found")
+        expect_entry_reference_refused(line_item, attribute: :timesheet_entry)
       end
 
       it "is valid with no timesheet entry, as a manual line" do
@@ -94,8 +92,7 @@ RSpec.describe InvoiceLineItem, type: :model do
       line_item = build(:invoice_line_item, invoice:, timesheet_entry: nil)
       line_item.linked_timesheet_entries = [same_company_entry, other_company_entry]
 
-      expect(line_item).not_to be_valid
-      expect(line_item.errors[:linked_timesheet_entries]).to include("not found")
+      expect_entry_reference_refused(line_item, attribute: :linked_timesheet_entries)
     end
 
     it "is valid when every linked timesheet entry belongs to the invoice's company" do
@@ -108,8 +105,7 @@ RSpec.describe InvoiceLineItem, type: :model do
     it "is invalid when the direct timesheet entry belongs to another company" do
       line_item = build(:invoice_line_item, invoice:, timesheet_entry: other_company_entry)
 
-      expect(line_item).not_to be_valid
-      expect(line_item.errors[:timesheet_entry]).to include("not found")
+      expect_entry_reference_refused(line_item, attribute: :timesheet_entry)
     end
 
     # Missing ids, other companies' ids and entries with no company must give
@@ -117,36 +113,31 @@ RSpec.describe InvoiceLineItem, type: :model do
     it "gives the same errors for a foreign or NULL-company direct entry id as for a missing id" do
       missing_line = build(:invoice_line_item, invoice:, timesheet_entry: nil)
       missing_line.timesheet_entry_id = missing_id
-      expect(missing_line).not_to be_valid
+      missing_refusal = expect_entry_reference_refused(missing_line, attribute: :timesheet_entry)
 
       [other_company_entry, null_company_entry].each do |entry|
         line = build(:invoice_line_item, invoice:, timesheet_entry: nil)
         line.timesheet_entry_id = entry.id
 
-        expect(line).not_to be_valid
-        expect(line.errors[:timesheet_entry]).to eq(["not found"])
-        expect(line.errors.to_hash).to eq(missing_line.errors.to_hash)
+        expect(expect_entry_reference_refused(line, attribute: :timesheet_entry)).to eq(missing_refusal)
 
         loaded_line = build(:invoice_line_item, invoice:, timesheet_entry: entry)
-        expect(loaded_line).not_to be_valid
-        expect(loaded_line.errors.to_hash).to eq(missing_line.errors.to_hash)
+        expect(expect_entry_reference_refused(loaded_line, attribute: :timesheet_entry)).to eq(missing_refusal)
       end
     end
 
     it "gives the same errors for foreign or NULL-company linked ids as for a missing id and links nothing" do
       missing_line = build(:invoice_line_item, invoice:, timesheet_entry: nil)
       missing_line.linked_timesheet_entry_ids = [same_company_entry.id, missing_id]
-      expect(missing_line).not_to be_valid
+      missing_refusal = expect_entry_reference_refused(missing_line, attribute: :linked_timesheet_entries)
 
       [other_company_entry, null_company_entry].each do |entry|
         line = build(:invoice_line_item, invoice:, timesheet_entry: nil)
         line.linked_timesheet_entry_ids = [same_company_entry.id, entry.id]
 
-        expect(line).not_to be_valid
-        expect(line.errors[:linked_timesheet_entries]).to eq(["not found"])
-        expect(line.errors.to_hash).to eq(missing_line.errors.to_hash)
-        expect(line.save).to be(false)
-        expect(line.linked_timesheet_entries).to be_empty
+        expect(expect_entry_reference_refused(line, attribute: :linked_timesheet_entries, via: :save))
+          .to eq(missing_refusal)
+        expect(InvoiceLineItemTimeEntry.where(timesheet_entry_id: [same_company_entry.id, entry.id])).to be_empty
       end
 
       # The same company's entry alone does link, so the empty reads above can fail.
@@ -164,13 +155,11 @@ RSpec.describe InvoiceLineItem, type: :model do
 
       [mislabelled_entry.reload, null_company_entry].each do |entry|
         direct_line = build(:invoice_line_item, invoice:, timesheet_entry: entry)
-        expect(direct_line).not_to be_valid
-        expect(direct_line.errors[:timesheet_entry]).to include("not found")
+        expect_entry_reference_refused(direct_line, attribute: :timesheet_entry)
 
         linked_line = build(:invoice_line_item, invoice:, timesheet_entry: nil)
         linked_line.linked_timesheet_entries = [entry]
-        expect(linked_line).not_to be_valid
-        expect(linked_line.errors[:linked_timesheet_entries]).to include("not found")
+        expect_entry_reference_refused(linked_line, attribute: :linked_timesheet_entries)
       end
     end
 
@@ -180,13 +169,10 @@ RSpec.describe InvoiceLineItem, type: :model do
         line = InvoiceLineItem.new(name: "Linked", date: Date.current, rate: 10, quantity: 60)
         line.linked_timesheet_entry_ids = [entry_id]
         line.invoice = invoice
-        expect(line).not_to be_valid
-        line.errors.to_hash
+        expect_entry_reference_refused(line, attribute: :linked_timesheet_entries)
       end
 
-      foreign_errors = errors_for.call(other_company_entry.id)
-      expect(foreign_errors[:linked_timesheet_entries]).to include("not found")
-      expect(foreign_errors).to eq(errors_for.call(missing_id))
+      expect(errors_for.call(other_company_entry.id)).to eq(errors_for.call(missing_id))
     end
 
     it "counts a persisted line with only pending linked ids as changed for autosave" do
@@ -203,18 +189,17 @@ RSpec.describe InvoiceLineItem, type: :model do
       persisted_line = create(:invoice_line_item, invoice:, timesheet_entry: nil)
 
       # Only the linked ids change, so no column is dirty; autosave must still pick the line up.
-      messages = [other_company_entry.id, missing_id].map do |entry_id|
+      refusals = [other_company_entry.id, missing_id].map do |entry_id|
         reloaded_invoice = Invoice.find(invoice.id)
         line = reloaded_invoice.invoice_line_items.find { |item| item.id == persisted_line.id }
         expect { line.linked_timesheet_entry_ids = [entry_id] }.not_to raise_error
 
         expect(line.changed_for_autosave?).to be(true)
-        expect(reloaded_invoice.save).to be(false)
-        reloaded_invoice.errors.full_messages.first
+        expect_entry_reference_refused(reloaded_invoice, attribute: :"invoice_line_items.linked_timesheet_entries",
+                                                         via: :save)
       end
 
-      expect(messages.first).to include("not found")
-      expect(messages.first).to eq(messages.last)
+      expect(refusals.first).to eq(refusals.last)
       expect(InvoiceLineItemTimeEntry.where(invoice_line_item_id: persisted_line.id)).to be_empty
     end
 
@@ -269,8 +254,7 @@ RSpec.describe InvoiceLineItem, type: :model do
       # Stands for another transaction moving the entry out of the company between validation and save.
       same_company_entry.update_column(:company_id, nil)
 
-      expect(line.save(validate: false)).to be(false)
-      expect(line.errors[:linked_timesheet_entries]).to eq(["not found"])
+      expect_entry_reference_refused(line, attribute: :linked_timesheet_entries, via: :save_without_validation)
       expect(InvoiceLineItemTimeEntry.where(invoice_line_item_id: line.id)).to be_empty
     end
   end
@@ -368,6 +352,26 @@ RSpec.describe InvoiceLineItem, type: :model do
 
     it "returns the number of hours multiplied by rate" do
       expect(invoice_line_item.total_cost).to eq((invoice_line_item.hours_spent * invoice_line_item.rate).round(3))
+    end
+  end
+
+  context "more tests 2", type: :model do
+    # "The legacy and rollback states keep today's invoice validation behaviour, and the 12.1 invoice specs still pass in all three states"
+    it "a line naming no entry or another company's entry is refused through the current owner's own check in every ownership state" do
+      invoice = create(:invoice)
+      other_company = create(:company)
+      foreign_project = create(:project, client: create(:client, company: other_company), billable: true)
+      foreign_user = create(:user, current_workspace: other_company)
+      foreign_entry = create(:timesheet_entry, user: foreign_user, project: foreign_project, bill_status: "unbilled")
+      missing_id = TimesheetEntry.maximum(:id).to_i + 1_000
+
+      [missing_id, foreign_entry.id].each do |entry_id|
+        line = build(:invoice_line_item, invoice:, timesheet_entry: nil)
+        line.timesheet_entry_id = entry_id
+
+        expect_entry_reference_refused(line, attribute: :timesheet_entry)
+        expect(InvoiceLineItem.where(invoice_id: invoice.id, timesheet_entry_id: entry_id)).to be_empty
+      end
     end
   end
 end
