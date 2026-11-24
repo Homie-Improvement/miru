@@ -808,6 +808,54 @@ RSpec.describe Invoices::ReservationBoundary, "checking the entries a save adds"
       expect(InvoiceLineItemTimeEntry.where(timesheet_entry_id: foreign_id)).to be_empty
       expect(adapter.prepared).to be_empty
     end
+
+    it "under the timekeeping owner refuses a #{kind} replacement of an older foreign line and restores the old line" do
+      foreign_id = added_check_foreign_entry.id
+      draft = create(:invoice, company: added_check_company, client: added_check_client)
+      InvoiceLineItem.insert_all!([{ invoice_id: draft.id, name: "Old", date: Date.current, rate: 100, quantity: 60,
+                                     timesheet_entry_id: foreign_id, created_at: Time.current, updated_at: Time.current }])
+      rows_before = InvoiceLineItem.where(invoice_id: draft.id).order(:id).map(&:attributes)
+      adapter = added_check_adapter_class.new
+      allow(Invoices::ReservationAdapters).to receive(:for).and_return(adapter)
+      added_check_take_timekeeping_ownership
+      replacement = InvoiceLineItem.new(invoice: Invoice.find(draft.id), name: "Replacement", date: Date.current,
+                                        rate: 100, quantity: 60)
+      if kind == :direct
+        replacement.timesheet_entry_id = foreign_id
+      else
+        replacement.linked_timesheet_entry_ids = [foreign_id]
+      end
+
+      expect {
+        Invoice.transaction do
+          InvoiceLineItem.find(rows_before.first.fetch("id")).destroy!
+          replacement.save!
+        end
+      }.to raise_error(Invoices::OperationErrors::Refused) { |refusal|
+        expect(refusal.outcome.conflicts).to eq([{ entry_id: foreign_id, reason: "not_found" }])
+      }
+      expect(InvoiceLineItem.where(invoice_id: draft.id).order(:id).map(&:attributes)).to eq(rows_before)
+      expect(InvoiceLineItemTimeEntry.where(timesheet_entry_id: foreign_id)).to be_empty
+      expect(adapter.prepared).to be_empty
+    end
+  end
+
+  it "under the timekeeping owner refuses retargeting an own line to a foreign id an older line names" do
+    foreign_id = added_check_foreign_entry.id
+    own_entry = create(:timesheet_entry, user: added_check_user, project: added_check_project, bill_status: "unbilled")
+    draft = create(:invoice, company: added_check_company, client: added_check_client)
+    InvoiceLineItem.insert_all!([{ invoice_id: draft.id, name: "Old", date: Date.current, rate: 100, quantity: 60,
+                                   timesheet_entry_id: foreign_id, created_at: Time.current, updated_at: Time.current }])
+    own_line = added_check_line(Invoice.find(draft.id), own_entry.id)
+    own_line.save!
+    adapter = added_check_adapter_class.new
+    allow(Invoices::ReservationAdapters).to receive(:for).and_return(adapter)
+    added_check_take_timekeeping_ownership
+
+    line = InvoiceLineItem.find(own_line.id)
+    line.timesheet_entry_id = foreign_id
+    expect { line.save! }.to raise_error(Invoices::OperationErrors::Refused)
+    expect(own_line.reload.timesheet_entry_id).to eq(own_entry.id)
   end
 
   it "under the timekeeping owner refuses a no-company projected entry added to a draft as not found" do

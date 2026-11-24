@@ -21,11 +21,14 @@ module Invoices
 
     module_function
 
-    def register(invoice)
+    # added_entries: the entry ids of the line or link references the caller
+    # is about to create, retarget or move onto the invoice. The flush checks
+    # each one under the owner it reads, whatever else the invoice names.
+    def register(invoice, added_entries: [])
       transaction = outermost_joinable_transaction(invoice.class.connection)
       raise OperationErrors::NoTransaction if transaction.nil?
 
-      Registry.on(transaction).register(invoice)
+      Registry.on(transaction).register(invoice, added_entries:)
     end
 
     # A destroyed invoice's row is gone when the flush runs, so its status is
@@ -120,15 +123,13 @@ module Invoices
     module CompanyEntries
       module_function
 
-      # Every entry reference the invoice's direct and grouped lines hold now,
-      # read from the line rows alone, one id per reference, sorted. An id
-      # named twice appears twice, so a new reference to an id an older row
-      # already names still counts as added. The invoice id pins the company.
+      # Every entry id the invoice's direct and grouped lines name now, read
+      # from the line rows alone. The invoice id pins the company.
       def referenced(invoice_id)
         direct = InvoiceLineItem.where(invoice_id:).where.not(timesheet_entry_id: nil).pluck(:timesheet_entry_id)
         grouped = InvoiceLineItemTimeEntry.joins(:invoice_line_item)
           .where(invoice_line_items: { invoice_id: }).pluck(:timesheet_entry_id)
-        (direct + grouped).sort.freeze
+        ReservationRequest.canonical_entries(direct + grouped)
       end
 
       # The entry ids an invoice's lines reference now that it can hold.
@@ -150,10 +151,16 @@ module Invoices
     end
 
     # What one invoice looked like at its first registration in a
-    # transaction: every entry id its lines named then, unfiltered, so the
-    # flush can tell which ids this transaction added. The status is kept for
-    # a destroyed invoice, whose row is gone when the flush runs.
-    Registration = Data.define(:invoice_id, :company_id, :status, :referenced_entries)
+    # transaction: every entry id its lines named then, unfiltered. The
+    # status is kept for a destroyed invoice, whose row is gone when the flush
+    # runs. added_entries collects the entry ids of every line or link
+    # reference the transaction created, retargeted or moved onto the
+    # invoice, so each is checked even when an older row names the same id.
+    Registration = Data.define(:invoice_id, :company_id, :status, :referenced_entries, :added_entries) do
+      def adding(entry_ids)
+        with(added_entries: ReservationRequest.canonical_entries(added_entries + entry_ids))
+      end
+    end
 
     # The invoices one transaction changed. It is enrolled as a transaction
     # record, so Rails calls `before_committed!` before COMMIT and drops it on
@@ -170,17 +177,20 @@ module Invoices
 
       # A new invoice is keyed by the record until its insert gives it an id;
       # it held nothing before, so its captured set is empty.
-      def register(invoice)
+      def register(invoice, added_entries: [])
         return if @flushing
 
         if invoice.new_record?
-          @registrations[[:new, invoice.__id__]] ||= registration_for(invoice, [])
+          key = [:new, invoice.__id__]
+          @registrations[key] = (@registrations[key] || registration_for(invoice, [])).adding(added_entries)
           return
         end
 
-        pending = @registrations.delete([:new, invoice.__id__])
-        @registrations[invoice.id] ||= pending&.with(invoice_id: invoice.id) ||
-          registration_for(invoice, CompanyEntries.referenced(invoice.id))
+        pending = @registrations.delete([:new, invoice.__id__])&.with(invoice_id: invoice.id)
+        current = @registrations[invoice.id]
+        registration = current || pending || registration_for(invoice, CompanyEntries.referenced(invoice.id))
+        registration = registration.adding(pending.added_entries) if current && pending
+        @registrations[invoice.id] = registration.adding(added_entries)
       end
 
       def record_status(invoice_id, status)
@@ -205,7 +215,8 @@ module Invoices
             invoice_id: invoice.id,
             company_id: invoice.company_id,
             status: invoice.status_in_database || invoice.status,
-            referenced_entries:
+            referenced_entries:,
+            added_entries: []
           )
         end
     end
@@ -332,12 +343,11 @@ module Invoices
           @holding || { entries: @captured, disposition: ACTIVE }
         end
 
-        # The ids this transaction added a reference to: each id the lines now
-        # name more often than at registration, including one an older row
-        # already named.
+        # The ids of the references this transaction created, retargeted or
+        # moved onto the invoice and that its lines still name, including an
+        # id an older row also names or a deleted row used to name.
         def added_entries
-          before = registration.referenced_entries.tally
-          @referenced.tally.filter_map { |entry_id, count| entry_id if count > before.fetch(entry_id, 0) }
+          registration.added_entries & @referenced
         end
 
         # Added ids the invoice cannot hold, as CompanyEntries.within decides
