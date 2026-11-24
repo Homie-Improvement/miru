@@ -88,28 +88,32 @@ RSpec.describe Imports::HarvestTimeEntriesImporter, committed_data: true do
     expect(entry_event[:context]).to include(source: "harvest_import", data_import_id: data_import.id.to_s)
   end
 
-  # Where the prepared store or Timekeeping owns the entries, the gateway's
-  # per-row write is left out of the count: there the owner reads the company
-  # and project memberships for every row to check the write, which is the
-  # owner's check, not the importer's batching. The live Timekeeping app reads
-  # them through this process's database pool, so its reads would otherwise be
-  # counted here. Where the legacy store owns the entries the whole import is
-  # counted.
+  # Where the prepared store owns the entries, the gateway's per-row write is
+  # left out of the count: that store reads the company and project
+  # memberships for every row to check the write, which is the store's check,
+  # not the importer's batching. In every other state the whole import is
+  # counted, the gateway's write included.
+  #
+  # Only queries on the thread that runs the import are counted. A live
+  # Timekeeping app reads the company's reference facts through
+  # TimekeepingLiveInstance::ReferenceStub, which runs them on the stub
+  # server's own threads; those reads are the service's, not the importer's.
   it "avoids per-row project membership and company queries" do
     select_queries = 0
     project_member_queries = 0
     company_queries = 0
     inside_gateway_import = false
-    owner_checks_each_write = Timekeeping::EntryOwner.for(TimekeepingOwnership.current) != :legacy
+    import_thread = Thread.current
+    store_checks_each_write = Timekeeping::EntryOwner.for(TimekeepingOwnership.current) == :prepared
     allow_any_instance_of(Timekeeping::Gateway).to receive(:import).and_wrap_original do |original, *args, **kwargs|
-      inside_gateway_import = owner_checks_each_write
+      inside_gateway_import = store_checks_each_write
       original.call(*args, **kwargs)
     ensure
       inside_gateway_import = false
     end
     subscriber = lambda do |*, payload|
       sql = payload[:sql]
-      next if inside_gateway_import || !sql.start_with?("SELECT")
+      next if !Thread.current.equal?(import_thread) || inside_gateway_import || !sql.start_with?("SELECT")
 
       select_queries += 1
       project_member_queries += 1 if sql.include?('FROM "project_members"')
