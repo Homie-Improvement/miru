@@ -290,7 +290,7 @@ RSpec.describe TimekeepingIntegrationTags do
 
   describe "the live handoff integration specs" do
     it "money guard and handoff sequence specs exist, carry committed_data, never load the handoff fakes, and run on the integrated runtime" do
-      paths = %w[money_guard_spec.rb handoff_sequence_spec.rb late_replay_spec.rb].map do |name|
+      paths = %w[money_guard_spec.rb handoff_sequence_spec.rb late_replay_spec.rb interrupted_handoff_spec.rb].map do |name|
         Rails.root.join("spec/integration/timekeeping", name)
       end
 
@@ -763,5 +763,54 @@ RSpec.describe TimekeepingIntegrationTags do
       expect(violations.map { |violation| [violation.kind, violation.line] })
         .to eq([[:missing_integrated_runtime, 3], [:missing_integrated_runtime, 8], [:missing_integrated_runtime, 12]])
     end
+  end
+
+  context "more tests 10" do
+  # "No non-dedicated queue job runs during these suites, shown by the teardown queue ledger"
+  # integrated_runtime turns on the teardown ledger; the second tag catches inline jobs the ledger cannot see.
+  it "every top-level group in the interrupted-handoff spec carries both integrated_runtime and inline_jobs_on_dedicated_queues" do
+    path = Rails.root.join("spec/integration/timekeeping/interrupted_handoff_spec.rb")
+    parsed = Prism.parse(File.read(path))
+    expect(parsed.success?).to be(true), parsed.errors.map(&:message).join("\n")
+
+    groups = parsed.value.statements.body.select do |node|
+      node.is_a?(Prism::CallNode) && node.name == :describe && node.receiver&.slice == "RSpec"
+    end
+    missing = groups.filter_map do |group|
+      symbols = Array(group.arguments&.arguments).grep(Prism::SymbolNode).map(&:unescaped)
+      group.location.start_line unless (%w[integrated_runtime inline_jobs_on_dedicated_queues] - symbols).empty?
+    end
+
+    expect(groups).not_to be_empty
+    expect(missing).to eq([]), "groups missing a tag start on lines #{missing.join(', ')}"
+  end
+  end
+
+  context "more tests 11" do
+  # "No non-dedicated queue job runs during these suites, shown by the teardown queue ledger"
+  # The ledger turns on only for :integrated_runtime examples, and it cannot see jobs run with perform_now,
+  # so every group must also carry the tag whose hook checks the queues of those inline jobs.
+  it "every interrupted-handoff group runs on the integrated runtime and under the inline dedicated-queue hook" do
+    path = Rails.root.join("spec/integration/timekeeping/interrupted_handoff_spec.rb")
+    source = File.read(path)
+
+    untagged = described_class.missing_integrated_runtime(path.to_s, source)
+    expect(untagged).to eq([]), untagged.map { |v| "#{v.line} #{v.kind} #{v.detail}" }.join("\n")
+    expect(described_class.example_names(source)).not_to be_empty
+
+    parsed = Prism.parse(source)
+    expect(parsed.errors).to be_empty
+    top_level_groups = parsed.value.statements.body.select do |node|
+      node.is_a?(Prism::CallNode) && node.name == :describe && node.receiver&.slice == "RSpec"
+    end
+    expect(top_level_groups).not_to be_empty
+
+    without_hook = top_level_groups.reject do |group|
+      group.arguments.arguments.any? do |argument|
+        argument.is_a?(Prism::SymbolNode) && argument.unescaped == "inline_jobs_on_dedicated_queues"
+      end
+    end
+    expect(without_hook.map { |group| group.location.start_line }).to eq([])
+  end
   end
 end
