@@ -570,6 +570,78 @@ RSpec.describe Timekeeping::ReservationOperations do
       expect([committed.status, JSON.parse(committed.body)]).to eq([200, { "reserved" => 1, "released" => 0 }])
     end
   end
+
+  context "more tests 4" do
+  it "owned? answers false for another company's invoice row even when the requester's own invoice_operations row names that id" do
+    other_company = timekeeping_arrange.company
+    timekeeping_arrange.invoice(company: other_company, invoice_id: 781)
+    # A row an unchecked prepare stored: the requester's company with the other company's invoice id.
+    InvoiceOperation.create!(company_id: company, invoice_id: 781, operation_id: SecureRandom.uuid,
+                             actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
+                             disposition: "active", generation: 1, created_at: Time.current)
+
+    # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
+    expect(Timekeeping::InvoiceOwnership.owned?(company_id: company, invoice_id: 781)).to be(false)
+    expect(Timekeeping::InvoiceOwnership.owned?(company_id: other_company, invoice_id: 781)).to be(true)
+  end
+  end
+
+  context "more tests 5" do
+  it "owned? answers false when the monolith reports another company's intent for the id, despite the requester's own invoice_operations row" do
+    InvoiceOperation.create!(company_id: company, invoice_id: 782, operation_id: SecureRandom.uuid,
+                             actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
+                             disposition: "active", generation: 1, created_at: Time.current)
+    # Another company holds only an intent for 782 (no invoice row yet): the requester owns nothing,
+    # and the monolith reports the id as held by another company.
+    WebMock.stub_request(:get, TimekeepingProviderArrange::REFERENCE_HOST).to_return do |request|
+      company_id = Integer(request.uri.path[%r{/companies/(\d+)/}, 1], 10)
+      { status: 200, headers: { "Content-Type" => "application/json" },
+        body: JSON.generate(company_id:, edit_days: 30, users: [], projects: [], missing_project_ids: [], agents: [],
+                            owned_agent_ids: [], invoices: [], foreign_invoice_ids: [782]) }
+    end
+
+    # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
+    expect(Timekeeping::InvoiceOwnership.owned?(company_id: company, invoice_id: 782)).to be(false)
+  end
+  end
+
+  context "more tests 6" do
+  it "owned? still counts the requester's own invoice_operations row for an id no company holds, after asking the monolith" do
+    InvoiceOperation.create!(company_id: company, invoice_id: 783, operation_id: SecureRandom.uuid,
+                             actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
+                             disposition: "active", generation: 1, created_at: Time.current)
+    # A hard-deleted invoice: nobody owns it and nobody else holds it.
+    reference = WebMock.stub_request(:get, TimekeepingProviderArrange::REFERENCE_HOST).to_return do |request|
+      company_id = Integer(request.uri.path[%r{/companies/(\d+)/}, 1], 10)
+      { status: 200, headers: { "Content-Type" => "application/json" },
+        body: JSON.generate(company_id:, edit_days: 30, users: [], projects: [], missing_project_ids: [], agents: [],
+                            owned_agent_ids: [], invoices: [], foreign_invoice_ids: []) }
+    end
+
+    expect(Timekeeping::InvoiceOwnership.owned?(company_id: company, invoice_id: 783)).to be(true)
+    # The other holders are checked before the own row counts, so the monolith must be asked.
+    expect(reference).to have_been_requested.once
+    expect(Timekeeping::InvoiceOwnership.owned?(company_id: company, invoice_id: 784)).to be(false)
+  end
+  end
+
+  context "more tests 7" do
+  it "owned? raises Unavailable instead of trusting the own invoice_operations row when the reference answer lacks foreign_invoice_ids or fails" do
+    InvoiceOperation.create!(company_id: company, invoice_id: 785, operation_id: SecureRandom.uuid,
+                             actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
+                             disposition: "active", generation: 1, created_at: Time.current)
+    without_field = JSON.generate(company_id: company, edit_days: 30, users: [], projects: [], missing_project_ids: [],
+                                  agents: [], owned_agent_ids: [], invoices: [])
+
+    [{ status: 200, headers: { "Content-Type" => "application/json" }, body: without_field },
+     { status: 500, body: "" }].each do |answer|
+      WebMock.stub_request(:get, TimekeepingProviderArrange::REFERENCE_HOST).to_return(answer)
+
+      expect { Timekeeping::InvoiceOwnership.owned?(company_id: company, invoice_id: 785) }
+        .to raise_error(Timekeeping::ReferenceClient::Unavailable), "answered from the own row for #{answer.inspect}"
+    end
+  end
+  end
 end
 
 RSpec.describe Timekeeping::InvoiceOwnership do
@@ -582,14 +654,6 @@ RSpec.describe Timekeeping::InvoiceOwnership do
     InvoiceOperation.create!(company_id:, invoice_id:, operation_id: SecureRandom.uuid, actor_name: "invoice-boundary",
                              state: "committed", desired_entry_ids: [], disposition: "active", generation: 1,
                              created_at: Time.current)
-  end
-
-  it "counts an invoice the company's own invoice_operations hold without asking the monolith" do
-    store_invoice_operation(company, 771)
-    unreachable = WebMock.stub_request(:get, TimekeepingProviderArrange::REFERENCE_HOST).to_return(status: 500)
-
-    expect(described_class.owned?(company_id: company, invoice_id: 771)).to be(true)
-    expect(unreachable).not_to have_been_requested
   end
 
   it "asks the monolith when only another company's invoice_operations hold the invoice, and follows its answer" do
@@ -606,6 +670,41 @@ RSpec.describe Timekeeping::InvoiceOwnership do
 
     expect { described_class.owned?(company_id: company, invoice_id: 774) }
       .to raise_error(Timekeeping::ReferenceClient::Unavailable)
+  end
+
+  context "more tests 2" do
+  # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
+  it "refuses another company's invoice row even when the requester's own invoice_operations row names the id" do
+    requester = timekeeping_arrange.company
+    owner = timekeeping_arrange.company
+    timekeeping_arrange.invoice(company: owner, invoice_id: 781)
+    InvoiceOperation.create!(company_id: requester, invoice_id: 781, operation_id: SecureRandom.uuid,
+                             actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
+                             disposition: "active", generation: 1, created_at: Time.current)
+
+    expect(described_class.owned?(company_id: requester, invoice_id: 781)).to be(false)
+    expect(described_class.owned?(company_id: owner, invoice_id: 781)).to be(true)
+  end
+  end
+
+  context "more tests 3" do
+  # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
+  it "refuses an id the monolith reports as held by another company's intent even when the requester's own invoice_operations row names it" do
+    requester = timekeeping_arrange.company
+    InvoiceOperation.create!(company_id: requester, invoice_id: 782, operation_id: SecureRandom.uuid,
+                             actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
+                             disposition: "active", generation: 1, created_at: Time.current)
+    # The monolith has no invoice row for 782, only another company's intent, so the requester owns nothing
+    # and the id is reported as held by another company.
+    reference = WebMock.stub_request(:get, TimekeepingProviderArrange::REFERENCE_HOST).to_return(
+      status: 200, headers: { "Content-Type" => "application/json" },
+      body: JSON.generate(company_id: requester, edit_days: 30, users: [], projects: [], missing_project_ids: [],
+                          agents: [], owned_agent_ids: [], invoices: [], foreign_invoice_ids: [782])
+    )
+
+    expect(described_class.owned?(company_id: requester, invoice_id: 782)).to be(false)
+    expect(reference).to have_been_requested
+  end
   end
 end
 
