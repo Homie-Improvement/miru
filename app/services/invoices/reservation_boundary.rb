@@ -21,15 +21,19 @@ module Invoices
 
     module_function
 
-    # added_references: [record, entry_id] pairs, one for each line or link
-    # row the caller is about to create, retarget or move onto the invoice.
-    # The flush checks each entry under the owner it reads, while that row
-    # still names it there, whatever else the invoice names.
+    # added_references: [record, entry_id, stored] triples, one for each line
+    # or link row the caller is about to create, retarget or move onto the
+    # invoice. stored is the row's [entry_id, invoice_id] as the database
+    # holds it before this save, or nil for a new row. The flush checks each
+    # entry under the owner it reads, while that row still names it there
+    # and differs from how the row stood before the transaction touched it.
     def register(invoice, added_references: [])
       transaction = outermost_joinable_transaction(invoice.class.connection)
       raise OperationErrors::NoTransaction if transaction.nil?
 
-      references = added_references.map { |record, entry_id| AddedReference.new(record:, entry_id:) }
+      references = added_references.map do |record, entry_id, stored|
+        AddedReference.new(record:, entry_id:, stored_before: stored)
+      end
       Registry.on(transaction).register(invoice, added_references: references)
     end
 
@@ -165,12 +169,17 @@ module Invoices
     end
 
     # One line or link row a save created, retargeted or moved onto an
-    # invoice, and the entry it named then. A savepoint that rolls the save
-    # back leaves no row (or the row as it was), so the reference is checked
-    # only while that same row still names that entry on that invoice.
-    AddedReference = Data.define(:record, :entry_id) do
+    # invoice, the entry it named then, and the row's [entry_id, invoice_id]
+    # as stored before that save (nil for a new row). A savepoint that rolls
+    # the save back leaves no row (or the row as it was), so the reference is
+    # checked only while that same row still names that entry on that invoice.
+    AddedReference = Data.define(:record, :entry_id, :stored_before) do
       def stored_on?(invoice_id)
         !record.id.nil? && REFERENCE_STILL_STORED.fetch(record.class.name).call(record.id, entry_id, invoice_id)
+      end
+
+      def row_key
+        [record.class.name, record.id]
       end
     end
 
@@ -365,9 +374,21 @@ module Invoices
         # The ids of the references this transaction created, retargeted or
         # moved onto the invoice whose rows still stand as saved, including an
         # id an older row also names or a deleted row used to name.
+        #
+        # A row's first reference holds how it stood before the transaction
+        # touched it; a row that ends exactly as it stood then gained no new
+        # reference, even when changes in between were rolled back.
         def added_entries
-          registration.added_references
-            .filter_map { |reference| reference.entry_id if reference.stored_on?(registration.invoice_id) }.uniq
+          invoice_id = registration.invoice_id
+          stood_before = {}
+          registration.added_references.each do |reference|
+            stood_before[reference.row_key] = reference.stored_before unless stood_before.key?(reference.row_key)
+          end
+          registration.added_references.filter_map do |reference|
+            next if stood_before[reference.row_key] == [reference.entry_id, invoice_id]
+
+            reference.entry_id if reference.stored_on?(invoice_id)
+          end.uniq
         end
 
         # Added ids the invoice cannot hold, as CompanyEntries.within decides

@@ -837,6 +837,39 @@ RSpec.describe Invoices::ReservationBoundary, "checking the entries a save adds"
       expect(InvoiceLineItemTimeEntry.where(timesheet_entry_id: foreign_id)).to be_empty
     end
 
+    it "under the timekeeping owner keeps an invoice edit after a rolled-back savepoint changed an older #{kind} " \
+       "foreign reference away and back" do
+      foreign_id = added_check_foreign_entry.id
+      own_entry = create(:timesheet_entry, user: added_check_user, project: added_check_project,
+        bill_status: "unbilled")
+      draft = create(:invoice, company: added_check_company, client: added_check_client)
+      InvoiceLineItem.insert_all!([{ invoice_id: draft.id, name: "Old", date: Date.current, rate: 100, quantity: 60,
+                                     timesheet_entry_id: kind == :direct ? foreign_id : nil,
+                                     created_at: Time.current, updated_at: Time.current }])
+      old_line = InvoiceLineItem.find_by!(invoice_id: draft.id)
+      if kind == :linked
+        InvoiceLineItemTimeEntry.insert_all!([{ invoice_line_item_id: old_line.id, timesheet_entry_id: foreign_id,
+                                                created_at: Time.current, updated_at: Time.current }])
+      end
+      reference = kind == :direct ? old_line : InvoiceLineItemTimeEntry.find_by!(invoice_line_item_id: old_line.id)
+      rows_before = [InvoiceLineItem, InvoiceLineItemTimeEntry].map { |model| model.order(:id).map(&:attributes) }
+      added_check_take_timekeeping_ownership
+
+      Invoice.transaction do
+        Invoice.find(draft.id).update!(reference: "kept")
+        Invoice.transaction(requires_new: true) do
+          changed = reference.class.find(reference.id)
+          changed.update!(timesheet_entry_id: own_entry.id)
+          changed.update!(timesheet_entry_id: foreign_id)
+          raise ActiveRecord::Rollback
+        end
+      end
+
+      expect(draft.reload.reference).to eq("kept")
+      expect([InvoiceLineItem, InvoiceLineItemTimeEntry].map { |model| model.order(:id).map(&:attributes) })
+        .to eq(rows_before)
+    end
+
     it "under the timekeeping owner refuses a #{kind} replacement of an older foreign line and restores the old line" do
       foreign_id = added_check_foreign_entry.id
       draft = create(:invoice, company: added_check_company, client: added_check_client)

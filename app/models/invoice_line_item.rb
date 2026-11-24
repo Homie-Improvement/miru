@@ -189,11 +189,12 @@ class InvoiceLineItem < ApplicationRecord
       added_references = []
       if timesheet_entry_id &&
          (new_record? || will_save_change_to_timesheet_entry_id? || will_save_change_to_invoice_id?)
-        added_references << [self, timesheet_entry_id]
+        stored = [timesheet_entry_id_in_database, invoice_id_in_database] if persisted?
+        added_references << [self, timesheet_entry_id, stored]
       end
       if persisted? && will_save_change_to_invoice_id?
         InvoiceLineItemTimeEntry.where(invoice_line_item_id: id).find_each do |link|
-          added_references << [link, link.timesheet_entry_id]
+          added_references << [link, link.timesheet_entry_id, [link.timesheet_entry_id, invoice_id_in_database]]
         end
       end
       register_reservation_change(added_references)
