@@ -387,6 +387,13 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
     end
   end
 
+  # Each invoice operation Timekeeping stores for the invoice, read from its
+  # own database, as [operation_id, state, disposition] in ledger order.
+  def section_9_3_operation_summaries(company, invoice)
+    section_9_3_timekeeping_operations(company_id: company.id, invoice_id: invoice.id)
+      .map { |operation| operation.values_at(:operation_id, :state, :disposition) }
+  end
+
   def section_9_3_bulk_delete(company, invoice)
     owner = company.users.with_role(:owner, company).order(:id).first!
     sign_in owner
@@ -690,12 +697,23 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
           baseline = section_9_3_reservations(company, [entry])
           expect(section_9_3_committed_by(baseline, entry, invoice).size).to eq(1),
             "#{name}: the non-draft should hold its entry committed before the delete; saw #{baseline.inspect}"
+          # Only the draft save's operation exists before the delete, so an
+          # unchanged ledger afterwards cannot be an empty-equals-empty match.
+          operations_before = section_9_3_operation_summaries(company, invoice)
+          expect(operations_before.map { |summary| summary.drop(1) }).to eq([%w[committed active]]),
+            "#{name}: Timekeeping should hold only the draft save's operation before the delete; saw #{operations_before.inspect}"
 
           answer = section_9_3_bulk_delete(company, invoice)
 
           expect(answer.status).to eq(422), "#{name}: the bulk delete answered #{answer.status}"
           expect(JSON.parse(answer.body).fetch("undeletable_invoice_ids")).to eq([invoice.id]),
             "#{name}: the refusal should name the paid invoice"
+          # The reservation flush runs inside the request, before COMMIT, so
+          # any operation the refused delete sent is already stored by now.
+          operations_after = section_9_3_operation_summaries(company, invoice)
+          expect(operations_after).to eq(operations_before),
+            "#{name}: the refused delete should send no operation; Timekeeping held #{operations_before.inspect} " \
+            "before and #{operations_after.inspect} after"
           expect(section_9_3_stored_invoice(invoice)).to eq(invoice_before),
             "#{name}: the paid invoice's stored row should be unchanged"
           expect(section_9_3_stored_lines(invoice)).to eq(lines_before),
