@@ -142,8 +142,19 @@ RSpec.describe Timekeeping::EntryWriter, "under concurrent requests" do
     reached.pop(timeout: wait_seconds)
     Timekeeping::Admission.fence!
     release << true
-    outcome = writer.join(wait_seconds).value
+    # The outbox's NOT NULL generation column also stops a write past the
+    # fence, but only by raising after the entry was written; the generation
+    # check is what refuses it first. Kept as a value so a missing check fails
+    # here, on an assertion, rather than through that error.
+    outcome = begin
+      writer.join(wait_seconds).value
+    rescue ActiveRecord::ActiveRecordError => error
+      error
+    end
 
+    expect(outcome).to be_a(Timekeeping::WriteOutcome),
+                       "the write past the fence should be refused by the generation check " \
+                       "(WriteSteps.generation_matches? in EntryWriter#write); it ended with #{outcome.inspect}"
     expect([outcome.status, JSON.parse(outcome.body)]).to eq([409, { "reason" => "stale_generation" }])
     expect(entry_write_counts).to eq(before)
   end

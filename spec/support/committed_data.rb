@@ -71,6 +71,16 @@ module CommittedDataMode
     ensure
       observer&.disconnect!
     end
+
+    # The statement session pid is running, as pg_stat_activity reports it, so
+    # a check can say which lock a blocked session waits in. Read outside the
+    # pool for the same reason blocked_by? is.
+    def committed_data_session_statement(pid)
+      observer = ActiveRecord::Base.connection_pool.db_config.new_connection
+      observer.select_value("SELECT query FROM pg_stat_activity WHERE pid = #{observer.quote(pid)}").to_s
+    ensure
+      observer&.disconnect!
+    end
   end
 end
 

@@ -6,16 +6,6 @@ require "rails_helper"
 require_relative "../../support/timekeeping/fake_timekeeping"
 
 RSpec.describe Timekeeping::Gateway, committed_data: true do
-  # The statement the session pid is running, read on a connection opened
-  # outside the pool, as blocked_by? does, so the check never waits for a
-  # pooled connection the racing threads hold.
-  def agent_race_session_statement(pid)
-    observer = ActiveRecord::Base.connection_pool.db_config.new_connection
-    observer.select_value("SELECT query FROM pg_stat_activity WHERE pid = #{observer.quote(pid)}").to_s
-  ensure
-    observer&.disconnect!
-  end
-
   it "makes an agent destroy wait for a forwarded agent create held inside its call, then detaches the entry that create committed" do
     base_url = "http://timekeeping.test"
     company = create(:company)
@@ -64,7 +54,7 @@ RSpec.describe Timekeeping::Gateway, committed_data: true do
         begin
           destroyer_pid = destroyer_pids.pop(timeout: 5)
           blocked = blocked_by?(destroyer_pid, creator_pids.pop(timeout: 5))
-          waiting_statement = agent_race_session_statement(destroyer_pid)
+          waiting_statement = committed_data_session_statement(destroyer_pid)
         ensure
           release << true
         end

@@ -147,7 +147,12 @@ Each run below removed one mechanism in the working tree, ran the examples that 
 **Timekeeping admission share lock.** Removed `FOR SHARE` from `Timekeeping::Admission.locked_generation` (`timekeeping/app/models/timekeeping/admission.rb`), which both `EntryWriter` and `ServiceCommands` call. `Admission.locked_state` was left alone, because entry writes do not call it.
 
 - `entry_writer_race_spec.rb`: 10 examples, 2 failures. "makes a fence wait until the write that read the admitted generation commits" failed with "the second request never waited on the first one's lock". "a fence that times out behind an admitted write ..." failed with "expected ActiveRecord::LockWaitTimeout but nothing was raised"; its teardown then hit a deadlock while truncating, which is an after-effect of the unfenced write and not counted.
-- "refuses with stale_generation a write that reads the generation after a fence commits" stayed green. The fence commits before the write reads the generation, so nothing waits: it proves the generation check, not the share lock.
+- "refuses with stale_generation a write that reads the generation after a fence commits" stayed green. The fence commits before the write reads the generation, so nothing waits: it proves the generation check, not the share lock. Its run is under **Timekeeping generation check** below.
+
+**Timekeeping generation check.** Made the `WriteSteps.generation_matches?` check in `Timekeeping::EntryWriter#write` never refuse. `ServiceCommands#run` has its own copy of the check, which was left alone, because entry writes do not reach it.
+
+- `entry_writer_race_spec.rb -e 'refuses with stale_generation'`, before strengthening: 1 example, 1 failure, raised as `ActiveRecord::NotNullViolation` ("null value in column "generation" of relation "outbox_snapshots""). The outbox column stopped the write only after the entry was written, so this red was only an error and does not count.
+- After strengthening: 1 example, 1 failure, "the write past the fence should be refused by the generation check (WriteSteps.generation_matches? in EntryWriter#write); it ended with #<ActiveRecord::NotNullViolation: ...>". The example now keeps the writer's error as a value and checks that the outcome is a refusal before reading its status.
 
 **Timekeeping agent lock.** Removed both acquisitions of the agent lock: `ServiceCommands.lock_agent` in `Timekeeping::EntryWriter#names_detached_agent?`, and `WriteSteps.lock_key(request.company_id, command.fetch(:lock), request.target_id)` in `Timekeeping::ServiceCommands#run` (`timekeeping/app/services/timekeeping/service_commands.rb`), whose detach lock is `"agent"`. The receipt-key `lock_key` call just above it was left alone.
 

@@ -4440,13 +4440,6 @@ RSpec.describe Timekeeping::Gateway, "legacy create replay by idempotency key", 
     observer&.disconnect!
   end
 
-  def legacy_create_session_statement(pid)
-    observer = ActiveRecord::Base.connection_pool.db_config.new_connection
-    observer.select_value("SELECT query FROM pg_stat_activity WHERE pid = #{observer.quote(pid)}").to_s
-  ensure
-    observer&.disconnect!
-  end
-
   # "Start with the initial ownership state, save a timer entry, and lose the response after commit. React Query retries with the planned stable key and body."
   # "Test a committed create followed by the same key under initial ownership."
   it "a committed legacy create retried with the same idempotency key and body returns the first entry and records the time once" do
@@ -4573,7 +4566,7 @@ RSpec.describe Timekeeping::Gateway, "legacy create replay by idempotency key", 
       retry_waited = blocked_by?(retry_pid, first_pids.pop(timeout: 5), within: 5)
       first_lock_keys = lock_keys.empty? ? nil : lock_keys.pop
       retry_waited_on_lock = !first_lock_keys.nil? && legacy_create_lock_wait?(retry_pid, first_lock_keys)
-      retry_statement = legacy_create_session_statement(retry_pid)
+      retry_statement = committed_data_session_statement(retry_pid)
     ensure
       release_first << true
     end
