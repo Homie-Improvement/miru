@@ -960,7 +960,8 @@ RSpec.describe "Timekeeping prepare against a crossed reference answer" do
     WebMock.stub_request(:get, TimekeepingProviderArrange::REFERENCE_HOST).to_return(
       status: 200, headers: { "Content-Type" => "application/json" },
       body: JSON.generate(company_id: company, edit_days: 30, users: [], projects: [], missing_project_ids: [],
-                          agents: [], owned_agent_ids: [], invoices: [{ id: 951, company_id: other_company }])
+                          agents: [], owned_agent_ids: [], invoices: [{ id: 951, company_id: other_company }],
+                          foreign_invoice_ids: [])
     )
     counts = -> { [InvoiceOperation.count, Reservation.count, ServiceIdempotencyReceipt.count, Entry.sum(:version)] }
     before = counts.call
