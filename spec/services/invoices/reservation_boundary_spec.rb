@@ -635,3 +635,130 @@ RSpec.describe Invoices::ReservationBoundary, "mark_billed with an undeliverable
     expect(adapter).not_to have_received(:mark_billed)
   end
 end
+
+RSpec.describe Invoices::ReservationBoundary, "checking the entries a save adds" do
+  let(:added_check_company) { create(:company) }
+  let(:added_check_client) { create(:client, company: added_check_company) }
+  let(:added_check_project) { create(:project, client: added_check_client, billable: true) }
+  let(:added_check_user) { create(:user, current_workspace_id: added_check_company.id) }
+  let(:added_check_other_company) { create(:company) }
+  let(:added_check_other_client) { create(:client, company: added_check_other_company) }
+  let(:added_check_foreign_entry) do
+    project = create(:project, client: added_check_other_client, billable: true)
+    create(:timesheet_entry, user: create(:user, current_workspace_id: added_check_other_company.id), project:,
+      bill_status: "unbilled")
+  end
+
+  # Records every reservation call and answers each one as accepted, standing
+  # in for the Timekeeping service.
+  let(:added_check_adapter_class) do
+    Class.new do
+      attr_reader :prepared
+
+      def initialize
+        @prepared = []
+      end
+
+      def prepare(request)
+        @prepared << request
+        outcome("prepared")
+      end
+
+      def commit(_request) = outcome("committed")
+      def abort(_request) = outcome("aborted")
+
+      private
+
+        def outcome(state)
+          Invoices::ReservationOutcome.new(state:, conflicts: [], counts: {})
+        end
+    end
+  end
+
+  def added_check_line(invoice, entry_id)
+    InvoiceLineItem.new(invoice:, name: "Work", date: Date.current, rate: 100, quantity: 60, timesheet_entry_id: entry_id)
+  end
+
+  def added_check_take_timekeeping_ownership
+    TimekeepingOwnership.current.update!(owner: "timekeeping", handoff_step: nil)
+  end
+
+  # Line validation runs before the ownership row is locked and, while
+  # Timekeeping owns entries, leaves existence and company to this check, so
+  # these saves skip validation to reach it alone.
+  def added_check_expect_not_found(line, entry_id)
+    expect { line.save(validate: false) }.to raise_error(Invoices::OperationErrors::Refused) { |refusal|
+      expect(refusal.outcome.conflicts).to eq([{ entry_id:, reason: "not_found" }])
+    }
+    expect(InvoiceLineItem.where(timesheet_entry_id: entry_id)).to be_empty
+  end
+
+  it "under the timekeeping owner refuses another company's entry added to a discarded draft as not found" do
+    foreign_id = added_check_foreign_entry.id
+    draft = create(:invoice, company: added_check_company, client: added_check_client)
+    draft.discard!
+    added_check_take_timekeeping_ownership
+
+    added_check_expect_not_found(added_check_line(Invoice.find(draft.id), foreign_id), foreign_id)
+  end
+
+  it "under the timekeeping owner refuses another company's entry added to a discarded sent invoice as not found" do
+    foreign_id = added_check_foreign_entry.id
+    sent = create(:invoice, company: added_check_company, client: added_check_client, status: :sent)
+    sent.discard!
+    added_check_take_timekeeping_ownership
+
+    added_check_expect_not_found(added_check_line(Invoice.find(sent.id), foreign_id), foreign_id)
+  end
+
+  it "under the timekeeping owner refuses another company's entry added to a live sent invoice as not found" do
+    foreign_id = added_check_foreign_entry.id
+    sent = create(:invoice, company: added_check_company, client: added_check_client, status: :sent)
+    added_check_take_timekeeping_ownership
+
+    added_check_expect_not_found(added_check_line(Invoice.find(sent.id), foreign_id), foreign_id)
+  end
+
+  it "refuses at flush a foreign line validated under the timekeeping owner and saved after a rollback" do
+    foreign_id = added_check_foreign_entry.id
+    draft = create(:invoice, company: added_check_company, client: added_check_client)
+    added_check_take_timekeeping_ownership
+    line = added_check_line(Invoice.find(draft.id), foreign_id)
+    line.valid?
+
+    TimekeepingOwnership.current.update!(owner: "monolith", monolith_store: "prepared")
+
+    added_check_expect_not_found(line, foreign_id)
+  end
+
+  it "under the timekeeping owner sends an unprojected entry to prepare and holds it, without another company's lines" do
+    other_invoice = create(:invoice, company: added_check_other_company, client: added_check_other_client)
+    create(:invoice_line_item, invoice: other_invoice, timesheet_entry: added_check_foreign_entry, rate: 100, quantity: 60)
+    draft = create(:invoice, company: added_check_company, client: added_check_client)
+    unprojected_id = TimesheetEntry.maximum(:id).to_i + 1_000
+    adapter = added_check_adapter_class.new
+    allow(Invoices::ReservationAdapters).to receive(:for).and_return(adapter)
+    added_check_take_timekeeping_ownership
+
+    expect(added_check_line(Invoice.find(draft.id), unprojected_id).save(validate: false)).to be(true)
+
+    expect(adapter.prepared.map(&:entries)).to eq([[unprojected_id]])
+    expect(adapter.prepared.map(&:company_id)).to eq([added_check_company.id])
+    expect(InvoiceEntryHolding.find_by!(company_id: added_check_company.id, invoice_id: draft.id).entry_ids)
+      .to eq([unprojected_id])
+  end
+
+  it "under the legacy owner still saves an invoice that already carries another company's line" do
+    foreign_entry = added_check_foreign_entry
+    own_entry = create(:timesheet_entry, user: added_check_user, project: added_check_project, bill_status: "unbilled")
+    draft = create(:invoice, company: added_check_company, client: added_check_client)
+    # A row written before validation refused foreign ids: insert_all runs no callback or validation.
+    InvoiceLineItem.insert_all!([{ invoice_id: draft.id, name: "Old", date: Date.current, rate: 100, quantity: 60,
+                                   timesheet_entry_id: foreign_entry.id, created_at: Time.current, updated_at: Time.current }])
+
+    added_check_line(Invoice.find(draft.id), own_entry.id).save!
+
+    expect(own_entry.reload.locked).to be(true)
+    expect(foreign_entry.reload.locked).to be(false)
+  end
+end

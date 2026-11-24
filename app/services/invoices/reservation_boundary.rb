@@ -66,7 +66,7 @@ module Invoices
         operation_id: SecureRandom.uuid,
         generation: ownership.generation,
         disposition: holding&.disposition || ACTIVE,
-        entries: CompanyEntries.on_lines(invoice.id, invoice.company_id)
+        entries: CompanyEntries.on_lines(invoice.id, invoice.company_id, source: EntryReferenceCheck.for(ownership))
       )
       outcome = ReservationAdapters.for(ownership).mark_billed(request)
       raise_unless_billed!(outcome)
@@ -109,29 +109,47 @@ module Invoices
 
     # The entries an invoice can hold are its own company's: an id that names
     # another company's entry is never sent across the reservation port.
-    # Validation already refuses such ids on new lines; this keeps rows
-    # written before it from failing a save.
+    #
+    # Where the monolith owns entries (the :projection source), an id the
+    # company's timesheet_entries rows do not hold is dropped, so rows
+    # written before validation refused such ids do not fail a save. Where
+    # Timekeeping owns them (:prepare_response), those rows lag behind the
+    # relay, so every id the invoice's own lines name is kept and
+    # Timekeeping's prepare answer decides whether it is the company's.
     module CompanyEntries
       module_function
 
-      # The entry ids an invoice's direct and grouped lines reference now.
-      def on_lines(invoice_id, company_id)
-        direct = InvoiceLineItem.joins(:timesheet_entry)
-          .where(invoice_id:, timesheet_entries: { company_id: }).pluck(:timesheet_entry_id)
-        grouped = InvoiceLineItemTimeEntry.joins(:invoice_line_item, :timesheet_entry)
-          .where(invoice_line_items: { invoice_id: }, timesheet_entries: { company_id: }).pluck(:timesheet_entry_id)
+      # Every entry id the invoice's direct and grouped lines name now, read
+      # from the line rows alone. The invoice id pins the company.
+      def referenced(invoice_id)
+        direct = InvoiceLineItem.where(invoice_id:).where.not(timesheet_entry_id: nil).pluck(:timesheet_entry_id)
+        grouped = InvoiceLineItemTimeEntry.joins(:invoice_line_item)
+          .where(invoice_line_items: { invoice_id: }).pluck(:timesheet_entry_id)
         ReservationRequest.canonical_entries(direct + grouped)
       end
 
-      def within(company_id, entry_ids)
-        ReservationRequest.canonical_entries(TimesheetEntry.where(company_id:, id: entry_ids).pluck(:id))
+      # The entry ids an invoice's lines reference now that it can hold.
+      def on_lines(invoice_id, company_id, source:)
+        within(company_id, referenced(invoice_id), source:)
+      end
+
+      def within(company_id, entry_ids, source:)
+        case source
+        when :projection
+          ReservationRequest.canonical_entries(TimesheetEntry.where(company_id:, id: entry_ids).pluck(:id))
+        when :prepare_response
+          ReservationRequest.canonical_entries(entry_ids)
+        else
+          raise ArgumentError, "unknown entry reference source #{source.inspect}"
+        end
       end
     end
 
     # What one invoice looked like at its first registration in a
-    # transaction. The status is kept for a destroyed invoice, whose row is
-    # gone when the flush runs.
-    Registration = Data.define(:invoice_id, :company_id, :status, :captured_entries)
+    # transaction: every entry id its lines named then, unfiltered, so the
+    # flush can tell which ids this transaction added. The status is kept for
+    # a destroyed invoice, whose row is gone when the flush runs.
+    Registration = Data.define(:invoice_id, :company_id, :status, :referenced_entries)
 
     # The invoices one transaction changed. It is enrolled as a transaction
     # record, so Rails calls `before_committed!` before COMMIT and drops it on
@@ -158,7 +176,7 @@ module Invoices
 
         pending = @registrations.delete([:new, invoice.__id__])
         @registrations[invoice.id] ||= pending&.with(invoice_id: invoice.id) ||
-          registration_for(invoice, CompanyEntries.on_lines(invoice.id, invoice.company_id))
+          registration_for(invoice, CompanyEntries.referenced(invoice.id))
       end
 
       def record_status(invoice_id, status)
@@ -178,12 +196,12 @@ module Invoices
 
       private
 
-        def registration_for(invoice, captured_entries)
+        def registration_for(invoice, referenced_entries)
           Registration.new(
             invoice_id: invoice.id,
             company_id: invoice.company_id,
             status: invoice.status_in_database || invoice.status,
-            captured_entries:
+            referenced_entries:
           )
         end
     end
@@ -213,32 +231,55 @@ module Invoices
       end
     end
 
-    # One invoice's held set, lines and decision, read under its lock.
+    # One invoice's held set, lines and decision, read under its lock. The
+    # owner is read here too: the billing fence holds the ownership row FOR
+    # SHARE from the first billing write until commit, so it cannot change
+    # before the flush ends.
     class InvoiceChange
+      # The conflict reason for an entry that is missing or not the
+      # invoice's company's (contracts/timekeeping/reservations.yml).
+      NOT_FOUND = "not_found"
+
       def self.read(registration)
         company_id = registration.company_id
         invoice_id = registration.invoice_id
+        ownership = TimekeepingOwnership.current
+        source = EntryReferenceCheck.for(ownership)
         holding = InvoiceEntryHolding.find_by(company_id:, invoice_id:)
+        referenced = CompanyEntries.referenced(invoice_id)
         new(
           registration:,
           invoice: Invoice.find_by(id: invoice_id),
-          lines: CompanyEntries.on_lines(invoice_id, company_id),
-          holding: holding && { entries: CompanyEntries.within(company_id, holding.entry_ids), disposition: holding.disposition }
+          ownership:,
+          entries: {
+            referenced:,
+            lines: CompanyEntries.within(company_id, referenced, source:),
+            captured: CompanyEntries.within(company_id, registration.referenced_entries, source:)
+          },
+          holding: holding && {
+            entries: CompanyEntries.within(company_id, holding.entry_ids, source:), disposition: holding.disposition
+          }
         )
       end
 
-      # holding: what the invoice's holding row lists, or nil when it has none.
-      def initialize(registration:, invoice:, lines:, holding:)
+      # entries: { referenced:, lines:, captured: }. referenced is every id
+      # the lines name now; lines and captured are the ids the invoice can
+      # hold now and at registration. holding: what the invoice's holding row
+      # lists, or nil when it has none.
+      def initialize(registration:, invoice:, ownership:, entries:, holding:)
         @registration = registration
         @invoice = invoice
-        @lines = lines
+        @ownership = ownership
+        @referenced = entries.fetch(:referenced)
+        @lines = entries.fetch(:lines)
+        @captured = entries.fetch(:captured)
         @holding = holding
         @decision = ReservationDecision.call(
           status: status,
           discarded: invoice&.discarded? || false,
           destroyed: invoice.nil?,
           held:,
-          lines:
+          lines: @lines
         )
       end
 
@@ -250,17 +291,22 @@ module Invoices
       # `held`), so a sent invoice keeps an entry after its line is removed,
       # and the adapter sees what an operation removes.
       def seed_holding
-        return unless @holding.nil? && registration.captured_entries.any? &&
-          (@decision || @lines != registration.captured_entries)
+        return unless @holding.nil? && @captured.any? && (@decision || @lines != @captured)
 
         InvoiceEntryHolding.insert(
           { company_id: registration.company_id, invoice_id: registration.invoice_id,
-            entry_ids: registration.captured_entries, disposition: ACTIVE },
+            entry_ids: @captured, disposition: ACTIVE },
           unique_by: %i[company_id invoice_id]
         )
       end
 
+      # Every id this transaction added to the lines is checked here, under
+      # the owner the flush reads, whatever the invoice's status: refused
+      # outright when the owner's own rows say it is not the company's, by
+      # admit when the operation does not send it, and by the prepare answer
+      # when it does.
       def apply
+        refuse_not_found!(unholdable_entries) if unholdable_entries.any?
         admit if admitted_entries.any?
         send_operation if @decision
       rescue OperationErrors::Refused => refusal
@@ -279,20 +325,46 @@ module Invoices
         # An invoice saved before holdings existed holds what its lines
         # referenced before this transaction changed them.
         def held
-          @holding || { entries: registration.captured_entries, disposition: ACTIVE }
+          @holding || { entries: @captured, disposition: ACTIVE }
         end
 
-        # A live sent invoice changes no locks, but the entries its lines
-        # gain must still pass the same conflict rules a draft's do.
-        def admitted_entries
-          return [] if @invoice.nil? || @invoice.discarded? || status.to_s == ReservationDecision::DRAFT_STATUS
+        # The ids this transaction added to the invoice's lines.
+        def added_entries
+          @referenced - registration.referenced_entries
+        end
 
-          @lines - registration.captured_entries
+        # Added ids the invoice cannot hold. Under the projection source these
+        # are ids the company's timesheet_entries rows do not hold: line
+        # validation normally refuses them first, but it runs before the
+        # ownership row is locked, so an owner change after it is caught
+        # here. Under the prepare_response source every id can be held until
+        # Timekeeping answers, so this is always empty.
+        def unholdable_entries
+          added_entries - @lines
+        end
+
+        # The added ids that go through admit, which changes no locks but
+        # applies the same conflict rules a draft's prepare does. Under the
+        # projection source that is what a live sent invoice gains; line
+        # validation checks every other save there. Under the prepare_response
+        # source validation checks nothing, so it is every added id the
+        # operation does not send to prepare, whatever the invoice's status.
+        def admitted_entries
+          return [] if @invoice.nil?
+          return added_entries - (@decision || held).fetch(:entries) if source == :prepare_response
+          return [] if @invoice.discarded? || status.to_s == ReservationDecision::DRAFT_STATUS
+
+          @lines - @captured
         end
 
         def admit
           outcome = adapter.admit(request(entries: admitted_entries, disposition: ACTIVE))
           raise OperationErrors::Refused.new(outcome) if outcome.state == "refused"
+        end
+
+        def refuse_not_found!(entry_ids)
+          conflicts = entry_ids.map { |entry_id| { entry_id:, reason: NOT_FOUND } }
+          raise OperationErrors::Refused.new(ReservationOutcome.new(state: "refused", conflicts:, counts: {}))
         end
 
         def send_operation
@@ -323,8 +395,10 @@ module Invoices
           )
         end
 
-        def ownership
-          @ownership ||= TimekeepingOwnership.current
+        attr_reader :ownership
+
+        def source
+          EntryReferenceCheck.for(ownership)
         end
 
         def adapter
