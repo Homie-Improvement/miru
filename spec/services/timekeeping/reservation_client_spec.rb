@@ -71,257 +71,257 @@ RSpec.describe Timekeeping::ReservationClient do
   end
 
   context "more tests 10" do
-  it "a prepare 200 that lists a requested entry under another company is refused as not_found, never prepared" do
-    answer = Struct.new(:status, :body)
-    request = Invoices::ReservationRequest.new(
-      company_id: 41, invoice_id: 501, operation_id: SecureRandom.uuid,
-      generation: 2, disposition: "active", entries: [7001, 7002]
-    )
-    http = lambda do |_method, _path, headers:, body:|
-      answer.new(200, {
-        "operation_id" => body["operation_id"], "state" => "prepared",
-        "entries" => [{ "entry_id" => 7001, "company_id" => 41 }, { "entry_id" => 7002, "company_id" => 42 }]
-      })
+    it "a prepare 200 that lists a requested entry under another company is refused as not_found, never prepared" do
+      answer = Struct.new(:status, :body)
+      request = Invoices::ReservationRequest.new(
+        company_id: 41, invoice_id: 501, operation_id: SecureRandom.uuid,
+        generation: 2, disposition: "active", entries: [7001, 7002]
+      )
+      http = lambda do |_method, _path, headers:, body:|
+        answer.new(200, {
+          "operation_id" => body["operation_id"], "state" => "prepared",
+          "entries" => [{ "entry_id" => 7001, "company_id" => 41 }, { "entry_id" => 7002, "company_id" => 42 }]
+        })
+      end
+      client = described_class.new(http:, credential: ->(**) { "token" })
+
+      outcome = client.prepare(request)
+
+      # "While Timekeeping owns the data, the invoice line-item company check uses each entry's company from the prepare response, as rule L8 says, and still refuses another company's entry with nothing changed"
+      expect(outcome.state).to eq("refused")
+      expect(outcome.conflicts).to include({ entry_id: 7002, reason: "not_found" })
+      expect(outcome.conflicts.pluck(:entry_id)).not_to include(7001)
     end
-    client = described_class.new(http:, credential: ->(**) { "token" })
-
-    outcome = client.prepare(request)
-
-    # "While Timekeeping owns the data, the invoice line-item company check uses each entry's company from the prepare response, as rule L8 says, and still refuses another company's entry with nothing changed"
-    expect(outcome.state).to eq("refused")
-    expect(outcome.conflicts).to include({ entry_id: 7002, reason: "not_found" })
-    expect(outcome.conflicts.pluck(:entry_id)).not_to include(7001)
-  end
   end
 
   context "more tests 11" do
-  it "a prepare 200 that leaves out a requested entry or carries no entries list never answers prepared" do
-    answer = Struct.new(:status, :body)
-    request = Invoices::ReservationRequest.new(
-      company_id: 41, invoice_id: 501, operation_id: SecureRandom.uuid,
-      generation: 2, disposition: "active", entries: [7001, 7002]
-    )
-    bodies = [
-      { "state" => "prepared", "entries" => [{ "entry_id" => 7001, "company_id" => 41 }] },
-      { "state" => "prepared" },
-      { "state" => "prepared", "entries" => [{ "entry_id" => "7001", "company_id" => 41 },
-                                             { "entry_id" => 7002, "company_id" => 41 }] },
-      { "state" => "prepared", "entries" => [{ "entry_id" => 7001, "company_id" => 41 },
-                                             { "entry_id" => 7002, "company_id" => nil }] }
-    ]
+    it "a prepare 200 that leaves out a requested entry or carries no entries list never answers prepared" do
+      answer = Struct.new(:status, :body)
+      request = Invoices::ReservationRequest.new(
+        company_id: 41, invoice_id: 501, operation_id: SecureRandom.uuid,
+        generation: 2, disposition: "active", entries: [7001, 7002]
+      )
+      bodies = [
+        { "state" => "prepared", "entries" => [{ "entry_id" => 7001, "company_id" => 41 }] },
+        { "state" => "prepared" },
+        { "state" => "prepared", "entries" => [{ "entry_id" => "7001", "company_id" => 41 },
+                                               { "entry_id" => 7002, "company_id" => 41 }] },
+        { "state" => "prepared", "entries" => [{ "entry_id" => 7001, "company_id" => 41 },
+                                               { "entry_id" => 7002, "company_id" => nil }] }
+      ]
 
-    states = bodies.map do |prepared_body|
-      http = lambda do |_method, _path, headers:, body:|
-        answer.new(200, prepared_body.merge("operation_id" => body["operation_id"]))
+      states = bodies.map do |prepared_body|
+        http = lambda do |_method, _path, headers:, body:|
+          answer.new(200, prepared_body.merge("operation_id" => body["operation_id"]))
+        end
+        described_class.new(http:, credential: ->(**) { "token" }).prepare(request).state
       end
-      described_class.new(http:, credential: ->(**) { "token" }).prepare(request).state
-    end
 
-    # An answer that does not confirm every requested entry under the request's company must fail closed.
-    expect(states).to all(satisfy { |state| %w[refused retryable].include?(state) })
-  end
+      # An answer that does not confirm every requested entry under the request's company must fail closed.
+      expect(states).to all(satisfy { |state| %w[refused retryable].include?(state) })
+    end
   end
 
   context "more tests 12" do
-  it "a prepare 200 that lists a requested entry under another company answers refused with a not_found conflict for that entry" do
-    answer = Struct.new(:status, :body)
-    invoice_company_id = 7
-    other_company_id = 8
-    own_entry_id = 11
-    foreign_entry_id = 12
-    sent_paths = []
-    http = lambda do |_method, path, headers:, body:|
-      sent_paths << path
-      answer.new(200, {
-        "operation_id" => body.fetch("operation_id"),
-        "state" => "prepared",
-        "entries" => [
-          { "entry_id" => own_entry_id, "company_id" => invoice_company_id },
-          { "entry_id" => foreign_entry_id, "company_id" => other_company_id }
-        ]
-      })
+    it "a prepare 200 that lists a requested entry under another company answers refused with a not_found conflict for that entry" do
+      answer = Struct.new(:status, :body)
+      invoice_company_id = 7
+      other_company_id = 8
+      own_entry_id = 11
+      foreign_entry_id = 12
+      sent_paths = []
+      http = lambda do |_method, path, headers:, body:|
+        sent_paths << path
+        answer.new(200, {
+          "operation_id" => body.fetch("operation_id"),
+          "state" => "prepared",
+          "entries" => [
+            { "entry_id" => own_entry_id, "company_id" => invoice_company_id },
+            { "entry_id" => foreign_entry_id, "company_id" => other_company_id }
+          ]
+        })
+      end
+      request = Invoices::ReservationRequest.new(
+        company_id: invoice_company_id, invoice_id: 501, operation_id: SecureRandom.uuid,
+        generation: 1, disposition: "active", entries: [own_entry_id, foreign_entry_id]
+      )
+
+      outcome = described_class.new(http:, credential: ->(**) { "token" }).prepare(request)
+
+      # "While Timekeeping owns the data, the invoice line-item company check uses each entry's company from the prepare response, as rule L8 says, and still refuses another company's entry with nothing changed"
+      expect(outcome.state).to eq("refused")
+      expect(outcome.conflicts).to include({ entry_id: foreign_entry_id, reason: "not_found" })
+      expect(outcome.conflicts.pluck(:entry_id)).not_to include(own_entry_id)
+      # The request is only ever sent under the invoice's own company.
+      expect(sent_paths).to all(start_with("/v1/companies/#{invoice_company_id}/"))
     end
-    request = Invoices::ReservationRequest.new(
-      company_id: invoice_company_id, invoice_id: 501, operation_id: SecureRandom.uuid,
-      generation: 1, disposition: "active", entries: [own_entry_id, foreign_entry_id]
-    )
 
-    outcome = described_class.new(http:, credential: ->(**) { "token" }).prepare(request)
+    it "a prepare 200 that leaves a requested entry out of its entries answers refused, never prepared" do
+      answer = Struct.new(:status, :body)
+      http = lambda do |_method, _path, headers:, body:|
+        answer.new(200, {
+          "operation_id" => body.fetch("operation_id"),
+          "state" => "prepared",
+          "entries" => [{ "entry_id" => 21, "company_id" => 7 }]
+        })
+      end
+      request = Invoices::ReservationRequest.new(
+        company_id: 7, invoice_id: 502, operation_id: SecureRandom.uuid,
+        generation: 1, disposition: "active", entries: [21, 22]
+      )
 
-    # "While Timekeeping owns the data, the invoice line-item company check uses each entry's company from the prepare response, as rule L8 says, and still refuses another company's entry with nothing changed"
-    expect(outcome.state).to eq("refused")
-    expect(outcome.conflicts).to include({ entry_id: foreign_entry_id, reason: "not_found" })
-    expect(outcome.conflicts.pluck(:entry_id)).not_to include(own_entry_id)
-    # The request is only ever sent under the invoice's own company.
-    expect(sent_paths).to all(start_with("/v1/companies/#{invoice_company_id}/"))
-  end
+      outcome = described_class.new(http:, credential: ->(**) { "token" }).prepare(request)
 
-  it "a prepare 200 that leaves a requested entry out of its entries answers refused, never prepared" do
-    answer = Struct.new(:status, :body)
-    http = lambda do |_method, _path, headers:, body:|
-      answer.new(200, {
-        "operation_id" => body.fetch("operation_id"),
-        "state" => "prepared",
-        "entries" => [{ "entry_id" => 21, "company_id" => 7 }]
-      })
+      # "While Timekeeping owns the data, the invoice line-item company check uses each entry's company from the prepare response, as rule L8 says, and still refuses another company's entry with nothing changed"
+      expect(outcome.state).to eq("refused")
+      expect(outcome.conflicts).to include({ entry_id: 22, reason: "not_found" })
     end
-    request = Invoices::ReservationRequest.new(
-      company_id: 7, invoice_id: 502, operation_id: SecureRandom.uuid,
-      generation: 1, disposition: "active", entries: [21, 22]
-    )
-
-    outcome = described_class.new(http:, credential: ->(**) { "token" }).prepare(request)
-
-    # "While Timekeeping owns the data, the invoice line-item company check uses each entry's company from the prepare response, as rule L8 says, and still refuses another company's entry with nothing changed"
-    expect(outcome.state).to eq("refused")
-    expect(outcome.conflicts).to include({ entry_id: 22, reason: "not_found" })
-  end
   end
 
   context "more tests 13" do
-  it "a prepare 200 that lists a requested entry under another company answers refused with a not_found conflict for that entry" do
-    answer = Struct.new(:status, :body).new(
-      200,
-      { "operation_id" => "op", "state" => "prepared",
-        "entries" => [{ "entry_id" => 11, "company_id" => 7 }, { "entry_id" => 12, "company_id" => 8 }] }
-    )
-    http = ->(_method, _path, headers:, body:) { answer }
-    request = Invoices::ReservationRequest.new(
-      company_id: 7, invoice_id: 501, operation_id: SecureRandom.uuid,
-      generation: 2, disposition: "active", entries: [11, 12]
-    )
+    it "a prepare 200 that lists a requested entry under another company answers refused with a not_found conflict for that entry" do
+      answer = Struct.new(:status, :body).new(
+        200,
+        { "operation_id" => "op", "state" => "prepared",
+          "entries" => [{ "entry_id" => 11, "company_id" => 7 }, { "entry_id" => 12, "company_id" => 8 }] }
+      )
+      http = ->(_method, _path, headers:, body:) { answer }
+      request = Invoices::ReservationRequest.new(
+        company_id: 7, invoice_id: 501, operation_id: SecureRandom.uuid,
+        generation: 2, disposition: "active", entries: [11, 12]
+      )
 
-    outcome = described_class.new(http:, credential: ->(**) { "token" }).prepare(request)
+      outcome = described_class.new(http:, credential: ->(**) { "token" }).prepare(request)
 
-    # "While Timekeeping owns the data, the invoice line-item company check uses each entry's company from the prepare response, as rule L8 says, and still refuses another company's entry with nothing changed"
-    expect(outcome.state).to eq("refused")
-    expect(outcome.conflicts).to eq([{ entry_id: 12, reason: "not_found" }])
-  end
+      # "While Timekeeping owns the data, the invoice line-item company check uses each entry's company from the prepare response, as rule L8 says, and still refuses another company's entry with nothing changed"
+      expect(outcome.state).to eq("refused")
+      expect(outcome.conflicts).to eq([{ entry_id: 12, reason: "not_found" }])
+    end
   end
 
   context "more tests 14" do
-  it "a prepare 200 that leaves out a requested entry answers refused, never prepared" do
-    answer = Struct.new(:status, :body).new(
-      200, { "operation_id" => "op", "state" => "prepared", "entries" => [{ "entry_id" => 11, "company_id" => 7 }] }
-    )
-    http = ->(_method, _path, headers:, body:) { answer }
-    request = Invoices::ReservationRequest.new(
-      company_id: 7, invoice_id: 501, operation_id: SecureRandom.uuid,
-      generation: 2, disposition: "active", entries: [11, 12]
-    )
+    it "a prepare 200 that leaves out a requested entry answers refused, never prepared" do
+      answer = Struct.new(:status, :body).new(
+        200, { "operation_id" => "op", "state" => "prepared", "entries" => [{ "entry_id" => 11, "company_id" => 7 }] }
+      )
+      http = ->(_method, _path, headers:, body:) { answer }
+      request = Invoices::ReservationRequest.new(
+        company_id: 7, invoice_id: 501, operation_id: SecureRandom.uuid,
+        generation: 2, disposition: "active", entries: [11, 12]
+      )
 
-    outcome = described_class.new(http:, credential: ->(**) { "token" }).prepare(request)
+      outcome = described_class.new(http:, credential: ->(**) { "token" }).prepare(request)
 
-    expect(outcome.state).to eq("refused")
-    expect(outcome.conflicts).to eq([{ entry_id: 12, reason: "not_found" }])
-  end
+      expect(outcome.state).to eq("refused")
+      expect(outcome.conflicts).to eq([{ entry_id: 12, reason: "not_found" }])
+    end
   end
 
   context "more tests 15" do
-  it "a prepare 200 with no entries list answers retryable, so a missing company never counts as a pass" do
-    answer = Struct.new(:status, :body).new(200, { "operation_id" => "op", "state" => "prepared" })
-    http = ->(_method, _path, headers:, body:) { answer }
-    request = Invoices::ReservationRequest.new(
-      company_id: 7, invoice_id: 501, operation_id: SecureRandom.uuid,
-      generation: 2, disposition: "active", entries: [11]
-    )
+    it "a prepare 200 with no entries list answers retryable, so a missing company never counts as a pass" do
+      answer = Struct.new(:status, :body).new(200, { "operation_id" => "op", "state" => "prepared" })
+      http = ->(_method, _path, headers:, body:) { answer }
+      request = Invoices::ReservationRequest.new(
+        company_id: 7, invoice_id: 501, operation_id: SecureRandom.uuid,
+        generation: 2, disposition: "active", entries: [11]
+      )
 
-    outcome = described_class.new(http:, credential: ->(**) { "token" }).prepare(request)
+      outcome = described_class.new(http:, credential: ->(**) { "token" }).prepare(request)
 
-    expect(outcome.state).to eq("retryable")
-  end
+      expect(outcome.state).to eq("retryable")
+    end
   end
 
   context "more tests 16" do
-  it "a prepare 200 listing every requested entry under the request's company answers prepared and keeps each entry's company" do
-    answer = Struct.new(:status, :body).new(
-      200,
-      { "operation_id" => "op", "state" => "prepared",
-        "entries" => [{ "entry_id" => 11, "company_id" => 7 }, { "entry_id" => 12, "company_id" => 7 }] }
-    )
-    http = ->(_method, _path, headers:, body:) { answer }
-    request = Invoices::ReservationRequest.new(
-      company_id: 7, invoice_id: 501, operation_id: SecureRandom.uuid,
-      generation: 2, disposition: "active", entries: [11, 12]
-    )
+    it "a prepare 200 listing every requested entry under the request's company answers prepared and keeps each entry's company" do
+      answer = Struct.new(:status, :body).new(
+        200,
+        { "operation_id" => "op", "state" => "prepared",
+          "entries" => [{ "entry_id" => 11, "company_id" => 7 }, { "entry_id" => 12, "company_id" => 7 }] }
+      )
+      http = ->(_method, _path, headers:, body:) { answer }
+      request = Invoices::ReservationRequest.new(
+        company_id: 7, invoice_id: 501, operation_id: SecureRandom.uuid,
+        generation: 2, disposition: "active", entries: [11, 12]
+      )
 
-    outcome = described_class.new(http:, credential: ->(**) { "token" }).prepare(request)
+      outcome = described_class.new(http:, credential: ->(**) { "token" }).prepare(request)
 
-    expect(outcome.state).to eq("prepared")
-    expect(outcome.entries).to eq([{ entry_id: 11, company_id: 7 }, { entry_id: 12, company_id: 7 }])
-    expect(outcome.entries).to be_frozen
-    expect(Invoices::ReservationOutcome.new(state: "prepared", conflicts: [], counts: {}).entries).to eq([])
-  end
+      expect(outcome.state).to eq("prepared")
+      expect(outcome.entries).to eq([{ entry_id: 11, company_id: 7 }, { entry_id: 12, company_id: 7 }])
+      expect(outcome.entries).to be_frozen
+      expect(Invoices::ReservationOutcome.new(state: "prepared", conflicts: [], counts: {}).entries).to eq([])
+    end
   end
 
   context "more tests 17" do
-  it "prepare answering 200 that lists a requested entry under another company is refused as not_found, never prepared" do
-    answer = Struct.new(:status, :body)
-    request = Invoices::ReservationRequest.new(
-      company_id: 41, invoice_id: 501, operation_id: SecureRandom.uuid,
-      generation: 2, disposition: "active", entries: [7001, 7002]
-    )
-    http = lambda do |_method, _path, headers:, body:|
-      answer.new(200, {
-        "operation_id" => body["operation_id"], "state" => "prepared",
-        "entries" => [{ "entry_id" => 7001, "company_id" => 41 }, { "entry_id" => 7002, "company_id" => 99 }]
-      })
+    it "prepare answering 200 that lists a requested entry under another company is refused as not_found, never prepared" do
+      answer = Struct.new(:status, :body)
+      request = Invoices::ReservationRequest.new(
+        company_id: 41, invoice_id: 501, operation_id: SecureRandom.uuid,
+        generation: 2, disposition: "active", entries: [7001, 7002]
+      )
+      http = lambda do |_method, _path, headers:, body:|
+        answer.new(200, {
+          "operation_id" => body["operation_id"], "state" => "prepared",
+          "entries" => [{ "entry_id" => 7001, "company_id" => 41 }, { "entry_id" => 7002, "company_id" => 99 }]
+        })
+      end
+      client = described_class.new(http:, credential: ->(**) { "token" })
+
+      outcome = client.prepare(request)
+
+      # "While Timekeeping owns the data, the invoice line-item company check uses each entry's company from the prepare response, as rule L8 says, and still refuses another company's entry with nothing changed"
+      expect(outcome.state).to eq("refused")
+      expect(outcome.conflicts).to include({ entry_id: 7002, reason: "not_found" })
+      expect(outcome.conflicts.pluck(:entry_id)).not_to include(7001)
     end
-    client = described_class.new(http:, credential: ->(**) { "token" })
-
-    outcome = client.prepare(request)
-
-    # "While Timekeeping owns the data, the invoice line-item company check uses each entry's company from the prepare response, as rule L8 says, and still refuses another company's entry with nothing changed"
-    expect(outcome.state).to eq("refused")
-    expect(outcome.conflicts).to include({ entry_id: 7002, reason: "not_found" })
-    expect(outcome.conflicts.pluck(:entry_id)).not_to include(7001)
-  end
   end
 
   context "more tests 18" do
-  it "prepare answering 200 that leaves out a requested entry is refused as not_found for that entry" do
-    answer = Struct.new(:status, :body)
-    request = Invoices::ReservationRequest.new(
-      company_id: 41, invoice_id: 502, operation_id: SecureRandom.uuid,
-      generation: 2, disposition: "active", entries: [7101, 7102]
-    )
-    http = lambda do |_method, _path, headers:, body:|
-      answer.new(200, {
-        "operation_id" => body["operation_id"], "state" => "prepared",
-        "entries" => [{ "entry_id" => 7101, "company_id" => 41 }]
-      })
+    it "prepare answering 200 that leaves out a requested entry is refused as not_found for that entry" do
+      answer = Struct.new(:status, :body)
+      request = Invoices::ReservationRequest.new(
+        company_id: 41, invoice_id: 502, operation_id: SecureRandom.uuid,
+        generation: 2, disposition: "active", entries: [7101, 7102]
+      )
+      http = lambda do |_method, _path, headers:, body:|
+        answer.new(200, {
+          "operation_id" => body["operation_id"], "state" => "prepared",
+          "entries" => [{ "entry_id" => 7101, "company_id" => 41 }]
+        })
+      end
+      client = described_class.new(http:, credential: ->(**) { "token" })
+
+      outcome = client.prepare(request)
+
+      # An entry the answer does not confirm has no known company, so the save must not settle with it.
+      expect(outcome.state).to eq("refused")
+      expect(outcome.conflicts).to include({ entry_id: 7102, reason: "not_found" })
     end
-    client = described_class.new(http:, credential: ->(**) { "token" })
-
-    outcome = client.prepare(request)
-
-    # An entry the answer does not confirm has no known company, so the save must not settle with it.
-    expect(outcome.state).to eq("refused")
-    expect(outcome.conflicts).to include({ entry_id: 7102, reason: "not_found" })
-  end
   end
 
   context "more tests 19" do
-  it "prepare answering 200 with no entries field or a malformed entry is never treated as prepared" do
-    answer = Struct.new(:status, :body)
-    request = Invoices::ReservationRequest.new(
-      company_id: 41, invoice_id: 503, operation_id: SecureRandom.uuid,
-      generation: 2, disposition: "active", entries: [7201]
-    )
-    bodies = [
-      { "state" => "prepared" },
-      { "state" => "prepared", "entries" => [{ "entry_id" => "7201", "company_id" => 41 }] },
-      { "state" => "prepared", "entries" => "7201" }
-    ]
+    it "prepare answering 200 with no entries field or a malformed entry is never treated as prepared" do
+      answer = Struct.new(:status, :body)
+      request = Invoices::ReservationRequest.new(
+        company_id: 41, invoice_id: 503, operation_id: SecureRandom.uuid,
+        generation: 2, disposition: "active", entries: [7201]
+      )
+      bodies = [
+        { "state" => "prepared" },
+        { "state" => "prepared", "entries" => [{ "entry_id" => "7201", "company_id" => 41 }] },
+        { "state" => "prepared", "entries" => "7201" }
+      ]
 
-    states = bodies.map do |answer_body|
-      http = ->(_method, _path, headers:, body:) { answer.new(200, answer_body.merge("operation_id" => body["operation_id"])) }
-      described_class.new(http:, credential: ->(**) { "token" }).prepare(request).state
+      states = bodies.map do |answer_body|
+        http = ->(_method, _path, headers:, body:) { answer.new(200, answer_body.merge("operation_id" => body["operation_id"])) }
+        described_class.new(http:, credential: ->(**) { "token" }).prepare(request).state
+      end
+
+      # A body that breaks the contract's response_entry_fields carries no company to check, so it must fail closed.
+      expect(states).to all(eq("retryable"))
     end
-
-    # A body that breaks the contract's response_entry_fields carries no company to check, so it must fail closed.
-    expect(states).to all(eq("retryable"))
-  end
   end
 end
 
