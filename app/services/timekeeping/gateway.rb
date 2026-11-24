@@ -287,18 +287,7 @@ module Timekeeping
 
           raise
         end
-        entry = found.entry
-        EntryLookup.check_target(entry, context:, entry_id:, scope:)
-        authorize.call(entry)
-        case owner
-        when :prepared
-          local_write(ownership:, operation: :destroy, entry_id: entry.id, if_match: context.if_match || found.version,
-                      body: {}, identity: {}, idempotency_key: request_key(:destroy, entry.id))
-        when :timekeeping
-          write_client.destroy_entry(context:, generation: ownership.generation, entry_id: entry.id,
-                                     version: found.version)
-        end
-        true
+        destroy_found(ownership:, owner:, found:, entry_id:, authorize:, scope:)
       end
     end
 
@@ -833,6 +822,24 @@ module Timekeeping
             entry.update!(attributes)
           end
         end
+      end
+
+      # Deletes the entry the owner's lookup found, in the store that owns it,
+      # once it passes the lookup's company, id and scope checks and the
+      # delete policy. Returns true.
+      def destroy_found(ownership:, owner:, found:, entry_id:, authorize:, scope:)
+        entry = found.entry
+        EntryLookup.check_target(entry, context:, entry_id:, scope:)
+        authorize.call(entry)
+        case owner
+        when :prepared
+          local_write(ownership:, operation: :destroy, entry_id: entry.id, if_match: context.if_match || found.version,
+                      body: {}, identity: {}, idempotency_key: request_key(:destroy, entry.id))
+        when :timekeeping
+          write_client.destroy_entry(context:, generation: ownership.generation, entry_id: entry.id,
+                                     version: found.version)
+        end
+        true
       end
 
       # :reek:LongParameterList
