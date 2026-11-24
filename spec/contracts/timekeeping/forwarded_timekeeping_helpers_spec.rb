@@ -388,7 +388,7 @@ RSpec.describe "forwarded Timekeeping readers with the live adapter running" do
     connection = double("live connection", close: nil)
     allow(connection).to receive(:exec_params).and_return(double("update result", cmd_tuples: 1))
     allow(TimekeepingRegressionAdapter).to receive(:database_url).and_return(reader_checked_database_url)
-    allow(PG).to receive(:connect).and_return(connection)
+    allow(PG).to receive(:connect).with(reader_checked_database_url).and_return(connection)
 
     admit_forwarded_generation(untouchable_fake, 3)
 
@@ -405,7 +405,7 @@ RSpec.describe "forwarded Timekeeping readers with the live adapter running" do
     connection = double("live connection", close: nil)
     allow(connection).to receive(:exec_params).and_return(double("count result", getvalue: "4"))
     allow(TimekeepingRegressionAdapter).to receive(:database_url).and_return(reader_checked_database_url)
-    allow(PG).to receive(:connect).and_return(connection)
+    allow(PG).to receive(:connect).with(reader_checked_database_url).and_return(connection)
 
     expect(forwarded_stored_entry_count(untouchable_fake, company:)).to eq(4)
 
