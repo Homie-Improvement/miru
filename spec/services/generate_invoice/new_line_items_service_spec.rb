@@ -32,13 +32,16 @@ RSpec.describe GenerateInvoice::NewLineItemsService do
     other_client = create(:client, company: other_company)
     other_invoice = create(:invoice, company: other_company, client: other_client)
     # Ids are global across companies, so another company's rows can name this
-    # company's entry ids. Validation refuses these rows, so they are written
-    # without it to stand for data that already exists.
-    build(:invoice_line_item, invoice: other_invoice, timesheet_entry: nil, timesheet_entry_id: direct_target.id)
-      .save!(validate: false)
+    # company's entry ids. Validation and the invoice save's own entry check
+    # refuse these rows, so they are inserted without callbacks to stand for
+    # data that already exists.
+    InvoiceLineItem.insert_all!([{ invoice_id: other_invoice.id, name: "Old", date: Date.current, rate: 100,
+                                   quantity: 60, timesheet_entry_id: direct_target.id,
+                                   created_at: Time.current, updated_at: Time.current }])
     other_aggregate_line = create(:invoice_line_item, invoice: other_invoice, timesheet_entry: nil)
-    InvoiceLineItemTimeEntry.new(invoice_line_item: other_aggregate_line, timesheet_entry_id: linked_target.id)
-      .save!(validate: false)
+    InvoiceLineItemTimeEntry.insert_all!([{ invoice_line_item_id: other_aggregate_line.id,
+                                            timesheet_entry_id: linked_target.id,
+                                            created_at: Time.current, updated_at: Time.current }])
 
     # "Another company's kept invoices do not change this company's candidate entries from GenerateInvoice::NewLineItemsService"
     result = described_class.new(workspace[:client], {}).process
