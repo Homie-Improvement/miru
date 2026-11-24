@@ -209,6 +209,12 @@ module LiveHandoff
     { notice: I18n.t("timesheet_entry.#{action}.message"), entry: entry.snippet }.to_json
   end
 
+  # The body the web controller renders for a destroy. It carries no entry,
+  # so every destroy, first attempt or replay, renders the same bytes.
+  def expected_web_destroy_reply
+    { notice: I18n.t("timesheet_entry.destroy.message") }.to_json
+  end
+
   # The refusals of company A's replay of company B's web create. The
   # controller looks the recorded project up inside A's company before any
   # receipt is read, so A is refused with ErrorHandler's 404 and the

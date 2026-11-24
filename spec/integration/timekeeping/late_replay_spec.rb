@@ -405,4 +405,57 @@ RSpec.describe "Timekeeping late replay" do
       expect(handoffs_done).to eq(%i[cutover rollback re_cutover])
     end
   end
+
+  context "more tests 2" do
+  context "legacy web deletes replayed after every handoff", :integrated_runtime, :two_tenant_seed, committed_data: true,
+                                                              owner_state: "legacy" do
+    it "live: legacy web deletes replayed after cutover, rollback and re-cutover answer the stored destroy reply with every tenant count unchanged" do
+      company_ids = [fork_and_leaf.id, copper_kettle.id]
+      monolith_url = @integrated_runtime.monolith_url
+      deletes = [fork_and_leaf, copper_kettle].map do |company|
+        company_owner = User.with_role(:owner, company).first
+        headers = lambda do |key|
+          { "X-Auth-Email" => company_owner.email, "X-Auth-Token" => company_owner.token, "Idempotency-Key" => key }
+        end
+        create_key = "late-destroy-create-#{SecureRandom.hex(8)}"
+        destroy_key = "late-destroy-#{SecureRandom.hex(8)}"
+        created = LiveHandoff.send_request(monolith_url, {
+          method: "POST", path: "/api/v1/timesheet_entry", headers: headers.call(create_key),
+          body: { "project_id" => company.projects.kept.first.id,
+                  "timesheet_entry" => { "duration" => 20.0, "note" => "late #{destroy_key}", "work_date" => "2026-01-06" } }
+        })
+        expect(created.status).to eq(200), "legacy create, company #{company.id}"
+        entry_id = JSON.parse(created.body).fetch("entry").fetch("id")
+        request = { method: "DELETE", path: "/api/v1/timesheet_entry/#{entry_id}", headers: headers.call(destroy_key) }
+        expect(LiveHandoff.send_request(monolith_url, request).status).to eq(200), "legacy destroy, company #{company.id}"
+        ActiveRecord::Base.uncached do
+          Timekeeping::LegacyEntryWriteReceipt.find_by!(company_id: company.id, actor_kind: "user", actor_id: company_owner.id,
+                                                        key: destroy_key, operation: "destroy")
+        end
+        { company:, request: }
+      end
+
+      with_live_handoff_integrations(@integrated_runtime) do
+        %i[cutover rollback re_cutover].each do |direction|
+          run_live_handoff(direction, company_ids:)
+          deletes.each do |capture|
+            label = "legacy destroy, company #{capture.fetch(:company).id}, after #{direction}"
+            before, reply, after = with_live_relays_held do
+              [live_tenant_states(company_ids), LiveHandoff.send_request(monolith_url, capture.fetch(:request)),
+               live_tenant_states(company_ids)]
+            end
+            # "A legacy-store destroy retried after cutover, rollback or re-cutover is answered from its LegacyEntryWriteReceipt with no forwarded or local second write, and a live late-replay example shows this."
+            # No refusal counts: a 404, 409 or 422 is not an answer from the receipt.
+            expect(reply.status).to eq(200), "#{label} answered #{reply.status}"
+            expect(LiveHandoff.replay_verdict(status: reply.status, body: reply.body,
+                                              expected_body: LiveHandoff.expected_web_destroy_reply, refusals: []))
+              .to eq(:answered_from_receipt), label
+            expect(JSON.parse(reply.body)).to eq("notice" => I18n.t("timesheet_entry.destroy.message"))
+            company_ids.each { |id| expect(after.fetch(id)).to eq(before.fetch(id)), "#{label}: company #{id} changed" }
+          end
+        end
+      end
+    end
+  end
+  end
 end
