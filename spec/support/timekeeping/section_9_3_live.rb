@@ -70,6 +70,12 @@ module TimekeepingSection93Live
 
   BACKEND_PRESENT_SQL = "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)"
 
+  SESSION_QUERY_SQL = "SELECT query FROM pg_stat_activity WHERE pid = $1"
+
+  # The statement Timekeeping::ReservationOperations#lock_entries sends:
+  # Entry.where(...).order(:id).lock("FOR UPDATE").pluck(:id).
+  ENTRY_LOCK_QUERY = /\ASELECT "entries"\."id" FROM "entries" .* FOR UPDATE\b/m
+
   RESERVATIONS_SQL = <<~SQL.squish
     SELECT company_id, entry_id, invoice_id, state, disposition, operation_id::text AS operation_id
     FROM reservations
@@ -195,6 +201,16 @@ module TimekeepingSection93Live
       waiters.size >= count
     end
     waiters
+  end
+
+  # True when the Timekeeping session pid is running the entry-locking
+  # statement of Timekeeping's prepare, as opposed to a later statement of the
+  # same prepare (such as the reservation INSERT) that can also wait on a held
+  # entry row.
+  def section_9_3_timekeeping_waiting_on_entry_lock?(pid)
+    section_9_3_observe_server(0) do |observer|
+      observer.exec_params(SESSION_QUERY_SQL, [Integer(pid)]).column_values(0).first.to_s.match?(ENTRY_LOCK_QUERY)
+    end
   end
 
   # True once the monolith session backend_pid holds (granted: true) or waits

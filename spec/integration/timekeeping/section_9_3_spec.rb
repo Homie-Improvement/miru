@@ -616,10 +616,17 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
             waiters = holder_pid ? section_9_3_timekeeping_waiters(holder_pid, count: 2) : []
             # The first prepare waits on the held row, the second queues behind it.
             directly_blocked = waiters.select { |waiter| section_9_3_timekeeping_blocked_by?(waiter, holder_pid, within: 0) }
+            # A reservation INSERT also waits on the held row (its foreign key
+            # check locks the entry), so a wait proves the entry lock only when
+            # the waiting statement is that lock's SELECT ... FOR UPDATE.
+            entry_lock_waiters = waiters.select { |waiter| section_9_3_timekeeping_waiting_on_entry_lock?(waiter) }
             # Released before asserting, well inside the client's 5 s timeout.
             release << :release
             expect(waiters.size).to eq(2),
               "#{name}: both prepares should wait on the held entry row; Timekeeping sessions waiting: #{waiters.inspect}"
+            expect(entry_lock_waiters).to eq(waiters),
+              "#{name}: both prepares should wait in Timekeeping's entry-locking SELECT ... FOR UPDATE; " \
+              "waiting sessions #{waiters.inspect}, of which in that SELECT #{entry_lock_waiters.inspect}"
             expect(directly_blocked).not_to be_empty,
               "#{name}: a prepare should be blocked by the held entry row itself; waiting sessions: #{waiters.inspect}"
             prepares.each { |prepare| prepare.join(TimekeepingSection93Live::DEFAULT_POLL_SECONDS) }
@@ -742,7 +749,10 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
               # Observed within 3 s, inside recovery's 5 s lock wait.
               expect(blocked_by?(recovery_pids.pop(timeout: 5), save_pid)).to be(true),
                 "#{name}: recovery should wait on the paused save's lock"
-              recovery.join(TimekeepingSection93Live::DEFAULT_POLL_SECONDS)
+              # An unchanged snapshot proves something only once recovery has
+              # returned; join answers nil when the thread is still running.
+              expect(recovery.join(TimekeepingSection93Live::DEFAULT_POLL_SECONDS)).to be(recovery),
+                "#{name}: recovery should return after its lock wait ends"
               after = section_9_3_recovery_snapshot(company, draft, [held, added])
               expect(after).to eq(before),
                 "#{name}: recovery beside a live save should change nothing; before #{before.inspect}, after #{after.inspect}"
