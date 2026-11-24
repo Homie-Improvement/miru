@@ -4404,6 +4404,42 @@ RSpec.describe Timekeeping::Gateway, "legacy create replay by idempotency key", 
     Timekeeping::WriteContext.new(company:, actor:, actor_kind: "user", request_id:, idempotency_key: key)
   end
 
+  # Pushes to recorded the two advisory keys of every legacy-create receipt
+  # lock as Gateway#legacy_create takes it, so a check can find that lock in
+  # pg_locks without taking it itself or rebuilding its key.
+  def record_legacy_create_lock_keys(recorded)
+    write_steps = Timekeeping::LocalOwner::WriteSteps
+    allow(write_steps).to receive(:lock_key).and_wrap_original do |method, *parts|
+      Thread.current[:legacy_create_lock] = parts.first == Timekeeping::Gateway::LEGACY_CREATE_LOCK
+      method.call(*parts)
+    ensure
+      Thread.current[:legacy_create_lock] = false
+    end
+    allow(write_steps).to receive(:advisory_lock).and_wrap_original do |method, *keys|
+      recorded << keys if Thread.current[:legacy_create_lock]
+      method.call(*keys)
+    end
+  end
+
+  # Whether session pid waits for the advisory lock on keys. A two-key
+  # pg_advisory_xact_lock is listed in pg_locks with the first key in classid,
+  # the second in objid and objsubid 2; both are unsigned 32-bit oids, so a
+  # negative key is listed as its two's-complement value. The check runs on a
+  # connection opened outside the pool, as blocked_by? does.
+  def legacy_create_lock_wait?(pid, keys)
+    high, low = keys.map { |key| key & 0xFFFF_FFFF }
+    observer = ActiveRecord::Base.connection_pool.db_config.new_connection
+    observer.select_value(<<~SQL.squish)
+      SELECT EXISTS (
+        SELECT 1 FROM pg_locks
+        WHERE pid = #{observer.quote(pid)} AND locktype = 'advisory' AND objsubid = 2 AND NOT granted
+          AND classid::bigint = #{observer.quote(high)} AND objid::bigint = #{observer.quote(low)}
+      )
+    SQL
+  ensure
+    observer&.disconnect!
+  end
+
   # "Start with the initial ownership state, save a timer entry, and lose the response after commit. React Query retries with the planned stable key and body."
   # "Test a committed create followed by the same key under initial ownership."
   it "a committed legacy create retried with the same idempotency key and body returns the first entry and records the time once" do
@@ -4509,6 +4545,8 @@ RSpec.describe Timekeeping::Gateway, "legacy create replay by idempotency key", 
     first_created = Queue.new
     release_first = Queue.new
     results = Queue.new
+    lock_keys = Queue.new
+    record_legacy_create_lock_keys(lock_keys)
 
     # The first create runs inside a transaction the test keeps open, so its
     # entry, its receipt and the receipt-key lock stay uncommitted while the
@@ -4524,13 +4562,26 @@ RSpec.describe Timekeeping::Gateway, "legacy create replay by idempotency key", 
     retried = committed_data_thread(retry_pids) { results << create_once.call("req-overlap-2") }
 
     begin
-      retry_waited = blocked_by?(retry_pids.pop(timeout: 5), first_pids.pop(timeout: 5), within: 5)
+      retry_pid = retry_pids.pop(timeout: 5)
+      retry_waited = blocked_by?(retry_pid, first_pids.pop(timeout: 5), within: 5)
+      first_lock_keys = lock_keys.empty? ? nil : lock_keys.pop
+      retry_waited_on_lock = !first_lock_keys.nil? && legacy_create_lock_wait?(retry_pid, first_lock_keys)
+      retry_statement = committed_data_session_statement(retry_pid)
     ensure
       release_first << true
     end
     finished = [first, retried].map { |thread| thread.join(10) }
 
     expect(retry_waited).to be(true)
+    # The receipt's unique index also makes the retry wait, but only at its
+    # insert, after it has saved a second entry; the lock is what makes it
+    # wait before reading the receipt.
+    expect(retry_waited_on_lock).to be(true),
+                                    "the retry should wait on the legacy-create receipt lock " \
+                                    "(LocalOwner::WriteSteps.lock_key(LEGACY_CREATE_LOCK, ...) in " \
+                                    "Timekeeping::Gateway#legacy_create); the first create " \
+                                    "#{first_lock_keys.nil? ? 'never took it' : "held it on keys #{first_lock_keys.inspect}"}, " \
+                                    "and the retry waited in #{retry_statement.inspect}"
     expect(finished).to all(be_a(Thread))
     answers = Array.new(results.size) { results.pop }
     expect(answers.size).to eq(2)

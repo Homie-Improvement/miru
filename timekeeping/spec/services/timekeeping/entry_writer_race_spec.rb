@@ -142,8 +142,19 @@ RSpec.describe Timekeeping::EntryWriter, "under concurrent requests" do
     reached.pop(timeout: wait_seconds)
     Timekeeping::Admission.fence!
     release << true
-    outcome = writer.join(wait_seconds).value
+    # The outbox's NOT NULL generation column also stops a write past the
+    # fence, but only by raising after the entry was written; the generation
+    # check is what refuses it first. Kept as a value so a missing check fails
+    # here, on an assertion, rather than through that error.
+    outcome = begin
+      writer.join(wait_seconds).value
+    rescue ActiveRecord::ActiveRecordError => error
+      error
+    end
 
+    expect(outcome).to be_a(Timekeeping::WriteOutcome),
+                       "the write past the fence should be refused by the generation check " \
+                       "(WriteSteps.generation_matches? in EntryWriter#write); it ended with #{outcome.inspect}"
     expect([outcome.status, JSON.parse(outcome.body)]).to eq([409, { "reason" => "stale_generation" }])
     expect(entry_write_counts).to eq(before)
   end
@@ -244,11 +255,40 @@ RSpec.describe Timekeeping::EntryWriter, "agent create against a detach of the s
     false
   end
 
+  # The parts of each WriteSteps.lock_key call the detach makes, in order, so
+  # a test can name the lock the detach was in when the database saw it wait.
+  # The lock itself is still taken by the product's own lock_key.
+  def record_detach_lock_parts
+    parts_seen = Queue.new
+    allow(Timekeeping::WriteSteps).to receive(:lock_key).and_wrap_original do |lock_key, *parts|
+      parts_seen << parts if Thread.current[:agent_detacher]
+      lock_key.call(*parts)
+    end
+    parts_seen
+  end
+
+  # Whether waiting_pid waits for a transaction-scoped advisory lock (two
+  # int4 keys, objsubid 2) that holding_pid holds granted. Read from pg_locks
+  # only, so this check never takes the lock it looks for.
+  def agent_waits_on_advisory_lock_held_by?(waiting_pid, holding_pid)
+    ApplicationRecord.connection.select_value(ApplicationRecord.sanitize_sql_array([<<~SQL.squish, waiting_pid, holding_pid]))
+      SELECT EXISTS (
+        SELECT 1 FROM pg_locks waiting
+        JOIN pg_locks holding ON holding.locktype = 'advisory' AND holding.granted
+          AND holding.classid = waiting.classid AND holding.objid = waiting.objid AND holding.objsubid = 2
+        WHERE waiting.locktype = 'advisory' AND NOT waiting.granted AND waiting.objsubid = 2
+          AND waiting.pid = ? AND holding.pid = ?
+      )
+    SQL
+  end
+
   # Runs the create until it reaches hold_at, then starts the detach on
   # another connection and lets the create go on after detach_wait seconds.
   # Returns the create's outcome, the detach's outcome, whether the detach
-  # finished while the create was held, and whether the database reported
-  # the detach waiting on the create.
+  # finished while the create was held, whether the database reported the
+  # detach waiting on the create, and, when it did, the parts of the
+  # advisory lock the detach was waiting in (nil when it waited on anything
+  # else).
   def run_create_held_at(hold_at, detach_wait:)
     command = agent_create
     request = detach_request
@@ -262,31 +302,46 @@ RSpec.describe Timekeeping::EntryWriter, "agent create against a detach of the s
       reached << true
       release.pop
     end
+    detach_lock_parts = record_detach_lock_parts
     creator = on_own_agent_connection(creator_pids) { described_class.new(checkpoint:).call(command) }
     detacher = nil
     detach_finished_while_held = false
     detach_blocked = false
+    waited_lock_parts = nil
     begin
       expect(reached.pop(timeout: wait_seconds)).to be(true)
-      detacher = on_own_agent_connection(detacher_pids) { Timekeeping::ServiceCommands.new.call(request) }
+      detacher = on_own_agent_connection(detacher_pids) do
+        Thread.current[:agent_detacher] = true
+        Timekeeping::ServiceCommands.new.call(request)
+      end
       detach_finished_while_held = !detacher.join(detach_wait).nil?
       unless detach_finished_while_held
-        detach_blocked = agent_detach_blocked_by?(detacher_pids.pop(timeout: wait_seconds),
-                                                  creator_pids.pop(timeout: wait_seconds))
+        detacher_pid = detacher_pids.pop(timeout: wait_seconds)
+        creator_pid = creator_pids.pop(timeout: wait_seconds)
+        detach_blocked = agent_detach_blocked_by?(detacher_pid, creator_pid)
+        if agent_waits_on_advisory_lock_held_by?(detacher_pid, creator_pid)
+          waited_lock_parts = Array.new(detach_lock_parts.size) { detach_lock_parts.pop }.last
+        end
       end
     ensure
       release << true
     end
     [creator.join(wait_seconds)&.value, detacher&.join(wait_seconds)&.value, detach_finished_while_held,
-     detach_blocked]
+     detach_blocked, waited_lock_parts]
   end
 
   it "makes a detach wait for a create that holds the agent lock, then detaches the committed entry" do
-    created, detached, detach_finished_while_held, detach_blocked =
+    created, detached, detach_finished_while_held, detach_blocked, waited_lock_parts =
       run_create_held_at(:generation_checked, detach_wait: 1)
 
-    expect(detach_finished_while_held).to be(false)
-    expect(detach_blocked).to be(true)
+    expect(detach_finished_while_held).to be(false),
+                                          "the detach finished while the create held the agent lock " \
+                                          "(ServiceCommands.lock_agent in EntryWriter#names_detached_agent?)"
+    expect(detach_blocked).to be(true), "the detach never waited on the create holding the agent lock"
+    expect(waited_lock_parts).to eq([company, "agent", agent]),
+                                 "the detach should wait in its agent lock, WriteSteps.lock_key(company_id, \"agent\", " \
+                                 "agent_id) in ServiceCommands#run, held by the create; it waited in lock_key " \
+                                 "#{waited_lock_parts.inspect}"
     expect(created.status).to eq(201)
     expect([detached.status, JSON.parse(detached.body)]).to eq([200, { "detached" => 1 }])
     expect(Entry.sole.agent_id).to be_nil
