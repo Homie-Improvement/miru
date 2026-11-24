@@ -6,7 +6,19 @@ require "net/http"
 require "securerandom"
 require "yaml"
 
-RSpec.describe "Timekeeping interrupted handoff", :integrated_runtime, :two_tenant_seed,
+# Live proofs that an interrupted handoff can be resumed or aborted. The
+# :integrated_runtime tag skips every group unless the live flag is set
+# (spec/support/timekeeping/integrated_runtime.rb), so the default suite skips
+# them, and a skip is not a pass.
+#
+# The same tag turns on the queue ledger
+# (spec/support/timekeeping/queue_ledger.rb), so a job any runtime worker runs
+# from a non-dedicated queue fails the suite at teardown. The ledger reads only
+# Solid Queue rows and cannot see the jobs Timekeeping::Handoff::Runner
+# performs inline, such as its relay drain, so every group also carries
+# :inline_jobs_on_dedicated_queues, whose hook fails an example in which any
+# job ran inline on a queue that is not dedicated on the monolith.
+RSpec.describe "Timekeeping interrupted handoff", :integrated_runtime, :inline_jobs_on_dedicated_queues, :two_tenant_seed,
                committed_data: true, owner_state: "legacy" do
   include_context "timekeeping live handoff"
 
@@ -113,7 +125,7 @@ RSpec.describe "Timekeeping interrupted handoff", :integrated_runtime, :two_tena
   end
 end
 
-RSpec.describe "Timekeeping interrupted handoff", :integrated_runtime, :two_tenant_seed,
+RSpec.describe "Timekeeping interrupted handoff", :integrated_runtime, :inline_jobs_on_dedicated_queues, :two_tenant_seed,
                committed_data: true, owner_state: "legacy" do
   include_context "timekeeping live handoff"
 
@@ -212,7 +224,7 @@ RSpec.describe "Timekeeping interrupted handoff", :integrated_runtime, :two_tena
   end
 end
 
-RSpec.describe "Timekeeping interrupted handoff, resumed from before_freeze", :integrated_runtime, :two_tenant_seed,
+RSpec.describe "Timekeeping interrupted handoff, resumed from before_freeze", :integrated_runtime, :inline_jobs_on_dedicated_queues, :two_tenant_seed,
                committed_data: true, owner_state: "legacy" do
   include_context "timekeeping live handoff"
 
@@ -327,7 +339,7 @@ RSpec.describe "Timekeeping interrupted handoff, resumed from before_freeze", :i
   end
 end
 
-RSpec.describe "Timekeeping interrupted handoff, interrupted at during_checkpoint", :integrated_runtime, :two_tenant_seed,
+RSpec.describe "Timekeeping interrupted handoff, interrupted at during_checkpoint", :integrated_runtime, :inline_jobs_on_dedicated_queues, :two_tenant_seed,
                committed_data: true, owner_state: "legacy" do
   include_context "timekeeping live handoff"
 
@@ -423,7 +435,7 @@ RSpec.describe "Timekeeping interrupted handoff, interrupted at during_checkpoin
   end
 end
 
-RSpec.describe "Timekeeping interrupted handoff, aborted while paused", :integrated_runtime, :two_tenant_seed,
+RSpec.describe "Timekeeping interrupted handoff, aborted while paused", :integrated_runtime, :inline_jobs_on_dedicated_queues, :two_tenant_seed,
                committed_data: true, owner_state: "legacy" do
   include_context "timekeeping live handoff"
 
@@ -547,7 +559,7 @@ RSpec.describe "Timekeeping interrupted handoff, aborted while paused", :integra
   end
 end
 
-RSpec.describe "Timekeeping interrupted handoff: paused abort", :integrated_runtime, :two_tenant_seed,
+RSpec.describe "Timekeeping interrupted handoff: paused abort", :integrated_runtime, :inline_jobs_on_dedicated_queues, :two_tenant_seed,
                committed_data: true, owner_state: "legacy" do
   include_context "timekeeping live handoff"
 
@@ -651,7 +663,7 @@ RSpec.describe "Timekeeping interrupted handoff: paused abort", :integrated_runt
   end
 end
 
-RSpec.describe "Timekeeping interrupted handoff: abort ordering", :integrated_runtime, :two_tenant_seed,
+RSpec.describe "Timekeeping interrupted handoff: abort ordering", :integrated_runtime, :inline_jobs_on_dedicated_queues, :two_tenant_seed,
                committed_data: true, owner_state: "legacy" do
   include_context "timekeeping live handoff"
 
@@ -744,7 +756,7 @@ RSpec.describe "Timekeeping interrupted handoff: abort ordering", :integrated_ru
   end
 end
 
-RSpec.describe "Timekeeping interrupted handoff: queue at before_freeze", :integrated_runtime, :two_tenant_seed,
+RSpec.describe "Timekeeping interrupted handoff: queue at before_freeze", :integrated_runtime, :inline_jobs_on_dedicated_queues, :two_tenant_seed,
                committed_data: true, owner_state: "legacy" do
   include_context "timekeeping live handoff"
 
@@ -819,7 +831,7 @@ RSpec.describe "Timekeeping interrupted handoff: queue at before_freeze", :integ
   end
 end
 
-RSpec.describe "Timekeeping interrupted handoff: second resume", :integrated_runtime, :two_tenant_seed,
+RSpec.describe "Timekeeping interrupted handoff: second resume", :integrated_runtime, :inline_jobs_on_dedicated_queues, :two_tenant_seed,
                committed_data: true, owner_state: "legacy" do
   include_context "timekeeping live handoff"
 
@@ -898,7 +910,7 @@ RSpec.describe "Timekeeping interrupted handoff: second resume", :integrated_run
   end
 end
 
-RSpec.describe "Timekeeping interrupted handoff: abort from during_checkpoint", :integrated_runtime, :two_tenant_seed,
+RSpec.describe "Timekeeping interrupted handoff: abort from during_checkpoint", :integrated_runtime, :inline_jobs_on_dedicated_queues, :two_tenant_seed,
                committed_data: true, owner_state: "legacy" do
   include_context "timekeeping live handoff"
 
@@ -987,7 +999,7 @@ RSpec.describe "Timekeeping interrupted handoff: abort from during_checkpoint", 
   end
 end
 
-RSpec.describe "Timekeeping interrupted handoff: redelivery after the flip", :integrated_runtime, :two_tenant_seed,
+RSpec.describe "Timekeeping interrupted handoff: redelivery after the flip", :integrated_runtime, :inline_jobs_on_dedicated_queues, :two_tenant_seed,
                committed_data: true, owner_state: "legacy" do
   include_context "timekeeping live handoff"
 

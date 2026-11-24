@@ -506,4 +506,26 @@ RSpec.configure do |config|
   config.after(:suite) do
     TimekeepingQueueLedger.session.finish!
   end
+
+  # A job run with perform_now, such as the relay drain the handoff runner
+  # performs in-process, writes no Solid Queue row, so the teardown ledger
+  # never sees it. This hook checks those jobs' queues instead. A skipped
+  # example is still checked, because a job it ran before the skip would
+  # otherwise pass unseen. An example's own error is left as its failure.
+  config.around(:each, :inline_jobs_on_dedicated_queues) do |example|
+    queues = TimekeepingQueueLedger.inline_performs { example.run }
+    next if example.exception
+
+    stray = TimekeepingQueueLedger.non_dedicated_queues(queues, database: "monolith").uniq
+    next if stray.empty?
+
+    # RSpec files any error raised in a pending example as an expected
+    # failure, and `skip` marks the example pending, so the mark is cleared
+    # first to make the stray job fail the run.
+    example.metadata[:skip] = false
+    example.metadata[:pending] = false
+    example.execution_result.pending_message = nil
+    raise RSpec::Expectations::ExpectationNotMetError,
+          "jobs ran inline on non-dedicated monolith queues: #{stray.join(', ')}"
+  end
 end
