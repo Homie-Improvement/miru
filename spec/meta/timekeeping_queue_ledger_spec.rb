@@ -961,25 +961,7 @@ RSpec.describe TimekeepingQueueLedger, :without_transaction do
     expect(results.fetch("skip_after_default").first).to be(false), results.fetch("skip_after_default").last
     expect(results.fetch("skip_after_default").last).to include("default")
     expect(results.fetch("dedicated").first).to be(true), results.fetch("dedicated").last
-  end
-end
-
-RSpec.describe TimekeepingQueueLedger do
-  it "an inline job on a dedicated queue in a tagged example lets the probe run pass", :without_transaction do
-    # "No non-dedicated queue job runs during these suites, shown by the teardown queue ledger"
-    # A job on invoice_operations is dedicated for the monolith, so the hook must not fail it.
-    probe = Rails.root.join("spec/fixtures/timekeeping_harness/inline_dedicated_queue_probe.rb").to_s
-
-    Dir.mktmpdir("inline-queue-probe") do |dir|
-      ledger_path = File.join(dir, "queue_ledger.json")
-      stdout, stderr, status = Open3.capture3(
-        { "INLINE_QUEUE_PROBE" => "dedicated", described_class::PATH_KEY => ledger_path },
-        "bundle", "exec", "rspec", probe, chdir: Rails.root.to_s
-      )
-
-      expect(status).to be_success, "#{stdout}\n#{stderr}"
-      expect(stdout).to match(/1 example, 0 failures/)
-    end
+    expect(results.fetch("dedicated").last).to match(/1 example, 0 failures/)
   end
 end
 

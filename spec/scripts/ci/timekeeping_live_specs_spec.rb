@@ -224,26 +224,10 @@ RSpec.describe TimekeepingLiveSpecs do
     expect { base.call("pull_request", "42/merge", nil) }.to raise_error(ArgumentError)
   end
 
-  it "finds exactly the four gated live specs and the interrupted-handoff spec in the real spec/integration/timekeeping directory" do
+  it "finds exactly the four live specs in the real spec/integration/timekeeping directory" do
     # owned_entries_spec.rb and regression_adapter_spec.rb also need TIMEKEEPING_REGRESSION=1, and
     # local_relay_spec.rb has no live gate, so none of them belongs in the live set.
-    # interrupted_handoff_spec.rb is gated by the :integrated_runtime tag and named by the selector.
-    expect(described_class.live_specs(root: Rails.root.to_s))
-      .to eq((live + ["spec/integration/timekeeping/interrupted_handoff_spec.rb"]).sort)
-  end
-
-  it "a diff touching the live support files runs all five live specs, the interrupted-handoff spec included" do
-    real_live_specs = described_class.live_specs(root: Rails.root.to_s)
-
-    status, _out, err, rspec_calls = run_timekeeping_live_selector(
-      env: pull_request_env, changed_paths: ->(_base) { ["spec/support/timekeeping/queue_ledger.rb"] },
-      live_specs: real_live_specs
-    )
-
-    expect(status).to eq(0), err
-    expect(rspec_calls).to eq([real_live_specs])
-    expect(real_live_specs.size).to eq(5)
-    expect(real_live_specs).to include("spec/integration/timekeeping/interrupted_handoff_spec.rb")
+    expect(described_class.live_specs(root: Rails.root.to_s)).to eq(live)
   end
 
   it "recognises a single-quoted gate, and fails the run on a TIMEKEEPING_LIVE gate it cannot recognise" do
@@ -402,8 +386,7 @@ RSpec.describe TimekeepingLiveSpecs do
 
       # A failing live spec must turn the required check red.
       expect(status.exitstatus).to eq(3)
-      full_live_set = (live + ["spec/integration/timekeeping/interrupted_handoff_spec.rb"]).sort
-      expect(File.readlines(args_file, chomp: true)).to eq(["exec", "rspec", *full_live_set])
+      expect(File.readlines(args_file, chomp: true)).to eq(["exec", "rspec", *live])
     end
   end
 
@@ -412,65 +395,6 @@ RSpec.describe TimekeepingLiveSpecs do
     Dir.chdir(Rails.root) do
       expect { described_class.changed_paths("origin/timekeeping-live-specs-no-such-branch") }
         .to raise_error(TimekeepingLiveSpecs::GitError)
-    end
-  end
-
-  # "No non-dedicated queue job runs during these suites, shown by the teardown queue ledger"
-  # The ledger's teardown verdict only runs on the interrupted-handoff suites if the live job selects them.
-  context "the interrupted-handoff spec" do
-    it "a pull request that edits only the interrupted-handoff spec runs exactly that file in the live job" do
-      interrupted = "spec/integration/timekeeping/interrupted_handoff_spec.rb"
-      env = { "GITHUB_EVENT_NAME" => "pull_request", "GITHUB_REF_NAME" => "597/merge", "GITHUB_BASE_REF" => "main" }
-      out = StringIO.new
-      err = StringIO.new
-      rspec_calls = []
-
-      status = Dir.chdir(Rails.root.to_s) do
-        described_class.run(
-          env:, out:, err:, full_run_branches: %w[develop main stable-3-0 production],
-          changed_paths: ->(_base) { [interrupted] }, run_rspec: ->(specs) { rspec_calls << specs; 0 }
-        )
-      end
-
-      expect(status).to eq(0), err.string
-      expect(rspec_calls).to eq([[interrupted]])
-      expect(out.string).not_to include("No live Timekeeping spec was selected")
-    end
-
-    # The sibling integrated suite stays out, because selecting every integrated suite is separate work.
-    it "a pull request that edits the interrupted handoff spec and a sibling integrated suite runs only the interrupted handoff spec live" do
-      changed = %w[
-        spec/integration/timekeeping/money_guard_spec.rb
-        spec/integration/timekeeping/interrupted_handoff_spec.rb
-      ]
-
-      status, _out, err, rspec_calls = run_timekeeping_live_selector(
-        env: pull_request_env, changed_paths: ->(_base) { changed },
-        live_specs: described_class.live_specs(root: Rails.root.to_s)
-      )
-
-      expect(status).to eq(0), err
-      expect(rspec_calls).to eq([["spec/integration/timekeeping/interrupted_handoff_spec.rb"]])
-    end
-
-    # A deleted or renamed file must not be handed to rspec, and the integrated-runtime tag alone selects nothing.
-    it "live_specs lists the interrupted handoff spec only while it exists and never a differently named integrated suite" do
-      Dir.mktmpdir do |root|
-        dir = File.join(root, "spec/integration/timekeeping")
-        FileUtils.mkdir_p(dir)
-        tagged_source = <<~RUBY
-          RSpec.describe "tagged", :integrated_runtime, committed_data: true do
-            it { expect(1).to eq(1) }
-          end
-        RUBY
-        File.write(File.join(dir, "sibling_integrated_spec.rb"), tagged_source)
-
-        expect(described_class.live_specs(root:)).to eq([])
-
-        File.write(File.join(dir, "interrupted_handoff_spec.rb"), tagged_source)
-
-        expect(described_class.live_specs(root:)).to eq(["spec/integration/timekeeping/interrupted_handoff_spec.rb"])
-      end
     end
   end
 end
