@@ -3,7 +3,10 @@
 require "rails_helper"
 
 # Live proofs of the failure cases in docs/architecture/timekeeping-soa.md,
-# section 9.3. Each example name starts with the exact Case text of its row.
+# section 9.3. Each example name starts with the exact Case text of its row
+# and is one plain string literal, never literals joined across lines:
+# spec/meta/timekeeping_section_9_3_traceability_spec.rb reads the names from
+# this file's source, and its reader refuses a name it cannot read whole.
 #
 # Every example boots the whole demo runtime, starts from the "legacy" owner
 # state and runs a real cutover, because the "timekeeping" owner state does not
@@ -58,18 +61,197 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
   # cutover. Waits until the projection row exists, because invoice lines
   # reference timesheet_entries.
   def section_9_3_fresh_entry(company:, employee:, project:, note:)
+    entry_id = section_9_3_create_entry(company:, employee:, project:, note:)
+
+    section_9_3_poll_until("#{company.name}: projection row for entry #{entry_id}") do
+      TimesheetEntry.uncached { TimesheetEntry.unscoped.exists?(id: entry_id) }
+    end
+    TimesheetEntry.unscoped.find(entry_id)
+  end
+
+  # Creates an unbilled entry dated today as the employee, through the
+  # timesheet entry API, and answers its id without waiting for the
+  # projection, so it also works while Timekeeping's relay is held.
+  def section_9_3_create_entry(company:, employee:, project:, note:)
     sign_in employee
     send_request :post, api_v1_timesheet_entry_index_path, params: {
       project_id: project.id, user_id: employee.id,
       timesheet_entry: { duration: 60, work_date: Date.current.iso8601, note:, bill_status: :unbilled }
     }, headers: auth_headers(employee)
     expect(response).to be_successful, "#{company.name}: creating #{note.inspect} answered #{response.status}"
-    entry_id = json_response.fetch("entry").fetch("id")
+    json_response.fetch("entry").fetch("id")
+  end
 
-    section_9_3_poll_until("#{company.name}: projection row for entry #{entry_id}") do
-      TimesheetEntry.uncached { TimesheetEntry.unscoped.exists?(id: entry_id) }
+  # The entry snapshot fields (contracts/timekeeping/entry_snapshots.yml) that
+  # Timekeeping's entries and the monolith's timesheet_entries both store,
+  # every value cast to text, because the monolith's connection decodes
+  # column types and the Timekeeping one does not. locked is left out:
+  # Timekeeping's stored column is not kept current.
+  def section_9_3_entry_fields_sql(table)
+    <<~SQL.squish
+      SELECT id::text, project_id::text, user_id::text, agent_id::text, work_date::text, duration::text, note,
+             bill_status::text, review_status::text, discarded_at::text, version::text
+      FROM #{table} WHERE company_id = $1 ORDER BY id
+    SQL
+  end
+
+  # One row of section_9_3_entry_fields_sql as comparable values. The
+  # monolith stores bill_status and review_status as integer enums and
+  # Timekeeping as their names, so both become the name.
+  def section_9_3_normalised_entry(row)
+    id, project_id, user_id, agent_id, work_date, duration, note, bill_status, review_status, discarded_at, version = row
+    {
+      id: Integer(id), project_id: Integer(project_id), user_id: Integer(user_id), agent_id: agent_id&.then { Integer(_1) },
+      work_date:, duration: Float(duration), note:,
+      bill_status: section_9_3_enum_name(TimesheetEntry.bill_statuses, bill_status),
+      review_status: section_9_3_enum_name(TimesheetEntry.review_statuses, review_status),
+      discarded_at:, version: Integer(version)
+    }
+  end
+
+  def section_9_3_enum_name(mapping, value)
+    value.match?(/\A\d+\z/) ? mapping.key(Integer(value)) || value : value
+  end
+
+  # Every entry of the company as Timekeeping stores it, in id order.
+  def section_9_3_timekeeping_entry_rows(company)
+    section_9_3_with_timekeeping_connection("read entries") do |connection|
+      connection.exec_params(section_9_3_entry_fields_sql("entries"), [company.id]).values
+                .map { |row| section_9_3_normalised_entry(row) }
     end
-    TimesheetEntry.unscoped.find(entry_id)
+  end
+
+  # Every projection row of the company, read on a raw connection so the
+  # query cache cannot answer, in id order. Duplicates are kept.
+  def section_9_3_projection_entry_rows(company)
+    ActiveRecord::Base.connection_pool.with_connection do |connection|
+      connection.raw_connection.exec_params(section_9_3_entry_fields_sql("timesheet_entries"), [company.id]).values
+                .map { |row| section_9_3_normalised_entry(row) }
+    end
+  end
+
+  def section_9_3_entry_comparison(company)
+    { timekeeping: section_9_3_timekeeping_entry_rows(company), projection: section_9_3_projection_entry_rows(company) }
+  end
+
+  # Unsent Timekeeping outbox snapshots of each entry, by entry id.
+  def section_9_3_unsent_snapshots(company, entry_ids)
+    section_9_3_with_timekeeping_connection("read outbox snapshots") do |connection|
+      entry_ids.index_with do |entry_id|
+        TimekeepingLiveHandoff.queued_count(connection, company_id: company.id, entry_id:)
+      end
+    end
+  end
+
+  # The highest Solid Queue job id of Timekeeping's recurring relay job so
+  # far, or 0 when it has never been enqueued.
+  def section_9_3_last_relay_job_id
+    section_9_3_with_timekeeping_connection("read relay jobs") do |connection|
+      Integer(connection.exec("SELECT coalesce(max(id), 0) FROM solid_queue_jobs WHERE class_name = 'RelayJob'")
+                        .getvalue(0, 0))
+    end
+  end
+
+  # Waits until a relay job enqueued after after_job_id has finished, so the
+  # relay has really run since then: a held relay leaves its rows unsent, a
+  # relay that is not held sends them. Without this, a check that runs
+  # between two scheduled runs would pass whether the relay is held or not.
+  def section_9_3_await_relay_run(name, after_job_id)
+    sql = "SELECT EXISTS (SELECT 1 FROM solid_queue_jobs WHERE class_name = 'RelayJob' AND id > $1 " \
+          "AND finished_at IS NOT NULL)"
+    section_9_3_poll_until("#{name}: a relay run enqueued after job #{after_job_id}") do
+      section_9_3_with_timekeeping_connection("read relay jobs") do |connection|
+        connection.exec_params(sql, [after_job_id]).getvalue(0, 0) == "t"
+      end
+    end
+  end
+
+  def section_9_3_projected_ids(entry_ids)
+    TimesheetEntry.uncached { TimesheetEntry.unscoped.where(id: entry_ids).order(:id).pluck(:id) }
+  end
+
+  # A reservation client whose commit answers are thrown away after
+  # Timekeeping applied the commit, as after a timeout. Prepares get their
+  # answers.
+  def section_9_3_client_dropping_commits
+    drop = ->(_method, path) { path.end_with?("/reservations/commit") }
+    Timekeeping::ReservationClient.new(
+      http: TimekeepingContract::DroppingHttp.new(Timekeeping::ReservationHttp.new, drop:)
+    )
+  end
+
+  # The invoice's latest commit outbox row, read fresh.
+  def section_9_3_commit_item(company, invoice)
+    InvoiceOperationOutboxItem.uncached do
+      InvoiceOperationOutboxItem.where(company_id: company.id, invoice_id: invoice.id, kind: "commit").order(:id).last
+    end
+  end
+
+  def section_9_3_delivered_at(outbox_item)
+    InvoiceOperationOutboxItem.uncached { InvoiceOperationOutboxItem.where(id: outbox_item.id).pick(:delivered_at) }
+  end
+
+  # The invoice worker's recurring recovery sweeps, as Solid Queue jobs.
+  def section_9_3_sweep_jobs
+    SolidQueue::Job.where(class_name: RecoverInvoiceOperationIntentsJob.name,
+                          queue_name: RecoverInvoiceOperationIntentsJob.queue_name)
+  end
+
+  def section_9_3_last_sweep_job_id
+    SolidQueue::Job.uncached { section_9_3_sweep_jobs.maximum(:id) || 0 }
+  end
+
+  # Waits until two recovery sweeps have been enqueued after after_job_id and
+  # answers whether the first of them has run (finished or claimed). The
+  # recurring task enqueues one a minute even while the queue is paused, and
+  # a free worker claims a sweep within its 0.5 s polling interval. So a first
+  # sweep still unrun when the next one arrives shows the pause, not the
+  # schedule, is what keeps a row undelivered.
+  def section_9_3_await_queued_sweep(name, after_job_id)
+    first, = section_9_3_poll_until("#{name}: two recovery sweeps enqueued after job #{after_job_id}",
+                                    within: TimekeepingSection93Live::RECOVERY_SWEEP_SECONDS,
+                                    satisfied: ->(jobs) { jobs.size == 2 }) do
+      SolidQueue::Job.uncached { section_9_3_sweep_jobs.where(id: (after_job_id + 1)..).order(:id).first(2) }
+    end
+    { finished: !first.finished_at.nil?, claimed: SolidQueue::ClaimedExecution.exists?(job_id: first.id) }
+  end
+
+  # Waits until every recovery sweep enqueued so far has finished.
+  def section_9_3_await_sweeps_finished(name)
+    last_id = section_9_3_last_sweep_job_id
+    section_9_3_poll_until("#{name}: recovery sweeps up to job #{last_id} finished",
+                           within: TimekeepingSection93Live::RECOVERY_SWEEP_SECONDS) do
+      SolidQueue::Job.uncached { section_9_3_sweep_jobs.where(id: ..last_id, finished_at: nil).none? }
+    end
+  end
+
+  # How many entries and idempotency receipts Timekeeping stores for the
+  # company, and how many projection rows the monolith holds for it.
+  def section_9_3_written_counts(company)
+    counts = section_9_3_with_timekeeping_connection("count entries and receipts") do |connection|
+      entries = connection.exec_params("SELECT count(*) FROM entries WHERE company_id = $1", [company.id])
+      { entries: Integer(entries.getvalue(0, 0)), receipts: TimekeepingLiveHandoff.receipt_count(connection, company_id: company.id) }
+    end
+    counts.merge(projection: TimesheetEntry.uncached { TimesheetEntry.unscoped.where(company_id: company.id).count })
+  end
+
+  # Holds an ACCESS EXCLUSIVE lock on project_members, which
+  # Timekeeping::ReferenceFacts reads for every entry write that names a
+  # project, until something is pushed to release. Answers the holding
+  # thread and its backend pid, or a nil pid when the lock was not taken in
+  # time.
+  def section_9_3_hold_project_members(release)
+    holder_pids = Queue.new
+    locked = Queue.new
+    holder = committed_data_thread(holder_pids) do
+      ApplicationRecord.transaction do
+        ApplicationRecord.connection.execute("LOCK TABLE project_members IN ACCESS EXCLUSIVE MODE")
+        locked << true
+        release.pop
+      end
+    end
+    taken = locked.pop(timeout: TimekeepingSection93Live::LOCK_OBSERVE_SECONDS)
+    [holder, taken ? holder_pids.pop : nil]
   end
 
   def section_9_3_line(entry)
@@ -297,8 +479,7 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
 
   before { WebMock.disable_net_connect!(allow_localhost: true) }
 
-  it "Prepare answer lost (timeout or 5xx): the save fails, the intent is failed, and after abort each entry's " \
-     "reservation equals its state before the save" do
+  it "Prepare answer lost (timeout or 5xx): the save fails, the intent is failed, and after abort each entry's reservation equals its state before the save" do
     section_9_3_live_context do
       section_9_3_cutover!
 
@@ -333,8 +514,7 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
     end
   end
 
-  it "Database commit fails after a 200 prepare: the intent is failed, the added entry ends free and the removed " \
-     "entry stays reserved by the draft" do
+  it "Database commit fails after a 200 prepare: the intent is failed, the added entry ends free and the removed entry stays reserved by the draft" do
     section_9_3_live_context do
       section_9_3_cutover!
 
@@ -409,8 +589,7 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
     end
   end
 
-  it "Successor prepares an entry held by a discarded or destroyed non-draft, then aborts: the entry stays " \
-     "reserved retained by the old invoice and locked against edits" do
+  it "Successor prepares an entry held by a discarded or destroyed non-draft, then aborts: the entry stays reserved retained by the old invoice and locked against edits" do
     section_9_3_live_context do
       section_9_3_cutover!
 
@@ -468,8 +647,7 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
     end
   end
 
-  it "Draft discarded: the draft's reservations are released, the entry shows locked: false and an employee " \
-     "can edit it" do
+  it "Draft discarded: the draft's reservations are released, the entry shows locked: false and an employee can edit it" do
     section_9_3_live_context do
       section_9_3_cutover!
 
@@ -530,8 +708,7 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
     end
   end
 
-  it "Hard delete of a non-draft succeeds: the entry stays reserved retained with its tenant, invoice and " \
-     "disposition, the operation ledger is kept, and a new invoice can prepare and commit it" do
+  it "Hard delete of a non-draft succeeds: the entry stays reserved retained with its tenant, invoice and disposition, the operation ledger is kept, and a new invoice can prepare and commit it" do
     section_9_3_live_context do
       section_9_3_cutover!
 
@@ -587,8 +764,7 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
   # while it is locked; without the hold they could run one after the other
   # and pass with Timekeeping's entry lock removed. The proof that they
   # serialize on the entry row is that both wait on the held row.
-  it "Two invoices prepare one entry at once: both prepares wait on the entry row, then exactly one gets 200 and " \
-     "the other 409 provisional_elsewhere" do
+  it "Two invoices prepare one entry at once: both prepares wait on the entry row, then exactly one gets 200 and the other 409 provisional_elsewhere" do
     section_9_3_live_context do
       section_9_3_cutover!
 
@@ -656,8 +832,7 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
   # A wait of the second save can then only be on the invoice-identity
   # advisory lock, which the example checks in pg_locks: blocked_by? alone
   # would also be true for a wait on a row lock.
-  it "Two saves of one invoice start together: the second save waits on the invoice-identity lock, both commit, " \
-     "and each entry has at most one committed reservation" do
+  it "Two saves of one invoice start together: the second save waits on the invoice-identity lock, both commit, and each entry has at most one committed reservation" do
     section_9_3_live_context do
       section_9_3_cutover!
 
@@ -716,8 +891,7 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
 
   # Recovery runs in this process while the worker's queue is paused, so the
   # worker's recurring sweep cannot settle the intent first.
-  it "Crash after prepare, before the invoice commits: recovery waits while the save holds the lock and changes " \
-     "nothing; after a killed save, recovery returns entries to their state before the save" do
+  it "Crash after prepare, before the invoice commits: recovery waits while the save holds the lock and changes nothing; after a killed save, recovery returns entries to their state before the save" do
     section_9_3_live_context do
       section_9_3_cutover!
 
@@ -803,8 +977,7 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
   # abort that recovery delivers can finish the stored operation. The child is
   # killed inside the failure transaction, after it wrote the abort row and
   # before that transaction commits.
-  it "Crash after the intent is set `failed`, before the abort outbox row exists: the intent is still pending, " \
-     "and recovery records failed and delivers the abort" do
+  it "Crash after the intent is set `failed`, before the abort outbox row exists: the intent is still pending, and recovery records failed and delivers the abort" do
     section_9_3_live_context do
       section_9_3_cutover!
 
@@ -850,6 +1023,175 @@ RSpec.describe "Timekeeping section 9.3 failure cases", :integrated_runtime, :tw
             expect(after).to eq(baseline),
               "#{name}: reservations after the abort #{after.inspect} differ from before the save #{baseline.inspect}"
           end
+        end
+      end
+    end
+  end
+
+  it "Relay down: after the relay worker is killed and replaced, the projection matches Timekeeping's entries with no duplicates" do
+    section_9_3_live_context do
+      section_9_3_cutover!
+
+      aggregate_failures do
+        section_9_3_each_company do |name, company|
+          employee, project = section_9_3_employee_and_project(company)
+          before = section_9_3_poll_until("#{name}: projection equal to Timekeeping's entries before the pause",
+                                          satisfied: ->(seen) { seen[:projection] == seen[:timekeeping] }) do
+            section_9_3_entry_comparison(company)
+          end
+          expect(before[:projection]).to eq(before[:timekeeping]),
+            "#{name}: the projection should match Timekeeping's entries before the relay is held"
+
+          entry_ids = []
+          section_9_3_with_paused_relay do
+            entry_ids = ["Written while the relay is down", "Also written while the relay is down"].map do |note|
+              section_9_3_create_entry(company:, employee:, project:, note:)
+            end
+            section_9_3_await_relay_run(name, section_9_3_last_relay_job_id)
+            held = section_9_3_unsent_snapshots(company, entry_ids)
+            expect(held.values).to all(be_positive),
+              "#{name}: each new entry should have an unsent outbox snapshot while the relay is held; saw #{held.inspect}"
+            expect(section_9_3_projected_ids(entry_ids)).to be_empty,
+              "#{name}: the projection should not hold entries #{entry_ids.inspect} while the relay is held"
+
+            # The queue the Timekeeping relay worker serves (timekeeping/config/solid_queue.yml).
+            killed_pid, new_pid = section_9_3_restart_queue_worker!(queue: "timekeeping_relay", database: :timekeeping)
+            expect(new_pid).not_to eq(killed_pid), "#{name}: the relay worker should be replaced by a new process"
+
+            # Only the replacement can run a relay job enqueued from here on.
+            section_9_3_await_relay_run(name, section_9_3_last_relay_job_id)
+            still_held = section_9_3_unsent_snapshots(company, entry_ids)
+            expect(still_held.values).to all(be_positive),
+              "#{name}: outbox snapshots should stay unsent after the restart until the relay resumes; " \
+              "saw #{still_held.inspect}"
+            expect(section_9_3_projected_ids(entry_ids)).to be_empty,
+              "#{name}: the projection should not hold entries #{entry_ids.inspect} before the relay resumes"
+          end
+
+          caught_up = lambda do |seen|
+            projected_ids = seen[:projection].pluck(:id)
+            seen[:projection] == seen[:timekeeping] && entry_ids.all? { |id| projected_ids.count(id) == 1 }
+          end
+          after = section_9_3_poll_until("#{name}: projection equal to Timekeeping's entries after the restart",
+                                         satisfied: caught_up) do
+            section_9_3_entry_comparison(company)
+          end
+          projected_ids = after[:projection].pluck(:id)
+          expect(projected_ids).to eq(projected_ids.uniq), "#{name}: the projection holds duplicate entry ids"
+          expect(entry_ids.map { |id| projected_ids.count(id) }).to eq([1, 1]),
+            "#{name}: each entry written while the relay was down should be projected once"
+          expect(after[:projection]).to eq(after[:timekeeping]),
+            "#{name}: the projection should match Timekeeping's entries field for field after the restart"
+        end
+      end
+    end
+  end
+
+  it "Commit answer lost, or relay down after the invoice commits: entries stay locked while the invoice worker is down and the commit applies once after it restarts" do
+    section_9_3_live_context do
+      section_9_3_cutover!
+
+      aggregate_failures do
+        section_9_3_each_company do |name, company|
+          employee, project = section_9_3_employee_and_project(company)
+          entry = section_9_3_fresh_entry(company:, employee:, project:, note: "Committed while its answer is lost")
+          commit_item = nil
+          invoice = nil
+
+          section_9_3_with_paused_invoice_operations do
+            sweeps_before = section_9_3_last_sweep_job_id
+            allow(Invoices::ReservationAdapters).to receive(:for).and_return(section_9_3_client_dropping_commits)
+            invoice = section_9_3_draft_holding(company:, project:, entries: [entry])
+            section_9_3_restore_adapters!
+
+            intent = section_9_3_latest_intent(company, invoice)
+            expect(intent&.state).to eq("committed"), "#{name}: the save's intent is #{intent&.state.inspect}"
+            expect(section_9_3_stored_lines(invoice).pluck("timesheet_entry_id")).to eq([entry.id]),
+              "#{name}: the invoice should commit holding the entry"
+            commit_item = section_9_3_commit_item(company, invoice)
+            expect(commit_item).not_to be_nil, "#{name}: the save should write a commit outbox row"
+            expect(commit_item&.delivered_at).to be_nil,
+              "#{name}: the commit row should stay undelivered after its answer was lost"
+            expect(section_9_3_entry_locked(company:, employee:, entry:)).to be(true),
+              "#{name}: the entry should show locked: true while the invoice worker is down"
+
+            sweep = section_9_3_await_queued_sweep(name, sweeps_before)
+            expect(sweep).to eq(finished: false, claimed: false),
+              "#{name}: the recovery sweep enqueued after the save should wait behind the paused queue; saw #{sweep.inspect}"
+            expect(commit_item && section_9_3_delivered_at(commit_item)).to be_nil,
+              "#{name}: the commit row should stay undelivered while the invoice worker is down"
+
+            killed_pid, new_pid = section_9_3_restart_queue_worker!(
+              queue: RecoverInvoiceOperationIntentsJob.queue_name, database: :monolith
+            )
+            expect(new_pid).not_to eq(killed_pid), "#{name}: the invoice worker should be replaced by a new process"
+          end
+          next unless commit_item
+
+          delivered_at = section_9_3_poll_until("#{name}: delivery of commit row #{commit_item.id}",
+                                                within: TimekeepingSection93Live::RECOVERY_SWEEP_SECONDS) do
+            section_9_3_delivered_at(commit_item)
+          end
+          expect(delivered_at).not_to be_nil, "#{name}: the restarted worker should deliver the commit row"
+          applied = section_9_3_reservations(company, [entry])
+          expect(applied.size).to eq(1), "#{name}: the entry should hold one reservation; saw #{applied.inspect}"
+          expect(section_9_3_committed_by(applied, entry, invoice).size).to eq(1),
+            "#{name}: the commit should apply once to the invoice; saw #{applied.inspect}"
+
+          # Every sweep queued while the worker was down has run by now, and
+          # each one could have delivered the commit again.
+          section_9_3_await_sweeps_finished(name)
+          expect(section_9_3_reservations(company, [entry])).to eq(applied),
+            "#{name}: later recovery sweeps should not change the committed reservation"
+        end
+      end
+    end
+  end
+
+  it "Reference facts unavailable: the entry write is refused with 503 reference_unavailable and nothing is written" do
+    section_9_3_live_context do
+      generation = section_9_3_cutover!
+
+      aggregate_failures do
+        section_9_3_each_company do |name, company|
+          employee, project = section_9_3_employee_and_project(company)
+          # Minted before the lock is taken: minting reads the same reference
+          # facts, so under the lock it would wait in this process.
+          token = Timekeeping::UserToken.mint(user: employee, company:, project_ids: [project.id])
+          body = Timekeeping::EntryWriteClient.create_body(
+            user: employee, project:,
+            attributes: { duration: 60, work_date: Date.current.iso8601, note: "Refused without reference facts",
+                          bill_status: "unbilled" }
+          )
+          counts_before = section_9_3_written_counts(company)
+          release = Queue.new
+          holder = nil
+          write = nil
+
+          begin
+            holder, holder_pid = section_9_3_hold_project_members(release)
+            expect(holder_pid).not_to be_nil, "#{name}: the test should hold project_members"
+            next unless holder_pid
+
+            write = Thread.new do
+              section_9_3_post_timekeeping_entry(company_id: company.id, token:, generation:, body:)
+            end
+            waiter = section_9_3_monolith_waiters(holder_pid, count: 1).first
+            expect(waiter && blocked_by?(waiter, holder_pid)).to be(true),
+              "#{name}: the monolith's reference request should wait on the held project_members lock"
+
+            response = write.value
+            expect(response.code).to eq("503"), "#{name}: the entry write answered #{response.code}"
+            expect(JSON.parse(response.body)).to eq("reason" => "reference_unavailable"),
+              "#{name}: the entry write should be refused for its reference facts"
+          ensure
+            release << true
+            stop_committed_data_threads(holder)
+            write&.kill&.join
+          end
+
+          expect(section_9_3_written_counts(company)).to eq(counts_before),
+            "#{name}: the refused write should store no entry, receipt or projection row"
         end
       end
     end
