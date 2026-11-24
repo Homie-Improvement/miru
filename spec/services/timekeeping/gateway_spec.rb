@@ -2062,7 +2062,7 @@ RSpec.describe Timekeeping::Gateway do
 
       handoffs = {
         "cutover" => { owner: "timekeeping", generation: 2 },
-        "rollback" => { monolith_store: "prepared", generation: 3 },
+        "rollback" => { owner: "monolith", monolith_store: "prepared", generation: 3 },
         "re-cutover" => { owner: "timekeeping", generation: 4 }
       }
       handoffs.each_with_index do |(handoff, columns), index|
