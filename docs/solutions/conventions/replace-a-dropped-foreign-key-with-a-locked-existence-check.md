@@ -40,7 +40,9 @@ Guard on nil, not on truthiness. Query the parent table, not the association cac
 ```ruby
 # app/models/invoice_line_item.rb (now also scoped to the invoice's company; FOR KEY SHARE
 # because the entry's locked flag is updated later in the same transaction, see
-# lock-existence-checks-for-key-share-when-the-row-is-updated-later.md)
+# lock-existence-checks-for-key-share-when-the-row-is-updated-later.md. The model now runs
+# it only while the monolith owns entries; under the Timekeeping owner the reservation
+# boundary checks added entries at commit instead.)
 validate :timesheet_entry_found_in_invoice_company, unless: -> { timesheet_entry_id.nil? }
 
 def timesheet_entry_found_in_invoice_company
