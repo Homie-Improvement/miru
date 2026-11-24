@@ -21,9 +21,13 @@ class InvoiceLineItem < ApplicationRecord
   validates :name, :date, :rate, :quantity, presence: true
   validates :rate, numericality: { greater_than_or_equal_to: 0 }
   validates :quantity, numericality: { greater_than_or_equal_to: 0 }
-  # Manual lines keep a NULL timesheet_entry_id.
-  validate :timesheet_entry_found_in_invoice_company, unless: -> { timesheet_entry_id.nil? }
-  validate :linked_timesheet_entries_found_in_invoice_company
+  # Manual lines keep a NULL timesheet_entry_id. Once Timekeeping owns the
+  # entries, the projection lags, so these checks would refuse an entry the
+  # relay has not delivered yet; the reservation boundary checks every added
+  # entry at commit instead, against Timekeeping's prepare answer.
+  validate :timesheet_entry_found_in_invoice_company,
+    if: -> { !timesheet_entry_id.nil? && entries_checked_by_projection? }
+  validate :linked_timesheet_entries_found_in_invoice_company, if: :entries_checked_by_projection?
 
   def self.total_cost_of_all_line_items
     (self.sum("quantity * rate") / 60.0).round(3)
@@ -101,6 +105,7 @@ class InvoiceLineItem < ApplicationRecord
     # validation refuse the save rather than leave the old links in place.
     def link_pending_linked_timesheet_entries
       return unless pending_linked_timesheet_entry_ids?
+      return link_pending_linked_timesheet_entry_ids unless entries_checked_by_projection?
 
       entries = pending_linked_entries_in_invoice_company
       if entries.nil?
@@ -110,6 +115,26 @@ class InvoiceLineItem < ApplicationRecord
 
       self.linked_timesheet_entries = entries
       @pending_linked_timesheet_entry_ids = nil
+    end
+
+    # Links the pending ids by id, because the projection may not hold their
+    # rows yet. Links to ids no longer named are destroyed now; new ones are
+    # saved with this line. The reservation boundary refuses the save at
+    # commit when any new id is not the invoice company's entry.
+    def link_pending_linked_timesheet_entry_ids
+      requested_ids = @pending_linked_timesheet_entry_ids
+      kept_links, dropped_links = invoice_line_item_time_entries.partition do |link|
+        requested_ids.include?(link.timesheet_entry_id)
+      end
+      invoice_line_item_time_entries.destroy(*dropped_links) if dropped_links.any?
+      (requested_ids - kept_links.map(&:timesheet_entry_id)).each do |entry_id|
+        invoice_line_item_time_entries.build(timesheet_entry_id: entry_id)
+      end
+      @pending_linked_timesheet_entry_ids = nil
+    end
+
+    def entries_checked_by_projection?
+      Invoices::EntryReferenceCheck.for(TimekeepingOwnership.current) == :projection
     end
 
     # Missing ids, other companies' ids and entries with no company get the same

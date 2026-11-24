@@ -4,15 +4,24 @@ class InvoiceLineItemTimeEntry < ApplicationRecord
   include BillingFenced
 
   belongs_to :invoice_line_item
-  belongs_to :timesheet_entry
+  # Optional because, once Timekeeping owns the entries, a link may name an
+  # entry the lagging projection does not hold yet. The reservation boundary
+  # then checks the id at commit against Timekeeping's prepare answer.
+  belongs_to :timesheet_entry, optional: true
 
+  validates :timesheet_entry, presence: { message: :required }, if: :entries_checked_by_projection?
+  validates :timesheet_entry_id, presence: true, unless: :entries_checked_by_projection?
   validates :timesheet_entry_id, uniqueness: { scope: :invoice_line_item_id }
-  validate :timesheet_entry_in_invoice_company
+  validate :timesheet_entry_in_invoice_company, if: :entries_checked_by_projection?
 
   before_save :register_reservation_change
   before_destroy :register_reservation_change
 
   private
+
+    def entries_checked_by_projection?
+      Invoices::EntryReferenceCheck.for(TimekeepingOwnership.current) == :projection
+    end
 
     # A link moved to another line can change the entries of two invoices,
     # so the invoice it leaves registers too, before the move is written.
