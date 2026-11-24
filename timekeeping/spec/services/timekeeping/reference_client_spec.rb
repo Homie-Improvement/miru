@@ -210,6 +210,41 @@ RSpec.describe Timekeeping::ReferenceClient do
       end
     end
   end
+
+  context "more tests 4" do
+  it "invoice_holders returns the owned and foreign invoice ids from one reference request" do
+    body = facts_body.merge("invoices" => [{ "id" => 41, "company_id" => 5 }], "foreign_invoice_ids" => [42])
+    stub = stub_request(:get, reference_url).with(query: hash_including("invoice_ids" => "41,42,99"))
+      .to_return(status: 200, body: body.to_json)
+
+    holders = client.invoice_holders(company_id: 5, invoice_ids: [41, 42, 99])
+
+    expect(holders).to eq(described_class::InvoiceHolders.new(owned_ids: [41], foreign_ids: [42]))
+    expect(stub).to have_been_requested.once
+  end
+  end
+
+  context "more tests 5" do
+  it "invoice_holders raises Unavailable when foreign_invoice_ids or invoices is missing or malformed" do
+    owned = { "invoices" => [{ "id" => 41, "company_id" => 5 }] }
+    bodies = [
+      facts_body.merge(owned),
+      facts_body.merge(owned).merge("foreign_invoice_ids" => nil),
+      facts_body.merge(owned).merge("foreign_invoice_ids" => ["42"]),
+      facts_body.merge(owned).merge("foreign_invoice_ids" => 42),
+      facts_body.merge("foreign_invoice_ids" => [42])
+    ]
+
+    bodies.each do |body|
+      WebMock.reset!
+      stub_request(:get, reference_url).with(query: hash_including("invoice_ids" => "41,42"))
+        .to_return(status: 200, body: body.to_json)
+
+      expect { client.invoice_holders(company_id: 5, invoice_ids: [41, 42]) }
+        .to raise_error(described_class::Unavailable), "accepted #{body.inspect}"
+    end
+  end
+  end
 end
 
 RSpec.describe Timekeeping::ReferenceClient, "invoice ownership" do
