@@ -234,4 +234,114 @@ RSpec.describe TimekeepingLiveHandoff do
       end
     end
   end
+
+  # "Exactly-once: read the `EntrySnapshotReceipt` rows written after the interrupt. The sum of their `"applied"` counts must equal the queued count."
+  describe ".applied_since" do
+    it "applied_since sums applied and ignored only over receipts above the baseline id, each receipt once" do
+      receipt = Struct.new(:id, :response_body)
+      receipts = [
+        receipt.new(4, { "applied" => 9, "ignored" => 0 }),
+        receipt.new(5, { "applied" => 3, "ignored" => 0 }),
+        receipt.new(6, { "applied" => 2, "ignored" => 1 })
+      ]
+
+      expect(described_class.applied_since(receipts, baseline_id: 4)).to eq({ applied: 5, ignored: 1 })
+      expect(described_class.applied_since(receipts, baseline_id: 6)).to eq({ applied: 0, ignored: 0 })
+      expect(described_class.applied_since([], baseline_id: 0)).to eq({ applied: 0, ignored: 0 })
+    end
+
+    it "applied_since excludes the baseline receipt itself, so a batch delivered before the interrupt is not counted as a second apply" do
+      receipts = [
+        EntrySnapshotReceipt.new(id: 4, response_body: { "applied" => 3, "ignored" => 0 }),
+        EntrySnapshotReceipt.new(id: 5, response_body: { "applied" => 2, "ignored" => 0 }),
+        EntrySnapshotReceipt.new(id: 6, response_body: { "applied" => 1, "ignored" => 0 })
+      ]
+
+      expect(described_class.applied_since(receipts, baseline_id: 4)).to eq(applied: 3, ignored: 0)
+    end
+
+    # "So sum each new receipt's `"applied"` once against the combined queued count of both companies"
+    it "applied_since counts a receipt covering both companies once and reports ignored snapshots" do
+      receipts = [
+        EntrySnapshotReceipt.new(id: 11, company_ids: [1, 2], response_body: { "applied" => 4, "ignored" => 1 }),
+        EntrySnapshotReceipt.new(id: 12, company_ids: [1, 2], response_body: { "applied" => 2, "ignored" => 0 })
+      ]
+
+      expect(described_class.applied_since(receipts, baseline_id: 10)).to eq(applied: 6, ignored: 1)
+    end
+
+    # "The relay worker offers unsent rows at once, so writing before the pause lets it send them."
+    it "applied_since returns zero when every receipt is at or below the baseline, so a relay that delivered before the pause cannot pass as exactly-once" do
+      receipts = [
+        EntrySnapshotReceipt.new(id: 7, response_body: { "applied" => 5, "ignored" => 0 }),
+        EntrySnapshotReceipt.new(id: 8, response_body: { "applied" => 2, "ignored" => 0 })
+      ]
+
+      expect(described_class.applied_since(receipts, baseline_id: 8)).to eq(applied: 0, ignored: 0)
+    end
+  end
+
+  describe ".queued_positions" do
+    let(:queued_positions_connection) { ActiveRecord::Base.connection.raw_connection }
+
+    around do |example|
+      queued_positions_connection.exec(
+        "CREATE TEMP TABLE outbox_snapshots (outbox_position bigint, id bigint, company_id bigint, sent_at timestamp)"
+      )
+      example.run
+    ensure
+      queued_positions_connection.exec("DROP TABLE IF EXISTS pg_temp.outbox_snapshots")
+    end
+
+    # "Assert that snapshots at or below P are still queued."
+    it "queued_positions lists only the unsent outbox positions of the given company, in order" do
+      queued_positions_connection.exec(<<~SQL)
+        INSERT INTO outbox_snapshots VALUES
+          (7, 30, 1, NULL), (2, 10, 1, now()), (5, 11, 1, NULL), (3, 11, 1, NULL), (4, 20, 2, NULL);
+      SQL
+
+      expect(described_class.queued_positions(queued_positions_connection, company_id: 1)).to eq([3, 5, 7])
+      expect(described_class.queued_positions(queued_positions_connection, company_id: 2)).to eq([4])
+      expect(described_class.queued_positions(queued_positions_connection, company_id: 3)).to eq([])
+    end
+  end
+
+  # "the ownership row read uncached as `row_to_json` text"
+  describe ".ownership_row_text" do
+    it "ownership_row_text reads the same text while the row is unchanged and new text once a column changes" do
+      connection = ActiveRecord::Base.connection.raw_connection
+      generation = Integer(connection.exec("SELECT generation FROM timekeeping_ownership").getvalue(0, 0))
+
+      first = described_class.ownership_row_text(connection)
+      second = described_class.ownership_row_text(connection)
+      expect(first).to be_a(String)
+      expect(second).to eq(first)
+      expect(JSON.parse(first)).to include("generation" => generation)
+
+      ActiveRecord::Base.cache do
+        connection.exec("UPDATE timekeeping_ownership SET generation = generation + 1")
+        changed = described_class.ownership_row_text(connection)
+
+        expect(changed).not_to eq(first)
+        expect(JSON.parse(changed)).to include("generation" => generation + 1)
+      end
+    end
+
+    it "ownership_row_text returns the whole ownership row as JSON text and sees a change written past the query cache" do
+      connection = ActiveRecord::Base.connection.raw_connection
+      stored = connection.exec("SELECT row_to_json(t)::text FROM timekeeping_ownership t").getvalue(0, 0)
+
+      ActiveRecord::Base.cache do
+        before = described_class.ownership_row_text(connection)
+        expect(before).to be_a(String)
+        expect(JSON.parse(before)).to eq(JSON.parse(stored))
+
+        connection.exec("UPDATE timekeeping_ownership SET generation = generation + 1")
+        after = described_class.ownership_row_text(connection)
+
+        expect(after).not_to eq(before)
+        expect(JSON.parse(after).fetch("generation")).to eq(JSON.parse(before).fetch("generation") + 1)
+      end
+    end
+  end
 end
