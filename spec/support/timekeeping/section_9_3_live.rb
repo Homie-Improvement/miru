@@ -405,10 +405,13 @@ module TimekeepingSection93Live
       raise CrashChildFailed, "crash child #{report || 'exited'} before its checkpoint"
     end
 
+    # A worker that ended before the signal reached it was not killed, so a
+    # replacement started after it would prove nothing about recovery from a
+    # kill: that case fails the restart instead of being polled past.
     def section_9_3_kill_worker(pid)
       Process.kill(:KILL, Integer(pid))
     rescue Errno::ESRCH
-      # It ended between the read and the kill; the supervisor replaces it all the same.
+      raise WorkerRestartFailed, "worker #{pid} ended before SIGKILL reached it, so no kill was delivered", cause: nil
     end
 
     # True while a process with this pid exists, including one owned by another
