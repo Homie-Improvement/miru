@@ -964,10 +964,6 @@ RSpec.describe TimekeepingQueueLedger, :without_transaction do
   end
 end
 
-require "rails_helper"
-require "open3"
-require "tmpdir"
-
 RSpec.describe TimekeepingQueueLedger do
   it "an inline default-queue job in a tagged example fails the run even when the example then skips", :without_transaction do
     # "No non-dedicated queue job runs during these suites, shown by the teardown queue ledger"
@@ -991,10 +987,6 @@ RSpec.describe TimekeepingQueueLedger do
     end
   end
 end
-
-require "rails_helper"
-require "open3"
-require "tmpdir"
 
 RSpec.describe TimekeepingQueueLedger do
   it "an inline job on a dedicated queue in a tagged example lets the probe run pass", :without_transaction do
