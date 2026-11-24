@@ -22,8 +22,7 @@ module Timekeeping
 
       def owned?(company_id:, invoice_id:)
         return true if OwnedInvoices.ids(company_id:, invoice_ids: [invoice_id]).include?(invoice_id)
-        return false if Invoice.where(id: invoice_id).where.not(company_id:).exists?
-        return false if InvoiceOperationIntent.where(invoice_id:).where.not(company_id:).exists?
+        return false if OwnedInvoices.held_by_others(company_id:, invoice_ids: [invoice_id]).include?(invoice_id)
 
         ReservationOperations::InvoiceOperation.exists?(company_id:, invoice_id:)
       end

@@ -19,10 +19,11 @@ max_project_ids: 200
 max_agent_ids: 200
 max_invoice_ids: 200
 
-# owned_agent_ids and invoices are additive: a reader that does not ask about
-# agents or invoices ignores them. Deploy the monolith before a Timekeeping
-# that reads them, and roll Timekeeping back first.
-response_fields: [company_id, edit_days, users, projects, missing_project_ids, agents, owned_agent_ids, invoices]
+# owned_agent_ids, invoices and foreign_invoice_ids are additive: a reader
+# that does not ask about agents or invoices ignores them. Deploy the monolith
+# before a Timekeeping that reads them, and roll Timekeeping back first.
+response_fields: [company_id, edit_days, users, projects, missing_project_ids, agents, owned_agent_ids, invoices,
+                  foreign_invoice_ids]
 user_fields: [id, role]
 project_fields: [id, company_id, billable, member_user_ids]
 agent_fields: [id, user_id]
@@ -47,8 +48,15 @@ rules:
     invoices of the company in the path, discarded ones included, or that the
     company holds only as an invoice operation intent (a new invoice whose save
     has not committed yet, or a deleted invoice). Another company's invoice or
-    intent is left out exactly like an id no invoice has. With no invoice_ids
-    the list is empty.
+    intent is left out of invoices exactly like an id no invoice has. With no
+    invoice_ids the list is empty.
+  foreign_invoices: >-
+    foreign_invoice_ids lists, sorted and once each, the requested invoice_ids
+    that another company holds as an invoice (discarded ones included) or as
+    an invoice operation intent. It carries bare ids only, never the company
+    that holds them or any other fact, and never an id that was not requested.
+    Timekeeping refuses such an id before it trusts the path company's own
+    invoice operations. With no invoice_ids the list is empty.
 
 errors:
   unauthorized:

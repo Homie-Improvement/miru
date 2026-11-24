@@ -8,6 +8,9 @@ module Timekeeping
   # appear. A requested project the company
   # does not own is reported in missing_project_ids exactly like an id that
   # does not exist, so the result never reveals another company's records.
+  # The one exception is foreign_invoice_ids: it names which requested invoice
+  # ids another company holds, as bare ids, so Timekeeping can refuse them
+  # before it trusts its own stored operations.
   class ReferenceFacts
     # The roles that act for colleagues, as the entry API contract names them.
     PRIVILEGED_ROLES = YAML.safe_load_file(Rails.root.join("contracts/timekeeping/entry_api.yml"))
@@ -33,7 +36,8 @@ module Timekeeping
         missing_project_ids: requested_project_ids - projects.map(&:id),
         agents: agents,
         owned_agent_ids: owned_agent_ids,
-        invoices: owned_invoice_ids.map { |id| { id:, company_id: company.id } }
+        invoices: owned_invoice_ids.map { |id| { id:, company_id: company.id } },
+        foreign_invoice_ids: OwnedInvoices.held_by_others(company_id: company.id, invoice_ids: requested_invoice_ids)
       }
     end
 
