@@ -133,6 +133,10 @@ RSpec.describe "Timekeeping handoff concurrency", :integrated_runtime, :two_tena
   # Sends create, update and discard as each company's owner, and checks each
   # answer is the handoff refusal and that the company's billing rows did not
   # change. aggregate_failures reports every refused write that went wrong.
+  #
+  # A write that raises instead of answering is kept as a value and reported
+  # as a failure, because an exception would end the aggregate block and
+  # leave the remaining writes and companies unchecked.
   def concurrency_expect_billing_writes_refused(companies, held_at:)
     aggregate_failures("billing writes held at #{held_at}") do
       companies.each do |company|
@@ -145,15 +149,27 @@ RSpec.describe "Timekeeping handoff concurrency", :integrated_runtime, :two_tena
           discard: -> { concurrency_discard_invoice(invoice, user) }
         }
         writes.each do |name, write|
+          label = "#{company.name} #{name} at #{held_at}"
           digest_before = concurrency_billing_digest(company)
-          write.call
+          raised = concurrency_request_error { write.call }
 
-          expect(response).to have_http_status(:service_unavailable), "#{company.name} #{name} at #{held_at}"
-          expect(response.parsed_body["reason"]).to eq("ownership_moving"), "#{company.name} #{name} at #{held_at}"
-          expect(concurrency_billing_digest(company)).to eq(digest_before), "#{company.name} #{name} at #{held_at}"
+          expect(raised).to be_nil, "#{label} raised #{raised.inspect} instead of answering 503 ownership_moving"
+          unless raised
+            expect(response).to have_http_status(:service_unavailable), label
+            expect(response.parsed_body["reason"]).to eq("ownership_moving"), label
+          end
+          expect(concurrency_billing_digest(company)).to eq(digest_before), label
         end
       end
     end
+  end
+
+  # The error a request raised through the app, or nil when it answered.
+  def concurrency_request_error
+    yield
+    nil
+  rescue StandardError => error
+    error
   end
 
   # How long a lock wait or a backend pid may take to appear. Each check
