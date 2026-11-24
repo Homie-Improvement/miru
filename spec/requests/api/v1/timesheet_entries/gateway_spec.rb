@@ -169,6 +169,51 @@ RSpec.describe "Api::V1::TimesheetEntry gateway forwarded token", type: :request
     expect(Timekeeping::LocalOwner::Receipt.where(company_id: company.id).count).to eq(receipts_before)
     expect(TimesheetEntry.where(company_id: company.id)).not_to exist
   end
+
+  context "more tests 5", type: :request do
+# frozen_string_literal: true
+  it "answers a web delete the legacy store committed, retried after cutover and after rollback, with the destroy notice and sends nothing to Timekeeping" do
+    entry = create(:timesheet_entry, user: admin, project:, work_date: Date.current, bill_status: :unbilled)
+    key = "legacy-destroy-route-#{SecureRandom.hex(4)}"
+    headers = auth_headers(admin).merge("Idempotency-Key" => key)
+    destroy_reply = { "notice" => I18n.t("timesheet_entry.destroy.message") }
+    TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID)
+      .update_columns(owner: "monolith", monolith_store: "legacy", generation: 1, handoff_step: nil)
+
+    send_request :delete, api_v1_timesheet_entry_path(entry), headers: headers
+    expect(response).to have_http_status(:ok)
+    expect(entry.reload).to be_discarded
+    expect(Timekeeping::LegacyEntryWriteReceipt.where(company_id: company.id, key:, operation: "destroy").count).to eq(1)
+    discarded_at = entry.discarded_at
+    audits_before = Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count
+    receipts_before = Timekeeping::LegacyEntryWriteReceipt.where(company_id: company.id).pluck(:id, :fingerprint, :expires_at)
+    entries_before = TimesheetEntry.where(company_id: company.id).count
+
+    # "A legacy-store destroy retried after cutover, rollback or re-cutover is answered from its LegacyEntryWriteReceipt with no forwarded or local second write, and a live late-replay example shows this."
+    [
+      { owner: "timekeeping", generation: 2 },
+      { owner: "monolith", monolith_store: "prepared", generation: 3 },
+      { owner: "timekeeping", generation: 4 }
+    ].each do |ownership|
+      TimekeepingOwnership.find(TimekeepingOwnership::SINGLETON_ID).update_columns(**ownership, handoff_step: nil)
+      fake.generation = ownership.fetch(:generation)
+      requests_before = fake.requests.size
+      counts_before = timekeeping_row_counts
+
+      send_request :delete, api_v1_timesheet_entry_path(entry), headers: headers
+
+      expect(response).to have_http_status(:ok), ownership.inspect
+      expect(response.parsed_body).to eq(destroy_reply)
+      expect(fake.requests.size).to eq(requests_before), ownership.inspect
+      expect(timekeeping_row_counts).to eq(counts_before), ownership.inspect
+      expect(entry.reload.discarded_at).to eq(discarded_at)
+      expect(TimesheetEntry.where(company_id: company.id).count).to eq(entries_before)
+      expect(Audited::Audit.where(auditable_type: "TimesheetEntry", auditable_id: entry.id).count).to eq(audits_before)
+      expect(Timekeeping::LegacyEntryWriteReceipt.where(company_id: company.id).pluck(:id, :fingerprint, :expires_at))
+        .to eq(receipts_before)
+    end
+  end
+  end
 end
 
 RSpec.describe "Api::V1::TimesheetEntry gateway employee target", type: :request do
