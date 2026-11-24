@@ -341,6 +341,7 @@ RSpec.describe "forwarded Timekeeping readers with the live adapter running" do
   let(:reader_live) { double("live adapter instance", base_url: "http://127.0.0.1:4999") }
   let(:reader_fake) { TimekeepingContract::FakeTimekeeping.new(token_public_key: timekeeping_key_pair.public_key) }
   let(:reader_entries_url) { "http://127.0.0.1:4999/v1/companies/7/entries" }
+  let(:reader_checked_database_url) { "postgresql://reader_user@127.0.0.1/timekeeping_reader_test" }
 
   before do
     allow(TimekeepingRegressionAdapter).to receive(:current).and_return(reader_live)
@@ -386,12 +387,32 @@ RSpec.describe "forwarded Timekeeping readers with the live adapter running" do
     untouchable_fake = double("FakeTimekeeping that must not be reached")
     connection = double("live connection", close: nil)
     allow(connection).to receive(:exec_params).and_return(double("update result", cmd_tuples: 1))
-    allow(PG).to receive(:connect).and_return(connection)
+    allow(TimekeepingRegressionAdapter).to receive(:database_url).and_return(reader_checked_database_url)
+    allow(PG).to receive(:connect).with(reader_checked_database_url).and_return(connection)
 
     admit_forwarded_generation(untouchable_fake, 3)
 
+    # Only the URL the adapter checked names a test database; any other,
+    # nil included, would open a database the run must not write.
+    expect(PG).to have_received(:connect).with(reader_checked_database_url).once
     expect(connection).to have_received(:exec_params)
       .with("UPDATE admission SET generation = $1 WHERE id = $2", [3, TimekeepingDatabaseReset::ADMISSION_ID]).once
+  end
+
+  it "forwarded_stored_entry_count with the live adapter running counts the live entries on the checked database and never reads the fake" do
+    untouchable_fake = double("FakeTimekeeping that must not be read")
+    company = double("company", id: 41)
+    connection = double("live connection", close: nil)
+    allow(connection).to receive(:exec_params).and_return(double("count result", getvalue: "4"))
+    allow(TimekeepingRegressionAdapter).to receive(:database_url).and_return(reader_checked_database_url)
+    allow(PG).to receive(:connect).with(reader_checked_database_url).and_return(connection)
+
+    expect(forwarded_stored_entry_count(untouchable_fake, company:)).to eq(4)
+
+    expect(PG).to have_received(:connect).with(reader_checked_database_url).once
+    expect(connection).to have_received(:exec_params)
+      .with("SELECT count(*) FROM entries WHERE company_id = $1", [41]).once
+    expect(connection).to have_received(:close).once
   end
 end
 

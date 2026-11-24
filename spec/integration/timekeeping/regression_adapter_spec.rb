@@ -274,6 +274,45 @@ RSpec.describe "TimekeepingRegressionAdapter.start! from a stopped adapter", com
     expect(TimekeepingRegressionAdapter.current).to be_nil
   end
 
+  # The live helpers open the Timekeeping database through database_url, so
+  # it must hold the URL start! checked while running and nothing otherwise.
+  it "database_url holds the checked test URL while the adapter runs and is nil after stop!" do
+    saved = [base_url_env, key_env].index_with { |name| ENV.fetch(name, nil) }
+    allow(TimekeepingLiveInstance).to receive(:start) do |**keywords|
+      double("live instance", base_url: "http://127.0.0.1:#{keywords[:port]}", private_key: OpenSSL::PKey::RSA.generate(2048),
+                              service_token: "adapter-url-token", stop: nil)
+    end
+    checked_url = "postgresql://url_user@127.0.0.1/timekeeping_url_reader_test"
+
+    begin
+      expect(TimekeepingRegressionAdapter.database_url).to be_nil
+      TimekeepingRegressionAdapter.start!(env: live_flags.merge("TIMEKEEPING_DATABASE_URL" => checked_url),
+                                          owner_state: "timekeeping")
+
+      expect(TimekeepingRegressionAdapter.database_url).to eq(checked_url)
+    ensure
+      TimekeepingRegressionAdapter.stop!
+      saved.each { |name, value| value.nil? ? ENV.delete(name) : ENV[name] = value }
+    end
+    expect(TimekeepingRegressionAdapter.database_url).to be_nil
+  end
+
+  it "database_url stays nil when the live instance fails to start" do
+    allow(TimekeepingLiveInstance).to receive(:start).and_raise(TimekeepingLiveInstance::BootError, "did not boot")
+
+    with_timekeeping_env(base_url_env => "http://outer-before.test", key_env => "outer-before-key") do
+      expect do
+        TimekeepingRegressionAdapter.start!(
+          env: live_flags.merge("TIMEKEEPING_DATABASE_URL" => "postgresql://url_user@127.0.0.1/timekeeping_url_fail_test"),
+          owner_state: "timekeeping"
+        )
+      end.to raise_error(TimekeepingRegressionAdapter::BootError)
+    end
+
+    expect(TimekeepingRegressionAdapter.database_url).to be_nil
+    expect(TimekeepingRegressionAdapter.current).to be_nil
+  end
+
   context "with the snapshot app the live relay delivers to", committed_data: true do
     # "In a live timekeeping regression run, TimekeepingRegressionAdapter.launch starts the live instance with a snapshot_app wrapping TimekeepingHandoffOutboxRelay::ConsumerEndpoint, run_harvest_import waits for that delivery, and the 9 reimport examples pass with their owned_entries counts and duplicate expectations unchanged."
     it "start! passes a TimekeepingLiveSnapshotApp holding the instance's service token as snapshot_app and stop! forgets it" do
