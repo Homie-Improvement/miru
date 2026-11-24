@@ -28,7 +28,7 @@ applies_when:
 
 A green suite says nothing about which examples depend on either one. Removing each mechanism once and running the file shows which examples fail without it. Those runs are recorded below. Each removal was a temporary edit, reverted after the run.
 
-The abort wait is already in place. `Runner.run(abort: true)` waits for the drain instead of raising `Refused`: `abort_handoff` calls `carry_out(owed, wait_until_complete: true)`, which sleeps `ABORT_POLL_INTERVAL` until each owed step completes. `spec/lib/timekeeping/handoff/runner_abort_wait_spec.rb` and the paused-abort groups of the interrupted-handoff spec assert it.
+The request that asked for these runs also asked for a report that "`Runner.run(abort: true)` waits rather than raising `Refused`" is not delivered. That request contradicts the code, and this note follows the code: the abort wait is already in place. `Runner.run(abort: true)` waits for the drain instead of raising `Refused`: `abort_handoff` calls `carry_out(owed, wait_until_complete: true)`, which sleeps `ABORT_POLL_INTERVAL` until each owed step completes. `spec/lib/timekeeping/handoff/runner_abort_wait_spec.rb` and the paused-abort groups of the interrupted-handoff spec assert it.
 
 ## The runs
 
