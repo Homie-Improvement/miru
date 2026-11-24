@@ -251,7 +251,8 @@ RSpec.describe Timekeeping::ReferenceClient, "invoice ownership" do
   let(:invoice_client) { described_class.new(base_url: "http://monolith.test", service_token: "invoice-spec-token") }
   let(:invoice_reference_url) { "http://monolith.test/internal/v1/companies/5/reference" }
   let(:invoice_facts_body) do
-    { "company_id" => 5, "edit_days" => 7, "users" => [], "projects" => [], "missing_project_ids" => [], "agents" => [] }
+    { "company_id" => 5, "edit_days" => 7, "users" => [], "projects" => [], "missing_project_ids" => [], "agents" => [],
+      "foreign_invoice_ids" => [] }
   end
 
   def stub_invoice_reference(body, status: 200)
@@ -271,14 +272,14 @@ RSpec.describe Timekeeping::ReferenceClient, "invoice ownership" do
             headers: { "Authorization" => "Bearer invoice-spec-token" })
       .to_return(status: 200, body: invoice_facts_body.merge("invoices" => [{ "id" => 41, "company_id" => 5 }]).to_json)
 
-    expect(invoice_client.owned_invoice_ids(company_id: 5, invoice_ids: [41, 99])).to eq([41])
+    expect(invoice_client.invoice_holders(company_id: 5, invoice_ids: [41, 99]).owned_ids).to eq([41])
     expect(stub).to have_been_requested.once
   end
 
   it "raises Unavailable when an invoice fact names another company, rather than granting that invoice" do
     stub_invoice_reference(invoice_facts_body.merge("invoices" => [{ "id" => 41, "company_id" => 6 }]))
 
-    expect { invoice_client.owned_invoice_ids(company_id: 5, invoice_ids: [41, 99]) }
+    expect { invoice_client.invoice_holders(company_id: 5, invoice_ids: [41, 99]) }
       .to raise_error(described_class::Unavailable)
   end
 
@@ -295,7 +296,7 @@ RSpec.describe Timekeeping::ReferenceClient, "invoice ownership" do
       WebMock.reset!
       stub_invoice_reference(answer.fetch(:body), status: answer.fetch(:status, 200))
 
-      expect { invoice_client.owned_invoice_ids(company_id: 5, invoice_ids: [41, 99]) }
+      expect { invoice_client.invoice_holders(company_id: 5, invoice_ids: [41, 99]) }
         .to raise_error(described_class::Unavailable), "accepted #{answer.inspect}"
     end
   end
@@ -309,8 +310,8 @@ RSpec.describe Timekeeping::ReferenceClient, "invoice ownership" do
   end
 
   it "refuses invoice ids that are not Integers before building a request URL" do
-    expect { invoice_client.owned_invoice_ids(company_id: 5, invoice_ids: ["1&x=2"]) }.to raise_error(ArgumentError)
-    expect { invoice_client.owned_invoice_ids(company_id: "5", invoice_ids: [41]) }.to raise_error(ArgumentError)
+    expect { invoice_client.invoice_holders(company_id: 5, invoice_ids: ["1&x=2"]) }.to raise_error(ArgumentError)
+    expect { invoice_client.invoice_holders(company_id: "5", invoice_ids: [41]) }.to raise_error(ArgumentError)
     expect(a_request(:any, /.*/)).not_to have_been_made
   end
 end

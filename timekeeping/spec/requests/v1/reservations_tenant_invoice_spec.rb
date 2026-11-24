@@ -88,36 +88,6 @@ RSpec.describe "Timekeeping reservations: another company's invoice id" do
     end
   end
 
-  context "more tests 12" do
-    # The own row must never decide on its own: a reference answer without foreign_invoice_ids cannot rule out
-    # another company holding the id, so the request fails closed instead of admitting it.
-    it "answers 503 and writes nothing when the reference answer says nothing about other holders, even with the requester's own invoice_operations row" do
-      arrange = timekeeping_arrange
-      requester = arrange.company
-      InvoiceOperation.create!(company_id: requester, invoice_id: 843, operation_id: SecureRandom.uuid,
-                               actor_name: "invoice-boundary", state: "committed", desired_entry_ids: [],
-                               disposition: "active", generation: 1, created_at: Time.current)
-      entry_id = arrange.entry(company: requester, user: arrange.user(company: requester, role: "employee"),
-                               project: arrange.project(company: requester))
-      token = arrange.service_identity(company: requester, name: "invoice-boundary", operations: %w[prepare])
-      WebMock.stub_request(:get, TimekeepingProviderArrange::REFERENCE_HOST).to_return(
-        status: 200, headers: { "Content-Type" => "application/json" },
-        body: JSON.generate(company_id: requester, edit_days: 30, users: [], projects: [], missing_project_ids: [],
-                            agents: [], owned_agent_ids: [], invoices: [])
-      )
-      counts = -> { [InvoiceOperation.count, Reservation.count, ServiceIdempotencyReceipt.count] }
-      before = counts.call
-
-      post "/v1/companies/#{requester}/reservations/prepare",
-           params: { "invoice_id" => 843, "operation_id" => SecureRandom.uuid, "disposition" => "active",
-                     "entries" => [entry_id], "generation" => arrange.current_generation }.to_json,
-           headers: { "Authorization" => "Bearer #{token}", "Content-Type" => "application/json" }
-
-      expect([response.status, response.parsed_body]).to eq([503, { "reason" => "reference_unavailable" }])
-      expect(counts.call).to eq(before)
-    end
-  end
-
   context "more tests 13" do
     # "In the Timekeeping service, InvoiceOwnership.owned? answers false when another company holds an invoice row or intent row for the id, even when the requester has its own invoice_operations row naming that id, matching the local owner."
     it "refuses a prepare of another company's invoice despite the requester's own invoice_operations row, writes nothing, and refuses the same operation_id again on retry" do

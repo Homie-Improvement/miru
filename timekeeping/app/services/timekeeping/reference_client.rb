@@ -24,8 +24,7 @@ module Timekeeping
     # owned_agent_ids, invoices and foreign_invoice_ids are nil when the
     # monolith did not send them, which an older monolith does not. Entry
     # writes never read them, so they keep working beside such a monolith;
-    # owned_agent_ids, owned_invoice_ids and invoice_holders below refuse
-    # instead.
+    # owned_agent_ids and invoice_holders below refuse instead.
     Facts = Data.define(:company_id, :edit_days, :users, :projects, :missing_project_ids, :agents,
                         :owned_agent_ids, :invoices, :foreign_invoice_ids) do
       def initialize(owned_agent_ids: nil, invoices: nil, foreign_invoice_ids: nil, **fields)
@@ -86,25 +85,12 @@ module Timekeeping
       owned
     end
 
-    # The requested invoice ids the monolith lists as the company's, counting
-    # a new invoice whose save has not committed yet. A response without
-    # invoices raises Unavailable: reading it as "owns none" would refuse the
-    # company's own invoice, and reading it as "owns all" would let one
-    # company write against another's.
-    def owned_invoice_ids(company_id:, invoice_ids:)
-      raise ArgumentError, "company_id must be an Integer" unless company_id.is_a?(Integer)
-      raise ArgumentError, "invoice_ids must be Integers" unless invoice_ids.all?(Integer)
-
-      invoices = read_facts(company_id, project_ids: [], invoice_ids:).invoices
-      raise Unavailable, "reference response lacks invoices" if invoices.nil?
-
-      invoices.map(&:id)
-    end
-
-    # The requested invoice ids the company holds and those another company
-    # holds, from one request so both lists describe the same moment. A
-    # response without either list raises Unavailable: without foreign ids an
-    # own invoice_operations row could admit another company's invoice.
+    # The requested invoice ids the company holds, counting a new invoice
+    # whose save has not committed yet, and those another company holds, from
+    # one request so both lists describe the same moment. A response without
+    # either list raises Unavailable: reading missing invoices as "owns none"
+    # would refuse the company's own invoice, and without foreign ids an own
+    # invoice_operations row could admit another company's invoice.
     def invoice_holders(company_id:, invoice_ids:)
       raise ArgumentError, "company_id must be an Integer" unless company_id.is_a?(Integer)
       raise ArgumentError, "invoice_ids must be Integers" unless invoice_ids.all?(Integer)
